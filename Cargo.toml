@@ -1,0 +1,29 @@
+[workspace]
+members = [
+  "apps/desktop/src-tauri",
+  "crates/citations",
+  "crates/database",
+  "crates/domain",
+  "crates/providers",
+  "crates/retrieval",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+citations = { path = "crates/citations" }
+database = { path = "crates/database" }
+domain = { path = "crates/domain" }
+providers = { path = "crates/providers" }
+retrieval = { path = "crates/retrieval" }
+
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tauri = "2.11.5"
+tauri-build = "2.6.3"
+tempfile = "3.23.0"

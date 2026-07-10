@@ -1,0 +1,10 @@
+[package]
+name = "citations"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+database.workspace = true
+domain.workspace = true
+rusqlite.workspace = true

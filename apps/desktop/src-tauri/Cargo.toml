@@ -1,0 +1,30 @@
+[package]
+name = "lawyer-assistance-desktop"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "lawyer_assistance_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "lawyer-assistance"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+citations.workspace = true
+database.workspace = true
+domain.workspace = true
+providers.workspace = true
+retrieval.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

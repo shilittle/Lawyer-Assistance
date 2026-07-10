@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Set up Python for CI fixture generation
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test legal database builder
+        run: python -m unittest data.build.test_build_legal_core
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --workspace
+
+      - name: Lint frontend
+        run: pnpm lint
+
+      - name: Test frontend
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Prepare CI-only legal database fixture
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import sqlite3
+
+          root = Path.cwd()
+          output = root / "apps" / "desktop" / "src-tauri" / "resources" / "legal_core.sqlite"
+          output.parent.mkdir(parents=True, exist_ok=True)
+          if output.exists():
+              output.unlink()
+
+          connection = sqlite3.connect(output)
+          try:
+              connection.executescript((root / "data" / "schema" / "legal_core.sql").read_text(encoding="utf-8"))
+              connection.executescript((root / "data" / "fixtures" / "legal_core_retrieval_fixture.sql").read_text(encoding="utf-8"))
+              connection.execute(
+                  "INSERT OR REPLACE INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+                  ("dataset_name", "ci-fixture-not-for-release", "1970-01-01T00:00:00Z"),
+              )
+              connection.execute(
+                  "INSERT OR REPLACE INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+                  ("coverage_status", "fixture", "1970-01-01T00:00:00Z"),
+              )
+              connection.commit()
+          finally:
+              connection.close()
+          '@ | python -
+
+      - name: Build Tauri with CI fixture (packaging smoke test only)
+        run: pnpm tauri build

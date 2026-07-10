@@ -1,0 +1,69 @@
+{
+  "built_at": "2026-07-10T13:21:24+00:00",
+  "output": "apps\\desktop\\src-tauri\\resources\\legal_core.sqlite",
+  "stage": "audit",
+  "metadata_only": false,
+  "limit": null,
+  "coverage": [
+    {
+      "source": "flk_npc",
+      "scope": "all_official_records",
+      "expected_total": 29708,
+      "fetched_total": 29708,
+      "detail_fetched_total": 29689,
+      "text_fetched_total": 29689,
+      "status": "complete",
+      "notes": "FLK list total matched fetched rows; detail and text counts recorded separately."
+    },
+    {
+      "source": "gjgzk_gov",
+      "scope": "地方政府规章",
+      "expected_total": 7941,
+      "fetched_total": 7941,
+      "detail_fetched_total": 7941,
+      "text_fetched_total": 7941,
+      "status": "complete",
+      "notes": "地方政府规章 official total matched fetched rows."
+    },
+    {
+      "source": "gjgzk_gov",
+      "scope": "部门规章",
+      "expected_total": 2663,
+      "fetched_total": 2663,
+      "detail_fetched_total": 2663,
+      "text_fetched_total": 2663,
+      "status": "complete",
+      "notes": "部门规章 official total matched fetched rows."
+    }
+  ],
+  "counts": {
+    "law_documents": 40293,
+    "law_versions": 40293,
+    "law_articles": 1181655,
+    "law_relations": 26699,
+    "law_articles_fts": 1181655,
+    "source_records": 110276,
+    "legal_attachments": 88890,
+    "ingestion_audit": 40293
+  },
+  "audit": {
+    "audit_status": "complete",
+    "coverage_status": "complete",
+    "schema_version": "3",
+    "failures": [],
+    "sqlite_integrity": "ok",
+    "foreign_key_errors": 0,
+    "article_count": 1181655,
+    "fts_count": 1181655,
+    "invalid_relation_endpoints": 0,
+    "missing_source_records": 0,
+    "placeholder_article_count": 0,
+    "blocked_record_count": 0,
+    "failed_record_count": 0,
+    "missing_text_record_count": 0,
+    "missing_article_record_count": 0,
+    "missing_date_count": 3344,
+    "duplicate_source_id_count": 0,
+    "fixture_demo_marker_hits": 0
+  }
+}

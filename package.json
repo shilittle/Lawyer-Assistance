@@ -1,0 +1,16 @@
+{
+  "name": "lawyer-assistance-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "pnpm --filter @lawyer-assistance/desktop build",
+    "lint": "pnpm --filter @lawyer-assistance/desktop lint",
+    "tauri": "pnpm --filter @lawyer-assistance/desktop tauri",
+    "test": "pnpm --filter @lawyer-assistance/desktop test"
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=11.0.0"
+  }
+}

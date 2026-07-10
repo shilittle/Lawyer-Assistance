@@ -1,0 +1,11 @@
+[package]
+name = "providers"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }

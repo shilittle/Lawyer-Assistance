@@ -1,0 +1,13 @@
+[package]
+name = "retrieval"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+database.workspace = true
+domain.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
