@@ -6,9 +6,15 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
-    Delta { content: String },
+    Delta {
+        content: String,
+        model: Option<String>,
+    },
     Usage(ChatUsage),
-    Error { error_type: String, message: String },
+    Error {
+        error_type: String,
+        message: String,
+    },
     Done,
 }
 
@@ -35,7 +41,7 @@ impl StreamParser {
             let separator_len = separator_len(&self.buffer);
             self.buffer.drain(..separator_len);
 
-            if event_bytes.iter().all(u8::is_ascii_whitespace) {
+            if event_bytes.iter().all(u8::is_ascii_whitespace) || is_comment_only(&event_bytes) {
                 continue;
             }
 
@@ -44,6 +50,15 @@ impl StreamParser {
 
         events
     }
+}
+
+fn is_comment_only(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).ok().is_some_and(|text| {
+        text.lines().all(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with(':')
+        })
+    })
 }
 
 fn find_event_separator(buffer: &[u8]) -> Option<usize> {
@@ -114,7 +129,7 @@ fn parse_data_event(data: &str) -> Result<StreamEvent, ProviderError> {
         return parse_error_value(error);
     }
 
-    if let Some(usage) = value.get("usage") {
+    if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
         return Ok(StreamEvent::Usage(ChatUsage {
             prompt_tokens: usage
                 .get("prompt_tokens")
@@ -140,8 +155,12 @@ fn parse_data_event(data: &str) -> Result<StreamEvent, ProviderError> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
-    Ok(StreamEvent::Delta { content })
+    Ok(StreamEvent::Delta { content, model })
 }
 
 fn parse_error_event(data: &str) -> Result<StreamEvent, ProviderError> {
@@ -195,7 +214,8 @@ mod tests {
         assert_eq!(
             events,
             vec![Ok(StreamEvent::Delta {
-                content: "hello".to_owned()
+                content: "hello".to_owned(),
+                model: None,
             })]
         );
     }
@@ -248,7 +268,51 @@ data: {"error":{"type":"rate_limit","message":"too many requests"}}
         assert_eq!(
             events,
             vec![Ok(StreamEvent::Delta {
-                content: "你好".to_owned()
+                content: "你好".to_owned(),
+                model: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn ignores_sse_keepalive_comments() {
+        let mut parser = StreamParser::new();
+
+        assert!(parser.push(b": keep-alive\n\n").is_empty());
+    }
+
+    #[test]
+    fn captures_model_from_content_delta() {
+        let mut parser = StreamParser::new();
+        let events = parser.push(
+            br#"data: {"model":"qwen-plus","choices":[{"delta":{"content":"pong"}}]}
+
+"#,
+        );
+
+        assert_eq!(
+            events,
+            vec![Ok(StreamEvent::Delta {
+                content: "pong".to_owned(),
+                model: Some("qwen-plus".to_owned()),
+            })]
+        );
+    }
+
+    #[test]
+    fn usage_null_does_not_hide_content_delta() {
+        let mut parser = StreamParser::new();
+        let events = parser.push(
+            br#"data: {"model":"qwen-plus","choices":[{"delta":{"content":"pong"}}],"usage":null}
+
+"#,
+        );
+
+        assert_eq!(
+            events,
+            vec![Ok(StreamEvent::Delta {
+                content: "pong".to_owned(),
+                model: Some("qwen-plus".to_owned()),
             })]
         );
     }

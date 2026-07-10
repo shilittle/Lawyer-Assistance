@@ -128,7 +128,7 @@ const PROVIDER_DEFAULTS: Record<
 > = {
   deep_seek: {
     displayName: "DeepSeek",
-    modelId: "deepseek-chat",
+    modelId: "deepseek-v4-flash",
     baseUrl: "https://api.deepseek.com",
   },
   qwen: {
@@ -138,12 +138,12 @@ const PROVIDER_DEFAULTS: Record<
   },
   silicon_flow: {
     displayName: "SiliconFlow",
-    modelId: "deepseek-ai/DeepSeek-V3",
+    modelId: "deepseek-ai/DeepSeek-V3.2",
     baseUrl: "https://api.siliconflow.cn/v1",
   },
   volcengine_ark: {
     displayName: "Volcengine Ark",
-    modelId: "doubao-seed-1-6-250615",
+    modelId: "doubao-seed-2-0-lite-260215",
     baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
   },
 };
@@ -165,8 +165,14 @@ function createProviderProfile(kind: ProviderKind): ProviderProfile {
     baseUrl: defaults.baseUrl,
     credentialAccountId: "default",
     capabilities: DEFAULT_CAPABILITIES,
-    options: {},
+    options: defaultProviderOptions(kind),
   };
+}
+
+function defaultProviderOptions(kind: ProviderKind): ProviderOptions {
+  return kind === "deep_seek" || kind === "volcengine_ark"
+    ? { thinking: false }
+    : { enableThinking: false };
 }
 
 function createCaseProject(): CaseProject {
@@ -1048,6 +1054,7 @@ export function App() {
       displayName: defaults.displayName,
       modelId: defaults.modelId,
       baseUrl: defaults.baseUrl,
+      options: defaultProviderOptions(kind),
     }));
   }
 
@@ -2590,82 +2597,103 @@ export function App() {
                     }
                   />
                 </label>
-                <label>
-                  <span>Endpoint ID</span>
-                  <input
-                    value={providerDraft.options.endpointId ?? ""}
-                    onChange={(event) =>
-                      updateOptions({ endpointId: event.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Workspace ID</span>
-                  <input
-                    value={providerDraft.options.workspaceId ?? ""}
-                    onChange={(event) =>
-                      updateOptions({ workspaceId: event.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Reasoning effort</span>
-                  <select
-                    value={providerDraft.options.reasoningEffort ?? ""}
-                    onChange={(event) =>
-                      updateOptions({
-                        reasoningEffort:
-                          event.target.value === ""
-                            ? null
-                            : (event.target.value as ReasoningEffort),
-                      })
-                    }
-                  >
-                    <option value="">未设置</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Thinking budget</span>
-                  <input
-                    min="0"
-                    type="number"
-                    value={providerDraft.options.thinkingBudget ?? ""}
-                    onChange={(event) =>
-                      updateOptions({
-                        thinkingBudget:
-                          event.target.value === ""
-                            ? null
-                            : Number(event.target.value),
-                      })
-                    }
-                  />
-                </label>
+                {providerDraft.kind === "volcengine_ark" ? (
+                  <label>
+                    <span>Endpoint ID（可覆盖模型 ID）</span>
+                    <input
+                      value={providerDraft.options.endpointId ?? ""}
+                      onChange={(event) =>
+                        updateOptions({ endpointId: event.target.value })
+                      }
+                    />
+                  </label>
+                ) : null}
+                {providerDraft.kind === "qwen" ? (
+                  <label>
+                    <span>Workspace ID（用于 Base URL 占位符）</span>
+                    <input
+                      value={providerDraft.options.workspaceId ?? ""}
+                      onChange={(event) =>
+                        updateOptions({ workspaceId: event.target.value })
+                      }
+                    />
+                  </label>
+                ) : null}
+                {providerDraft.kind === "deep_seek" ||
+                providerDraft.kind === "volcengine_ark" ? (
+                  <label>
+                    <span>Reasoning effort</span>
+                    <select
+                      value={providerDraft.options.reasoningEffort ?? ""}
+                      onChange={(event) =>
+                        updateOptions({
+                          reasoningEffort:
+                            event.target.value === ""
+                              ? null
+                              : (event.target.value as ReasoningEffort),
+                        })
+                      }
+                    >
+                      <option value="">未设置</option>
+                      <option value="low">low</option>
+                      <option value="medium">medium</option>
+                      <option value="high">high</option>
+                    </select>
+                  </label>
+                ) : null}
+                {providerDraft.kind === "qwen" ||
+                providerDraft.kind === "silicon_flow" ? (
+                  <label>
+                    <span>Thinking budget</span>
+                    <input
+                      min={providerDraft.kind === "silicon_flow" ? 128 : 1}
+                      max={
+                        providerDraft.kind === "silicon_flow"
+                          ? 32768
+                          : undefined
+                      }
+                      type="number"
+                      value={providerDraft.options.thinkingBudget ?? ""}
+                      onChange={(event) =>
+                        updateOptions({
+                          thinkingBudget:
+                            event.target.value === ""
+                              ? null
+                              : Number(event.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                ) : null}
               </div>
 
               <div className="toggle-row">
-                <label>
-                  <input
-                    checked={providerDraft.options.enableThinking ?? false}
-                    type="checkbox"
-                    onChange={(event) =>
-                      updateOptions({ enableThinking: event.target.checked })
-                    }
-                  />
-                  <span>enable_thinking</span>
-                </label>
-                <label>
-                  <input
-                    checked={providerDraft.options.thinking ?? false}
-                    type="checkbox"
-                    onChange={(event) =>
-                      updateOptions({ thinking: event.target.checked })
-                    }
-                  />
-                  <span>thinking</span>
-                </label>
+                {providerDraft.kind === "qwen" ||
+                providerDraft.kind === "silicon_flow" ? (
+                  <label>
+                    <input
+                      checked={providerDraft.options.enableThinking ?? false}
+                      type="checkbox"
+                      onChange={(event) =>
+                        updateOptions({ enableThinking: event.target.checked })
+                      }
+                    />
+                    <span>enable_thinking</span>
+                  </label>
+                ) : null}
+                {providerDraft.kind === "deep_seek" ||
+                providerDraft.kind === "volcengine_ark" ? (
+                  <label>
+                    <input
+                      checked={providerDraft.options.thinking ?? false}
+                      type="checkbox"
+                      onChange={(event) =>
+                        updateOptions({ thinking: event.target.checked })
+                      }
+                    />
+                    <span>thinking</span>
+                  </label>
+                ) : null}
               </div>
 
               <div className="command-row">
@@ -2736,7 +2764,9 @@ export function App() {
                   <dd>{currentConnectionResult?.model ?? "未返回"}</dd>
                 </div>
                 <div>
-                  <dt>首字延迟</dt>
+                  <dt title="从发起请求到首个非空 SSE delta.content 到达；不按响应头、keep-alive 或空 delta 计时">
+                    首个内容 token
+                  </dt>
                   <dd>
                     {formatLatency(
                       currentConnectionResult?.firstTokenLatencyMs,
