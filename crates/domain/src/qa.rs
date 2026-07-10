@@ -111,6 +111,7 @@ pub struct CitationValidationReport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegalAnswerRequest {
+    pub request_id: String,
     pub provider_id: String,
     pub question: String,
     pub law_name: Option<String>,
@@ -133,11 +134,21 @@ pub enum LegalAnswerStreamEventType {
     Done,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegalAnswerStreamUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegalAnswerStreamEvent {
+    pub request_id: String,
     pub event_type: LegalAnswerStreamEventType,
     pub content: Option<String>,
+    pub usage: Option<LegalAnswerStreamUsage>,
     pub error_type: Option<String>,
     pub message: Option<String>,
 }
@@ -149,8 +160,20 @@ pub struct LegalAnswerResponse {
     pub answer: String,
     pub context: LegalAnswerContext,
     pub citation_report: CitationValidationReport,
-    pub stream_events: Vec<LegalAnswerStreamEvent>,
     pub record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelLegalAnswerRequest {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelLegalAnswerResponse {
+    pub request_id: String,
+    pub cancelled: bool,
 }
 
 #[cfg(test)]
@@ -160,6 +183,7 @@ mod tests {
     #[test]
     fn legal_answer_request_uses_camel_case_contract() {
         let request = LegalAnswerRequest {
+            request_id: "answer-test-1".to_owned(),
             provider_id: "deepseek-main".to_owned(),
             question: "合同违约责任是什么？".to_owned(),
             law_name: Some("民法典".to_owned()),
@@ -176,6 +200,7 @@ mod tests {
         let serialized = serde_json::to_value(request).expect("request serializes");
 
         assert_eq!(serialized["providerId"], "deepseek-main");
+        assert_eq!(serialized["requestId"], "answer-test-1");
         assert_eq!(serialized["caseDate"], "2024-01-01");
         assert_eq!(serialized["includeExpired"], false);
         assert_eq!(serialized["maxTokens"], 512);

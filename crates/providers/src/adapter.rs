@@ -94,6 +94,93 @@ pub struct ReqwestTransport {
     client: reqwest::blocking::Client,
 }
 
+/// Async transport used by business commands that must consume provider bytes
+/// as they arrive. The existing blocking transport remains unchanged for the
+/// stage 2 connection probe contract.
+#[derive(Debug, Clone)]
+pub struct ReqwestStreamingTransport {
+    client: reqwest::Client,
+}
+
+#[derive(Debug)]
+pub struct StreamingTransportResponse {
+    status: u16,
+    response: reqwest::Response,
+}
+
+impl ReqwestStreamingTransport {
+    pub fn new(timeout: Duration) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|error| ProviderError::new(ProviderErrorKind::Network, error.to_string()))?;
+
+        Ok(Self { client })
+    }
+
+    pub async fn send_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ChatRequest,
+    ) -> Result<StreamingTransportResponse, ProviderError> {
+        let request = build_transport_request(profile, secret, request)?;
+        let mut builder = self.client.post(&request.url);
+
+        for header in &request.headers {
+            builder = builder.header(&header.name, &header.value);
+        }
+
+        let response =
+            builder.body(request.body).send().await.map_err(|error| {
+                ProviderError::new(ProviderErrorKind::Network, error.to_string())
+            })?;
+
+        Ok(StreamingTransportResponse {
+            status: response.status().as_u16(),
+            response,
+        })
+    }
+}
+
+impl StreamingTransportResponse {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ProviderError> {
+        self.response
+            .chunk()
+            .await
+            .map(|chunk| chunk.map(|chunk| chunk.to_vec()))
+            .map_err(|error| ProviderError::new(ProviderErrorKind::Network, error.to_string()))
+    }
+
+    pub async fn into_http_error(mut self) -> ProviderError {
+        const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+        let mut body = Vec::new();
+
+        while body.len() < MAX_ERROR_BODY_BYTES {
+            match self.response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = MAX_ERROR_BODY_BYTES - body.len();
+                    body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    return ProviderError::with_status(
+                        ProviderErrorKind::Network,
+                        self.status,
+                        error.to_string(),
+                    );
+                }
+            }
+        }
+
+        map_http_error(self.status, &String::from_utf8_lossy(&body))
+    }
+}
+
 impl ReqwestTransport {
     pub fn new(timeout: Duration) -> Result<Self, ProviderError> {
         let client = reqwest::blocking::Client::builder()
@@ -151,32 +238,7 @@ where
         secret: &ApiSecret,
         request: &ChatRequest,
     ) -> Result<TransportRequest, ProviderError> {
-        let url = chat_completions_url(&profile.base_url)?;
-        let mut headers = vec![
-            TransportHeader::new(
-                "Authorization",
-                format!("Bearer {}", secret.expose_secret()),
-            ),
-            TransportHeader::new("Content-Type", "application/json"),
-            TransportHeader::new("Accept", "application/json"),
-        ];
-
-        if profile.kind == ProviderKind::VolcengineArk {
-            if let Some(workspace_id) = non_empty(profile.options.workspace_id.as_deref()) {
-                headers.push(TransportHeader::new("X-Volcengine-Workspace", workspace_id));
-            }
-        }
-
-        let body = build_chat_body(profile, request)?;
-
-        Ok(TransportRequest {
-            method: "POST".to_owned(),
-            url,
-            headers,
-            body: serde_json::to_string(&body).map_err(|error| {
-                ProviderError::new(ProviderErrorKind::InvalidRequest, error.to_string())
-            })?,
-        })
+        build_transport_request(profile, secret, request)
     }
 
     pub fn send_chat(
@@ -225,6 +287,46 @@ where
             Err(error) => ConnectionTest::failed(profile.id.clone(), None, None, 0, &error),
         }
     }
+}
+
+fn build_transport_request(
+    profile: &ProviderProfile,
+    secret: &ApiSecret,
+    request: &ChatRequest,
+) -> Result<TransportRequest, ProviderError> {
+    let url = chat_completions_url(&profile.base_url)?;
+    let mut headers = vec![
+        TransportHeader::new(
+            "Authorization",
+            format!("Bearer {}", secret.expose_secret()),
+        ),
+        TransportHeader::new("Content-Type", "application/json"),
+        TransportHeader::new(
+            "Accept",
+            if request.stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        ),
+    ];
+
+    if profile.kind == ProviderKind::VolcengineArk {
+        if let Some(workspace_id) = non_empty(profile.options.workspace_id.as_deref()) {
+            headers.push(TransportHeader::new("X-Volcengine-Workspace", workspace_id));
+        }
+    }
+
+    let body = build_chat_body(profile, request)?;
+
+    Ok(TransportRequest {
+        method: "POST".to_owned(),
+        url,
+        headers,
+        body: serde_json::to_string(&body).map_err(|error| {
+            ProviderError::new(ProviderErrorKind::InvalidRequest, error.to_string())
+        })?,
+    })
 }
 
 fn chat_completions_url(base_url: &str) -> Result<String, ProviderError> {

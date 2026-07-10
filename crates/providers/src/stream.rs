@@ -44,6 +44,19 @@ impl StreamParser {
 
         events
     }
+
+    /// Flushes the final SSE event at EOF. A provider is allowed to close the
+    /// stream without an extra blank line, but an incomplete UTF-8 or JSON
+    /// payload is still reported as a parse error.
+    pub fn finish(&mut self) -> Vec<Result<StreamEvent, ProviderError>> {
+        if self.buffer.iter().all(u8::is_ascii_whitespace) {
+            self.buffer.clear();
+            return Vec::new();
+        }
+
+        let event_bytes = std::mem::take(&mut self.buffer);
+        vec![parse_event_bytes(&event_bytes)]
+    }
 }
 
 fn find_event_separator(buffer: &[u8]) -> Option<usize> {
@@ -274,6 +287,33 @@ data: {"error":{"type":"rate_limit","message":"too many requests"}}
         let error = events[0]
             .as_ref()
             .expect_err("invalid JSON returns an error");
+        assert_eq!(error.kind, ProviderErrorKind::Parse);
+    }
+
+    #[test]
+    fn flushes_final_event_without_separator() {
+        let mut parser = StreamParser::new();
+        assert!(parser
+            .push(br#"data: {"choices":[{"delta":{"content":"tail"}}]}"#)
+            .is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![Ok(StreamEvent::Delta {
+                content: "tail".to_owned()
+            })]
+        );
+    }
+
+    #[test]
+    fn finish_reports_incomplete_utf8_half_package() {
+        let mut parser = StreamParser::new();
+        parser.push(&[b'd', b'a', b't', b'a', b':', b' ', 0xe4, 0xbd]);
+
+        let events = parser.finish();
+        let error = events[0]
+            .as_ref()
+            .expect_err("incomplete UTF-8 is rejected at EOF");
         assert_eq!(error.kind, ProviderErrorKind::Parse);
     }
 }

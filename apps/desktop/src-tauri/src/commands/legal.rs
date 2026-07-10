@@ -4,29 +4,42 @@ use domain::law::{
     SearchLawsRequest, SearchLawsResponse,
 };
 use domain::qa::{
-    CitationStatus, LegalAnswerCandidatesRequest, LegalAnswerCandidatesResponse,
-    LegalAnswerRequest, LegalAnswerResponse, LegalAnswerStreamEvent, LegalAnswerStreamEventType,
+    CancelLegalAnswerRequest, CancelLegalAnswerResponse, CitationStatus,
+    LegalAnswerCandidatesRequest, LegalAnswerCandidatesResponse, LegalAnswerRequest,
+    LegalAnswerResponse, LegalAnswerStreamEvent, LegalAnswerStreamEventType,
+    LegalAnswerStreamUsage,
 };
 use providers::{
-    ChatMessage, ChatMessageRole, ChatRequest, ChatTransport, CredentialStore,
-    OpenAiCompatibleAdapter, ProviderCredentialKey, ProviderError, ProviderErrorKind,
-    ReqwestTransport, StreamEvent, StreamParser, TransportResponse,
+    ChatMessage, ChatMessageRole, ChatRequest, CredentialStore, ProviderCredentialKey,
+    ProviderError, ProviderErrorKind, ProviderProfile, ReqwestStreamingTransport, StreamEvent,
+    StreamParser,
 };
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{ipc::Channel, State};
 
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpcError {
+    pub error_type: String,
     pub message: String,
+}
+
+impl IpcError {
+    fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error_type: error_type.into(),
+            message: providers::redact_sensitive(&message.into()),
+        }
+    }
 }
 
 impl From<database::DatabaseInitError> for IpcError {
     fn from(error: database::DatabaseInitError) -> Self {
         Self {
+            error_type: "database".to_owned(),
             message: error.to_string(),
         }
     }
@@ -35,6 +48,7 @@ impl From<database::DatabaseInitError> for IpcError {
 impl From<retrieval::RetrievalError> for IpcError {
     fn from(error: retrieval::RetrievalError) -> Self {
         Self {
+            error_type: "retrieval".to_owned(),
             message: error.to_string(),
         }
     }
@@ -43,6 +57,7 @@ impl From<retrieval::RetrievalError> for IpcError {
 impl From<citations::CitationError> for IpcError {
     fn from(error: citations::CitationError) -> Self {
         Self {
+            error_type: "citation".to_owned(),
             message: error.to_string(),
         }
     }
@@ -50,15 +65,14 @@ impl From<citations::CitationError> for IpcError {
 
 impl From<providers::ProviderError> for IpcError {
     fn from(error: providers::ProviderError) -> Self {
-        Self {
-            message: providers::redact_sensitive(&error.to_string()),
-        }
+        Self::new(error.kind.as_str(), error.to_string())
     }
 }
 
 impl From<rusqlite::Error> for IpcError {
     fn from(error: rusqlite::Error) -> Self {
         Self {
+            error_type: "database".to_owned(),
             message: error.to_string(),
         }
     }
@@ -67,6 +81,7 @@ impl From<rusqlite::Error> for IpcError {
 impl From<serde_json::Error> for IpcError {
     fn from(error: serde_json::Error) -> Self {
         Self {
+            error_type: "serialization".to_owned(),
             message: error.to_string(),
         }
     }
@@ -129,36 +144,145 @@ pub fn find_legal_answer_candidates(
 }
 
 #[tauri::command]
-pub fn answer_legal_question(
+pub async fn answer_legal_question(
     state: State<'_, AppState>,
     request: LegalAnswerRequest,
+    on_event: Channel<LegalAnswerStreamEvent>,
 ) -> Result<LegalAnswerResponse, IpcError> {
-    let legal_connection = database::open_legal_core_read_only(state.legal_core_path())?;
-    let user_connection = database::open_user_database(state.user_database_path())?;
-    let transport = ReqwestTransport::new(Duration::from_secs(90))?;
-    let credential_store = providers::windows_credentials::WindowsCredentialStore::new();
+    let request_id = request.request_id.clone();
+    let result = answer_legal_question_inner(state.inner(), request, &on_event).await;
 
-    answer_legal_question_with_transport(
-        &legal_connection,
-        &user_connection,
-        &credential_store,
-        transport,
-        request,
-    )
+    if let Err(error) = &result {
+        let _ = on_event.send(error_stream_event(
+            &request_id,
+            &error.error_type,
+            &error.message,
+        ));
+    }
+
+    result
 }
 
-pub(crate) fn answer_legal_question_with_transport<T, S>(
-    legal_connection: &rusqlite::Connection,
-    user_connection: &rusqlite::Connection,
-    credential_store: &S,
-    transport: T,
+#[tauri::command]
+pub fn cancel_legal_answer(
+    state: State<'_, AppState>,
+    request: CancelLegalAnswerRequest,
+) -> CancelLegalAnswerResponse {
+    let cancelled = state.cancel_legal_answer(&request.request_id);
+
+    CancelLegalAnswerResponse {
+        request_id: request.request_id,
+        cancelled,
+    }
+}
+
+async fn answer_legal_question_inner(
+    state: &AppState,
     request: LegalAnswerRequest,
-) -> Result<LegalAnswerResponse, IpcError>
+    on_event: &Channel<LegalAnswerStreamEvent>,
+) -> Result<LegalAnswerResponse, IpcError> {
+    validate_answer_request(&request)?;
+    let cancellation_guard = state
+        .begin_legal_answer(&request.request_id)
+        .map_err(|message| IpcError::new("duplicate_request", message))?;
+    let cancellation = cancellation_guard.token();
+    let prepared = prepare_legal_answer(
+        state,
+        &providers::windows_credentials::WindowsCredentialStore::new(),
+        &request,
+    )?;
+    let transport = ReqwestStreamingTransport::new(Duration::from_secs(90))?;
+    let mut response = tokio::select! {
+        _ = cancellation.cancelled() => return Err(cancelled_error()),
+        response = transport.send_chat(&prepared.profile, &prepared.secret, &prepared.chat_request) => response?,
+    };
+
+    if !(200..300).contains(&response.status()) {
+        return tokio::select! {
+            _ = cancellation.cancelled() => Err(cancelled_error()),
+            error = response.into_http_error() => Err(error.into()),
+        };
+    }
+
+    let mut parser = StreamParser::new();
+    let mut accumulator = AnswerStreamAccumulator::default();
+    let mut emit = |event| send_stream_event(on_event, event);
+
+    loop {
+        let chunk = tokio::select! {
+            _ = cancellation.cancelled() => return Err(cancelled_error()),
+            chunk = response.next_chunk() => chunk?,
+        };
+
+        match chunk {
+            Some(chunk) => {
+                consume_stream_results(
+                    &request.request_id,
+                    parser.push(&chunk),
+                    &mut accumulator,
+                    &mut emit,
+                )?;
+                if accumulator.provider_done {
+                    break;
+                }
+            }
+            None => {
+                consume_stream_results(
+                    &request.request_id,
+                    parser.finish(),
+                    &mut accumulator,
+                    &mut emit,
+                )?;
+                break;
+            }
+        }
+    }
+
+    ensure_stream_complete(&accumulator)?;
+
+    if cancellation.is_cancelled() {
+        return Err(cancelled_error());
+    }
+
+    // No database connection is held across the network await. Validation and
+    // persistence happen only after the complete provider answer is available.
+    let finalized = finalize_answer(state, &request, prepared.context, accumulator.answer)?;
+    send_stream_event(on_event, done_stream_event(&request.request_id))?;
+
+    Ok(finalized)
+}
+
+fn validate_answer_request(request: &LegalAnswerRequest) -> Result<(), ProviderError> {
+    if request.request_id.trim().is_empty()
+        || request.provider_id.trim().is_empty()
+        || request.question.trim().is_empty()
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "request_id, provider_id and question are required",
+        ));
+    }
+
+    Ok(())
+}
+
+struct PreparedLegalAnswer {
+    context: domain::qa::LegalAnswerContext,
+    profile: ProviderProfile,
+    secret: providers::ApiSecret,
+    chat_request: ChatRequest,
+}
+
+fn prepare_legal_answer<S>(
+    state: &AppState,
+    credential_store: &S,
+    request: &LegalAnswerRequest,
+) -> Result<PreparedLegalAnswer, IpcError>
 where
-    T: ChatTransport,
     S: CredentialStore<Error = ProviderError>,
 {
-    validate_answer_request(&request)?;
+    let legal_connection = database::open_legal_core_read_only(state.legal_core_path())?;
+    let user_connection = database::open_user_database(state.user_database_path())?;
     let context_request = LegalAnswerCandidatesRequest {
         question: request.question.clone(),
         law_name: request.law_name.clone(),
@@ -169,14 +293,15 @@ where
         include_expired: request.include_expired,
         limit: request.limit,
     };
-    let context = citations::build_legal_answer_context(legal_connection, &context_request)?;
+    let context = citations::build_legal_answer_context(&legal_connection, &context_request)?;
     if context.sources.is_empty() {
-        return Err(IpcError {
-            message: "no local legal sources matched the question".to_owned(),
-        });
+        return Err(IpcError::new(
+            "no_local_sources",
+            "no local legal sources matched the question",
+        ));
     }
 
-    let profile = database::get_provider_profile(user_connection, &request.provider_id)?
+    let profile = database::get_provider_profile(&user_connection, &request.provider_id)?
         .ok_or_else(|| ProviderError::new(ProviderErrorKind::InvalidProfile, "profile not found"))
         .and_then(super::provider::profile_from_row)?;
     let key = ProviderCredentialKey::new(&profile.id, &profile.credential_account_id);
@@ -186,7 +311,6 @@ where
             "API key is not configured",
         )
     })?;
-
     let chat_request = ChatRequest {
         messages: vec![
             ChatMessage {
@@ -202,181 +326,159 @@ where
         temperature: request.temperature.or(Some(0.1)),
         max_tokens: request.max_tokens.or(Some(1024)),
     };
-    let response =
-        OpenAiCompatibleAdapter::new(transport).send_chat(&profile, &secret, &chat_request)?;
-    let (answer, stream_events) = parse_answer_response(response)?;
-    let citation_report = citations::validate_answer_citations(
-        legal_connection,
-        &answer,
-        &context.sources,
-        request.case_date.as_deref(),
-        request.include_expired,
-    )?;
-    let record_id = insert_answer_record(
-        user_connection,
-        &request,
-        &answer,
-        &context,
-        &citation_report,
-    )?;
 
-    Ok(LegalAnswerResponse {
-        provider_id: request.provider_id,
-        answer,
+    Ok(PreparedLegalAnswer {
         context,
-        citation_report,
-        stream_events,
-        record_id: Some(record_id),
+        profile,
+        secret,
+        chat_request,
     })
 }
 
-fn validate_answer_request(request: &LegalAnswerRequest) -> Result<(), ProviderError> {
-    if request.provider_id.trim().is_empty() || request.question.trim().is_empty() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "provider_id and question are required",
+#[derive(Debug, Default)]
+struct AnswerStreamAccumulator {
+    answer: String,
+    provider_done: bool,
+}
+
+fn ensure_stream_complete(accumulator: &AnswerStreamAccumulator) -> Result<(), IpcError> {
+    if accumulator.answer.trim().is_empty() {
+        return Err(IpcError::new(
+            "empty_response",
+            "provider stream did not include answer content",
+        ));
+    }
+    if !accumulator.provider_done {
+        return Err(IpcError::new(
+            "interrupted",
+            "provider stream ended before the done event",
         ));
     }
 
     Ok(())
 }
 
-fn parse_answer_response(
-    response: TransportResponse,
-) -> Result<(String, Vec<LegalAnswerStreamEvent>), ProviderError> {
-    if !(200..300).contains(&response.status) {
-        return Err(ProviderError::with_status(
-            ProviderErrorKind::Http,
-            response.status,
-            format!("provider returned HTTP {}", response.status),
-        ));
-    }
-
-    if response.body.contains("data:") || response.body.contains("[DONE]") {
-        parse_streaming_answer(&response.body)
-    } else {
-        parse_json_answer(&response.body)
-    }
-}
-
-fn parse_streaming_answer(
-    body: &str,
-) -> Result<(String, Vec<LegalAnswerStreamEvent>), ProviderError> {
-    let mut parser = StreamParser::new();
-    let mut bytes = body.as_bytes().to_vec();
-    if !body.ends_with("\n\n") && !body.ends_with("\r\n\r\n") {
-        bytes.extend_from_slice(b"\n\n");
-    }
-
-    let mut answer = String::new();
-    let mut stream_events = Vec::new();
-    for event in parser.push(&bytes) {
-        match event? {
+fn consume_stream_results<F>(
+    request_id: &str,
+    results: Vec<Result<StreamEvent, ProviderError>>,
+    accumulator: &mut AnswerStreamAccumulator,
+    emit: &mut F,
+) -> Result<(), IpcError>
+where
+    F: FnMut(LegalAnswerStreamEvent) -> Result<(), IpcError>,
+{
+    for result in results {
+        match result? {
             StreamEvent::Delta { content } => {
-                answer.push_str(&content);
-                stream_events.push(LegalAnswerStreamEvent {
+                if content.is_empty() {
+                    continue;
+                }
+                accumulator.answer.push_str(&content);
+                emit(LegalAnswerStreamEvent {
+                    request_id: request_id.to_owned(),
                     event_type: LegalAnswerStreamEventType::Delta,
                     content: Some(content),
+                    usage: None,
                     error_type: None,
                     message: None,
-                });
+                })?;
             }
-            StreamEvent::Usage(usage) => {
-                stream_events.push(LegalAnswerStreamEvent {
-                    event_type: LegalAnswerStreamEventType::Usage,
-                    content: Some(serde_json::to_string(&usage).map_err(|error| {
-                        ProviderError::new(ProviderErrorKind::Parse, error.to_string())
-                    })?),
-                    error_type: None,
-                    message: None,
-                });
-            }
+            StreamEvent::Usage(usage) => emit(LegalAnswerStreamEvent {
+                request_id: request_id.to_owned(),
+                event_type: LegalAnswerStreamEventType::Usage,
+                content: None,
+                usage: Some(LegalAnswerStreamUsage {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                }),
+                error_type: None,
+                message: None,
+            })?,
             StreamEvent::Error {
                 error_type,
                 message,
             } => {
-                stream_events.push(LegalAnswerStreamEvent {
-                    event_type: LegalAnswerStreamEventType::Error,
-                    content: None,
-                    error_type: Some(error_type.clone()),
-                    message: Some(message.clone()),
-                });
-                return Err(ProviderError::new(
-                    ProviderErrorKind::Http,
-                    format!("{error_type}: {message}"),
-                ));
+                return Err(IpcError::new(error_type, message));
             }
-            StreamEvent::Done => stream_events.push(LegalAnswerStreamEvent {
-                event_type: LegalAnswerStreamEventType::Done,
-                content: None,
-                error_type: None,
-                message: None,
-            }),
+            StreamEvent::Done => {
+                accumulator.provider_done = true;
+                break;
+            }
         }
     }
 
-    if answer.trim().is_empty() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::Parse,
-            "provider stream did not include answer content",
-        ));
-    }
-
-    Ok((answer, stream_events))
+    Ok(())
 }
 
-fn parse_json_answer(body: &str) -> Result<(String, Vec<LegalAnswerStreamEvent>), ProviderError> {
-    let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
-        ProviderError::new(
-            ProviderErrorKind::Parse,
-            format!("provider response was not valid JSON: {error}"),
+fn finalize_answer(
+    state: &AppState,
+    request: &LegalAnswerRequest,
+    context: domain::qa::LegalAnswerContext,
+    answer: String,
+) -> Result<LegalAnswerResponse, IpcError> {
+    let legal_connection = database::open_legal_core_read_only(state.legal_core_path())?;
+    let user_connection = database::open_user_database(state.user_database_path())?;
+    let citation_report = citations::validate_answer_citations(
+        &legal_connection,
+        &answer,
+        &context.sources,
+        request.case_date.as_deref(),
+        request.include_expired,
+    )?;
+    let record_id = insert_answer_record(
+        &user_connection,
+        request,
+        &answer,
+        &context,
+        &citation_report,
+    )?;
+
+    Ok(LegalAnswerResponse {
+        provider_id: request.provider_id.clone(),
+        answer,
+        context,
+        citation_report,
+        record_id: Some(record_id),
+    })
+}
+
+fn send_stream_event(
+    channel: &Channel<LegalAnswerStreamEvent>,
+    event: LegalAnswerStreamEvent,
+) -> Result<(), IpcError> {
+    channel.send(event).map_err(|_| {
+        IpcError::new(
+            "consumer_disconnected",
+            "legal answer stream consumer disconnected",
         )
-    })?;
-    if let Some(error) = value.get("error") {
-        return Err(ProviderError::new(
-            ProviderErrorKind::Http,
-            error
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("provider returned an error"),
-        ));
+    })
+}
+
+fn error_stream_event(request_id: &str, error_type: &str, message: &str) -> LegalAnswerStreamEvent {
+    LegalAnswerStreamEvent {
+        request_id: request_id.to_owned(),
+        event_type: LegalAnswerStreamEventType::Error,
+        content: None,
+        usage: None,
+        error_type: Some(error_type.to_owned()),
+        message: Some(providers::redact_sensitive(message)),
     }
+}
 
-    let answer = value
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            value
-                .get("choices")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("delta"))
-                .and_then(|delta| delta.get("content"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or_default()
-        .to_owned();
-
-    if answer.trim().is_empty() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::Parse,
-            "provider response did not include answer content",
-        ));
+fn done_stream_event(request_id: &str) -> LegalAnswerStreamEvent {
+    LegalAnswerStreamEvent {
+        request_id: request_id.to_owned(),
+        event_type: LegalAnswerStreamEventType::Done,
+        content: None,
+        usage: None,
+        error_type: None,
+        message: Some("citations_validated_and_answer_saved".to_owned()),
     }
+}
 
-    Ok((
-        answer.clone(),
-        vec![LegalAnswerStreamEvent {
-            event_type: LegalAnswerStreamEventType::Delta,
-            content: Some(answer),
-            error_type: None,
-            message: None,
-        }],
-    ))
+fn cancelled_error() -> IpcError {
+    IpcError::new("cancelled", "legal answer request was cancelled")
 }
 
 fn insert_answer_record(
@@ -437,28 +539,30 @@ fn next_answer_record_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use providers::{
-        ApiSecret, ProviderCapabilities, ProviderKind, ProviderOptions, TransportRequest,
-    };
-    use std::sync::{Arc, Mutex};
+    use providers::{ApiSecret, ProviderCapabilities, ProviderKind, ProviderOptions};
+    use tempfile::TempDir;
 
     const RETRIEVAL_FIXTURE_SQL: &str =
         include_str!("../../../../../data/fixtures/legal_core_retrieval_fixture.sql");
 
-    fn legal_connection() -> rusqlite::Connection {
-        let connection = rusqlite::Connection::open_in_memory().expect("memory database opens");
+    struct TestHarness {
+        _directory: TempDir,
+        state: AppState,
+    }
+
+    fn test_harness() -> TestHarness {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let legal_path = directory.path().join("legal_core.sqlite");
+        let connection = rusqlite::Connection::open(&legal_path).expect("legal database opens");
         database::initialize_legal_core_database(&connection).expect("fixture schema loads");
         connection
             .execute_batch(RETRIEVAL_FIXTURE_SQL)
             .expect("retrieval fixture loads");
-        connection
-    }
+        drop(connection);
 
-    fn user_connection() -> rusqlite::Connection {
-        let directory = tempfile::tempdir().expect("tempdir exists");
-        let database_path =
+        let user_path =
             database::ensure_user_database(directory.path()).expect("user database path");
-        let connection = database::open_user_database(database_path).expect("user database opens");
+        let connection = database::open_user_database(&user_path).expect("user database opens");
         database::upsert_provider_profile(
             &connection,
             &database::ProviderProfileRow {
@@ -479,66 +583,241 @@ mod tests {
             },
         )
         .expect("profile inserts");
-        connection
+
+        TestHarness {
+            _directory: directory,
+            state: AppState::new(legal_path, user_path),
+        }
     }
 
     #[test]
-    fn answer_flow_accepts_valid_citation_from_mock_provider() {
-        let legal = legal_connection();
-        let user = user_connection();
-        let store = MockCredentialStore::new(Some(ApiSecret::new("mock-secret-1234")));
-        let transport = MockTransport::new(stream_body(
+    fn mock_stream_accepts_valid_citation_and_persists_only_after_validation() {
+        let harness = test_harness();
+        let (response, events) = run_mock_answer(
+            &harness,
             "应当承担违约责任。[SRC:law:cn-civil-code:cn-civil-code-20210101:art:577]",
-        ));
-
-        let response = answer_legal_question_with_transport(
-            &legal,
-            &user,
-            &store,
-            transport.clone(),
-            answer_request(),
-        )
-        .expect("answer succeeds");
+        );
 
         assert_eq!(response.citation_report.valid_count, 1);
         assert_eq!(response.citation_report.invalid_count, 0);
         assert!(response.record_id.is_some());
+        assert!(events.iter().any(|event| {
+            event.event_type == LegalAnswerStreamEventType::Delta
+                && event
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.is_empty())
+        }));
         assert_eq!(
-            database::list_legal_answer_records(&user, 10)
-                .expect("records list")
-                .len(),
+            database::list_legal_answer_records(
+                &database::open_user_database(harness.state.user_database_path())
+                    .expect("user database opens"),
+                10,
+            )
+            .expect("records list")
+            .len(),
             1
         );
-        let sent = transport.requests.lock().expect("requests lock");
-        assert!(sent[0].body.contains("stream"));
-        assert!(!format!("{:?}", sent[0]).contains("mock-secret-1234"));
     }
 
     #[test]
-    fn answer_flow_reports_invalid_and_unsupported_mock_outputs() {
-        let legal = legal_connection();
-        let user = user_connection();
-        let store = MockCredentialStore::new(Some(ApiSecret::new("mock-secret-1234")));
-        let transport = MockTransport::new(stream_body(
+    fn mock_stream_reports_invalid_citation() {
+        let harness = test_harness();
+        let (response, _) = run_mock_answer(
+            &harness,
             "应当承担责任。[SRC:law:cn-civil-code:cn-civil-code-20210101:art:999]",
-        ));
-
-        let response = answer_legal_question_with_transport(
-            &legal,
-            &user,
-            &store,
-            transport,
-            answer_request(),
-        )
-        .expect("answer succeeds");
+        );
 
         assert_eq!(response.citation_report.valid_count, 0);
         assert_eq!(response.citation_report.invalid_count, 1);
         assert!(response.citation_report.unsupported_legal_conclusion);
     }
 
+    #[test]
+    fn mock_stream_reports_mixed_valid_and_invalid_citations() {
+        let harness = test_harness();
+        let (response, _) = run_mock_answer(
+            &harness,
+            concat!(
+                "应当承担违约责任。[SRC:law:cn-civil-code:cn-civil-code-20210101:art:577] ",
+                "另见伪造来源。[SRC:law:cn-civil-code:cn-civil-code-20210101:art:999]"
+            ),
+        );
+
+        assert_eq!(response.citation_report.valid_count, 1);
+        assert_eq!(response.citation_report.invalid_count, 1);
+        assert!(!response.citation_report.unsupported_legal_conclusion);
+    }
+
+    #[test]
+    fn mock_stream_flags_legal_conclusion_without_citations() {
+        let harness = test_harness();
+        let (response, _) = run_mock_answer(&harness, "当事人应当承担违约责任。");
+
+        assert_eq!(response.citation_report.valid_count, 0);
+        assert_eq!(response.citation_report.invalid_count, 0);
+        assert!(response.citation_report.unsupported_legal_conclusion);
+    }
+
+    #[test]
+    fn empty_mock_stream_is_rejected_before_persistence() {
+        let harness = test_harness();
+        let mut accumulator = AnswerStreamAccumulator::default();
+        let mut events = Vec::new();
+        consume_stream_results(
+            "answer-mock",
+            StreamParser::new().push(b"data: [DONE]\n\n"),
+            &mut accumulator,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .expect("done event parses");
+
+        assert!(accumulator.answer.is_empty());
+        assert!(accumulator.provider_done);
+        assert_eq!(
+            ensure_stream_complete(&accumulator)
+                .expect_err("empty response is rejected")
+                .error_type,
+            "empty_response"
+        );
+        assert!(events.is_empty(), "provider done is not trusted final done");
+        assert!(database::list_legal_answer_records(
+            &database::open_user_database(harness.state.user_database_path())
+                .expect("user database opens"),
+            10,
+        )
+        .expect("records list")
+        .is_empty());
+    }
+
+    #[test]
+    fn disconnected_stream_consumer_stops_before_persistence() {
+        let harness = test_harness();
+        let mut accumulator = AnswerStreamAccumulator::default();
+        let mut parser = StreamParser::new();
+        let error = consume_stream_results(
+            "answer-disconnected",
+            parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
+            &mut accumulator,
+            &mut |_| {
+                Err(IpcError::new(
+                    "consumer_disconnected",
+                    "stream consumer left the page",
+                ))
+            },
+        )
+        .expect_err("channel failure stops stream processing");
+
+        assert_eq!(error.error_type, "consumer_disconnected");
+        assert!(database::list_legal_answer_records(
+            &database::open_user_database(harness.state.user_database_path())
+                .expect("user database opens"),
+            10,
+        )
+        .expect("records list")
+        .is_empty());
+    }
+
+    #[test]
+    fn interrupted_mock_stream_is_not_finalized_or_persisted() {
+        let harness = test_harness();
+        let mut accumulator = AnswerStreamAccumulator::default();
+        let mut parser = StreamParser::new();
+        let mut events = Vec::new();
+        consume_stream_results(
+            "answer-interrupted",
+            parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
+            &mut accumulator,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .expect("partial event parses");
+
+        assert_eq!(accumulator.answer, "partial");
+        assert!(!accumulator.provider_done);
+        assert_eq!(
+            ensure_stream_complete(&accumulator)
+                .expect_err("missing done event is interrupted")
+                .error_type,
+            "interrupted"
+        );
+        assert!(database::list_legal_answer_records(
+            &database::open_user_database(harness.state.user_database_path())
+                .expect("user database opens"),
+            10,
+        )
+        .expect("records list")
+        .is_empty());
+    }
+
+    fn run_mock_answer(
+        harness: &TestHarness,
+        answer: &str,
+    ) -> (LegalAnswerResponse, Vec<LegalAnswerStreamEvent>) {
+        let request = answer_request();
+        let prepared = prepare_legal_answer(
+            &harness.state,
+            &MockCredentialStore::new(Some(ApiSecret::new("mock-secret-1234"))),
+            &request,
+        )
+        .expect("answer prepares");
+        assert!(prepared.chat_request.stream);
+
+        let user = database::open_user_database(harness.state.user_database_path())
+            .expect("user database opens");
+        assert!(database::list_legal_answer_records(&user, 10)
+            .expect("records list")
+            .is_empty());
+        drop(user);
+
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(answer).expect("answer serializes")
+        );
+        let split = body.len() / 2;
+        let mut parser = StreamParser::new();
+        let mut accumulator = AnswerStreamAccumulator::default();
+        let mut events = Vec::new();
+        let mut emit = |event| {
+            events.push(event);
+            Ok(())
+        };
+        consume_stream_results(
+            &request.request_id,
+            parser.push(&body.as_bytes()[..split]),
+            &mut accumulator,
+            &mut emit,
+        )
+        .expect("first network chunk parses");
+        consume_stream_results(
+            &request.request_id,
+            parser.push(&body.as_bytes()[split..]),
+            &mut accumulator,
+            &mut emit,
+        )
+        .expect("second network chunk parses");
+        assert!(accumulator.provider_done);
+
+        let response = finalize_answer(
+            &harness.state,
+            &request,
+            prepared.context,
+            accumulator.answer,
+        )
+        .expect("answer validates and persists");
+        events.push(done_stream_event(&request.request_id));
+
+        (response, events)
+    }
+
     fn answer_request() -> LegalAnswerRequest {
         LegalAnswerRequest {
+            request_id: "answer-mock".to_owned(),
             provider_id: "mock-provider".to_owned(),
             question: "违约责任如何承担？".to_owned(),
             law_name: None,
@@ -550,40 +829,6 @@ mod tests {
             limit: Some(4),
             temperature: Some(0.0),
             max_tokens: Some(256),
-        }
-    }
-
-    fn stream_body(answer: &str) -> TransportResponse {
-        TransportResponse {
-            status: 200,
-            body: format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
-                serde_json::to_string(answer).expect("answer serializes")
-            ),
-            first_byte_latency_ms: 1,
-            total_latency_ms: 2,
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct MockTransport {
-        response: TransportResponse,
-        requests: Arc<Mutex<Vec<TransportRequest>>>,
-    }
-
-    impl MockTransport {
-        fn new(response: TransportResponse) -> Self {
-            Self {
-                response,
-                requests: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    impl ChatTransport for MockTransport {
-        fn send(&self, request: TransportRequest) -> Result<TransportResponse, ProviderError> {
-            self.requests.lock().expect("requests lock").push(request);
-            Ok(self.response.clone())
         }
     }
 
