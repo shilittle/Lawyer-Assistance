@@ -43,24 +43,6 @@ jobs:
       - name: Test legal database builder
         run: python -m unittest data.build.test_build_legal_core
 
-      - name: Check Rust formatting
-        run: cargo fmt --check
-
-      - name: Lint Rust
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test Rust
-        run: cargo test --workspace
-
-      - name: Lint frontend
-        run: pnpm lint
-
-      - name: Test frontend
-        run: pnpm test
-
-      - name: Build frontend
-        run: pnpm build
-
       - name: Prepare CI-only legal database fixture
         shell: pwsh
         run: |
@@ -90,6 +72,24 @@ jobs:
           finally:
               connection.close()
           '@ | python -
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --workspace
+
+      - name: Lint frontend
+        run: pnpm lint
+
+      - name: Test frontend
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm build
 
       - name: Build Tauri with CI fixture (packaging smoke test only)
         run: pnpm tauri build
