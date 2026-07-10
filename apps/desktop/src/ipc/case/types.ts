@@ -8,6 +8,13 @@ export type PartyRole =
   | "other";
 export type ConfirmationStatus = "model_suggested" | "confirmed";
 export type LegalIssueStatus = "open" | "resolved";
+export type UncertaintyStatus = "open" | "resolved";
+export type UncertaintyRelatedEntityType =
+  | "general"
+  | "party"
+  | "fact"
+  | "evidence"
+  | "legal_issue";
 export type CitationStatus = "valid" | "invalid";
 export type CitationInvalidReason =
   | "invalid_syntax"
@@ -88,6 +95,20 @@ export interface LegalIssue {
   confirmationStatus: ConfirmationStatus;
 }
 
+export interface CaseUncertainty {
+  uncertaintyId: string;
+  projectId: string;
+  description: string;
+  relatedEntityType: UncertaintyRelatedEntityType;
+  relatedEntityId?: string | null;
+  sourceFileIds: string[];
+  status: UncertaintyStatus;
+  resolution: string;
+  confirmationStatus: ConfirmationStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface LegalBasis {
   basisId: string;
   projectId: string;
@@ -141,6 +162,7 @@ export interface CaseWorkspace {
   evidenceLinks: EvidenceLink[];
   legalIssues: LegalIssue[];
   legalBasis: LegalBasis[];
+  uncertainties: CaseUncertainty[];
   gaps: CaseGap[];
 }
 
@@ -220,7 +242,8 @@ export type CaseEntityType =
   | "evidence"
   | "evidence_link"
   | "legal_issue"
-  | "legal_basis";
+  | "legal_basis"
+  | "uncertainty";
 
 export interface DeleteCaseEntityRequest {
   entityType: CaseEntityType;
@@ -239,21 +262,90 @@ export interface AnalyzeCaseGapsResponse {
   gaps: CaseGap[];
 }
 
-export interface ParseStructuredCaseExtractionRequest {
-  rawOutput: string;
-  repairedOutput?: string | null;
+export interface StructuredCaseExtractionRequest {
+  projectId: string;
+  providerId: string;
+  fileIds: string[];
 }
 
-export type StructuredCaseExtractionStatus = "parsed" | "failed";
+export interface ExtractedParty {
+  name: string;
+  role: PartyRole;
+}
+
+export interface ExtractedFact {
+  occurredOn?: string | null;
+  title: string;
+  description: string;
+  evidenceNumbers: string[];
+}
+
+export interface ExtractedEvidence {
+  evidenceNumber: string;
+  title: string;
+  source: string;
+  formedOn?: string | null;
+  summary: string;
+}
+
+export interface ExtractedLegalIssue {
+  title: string;
+  description: string;
+  claim: string;
+}
+
+export type ExtractedRelatedEntityType = UncertaintyRelatedEntityType;
+
+export interface ExtractedUncertainty {
+  description: string;
+  relatedEntityType: ExtractedRelatedEntityType;
+  relatedReference?: string | null;
+}
+
+export interface StructuredCaseExtraction {
+  parties: ExtractedParty[];
+  facts: ExtractedFact[];
+  evidence: ExtractedEvidence[];
+  legalIssues: ExtractedLegalIssue[];
+  uncertainties: ExtractedUncertainty[];
+}
+
+export type StructuredCaseExtractionStatus = "review_required" | "failed";
 
 export interface StructuredCaseExtractionResponse {
   status: StructuredCaseExtractionStatus;
-  extraction?: unknown | null;
+  extraction?: StructuredCaseExtraction | null;
   error?: { errorType: string; message: string } | null;
-  rawOutput: string;
+  rawOutput?: string | null;
+  repairOutput?: string | null;
+  repairAttempted: boolean;
   repaired: boolean;
+  reviewId?: string | null;
 }
 
-export interface ParseStructuredCaseExtractionResponse {
+export interface GenerateStructuredCaseExtractionResponse {
   result: StructuredCaseExtractionResponse;
+}
+
+export interface ConfirmStructuredCaseExtractionRequest {
+  reviewId: string;
+  projectId: string;
+  providerId: string;
+  fileIds: string[];
+  extraction: StructuredCaseExtraction;
+  confirmed: boolean;
+}
+
+export interface ConfirmedExtractionCounts {
+  parties: number;
+  facts: number;
+  evidence: number;
+  evidenceLinks: number;
+  legalIssues: number;
+  uncertainties: number;
+}
+
+export interface ConfirmStructuredCaseExtractionResponse {
+  applied: boolean;
+  counts: ConfirmedExtractionCounts;
 }

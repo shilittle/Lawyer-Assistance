@@ -121,6 +121,39 @@ pub struct LegalIssue {
     pub confirmation_status: ConfirmationStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncertaintyStatus {
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncertaintyRelatedEntityType {
+    General,
+    Party,
+    Fact,
+    Evidence,
+    LegalIssue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseUncertainty {
+    pub uncertainty_id: String,
+    pub project_id: String,
+    pub description: String,
+    pub related_entity_type: UncertaintyRelatedEntityType,
+    pub related_entity_id: Option<String>,
+    pub source_file_ids: Vec<String>,
+    pub status: UncertaintyStatus,
+    pub resolution: String,
+    pub confirmation_status: ConfirmationStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegalBasis {
@@ -158,6 +191,7 @@ pub struct CaseWorkspace {
     pub evidence_links: Vec<EvidenceLink>,
     pub legal_issues: Vec<LegalIssue>,
     pub legal_basis: Vec<LegalBasis>,
+    pub uncertainties: Vec<CaseUncertainty>,
     pub gaps: Vec<CaseGap>,
 }
 
@@ -409,7 +443,8 @@ fn normalize_text(value: &str) -> String {
 #[serde(rename_all = "camelCase")]
 pub struct StructuredCaseExtractionRequest {
     pub project_id: String,
-    pub raw_text: String,
+    pub provider_id: String,
+    pub file_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,14 +453,17 @@ pub struct StructuredCaseExtractionResponse {
     pub status: StructuredCaseExtractionStatus,
     pub extraction: Option<StructuredCaseExtraction>,
     pub error: Option<StructuredCaseExtractionError>,
-    pub raw_output: String,
+    pub raw_output: Option<String>,
+    pub repair_output: Option<String>,
+    pub repair_attempted: bool,
     pub repaired: bool,
+    pub review_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredCaseExtractionStatus {
-    Parsed,
+    ReviewRequired,
     Failed,
 }
 
@@ -443,6 +481,7 @@ pub struct StructuredCaseExtraction {
     pub facts: Vec<ExtractedFact>,
     pub evidence: Vec<ExtractedEvidence>,
     pub legal_issues: Vec<ExtractedLegalIssue>,
+    pub uncertainties: Vec<ExtractedUncertainty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,6 +518,14 @@ pub struct ExtractedLegalIssue {
     pub claim: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtractedUncertainty {
+    pub description: String,
+    pub related_entity_type: UncertaintyRelatedEntityType,
+    pub related_reference: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredExtractionParseError {
     pub message: String,
@@ -497,11 +544,69 @@ impl Display for StructuredExtractionParseError {
 pub fn parse_structured_case_extraction(
     raw_output: &str,
 ) -> Result<StructuredCaseExtraction, StructuredExtractionParseError> {
-    serde_json::from_str::<StructuredCaseExtraction>(raw_output).map_err(|error| {
-        StructuredExtractionParseError {
-            message: error.to_string(),
+    let extraction =
+        serde_json::from_str::<StructuredCaseExtraction>(raw_output).map_err(|error| {
+            StructuredExtractionParseError {
+                message: error.to_string(),
+            }
+        })?;
+    validate_extraction_dates(&extraction)?;
+
+    Ok(extraction)
+}
+
+fn validate_extraction_dates(
+    extraction: &StructuredCaseExtraction,
+) -> Result<(), StructuredExtractionParseError> {
+    for (label, date) in
+        extraction
+            .facts
+            .iter()
+            .filter_map(|fact| fact.occurred_on.as_deref().map(|date| ("occurredOn", date)))
+            .chain(extraction.evidence.iter().filter_map(|evidence| {
+                evidence.formed_on.as_deref().map(|date| ("formedOn", date))
+            }))
+    {
+        if !is_iso_calendar_date(date) {
+            return Err(StructuredExtractionParseError {
+                message: format!("{label} must be a valid YYYY-MM-DD calendar date or null"),
+            });
         }
-    })
+    }
+
+    Ok(())
+}
+
+fn is_iso_calendar_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(year) = value[0..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = value[5..7].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = value[8..10].parse::<u32>() else {
+        return false;
+    };
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+
+    year > 0 && (1..=days_in_month).contains(&day)
 }
 
 pub fn parse_structured_case_extraction_with_repair(
@@ -510,29 +615,48 @@ pub fn parse_structured_case_extraction_with_repair(
 ) -> StructuredCaseExtractionResponse {
     match parse_structured_case_extraction(raw_output) {
         Ok(extraction) => StructuredCaseExtractionResponse {
-            status: StructuredCaseExtractionStatus::Parsed,
+            status: StructuredCaseExtractionStatus::ReviewRequired,
             extraction: Some(extraction),
             error: None,
-            raw_output: raw_output.to_owned(),
+            raw_output: None,
+            repair_output: None,
+            repair_attempted: false,
             repaired: false,
+            review_id: None,
         },
         Err(first_error) => match repaired_output {
             Some(repaired_output) => match parse_structured_case_extraction(repaired_output) {
                 Ok(extraction) => StructuredCaseExtractionResponse {
-                    status: StructuredCaseExtractionStatus::Parsed,
+                    status: StructuredCaseExtractionStatus::ReviewRequired,
                     extraction: Some(extraction),
                     error: None,
-                    raw_output: repaired_output.to_owned(),
+                    raw_output: None,
+                    repair_output: None,
+                    repair_attempted: true,
                     repaired: true,
+                    review_id: None,
                 },
-                Err(repair_error) => failed_extraction(raw_output, repair_error.message),
+                Err(repair_error) => failed_extraction(
+                    raw_output,
+                    Some(repaired_output),
+                    true,
+                    format!(
+                        "automatic repair failed strict validation: {}",
+                        repair_error.message
+                    ),
+                ),
             },
-            None => failed_extraction(raw_output, first_error.message),
+            None => failed_extraction(raw_output, None, false, first_error.message),
         },
     }
 }
 
-fn failed_extraction(raw_output: &str, message: String) -> StructuredCaseExtractionResponse {
+fn failed_extraction(
+    raw_output: &str,
+    repair_output: Option<&str>,
+    repair_attempted: bool,
+    message: String,
+) -> StructuredCaseExtractionResponse {
     StructuredCaseExtractionResponse {
         status: StructuredCaseExtractionStatus::Failed,
         extraction: None,
@@ -540,8 +664,11 @@ fn failed_extraction(raw_output: &str, message: String) -> StructuredCaseExtract
             error_type: "parse_error".to_owned(),
             message,
         }),
-        raw_output: raw_output.to_owned(),
+        raw_output: Some(raw_output.to_owned()),
+        repair_output: repair_output.map(ToOwned::to_owned),
+        repair_attempted,
         repaired: false,
+        review_id: None,
     }
 }
 
@@ -554,7 +681,8 @@ mod tests {
             "parties":[{"name":"Acme Ltd.","role":"plaintiff"}],
             "facts":[{"occurredOn":"2024-01-02","title":"Contract signed","description":"The contract was signed.","evidenceNumbers":["E-1"]}],
             "evidence":[{"evidenceNumber":"E-1","title":"Contract","source":"Client upload","formedOn":"2024-01-02","summary":"Signed contract"}],
-            "legalIssues":[{"title":"Breach","description":"Late payment.","claim":"Request payment."}]
+            "legalIssues":[{"title":"Breach","description":"Late payment.","claim":"Request payment."}],
+            "uncertainties":[{"description":"Payment date is unclear.","relatedEntityType":"fact","relatedReference":"Contract signed"}]
         }"#
     }
 
@@ -736,11 +864,19 @@ mod tests {
     fn rejects_missing_fields_type_errors_and_extra_fields() {
         assert!(parse_structured_case_extraction(r#"{"parties":[]}"#).is_err());
         assert!(parse_structured_case_extraction(
-            r#"{"parties":"bad","facts":[],"evidence":[],"legalIssues":[]}"#
+            r#"{"parties":"bad","facts":[],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
         )
         .is_err());
         assert!(parse_structured_case_extraction(
-            r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"extra":true}"#
+            r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[],"extra":true}"#
+        )
+        .is_err());
+        assert!(parse_structured_case_extraction(
+            r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[{"description":"bad type","relatedEntityType":"nonsense","relatedReference":null}]}"#
+        )
+        .is_err());
+        assert!(parse_structured_case_extraction(
+            r#"{"parties":[],"facts":[{"occurredOn":"tomorrow","title":"bad date","description":"","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
         )
         .is_err());
     }
@@ -751,8 +887,13 @@ mod tests {
             r#"{"parties":[]}"#,
             Some(valid_extraction_json()),
         );
-        assert_eq!(repaired.status, StructuredCaseExtractionStatus::Parsed);
+        assert_eq!(
+            repaired.status,
+            StructuredCaseExtractionStatus::ReviewRequired
+        );
         assert!(repaired.repaired);
+        assert!(repaired.repair_attempted);
+        assert!(repaired.raw_output.is_none());
 
         let failed = parse_structured_case_extraction_with_repair(
             r#"{"parties":[]}"#,
@@ -760,6 +901,8 @@ mod tests {
         );
         assert_eq!(failed.status, StructuredCaseExtractionStatus::Failed);
         assert!(failed.error.is_some());
-        assert_eq!(failed.raw_output, r#"{"parties":[]}"#);
+        assert!(failed.repair_attempted);
+        assert_eq!(failed.raw_output.as_deref(), Some(r#"{"parties":[]}"#));
+        assert_eq!(failed.repair_output.as_deref(), Some(r#"{"still":"bad"}"#));
     }
 }

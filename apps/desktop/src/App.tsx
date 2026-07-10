@@ -1,12 +1,13 @@
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useReducer, useState } from "react";
 
 import {
   addCaseLegalBasis,
+  confirmStructuredCaseExtraction,
   deleteCaseEntity,
   deleteCaseProject,
   getCaseWorkspace,
   listCaseProjects,
-  parseStructuredCaseExtraction,
+  generateStructuredCaseExtraction,
   upsertCaseFile,
   upsertCaseFact,
   upsertCaseParty,
@@ -24,6 +25,12 @@ import {
   formatLegalIssueStatus,
   formatPartyRole,
 } from "./ipc/case/format";
+import {
+  buildConfirmationRequest,
+  createExtractionContext,
+  extractionLocksSources,
+  extractionReducer,
+} from "./ipc/case/extractionReview";
 import type {
   CaseFact,
   CaseFile,
@@ -35,8 +42,8 @@ import type {
   LegalBasis,
   LegalIssue,
   LegalIssueStatus,
-  ParseStructuredCaseExtractionResponse,
   PartyRole,
+  StructuredCaseExtraction,
 } from "./ipc/case/types";
 import { formatHealthCheck } from "./ipc/health/format";
 import { healthCheck } from "./ipc/health/client";
@@ -398,10 +405,12 @@ export function App() {
   const [basisNote, setBasisNote] = useState("");
   const [linkFactId, setLinkFactId] = useState("");
   const [linkEvidenceId, setLinkEvidenceId] = useState("");
-  const [extractionRawOutput, setExtractionRawOutput] = useState("");
-  const [extractionRepairOutput, setExtractionRepairOutput] = useState("");
-  const [extractionResult, setExtractionResult] =
-    useState<ParseStructuredCaseExtractionResponse | null>(null);
+  const [extractionProviderId, setExtractionProviderId] = useState("");
+  const [extractionFileIds, setExtractionFileIds] = useState<string[]>([]);
+  const [extractionState, dispatchExtraction] = useReducer(extractionReducer, {
+    kind: "idle",
+  });
+  const extractionSourcesLocked = extractionLocksSources(extractionState);
 
   useEffect(() => {
     let isMounted = true;
@@ -489,6 +498,7 @@ export function App() {
         if (response.profiles.length > 0) {
           setSelectedProviderId(response.profiles[0].id);
           setQaProviderId(response.profiles[0].id);
+          setExtractionProviderId(response.profiles[0].id);
           setProviderDraft(response.profiles[0]);
         }
 
@@ -543,6 +553,12 @@ export function App() {
         setBasisNote("");
         setLinkFactId(workspace.facts[0]?.factId ?? "");
         setLinkEvidenceId(workspace.evidence[0]?.evidenceId ?? "");
+        const availableFileIds = new Set(
+          workspace.files.map((file) => file.fileId),
+        );
+        setExtractionFileIds((current) =>
+          current.filter((fileId) => availableFileIds.has(fileId)),
+        );
       }
 
       setCaseState({ kind: "idle" });
@@ -785,10 +801,14 @@ export function App() {
     setBasisNote("");
     setLinkFactId("");
     setLinkEvidenceId("");
+    setExtractionFileIds([]);
+    dispatchExtraction({ type: "reset" });
     setCaseState({ kind: "idle" });
   }
 
   function selectCaseProject(project: CaseProject) {
+    setExtractionFileIds([]);
+    dispatchExtraction({ type: "reset" });
     void loadCaseWorkspace(project.projectId);
   }
 
@@ -1006,7 +1026,8 @@ export function App() {
       | "evidence"
       | "evidence_link"
       | "legal_issue"
-      | "legal_basis",
+      | "legal_basis"
+      | "uncertainty",
     id: string,
   ) {
     try {
@@ -1017,12 +1038,93 @@ export function App() {
     }
   }
 
-  async function parseExtractionOutput() {
-    const response = await parseStructuredCaseExtraction({
-      rawOutput: extractionRawOutput,
-      repairedOutput: extractionRepairOutput || null,
-    });
-    setExtractionResult(response);
+  async function runStructuredExtraction() {
+    if (
+      !caseWorkspace ||
+      !extractionProviderId ||
+      extractionFileIds.length === 0
+    ) {
+      return;
+    }
+
+    const context = createExtractionContext(
+      createId("extraction-request"),
+      caseWorkspace.project.projectId,
+      extractionProviderId,
+      extractionFileIds,
+    );
+    dispatchExtraction({ type: "start", context });
+    try {
+      const response = await generateStructuredCaseExtraction({
+        projectId: context.projectId,
+        providerId: context.providerId,
+        fileIds: context.sourceFileIds,
+      });
+      if (
+        response.result.status === "review_required" &&
+        response.result.extraction &&
+        response.result.reviewId
+      ) {
+        dispatchExtraction({
+          type: "generated",
+          requestId: context.requestId,
+          reviewId: response.result.reviewId,
+          draft: response.result.extraction,
+          repaired: response.result.repaired,
+        });
+      } else {
+        dispatchExtraction({
+          type: "failed",
+          requestId: context.requestId,
+          message: response.result.error?.message ?? "结构化抽取失败",
+          repairAttempted: response.result.repairAttempted,
+          rawOutput: response.result.rawOutput,
+          repairOutput: response.result.repairOutput,
+        });
+      }
+    } catch (error: unknown) {
+      dispatchExtraction({
+        type: "failed",
+        requestId: context.requestId,
+        message: errorMessage(error),
+        repairAttempted: false,
+      });
+    }
+  }
+
+  function updateExtractionDraft(
+    update: (draft: StructuredCaseExtraction) => StructuredCaseExtraction,
+  ) {
+    if (extractionState.kind === "reviewing") {
+      dispatchExtraction({
+        type: "edit",
+        draft: update(extractionState.draft),
+      });
+    }
+  }
+
+  function cancelExtractionReview() {
+    dispatchExtraction({ type: "cancel" });
+  }
+
+  async function confirmExtractionReview() {
+    const confirmation = buildConfirmationRequest(extractionState);
+    if (!confirmation) {
+      return;
+    }
+    dispatchExtraction({ type: "begin_commit" });
+    try {
+      const response = await confirmStructuredCaseExtraction(confirmation);
+      await loadCaseWorkspace(confirmation.projectId);
+      dispatchExtraction({
+        type: "committed",
+        message: `已原子写入 ${response.counts.facts} 项事实、${response.counts.evidence} 项证据和 ${response.counts.uncertainties} 项待核实事项。`,
+      });
+    } catch (error: unknown) {
+      const message = errorMessage(error);
+      dispatchExtraction({ type: "commit_failed", message });
+      setCaseState({ kind: "error", message });
+    }
   }
 
   function startNewProvider(kind: ProviderKind) {
@@ -1075,6 +1177,7 @@ export function App() {
       });
       setProviderDraft(response.profile);
       setSelectedProviderId(response.profile.id);
+      setExtractionProviderId((current) => current || response.profile.id);
       await refreshKeyStatus(response.profile);
       setProviderState({ kind: "idle" });
     } catch (error: unknown) {
@@ -1130,6 +1233,17 @@ export function App() {
 
   async function removeProvider() {
     const profileId = providerDraft.id;
+    if (
+      extractionSourcesLocked &&
+      "context" in extractionState &&
+      extractionState.context.providerId === profileId
+    ) {
+      setProviderState({
+        kind: "error",
+        message: "请先取消当前案件抽取审阅，再删除本轮使用的 Provider。",
+      });
+      return;
+    }
     setProviderState({ kind: "loading" });
 
     try {
@@ -1152,7 +1266,11 @@ export function App() {
       if (remaining[0]) {
         setSelectedProviderId(remaining[0].id);
         setProviderDraft(remaining[0]);
+        setExtractionProviderId((current) =>
+          current === profileId ? remaining[0].id : current,
+        );
       } else {
+        setExtractionProviderId("");
         startNewProvider("deep_seek");
       }
 
@@ -1865,30 +1983,48 @@ export function App() {
                         }
                       />
                     </label>
-                    <label>
-                      <span>摘要</span>
-                      <input
-                        value={fileDraft.summary}
-                        onChange={(event) =>
-                          setFileDraft((current) => ({
-                            ...current,
-                            summary: event.target.value,
-                          }))
-                        }
-                      />
-                    </label>
                   </div>
+                  <label>
+                    <span>材料文本或摘要（仅由用户维护）</span>
+                    <textarea
+                      value={fileDraft.summary}
+                      onChange={(event) =>
+                        setFileDraft((current) => ({
+                          ...current,
+                          summary: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
                   <button type="submit">添加材料</button>
                 </form>
                 <div className="compact-list">
                   {caseWorkspace?.files.map((file) => (
                     <div className="compact-row" key={file.fileId}>
-                      <strong>{file.title}</strong>
+                      <label className="material-select">
+                        <input
+                          checked={extractionFileIds.includes(file.fileId)}
+                          disabled={extractionSourcesLocked}
+                          type="checkbox"
+                          onChange={(event) =>
+                            setExtractionFileIds((current) =>
+                              event.target.checked
+                                ? [...current, file.fileId]
+                                : current.filter(
+                                    (fileId) => fileId !== file.fileId,
+                                  ),
+                            )
+                          }
+                        />
+                        <strong>{file.title}</strong>
+                      </label>
                       <span>
                         {file.fileType || "未分类"} ·{" "}
                         {file.storageReference || "未登记位置"}
                       </span>
+                      <span>{file.summary || "未填写材料文本或摘要"}</span>
                       <button
+                        disabled={extractionSourcesLocked}
                         type="button"
                         onClick={() => void removeCaseEntity("file", file.fileId)}
                       >
@@ -2430,44 +2566,532 @@ export function App() {
             </div>
 
             <section className="provider-subsection">
-              <h3>结构化抽取解析</h3>
+              <h3>待核实事项</h3>
+              <div className="compact-list extraction-uncertainty-list">
+                {caseWorkspace?.uncertainties.map((uncertainty) => (
+                  <div className="compact-row" key={uncertainty.uncertaintyId}>
+                    <strong>{uncertainty.description}</strong>
+                    <span>
+                      {uncertainty.status === "open" ? "待核实" : "已解决"} ·{" "}
+                      {formatConfirmationStatus(uncertainty.confirmationStatus)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void removeCaseEntity(
+                          "uncertainty",
+                          uncertainty.uncertaintyId,
+                        )
+                      }
+                    >
+                      删除
+                    </button>
+                  </div>
+                ))}
+                {caseWorkspace && caseWorkspace.uncertainties.length === 0 ? (
+                  <p className="empty-state">暂无独立待核实事项</p>
+                ) : null}
+              </div>
+            </section>
+
+            <section className="provider-subsection extraction-panel">
+              <h3>模型结构化抽取</h3>
+              <p className="privacy-note">
+                仅发送已勾选材料的“材料文本或摘要”。模型建议先在本机审阅，确认事务不会修改案件材料记录。
+              </p>
               <label>
-                <span>模型原始输出</span>
-                <textarea
-                  value={extractionRawOutput}
-                  onChange={(event) => setExtractionRawOutput(event.target.value)}
-                />
-              </label>
-              <label>
-                <span>一次修复输出</span>
-                <textarea
-                  value={extractionRepairOutput}
+                <span>Provider</span>
+                <select
+                  disabled={extractionSourcesLocked}
+                  value={extractionProviderId}
                   onChange={(event) =>
-                    setExtractionRepairOutput(event.target.value)
+                    setExtractionProviderId(event.target.value)
                   }
-                />
+                >
+                  <option value="">选择已保存 Provider</option>
+                  {providerProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.displayName} · {profile.modelId}
+                    </option>
+                  ))}
+                </select>
               </label>
-              <button type="button" onClick={() => void parseExtractionOutput()}>
-                解析
+              <button
+                disabled={
+                  !caseWorkspace ||
+                  !extractionProviderId ||
+                  extractionFileIds.length === 0 ||
+                  extractionState.kind === "generating" ||
+                  extractionState.kind === "committing"
+                }
+                type="button"
+                onClick={() => void runStructuredExtraction()}
+              >
+                {extractionState.kind === "generating"
+                  ? "正在请求并严格校验…"
+                  : `生成模型建议（已选 ${extractionFileIds.length} 份材料）`}
               </button>
-              {extractionResult ? (
+
+              {extractionState.kind === "reviewing" ||
+              extractionState.kind === "committing" ? (
+                <div className="extraction-review">
+                  <div className="review-banner">
+                    <strong>模型建议，尚未写入</strong>
+                    <span>
+                      {extractionState.repaired
+                        ? "首次输出失败，Rust 已自动修复 1 次并重新严格校验。"
+                        : "首次输出已通过 Rust 严格校验。"}
+                    </span>
+                  </div>
+
+                  <fieldset
+                    className="review-fields"
+                    disabled={extractionState.kind === "committing"}
+                  >
+                  <h4>当事人</h4>
+                  {extractionState.draft.parties.map((party, index) => (
+                    <div className="review-card" key={`party-${index}`}>
+                      <button
+                        className="review-remove"
+                        type="button"
+                        onClick={() =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            parties: draft.parties.filter(
+                              (_, itemIndex) => itemIndex !== index,
+                            ),
+                          }))
+                        }
+                      >
+                        移除此建议
+                      </button>
+                      <input
+                        aria-label={`建议当事人 ${index + 1}`}
+                        value={party.name}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            parties: draft.parties.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? { ...item, name: event.target.value }
+                                : item,
+                            ),
+                          }))
+                        }
+                      />
+                      <select
+                        value={party.role}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            parties: draft.parties.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? {
+                                    ...item,
+                                    role: event.target.value as PartyRole,
+                                  }
+                                : item,
+                            ),
+                          }))
+                        }
+                      >
+                        <option value="plaintiff">原告</option>
+                        <option value="defendant">被告</option>
+                        <option value="claimant">申请人</option>
+                        <option value="respondent">被申请人</option>
+                        <option value="third_party">第三人</option>
+                        <option value="other">其他</option>
+                      </select>
+                    </div>
+                  ))}
+
+                  <h4>事实</h4>
+                  {extractionState.draft.facts.map((fact, index) => (
+                    <div className="review-card" key={`fact-${index}`}>
+                      <button
+                        className="review-remove"
+                        type="button"
+                        onClick={() =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            facts: draft.facts.filter(
+                              (_, itemIndex) => itemIndex !== index,
+                            ),
+                          }))
+                        }
+                      >
+                        移除此建议
+                      </button>
+                      <input
+                        type="date"
+                        value={fact.occurredOn ?? ""}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            facts: draft.facts.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? {
+                                    ...item,
+                                    occurredOn: event.target.value || null,
+                                  }
+                                : item,
+                            ),
+                          }))
+                        }
+                      />
+                      <input
+                        value={fact.title}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            facts: draft.facts.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? { ...item, title: event.target.value }
+                                : item,
+                            ),
+                          }))
+                        }
+                      />
+                      <textarea
+                        value={fact.description}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            facts: draft.facts.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? { ...item, description: event.target.value }
+                                : item,
+                            ),
+                          }))
+                        }
+                      />
+                      <input
+                        aria-label="关联证据编号，逗号分隔"
+                        value={fact.evidenceNumbers.join(", ")}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            facts: draft.facts.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? {
+                                    ...item,
+                                    evidenceNumbers: event.target.value
+                                      .split(/[,，]/u)
+                                      .map((value) => value.trim())
+                                      .filter(Boolean),
+                                  }
+                                : item,
+                            ),
+                          }))
+                        }
+                      />
+                    </div>
+                  ))}
+
+                  <h4>证据</h4>
+                  {extractionState.draft.evidence.map((item, index) => (
+                    <div className="review-card" key={`evidence-${index}`}>
+                      <button
+                        className="review-remove"
+                        type="button"
+                        onClick={() =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            evidence: draft.evidence.filter(
+                              (_, itemIndex) => itemIndex !== index,
+                            ),
+                          }))
+                        }
+                      >
+                        移除此建议
+                      </button>
+                      <input
+                        value={item.evidenceNumber}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            evidence: draft.evidence.map((evidence, itemIndex) =>
+                              itemIndex === index
+                                ? {
+                                    ...evidence,
+                                    evidenceNumber: event.target.value,
+                                  }
+                                : evidence,
+                            ),
+                          }))
+                        }
+                      />
+                      <input
+                        value={item.title}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            evidence: draft.evidence.map((evidence, itemIndex) =>
+                              itemIndex === index
+                                ? { ...evidence, title: event.target.value }
+                                : evidence,
+                            ),
+                          }))
+                        }
+                      />
+                      <input
+                        value={item.source}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            evidence: draft.evidence.map((evidence, itemIndex) =>
+                              itemIndex === index
+                                ? { ...evidence, source: event.target.value }
+                                : evidence,
+                            ),
+                          }))
+                        }
+                      />
+                      <input
+                        type="date"
+                        value={item.formedOn ?? ""}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            evidence: draft.evidence.map((evidence, itemIndex) =>
+                              itemIndex === index
+                                ? {
+                                    ...evidence,
+                                    formedOn: event.target.value || null,
+                                  }
+                                : evidence,
+                            ),
+                          }))
+                        }
+                      />
+                      <textarea
+                        value={item.summary}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            evidence: draft.evidence.map((evidence, itemIndex) =>
+                              itemIndex === index
+                                ? { ...evidence, summary: event.target.value }
+                                : evidence,
+                            ),
+                          }))
+                        }
+                      />
+                    </div>
+                  ))}
+
+                  <h4>争点与主张</h4>
+                  {extractionState.draft.legalIssues.map((issue, index) => (
+                    <div className="review-card" key={`issue-${index}`}>
+                      <button
+                        className="review-remove"
+                        type="button"
+                        onClick={() =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            legalIssues: draft.legalIssues.filter(
+                              (_, itemIndex) => itemIndex !== index,
+                            ),
+                          }))
+                        }
+                      >
+                        移除此建议
+                      </button>
+                      <input
+                        value={issue.title}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            legalIssues: draft.legalIssues.map(
+                              (item, itemIndex) =>
+                                itemIndex === index
+                                  ? { ...item, title: event.target.value }
+                                  : item,
+                            ),
+                          }))
+                        }
+                      />
+                      <textarea
+                        value={issue.description}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            legalIssues: draft.legalIssues.map(
+                              (item, itemIndex) =>
+                                itemIndex === index
+                                  ? {
+                                      ...item,
+                                      description: event.target.value,
+                                    }
+                                  : item,
+                            ),
+                          }))
+                        }
+                      />
+                      <textarea
+                        value={issue.claim}
+                        onChange={(event) =>
+                          updateExtractionDraft((draft) => ({
+                            ...draft,
+                            legalIssues: draft.legalIssues.map(
+                              (item, itemIndex) =>
+                                itemIndex === index
+                                  ? { ...item, claim: event.target.value }
+                                  : item,
+                            ),
+                          }))
+                        }
+                      />
+                    </div>
+                  ))}
+
+                  <h4>待核实事项</h4>
+                  {extractionState.draft.uncertainties.map(
+                    (uncertainty, index) => (
+                      <div
+                        className="review-card"
+                        key={`uncertainty-${index}`}
+                      >
+                        <button
+                          className="review-remove"
+                          type="button"
+                          onClick={() =>
+                            updateExtractionDraft((draft) => ({
+                              ...draft,
+                              uncertainties: draft.uncertainties.filter(
+                                (_, itemIndex) => itemIndex !== index,
+                              ),
+                            }))
+                          }
+                        >
+                          移除此建议
+                        </button>
+                        <textarea
+                          value={uncertainty.description}
+                          onChange={(event) =>
+                            updateExtractionDraft((draft) => ({
+                              ...draft,
+                              uncertainties: draft.uncertainties.map(
+                                (item, itemIndex) =>
+                                  itemIndex === index
+                                    ? {
+                                        ...item,
+                                        description: event.target.value,
+                                      }
+                                    : item,
+                              ),
+                            }))
+                          }
+                        />
+                        <select
+                          value={uncertainty.relatedEntityType}
+                          onChange={(event) =>
+                            updateExtractionDraft((draft) => ({
+                              ...draft,
+                              uncertainties: draft.uncertainties.map(
+                                (item, itemIndex) =>
+                                  itemIndex === index
+                                    ? {
+                                        ...item,
+                                        relatedEntityType: event.target.value as typeof item.relatedEntityType,
+                                      }
+                                    : item,
+                              ),
+                            }))
+                          }
+                        >
+                          <option value="general">一般</option>
+                          <option value="party">当事人</option>
+                          <option value="fact">事实</option>
+                          <option value="evidence">证据</option>
+                          <option value="legal_issue">争点</option>
+                        </select>
+                        <input
+                          placeholder="关联名称/标题/证据编号（可空）"
+                          value={uncertainty.relatedReference ?? ""}
+                          onChange={(event) =>
+                            updateExtractionDraft((draft) => ({
+                              ...draft,
+                              uncertainties: draft.uncertainties.map(
+                                (item, itemIndex) =>
+                                  itemIndex === index
+                                    ? {
+                                        ...item,
+                                        relatedReference:
+                                          event.target.value || null,
+                                      }
+                                    : item,
+                              ),
+                            }))
+                          }
+                        />
+                      </div>
+                    ),
+                  )}
+                  </fieldset>
+
+                  {extractionState.kind === "reviewing" &&
+                  extractionState.commitError ? (
+                    <p className="error-text">{extractionState.commitError}</p>
+                  ) : null}
+
+                  <div className="review-actions">
+                    <button
+                      className="secondary-action"
+                      disabled={extractionState.kind === "committing"}
+                      type="button"
+                      onClick={cancelExtractionReview}
+                    >
+                      取消，不写入
+                    </button>
+                    <button
+                      className="confirm-action"
+                      disabled={extractionState.kind === "committing"}
+                      type="button"
+                      onClick={() => void confirmExtractionReview()}
+                    >
+                      {extractionState.kind === "committing"
+                        ? "事务写入中…"
+                        : "确认审阅结果并原子写入"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {extractionState.kind === "failed" ? (
+                <div className="extraction-failure">
+                  <strong>抽取失败：{extractionState.message}</strong>
+                  <span>
+                    {extractionState.repairAttempted
+                      ? "Rust 已自动修复且仅修复 1 次，第二次严格校验仍失败。"
+                      : "未进入结构修复流程（例如 provider、网络或响应信封错误）。"}
+                  </span>
+                  {extractionState.rawOutput ? (
+                    <details>
+                      <summary>
+                        查看首次模型输出（API 凭据已脱敏，案件内容仍可能敏感）
+                      </summary>
+                      <pre>{extractionState.rawOutput}</pre>
+                    </details>
+                  ) : null}
+                  {extractionState.repairOutput ? (
+                    <details>
+                      <summary>
+                        查看一次修复输出（API 凭据已脱敏，案件内容仍可能敏感）
+                      </summary>
+                      <pre>{extractionState.repairOutput}</pre>
+                    </details>
+                  ) : null}
+                  <button type="button" onClick={cancelExtractionReview}>
+                    关闭
+                  </button>
+                </div>
+              ) : null}
+
+              {extractionState.kind === "committed" ? (
                 <div className="connection-summary">
-                  <span
-                    className={`status-dot status-dot--${
-                      extractionResult.result.status === "parsed"
-                        ? "succeeded"
-                        : "failed"
-                    }`}
-                  />
-                  <strong>
-                    {extractionResult.result.status === "parsed"
-                      ? extractionResult.result.repaired
-                        ? "修复后解析成功"
-                        : "解析成功"
-                      : `解析失败：${
-                          extractionResult.result.error?.message ?? "未知错误"
-                        }`}
-                  </strong>
+                  <span className="status-dot status-dot--succeeded" />
+                  <strong>{extractionState.message}</strong>
                 </div>
               ) : null}
             </section>
