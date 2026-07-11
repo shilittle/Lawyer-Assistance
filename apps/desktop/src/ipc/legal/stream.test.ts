@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   formatLegalAnswerStreamStatus,
   INITIAL_LEGAL_ANSWER_STREAM_STATE,
+  isLegalAnswerStreamActive,
+  isLegalAnswerStreamCancellable,
   markLegalAnswerCancelling,
   reduceLegalAnswerStreamEvent,
   startLegalAnswerStream,
@@ -35,8 +37,11 @@ describe("legal answer stream state", () => {
       requestId: "answer-1",
       eventType: "done",
     });
-    expect(state.status).toBe("done");
-    expect(formatLegalAnswerStreamStatus(state)).toContain("已完成");
+    expect(state.status).toBe("finalizing");
+    expect(formatLegalAnswerStreamStatus(state)).toContain("正在载入结果");
+    expect(isLegalAnswerStreamActive(state)).toBe(true);
+    expect(isLegalAnswerStreamCancellable(state)).toBe(false);
+    expect(markLegalAnswerCancelling(state)).toBe(state);
   });
 
   it("shows cancellation and provider error states", () => {
@@ -83,5 +88,20 @@ describe("legal answer stream state", () => {
     expect(markLegalAnswerCancelling(INITIAL_LEGAL_ANSWER_STREAM_STATE)).toBe(
       INITIAL_LEGAL_ANSWER_STREAM_STATE,
     );
+  });
+
+  it("does not let late channel events move a finalized request backwards", () => {
+    let state = reduceLegalAnswerStreamEvent(startLegalAnswerStream("answer-4"), {
+      requestId: "answer-4",
+      eventType: "done",
+    });
+    state = reduceLegalAnswerStreamEvent(state, {
+      requestId: "answer-4",
+      eventType: "delta",
+      content: "late",
+    });
+
+    expect(state.status).toBe("finalizing");
+    expect(state.answer).toBe("");
   });
 });

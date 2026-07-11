@@ -20,6 +20,10 @@ use tauri::{ipc::Channel, State};
 
 use crate::state::AppState;
 
+const MAX_PROVIDER_STREAM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ANSWER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PROVIDER_STREAM_EVENTS: usize = 16_384;
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpcError {
@@ -29,10 +33,25 @@ pub struct IpcError {
 
 impl IpcError {
     fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        let error_type = normalize_ipc_error_type(&error_type.into());
         Self {
-            error_type: error_type.into(),
+            error_type,
             message: providers::redact_sensitive(&message.into()),
         }
+    }
+}
+
+fn normalize_ipc_error_type(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(64)
+        .collect::<String>();
+
+    if normalized.is_empty() {
+        "provider_error".to_owned()
+    } else {
+        normalized
     }
 }
 
@@ -200,12 +219,13 @@ async fn answer_legal_question_inner(
     if !(200..300).contains(&response.status()) {
         return tokio::select! {
             _ = cancellation.cancelled() => Err(cancelled_error()),
-            error = response.into_http_error() => Err(error.into()),
+            error = response.into_http_error(&prepared.secret) => Err(error.into()),
         };
     }
 
     let mut parser = StreamParser::new();
     let mut accumulator = AnswerStreamAccumulator::default();
+    let mut received_stream_bytes = 0;
     let mut emit = |event| send_stream_event(on_event, event);
 
     loop {
@@ -216,10 +236,12 @@ async fn answer_legal_question_inner(
 
         match chunk {
             Some(chunk) => {
-                consume_stream_results(
+                add_stream_bytes(&mut received_stream_bytes, chunk.len())?;
+                consume_stream_results_with_secret(
                     &request.request_id,
                     parser.push(&chunk),
                     &mut accumulator,
+                    Some(&prepared.secret),
                     &mut emit,
                 )?;
                 if accumulator.provider_done {
@@ -227,10 +249,11 @@ async fn answer_legal_question_inner(
                 }
             }
             None => {
-                consume_stream_results(
+                consume_stream_results_with_secret(
                     &request.request_id,
                     parser.finish(),
                     &mut accumulator,
+                    Some(&prepared.secret),
                     &mut emit,
                 )?;
                 break;
@@ -240,14 +263,14 @@ async fn answer_legal_question_inner(
 
     ensure_stream_complete(&accumulator)?;
 
-    if cancellation.is_cancelled() {
+    if !cancellation_guard.begin_finalization() {
         return Err(cancelled_error());
     }
 
     // No database connection is held across the network await. Validation and
     // persistence happen only after the complete provider answer is available.
     let finalized = finalize_answer(state, &request, prepared.context, accumulator.answer)?;
-    send_stream_event(on_event, done_stream_event(&request.request_id))?;
+    notify_answer_done(&request.request_id, &mut emit);
 
     Ok(finalized)
 }
@@ -339,6 +362,18 @@ where
 struct AnswerStreamAccumulator {
     answer: String,
     provider_done: bool,
+    event_count: usize,
+}
+
+fn add_stream_bytes(total: &mut usize, chunk_len: usize) -> Result<(), IpcError> {
+    *total = total.saturating_add(chunk_len);
+    if *total > MAX_PROVIDER_STREAM_BYTES {
+        return Err(response_too_large_error(
+            "provider stream exceeded the 4 MiB wire-size limit",
+        ));
+    }
+
+    Ok(())
 }
 
 fn ensure_stream_complete(accumulator: &AnswerStreamAccumulator) -> Result<(), IpcError> {
@@ -358,6 +393,7 @@ fn ensure_stream_complete(accumulator: &AnswerStreamAccumulator) -> Result<(), I
     Ok(())
 }
 
+#[cfg(test)]
 fn consume_stream_results<F>(
     request_id: &str,
     results: Vec<Result<StreamEvent, ProviderError>>,
@@ -367,11 +403,37 @@ fn consume_stream_results<F>(
 where
     F: FnMut(LegalAnswerStreamEvent) -> Result<(), IpcError>,
 {
+    consume_stream_results_with_secret(request_id, results, accumulator, None, emit)
+}
+
+fn consume_stream_results_with_secret<F>(
+    request_id: &str,
+    results: Vec<Result<StreamEvent, ProviderError>>,
+    accumulator: &mut AnswerStreamAccumulator,
+    known_secret: Option<&providers::ApiSecret>,
+    emit: &mut F,
+) -> Result<(), IpcError>
+where
+    F: FnMut(LegalAnswerStreamEvent) -> Result<(), IpcError>,
+{
     for result in results {
-        match result? {
-            StreamEvent::Delta { content } => {
+        accumulator.event_count = accumulator.event_count.saturating_add(1);
+        if accumulator.event_count > MAX_PROVIDER_STREAM_EVENTS {
+            return Err(response_too_large_error(
+                "provider stream exceeded the event-count limit",
+            ));
+        }
+
+        let event = result.map_err(|error| provider_stream_error(error, known_secret))?;
+        match event {
+            StreamEvent::Delta { content, .. } => {
                 if content.is_empty() {
                     continue;
+                }
+                if accumulator.answer.len().saturating_add(content.len()) > MAX_ANSWER_BYTES {
+                    return Err(response_too_large_error(
+                        "provider answer exceeded the 2 MiB text limit",
+                    ));
                 }
                 accumulator.answer.push_str(&content);
                 emit(LegalAnswerStreamEvent {
@@ -399,7 +461,10 @@ where
                 error_type,
                 message,
             } => {
-                return Err(IpcError::new(error_type, message));
+                return Err(IpcError::new(
+                    redact_known_secret(&error_type, known_secret),
+                    redact_known_secret(&message, known_secret),
+                ));
             }
             StreamEvent::Done => {
                 accumulator.provider_done = true;
@@ -409,6 +474,25 @@ where
     }
 
     Ok(())
+}
+
+fn provider_stream_error(
+    mut error: ProviderError,
+    known_secret: Option<&providers::ApiSecret>,
+) -> IpcError {
+    error.message = redact_known_secret(&error.message, known_secret);
+    IpcError::new(error.kind.as_str(), error.to_string())
+}
+
+fn redact_known_secret(value: &str, known_secret: Option<&providers::ApiSecret>) -> String {
+    let Some(secret) = known_secret else {
+        return value.to_owned();
+    };
+    if secret.expose_secret().is_empty() {
+        value.to_owned()
+    } else {
+        value.replace(secret.expose_secret(), "<redacted>")
+    }
 }
 
 fn finalize_answer(
@@ -477,8 +561,23 @@ fn done_stream_event(request_id: &str) -> LegalAnswerStreamEvent {
     }
 }
 
+fn notify_answer_done<F>(request_id: &str, emit: &mut F)
+where
+    F: FnMut(LegalAnswerStreamEvent) -> Result<(), IpcError>,
+{
+    // Persistence and the invoke response are authoritative. A channel can be
+    // released in the narrow window after the record commits; failing this
+    // best-effort notification must not turn a committed answer into an error
+    // and prompt a duplicate retry.
+    let _ = emit(done_stream_event(request_id));
+}
+
 fn cancelled_error() -> IpcError {
     IpcError::new("cancelled", "legal answer request was cancelled")
+}
+
+fn response_too_large_error(message: &str) -> IpcError {
+    IpcError::new("response_too_large", message)
 }
 
 fn insert_answer_record(
@@ -753,6 +852,91 @@ mod tests {
         )
         .expect("records list")
         .is_empty());
+    }
+
+    #[test]
+    fn provider_stream_wire_size_has_a_typed_limit() {
+        let mut total = MAX_PROVIDER_STREAM_BYTES;
+        let error = add_stream_bytes(&mut total, 1).expect_err("wire limit rejects overflow");
+
+        assert_eq!(error.error_type, "response_too_large");
+        assert!(error.message.contains("4 MiB"));
+    }
+
+    #[test]
+    fn provider_answer_text_and_event_count_have_typed_limits() {
+        let mut accumulator = AnswerStreamAccumulator {
+            answer: "x".repeat(MAX_ANSWER_BYTES),
+            ..AnswerStreamAccumulator::default()
+        };
+        let mut emitted = Vec::new();
+        let error = consume_stream_results(
+            "answer-too-large",
+            vec![Ok(StreamEvent::Delta {
+                content: "x".to_owned(),
+                model: None,
+            })],
+            &mut accumulator,
+            &mut |event| {
+                emitted.push(event);
+                Ok(())
+            },
+        )
+        .expect_err("answer limit rejects overflow");
+        assert_eq!(error.error_type, "response_too_large");
+        assert!(emitted.is_empty());
+
+        let mut event_limited = AnswerStreamAccumulator {
+            event_count: MAX_PROVIDER_STREAM_EVENTS,
+            ..AnswerStreamAccumulator::default()
+        };
+        let error = consume_stream_results(
+            "answer-too-many-events",
+            vec![Ok(StreamEvent::Delta {
+                content: String::new(),
+                model: None,
+            })],
+            &mut event_limited,
+            &mut |_| Ok(()),
+        )
+        .expect_err("event limit rejects overflow");
+        assert_eq!(error.error_type, "response_too_large");
+    }
+
+    #[test]
+    fn final_done_disconnect_does_not_overturn_a_committed_answer() {
+        let mut attempts = 0;
+        notify_answer_done("answer-committed", &mut |event| {
+            attempts += 1;
+            assert_eq!(event.event_type, LegalAnswerStreamEventType::Done);
+            Err(IpcError::new(
+                "consumer_disconnected",
+                "stream consumer left after persistence",
+            ))
+        });
+
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn provider_stream_errors_redact_the_exact_credential_and_normalize_type() {
+        let secret = ApiSecret::new("exact-secret-1234");
+        let mut accumulator = AnswerStreamAccumulator::default();
+        let error = consume_stream_results_with_secret(
+            "answer-secret-error",
+            vec![Ok(StreamEvent::Error {
+                error_type: "rate limit/exact-secret-1234".to_owned(),
+                message: "provider echoed exact-secret-1234".to_owned(),
+            })],
+            &mut accumulator,
+            Some(&secret),
+            &mut |_| Ok(()),
+        )
+        .expect_err("provider error stops the stream");
+
+        assert_eq!(error.error_type, "ratelimitredacted");
+        assert!(!error.message.contains(secret.expose_secret()));
+        assert!(error.message.contains("<redacted>"));
     }
 
     fn run_mock_answer(

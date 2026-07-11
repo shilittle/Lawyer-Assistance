@@ -4,11 +4,19 @@ use crate::{
 };
 use serde_json::Value;
 
+const MAX_PENDING_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
-    Delta { content: String },
+    Delta {
+        content: String,
+        model: Option<String>,
+    },
     Usage(ChatUsage),
-    Error { error_type: String, message: String },
+    Error {
+        error_type: String,
+        message: String,
+    },
     Done,
 }
 
@@ -30,16 +38,23 @@ impl StreamParser {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
-        while let Some(index) = find_event_separator(&self.buffer) {
+        while let Some((index, separator_len)) = find_event_separator(&self.buffer) {
             let event_bytes: Vec<u8> = self.buffer.drain(..index).collect();
-            let separator_len = separator_len(&self.buffer);
             self.buffer.drain(..separator_len);
 
             if event_bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
 
-            events.push(parse_event_bytes(&event_bytes));
+            append_parsed_event(&mut events, &event_bytes);
+        }
+
+        if self.buffer.len() > MAX_PENDING_SSE_EVENT_BYTES {
+            self.buffer.clear();
+            events.push(Err(ProviderError::new(
+                ProviderErrorKind::ResponseTooLarge,
+                "provider SSE event exceeded the 1 MiB pending-event limit",
+            )));
         }
 
         events
@@ -55,60 +70,94 @@ impl StreamParser {
         }
 
         let event_bytes = std::mem::take(&mut self.buffer);
-        vec![parse_event_bytes(&event_bytes)]
+        let mut events = Vec::new();
+        append_parsed_event(&mut events, &event_bytes);
+        events
     }
 }
 
-fn find_event_separator(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .or_else(|| buffer.windows(4).position(|window| window == b"\r\n\r\n"))
-}
-
-fn separator_len(buffer: &[u8]) -> usize {
-    if buffer.starts_with(b"\r\n\r\n") {
-        4
-    } else {
-        2
+fn append_parsed_event(events: &mut Vec<Result<StreamEvent, ProviderError>>, event_bytes: &[u8]) {
+    match parse_event_bytes(event_bytes) {
+        Ok(parsed_events) => events.extend(parsed_events.into_iter().map(Ok)),
+        Err(error) => events.push(Err(error)),
     }
 }
 
-fn parse_event_bytes(bytes: &[u8]) -> Result<StreamEvent, ProviderError> {
+/// Finds the first SSE blank line and returns its byte position and length.
+/// SSE permits CRLF, LF, or CR line endings, including mixed line endings.
+fn find_event_separator(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+
+    while index < buffer.len() {
+        let Some(first_len) = line_ending_len(buffer, index) else {
+            index += 1;
+            continue;
+        };
+        let second_index = index + first_len;
+        if let Some(second_len) = line_ending_len(buffer, second_index) {
+            return Some((index, first_len + second_len));
+        }
+        index = second_index;
+    }
+
+    None
+}
+
+fn line_ending_len(buffer: &[u8], index: usize) -> Option<usize> {
+    match buffer.get(index) {
+        Some(b'\n') => Some(1),
+        Some(b'\r') if buffer.get(index + 1) == Some(&b'\n') => Some(2),
+        Some(b'\r') => Some(1),
+        _ => None,
+    }
+}
+
+fn parse_event_bytes(bytes: &[u8]) -> Result<Vec<StreamEvent>, ProviderError> {
     let text = std::str::from_utf8(bytes).map_err(|error| {
         ProviderError::new(
             ProviderErrorKind::Parse,
             format!("stream chunk was not valid UTF-8: {error}"),
         )
     })?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
 
     let mut event_name = None;
     let mut data_lines = Vec::new();
 
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-
+    for line in text.split(['\r', '\n']) {
         if let Some(value) = line.strip_prefix("event:") {
             event_name = Some(value.trim().to_owned());
         } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim_start().to_owned());
+            data_lines.push(value.strip_prefix(' ').unwrap_or(value).to_owned());
+        } else if line == "data" {
+            data_lines.push(String::new());
         }
+    }
+
+    // Per the SSE dispatch algorithm, comment/heartbeat events and events
+    // without a data field are ignored rather than treated as malformed JSON.
+    if data_lines.is_empty() {
+        return Ok(Vec::new());
     }
 
     let data = data_lines.join("\n");
 
     if data.trim() == "[DONE]" {
-        return Ok(StreamEvent::Done);
+        return Ok(vec![StreamEvent::Done]);
     }
 
     if event_name.as_deref() == Some("error") {
-        return parse_error_event(&data);
+        return parse_error_event(&data).map(|event| vec![event]);
     }
 
-    parse_data_event(&data)
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    parse_data_events(&data)
 }
 
-fn parse_data_event(data: &str) -> Result<StreamEvent, ProviderError> {
+fn parse_data_events(data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
     if data.trim().is_empty() {
         return Err(ProviderError::new(
             ProviderErrorKind::Parse,
@@ -124,11 +173,13 @@ fn parse_data_event(data: &str) -> Result<StreamEvent, ProviderError> {
     })?;
 
     if let Some(error) = value.get("error") {
-        return parse_error_value(error);
+        return parse_error_value(error).map(|event| vec![event]);
     }
 
-    if let Some(usage) = value.get("usage") {
-        return Ok(StreamEvent::Usage(ChatUsage {
+    let usage = value
+        .get("usage")
+        .filter(|usage| usage.is_object())
+        .map(|usage| ChatUsage {
             prompt_tokens: usage
                 .get("prompt_tokens")
                 .and_then(Value::as_u64)
@@ -141,20 +192,41 @@ fn parse_data_event(data: &str) -> Result<StreamEvent, ProviderError> {
                 .get("total_tokens")
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok()),
-        }));
-    }
+        });
 
-    let content = value
+    let delta = value
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("delta"))
+        .and_then(|choice| choice.get("delta"));
+    let content = delta
         .and_then(|delta| delta.get("content"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
-    Ok(StreamEvent::Delta { content })
+    let mut events = Vec::with_capacity(2);
+    if delta.is_some() || model.is_some() {
+        events.push(StreamEvent::Delta { content, model });
+    }
+    if let Some(usage) = usage {
+        events.push(StreamEvent::Usage(usage));
+    }
+
+    // Keep the historical parser contract for syntactically valid data that
+    // contains neither a delta nor usage; consumers can ignore the empty delta.
+    if events.is_empty() {
+        events.push(StreamEvent::Delta {
+            content: String::new(),
+            model: None,
+        });
+    }
+
+    Ok(events)
 }
 
 fn parse_error_event(data: &str) -> Result<StreamEvent, ProviderError> {
@@ -208,7 +280,8 @@ mod tests {
         assert_eq!(
             events,
             vec![Ok(StreamEvent::Delta {
-                content: "hello".to_owned()
+                content: "hello".to_owned(),
+                model: None,
             })]
         );
     }
@@ -261,7 +334,8 @@ data: {"error":{"type":"rate_limit","message":"too many requests"}}
         assert_eq!(
             events,
             vec![Ok(StreamEvent::Delta {
-                content: "你好".to_owned()
+                content: "你好".to_owned(),
+                model: None,
             })]
         );
     }
@@ -300,9 +374,135 @@ data: {"error":{"type":"rate_limit","message":"too many requests"}}
         assert_eq!(
             parser.finish(),
             vec![Ok(StreamEvent::Delta {
-                content: "tail".to_owned()
+                content: "tail".to_owned(),
+                model: None,
             })]
         );
+    }
+
+    #[test]
+    fn parses_the_earliest_separator_when_line_endings_are_mixed() {
+        let mut parser = StreamParser::new();
+        let events = parser.push(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\r\n\r\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n"
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                Ok(StreamEvent::Delta {
+                    content: "first".to_owned(),
+                    model: None,
+                }),
+                Ok(StreamEvent::Delta {
+                    content: "second".to_owned(),
+                    model: None,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_cr_only_and_mixed_blank_lines() {
+        let mut parser = StreamParser::new();
+        let events = parser
+            .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\r\rdata: [DONE]\n\r\n");
+
+        assert_eq!(
+            events,
+            vec![
+                Ok(StreamEvent::Delta {
+                    content: "one".to_owned(),
+                    model: None,
+                }),
+                Ok(StreamEvent::Done),
+            ]
+        );
+    }
+
+    #[test]
+    fn joins_multi_line_data_with_cr_only_line_endings() {
+        let mut parser = StreamParser::new();
+        let events =
+            parser.push(b"data: {\"choices\":[{\"delta\":\rdata: {\"content\":\"joined\"}}]}\r\r");
+
+        assert_eq!(
+            events,
+            vec![Ok(StreamEvent::Delta {
+                content: "joined".to_owned(),
+                model: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn ignores_keepalive_comments_and_empty_data_events() {
+        let mut parser = StreamParser::new();
+
+        assert!(parser
+            .push(b": keep-alive\nretry: 1000\n\ndata:\n\n")
+            .is_empty());
+    }
+
+    #[test]
+    fn keeps_content_when_usage_is_present_in_the_same_event() {
+        let mut parser = StreamParser::new();
+        let events = parser.push(
+            br#"data: {"model":"qwen-plus","choices":[{"delta":{"content":"pong"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}
+
+"#,
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                Ok(StreamEvent::Delta {
+                    content: "pong".to_owned(),
+                    model: Some("qwen-plus".to_owned()),
+                }),
+                Ok(StreamEvent::Usage(ChatUsage {
+                    prompt_tokens: Some(1),
+                    completion_tokens: Some(2),
+                    total_tokens: Some(3),
+                })),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_a_utf8_bom_on_the_first_event() {
+        let mut parser = StreamParser::new();
+
+        assert_eq!(
+            parser.push(
+                "\u{feff}data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n".as_bytes(),
+            ),
+            vec![Ok(StreamEvent::Delta {
+                content: "ok".to_owned(),
+                model: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn rejects_an_unbounded_pending_sse_event_with_a_typed_error() {
+        let mut parser = StreamParser::new();
+        let oversized = vec![b'x'; MAX_PENDING_SSE_EVENT_BYTES + 1];
+        let events = parser.push(&oversized);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .as_ref()
+                .expect_err("oversized pending event is rejected")
+                .kind,
+            ProviderErrorKind::ResponseTooLarge
+        );
+        assert!(parser.finish().is_empty(), "oversized buffer is released");
     }
 
     #[test]

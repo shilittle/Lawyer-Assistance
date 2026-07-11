@@ -8,6 +8,7 @@ export type LegalAnswerStreamStatus =
   | "connecting"
   | "streaming"
   | "cancelling"
+  | "finalizing"
   | "cancelled"
   | "error"
   | "done";
@@ -46,7 +47,7 @@ export function startLegalAnswerStream(
 export function markLegalAnswerCancelling(
   state: LegalAnswerStreamState,
 ): LegalAnswerStreamState {
-  if (!isLegalAnswerStreamActive(state)) {
+  if (!isLegalAnswerStreamCancellable(state)) {
     return state;
   }
 
@@ -60,7 +61,7 @@ export function reduceLegalAnswerStreamEvent(
   if (state.requestId !== event.requestId) {
     return state;
   }
-  if (["cancelled", "error", "done"].includes(state.status)) {
+  if (["finalizing", "cancelled", "error", "done"].includes(state.status)) {
     return state;
   }
   if (
@@ -89,8 +90,11 @@ export function reduceLegalAnswerStreamEvent(
     case "done":
       return {
         ...state,
-        status: "done",
-        message: "引用已由 Rust 校验，回答已保存",
+        // The channel event is emitted after validation/persistence but just
+        // before the invoke Promise resolves with the citation report. Keep a
+        // distinct state so the UI does not claim it already has final data.
+        status: "finalizing",
+        message: "引用已校验并保存，正在载入最终结果",
       };
   }
 }
@@ -98,7 +102,15 @@ export function reduceLegalAnswerStreamEvent(
 export function isLegalAnswerStreamActive(
   state: LegalAnswerStreamState,
 ): boolean {
-  return ["connecting", "streaming", "cancelling"].includes(state.status);
+  return ["connecting", "streaming", "cancelling", "finalizing"].includes(
+    state.status,
+  );
+}
+
+export function isLegalAnswerStreamCancellable(
+  state: LegalAnswerStreamState,
+): boolean {
+  return ["connecting", "streaming"].includes(state.status);
 }
 
 export function formatLegalAnswerStreamStatus(
@@ -109,6 +121,7 @@ export function formatLegalAnswerStreamStatus(
     connecting: "正在连接 Provider",
     streaming: "正在生成（引用未校验）",
     cancelling: "正在取消",
+    finalizing: "引用已校验，正在载入结果",
     cancelled: "已取消",
     error: state.message ?? "生成失败",
     done: "已完成并校验引用",

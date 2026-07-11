@@ -62,6 +62,7 @@ import {
   formatLegalAnswerStreamStatus,
   INITIAL_LEGAL_ANSWER_STREAM_STATE,
   isLegalAnswerStreamActive,
+  isLegalAnswerStreamCancellable,
   markLegalAnswerCancelling,
   reduceLegalAnswerStreamEvent,
   startLegalAnswerStream,
@@ -1665,7 +1666,7 @@ export function App() {
                 >
                   生成带引用回答
                 </button>
-                {isLegalAnswerStreamActive(qaStream) ? (
+                {isLegalAnswerStreamCancellable(qaStream) ? (
                   <button
                     type="button"
                     onClick={() => void cancelCurrentLegalAnswer()}
@@ -1783,7 +1784,9 @@ export function App() {
             ) : qaStream.answer ? (
               <>
                 <p className="risk-banner">
-                  以下为生成中的原始增量，引用尚未由 Rust 校验，不能作为可信来源。
+                  {qaStream.status === "finalizing"
+                    ? "回答已由 Rust 校验并保存，正在载入引用明细。"
+                    : "以下为生成中的原始增量，引用尚未由 Rust 校验，不能作为可信来源。"}
                 </p>
                 <article className="answer-box" aria-live="polite">
                   <p>{qaStream.answer}</p>

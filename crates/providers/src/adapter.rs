@@ -131,10 +131,11 @@ impl ReqwestStreamingTransport {
             builder = builder.header(&header.name, &header.value);
         }
 
-        let response =
-            builder.body(request.body).send().await.map_err(|error| {
-                ProviderError::new(ProviderErrorKind::Network, error.to_string())
-            })?;
+        let response = builder
+            .body(request.body)
+            .send()
+            .await
+            .map_err(|error| redact_known_secret(map_reqwest_error(error), secret))?;
 
         Ok(StreamingTransportResponse {
             status: response.status().as_u16(),
@@ -153,10 +154,10 @@ impl StreamingTransportResponse {
             .chunk()
             .await
             .map(|chunk| chunk.map(|chunk| chunk.to_vec()))
-            .map_err(|error| ProviderError::new(ProviderErrorKind::Network, error.to_string()))
+            .map_err(map_reqwest_error)
     }
 
-    pub async fn into_http_error(mut self) -> ProviderError {
+    pub async fn into_http_error(mut self, secret: &ApiSecret) -> ProviderError {
         const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
         let mut body = Vec::new();
 
@@ -168,16 +169,26 @@ impl StreamingTransportResponse {
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    return ProviderError::with_status(
-                        ProviderErrorKind::Network,
-                        self.status,
-                        error.to_string(),
+                    return redact_known_secret(
+                        ProviderError::with_status(
+                            if error.is_timeout() {
+                                ProviderErrorKind::Timeout
+                            } else {
+                                ProviderErrorKind::Network
+                            },
+                            self.status,
+                            error.to_string(),
+                        ),
+                        secret,
                     );
                 }
             }
         }
 
-        map_http_error(self.status, &String::from_utf8_lossy(&body))
+        redact_known_secret(
+            map_http_error(self.status, &String::from_utf8_lossy(&body)),
+            secret,
+        )
     }
 }
 
@@ -550,6 +561,24 @@ fn map_http_error(status: u16, body: &str) -> ProviderError {
         status,
         truncate_for_log(&message, 240),
     )
+}
+
+fn map_reqwest_error(error: reqwest::Error) -> ProviderError {
+    ProviderError::new(
+        if error.is_timeout() {
+            ProviderErrorKind::Timeout
+        } else {
+            ProviderErrorKind::Network
+        },
+        error.to_string(),
+    )
+}
+
+fn redact_known_secret(mut error: ProviderError, secret: &ApiSecret) -> ProviderError {
+    if !secret.expose_secret().is_empty() {
+        error.message = error.message.replace(secret.expose_secret(), "<redacted>");
+    }
+    error
 }
 
 #[cfg(test)]
