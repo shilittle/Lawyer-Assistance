@@ -13,6 +13,8 @@ import type {
   DeleteCaseEntityResponse,
   DeleteCaseProjectRequest,
   DeleteCaseProjectResponse,
+  DiscardStructuredCaseExtractionRequest,
+  DiscardStructuredCaseExtractionResponse,
   EntitySavedResponse,
   GetCaseWorkspaceRequest,
   GetCaseWorkspaceResponse,
@@ -119,6 +121,15 @@ export function confirmStructuredCaseExtraction(
 ): Promise<ConfirmStructuredCaseExtractionResponse> {
   return invoke<ConfirmStructuredCaseExtractionResponse>(
     "confirm_structured_case_extraction",
+    { request },
+  );
+}
+
+export function discardStructuredCaseExtraction(
+  request: DiscardStructuredCaseExtractionRequest,
+): Promise<DiscardStructuredCaseExtractionResponse> {
+  return invoke<DiscardStructuredCaseExtractionResponse>(
+    "discard_structured_case_extraction",
     { request },
   );
 }

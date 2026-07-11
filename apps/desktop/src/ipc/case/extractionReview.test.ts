@@ -139,4 +139,35 @@ describe("case extraction review state", () => {
 
     expect(buildConfirmationRequest(state)?.extraction.facts).toEqual([]);
   });
+
+  it("does not overwrite an active review with another generation start", () => {
+    const context = createExtractionContext(
+      "request-1",
+      "project-1",
+      "provider-1",
+      ["file-a"],
+    );
+    const reviewing = extractionReducer(
+      { kind: "generating", context } satisfies ExtractionState,
+      {
+        type: "generated",
+        requestId: "request-1",
+        reviewId: "review-1",
+        draft,
+        repaired: false,
+      },
+    );
+
+    expect(
+      extractionReducer(reviewing, {
+        type: "start",
+        context: createExtractionContext(
+          "request-2",
+          "project-1",
+          "provider-1",
+          ["file-b"],
+        ),
+      }),
+    ).toBe(reviewing);
+  });
 });

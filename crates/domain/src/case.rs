@@ -550,9 +550,119 @@ pub fn parse_structured_case_extraction(
                 message: error.to_string(),
             }
         })?;
-    validate_extraction_dates(&extraction)?;
+    validate_structured_case_extraction(&extraction)?;
 
     Ok(extraction)
+}
+
+pub fn validate_structured_case_extraction(
+    extraction: &StructuredCaseExtraction,
+) -> Result<(), StructuredExtractionParseError> {
+    validate_extraction_dates(extraction)?;
+
+    if extraction
+        .parties
+        .iter()
+        .any(|party| party.name.trim().is_empty())
+        || extraction
+            .facts
+            .iter()
+            .any(|fact| fact.title.trim().is_empty())
+        || extraction.evidence.iter().any(|evidence| {
+            evidence.evidence_number.trim().is_empty() || evidence.title.trim().is_empty()
+        })
+        || extraction
+            .legal_issues
+            .iter()
+            .any(|issue| issue.title.trim().is_empty())
+        || extraction
+            .uncertainties
+            .iter()
+            .any(|uncertainty| uncertainty.description.trim().is_empty())
+    {
+        return Err(extraction_validation_error(
+            "structured extraction contains an empty required field",
+        ));
+    }
+
+    let party_names = unique_labels(
+        extraction.parties.iter().map(|party| party.name.as_str()),
+        "party names",
+    )?;
+    let fact_titles = unique_labels(
+        extraction.facts.iter().map(|fact| fact.title.as_str()),
+        "fact titles",
+    )?;
+    let evidence_numbers = unique_labels(
+        extraction
+            .evidence
+            .iter()
+            .map(|evidence| evidence.evidence_number.as_str()),
+        "evidence numbers",
+    )?;
+    let evidence_titles = unique_labels(
+        extraction
+            .evidence
+            .iter()
+            .map(|evidence| evidence.title.as_str()),
+        "evidence titles",
+    )?;
+    let legal_issue_titles = unique_labels(
+        extraction
+            .legal_issues
+            .iter()
+            .map(|issue| issue.title.as_str()),
+        "legal issue titles",
+    )?;
+
+    for fact in &extraction.facts {
+        let mut fact_evidence_numbers = HashSet::new();
+        for evidence_number in &fact.evidence_numbers {
+            let evidence_number = evidence_number.trim();
+            if evidence_number.is_empty() || !evidence_numbers.contains(evidence_number) {
+                return Err(extraction_validation_error(format!(
+                    "fact '{}' references an unknown evidence number",
+                    fact.title.trim()
+                )));
+            }
+            if !fact_evidence_numbers.insert(evidence_number) {
+                return Err(extraction_validation_error(format!(
+                    "fact '{}' contains a duplicate evidence reference",
+                    fact.title.trim()
+                )));
+            }
+        }
+    }
+
+    for uncertainty in &extraction.uncertainties {
+        let related_reference = uncertainty
+            .related_reference
+            .as_deref()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty());
+        let matches_entity = match uncertainty.related_entity_type {
+            UncertaintyRelatedEntityType::General => related_reference.is_none(),
+            UncertaintyRelatedEntityType::Party => {
+                related_reference.is_some_and(|reference| party_names.contains(reference))
+            }
+            UncertaintyRelatedEntityType::Fact => {
+                related_reference.is_some_and(|reference| fact_titles.contains(reference))
+            }
+            UncertaintyRelatedEntityType::Evidence => related_reference.is_some_and(|reference| {
+                evidence_numbers.contains(reference) || evidence_titles.contains(reference)
+            }),
+            UncertaintyRelatedEntityType::LegalIssue => {
+                related_reference.is_some_and(|reference| legal_issue_titles.contains(reference))
+            }
+        };
+        if !matches_entity {
+            return Err(extraction_validation_error(
+                "uncertainty relatedReference does not match its related entity type",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_extraction_dates(
@@ -575,6 +685,27 @@ fn validate_extraction_dates(
     }
 
     Ok(())
+}
+
+fn unique_labels<'a>(
+    labels: impl Iterator<Item = &'a str>,
+    label_name: &str,
+) -> Result<HashSet<&'a str>, StructuredExtractionParseError> {
+    let mut unique = HashSet::new();
+    for label in labels {
+        if !unique.insert(label.trim()) {
+            return Err(extraction_validation_error(format!(
+                "structured extraction {label_name} must be unique"
+            )));
+        }
+    }
+    Ok(unique)
+}
+
+fn extraction_validation_error(message: impl Into<String>) -> StructuredExtractionParseError {
+    StructuredExtractionParseError {
+        message: message.into(),
+    }
 }
 
 fn is_iso_calendar_date(value: &str) -> bool {
@@ -877,6 +1008,26 @@ mod tests {
         .is_err());
         assert!(parse_structured_case_extraction(
             r#"{"parties":[],"facts":[{"occurredOn":"tomorrow","title":"bad date","description":"","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_dangling_duplicate_and_semantically_invalid_relationships() {
+        assert!(parse_structured_case_extraction(
+            r#"{"parties":[],"facts":[{"occurredOn":null,"title":"fact","description":"description","evidenceNumbers":["missing"]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
+        )
+        .is_err());
+        assert!(parse_structured_case_extraction(
+            r#"{"parties":[],"facts":[],"evidence":[{"evidenceNumber":"E-1","title":"one","source":"","formedOn":null,"summary":""},{"evidenceNumber":"E-1","title":"two","source":"","formedOn":null,"summary":""}],"legalIssues":[],"uncertainties":[]}"#
+        )
+        .is_err());
+        assert!(parse_structured_case_extraction(
+            r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[{"description":"needs review","relatedEntityType":"fact","relatedReference":"missing"}]}"#
+        )
+        .is_err());
+        assert!(parse_structured_case_extraction(
+            r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[{"description":"general","relatedEntityType":"general","relatedReference":"unexpected"}]}"#
         )
         .is_err());
     }

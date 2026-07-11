@@ -70,6 +70,7 @@ pub fn run() {
             commands::case::analyze_case_gaps_command,
             commands::case::generate_structured_case_extraction,
             commands::case::confirm_structured_case_extraction,
+            commands::case::discard_structured_case_extraction,
             commands::legal::search_laws,
             commands::legal::search_articles,
             commands::legal::get_article,

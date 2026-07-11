@@ -349,3 +349,11 @@ export interface ConfirmStructuredCaseExtractionResponse {
   applied: boolean;
   counts: ConfirmedExtractionCounts;
 }
+
+export interface DiscardStructuredCaseExtractionRequest {
+  reviewId: string;
+}
+
+export interface DiscardStructuredCaseExtractionResponse {
+  discarded: boolean;
+}

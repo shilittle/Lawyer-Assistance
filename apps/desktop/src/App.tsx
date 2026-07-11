@@ -3,6 +3,7 @@ import { FormEvent, useCallback, useEffect, useReducer, useState } from "react";
 import {
   addCaseLegalBasis,
   confirmStructuredCaseExtraction,
+  discardStructuredCaseExtraction,
   deleteCaseEntity,
   deleteCaseProject,
   getCaseWorkspace,
@@ -802,13 +803,13 @@ export function App() {
     setLinkFactId("");
     setLinkEvidenceId("");
     setExtractionFileIds([]);
-    dispatchExtraction({ type: "reset" });
+    cancelExtractionReview();
     setCaseState({ kind: "idle" });
   }
 
   function selectCaseProject(project: CaseProject) {
     setExtractionFileIds([]);
-    dispatchExtraction({ type: "reset" });
+    cancelExtractionReview();
     void loadCaseWorkspace(project.projectId);
   }
 
@@ -1104,6 +1105,13 @@ export function App() {
   }
 
   function cancelExtractionReview() {
+    if (extractionState.kind === "reviewing") {
+      void discardStructuredCaseExtraction({
+        reviewId: extractionState.reviewId,
+      }).catch((error: unknown) => {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      });
+    }
     dispatchExtraction({ type: "cancel" });
   }
 
@@ -2597,7 +2605,7 @@ export function App() {
             <section className="provider-subsection extraction-panel">
               <h3>模型结构化抽取</h3>
               <p className="privacy-note">
-                仅发送已勾选材料的“材料文本或摘要”。模型建议先在本机审阅，确认事务不会修改案件材料记录。
+                仅发送已勾选材料记录中的“摘要”字段，不读取存储引用指向的原文件。模型建议先在本机审阅，确认事务不会修改案件材料记录。
               </p>
               <label>
                 <span>Provider</span>
@@ -2621,8 +2629,7 @@ export function App() {
                   !caseWorkspace ||
                   !extractionProviderId ||
                   extractionFileIds.length === 0 ||
-                  extractionState.kind === "generating" ||
-                  extractionState.kind === "committing"
+                  extractionLocksSources(extractionState)
                 }
                 type="button"
                 onClick={() => void runStructuredExtraction()}

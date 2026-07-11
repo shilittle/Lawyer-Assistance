@@ -16,6 +16,8 @@ pub const LEGAL_CORE_SCHEMA_SQL: &str = include_str!("../../../data/schema/legal
 pub enum DatabaseInitError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
+    InvalidUserSchemaVersion(String),
+    UnsupportedUserSchemaVersion { found: i64, supported: i64 },
 }
 
 impl Display for DatabaseInitError {
@@ -23,6 +25,13 @@ impl Display for DatabaseInitError {
         match self {
             Self::Io(error) => write!(formatter, "database filesystem error: {error}"),
             Self::Sqlite(error) => write!(formatter, "sqlite initialization error: {error}"),
+            Self::InvalidUserSchemaVersion(value) => {
+                write!(formatter, "invalid user database schema version: {value}")
+            }
+            Self::UnsupportedUserSchemaVersion { found, supported } => write!(
+                formatter,
+                "user database schema version {found} is newer than supported version {supported}"
+            ),
         }
     }
 }
@@ -32,6 +41,7 @@ impl Error for DatabaseInitError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
+            Self::InvalidUserSchemaVersion(_) | Self::UnsupportedUserSchemaVersion { .. } => None,
         }
     }
 }
@@ -1427,6 +1437,14 @@ fn configure_legal_core_connection(
 }
 
 fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), DatabaseInitError> {
+    if let Some(found) = existing_user_schema_version(connection)? {
+        if found > USER_SCHEMA_VERSION {
+            return Err(DatabaseInitError::UnsupportedUserSchemaVersion {
+                found,
+                supported: USER_SCHEMA_VERSION,
+            });
+        }
+    }
     let transaction = connection.transaction()?;
 
     transaction.execute_batch(
@@ -1651,6 +1669,33 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
     transaction.commit()?;
 
     Ok(())
+}
+
+fn existing_user_schema_version(
+    connection: &rusqlite::Connection,
+) -> Result<Option<i64>, DatabaseInitError> {
+    let metadata_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_database_metadata')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !metadata_exists {
+        return Ok(None);
+    }
+    let value = connection
+        .query_row(
+            "SELECT value FROM user_database_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| DatabaseInitError::InvalidUserSchemaVersion(value))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -2091,6 +2136,56 @@ mod tests {
         assert_eq!(schema_version, "2");
         assert_eq!(sqlite_master_count(&connection, "projects"), 0);
         assert_eq!(sqlite_master_count(&connection, "case_uncertainties"), 0);
+    }
+
+    #[test]
+    fn future_user_schema_is_rejected_without_downgrade_or_writes() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        {
+            let connection =
+                rusqlite::Connection::open(&database_path).expect("future database opens");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE user_database_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('schema_version', '999');
+                    CREATE TABLE future_only_data (value TEXT NOT NULL);
+                    INSERT INTO future_only_data (value) VALUES ('must remain');
+                    ",
+                )
+                .expect("future schema writes");
+        }
+
+        let error = ensure_user_database(directory.path())
+            .expect_err("future schema must not be silently downgraded");
+        assert!(matches!(
+            error,
+            DatabaseInitError::UnsupportedUserSchemaVersion {
+                found: 999,
+                supported: USER_SCHEMA_VERSION
+            }
+        ));
+
+        let connection = rusqlite::Connection::open(&database_path).expect("database reopens");
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM user_database_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("future schema version remains");
+        let future_value: String = connection
+            .query_row("SELECT value FROM future_only_data", [], |row| row.get(0))
+            .expect("future-only data remains");
+        assert_eq!(schema_version, "999");
+        assert_eq!(future_value, "must remain");
+        assert_eq!(sqlite_master_count(&connection, "projects"), 0);
     }
 
     #[test]

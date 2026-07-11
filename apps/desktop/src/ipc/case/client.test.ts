@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   confirmStructuredCaseExtraction,
+  discardStructuredCaseExtraction,
   generateStructuredCaseExtraction,
 } from "./client";
 import type { StructuredCaseExtraction } from "./types";
@@ -85,6 +86,14 @@ describe("case extraction IPC client", () => {
         extraction,
         confirmed: true,
       },
+    });
+  });
+
+  it("discards the server-side review token when the user cancels", async () => {
+    await discardStructuredCaseExtraction({ reviewId: "review-1" });
+
+    expect(invoke).toHaveBeenCalledWith("discard_structured_case_extraction", {
+      request: { reviewId: "review-1" },
     });
   });
 });

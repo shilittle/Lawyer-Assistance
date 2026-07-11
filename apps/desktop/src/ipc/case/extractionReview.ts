@@ -81,7 +81,11 @@ export function extractionReducer(
 ): ExtractionState {
   switch (action.type) {
     case "start":
-      return { kind: "generating", context: action.context };
+      return state.kind === "generating" ||
+        state.kind === "reviewing" ||
+        state.kind === "committing"
+        ? state
+        : { kind: "generating", context: action.context };
     case "generated":
       if (
         state.kind !== "generating" ||
