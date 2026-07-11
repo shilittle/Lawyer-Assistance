@@ -4,7 +4,7 @@ export type ProviderKind =
   | "silicon_flow"
   | "volcengine_ark";
 
-export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffort = "low" | "medium" | "high" | "max";
 
 export interface ProviderCapabilities {
   chat: boolean;

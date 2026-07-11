@@ -26,10 +26,23 @@ impl ProviderKind {
 
     pub fn default_model_id(self) -> &'static str {
         match self {
-            Self::DeepSeek => "deepseek-chat",
+            Self::DeepSeek => "deepseek-v4-flash",
             Self::Qwen => "qwen-plus",
-            Self::SiliconFlow => "deepseek-ai/DeepSeek-V3",
-            Self::VolcengineArk => "doubao-seed-1-6-250615",
+            Self::SiliconFlow => "deepseek-ai/DeepSeek-V3.2",
+            Self::VolcengineArk => "doubao-seed-2-0-lite-260215",
+        }
+    }
+
+    pub fn default_options(self) -> ProviderOptions {
+        match self {
+            Self::DeepSeek | Self::VolcengineArk => ProviderOptions {
+                thinking: Some(false),
+                ..ProviderOptions::default()
+            },
+            Self::Qwen | Self::SiliconFlow => ProviderOptions {
+                enable_thinking: Some(false),
+                ..ProviderOptions::default()
+            },
         }
     }
 }
@@ -62,6 +75,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -98,7 +112,7 @@ impl ProviderProfile {
             base_url: kind.default_base_url().to_owned(),
             credential_account_id: "default".to_owned(),
             capabilities: ProviderCapabilities::chat_defaults(),
-            options: ProviderOptions::default(),
+            options: kind.default_options(),
         }
     }
 }
@@ -140,9 +154,9 @@ impl ChatRequest {
                     content: "ping".to_owned(),
                 },
             ],
-            stream: false,
+            stream: true,
             temperature: Some(0.0),
-            max_tokens: Some(8),
+            max_tokens: Some(64),
         }
     }
 }
@@ -226,6 +240,8 @@ pub enum ProviderErrorKind {
     InvalidProfile,
     InvalidRequest,
     Network,
+    Timeout,
+    Cancelled,
     Http,
     Parse,
     Credential,
@@ -238,6 +254,8 @@ impl ProviderErrorKind {
             Self::InvalidProfile => "invalid_profile",
             Self::InvalidRequest => "invalid_request",
             Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
             Self::Http => "http",
             Self::Parse => "parse",
             Self::Credential => "credential",

@@ -272,7 +272,7 @@ fn parse_streaming_answer(
     let mut stream_events = Vec::new();
     for event in parser.push(&bytes) {
         match event? {
-            StreamEvent::Delta { content } => {
+            StreamEvent::Delta { content, .. } => {
                 answer.push_str(&content);
                 stream_events.push(LegalAnswerStreamEvent {
                     event_type: LegalAnswerStreamEventType::Delta,
@@ -560,7 +560,7 @@ mod tests {
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
                 serde_json::to_string(answer).expect("answer serializes")
             ),
-            first_byte_latency_ms: 1,
+            first_content_token_latency_ms: Some(1),
             total_latency_ms: 2,
         }
     }

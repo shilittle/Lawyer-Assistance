@@ -176,7 +176,7 @@ mod platform {
         use super::*;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        fn test_store() -> (WindowsCredentialStore, ProviderCredentialKey) {
+        fn test_store() -> (String, WindowsCredentialStore, ProviderCredentialKey) {
             let suffix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time is after epoch")
@@ -184,12 +184,16 @@ mod platform {
             let prefix = format!("LawyerAssistanceTest-{}-{suffix}", std::process::id());
             let key = ProviderCredentialKey::new("deepseek-test", "default");
 
-            (WindowsCredentialStore::with_service_prefix(prefix), key)
+            (
+                prefix.clone(),
+                WindowsCredentialStore::with_service_prefix(prefix),
+                key,
+            )
         }
 
         #[test]
         fn credential_manager_covers_write_query_overwrite_delete_and_missing_key() {
-            let (store, key) = test_store();
+            let (prefix, store, key) = test_store();
             store
                 .delete_api_key(&key)
                 .expect("pre-test cleanup succeeds");
@@ -202,10 +206,11 @@ mod platform {
             store
                 .write_api_key(&key, ApiSecret::new("cred-manager-secret-1111"))
                 .expect("credential writes");
-            let secret = store
+            let reopened_store = WindowsCredentialStore::with_service_prefix(prefix.clone());
+            let secret = reopened_store
                 .read_api_key(&key)
-                .expect("credential reads")
-                .expect("credential exists");
+                .expect("credential reads after store recreation")
+                .expect("credential persists after store recreation");
             assert_eq!(secret.expose_secret(), "cred-manager-secret-1111");
             assert_eq!(secret.masked_last_four(), "****1111");
 
@@ -218,7 +223,9 @@ mod platform {
                 .expect("credential exists after overwrite");
             assert_eq!(secret.expose_secret(), "cred-manager-secret-2222");
 
-            store.delete_api_key(&key).expect("credential deletes");
+            WindowsCredentialStore::with_service_prefix(prefix)
+                .delete_api_key(&key)
+                .expect("credential deletes after another store recreation");
             assert!(store
                 .read_api_key(&key)
                 .expect("deleted credential can be queried")
