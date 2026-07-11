@@ -50,6 +50,22 @@ impl StreamParser {
 
         events
     }
+
+    /// Finishes the stream and parses a final event that was not followed by an
+    /// empty-line delimiter. SSE dispatches such an event when the connection
+    /// reaches EOF, so callers must invoke this after their last read.
+    pub fn finish(&mut self) -> Vec<Result<StreamEvent, ProviderError>> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+
+        let event_bytes = std::mem::take(&mut self.buffer);
+        if event_bytes.iter().all(u8::is_ascii_whitespace) || is_comment_only(&event_bytes) {
+            Vec::new()
+        } else {
+            vec![parse_event_bytes(&event_bytes)]
+        }
+    }
 }
 
 fn is_comment_only(bytes: &[u8]) -> bool {
@@ -315,6 +331,33 @@ data: {"error":{"type":"rate_limit","message":"too many requests"}}
                 model: Some("qwen-plus".to_owned()),
             })]
         );
+    }
+
+    #[test]
+    fn finish_dispatches_final_event_without_empty_line() {
+        let mut parser = StreamParser::new();
+        assert!(parser
+            .push(
+                br#"data: {"model":"deepseek-v4-flash","choices":[{"delta":{"content":"pong"}}]}"#
+            )
+            .is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![Ok(StreamEvent::Delta {
+                content: "pong".to_owned(),
+                model: Some("deepseek-v4-flash".to_owned()),
+            })]
+        );
+        assert!(parser.finish().is_empty(), "finish is idempotent after EOF");
+    }
+
+    #[test]
+    fn finish_ignores_trailing_keepalive_comment() {
+        let mut parser = StreamParser::new();
+        assert!(parser.push(b": keep-alive").is_empty());
+
+        assert!(parser.finish().is_empty());
     }
 
     #[test]

@@ -2638,6 +2638,9 @@ export function App() {
                       <option value="low">low</option>
                       <option value="medium">medium</option>
                       <option value="high">high</option>
+                      {providerDraft.kind === "deep_seek" ? (
+                        <option value="max">max</option>
+                      ) : null}
                     </select>
                   </label>
                 ) : null}

@@ -175,9 +175,12 @@ pub fn delete_provider_profile(
 
 #[tauri::command]
 pub fn get_provider_api_key_status(
+    state: State<'_, AppState>,
     request: ProviderApiKeyStatusRequest,
 ) -> Result<ProviderApiKeyStatusResponse, IpcError> {
-    let key = ProviderCredentialKey::new(&request.provider_id, &request.account_id);
+    let connection = database::open_user_database(state.user_database_path())?;
+    let key =
+        credential_key_for_saved_profile(&connection, &request.provider_id, &request.account_id)?;
     let status = key_status(
         &providers::windows_credentials::WindowsCredentialStore::new(),
         &key,
@@ -210,9 +213,12 @@ pub fn write_provider_api_key(
 
 #[tauri::command]
 pub fn delete_provider_api_key(
+    state: State<'_, AppState>,
     request: DeleteProviderApiKeyRequest,
 ) -> Result<ProviderApiKeyStatusResponse, IpcError> {
-    let key = ProviderCredentialKey::new(&request.provider_id, &request.account_id);
+    let connection = database::open_user_database(state.user_database_path())?;
+    let key =
+        credential_key_for_saved_profile(&connection, &request.provider_id, &request.account_id)?;
     let store = providers::windows_credentials::WindowsCredentialStore::new();
     store.delete_api_key(&key)?;
 
@@ -326,11 +332,21 @@ fn write_api_key_for_profile<S>(
 where
     S: CredentialStore<Error = ProviderError>,
 {
-    let profile =
-        database::get_provider_profile(connection, &key.provider_id)?.ok_or_else(|| {
-            ProviderError::new(ProviderErrorKind::InvalidProfile, "profile not found")
-        })?;
-    if profile.credential_account_id != key.account_id {
+    let saved_key =
+        credential_key_for_saved_profile(connection, &key.provider_id, &key.account_id)?;
+    store.write_api_key(&saved_key, secret)?;
+    Ok(())
+}
+
+fn credential_key_for_saved_profile(
+    connection: &rusqlite::Connection,
+    provider_id: &str,
+    account_id: &str,
+) -> Result<ProviderCredentialKey, IpcError> {
+    let profile = database::get_provider_profile(connection, provider_id)?.ok_or_else(|| {
+        ProviderError::new(ProviderErrorKind::InvalidProfile, "profile not found")
+    })?;
+    if profile.credential_account_id != account_id {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidProfile,
             "credential account does not match the saved profile",
@@ -338,8 +354,7 @@ where
         .into());
     }
 
-    store.write_api_key(key, secret)?;
-    Ok(())
+    Ok(ProviderCredentialKey::new(provider_id, account_id))
 }
 
 fn validate_profile(profile: &ProviderProfile) -> Result<(), ProviderError> {
@@ -538,6 +553,30 @@ mod tests {
             .read_api_key(&wrong_account)
             .expect("wrong account reads")
             .is_none());
+    }
+
+    #[test]
+    fn credential_status_and_delete_target_require_saved_matching_account() {
+        let (_directory, connection) = test_user_database();
+        let profile = ProviderProfile::new_default("deepseek-main", ProviderKind::DeepSeek);
+        let store = MockCredentialStore::default();
+        upsert_profile_with_store(&connection, &profile, &store).expect("profile inserts");
+        let saved_key = ProviderCredentialKey::new("deepseek-main", "default");
+        store
+            .write_api_key(&saved_key, ApiSecret::new("mock-credential-2468"))
+            .expect("key writes");
+
+        let missing = credential_key_for_saved_profile(&connection, "missing", "default")
+            .expect_err("missing profile cannot address a credential");
+        assert_eq!(missing.error_type, "invalid_profile");
+
+        let mismatch = credential_key_for_saved_profile(&connection, "deepseek-main", "other")
+            .expect_err("wrong account cannot address a saved profile credential");
+        assert_eq!(mismatch.error_type, "invalid_profile");
+        assert!(store
+            .read_api_key(&saved_key)
+            .expect("saved key reads")
+            .is_some());
     }
 
     #[test]

@@ -19,6 +19,8 @@ use std::{
 
 use crate::stream::{StreamEvent, StreamParser};
 
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportHeader {
     pub name: String,
@@ -85,12 +87,27 @@ impl fmt::Debug for TransportRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TransportResponse {
     pub status: u16,
     pub body: String,
     pub first_content_token_latency_ms: Option<u128>,
     pub total_latency_ms: u128,
+}
+
+impl fmt::Debug for TransportResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportResponse")
+            .field("status", &self.status)
+            .field("body", &"<redacted>")
+            .field(
+                "first_content_token_latency_ms",
+                &self.first_content_token_latency_ms,
+            )
+            .field("total_latency_ms", &self.total_latency_ms)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +200,15 @@ impl ReqwestTransport {
             .map_err(map_reqwest_error)?;
         let mut response = response;
         let status = response.status().as_u16();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+        {
+            return Err(response_too_large_error(
+                MAX_PROVIDER_RESPONSE_BYTES,
+                Some(status),
+            ));
+        }
         let mut body = Vec::new();
         let mut buffer = [0_u8; 8192];
         let mut parser = StreamParser::new();
@@ -194,18 +220,32 @@ impl ReqwestTransport {
             }
 
             let bytes_read = response.read(&mut buffer).map_err(map_read_error)?;
+            if cancellation.is_cancelled() {
+                return Err(cancelled_error());
+            }
             if bytes_read == 0 {
+                if expects_stream
+                    && first_content_token_latency_ms.is_none()
+                    && stream_finish_has_content(&mut parser)
+                {
+                    first_content_token_latency_ms = Some(elapsed_millis(&started_at));
+                }
                 break;
             }
 
             let chunk = &buffer[..bytes_read];
+            append_bounded_response_chunk(
+                &mut body,
+                chunk,
+                MAX_PROVIDER_RESPONSE_BYTES,
+                Some(status),
+            )?;
             if expects_stream
                 && first_content_token_latency_ms.is_none()
                 && stream_chunk_has_content(&mut parser, chunk)
             {
-                first_content_token_latency_ms = Some(started_at.elapsed().as_millis());
+                first_content_token_latency_ms = Some(elapsed_millis(&started_at));
             }
-            body.extend_from_slice(chunk);
         }
 
         let body = String::from_utf8(body).map_err(|error| {
@@ -214,12 +254,15 @@ impl ReqwestTransport {
                 format!("provider response was not valid UTF-8: {error}"),
             )
         })?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
 
         Ok(TransportResponse {
             status,
             body,
             first_content_token_latency_ms,
-            total_latency_ms: started_at.elapsed().as_millis(),
+            total_latency_ms: elapsed_millis(&started_at),
         })
     }
 }
@@ -296,10 +339,29 @@ where
 
     pub fn test_connection(&self, profile: &ProviderProfile, secret: &ApiSecret) -> ConnectionTest {
         let request = ChatRequest::connection_probe();
+        let started_at = Instant::now();
 
         match self.send_chat(profile, secret, &request) {
             Ok(response) if (200..300).contains(&response.status) => {
-                match parse_chat_completion_metadata(&response.body) {
+                let parsed = parse_chat_completion_metadata(&response.body).and_then(|metadata| {
+                    match response.first_content_token_latency_ms {
+                        Some(first_latency)
+                            if first_latency > 0 && first_latency <= response.total_latency_ms =>
+                        {
+                            Ok(metadata)
+                        }
+                        Some(_) => Err(ProviderError::new(
+                            ProviderErrorKind::Parse,
+                            "provider returned an invalid first content token latency",
+                        )),
+                        None => Err(ProviderError::new(
+                            ProviderErrorKind::Parse,
+                            "provider stream did not include a content token",
+                        )),
+                    }
+                });
+
+                match parsed {
                     Ok((model, usage)) => ConnectionTest::succeeded(
                         profile.id.clone(),
                         response.status,
@@ -332,8 +394,15 @@ where
                 )
             }
             Err(error) => {
+                let http_status = error.http_status;
                 let error = redact_known_secret(error, secret);
-                ConnectionTest::failed(profile.id.clone(), None, None, 0, &error)
+                ConnectionTest::failed(
+                    profile.id.clone(),
+                    http_status,
+                    None,
+                    elapsed_millis(&started_at),
+                    &error,
+                )
             }
         }
     }
@@ -400,7 +469,8 @@ fn resolve_base_url(profile: &ProviderProfile) -> Result<String, ProviderError> 
 
     if profile.kind != ProviderKind::Qwen
         || (!profile.base_url.contains("{workspace_id}")
-            && !profile.base_url.contains("{workspaceId}"))
+            && !profile.base_url.contains("{workspaceId}")
+            && !profile.base_url.contains("{WorkspaceId}"))
     {
         return Ok(profile.base_url.clone());
     }
@@ -418,7 +488,8 @@ fn resolve_base_url(profile: &ProviderProfile) -> Result<String, ProviderError> 
     Ok(profile
         .base_url
         .replace("{workspace_id}", workspace_id)
-        .replace("{workspaceId}", workspace_id))
+        .replace("{workspaceId}", workspace_id)
+        .replace("{WorkspaceId}", workspace_id))
 }
 
 fn build_chat_body(
@@ -570,11 +641,33 @@ fn parse_chat_completion_metadata(
     body: &str,
 ) -> Result<(Option<String>, Option<ChatUsage>), ProviderError> {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if value.get("error").is_some() {
+            return Err(map_http_error(200, body));
+        }
+
+        let has_content = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty());
+        if !has_content {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Parse,
+                "provider response did not include response content",
+            ));
+        }
+
         let model = value
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let usage = value.get("usage").map(parse_usage);
+        let usage = value
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .map(parse_usage);
 
         return Ok((model, usage));
     }
@@ -590,7 +683,9 @@ fn parse_streaming_completion_metadata(
     let mut usage = None;
     let mut has_content = false;
 
-    for event in parser.push(body.as_bytes()) {
+    let mut events = parser.push(body.as_bytes());
+    events.extend(parser.finish());
+    for event in events {
         match event? {
             StreamEvent::Delta {
                 content,
@@ -695,6 +790,32 @@ fn map_read_error(error: std::io::Error) -> ProviderError {
     )
 }
 
+fn append_bounded_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    limit: usize,
+    http_status: Option<u16>,
+) -> Result<(), ProviderError> {
+    if chunk.len() > limit.saturating_sub(body.len()) {
+        return Err(response_too_large_error(limit, http_status));
+    }
+
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn response_too_large_error(limit: usize, http_status: Option<u16>) -> ProviderError {
+    let message = format!("provider response exceeded the {limit}-byte safety limit");
+    match http_status {
+        Some(status) => ProviderError::with_status(ProviderErrorKind::Parse, status, message),
+        None => ProviderError::new(ProviderErrorKind::Parse, message),
+    }
+}
+
+fn elapsed_millis(started_at: &Instant) -> u128 {
+    started_at.elapsed().as_micros().saturating_add(999) / 1_000
+}
+
 fn cancelled_error() -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::Cancelled,
@@ -703,7 +824,15 @@ fn cancelled_error() -> ProviderError {
 }
 
 fn stream_chunk_has_content(parser: &mut StreamParser, chunk: &[u8]) -> bool {
-    parser.push(chunk).into_iter().any(|event| {
+    stream_events_have_content(parser.push(chunk))
+}
+
+fn stream_finish_has_content(parser: &mut StreamParser) -> bool {
+    stream_events_have_content(parser.finish())
+}
+
+fn stream_events_have_content(events: Vec<Result<StreamEvent, ProviderError>>) -> bool {
+    events.into_iter().any(|event| {
         matches!(
             event,
             Ok(StreamEvent::Delta { content, .. }) if !content.is_empty()
@@ -767,7 +896,7 @@ mod tests {
         let request = build(
             ProviderKind::DeepSeek,
             ProviderOptions {
-                reasoning_effort: Some(ReasoningEffort::High),
+                reasoning_effort: Some(ReasoningEffort::Max),
                 thinking: Some(true),
                 thinking_budget: Some(2048),
                 ..ProviderOptions::default()
@@ -783,7 +912,7 @@ mod tests {
         assert_eq!(body["model"], "deepseek-v4-flash");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
-        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["thinking"]["type"], "enabled");
         assert!(body.get("thinking_budget").is_none());
         assert!(!format!("{request:?}").contains("contract-secret-1234"));
@@ -815,8 +944,8 @@ mod tests {
     fn qwen_contract_expands_workspace_placeholder_in_base_url() {
         let mut profile = profile(ProviderKind::Qwen);
         profile.base_url =
-            "https://{workspace_id}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1".to_owned();
-        profile.options.workspace_id = Some("ws_example-1".to_owned());
+            "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1".to_owned();
+        profile.options.workspace_id = Some("ws-example-1".to_owned());
 
         let request = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
             &profile,
@@ -827,7 +956,7 @@ mod tests {
 
         assert_eq!(
             request.url,
-            "https://ws_example-1.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+            "https://ws-example-1.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
         );
     }
 
@@ -959,6 +1088,41 @@ mod tests {
     }
 
     #[test]
+    fn json_completion_metadata_is_parsed_but_cannot_fake_stream_latency() {
+        let body = r#"{"model":"mock-json-model","choices":[{"message":{"content":"pong"}}],"usage":null}"#;
+        let (model, usage) =
+            parse_chat_completion_metadata(body).expect("valid JSON completion parses");
+        assert_eq!(model.as_deref(), Some("mock-json-model"));
+        assert_eq!(usage, None);
+
+        let adapter = OpenAiCompatibleAdapter::new(MockTransport::new(TransportResponse {
+            status: 200,
+            body: body.to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 5,
+        }));
+        let result = adapter.test_connection(
+            &profile(ProviderKind::DeepSeek),
+            &ApiSecret::new("contract-secret-1234"),
+        );
+
+        assert_eq!(result.status, crate::types::ConnectionTestStatus::Failed);
+        assert_eq!(result.error_type.as_deref(), Some("parse"));
+        assert_eq!(result.first_token_latency_ms, None);
+    }
+
+    #[test]
+    fn json_error_inside_success_status_is_not_accepted_as_a_completion() {
+        let error = parse_chat_completion_metadata(
+            r#"{"error":{"type":"upstream_error","message":"generation failed"}}"#,
+        )
+        .expect_err("JSON error envelope is rejected");
+
+        assert_eq!(error.kind, ProviderErrorKind::Http);
+        assert!(error.message.contains("generation failed"));
+    }
+
+    #[test]
     fn connection_test_maps_error_response_without_full_body() {
         let transport = MockTransport::new(TransportResponse {
             status: 401,
@@ -980,6 +1144,21 @@ mod tests {
     }
 
     #[test]
+    fn transport_response_debug_redacts_complete_body() {
+        let response = TransportResponse {
+            status: 401,
+            body: "provider body with contract-secret-1234".to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 6,
+        };
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("provider body"));
+        assert!(!debug.contains("contract-secret-1234"));
+    }
+
+    #[test]
     fn first_content_token_ignores_keepalive_role_and_empty_deltas() {
         let mut parser = StreamParser::new();
 
@@ -991,6 +1170,33 @@ mod tests {
             &mut parser,
             b"data: {\"choices\":[{\"delta\":{\"content\":\"p\"}}]}\n\n"
         ));
+    }
+
+    #[test]
+    fn first_content_token_is_detected_when_eof_terminates_the_event() {
+        let mut parser = StreamParser::new();
+
+        assert!(!stream_chunk_has_content(
+            &mut parser,
+            br#"data: {"choices":[{"delta":{"content":"pong"}}]}"#
+        ));
+        assert!(stream_finish_has_content(&mut parser));
+    }
+
+    #[test]
+    fn response_buffer_limit_rejects_oversize_chunk_without_retaining_it() {
+        let mut body = b"1234".to_vec();
+        append_bounded_response_chunk(&mut body, b"5678", 8, Some(200))
+            .expect("response at the exact limit is accepted");
+        let error =
+            append_bounded_response_chunk(&mut body, b"secret-response-content", 8, Some(200))
+                .expect_err("response beyond the limit is rejected");
+
+        assert_eq!(body, b"12345678");
+        assert_eq!(error.kind, ProviderErrorKind::Parse);
+        assert_eq!(error.http_status, Some(200));
+        assert!(!error.message.contains("secret-response-content"));
+        assert!(error.message.contains("8-byte safety limit"));
     }
 
     #[test]
