@@ -76,6 +76,7 @@ pub fn run() {
             commands::legal::get_law_relations,
             commands::legal::find_legal_answer_candidates,
             commands::legal::answer_legal_question,
+            commands::legal::cancel_legal_answer,
             commands::provider::list_provider_profiles,
             commands::provider::upsert_provider_profile,
             commands::provider::delete_provider_profile,

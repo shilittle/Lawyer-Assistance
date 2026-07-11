@@ -800,6 +800,41 @@ mod tests {
         }
     }
 
+    fn insert_historical_civil_code_version(connection: &rusqlite::Connection) {
+        connection
+            .execute_batch(
+                "
+                INSERT INTO law_versions (
+                  id, document_id, version_label, status, effective_from, effective_to,
+                  published_on, source_reference
+                ) VALUES (
+                  'cn-civil-code-20150101', 'cn-civil-code', '2015年历史测试版本',
+                  'repealed', '2015-01-01', '2020-12-31', '2014-12-01', '测试 fixture'
+                );
+                INSERT INTO law_articles (
+                  id, document_id, version_id, article_number, article_order, title, content, updated_on
+                ) VALUES (
+                  'cn-civil-code-20150101-577', 'cn-civil-code', 'cn-civil-code-20150101',
+                  '第五百七十七条', 577, '违约责任历史版本',
+                  '历史版本规定当事人应当承担违约责任。', '2026-07-10'
+                );
+                INSERT INTO citation_metadata (id, article_id, citation_id, canonical_label) VALUES (
+                  'cite-civil-code-old-577', 'cn-civil-code-20150101-577',
+                  'law:cn-civil-code:cn-civil-code-20150101:art:577',
+                  '《中华人民共和国民法典》第五百七十七条（历史测试版本）'
+                );
+                INSERT INTO law_articles_fts (
+                  rowid, article_id, document_id, version_id, document_title,
+                  article_number, article_title, content
+                )
+                SELECT rowid, id, document_id, version_id, '中华人民共和国民法典',
+                       article_number, title, content
+                FROM law_articles WHERE id = 'cn-civil-code-20150101-577';
+                ",
+            )
+            .expect("historical fixture version inserts");
+    }
+
     #[test]
     fn parser_reports_valid_invalid_duplicate_and_cross_paragraph_markers() {
         let answer = concat!(
@@ -903,5 +938,115 @@ mod tests {
         assert!(!context.sources.is_empty());
         assert!(context.prompt.contains("[SRC:"));
         assert!(context.prompt.contains("不得编造 source id"));
+    }
+
+    #[test]
+    fn context_builder_includes_multiple_laws() {
+        let connection = fixture_connection();
+        let request = LegalAnswerCandidatesRequest {
+            question: String::new(),
+            law_name: None,
+            article_number: None,
+            keywords: Vec::new(),
+            case_date: Some("2024-01-01".to_owned()),
+            effectiveness_levels: Vec::new(),
+            include_expired: false,
+            limit: Some(16),
+        };
+
+        let context = build_legal_answer_context(&connection, &request).expect("context builds");
+        let document_ids = context
+            .sources
+            .iter()
+            .map(|source| source.document_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(document_ids.contains("cn-civil-code"));
+        assert!(document_ids.contains("cn-labor-contract-law"));
+    }
+
+    #[test]
+    fn context_builder_can_include_multiple_versions_when_fixture_supplies_them() {
+        let connection = fixture_connection();
+        insert_historical_civil_code_version(&connection);
+        let request = LegalAnswerCandidatesRequest {
+            question: String::new(),
+            law_name: Some("中华人民共和国民法典".to_owned()),
+            article_number: Some("第五百七十七条".to_owned()),
+            keywords: Vec::new(),
+            case_date: None,
+            effectiveness_levels: Vec::new(),
+            include_expired: true,
+            limit: Some(16),
+        };
+
+        let context = build_legal_answer_context(&connection, &request).expect("context builds");
+        let versions = context
+            .sources
+            .iter()
+            .map(|source| source.version_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(versions.contains("cn-civil-code-20150101"));
+        assert!(versions.contains("cn-civil-code-20210101"));
+    }
+
+    #[test]
+    fn context_builder_filters_expired_versions_by_case_date() {
+        let connection = fixture_connection();
+        insert_historical_civil_code_version(&connection);
+        let mut request = LegalAnswerCandidatesRequest {
+            question: "违约责任".to_owned(),
+            law_name: Some("中华人民共和国民法典".to_owned()),
+            article_number: None,
+            keywords: vec!["违约责任".to_owned()],
+            case_date: Some("2019-01-01".to_owned()),
+            effectiveness_levels: Vec::new(),
+            include_expired: false,
+            limit: Some(16),
+        };
+
+        let historical =
+            build_legal_answer_context(&connection, &request).expect("historical context builds");
+        assert!(historical
+            .sources
+            .iter()
+            .any(|source| source.version_id == "cn-civil-code-20150101"));
+        assert!(historical
+            .sources
+            .iter()
+            .all(|source| source.version_id != "cn-civil-code-20210101"));
+
+        request.case_date = Some("2024-01-01".to_owned());
+        let current =
+            build_legal_answer_context(&connection, &request).expect("current context builds");
+        assert!(current
+            .sources
+            .iter()
+            .any(|source| source.version_id == "cn-civil-code-20210101"));
+        assert!(current
+            .sources
+            .iter()
+            .all(|source| source.version_id != "cn-civil-code-20150101"));
+    }
+
+    #[test]
+    fn context_prompt_truncates_long_articles_and_records_warning() {
+        let connection = fixture_connection();
+        let mut source = source_by_citation_id(
+            &connection,
+            "law:cn-civil-code:cn-civil-code-20210101:art:577",
+        )
+        .expect("source lookup succeeds")
+        .expect("source exists");
+        source.content = format!("{}TAIL", "长".repeat(MAX_CONTEXT_CHARS_PER_SOURCE + 20));
+        let query = extract_structured_query(&request());
+        let mut warnings = Vec::new();
+
+        let prompt = assemble_source_bounded_prompt(&query, &[source.clone()], &mut warnings);
+
+        assert!(warnings.contains(&format!("source_truncated:{}", source.source_id)));
+        assert!(prompt.contains("长长长"));
+        assert!(!prompt.contains("TAIL"));
     }
 }

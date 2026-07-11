@@ -191,6 +191,7 @@ export interface CitationValidationReport {
 }
 
 export interface LegalAnswerRequest extends LegalAnswerCandidatesRequest {
+  requestId: string;
   providerId: string;
   temperature?: number | null;
   maxTokens?: number | null;
@@ -199,10 +200,18 @@ export interface LegalAnswerRequest extends LegalAnswerCandidatesRequest {
 export type LegalAnswerStreamEventType = "delta" | "usage" | "error" | "done";
 
 export interface LegalAnswerStreamEvent {
+  requestId: string;
   eventType: LegalAnswerStreamEventType;
   content?: string | null;
+  usage?: LegalAnswerStreamUsage | null;
   errorType?: string | null;
   message?: string | null;
+}
+
+export interface LegalAnswerStreamUsage {
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  totalTokens?: number | null;
 }
 
 export interface LegalAnswerResponse {
@@ -210,6 +219,14 @@ export interface LegalAnswerResponse {
   answer: string;
   context: LegalAnswerContext;
   citationReport: CitationValidationReport;
-  streamEvents: LegalAnswerStreamEvent[];
   recordId?: string | null;
+}
+
+export interface CancelLegalAnswerRequest {
+  requestId: string;
+}
+
+export interface CancelLegalAnswerResponse {
+  requestId: string;
+  cancelled: boolean;
 }

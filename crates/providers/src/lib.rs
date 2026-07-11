@@ -6,8 +6,9 @@ pub mod types;
 pub mod windows_credentials;
 
 pub use adapter::{
-    ChatTransport, OpenAiCompatibleAdapter, RequestCancellation, ReqwestTransport, TransportHeader,
-    TransportRequest, TransportResponse,
+    ChatTransport, OpenAiCompatibleAdapter, RequestCancellation, ReqwestStreamingTransport,
+    ReqwestTransport, StreamingTransportResponse, TransportHeader, TransportRequest,
+    TransportResponse,
 };
 pub use credentials::{ApiSecret, CredentialStore, ProviderCredentialKey};
 pub use redaction::redact_sensitive;

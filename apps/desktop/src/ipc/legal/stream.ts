@@ -1,0 +1,131 @@
+import type {
+  LegalAnswerStreamEvent,
+  LegalAnswerStreamUsage,
+} from "./types";
+
+export type LegalAnswerStreamStatus =
+  | "idle"
+  | "connecting"
+  | "streaming"
+  | "cancelling"
+  | "finalizing"
+  | "cancelled"
+  | "error"
+  | "done";
+
+export interface LegalAnswerStreamState {
+  requestId?: string | null;
+  status: LegalAnswerStreamStatus;
+  answer: string;
+  usage?: LegalAnswerStreamUsage | null;
+  errorType?: string | null;
+  message?: string | null;
+}
+
+export const INITIAL_LEGAL_ANSWER_STREAM_STATE: LegalAnswerStreamState = {
+  requestId: null,
+  status: "idle",
+  answer: "",
+  usage: null,
+  errorType: null,
+  message: null,
+};
+
+export function startLegalAnswerStream(
+  requestId: string,
+): LegalAnswerStreamState {
+  return {
+    requestId,
+    status: "connecting",
+    answer: "",
+    usage: null,
+    errorType: null,
+    message: null,
+  };
+}
+
+export function markLegalAnswerCancelling(
+  state: LegalAnswerStreamState,
+): LegalAnswerStreamState {
+  if (!isLegalAnswerStreamCancellable(state)) {
+    return state;
+  }
+
+  return { ...state, status: "cancelling", message: "正在取消生成…" };
+}
+
+export function reduceLegalAnswerStreamEvent(
+  state: LegalAnswerStreamState,
+  event: LegalAnswerStreamEvent,
+): LegalAnswerStreamState {
+  if (state.requestId !== event.requestId) {
+    return state;
+  }
+  if (["finalizing", "cancelled", "error", "done"].includes(state.status)) {
+    return state;
+  }
+  if (
+    state.status === "cancelling" &&
+    (event.eventType === "delta" || event.eventType === "usage")
+  ) {
+    return state;
+  }
+
+  switch (event.eventType) {
+    case "delta":
+      return {
+        ...state,
+        status: "streaming",
+        answer: state.answer + (event.content ?? ""),
+      };
+    case "usage":
+      return { ...state, usage: event.usage ?? null };
+    case "error":
+      return {
+        ...state,
+        status: event.errorType === "cancelled" ? "cancelled" : "error",
+        errorType: event.errorType ?? "stream_error",
+        message: event.message ?? "生成过程中发生错误",
+      };
+    case "done":
+      return {
+        ...state,
+        // The channel event is emitted after validation/persistence but just
+        // before the invoke Promise resolves with the citation report. Keep a
+        // distinct state so the UI does not claim it already has final data.
+        status: "finalizing",
+        message: "引用已校验并保存，正在载入最终结果",
+      };
+  }
+}
+
+export function isLegalAnswerStreamActive(
+  state: LegalAnswerStreamState,
+): boolean {
+  return ["connecting", "streaming", "cancelling", "finalizing"].includes(
+    state.status,
+  );
+}
+
+export function isLegalAnswerStreamCancellable(
+  state: LegalAnswerStreamState,
+): boolean {
+  return ["connecting", "streaming"].includes(state.status);
+}
+
+export function formatLegalAnswerStreamStatus(
+  state: LegalAnswerStreamState,
+): string {
+  const labels: Record<LegalAnswerStreamStatus, string> = {
+    idle: "等待生成",
+    connecting: "正在连接 Provider",
+    streaming: "正在生成（引用未校验）",
+    cancelling: "正在取消",
+    finalizing: "引用已校验，正在载入结果",
+    cancelled: "已取消",
+    error: state.message ?? "生成失败",
+    done: "已完成并校验引用",
+  };
+
+  return labels[state.status];
+}

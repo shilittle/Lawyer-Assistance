@@ -1,6 +1,8 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 import type {
+  CancelLegalAnswerRequest,
+  CancelLegalAnswerResponse,
   GetArticleRequest,
   GetArticleResponse,
   GetLawRelationsRequest,
@@ -11,6 +13,7 @@ import type {
   LegalAnswerCandidatesResponse,
   LegalAnswerRequest,
   LegalAnswerResponse,
+  LegalAnswerStreamEvent,
   SearchArticlesRequest,
   SearchArticlesResponse,
   SearchLawsRequest,
@@ -57,6 +60,18 @@ export function findLegalAnswerCandidates(
 
 export function answerLegalQuestion(
   request: LegalAnswerRequest,
+  onEvent: (event: LegalAnswerStreamEvent) => void,
 ): Promise<LegalAnswerResponse> {
-  return invoke<LegalAnswerResponse>("answer_legal_question", { request });
+  const eventChannel = new Channel<LegalAnswerStreamEvent>(onEvent);
+
+  return invoke<LegalAnswerResponse>("answer_legal_question", {
+    request,
+    onEvent: eventChannel,
+  });
+}
+
+export function cancelLegalAnswer(
+  request: CancelLegalAnswerRequest,
+): Promise<CancelLegalAnswerResponse> {
+  return invoke<CancelLegalAnswerResponse>("cancel_legal_answer", { request });
 }

@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   addCaseLegalBasis,
@@ -43,6 +43,7 @@ import { healthCheck } from "./ipc/health/client";
 import type { HealthCheckResponse } from "./ipc/health/types";
 import {
   answerLegalQuestion,
+  cancelLegalAnswer,
   findLegalAnswerCandidates,
   getArticle,
   getLawRelations,
@@ -57,6 +58,15 @@ import {
   formatLegalSourceLabel,
   formatStatus,
 } from "./ipc/legal/format";
+import {
+  formatLegalAnswerStreamStatus,
+  INITIAL_LEGAL_ANSWER_STREAM_STATE,
+  isLegalAnswerStreamActive,
+  isLegalAnswerStreamCancellable,
+  markLegalAnswerCancelling,
+  reduceLegalAnswerStreamEvent,
+  startLegalAnswerStream,
+} from "./ipc/legal/stream";
 import type {
   ArticleSearchResult,
   LawArticleDetail,
@@ -315,6 +325,14 @@ function splitKeywords(value: string): string[] {
     .filter(Boolean);
 }
 
+function createLegalAnswerRequestId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `answer-${crypto.randomUUID()}`;
+  }
+
+  return `answer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("search");
   const [health, setHealth] = useState<HealthState>({ kind: "loading" });
@@ -347,6 +365,10 @@ export function App() {
   const [qaProviderId, setQaProviderId] = useState("");
   const [qaContext, setQaContext] = useState<LegalAnswerContext | null>(null);
   const [qaAnswer, setQaAnswer] = useState<LegalAnswerResponse | null>(null);
+  const [qaStream, setQaStream] = useState(
+    INITIAL_LEGAL_ANSWER_STREAM_STATE,
+  );
+  const activeQaRequestId = useRef<string | null>(null);
   const [selectedQaSourceId, setSelectedQaSourceId] = useState<string | null>(
     null,
   );
@@ -468,6 +490,32 @@ export function App() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (viewMode !== "qa" && activeQaRequestId.current) {
+      const requestId = activeQaRequestId.current;
+      activeQaRequestId.current = null;
+      setQaStream((current) => ({
+        ...current,
+        requestId: null,
+        status: "cancelled",
+        errorType: "cancelled",
+        message: "离开问答页面，生成已取消",
+      }));
+      void cancelLegalAnswer({ requestId });
+    }
+  }, [viewMode]);
+
+  useEffect(
+    () => () => {
+      const requestId = activeQaRequestId.current;
+      if (requestId) {
+        activeQaRequestId.current = null;
+        void cancelLegalAnswer({ requestId });
+      }
+    },
+    [],
+  );
 
   const refreshKeyStatus = useCallback(async (profile: ProviderProfile) => {
     const response = await getProviderApiKeyStatus({
@@ -729,6 +777,7 @@ export function App() {
 
     setQaState({ kind: "loading" });
     setQaAnswer(null);
+    setQaStream(INITIAL_LEGAL_ANSWER_STREAM_STATE);
 
     try {
       const response = await findLegalAnswerCandidates(request);
@@ -752,21 +801,82 @@ export function App() {
       return;
     }
 
+    if (activeQaRequestId.current) {
+      await cancelCurrentLegalAnswer();
+    }
+
+    const requestId = createLegalAnswerRequestId();
+    activeQaRequestId.current = requestId;
     setQaState({ kind: "loading" });
+    setQaAnswer(null);
+    setQaStream(startLegalAnswerStream(requestId));
 
     try {
-      const response = await answerLegalQuestion({
-        ...request,
-        providerId: qaProviderId,
-        temperature: 0.1,
-        maxTokens: 1024,
-      });
+      const response = await answerLegalQuestion(
+        {
+          ...request,
+          requestId,
+          providerId: qaProviderId,
+          temperature: 0.1,
+          maxTokens: 1024,
+        },
+        (streamEvent) => {
+          setQaStream((current) =>
+            reduceLegalAnswerStreamEvent(current, streamEvent),
+          );
+        },
+      );
+      if (activeQaRequestId.current !== requestId) {
+        return;
+      }
       setQaAnswer(response);
       setQaContext(response.context);
       setSelectedQaSourceId(response.context.sources[0]?.sourceId ?? null);
+      setQaStream((current) => ({
+        ...current,
+        status: "done",
+        answer: response.answer,
+        message: "引用已由 Rust 校验，回答已保存",
+      }));
       setQaState({ kind: "idle" });
     } catch (error: unknown) {
-      setQaState({ kind: "error", message: errorMessage(error) });
+      if (activeQaRequestId.current === requestId) {
+        const message = errorMessage(error);
+        setQaStream((current) =>
+          current.status === "cancelled" || current.status === "error"
+            ? current
+            : {
+                ...current,
+                status: message.toLowerCase().includes("cancel")
+                  ? "cancelled"
+                  : "error",
+                message,
+              },
+        );
+        setQaState({ kind: "idle" });
+      }
+    } finally {
+      if (activeQaRequestId.current === requestId) {
+        activeQaRequestId.current = null;
+      }
+    }
+  }
+
+  async function cancelCurrentLegalAnswer() {
+    const requestId = activeQaRequestId.current;
+    if (!requestId) {
+      return;
+    }
+
+    setQaStream((current) => markLegalAnswerCancelling(current));
+    try {
+      await cancelLegalAnswer({ requestId });
+    } catch (error: unknown) {
+      setQaStream((current) => ({
+        ...current,
+        status: "error",
+        message: errorMessage(error),
+      }));
     }
   }
 
@@ -1478,7 +1588,7 @@ export function App() {
           <aside className="panel qa-control-panel" aria-labelledby="qa-control-title">
             <div className="panel-heading">
               <h2 id="qa-control-title">问题</h2>
-              <span>{qaState.kind === "loading" ? "处理中" : "本地优先"}</span>
+              <span>{formatLegalAnswerStreamStatus(qaStream)}</span>
             </div>
             <form className="qa-form" onSubmit={submitLegalAnswer}>
               <label>
@@ -1552,13 +1662,25 @@ export function App() {
               <div className="command-row">
                 <button
                   type="button"
+                  disabled={isLegalAnswerStreamActive(qaStream)}
                   onClick={() => void previewLegalAnswerContext()}
                 >
                   本地检索来源
                 </button>
-                <button type="submit" disabled={!qaProviderId}>
+                <button
+                  type="submit"
+                  disabled={!qaProviderId || isLegalAnswerStreamActive(qaStream)}
+                >
                   生成带引用回答
                 </button>
+                {isLegalAnswerStreamCancellable(qaStream) ? (
+                  <button
+                    type="button"
+                    onClick={() => void cancelCurrentLegalAnswer()}
+                  >
+                    取消生成
+                  </button>
+                ) : null}
               </div>
             </form>
             {qaState.kind === "error" ? (
@@ -1607,11 +1729,13 @@ export function App() {
               <span>
                 {qaAnswer
                   ? `${qaAnswer.citationReport.validCount} 个有效引用`
-                  : "等待生成"}
+                  : formatLegalAnswerStreamStatus(qaStream)}
               </span>
             </div>
-            {qaState.kind === "loading" ? (
-              <p className="empty-state">正在检索来源或等待 provider 返回。</p>
+            {qaStream.status === "error" || qaStream.status === "cancelled" ? (
+              <p className="error-text">
+                {qaStream.message ?? formatLegalAnswerStreamStatus(qaStream)}
+              </p>
             ) : null}
             {qaAnswer ? (
               <>
@@ -1623,7 +1747,11 @@ export function App() {
                 </article>
                 <div className="answer-meta-row">
                   <span>记录：{qaAnswer.recordId ?? "未保存"}</span>
-                  <span>{qaAnswer.streamEvents.length} 个流式事件</span>
+                  <span>
+                    {qaStream.usage?.totalTokens
+                      ? `${qaStream.usage.totalTokens} tokens`
+                      : "用量未返回"}
+                  </span>
                 </div>
                 <section className="detail-section" aria-labelledby="qa-citation-title">
                   <div className="section-heading">
@@ -1659,6 +1787,17 @@ export function App() {
                     ) : null}
                   </div>
                 </section>
+              </>
+            ) : qaStream.answer ? (
+              <>
+                <p className="risk-banner">
+                  {qaStream.status === "finalizing"
+                    ? "回答已由 Rust 校验并保存，正在载入引用明细。"
+                    : "以下为生成中的原始增量，引用尚未由 Rust 校验，不能作为可信来源。"}
+                </p>
+                <article className="answer-box" aria-live="polite">
+                  <p>{qaStream.answer}</p>
+                </article>
               </>
             ) : (
               <p className="empty-state">
