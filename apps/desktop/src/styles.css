@@ -189,6 +189,7 @@ h1 {
 .provider-form select,
 .provider-form textarea,
 .provider-subsection input,
+.provider-subsection select,
 .provider-subsection textarea,
 .qa-form input,
 .qa-form select,
@@ -210,6 +211,7 @@ h1 {
 .provider-form input,
 .provider-form select,
 .provider-subsection input,
+.provider-subsection select,
 .qa-form input,
 .qa-form select,
 .case-form input,
@@ -236,6 +238,7 @@ h1 {
 .provider-form select:focus,
 .provider-form textarea:focus,
 .provider-subsection input:focus,
+.provider-subsection select:focus,
 .provider-subsection textarea:focus,
 .qa-form input:focus,
 .qa-form select:focus,
@@ -643,6 +646,118 @@ h1 {
   align-items: center;
   color: #24313b;
   font-size: 0.9rem;
+}
+
+.material-select {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 7px;
+  align-items: center;
+}
+
+.material-select input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+.privacy-note,
+.review-banner,
+.extraction-failure {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  border: 1px solid #d7e1de;
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #f7faf9;
+  color: #52635b;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.review-banner {
+  border-color: #d9bd7c;
+  background: #fff9eb;
+  color: #684b15;
+}
+
+.extraction-failure {
+  border-color: #e4b4ab;
+  background: #fff7f5;
+  color: #8f3322;
+}
+
+.extraction-failure pre {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid #ead7d2;
+  border-radius: 4px;
+  padding: 8px;
+  background: #ffffff;
+  color: #27343c;
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.extraction-review {
+  display: grid;
+  gap: 10px;
+}
+
+.extraction-review h4 {
+  margin: 4px 0 0;
+  color: #24343c;
+  font-size: 0.84rem;
+}
+
+.review-fields {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.review-card {
+  display: grid;
+  gap: 7px;
+  border-left: 3px solid #d69c32;
+  padding-left: 9px;
+}
+
+.review-card .review-remove {
+  justify-self: start;
+  min-height: 28px;
+  border-color: #d6aaa2;
+  background: #fff7f5;
+  color: #8f3322;
+  padding: 0 9px;
+  font-size: 0.74rem;
+}
+
+.review-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.review-actions .secondary-action {
+  border-color: #aab8b3;
+  background: #f5f7f6;
+  color: #46564f;
+}
+
+.review-actions .confirm-action {
+  border-color: #237462;
+  background: #eaf7f3;
+  color: #15584a;
+}
+
+.extraction-uncertainty-list {
+  padding: 0;
 }
 
 .qa-layout {

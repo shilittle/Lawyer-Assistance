@@ -7,15 +7,19 @@ import type {
   AnalyzeCaseGapsResponse,
   CaseProjectResponse,
   CaseProjectsResponse,
+  ConfirmStructuredCaseExtractionRequest,
+  ConfirmStructuredCaseExtractionResponse,
   DeleteCaseEntityRequest,
   DeleteCaseEntityResponse,
   DeleteCaseProjectRequest,
   DeleteCaseProjectResponse,
+  DiscardStructuredCaseExtractionRequest,
+  DiscardStructuredCaseExtractionResponse,
   EntitySavedResponse,
   GetCaseWorkspaceRequest,
   GetCaseWorkspaceResponse,
-  ParseStructuredCaseExtractionRequest,
-  ParseStructuredCaseExtractionResponse,
+  GenerateStructuredCaseExtractionResponse,
+  StructuredCaseExtractionRequest,
   UpsertCaseFileRequest,
   UpsertCaseFactRequest,
   UpsertCasePartyRequest,
@@ -103,11 +107,29 @@ export function analyzeCaseGaps(
   });
 }
 
-export function parseStructuredCaseExtraction(
-  request: ParseStructuredCaseExtractionRequest,
-): Promise<ParseStructuredCaseExtractionResponse> {
-  return invoke<ParseStructuredCaseExtractionResponse>(
-    "parse_structured_case_extraction",
+export function generateStructuredCaseExtraction(
+  request: StructuredCaseExtractionRequest,
+): Promise<GenerateStructuredCaseExtractionResponse> {
+  return invoke<GenerateStructuredCaseExtractionResponse>(
+    "generate_structured_case_extraction",
+    { request },
+  );
+}
+
+export function confirmStructuredCaseExtraction(
+  request: ConfirmStructuredCaseExtractionRequest,
+): Promise<ConfirmStructuredCaseExtractionResponse> {
+  return invoke<ConfirmStructuredCaseExtractionResponse>(
+    "confirm_structured_case_extraction",
+    { request },
+  );
+}
+
+export function discardStructuredCaseExtraction(
+  request: DiscardStructuredCaseExtractionRequest,
+): Promise<DiscardStructuredCaseExtractionResponse> {
+  return invoke<DiscardStructuredCaseExtractionResponse>(
+    "discard_structured_case_extraction",
     { request },
   );
 }
