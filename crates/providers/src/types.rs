@@ -12,6 +12,7 @@ pub enum ProviderKind {
     Qwen,
     SiliconFlow,
     VolcengineArk,
+    Custom,
 }
 
 impl ProviderKind {
@@ -21,6 +22,7 @@ impl ProviderKind {
             Self::Qwen => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Self::SiliconFlow => "https://api.siliconflow.cn/v1",
             Self::VolcengineArk => "https://ark.cn-beijing.volces.com/api/v3",
+            Self::Custom => "",
         }
     }
 
@@ -30,6 +32,7 @@ impl ProviderKind {
             Self::Qwen => "qwen-plus",
             Self::SiliconFlow => "deepseek-ai/DeepSeek-V3.2",
             Self::VolcengineArk => "doubao-seed-2-0-lite-260215",
+            Self::Custom => "",
         }
     }
 
@@ -43,6 +46,7 @@ impl ProviderKind {
                 enable_thinking: Some(false),
                 ..ProviderOptions::default()
             },
+            Self::Custom => ProviderOptions::default(),
         }
     }
 }
@@ -65,6 +69,13 @@ impl ProviderCapabilities {
             custom_model_id: true,
             custom_base_url: true,
             reasoning: true,
+        }
+    }
+
+    pub fn custom_openai_compatible_defaults() -> Self {
+        Self {
+            reasoning: false,
+            ..Self::chat_defaults()
         }
     }
 }
@@ -111,7 +122,11 @@ impl ProviderProfile {
             model_id: kind.default_model_id().to_owned(),
             base_url: kind.default_base_url().to_owned(),
             credential_account_id: "default".to_owned(),
-            capabilities: ProviderCapabilities::chat_defaults(),
+            capabilities: if kind == ProviderKind::Custom {
+                ProviderCapabilities::custom_openai_compatible_defaults()
+            } else {
+                ProviderCapabilities::chat_defaults()
+            },
             options: kind.default_options(),
         }
     }
@@ -313,6 +328,38 @@ impl Error for ProviderError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_kind_serde_wire_contract_is_stable_and_unknown_values_fail_closed() {
+        let cases = [
+            (ProviderKind::DeepSeek, "deep_seek"),
+            (ProviderKind::Qwen, "qwen"),
+            (ProviderKind::SiliconFlow, "silicon_flow"),
+            (ProviderKind::VolcengineArk, "volcengine_ark"),
+            (ProviderKind::Custom, "custom"),
+        ];
+
+        for (kind, wire_value) in cases {
+            assert_eq!(
+                serde_json::to_value(kind).expect("provider kind serializes"),
+                serde_json::Value::String(wire_value.to_owned())
+            );
+            assert_eq!(
+                serde_json::from_value::<ProviderKind>(serde_json::Value::String(
+                    wire_value.to_owned()
+                ))
+                .expect("known provider kind deserializes"),
+                kind
+            );
+        }
+
+        assert!(
+            serde_json::from_value::<ProviderKind>(serde_json::Value::String(
+                "future_provider".to_owned()
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn provider_error_redacts_debug_and_display() {

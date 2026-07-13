@@ -5,6 +5,18 @@ use std::{
     fmt::{self, Display},
 };
 
+const MAX_EXTRACTED_LABEL_BYTES: usize = 1_024;
+const MAX_EXTRACTED_REFERENCE_BYTES: usize = 256;
+const MAX_EXTRACTED_SOURCE_BYTES: usize = 16 * 1_024;
+const MAX_EXTRACTED_TEXT_BYTES: usize = 64 * 1_024;
+pub const MAX_EXTRACTED_PARTIES: usize = 128;
+pub const MAX_EXTRACTED_FACTS: usize = 256;
+pub const MAX_EXTRACTED_EVIDENCE: usize = 256;
+pub const MAX_EXTRACTED_LEGAL_ISSUES: usize = 128;
+pub const MAX_EXTRACTED_UNCERTAINTIES: usize = 256;
+pub const MAX_EVIDENCE_REFERENCES_PER_FACT: usize = 64;
+pub const MAX_TOTAL_EVIDENCE_REFERENCES: usize = 1_024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseProjectStatus {
@@ -245,6 +257,10 @@ pub fn analyze_case_gaps(
         .collect::<HashSet<_>>();
     let linked_fact_ids = evidence_links
         .iter()
+        .filter(|link| {
+            fact_ids.contains(link.fact_id.as_str())
+                && evidence_ids.contains(link.evidence_id.as_str())
+        })
         .map(|link| link.fact_id.as_str())
         .collect::<HashSet<_>>();
 
@@ -545,9 +561,9 @@ pub fn parse_structured_case_extraction(
     raw_output: &str,
 ) -> Result<StructuredCaseExtraction, StructuredExtractionParseError> {
     let extraction =
-        serde_json::from_str::<StructuredCaseExtraction>(raw_output).map_err(|error| {
+        serde_json::from_str::<StructuredCaseExtraction>(raw_output).map_err(|_| {
             StructuredExtractionParseError {
-                message: error.to_string(),
+                message: "structured extraction JSON did not match the required schema".to_owned(),
             }
         })?;
     validate_structured_case_extraction(&extraction)?;
@@ -558,6 +574,7 @@ pub fn parse_structured_case_extraction(
 pub fn validate_structured_case_extraction(
     extraction: &StructuredCaseExtraction,
 ) -> Result<(), StructuredExtractionParseError> {
+    validate_extraction_bounds(extraction)?;
     validate_extraction_dates(extraction)?;
 
     if extraction
@@ -620,16 +637,14 @@ pub fn validate_structured_case_extraction(
         for evidence_number in &fact.evidence_numbers {
             let evidence_number = evidence_number.trim();
             if evidence_number.is_empty() || !evidence_numbers.contains(evidence_number) {
-                return Err(extraction_validation_error(format!(
-                    "fact '{}' references an unknown evidence number",
-                    fact.title.trim()
-                )));
+                return Err(extraction_validation_error(
+                    "a fact references an unknown evidence number",
+                ));
             }
             if !fact_evidence_numbers.insert(evidence_number) {
-                return Err(extraction_validation_error(format!(
-                    "fact '{}' contains a duplicate evidence reference",
-                    fact.title.trim()
-                )));
+                return Err(extraction_validation_error(
+                    "a fact contains a duplicate evidence reference",
+                ));
             }
         }
     }
@@ -665,6 +680,146 @@ pub fn validate_structured_case_extraction(
     Ok(())
 }
 
+fn validate_extraction_bounds(
+    extraction: &StructuredCaseExtraction,
+) -> Result<(), StructuredExtractionParseError> {
+    use crate::validation::{self, TextMode};
+
+    for (field, count, max) in [
+        ("parties", extraction.parties.len(), MAX_EXTRACTED_PARTIES),
+        ("facts", extraction.facts.len(), MAX_EXTRACTED_FACTS),
+        (
+            "evidence",
+            extraction.evidence.len(),
+            MAX_EXTRACTED_EVIDENCE,
+        ),
+        (
+            "legalIssues",
+            extraction.legal_issues.len(),
+            MAX_EXTRACTED_LEGAL_ISSUES,
+        ),
+        (
+            "uncertainties",
+            extraction.uncertainties.len(),
+            MAX_EXTRACTED_UNCERTAINTIES,
+        ),
+    ] {
+        validation::item_count(field, count, max)
+            .map_err(|error| extraction_validation_error(error.to_string()))?;
+    }
+
+    for party in &extraction.parties {
+        validation::required_text(
+            "party.name",
+            &party.name,
+            MAX_EXTRACTED_LABEL_BYTES,
+            TextMode::SingleLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+    }
+
+    let mut total_evidence_references = 0usize;
+    for fact in &extraction.facts {
+        validation::required_text(
+            "fact.title",
+            &fact.title,
+            MAX_EXTRACTED_LABEL_BYTES,
+            TextMode::SingleLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        validation::bounded_text(
+            "fact.description",
+            &fact.description,
+            MAX_EXTRACTED_TEXT_BYTES,
+            TextMode::MultiLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        validation::required_string_list(
+            "fact.evidenceNumbers",
+            &fact.evidence_numbers,
+            MAX_EVIDENCE_REFERENCES_PER_FACT,
+            MAX_EXTRACTED_REFERENCE_BYTES,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        total_evidence_references = total_evidence_references
+            .checked_add(fact.evidence_numbers.len())
+            .ok_or_else(|| extraction_validation_error("evidence reference count overflow"))?;
+    }
+    validation::item_count(
+        "total evidence references",
+        total_evidence_references,
+        MAX_TOTAL_EVIDENCE_REFERENCES,
+    )
+    .map_err(|error| extraction_validation_error(error.to_string()))?;
+
+    for evidence in &extraction.evidence {
+        validation::required_text(
+            "evidence.evidenceNumber",
+            &evidence.evidence_number,
+            MAX_EXTRACTED_REFERENCE_BYTES,
+            TextMode::SingleLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        validation::required_text(
+            "evidence.title",
+            &evidence.title,
+            MAX_EXTRACTED_LABEL_BYTES,
+            TextMode::SingleLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        validation::bounded_text(
+            "evidence.source",
+            &evidence.source,
+            MAX_EXTRACTED_SOURCE_BYTES,
+            TextMode::MultiLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        validation::bounded_text(
+            "evidence.summary",
+            &evidence.summary,
+            MAX_EXTRACTED_TEXT_BYTES,
+            TextMode::MultiLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+    }
+
+    for issue in &extraction.legal_issues {
+        validation::required_text(
+            "legalIssue.title",
+            &issue.title,
+            MAX_EXTRACTED_LABEL_BYTES,
+            TextMode::SingleLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        for (field, value) in [
+            ("legalIssue.description", issue.description.as_str()),
+            ("legalIssue.claim", issue.claim.as_str()),
+        ] {
+            validation::bounded_text(field, value, MAX_EXTRACTED_TEXT_BYTES, TextMode::MultiLine)
+                .map_err(|error| extraction_validation_error(error.to_string()))?;
+        }
+    }
+
+    for uncertainty in &extraction.uncertainties {
+        validation::required_text(
+            "uncertainty.description",
+            &uncertainty.description,
+            MAX_EXTRACTED_TEXT_BYTES,
+            TextMode::MultiLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        validation::optional_text(
+            "uncertainty.relatedReference",
+            uncertainty.related_reference.as_deref(),
+            MAX_EXTRACTED_LABEL_BYTES,
+            TextMode::SingleLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
 fn validate_extraction_dates(
     extraction: &StructuredCaseExtraction,
 ) -> Result<(), StructuredExtractionParseError> {
@@ -677,7 +832,7 @@ fn validate_extraction_dates(
                 evidence.formed_on.as_deref().map(|date| ("formedOn", date))
             }))
     {
-        if !is_iso_calendar_date(date) {
+        if !crate::date::is_iso_calendar_date(date) {
             return Err(StructuredExtractionParseError {
                 message: format!("{label} must be a valid YYYY-MM-DD calendar date or null"),
             });
@@ -706,38 +861,6 @@ fn extraction_validation_error(message: impl Into<String>) -> StructuredExtracti
     StructuredExtractionParseError {
         message: message.into(),
     }
-}
-
-fn is_iso_calendar_date(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() != 10
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
-    {
-        return false;
-    }
-    let Ok(year) = value[0..4].parse::<u32>() else {
-        return false;
-    };
-    let Ok(month) = value[5..7].parse::<u32>() else {
-        return false;
-    };
-    let Ok(day) = value[8..10].parse::<u32>() else {
-        return false;
-    };
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
-        2 => 28,
-        _ => return false,
-    };
-
-    year > 0 && (1..=days_in_month).contains(&day)
 }
 
 pub fn parse_structured_case_extraction_with_repair(
@@ -857,6 +980,9 @@ mod tests {
         assert!(gaps
             .iter()
             .any(|gap| gap.kind == CaseGapKind::InvalidEvidenceId));
+        assert!(gaps
+            .iter()
+            .any(|gap| gap.kind == CaseGapKind::FactMissingEvidence));
     }
 
     #[test]
@@ -992,6 +1118,33 @@ mod tests {
     }
 
     #[test]
+    fn structured_extraction_bounds_arrays_and_text_without_rejecting_chinese() {
+        let mut extraction = parse_structured_case_extraction(valid_extraction_json())
+            .expect("baseline extraction parses");
+        extraction.parties[0].name = "中华人民共和国当事人".to_owned();
+        validate_structured_case_extraction(&extraction)
+            .expect("bounded Chinese extraction text is accepted");
+
+        extraction.parties = (0..=MAX_EXTRACTED_PARTIES)
+            .map(|index| ExtractedParty {
+                name: format!("当事人{index}"),
+                role: PartyRole::Other,
+            })
+            .collect();
+        let error = validate_structured_case_extraction(&extraction)
+            .expect_err("oversized model entity array is rejected");
+        assert!(error.message.contains("item limit"));
+
+        let mut extraction = parse_structured_case_extraction(valid_extraction_json())
+            .expect("baseline extraction parses");
+        extraction.facts[0].description =
+            "sensitive-description-".to_owned() + &"x".repeat(MAX_EXTRACTED_TEXT_BYTES);
+        let error = validate_structured_case_extraction(&extraction)
+            .expect_err("oversized extracted text is rejected");
+        assert!(!error.message.contains("sensitive-description"));
+    }
+
+    #[test]
     fn rejects_missing_fields_type_errors_and_extra_fields() {
         assert!(parse_structured_case_extraction(r#"{"parties":[]}"#).is_err());
         assert!(parse_structured_case_extraction(
@@ -1010,6 +1163,17 @@ mod tests {
             r#"{"parties":[],"facts":[{"occurredOn":"tomorrow","title":"bad date","description":"","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn schema_errors_do_not_echo_model_output_fragments() {
+        let raw = r#"{"parties":[{"name":"Client","role":"sensitive-model-fragment"}],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[]}"#;
+        let error = parse_structured_case_extraction(raw)
+            .expect_err("unknown enum value is rejected without echoing it");
+
+        assert!(error.message.contains("did not match the required schema"));
+        assert!(!error.message.contains("sensitive-model-fragment"));
+        assert!(!error.message.contains("Client"));
     }
 
     #[test]

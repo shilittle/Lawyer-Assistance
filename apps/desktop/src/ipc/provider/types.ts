@@ -2,7 +2,8 @@ export type ProviderKind =
   | "deep_seek"
   | "qwen"
   | "silicon_flow"
-  | "volcengine_ark";
+  | "volcengine_ark"
+  | "custom";
 
 export type ReasoningEffort = "low" | "medium" | "high" | "max";
 

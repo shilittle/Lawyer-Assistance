@@ -1,0 +1,59 @@
+{
+  "generated_at": "2026-07-13T17:23:57Z",
+  "runtime_database": {
+    "size_bytes": 1775419392,
+    "sha256": "37467b652d3345b46b0603a4e5330d808a8a8650d16b5f62c8f477aabd037c25",
+    "archival_source_size_bytes": 4512894976,
+    "archival_source_sha256": "ebd53e00fbcf17b176347731d2a7bf85d8d6c931e9a99530a3dfd078ec84209d",
+    "size_reduction_bytes": 2737475584,
+    "size_reduction_percent": 60.659
+  },
+  "release_executable": {
+    "path": "target/x86_64-pc-windows-msvc/release/lawyer-assistance.exe",
+    "size_bytes": 17024512,
+    "sha256": "bf4af1d5b61b9db4847cbd6a28c5e68f47eb3d4a0e7671e89e5871ecbe035b9b"
+  },
+  "nsis_embedded_executable": {
+    "path": "lawyer-assistance.exe",
+    "size_bytes": 17024512,
+    "sha256": "f165109cb4c2a93a1f3967a7ec7b3dc73d95322f3e92f782dce59fd125545a41",
+    "bundle_type_marker": "NSI",
+    "differs_from_standalone_only_at_bundle_type_marker": true
+  },
+  "nsis_installer": {
+    "path": "target/x86_64-pc-windows-msvc/release/bundle/nsis/Lawyer Assistance_0.1.0_x64-setup.exe",
+    "size_bytes": 321050866,
+    "sha256": "c1b272ce14bff627df2891abbcb89335fc84105d3bec82780277db6d610b43f1",
+    "compression": "lzma",
+    "languages": [
+      "SimpChinese",
+      "English"
+    ],
+    "extracted_payload_size_bytes": 1792443904,
+    "compression_reduction_percent": 82.089
+  },
+  "full_database_nsis_baseline": {
+    "attempted": true,
+    "archival_database_size_bytes": 4512894976,
+    "result": "not_packageable",
+    "reason": "makensis could not memory-map the 4.51 GB archival SQLite resource",
+    "comparable_installer_size_bytes": null,
+    "installer_reduction_percent": null
+  },
+  "performance_acceptance": {
+    "report": "data/generated/legal_core_performance_report.json",
+    "report_sha256": "e6a3e2a33bc6901420eb707e00c775a6342b3f4c700d8c10521a7f96013b6024",
+    "functional_equivalence": true,
+    "measured_iterations": 30,
+    "runtime_open_median_improvement_percent": 13.035,
+    "runtime_query_median_improvement_percent": 19.217,
+    "passed": true
+  },
+  "release_resource_gate_passed": true,
+  "release_resource_matches_runtime_database": true,
+  "archive_test_passed": true,
+  "archive_listing_contains": [
+    "lawyer-assistance.exe",
+    "resources/legal_core.sqlite"
+  ]
+}

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.shilittle.lawyer-assistance",
   "build": {
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm run build:tauri",
     "frontendDist": "../frontend-dist"
   },
   "app": {
@@ -23,7 +23,15 @@
     }
   },
   "bundle": {
-    "active": false,
-    "resources": ["resources/legal_core.sqlite"]
+    "active": true,
+    "targets": ["nsis"],
+    "resources": ["resources/legal_core.sqlite"],
+    "windows": {
+      "nsis": {
+        "compression": "lzma",
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"]
+      }
+    }
   }
 }

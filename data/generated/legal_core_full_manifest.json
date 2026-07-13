@@ -1,0 +1,12 @@
+{
+  "dataset_version": "2026.07.11-stage1c.1",
+  "generated_at": "2026-07-11T13:48:41+00:00",
+  "filename": "legal_core_full.sqlite",
+  "size_bytes": 4512894976,
+  "sha256": "ebd53e00fbcf17b176347731d2a7bf85d8d6c931e9a99530a3dfd078ec84209d",
+  "source_manifest_sha256": "011551065b404507bce7b2cf542cb3b18da79a14437d094d067e685a438cd9fa",
+  "schema_version": "4",
+  "distribution_status": "archival_local_snapshot",
+  "download_url": null,
+  "ci_fixture_allowed": false
+}

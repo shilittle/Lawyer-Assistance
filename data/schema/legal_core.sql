@@ -16,6 +16,7 @@ DROP TABLE IF EXISTS law_versions;
 DROP TABLE IF EXISTS law_documents;
 DROP TABLE IF EXISTS issuing_authorities;
 DROP TABLE IF EXISTS coverage_audit;
+DROP TABLE IF EXISTS history_version_exceptions;
 DROP TABLE IF EXISTS ingestion_audit;
 DROP TABLE IF EXISTS source_categories;
 DROP TABLE IF EXISTS source_records;
@@ -73,6 +74,16 @@ CREATE TABLE coverage_audit (
   status TEXT NOT NULL,
   checked_at TEXT NOT NULL,
   notes TEXT NOT NULL
+);
+
+CREATE TABLE history_version_exceptions (
+  id TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  document_ids_json TEXT NOT NULL,
+  effective_dates_json TEXT NOT NULL,
+  source_system_id TEXT NOT NULL REFERENCES source_systems(id),
+  source_reference TEXT NOT NULL,
+  checked_at TEXT NOT NULL
 );
 
 CREATE TABLE ingestion_audit (
@@ -188,11 +199,20 @@ CREATE TABLE article_topics (
 CREATE TABLE guiding_cases (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
+  case_type TEXT NOT NULL,
   case_number TEXT,
   court TEXT,
   decided_on TEXT,
+  published_on TEXT,
   summary TEXT NOT NULL,
-  related_article_id TEXT REFERENCES law_articles(id)
+  content TEXT NOT NULL,
+  related_article_id TEXT REFERENCES law_articles(id),
+  source_system_id TEXT NOT NULL REFERENCES source_systems(id),
+  source_external_id TEXT NOT NULL,
+  source_record_id TEXT NOT NULL REFERENCES source_records(id),
+  source_url TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  UNIQUE(source_system_id, source_external_id, case_type)
 );
 
 CREATE TABLE document_templates (
@@ -200,7 +220,13 @@ CREATE TABLE document_templates (
   name TEXT NOT NULL,
   template_type TEXT NOT NULL,
   content TEXT NOT NULL,
-  metadata_json TEXT NOT NULL
+  metadata_json TEXT NOT NULL,
+  published_on TEXT,
+  source_system_id TEXT NOT NULL REFERENCES source_systems(id),
+  source_external_id TEXT NOT NULL,
+  source_record_id TEXT NOT NULL REFERENCES source_records(id),
+  source_url TEXT NOT NULL,
+  UNIQUE(source_system_id, source_external_id)
 );
 
 CREATE TABLE citation_metadata (
@@ -224,6 +250,7 @@ CREATE VIRTUAL TABLE law_articles_fts USING fts5(
 CREATE INDEX idx_source_records_external ON source_records(source_system_id, external_id);
 CREATE INDEX idx_source_categories_source ON source_categories(source_system_id, category_type);
 CREATE INDEX idx_coverage_audit_source ON coverage_audit(source_system_id, scope);
+CREATE INDEX idx_history_version_exceptions_reason ON history_version_exceptions(reason);
 CREATE INDEX idx_ingestion_audit_source ON ingestion_audit(source_system_id, source_scope);
 CREATE INDEX idx_ingestion_audit_status ON ingestion_audit(detail_status, text_status, article_status, relation_status);
 CREATE INDEX idx_law_documents_title ON law_documents(title);
@@ -238,9 +265,13 @@ CREATE INDEX idx_law_aliases_document ON law_aliases(document_id);
 CREATE INDEX idx_law_aliases_normalized ON law_aliases(normalized_alias);
 CREATE INDEX idx_legal_attachments_document ON legal_attachments(document_id);
 CREATE INDEX idx_citation_metadata_article ON citation_metadata(article_id);
+CREATE INDEX idx_guiding_cases_type ON guiding_cases(case_type, published_on);
+CREATE INDEX idx_guiding_cases_source ON guiding_cases(source_system_id, source_external_id);
+CREATE INDEX idx_document_templates_type ON document_templates(template_type, published_on);
+CREATE INDEX idx_document_templates_source ON document_templates(source_system_id, source_external_id);
 
 INSERT INTO database_metadata (key, value, updated_at) VALUES
-  ('schema_version', '3', '2026-07-03T00:00:00Z'),
+  ('schema_version', '4', '2026-07-11T00:00:00Z'),
   ('dataset_name', 'official-china-legal-core', '2026-07-02T00:00:00Z'),
   ('dataset_notice', 'Schema only. Production data must be generated from official sources with coverage audit records.', '2026-07-02T00:00:00Z');
 

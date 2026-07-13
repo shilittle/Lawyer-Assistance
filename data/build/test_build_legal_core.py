@@ -78,6 +78,7 @@ class LegalCoreBuildTests(unittest.TestCase):
 
     def test_insert_articles_keeps_duplicate_article_numbers(self) -> None:
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.executescript((build.ROOT / "data" / "schema" / "legal_core.sql").read_text(encoding="utf-8"))
         connection.execute(
             """
@@ -128,6 +129,7 @@ class LegalCoreBuildTests(unittest.TestCase):
 
     def test_insert_articles_skips_title_only_preamble(self) -> None:
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.executescript((build.ROOT / "data" / "schema" / "legal_core.sql").read_text(encoding="utf-8"))
         connection.execute(
             """
@@ -183,6 +185,7 @@ class LegalCoreBuildTests(unittest.TestCase):
 
     def test_text_marker_hits_ignores_official_english_terms(self) -> None:
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.executescript((build.ROOT / "data" / "schema" / "legal_core.sql").read_text(encoding="utf-8"))
         connection.execute(
             """

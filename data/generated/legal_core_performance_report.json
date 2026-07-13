@@ -1,0 +1,138 @@
+{
+  "generated_at_unix_ms": 1783962390833,
+  "operating_system": "windows",
+  "architecture": "x86_64",
+  "warmup_iterations": 3,
+  "measured_iterations": 30,
+  "functional_equivalence": true,
+  "compared_operations": [
+    "open_metadata",
+    "search_laws",
+    "search_articles_contract",
+    "search_articles_protection",
+    "get_article",
+    "get_law_versions",
+    "get_law_relations"
+  ],
+  "archive": {
+    "path": "<WORKSPACE>/data\\generated\\legal_core_full.sqlite",
+    "size_bytes": 4512894976,
+    "metrics": {
+      "get_article": {
+        "iterations": 30,
+        "min_ms": 0.146,
+        "median_ms": 0.208,
+        "p95_ms": 0.36,
+        "max_ms": 0.409
+      },
+      "get_law_relations": {
+        "iterations": 30,
+        "min_ms": 4.946,
+        "median_ms": 5.194,
+        "p95_ms": 6.34,
+        "max_ms": 6.735
+      },
+      "get_law_versions": {
+        "iterations": 30,
+        "min_ms": 0.161,
+        "median_ms": 0.177,
+        "p95_ms": 0.253,
+        "max_ms": 0.279
+      },
+      "open_metadata": {
+        "iterations": 30,
+        "min_ms": 0.456,
+        "median_ms": 0.514,
+        "p95_ms": 0.83,
+        "max_ms": 1.029
+      },
+      "search_articles_contract": {
+        "iterations": 30,
+        "min_ms": 10.607,
+        "median_ms": 16.275,
+        "p95_ms": 21.435,
+        "max_ms": 22.689
+      },
+      "search_articles_protection": {
+        "iterations": 30,
+        "min_ms": 53.094,
+        "median_ms": 60.968,
+        "p95_ms": 71.866,
+        "max_ms": 74.974
+      },
+      "search_laws": {
+        "iterations": 30,
+        "min_ms": 290.384,
+        "median_ms": 313.187,
+        "p95_ms": 340.604,
+        "max_ms": 362.992
+      }
+    },
+    "aggregate_query_median_ms": 396.009
+  },
+  "runtime": {
+    "path": "<WORKSPACE>/apps\\desktop\\src-tauri\\resources\\legal_core.sqlite",
+    "size_bytes": 1775419392,
+    "metrics": {
+      "get_article": {
+        "iterations": 30,
+        "min_ms": 0.082,
+        "median_ms": 0.119,
+        "p95_ms": 0.186,
+        "max_ms": 0.292
+      },
+      "get_law_relations": {
+        "iterations": 30,
+        "min_ms": 1.257,
+        "median_ms": 1.362,
+        "p95_ms": 1.574,
+        "max_ms": 1.99
+      },
+      "get_law_versions": {
+        "iterations": 30,
+        "min_ms": 0.181,
+        "median_ms": 0.202,
+        "p95_ms": 0.24,
+        "max_ms": 0.38
+      },
+      "open_metadata": {
+        "iterations": 30,
+        "min_ms": 0.371,
+        "median_ms": 0.447,
+        "p95_ms": 0.655,
+        "max_ms": 0.837
+      },
+      "search_articles_contract": {
+        "iterations": 30,
+        "min_ms": 11.29,
+        "median_ms": 13.434,
+        "p95_ms": 16.24,
+        "max_ms": 17.182
+      },
+      "search_articles_protection": {
+        "iterations": 30,
+        "min_ms": 62.237,
+        "median_ms": 69.266,
+        "p95_ms": 77.324,
+        "max_ms": 78.938
+      },
+      "search_laws": {
+        "iterations": 30,
+        "min_ms": 221.346,
+        "median_ms": 235.524,
+        "p95_ms": 253.331,
+        "max_ms": 257.434
+      }
+    },
+    "aggregate_query_median_ms": 319.907
+  },
+  "size_reduction_bytes": 2737475584,
+  "size_reduction_percent": 60.659,
+  "runtime_open_median_improvement_percent": 13.035,
+  "runtime_query_median_improvement_percent": 19.217,
+  "acceptance": {
+    "passed": true,
+    "enforced": true,
+    "failures": []
+  }
+}

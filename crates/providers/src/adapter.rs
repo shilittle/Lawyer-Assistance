@@ -243,7 +243,7 @@ impl StreamingTransportResponse {
         }
 
         redact_known_secret(
-            map_http_error(self.status, &String::from_utf8_lossy(&body)),
+            map_http_error(self.status, &String::from_utf8_lossy(&body), secret),
             secret,
         )
     }
@@ -365,6 +365,29 @@ impl ReqwestTransport {
     }
 }
 
+/// Provider-facing boundary shared by all supported BYOK profiles.
+///
+/// Provider-specific URL and body differences stay inside the adapter while
+/// callers depend on one typed chat/connection contract.
+pub trait ProviderAdapter: Send + Sync {
+    fn send_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ChatRequest,
+    ) -> Result<TransportResponse, ProviderError>;
+
+    fn send_chat_with_cancellation(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ChatRequest,
+        cancellation: &RequestCancellation,
+    ) -> Result<TransportResponse, ProviderError>;
+
+    fn test_connection(&self, profile: &ProviderProfile, secret: &ApiSecret) -> ConnectionTest;
+}
+
 #[derive(Debug)]
 pub struct OpenAiCompatibleAdapter<T> {
     transport: T,
@@ -414,23 +437,25 @@ where
 
         match self.send_chat(profile, secret, &request) {
             Ok(response) if (200..300).contains(&response.status) => {
-                let parsed = parse_chat_completion_metadata(&response.body).and_then(|metadata| {
-                    match response.first_content_token_latency_ms {
-                        Some(first_latency)
-                            if first_latency > 0 && first_latency <= response.total_latency_ms =>
-                        {
-                            Ok(metadata)
+                let parsed =
+                    parse_chat_completion_metadata(&response.body, secret).and_then(|metadata| {
+                        match response.first_content_token_latency_ms {
+                            Some(first_latency)
+                                if first_latency > 0
+                                    && first_latency <= response.total_latency_ms =>
+                            {
+                                Ok(metadata)
+                            }
+                            Some(_) => Err(ProviderError::new(
+                                ProviderErrorKind::Parse,
+                                "provider returned an invalid first content token latency",
+                            )),
+                            None => Err(ProviderError::new(
+                                ProviderErrorKind::Parse,
+                                "provider stream did not include a content token",
+                            )),
                         }
-                        Some(_) => Err(ProviderError::new(
-                            ProviderErrorKind::Parse,
-                            "provider returned an invalid first content token latency",
-                        )),
-                        None => Err(ProviderError::new(
-                            ProviderErrorKind::Parse,
-                            "provider stream did not include a content token",
-                        )),
-                    }
-                });
+                    });
 
                 match parsed {
                     Ok((model, usage)) => ConnectionTest::succeeded(
@@ -454,8 +479,7 @@ where
                 }
             }
             Ok(response) => {
-                let error =
-                    redact_known_secret(map_http_error(response.status, &response.body), secret);
+                let error = map_http_error(response.status, &response.body, secret);
                 ConnectionTest::failed(
                     profile.id.clone(),
                     Some(response.status),
@@ -476,6 +500,40 @@ where
                 )
             }
         }
+    }
+}
+
+impl<T> ProviderAdapter for OpenAiCompatibleAdapter<T>
+where
+    T: ChatTransport,
+{
+    fn send_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ChatRequest,
+    ) -> Result<TransportResponse, ProviderError> {
+        OpenAiCompatibleAdapter::send_chat(self, profile, secret, request)
+    }
+
+    fn send_chat_with_cancellation(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ChatRequest,
+        cancellation: &RequestCancellation,
+    ) -> Result<TransportResponse, ProviderError> {
+        OpenAiCompatibleAdapter::send_chat_with_cancellation(
+            self,
+            profile,
+            secret,
+            request,
+            cancellation,
+        )
+    }
+
+    fn test_connection(&self, profile: &ProviderProfile, secret: &ApiSecret) -> ConnectionTest {
+        OpenAiCompatibleAdapter::test_connection(self, profile, secret)
     }
 }
 
@@ -514,11 +572,28 @@ fn build_transport_request(
     })
 }
 
+pub fn provider_endpoint_origin(profile: &ProviderProfile) -> Result<String, ProviderError> {
+    let (_, parsed) = parsed_provider_base_url(profile)?;
+    Ok(parsed.origin().ascii_serialization())
+}
+
 fn chat_completions_url(profile: &ProviderProfile) -> Result<String, ProviderError> {
+    let (trimmed, _) = parsed_provider_base_url(profile)?;
+
+    if trimmed.ends_with("/chat/completions") {
+        Ok(trimmed)
+    } else {
+        Ok(format!("{trimmed}/chat/completions"))
+    }
+}
+
+fn parsed_provider_base_url(
+    profile: &ProviderProfile,
+) -> Result<(String, reqwest::Url), ProviderError> {
     let resolved_base_url = resolve_base_url(profile)?;
     let base_url = resolved_base_url.as_str();
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let parsed = reqwest::Url::parse(trimmed).map_err(|error| {
+    let trimmed = base_url.trim().trim_end_matches('/').to_owned();
+    let parsed = reqwest::Url::parse(&trimmed).map_err(|error| {
         ProviderError::new(
             ProviderErrorKind::InvalidProfile,
             format!("invalid provider base URL: {error}"),
@@ -561,11 +636,7 @@ fn chat_completions_url(profile: &ProviderProfile) -> Result<String, ProviderErr
         }
     }
 
-    if trimmed.ends_with("/chat/completions") {
-        Ok(trimmed.to_owned())
-    } else {
-        Ok(format!("{trimmed}/chat/completions"))
-    }
+    Ok((trimmed, parsed))
 }
 
 fn resolve_base_url(profile: &ProviderProfile) -> Result<String, ProviderError> {
@@ -665,7 +736,12 @@ fn build_chat_body(
         body.insert("max_tokens".to_owned(), json!(max_tokens));
     }
 
-    if request.stream && profile.kind != ProviderKind::SiliconFlow {
+    if request.stream
+        && !matches!(
+            profile.kind,
+            ProviderKind::SiliconFlow | ProviderKind::Custom
+        )
+    {
         body.insert(
             "stream_options".to_owned(),
             json!({ "include_usage": true }),
@@ -703,6 +779,7 @@ fn apply_provider_options(
             insert_option(body, "reasoning_effort", options.reasoning_effort);
             insert_thinking_object(body, options.thinking);
         }
+        ProviderKind::Custom => {}
     }
 }
 
@@ -745,10 +822,11 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 
 fn parse_chat_completion_metadata(
     body: &str,
+    secret: &ApiSecret,
 ) -> Result<(Option<String>, Option<ChatUsage>), ProviderError> {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         if value.get("error").is_some() {
-            return Err(map_http_error(200, body));
+            return Err(map_http_error(200, body, secret));
         }
 
         let has_content = value
@@ -769,7 +847,7 @@ fn parse_chat_completion_metadata(
         let model = value
             .get("model")
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .map(|model| redact_known_secret_text(model, secret));
         let usage = value
             .get("usage")
             .filter(|usage| usage.is_object())
@@ -778,11 +856,12 @@ fn parse_chat_completion_metadata(
         return Ok((model, usage));
     }
 
-    parse_streaming_completion_metadata(body)
+    parse_streaming_completion_metadata(body, secret)
 }
 
 fn parse_streaming_completion_metadata(
     body: &str,
+    secret: &ApiSecret,
 ) -> Result<(Option<String>, Option<ChatUsage>), ProviderError> {
     let mut parser = StreamParser::new();
     let mut model = None;
@@ -798,8 +877,8 @@ fn parse_streaming_completion_metadata(
                 model: event_model,
             } => {
                 has_content |= !content.is_empty();
-                if event_model.is_some() {
-                    model = event_model;
+                if let Some(event_model) = event_model {
+                    model = Some(redact_known_secret_text(&event_model, secret));
                 }
             }
             StreamEvent::Usage(event_usage) => usage = Some(event_usage),
@@ -809,7 +888,7 @@ fn parse_streaming_completion_metadata(
             } => {
                 return Err(ProviderError::new(
                     ProviderErrorKind::Http,
-                    format!("{error_type}: {message}"),
+                    redact_known_secret_text(&format!("{error_type}: {message}"), secret),
                 ));
             }
             StreamEvent::Done => {}
@@ -843,7 +922,7 @@ fn parse_usage(value: &Value) -> ChatUsage {
     }
 }
 
-fn map_http_error(status: u16, body: &str) -> ProviderError {
+fn map_http_error(status: u16, body: &str, secret: &ApiSecret) -> ProviderError {
     let parsed: Result<Value, _> = serde_json::from_str(body);
     let message = parsed
         .ok()
@@ -867,6 +946,7 @@ fn map_http_error(status: u16, body: &str) -> ProviderError {
         })
         .unwrap_or_else(|| format!("provider returned HTTP {status}"));
 
+    let message = redact_known_secret_text(&message, secret);
     ProviderError::with_status(
         ProviderErrorKind::Http,
         status,
@@ -948,10 +1028,16 @@ fn stream_events_have_content(events: Vec<Result<StreamEvent, ProviderError>>) -
     })
 }
 fn redact_known_secret(mut error: ProviderError, secret: &ApiSecret) -> ProviderError {
-    if !secret.expose_secret().is_empty() {
-        error.message = error.message.replace(secret.expose_secret(), "<redacted>");
-    }
+    error.message = redact_known_secret_text(&error.message, secret);
     error
+}
+
+fn redact_known_secret_text(message: &str, secret: &ApiSecret) -> String {
+    if secret.expose_secret().is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(secret.expose_secret(), "<redacted>")
+    }
 }
 
 #[cfg(test)]
@@ -1132,6 +1218,72 @@ mod tests {
     }
 
     #[test]
+    fn custom_contract_sends_only_openai_compatible_core_fields() {
+        let mut profile = profile(ProviderKind::Custom);
+        profile.display_name = "Private Gateway".to_owned();
+        profile.model_id = "private-chat-model".to_owned();
+        profile.base_url = "https://models.example.com/openai/v1".to_owned();
+        profile.options = ProviderOptions {
+            thinking: Some(true),
+            enable_thinking: Some(true),
+            reasoning_effort: Some(ReasoningEffort::High),
+            endpoint_id: Some("vendor-endpoint".to_owned()),
+            workspace_id: Some("vendor-workspace".to_owned()),
+            ..ProviderOptions::default()
+        };
+
+        let request = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
+            &profile,
+            &ApiSecret::new("contract-secret-1234"),
+            &request_for_contract(),
+        )
+        .expect("custom OpenAI-compatible request builds");
+        let body: Value = serde_json::from_str(&request.body).expect("body is JSON");
+
+        assert_eq!(
+            request.url,
+            "https://models.example.com/openai/v1/chat/completions"
+        );
+        assert_eq!(body["model"], "private-chat-model");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["temperature"].as_f64(), Some(f64::from(0.2_f32)));
+        assert_eq!(body["max_tokens"], 16);
+        for provider_specific in [
+            "stream_options",
+            "thinking",
+            "enable_thinking",
+            "thinking_budget",
+            "reasoning_effort",
+            "endpoint_id",
+            "workspace_id",
+        ] {
+            assert!(
+                body.get(provider_specific).is_none(),
+                "custom request leaked provider-specific field {provider_specific}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_contract_accepts_a_full_chat_completions_url_without_duplication() {
+        let mut profile = profile(ProviderKind::Custom);
+        profile.model_id = "private-chat-model".to_owned();
+        profile.base_url = "https://models.example.com/openai/v1/chat/completions".to_owned();
+
+        let request = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
+            &profile,
+            &ApiSecret::new("contract-secret-1234"),
+            &request_for_contract(),
+        )
+        .expect("full custom endpoint builds");
+
+        assert_eq!(
+            request.url,
+            "https://models.example.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
     fn invalid_localhost_endpoint_is_rejected() {
         let mut profile = profile(ProviderKind::DeepSeek);
         profile.base_url = "https://localhost:3000/v1".to_owned();
@@ -1198,7 +1350,8 @@ mod tests {
     fn json_completion_metadata_is_parsed_but_cannot_fake_stream_latency() {
         let body = r#"{"model":"mock-json-model","choices":[{"message":{"content":"pong"}}],"usage":null}"#;
         let (model, usage) =
-            parse_chat_completion_metadata(body).expect("valid JSON completion parses");
+            parse_chat_completion_metadata(body, &ApiSecret::new("contract-secret-1234"))
+                .expect("valid JSON completion parses");
         assert_eq!(model.as_deref(), Some("mock-json-model"));
         assert_eq!(usage, None);
 
@@ -1219,9 +1372,28 @@ mod tests {
     }
 
     #[test]
+    fn json_and_sse_model_metadata_cannot_echo_the_known_secret() {
+        let secret = ApiSecret::new("model-echo-secret-1234");
+        let json =
+            r#"{"model":"model-echo-secret-1234","choices":[{"message":{"content":"pong"}}]}"#;
+        let (json_model, _) =
+            parse_chat_completion_metadata(json, &secret).expect("JSON completion metadata parses");
+        assert_eq!(json_model.as_deref(), Some("<redacted>"));
+
+        let sse = concat!(
+            "data: {\"model\":\"model-echo-secret-1234\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (sse_model, _) = parse_streaming_completion_metadata(sse, &secret)
+            .expect("SSE completion metadata parses");
+        assert_eq!(sse_model.as_deref(), Some("<redacted>"));
+    }
+
+    #[test]
     fn json_error_inside_success_status_is_not_accepted_as_a_completion() {
         let error = parse_chat_completion_metadata(
             r#"{"error":{"type":"upstream_error","message":"generation failed"}}"#,
+            &ApiSecret::new("contract-secret-1234"),
         )
         .expect_err("JSON error envelope is rejected");
 
@@ -1248,6 +1420,44 @@ mod tests {
         assert_eq!(result.error_type, Some("http".to_owned()));
         assert!(!result.message.contains("contract-secret-1234"));
         assert!(!result.message.contains("full response body"));
+    }
+
+    #[test]
+    fn http_error_redacts_known_secret_before_message_truncation() {
+        let secret = "boundary-secret-that-must-never-be-partially-returned-1234";
+        let filler = "x".repeat(210);
+        let body = serde_json::json!({
+            "error": {
+                "type": "auth_error",
+                "message": format!("{filler}{secret} rejected")
+            }
+        })
+        .to_string();
+        let adapter = OpenAiCompatibleAdapter::new(MockTransport::new(TransportResponse {
+            status: 401,
+            body,
+            first_content_token_latency_ms: None,
+            total_latency_ms: 6,
+        }));
+
+        let result =
+            adapter.test_connection(&profile(ProviderKind::DeepSeek), &ApiSecret::new(secret));
+
+        assert_eq!(result.status, crate::types::ConnectionTestStatus::Failed);
+        assert!(!result.message.contains(secret));
+        assert!(!result.message.contains(&secret[..16]));
+        assert!(result.message.contains("<redacted>"));
+    }
+
+    #[test]
+    fn provider_endpoint_origin_normalizes_path_and_default_port() {
+        let mut profile = profile(ProviderKind::DeepSeek);
+        profile.base_url = "https://API.DeepSeek.com:443/v1/".to_owned();
+
+        assert_eq!(
+            provider_endpoint_origin(&profile).expect("origin resolves"),
+            "https://api.deepseek.com"
+        );
     }
 
     #[test]

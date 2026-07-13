@@ -9,20 +9,31 @@ use domain::qa::{
     LegalAnswerResponse, LegalAnswerStreamEvent, LegalAnswerStreamEventType,
     LegalAnswerStreamUsage,
 };
+use domain::validation::{self, TextMode};
 use providers::{
-    ChatMessage, ChatMessageRole, ChatRequest, CredentialStore, ProviderCredentialKey,
-    ProviderError, ProviderErrorKind, ProviderProfile, ReqwestStreamingTransport, StreamEvent,
-    StreamParser,
+    ChatMessage, ChatMessageRole, ChatRequest, CredentialStore, ProviderError, ProviderErrorKind,
+    ProviderProfile, ReqwestStreamingTransport, StreamEvent, StreamParser,
 };
 use serde::Serialize;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tauri::{ipc::Channel, State};
+use uuid::Uuid;
 
 use crate::state::AppState;
 
 const MAX_PROVIDER_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ANSWER_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROVIDER_STREAM_EVENTS: usize = 16_384;
+const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_PROVIDER_ID_BYTES: usize = 128;
+const MAX_SEARCH_QUERY_BYTES: usize = 4_096;
+const MAX_QUESTION_BYTES: usize = 32 * 1_024;
+const MAX_FILTER_BYTES: usize = 512;
+const MAX_ARTICLE_NUMBER_BYTES: usize = 128;
+const MAX_STRUCTURED_FILTER_VALUES: usize = 16;
+const MAX_SEARCH_RESULTS: u32 = 50;
+const MAX_ANSWER_SOURCES: u32 = 16;
+const MAX_CHAT_OUTPUT_TOKENS: u32 = 65_536;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,27 +68,28 @@ fn normalize_ipc_error_type(value: &str) -> String {
 
 impl From<database::DatabaseInitError> for IpcError {
     fn from(error: database::DatabaseInitError) -> Self {
-        Self {
-            error_type: "database".to_owned(),
-            message: error.to_string(),
-        }
+        Self::new("database", error.to_string())
     }
 }
 
 impl From<retrieval::RetrievalError> for IpcError {
     fn from(error: retrieval::RetrievalError) -> Self {
-        Self {
-            error_type: "retrieval".to_owned(),
-            message: error.to_string(),
+        match error {
+            retrieval::RetrievalError::InvalidRequest(message) => {
+                Self::new("invalid_request", message)
+            }
+            error => Self::new("retrieval", error.to_string()),
         }
     }
 }
 
 impl From<citations::CitationError> for IpcError {
     fn from(error: citations::CitationError) -> Self {
-        Self {
-            error_type: "citation".to_owned(),
-            message: error.to_string(),
+        match error {
+            citations::CitationError::InvalidRequest(message) => {
+                Self::new("invalid_request", message)
+            }
+            error => Self::new("citation", error.to_string()),
         }
     }
 }
@@ -90,19 +102,13 @@ impl From<providers::ProviderError> for IpcError {
 
 impl From<rusqlite::Error> for IpcError {
     fn from(error: rusqlite::Error) -> Self {
-        Self {
-            error_type: "database".to_owned(),
-            message: error.to_string(),
-        }
+        Self::new("database", error.to_string())
     }
 }
 
 impl From<serde_json::Error> for IpcError {
     fn from(error: serde_json::Error) -> Self {
-        Self {
-            error_type: "serialization".to_owned(),
-            message: error.to_string(),
-        }
+        Self::new("serialization", error.to_string())
     }
 }
 
@@ -111,6 +117,7 @@ pub fn search_laws(
     state: State<'_, AppState>,
     request: SearchLawsRequest,
 ) -> Result<SearchLawsResponse, IpcError> {
+    validate_search_laws_request(&request)?;
     let connection = database::open_legal_core_read_only(state.legal_core_path())?;
     retrieval::search_laws(&connection, request).map_err(Into::into)
 }
@@ -120,6 +127,7 @@ pub fn search_articles(
     state: State<'_, AppState>,
     request: SearchArticlesRequest,
 ) -> Result<SearchArticlesResponse, IpcError> {
+    validate_search_articles_request(&request)?;
     let connection = database::open_legal_core_read_only(state.legal_core_path())?;
     retrieval::search_articles(&connection, request).map_err(Into::into)
 }
@@ -129,6 +137,7 @@ pub fn get_article(
     state: State<'_, AppState>,
     request: GetArticleRequest,
 ) -> Result<GetArticleResponse, IpcError> {
+    validate_identifier("articleId", &request.article_id)?;
     let connection = database::open_legal_core_read_only(state.legal_core_path())?;
     retrieval::get_article(&connection, request).map_err(Into::into)
 }
@@ -138,6 +147,7 @@ pub fn get_law_versions(
     state: State<'_, AppState>,
     request: GetLawVersionsRequest,
 ) -> Result<GetLawVersionsResponse, IpcError> {
+    validate_identifier("documentId", &request.document_id)?;
     let connection = database::open_legal_core_read_only(state.legal_core_path())?;
     retrieval::get_law_versions(&connection, request).map_err(Into::into)
 }
@@ -147,6 +157,7 @@ pub fn get_law_relations(
     state: State<'_, AppState>,
     request: GetLawRelationsRequest,
 ) -> Result<GetLawRelationsResponse, IpcError> {
+    validate_identifier("documentId", &request.document_id)?;
     let connection = database::open_legal_core_read_only(state.legal_core_path())?;
     retrieval::get_law_relations(&connection, request).map_err(Into::into)
 }
@@ -156,6 +167,7 @@ pub fn find_legal_answer_candidates(
     state: State<'_, AppState>,
     request: LegalAnswerCandidatesRequest,
 ) -> Result<LegalAnswerCandidatesResponse, IpcError> {
+    validate_candidate_request(&request)?;
     let connection = database::open_legal_core_read_only(state.legal_core_path())?;
     let context = citations::build_legal_answer_context(&connection, &request)?;
 
@@ -168,6 +180,7 @@ pub async fn answer_legal_question(
     request: LegalAnswerRequest,
     on_event: Channel<LegalAnswerStreamEvent>,
 ) -> Result<LegalAnswerResponse, IpcError> {
+    validate_answer_request(&request)?;
     let request_id = request.request_id.clone();
     let result = answer_legal_question_inner(state.inner(), request, &on_event).await;
 
@@ -186,13 +199,14 @@ pub async fn answer_legal_question(
 pub fn cancel_legal_answer(
     state: State<'_, AppState>,
     request: CancelLegalAnswerRequest,
-) -> CancelLegalAnswerResponse {
+) -> Result<CancelLegalAnswerResponse, IpcError> {
+    validate_identifier_with_limit("requestId", &request.request_id, MAX_REQUEST_ID_BYTES)?;
     let cancelled = state.cancel_legal_answer(&request.request_id);
 
-    CancelLegalAnswerResponse {
+    Ok(CancelLegalAnswerResponse {
         request_id: request.request_id,
         cancelled,
-    }
+    })
 }
 
 async fn answer_legal_question_inner(
@@ -219,7 +233,7 @@ async fn answer_legal_question_inner(
     if !(200..300).contains(&response.status()) {
         return tokio::select! {
             _ = cancellation.cancelled() => Err(cancelled_error()),
-            error = response.into_http_error(&prepared.secret) => Err(error.into()),
+            error = response.into_http_error(&prepared.secret) => Err(provider_reported_http_error(error)),
         };
     }
 
@@ -269,24 +283,143 @@ async fn answer_legal_question_inner(
 
     // No database connection is held across the network await. Validation and
     // persistence happen only after the complete provider answer is available.
-    let finalized = finalize_answer(state, &request, prepared.context, accumulator.answer)?;
+    let final_answer = redact_known_secret(&accumulator.answer, Some(&prepared.secret));
+    let finalized = finalize_answer(state, &request, prepared.context, final_answer)?;
     notify_answer_done(&request.request_id, &mut emit);
 
     Ok(finalized)
 }
 
-fn validate_answer_request(request: &LegalAnswerRequest) -> Result<(), ProviderError> {
-    if request.request_id.trim().is_empty()
-        || request.provider_id.trim().is_empty()
-        || request.question.trim().is_empty()
-    {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "request_id, provider_id and question are required",
-        ));
-    }
-
+fn validate_answer_request(request: &LegalAnswerRequest) -> Result<(), IpcError> {
+    validate_identifier_with_limit("requestId", &request.request_id, MAX_REQUEST_ID_BYTES)?;
+    validate_identifier_with_limit("providerId", &request.provider_id, MAX_PROVIDER_ID_BYTES)?;
+    validate_candidate_fields(
+        &request.question,
+        request.law_name.as_deref(),
+        request.article_number.as_deref(),
+        &request.keywords,
+        request.case_date.as_deref(),
+        &request.effectiveness_levels,
+        request.limit,
+    )?;
+    validation::optional_finite_f32("temperature", request.temperature, 0.0, 2.0)
+        .map_err(invalid_request)?;
+    validation::optional_positive_u32("maxTokens", request.max_tokens, MAX_CHAT_OUTPUT_TOKENS)
+        .map_err(invalid_request)?;
     Ok(())
+}
+
+fn validate_search_laws_request(request: &SearchLawsRequest) -> Result<(), IpcError> {
+    validation::bounded_text(
+        "query",
+        &request.query,
+        MAX_SEARCH_QUERY_BYTES,
+        TextMode::SingleLine,
+    )
+    .map_err(invalid_request)?;
+    validation::optional_positive_u32("limit", request.limit, MAX_SEARCH_RESULTS)
+        .map_err(invalid_request)
+}
+
+fn validate_search_articles_request(request: &SearchArticlesRequest) -> Result<(), IpcError> {
+    validation::bounded_text(
+        "query",
+        &request.query,
+        MAX_SEARCH_QUERY_BYTES,
+        TextMode::SingleLine,
+    )
+    .map_err(invalid_request)?;
+    if let Some(document_id) = request.document_id.as_deref() {
+        validate_identifier("documentId", document_id)?;
+    }
+    validate_case_date(request.case_date.as_deref())?;
+    validation::optional_positive_u32("limit", request.limit, MAX_SEARCH_RESULTS)
+        .map_err(invalid_request)
+}
+
+fn validate_candidate_request(request: &LegalAnswerCandidatesRequest) -> Result<(), IpcError> {
+    validate_candidate_fields(
+        &request.question,
+        request.law_name.as_deref(),
+        request.article_number.as_deref(),
+        &request.keywords,
+        request.case_date.as_deref(),
+        &request.effectiveness_levels,
+        request.limit,
+    )
+}
+
+fn validate_candidate_fields(
+    question: &str,
+    law_name: Option<&str>,
+    article_number: Option<&str>,
+    keywords: &[String],
+    case_date: Option<&str>,
+    effectiveness_levels: &[String],
+    limit: Option<u32>,
+) -> Result<(), IpcError> {
+    validation::required_text(
+        "question",
+        question,
+        MAX_QUESTION_BYTES,
+        TextMode::MultiLine,
+    )
+    .map_err(invalid_request)?;
+    validation::optional_text("lawName", law_name, MAX_FILTER_BYTES, TextMode::SingleLine)
+        .map_err(invalid_request)?;
+    validation::optional_text(
+        "articleNumber",
+        article_number,
+        MAX_ARTICLE_NUMBER_BYTES,
+        TextMode::SingleLine,
+    )
+    .map_err(invalid_request)?;
+    validation::required_string_list(
+        "keywords",
+        keywords,
+        MAX_STRUCTURED_FILTER_VALUES,
+        MAX_FILTER_BYTES,
+    )
+    .map_err(invalid_request)?;
+    validation::required_string_list(
+        "effectivenessLevels",
+        effectiveness_levels,
+        MAX_STRUCTURED_FILTER_VALUES,
+        MAX_FILTER_BYTES,
+    )
+    .map_err(invalid_request)?;
+    validate_case_date(case_date)?;
+    validation::optional_positive_u32("limit", limit, MAX_ANSWER_SOURCES).map_err(invalid_request)
+}
+
+fn validate_case_date(value: Option<&str>) -> Result<(), IpcError> {
+    if let Some(value) = value {
+        validation::required_text("caseDate", value, 10, TextMode::SingleLine)
+            .map_err(invalid_request)?;
+        if !domain::date::is_iso_calendar_date(value) {
+            return Err(IpcError::new(
+                "invalid_request",
+                "caseDate must be a valid YYYY-MM-DD calendar date",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_identifier(field: &str, value: &str) -> Result<(), IpcError> {
+    validate_identifier_with_limit(field, value, MAX_FILTER_BYTES)
+}
+
+fn validate_identifier_with_limit(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), IpcError> {
+    validation::identifier(field, value, max_bytes).map_err(invalid_request)
+}
+
+fn invalid_request(error: validation::InputValidationError) -> IpcError {
+    IpcError::new("invalid_request", error.to_string())
 }
 
 struct PreparedLegalAnswer {
@@ -304,6 +437,7 @@ fn prepare_legal_answer<S>(
 where
     S: CredentialStore<Error = ProviderError>,
 {
+    validate_answer_request(request)?;
     let legal_connection = database::open_legal_core_read_only(state.legal_core_path())?;
     let user_connection = database::open_user_database(state.user_database_path())?;
     let context_request = LegalAnswerCandidatesRequest {
@@ -324,11 +458,13 @@ where
         ));
     }
 
-    let profile = database::get_provider_profile(&user_connection, &request.provider_id)?
-        .ok_or_else(|| ProviderError::new(ProviderErrorKind::InvalidProfile, "profile not found"))
-        .and_then(super::provider::profile_from_row)?;
-    let key = ProviderCredentialKey::new(&profile.id, &profile.credential_account_id);
-    let secret = credential_store.read_api_key(&key)?.ok_or_else(|| {
+    let (profile, secret) = super::provider::provider_profile_and_credential_snapshot(
+        &user_connection,
+        &request.provider_id,
+        credential_store,
+    )
+    .map_err(|error| IpcError::new(error.error_type, error.message))?;
+    let secret = secret.ok_or_else(|| {
         ProviderError::new(
             ProviderErrorKind::MissingCredential,
             "API key is not configured",
@@ -363,6 +499,7 @@ struct AnswerStreamAccumulator {
     answer: String,
     provider_done: bool,
     event_count: usize,
+    pending_secret_prefix: String,
 }
 
 fn add_stream_bytes(total: &mut usize, chunk_len: usize) -> Result<(), IpcError> {
@@ -427,23 +564,13 @@ where
         let event = result.map_err(|error| provider_stream_error(error, known_secret))?;
         match event {
             StreamEvent::Delta { content, .. } => {
-                if content.is_empty() {
-                    continue;
-                }
-                if accumulator.answer.len().saturating_add(content.len()) > MAX_ANSWER_BYTES {
-                    return Err(response_too_large_error(
-                        "provider answer exceeded the 2 MiB text limit",
-                    ));
-                }
-                accumulator.answer.push_str(&content);
-                emit(LegalAnswerStreamEvent {
-                    request_id: request_id.to_owned(),
-                    event_type: LegalAnswerStreamEventType::Delta,
-                    content: Some(content),
-                    usage: None,
-                    error_type: None,
-                    message: None,
-                })?;
+                let content = drain_secret_safe_content(
+                    &mut accumulator.pending_secret_prefix,
+                    &content,
+                    known_secret,
+                    false,
+                );
+                emit_answer_content(request_id, content, accumulator, emit)?;
             }
             StreamEvent::Usage(usage) => emit(LegalAnswerStreamEvent {
                 request_id: request_id.to_owned(),
@@ -461,12 +588,16 @@ where
                 error_type,
                 message,
             } => {
-                return Err(IpcError::new(
-                    redact_known_secret(&error_type, known_secret),
-                    redact_known_secret(&message, known_secret),
-                ));
+                return Err(provider_reported_stream_error(error_type, message));
             }
             StreamEvent::Done => {
+                let remaining = drain_secret_safe_content(
+                    &mut accumulator.pending_secret_prefix,
+                    "",
+                    known_secret,
+                    true,
+                );
+                emit_answer_content(request_id, remaining, accumulator, emit)?;
                 accumulator.provider_done = true;
                 break;
             }
@@ -476,12 +607,94 @@ where
     Ok(())
 }
 
+fn emit_answer_content<F>(
+    request_id: &str,
+    content: String,
+    accumulator: &mut AnswerStreamAccumulator,
+    emit: &mut F,
+) -> Result<(), IpcError>
+where
+    F: FnMut(LegalAnswerStreamEvent) -> Result<(), IpcError>,
+{
+    if content.is_empty() {
+        return Ok(());
+    }
+    if accumulator.answer.len().saturating_add(content.len()) > MAX_ANSWER_BYTES {
+        return Err(response_too_large_error(
+            "provider answer exceeded the 2 MiB text limit",
+        ));
+    }
+
+    accumulator.answer.push_str(&content);
+    emit(LegalAnswerStreamEvent {
+        request_id: request_id.to_owned(),
+        event_type: LegalAnswerStreamEventType::Delta,
+        content: Some(content),
+        usage: None,
+        error_type: None,
+        message: None,
+    })
+}
+
+fn drain_secret_safe_content(
+    pending: &mut String,
+    content: &str,
+    known_secret: Option<&providers::ApiSecret>,
+    finish: bool,
+) -> String {
+    let Some(secret) = known_secret.map(providers::ApiSecret::expose_secret) else {
+        return content.to_owned();
+    };
+    if secret.is_empty() {
+        return content.to_owned();
+    }
+
+    pending.push_str(content);
+    *pending = pending.replace(secret, "<redacted>");
+    let keep_bytes = longest_suffix_matching_secret_prefix(pending, secret);
+    let safe_bytes = pending.len().saturating_sub(keep_bytes);
+    let mut safe = pending[..safe_bytes].to_owned();
+    let tail = pending[safe_bytes..].to_owned();
+
+    if finish {
+        if !tail.is_empty() {
+            safe.push_str("<redacted>");
+        }
+        pending.clear();
+    } else {
+        *pending = tail;
+    }
+
+    safe
+}
+
+fn longest_suffix_matching_secret_prefix(value: &str, secret: &str) -> usize {
+    let mut longest = 0;
+    for (prefix_bytes, _) in secret.char_indices().skip(1) {
+        if value.ends_with(&secret[..prefix_bytes]) {
+            longest = prefix_bytes;
+        }
+    }
+    longest
+}
+
 fn provider_stream_error(
     mut error: ProviderError,
     known_secret: Option<&providers::ApiSecret>,
 ) -> IpcError {
     error.message = redact_known_secret(&error.message, known_secret);
     IpcError::new(error.kind.as_str(), error.to_string())
+}
+
+fn provider_reported_http_error(error: ProviderError) -> IpcError {
+    match error.http_status {
+        Some(status) => IpcError::new("http", format!("provider returned HTTP {status}")),
+        None => IpcError::new("provider_error", "provider request failed"),
+    }
+}
+
+fn provider_reported_stream_error(_error_type: String, _message: String) -> IpcError {
+    IpcError::new("provider_error", "provider stream returned an error")
 }
 
 fn redact_known_secret(value: &str, known_secret: Option<&providers::ApiSecret>) -> String {
@@ -501,6 +714,7 @@ fn finalize_answer(
     context: domain::qa::LegalAnswerContext,
     answer: String,
 ) -> Result<LegalAnswerResponse, IpcError> {
+    validate_answer_request(request)?;
     let legal_connection = database::open_legal_core_read_only(state.legal_core_path())?;
     let user_connection = database::open_user_database(state.user_database_path())?;
     let citation_report = citations::validate_answer_citations(
@@ -627,22 +841,170 @@ fn insert_answer_record(
 }
 
 fn next_answer_record_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-
-    format!("answer-{millis}")
+    format!("answer-{}", Uuid::new_v4())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use providers::{ApiSecret, ProviderCapabilities, ProviderKind, ProviderOptions};
+    use providers::{
+        ApiSecret, ProviderCapabilities, ProviderCredentialKey, ProviderKind, ProviderOptions,
+    };
     use tempfile::TempDir;
 
     const RETRIEVAL_FIXTURE_SQL: &str =
         include_str!("../../../../../data/fixtures/legal_core_retrieval_fixture.sql");
+
+    #[test]
+    fn legal_ipc_validation_accepts_chinese_and_rejects_oversized_or_abnormal_inputs() {
+        let valid = answer_request();
+        validate_answer_request(&valid).expect("normal Chinese legal request is accepted");
+
+        let mut invalid_requests = Vec::new();
+        let mut request = valid.clone();
+        request.request_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.question = format!("sensitive-question-{}", "问".repeat(MAX_QUESTION_BYTES));
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.law_name = Some("法".repeat(MAX_FILTER_BYTES));
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.article_number = Some("条".repeat(MAX_ARTICLE_NUMBER_BYTES));
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.keywords = (0..=MAX_STRUCTURED_FILTER_VALUES)
+            .map(|index| format!("关键词{index}"))
+            .collect();
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.effectiveness_levels = vec!["x".repeat(MAX_FILTER_BYTES + 1)];
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.case_date = Some("2024-02-30".to_owned());
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.limit = Some(MAX_ANSWER_SOURCES + 1);
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.temperature = Some(f32::NAN);
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.temperature = Some(f32::INFINITY);
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.temperature = Some(-0.01);
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.temperature = Some(2.01);
+        invalid_requests.push(request);
+
+        let mut request = valid.clone();
+        request.max_tokens = Some(0);
+        invalid_requests.push(request);
+
+        let mut request = valid;
+        request.max_tokens = Some(MAX_CHAT_OUTPUT_TOKENS + 1);
+        invalid_requests.push(request);
+
+        for invalid in invalid_requests {
+            let error = validate_answer_request(&invalid)
+                .expect_err("invalid request is rejected at the Rust IPC boundary");
+            assert_eq!(error.error_type, "invalid_request");
+            assert!(!error.message.contains("sensitive-question"));
+        }
+    }
+
+    #[test]
+    fn legal_search_and_candidate_filters_are_bounded_before_fts() {
+        let search_error = validate_search_laws_request(&SearchLawsRequest {
+            query: "法".repeat(MAX_SEARCH_QUERY_BYTES),
+            limit: Some(20),
+        })
+        .expect_err("oversized UTF-8 search query is rejected");
+        assert_eq!(search_error.error_type, "invalid_request");
+
+        let article_error = validate_search_articles_request(&SearchArticlesRequest {
+            query: "合同".to_owned(),
+            document_id: Some("doc\nother".to_owned()),
+            case_date: None,
+            limit: Some(20),
+        })
+        .expect_err("control characters in a filter are rejected");
+        assert_eq!(article_error.error_type, "invalid_request");
+
+        let candidate_error = validate_candidate_request(&LegalAnswerCandidatesRequest {
+            question: "合同责任是什么？".to_owned(),
+            law_name: None,
+            article_number: None,
+            keywords: vec!["关键词".to_owned(); MAX_STRUCTURED_FILTER_VALUES + 1],
+            case_date: None,
+            effectiveness_levels: Vec::new(),
+            include_expired: false,
+            limit: Some(8),
+        })
+        .expect_err("oversized filter array is rejected");
+        assert_eq!(candidate_error.error_type, "invalid_request");
+
+        validate_candidate_request(&LegalAnswerCandidatesRequest {
+            question: "中文问题\n包含必要背景".to_owned(),
+            law_name: Some("中华人民共和国民法典".to_owned()),
+            article_number: Some("第五百七十七条".to_owned()),
+            keywords: vec!["违约责任".to_owned()],
+            case_date: Some("2024-02-29".to_owned()),
+            effectiveness_levels: vec!["national_law".to_owned()],
+            include_expired: false,
+            limit: Some(8),
+        })
+        .expect("bounded Chinese filters are accepted");
+    }
+
+    #[test]
+    fn invalid_answer_input_is_rejected_before_any_database_or_credential_access() {
+        let state = AppState::new("missing-legal.sqlite".into(), "missing-user.sqlite".into());
+        let mut request = answer_request();
+        request.question = "x".repeat(MAX_QUESTION_BYTES + 1);
+
+        let error = match prepare_legal_answer(
+            &state,
+            &MockCredentialStore::new(Some(ApiSecret::new("unused-secret"))),
+            &request,
+        ) {
+            Ok(_) => panic!("invalid request must not reach database or credential access"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.error_type, "invalid_request");
+    }
+
+    #[test]
+    fn answer_record_ids_are_uuid_v4_and_unique() {
+        let ids = (0..1_024)
+            .map(|_| next_answer_record_id())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(ids.len(), 1_024);
+        for id in ids {
+            let uuid = Uuid::parse_str(
+                id.strip_prefix("answer-")
+                    .expect("answer record id has the expected prefix"),
+            )
+            .expect("answer record id contains a UUID");
+            assert_eq!(uuid.get_version_num(), 4);
+        }
+    }
 
     struct TestHarness {
         _directory: TempDir,
@@ -919,14 +1281,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_stream_errors_redact_the_exact_credential_and_normalize_type() {
+    fn provider_reported_errors_never_echo_remote_message_question_model_or_output() {
         let secret = ApiSecret::new("exact-secret-1234");
+        let confidential = "confidential-question confidential-model confidential-output";
         let mut accumulator = AnswerStreamAccumulator::default();
         let error = consume_stream_results_with_secret(
             "answer-secret-error",
             vec![Ok(StreamEvent::Error {
-                error_type: "rate limit/exact-secret-1234".to_owned(),
-                message: "provider echoed exact-secret-1234".to_owned(),
+                error_type: format!("rate limit/{}", secret.expose_secret()),
+                message: format!("provider echoed {} {confidential}", secret.expose_secret()),
             })],
             &mut accumulator,
             Some(&secret),
@@ -934,9 +1297,93 @@ mod tests {
         )
         .expect_err("provider error stops the stream");
 
-        assert_eq!(error.error_type, "ratelimitredacted");
+        assert_eq!(error.error_type, "provider_error");
+        assert_eq!(error.message, "provider stream returned an error");
         assert!(!error.message.contains(secret.expose_secret()));
-        assert!(error.message.contains("<redacted>"));
+        assert!(!error.message.contains(confidential));
+
+        let http = provider_reported_http_error(ProviderError::with_status(
+            ProviderErrorKind::Http,
+            422,
+            format!(
+                "remote body echoed {} {confidential}",
+                secret.expose_secret()
+            ),
+        ));
+        assert_eq!(http.error_type, "http");
+        assert_eq!(http.message, "provider returned HTTP 422");
+        assert!(!http.message.contains(secret.expose_secret()));
+        assert!(!http.message.contains(confidential));
+    }
+
+    #[test]
+    fn provider_stream_content_redacts_a_secret_split_across_delta_events() {
+        let secret = ApiSecret::new("exact-secret-1234");
+        let mut accumulator = AnswerStreamAccumulator::default();
+        let mut events = Vec::new();
+
+        consume_stream_results_with_secret(
+            "answer-secret-content",
+            vec![
+                Ok(StreamEvent::Delta {
+                    content: "before exact-secret-".to_owned(),
+                    model: None,
+                }),
+                Ok(StreamEvent::Delta {
+                    content: "1234 after".to_owned(),
+                    model: None,
+                }),
+                Ok(StreamEvent::Done),
+            ],
+            &mut accumulator,
+            Some(&secret),
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .expect("split secret is consumed safely");
+
+        assert_eq!(accumulator.answer, "before <redacted> after");
+        assert!(accumulator.pending_secret_prefix.is_empty());
+        let visible = events
+            .iter()
+            .filter_map(|event| event.content.as_deref())
+            .collect::<String>();
+        assert_eq!(visible, accumulator.answer);
+        assert!(!visible.contains(secret.expose_secret()));
+    }
+
+    #[test]
+    fn provider_stream_does_not_flush_a_trailing_secret_prefix() {
+        let secret = ApiSecret::new("exact-secret-1234");
+        let mut accumulator = AnswerStreamAccumulator::default();
+        let mut events = Vec::new();
+
+        consume_stream_results_with_secret(
+            "answer-secret-prefix",
+            vec![
+                Ok(StreamEvent::Delta {
+                    content: "answer exact-secret-".to_owned(),
+                    model: None,
+                }),
+                Ok(StreamEvent::Done),
+            ],
+            &mut accumulator,
+            Some(&secret),
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .expect("trailing secret prefix is consumed safely");
+
+        assert_eq!(accumulator.answer, "answer <redacted>");
+        assert!(!events
+            .iter()
+            .filter_map(|event| event.content.as_deref())
+            .collect::<String>()
+            .contains("exact-secret-"));
     }
 
     fn run_mock_answer(

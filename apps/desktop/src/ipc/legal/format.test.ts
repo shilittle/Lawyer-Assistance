@@ -6,6 +6,7 @@ import {
   formatEffectiveWindow,
   formatLegalSourceLabel,
   formatStatus,
+  segmentLegalAnswer,
 } from "./format";
 
 describe("legal IPC format helpers", () => {
@@ -54,6 +55,51 @@ describe("legal IPC format helpers", () => {
     ).toBe("《中华人民共和国民法典》第五百七十七条：违约责任");
     expect(formatCitationInvalidReason("not_in_context")).toBe(
       "未在本次候选来源中",
+    );
+  });
+
+  it("segments repeated citations without losing surrounding Unicode text", () => {
+    const source = {
+      sourceId: "law:doc:version:art:1",
+      articleId: "article-1",
+      documentId: "doc-1",
+      versionId: "version-1",
+      documentTitle: "中华人民共和国民法典",
+      versionLabel: "2021年施行版本",
+      articleNumber: "第一条",
+      articleTitle: "",
+      canonicalLabel: "《中华人民共和国民法典》第一条",
+      content: "示例原文",
+      snippet: "示例原文",
+      effectiveFrom: "2021-01-01",
+      effectiveTo: null,
+      versionStatus: "in_force",
+    };
+    const marker = "[SRC:law:doc:version:art:1]";
+    const segments = segmentLegalAnswer(`结论一${marker}；结论二${marker}。`, [
+      {
+        rawMarker: marker,
+        sourceId: source.sourceId,
+        status: "valid",
+        source,
+      },
+      {
+        rawMarker: marker,
+        sourceId: source.sourceId,
+        status: "invalid",
+        reason: "duplicate",
+        source,
+      },
+    ]);
+
+    expect(segments.map((segment) => segment.text).join("")).toBe(
+      `结论一${marker}；结论二${marker}。`,
+    );
+    expect(segments.filter((segment) => segment.kind === "citation")).toHaveLength(
+      2,
+    );
+    expect(new Set(segments.map((segment) => segment.key)).size).toBe(
+      segments.length,
     );
   });
 });

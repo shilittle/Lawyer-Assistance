@@ -1,8 +1,10 @@
 use std::{
+    collections::HashSet,
     error::Error,
     fmt::{self, Display},
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use rusqlite::{params, OptionalExtension};
@@ -10,6 +12,11 @@ use rusqlite::{params, OptionalExtension};
 pub const LEGAL_CORE_DB_FILE_NAME: &str = "legal_core.sqlite";
 pub const USER_DB_FILE_NAME: &str = "user.sqlite";
 pub const USER_SCHEMA_VERSION: i64 = 6;
+const USER_CANONICAL_SCHEMA_MARKER_KEY: &str = "canonical_schema_version";
+// This marker describes the exact canonical shape within schema version 6.
+// Keep it independent from USER_SCHEMA_VERSION so constraint-only repairs can
+// be applied once without pretending that an unverified v6 database is sound.
+const USER_CANONICAL_SCHEMA_MARKER_VALUE: &str = "v6-project-scope-integrity-20260713";
 pub const LEGAL_CORE_SCHEMA_SQL: &str = include_str!("../../../data/schema/legal_core.sql");
 
 #[derive(Debug)]
@@ -82,6 +89,12 @@ pub fn open_user_database(
 ) -> Result<rusqlite::Connection, DatabaseInitError> {
     let connection = rusqlite::Connection::open(user_database_path)?;
 
+    // User commands open short-lived connections and Tauri may execute more
+    // than one write command at a time. SQLite otherwise fails immediately on
+    // a transient writer lock. A bounded wait is sufficient for this small,
+    // local workload and avoids changing the persistent journal mode (and its
+    // backup/sidecar-file lifecycle) merely to serialize short writes.
+    connection.busy_timeout(Duration::from_secs(5))?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "trusted_schema", "OFF")?;
 
@@ -491,7 +504,7 @@ pub fn upsert_case_file(
     connection: &rusqlite::Connection,
     file: &CaseFileRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO case_files (file_id, project_id, title, file_type, storage_reference, summary)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -500,6 +513,7 @@ pub fn upsert_case_file(
             file_type = excluded.file_type,
             storage_reference = excluded.storage_reference,
             summary = excluded.summary
+        WHERE case_files.project_id = excluded.project_id
         ",
         params![
             file.file_id,
@@ -511,14 +525,17 @@ pub fn upsert_case_file(
         ],
     )?;
 
-    Ok(())
+    ensure_project_scoped_write(
+        affected_rows,
+        "case file id is already assigned to another project",
+    )
 }
 
 pub fn upsert_case_party(
     connection: &rusqlite::Connection,
     party: &CasePartyRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO case_parties (party_id, project_id, name, normalized_name, role, contact, notes)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -528,6 +545,7 @@ pub fn upsert_case_party(
             role = excluded.role,
             contact = excluded.contact,
             notes = excluded.notes
+        WHERE case_parties.project_id = excluded.project_id
         ",
         params![
             party.party_id,
@@ -540,14 +558,17 @@ pub fn upsert_case_party(
         ],
     )?;
 
-    Ok(())
+    ensure_project_scoped_write(
+        affected_rows,
+        "case party id is already assigned to another project",
+    )
 }
 
 pub fn upsert_case_fact(
     connection: &rusqlite::Connection,
     fact: &CaseFactRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO case_facts (
             fact_id, project_id, occurred_on, title, description, source, confirmation_status
@@ -559,6 +580,7 @@ pub fn upsert_case_fact(
             description = excluded.description,
             source = excluded.source,
             confirmation_status = excluded.confirmation_status
+        WHERE case_facts.project_id = excluded.project_id
         ",
         params![
             fact.fact_id,
@@ -571,14 +593,17 @@ pub fn upsert_case_fact(
         ],
     )?;
 
-    Ok(())
+    ensure_project_scoped_write(
+        affected_rows,
+        "case fact id is already assigned to another project",
+    )
 }
 
 pub fn upsert_evidence_item(
     connection: &rusqlite::Connection,
     evidence: &EvidenceItemRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO evidence_items (
             evidence_id, project_id, evidence_number, title, source, formed_on, summary,
@@ -593,6 +618,7 @@ pub fn upsert_evidence_item(
             summary = excluded.summary,
             storage_reference = excluded.storage_reference,
             confirmation_status = excluded.confirmation_status
+        WHERE evidence_items.project_id = excluded.project_id
         ",
         params![
             evidence.evidence_id,
@@ -607,14 +633,17 @@ pub fn upsert_evidence_item(
         ],
     )?;
 
-    Ok(())
+    ensure_project_scoped_write(
+        affected_rows,
+        "evidence item id is already assigned to another project",
+    )
 }
 
 pub fn upsert_legal_issue(
     connection: &rusqlite::Connection,
     issue: &LegalIssueRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO legal_issues (
             issue_id, project_id, title, description, claim, status, confirmation_status
@@ -626,6 +655,7 @@ pub fn upsert_legal_issue(
             claim = excluded.claim,
             status = excluded.status,
             confirmation_status = excluded.confirmation_status
+        WHERE legal_issues.project_id = excluded.project_id
         ",
         params![
             issue.issue_id,
@@ -638,14 +668,17 @@ pub fn upsert_legal_issue(
         ],
     )?;
 
-    Ok(())
+    ensure_project_scoped_write(
+        affected_rows,
+        "legal issue id is already assigned to another project",
+    )
 }
 
 pub fn upsert_case_uncertainty(
     connection: &rusqlite::Connection,
     uncertainty: &CaseUncertaintyRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO case_uncertainties (
             uncertainty_id, project_id, description, related_entity_type, related_entity_id,
@@ -661,6 +694,7 @@ pub fn upsert_case_uncertainty(
             resolution = excluded.resolution,
             confirmation_status = excluded.confirmation_status,
             updated_at = CURRENT_TIMESTAMP
+        WHERE case_uncertainties.project_id = excluded.project_id
         ",
         params![
             uncertainty.uncertainty_id,
@@ -675,14 +709,18 @@ pub fn upsert_case_uncertainty(
         ],
     )?;
 
-    Ok(())
+    ensure_project_scoped_write(
+        affected_rows,
+        "case uncertainty id is already assigned to another project",
+    )
 }
 
 pub fn insert_confirmed_case_extraction(
     connection: &mut rusqlite::Connection,
     rows: &ConfirmedCaseExtractionRows,
 ) -> rusqlite::Result<()> {
-    let transaction = connection.transaction()?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     for file_id in &rows.source_file_ids {
         let exists: bool = transaction.query_row(
@@ -827,10 +865,17 @@ fn insert_evidence_link(
     connection: &rusqlite::Connection,
     link: &EvidenceLinkRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO evidence_links (link_id, project_id, fact_id, evidence_id)
-        VALUES (?1, ?2, ?3, ?4)
+        SELECT ?1, ?2, ?3, ?4
+        WHERE EXISTS (
+            SELECT 1 FROM case_facts
+            WHERE fact_id = ?3 AND project_id = ?2
+        ) AND EXISTS (
+            SELECT 1 FROM evidence_items
+            WHERE evidence_id = ?4 AND project_id = ?2
+        )
         ",
         params![
             link.link_id,
@@ -839,7 +884,11 @@ fn insert_evidence_link(
             link.evidence_id
         ],
     )?;
-    Ok(())
+
+    ensure_project_scoped_write(
+        affected_rows,
+        "evidence link fact and evidence must belong to its project",
+    )
 }
 
 fn insert_case_uncertainty(
@@ -872,7 +921,7 @@ pub fn upsert_legal_basis(
     connection: &rusqlite::Connection,
     basis: &LegalBasisRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO legal_basis (
             basis_id,
@@ -896,9 +945,12 @@ pub fn upsert_legal_basis(
             excerpt,
             note
         )
-        VALUES (
+        SELECT
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+        WHERE ?3 IS NULL OR EXISTS (
+            SELECT 1 FROM legal_issues
+            WHERE issue_id = ?3 AND project_id = ?2
         )
         ON CONFLICT(basis_id) DO UPDATE SET
             issue_id = excluded.issue_id,
@@ -919,6 +971,7 @@ pub fn upsert_legal_basis(
             version_status = excluded.version_status,
             excerpt = excluded.excerpt,
             note = excluded.note
+        WHERE legal_basis.project_id = excluded.project_id
         ",
         params![
             basis.basis_id,
@@ -944,20 +997,31 @@ pub fn upsert_legal_basis(
         ],
     )?;
 
-    Ok(())
+    ensure_project_scoped_write(
+        affected_rows,
+        "legal basis id must stay in its project, and its issue must belong to that project",
+    )
 }
 
 pub fn upsert_evidence_link(
     connection: &rusqlite::Connection,
     link: &EvidenceLinkRow,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let affected_rows = connection.execute(
         "
         INSERT INTO evidence_links (link_id, project_id, fact_id, evidence_id)
-        VALUES (?1, ?2, ?3, ?4)
+        SELECT ?1, ?2, ?3, ?4
+        WHERE EXISTS (
+            SELECT 1 FROM case_facts
+            WHERE fact_id = ?3 AND project_id = ?2
+        ) AND EXISTS (
+            SELECT 1 FROM evidence_items
+            WHERE evidence_id = ?4 AND project_id = ?2
+        )
         ON CONFLICT(link_id) DO UPDATE SET
             fact_id = excluded.fact_id,
             evidence_id = excluded.evidence_id
+        WHERE evidence_links.project_id = excluded.project_id
         ",
         params![
             link.link_id,
@@ -966,6 +1030,20 @@ pub fn upsert_evidence_link(
             link.evidence_id
         ],
     )?;
+
+    ensure_project_scoped_write(
+        affected_rows,
+        "evidence link id must stay in its project, and its fact and evidence must belong to that project",
+    )
+}
+
+fn ensure_project_scoped_write(affected_rows: usize, message: &str) -> rusqlite::Result<()> {
+    if affected_rows == 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(message.to_owned()),
+        ));
+    }
 
     Ok(())
 }
@@ -989,7 +1067,8 @@ pub fn delete_case_entity(
         }
         _ => return Err(rusqlite::Error::InvalidParameterName(table.to_owned())),
     };
-    let transaction = connection.transaction()?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if table == "case_files" {
         let referenced: bool = transaction.query_row(
             "
@@ -1436,8 +1515,500 @@ fn configure_legal_core_connection(
     Ok(())
 }
 
+#[derive(Debug)]
+struct UserTableMigrationSpec {
+    name: &'static str,
+    canonical_columns: &'static [&'static str],
+    required_legacy_columns: &'static [&'static str],
+}
+
+// Keep this list in parent-before-child copy order. Columns absent from older
+// schemas are filled by the canonical table defaults. Required columns are the
+// minimum data-bearing contract of every historical version that introduced
+// the table; a missing or unknown column is treated as schema damage instead
+// of silently inventing or dropping user data.
+const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
+    UserTableMigrationSpec {
+        name: "provider_profiles",
+        canonical_columns: &[
+            "id",
+            "kind",
+            "display_name",
+            "model_id",
+            "base_url",
+            "credential_account_id",
+            "capabilities_json",
+            "options_json",
+            "created_at",
+            "updated_at",
+        ],
+        required_legacy_columns: &[
+            "id",
+            "kind",
+            "display_name",
+            "model_id",
+            "base_url",
+            "credential_account_id",
+            "capabilities_json",
+            "options_json",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "projects",
+        canonical_columns: &[
+            "project_id",
+            "title",
+            "case_type",
+            "status",
+            "opened_on",
+            "summary",
+            "created_at",
+            "updated_at",
+        ],
+        required_legacy_columns: &["project_id", "title", "status"],
+    },
+    UserTableMigrationSpec {
+        name: "case_files",
+        canonical_columns: &[
+            "file_id",
+            "project_id",
+            "title",
+            "file_type",
+            "storage_reference",
+            "summary",
+            "created_at",
+        ],
+        required_legacy_columns: &["file_id", "project_id", "title"],
+    },
+    UserTableMigrationSpec {
+        name: "case_parties",
+        canonical_columns: &[
+            "party_id",
+            "project_id",
+            "name",
+            "normalized_name",
+            "role",
+            "contact",
+            "notes",
+        ],
+        required_legacy_columns: &["party_id", "project_id", "name", "role"],
+    },
+    UserTableMigrationSpec {
+        name: "case_facts",
+        canonical_columns: &[
+            "fact_id",
+            "project_id",
+            "occurred_on",
+            "title",
+            "description",
+            "source",
+            "confirmation_status",
+        ],
+        required_legacy_columns: &["fact_id", "project_id", "title", "confirmation_status"],
+    },
+    UserTableMigrationSpec {
+        name: "evidence_items",
+        canonical_columns: &[
+            "evidence_id",
+            "project_id",
+            "evidence_number",
+            "title",
+            "source",
+            "formed_on",
+            "summary",
+            "storage_reference",
+            "confirmation_status",
+        ],
+        required_legacy_columns: &[
+            "evidence_id",
+            "project_id",
+            "evidence_number",
+            "title",
+            "confirmation_status",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "legal_issues",
+        canonical_columns: &[
+            "issue_id",
+            "project_id",
+            "title",
+            "description",
+            "claim",
+            "status",
+            "confirmation_status",
+        ],
+        required_legacy_columns: &[
+            "issue_id",
+            "project_id",
+            "title",
+            "status",
+            "confirmation_status",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "evidence_links",
+        canonical_columns: &["link_id", "project_id", "fact_id", "evidence_id"],
+        required_legacy_columns: &["link_id", "project_id", "fact_id", "evidence_id"],
+    },
+    UserTableMigrationSpec {
+        name: "case_extraction_confirmations",
+        canonical_columns: &[
+            "review_id",
+            "project_id",
+            "provider_id",
+            "source_file_ids_json",
+            "confirmed_at",
+        ],
+        required_legacy_columns: &[
+            "review_id",
+            "project_id",
+            "provider_id",
+            "source_file_ids_json",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "case_uncertainties",
+        canonical_columns: &[
+            "uncertainty_id",
+            "project_id",
+            "description",
+            "related_entity_type",
+            "related_entity_id",
+            "source_file_ids_json",
+            "status",
+            "resolution",
+            "confirmation_status",
+            "created_at",
+            "updated_at",
+        ],
+        required_legacy_columns: &[
+            "uncertainty_id",
+            "project_id",
+            "description",
+            "status",
+            "confirmation_status",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "legal_basis",
+        canonical_columns: &[
+            "basis_id",
+            "project_id",
+            "issue_id",
+            "source_id",
+            "status",
+            "invalid_reason",
+            "case_date",
+            "article_id",
+            "document_id",
+            "version_id",
+            "document_title",
+            "version_label",
+            "article_number",
+            "article_title",
+            "canonical_label",
+            "effective_from",
+            "effective_to",
+            "version_status",
+            "excerpt",
+            "note",
+            "created_at",
+        ],
+        required_legacy_columns: &["basis_id", "project_id", "source_id", "status"],
+    },
+    UserTableMigrationSpec {
+        name: "legal_answer_records",
+        canonical_columns: &[
+            "record_id",
+            "provider_id",
+            "question",
+            "answer_text",
+            "case_date",
+            "query_json",
+            "source_ids_json",
+            "verified_citations_json",
+            "invalid_citations_json",
+            "unsupported_legal_conclusion",
+            "created_at",
+        ],
+        required_legacy_columns: &[
+            "record_id",
+            "provider_id",
+            "question",
+            "query_json",
+            "source_ids_json",
+            "verified_citations_json",
+            "invalid_citations_json",
+            "unsupported_legal_conclusion",
+        ],
+    },
+];
+
+const USER_SCHEMA_INDEX_NAMES: &[&str] = &[
+    "idx_provider_profiles_kind",
+    "idx_projects_updated",
+    "idx_case_files_project",
+    "idx_case_extraction_confirmations_project",
+    "idx_case_parties_project",
+    "idx_case_facts_project",
+    "idx_evidence_items_project",
+    "idx_evidence_links_project",
+    "idx_legal_issues_project",
+    "idx_case_uncertainties_project",
+    "idx_legal_basis_project",
+    "idx_legal_answer_records_created",
+];
+
+const USER_SCHEMA_TRIGGER_NAMES: &[&str] = &[
+    "trg_legal_basis_issue_project_insert",
+    "trg_legal_basis_issue_project_update",
+];
+
+const LEGACY_USER_TABLE_DROP_ORDER: &[&str] = &[
+    "case_extraction_confirmations",
+    "evidence_links",
+    "legal_basis",
+    "case_uncertainties",
+    "case_files",
+    "case_parties",
+    "case_facts",
+    "evidence_items",
+    "legal_issues",
+    "projects",
+    "provider_profiles",
+    "legal_answer_records",
+];
+
+fn legacy_user_table_name(table: &str) -> String {
+    format!("__lawyer_assistance_v6_legacy_{table}")
+}
+
+fn sqlite_table_exists(connection: &rusqlite::Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+fn stage_legacy_user_tables(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<HashSet<&'static str>> {
+    let mut staged = HashSet::new();
+    for spec in USER_TABLE_MIGRATION_SPECS {
+        if !sqlite_table_exists(transaction, spec.name)? {
+            continue;
+        }
+        let legacy_name = legacy_user_table_name(spec.name);
+        if sqlite_table_exists(transaction, &legacy_name)? {
+            return Err(user_schema_migration_error(format!(
+                "reserved migration table already exists: {legacy_name}"
+            )));
+        }
+        transaction.execute(
+            &format!(
+                "ALTER TABLE \"{}\" RENAME TO \"{}\"",
+                spec.name, legacy_name
+            ),
+            [],
+        )?;
+        staged.insert(spec.name);
+    }
+
+    // Named indexes retain their names when a table is renamed. Remove the
+    // historical copies so the canonical DDL can recreate them on the new
+    // tables. The surrounding transaction restores them on any later failure.
+    for index_name in USER_SCHEMA_INDEX_NAMES {
+        transaction.execute(&format!("DROP INDEX IF EXISTS \"{index_name}\""), [])?;
+    }
+    // Triggers, like indexes, keep their global names after ALTER TABLE RENAME.
+    // Drop the legacy copies transactionally so canonical triggers can be
+    // created on the replacement tables. Rollback restores them on failure.
+    for trigger_name in USER_SCHEMA_TRIGGER_NAMES {
+        transaction.execute(&format!("DROP TRIGGER IF EXISTS \"{trigger_name}\""), [])?;
+    }
+
+    Ok(staged)
+}
+
+fn table_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+) -> rusqlite::Result<HashSet<String>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(columns)
+}
+
+fn copy_legacy_user_table(
+    transaction: &rusqlite::Transaction<'_>,
+    spec: &UserTableMigrationSpec,
+) -> rusqlite::Result<()> {
+    let legacy_name = legacy_user_table_name(spec.name);
+    let source_columns = table_columns(transaction, &legacy_name)?;
+    let canonical_columns = spec
+        .canonical_columns
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+
+    if let Some(unknown) = source_columns
+        .iter()
+        .find(|column| !canonical_columns.contains(column.as_str()))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} contains unsupported column {unknown}; refusing to drop user data",
+            spec.name
+        )));
+    }
+    if let Some(missing) = spec
+        .required_legacy_columns
+        .iter()
+        .find(|column| !source_columns.contains(**column))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} is missing required column {missing}",
+            spec.name
+        )));
+    }
+
+    let copied_columns = spec
+        .canonical_columns
+        .iter()
+        .filter(|column| source_columns.contains(**column))
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>();
+    let column_list = copied_columns.join(", ");
+    let source_count: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM \"{legacy_name}\""),
+        [],
+        |row| row.get(0),
+    )?;
+    let copied = transaction.execute(
+        &format!(
+            "INSERT INTO \"{}\" ({column_list}) SELECT {column_list} FROM \"{legacy_name}\"",
+            spec.name
+        ),
+        [],
+    )?;
+    if i64::try_from(copied).ok() != Some(source_count) {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} row count changed during migration",
+            spec.name
+        )));
+    }
+
+    Ok(())
+}
+
+fn migrate_staged_user_tables(
+    transaction: &rusqlite::Transaction<'_>,
+    staged: &HashSet<&str>,
+) -> rusqlite::Result<()> {
+    for spec in USER_TABLE_MIGRATION_SPECS {
+        if staged.contains(spec.name) {
+            copy_legacy_user_table(transaction, spec)?;
+        }
+    }
+
+    validate_project_scoped_relations(transaction)?;
+
+    for table in LEGACY_USER_TABLE_DROP_ORDER {
+        if staged.contains(table) {
+            transaction.execute(
+                &format!("DROP TABLE \"{}\"", legacy_user_table_name(table)),
+                [],
+            )?;
+        }
+    }
+
+    let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        return Err(user_schema_migration_error(
+            "foreign key violations remain after canonical migration".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_project_scoped_relations(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let invalid_evidence_link: bool = connection.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM evidence_links AS link
+            LEFT JOIN case_facts AS fact
+              ON fact.fact_id = link.fact_id
+             AND fact.project_id = link.project_id
+            LEFT JOIN evidence_items AS evidence
+              ON evidence.evidence_id = link.evidence_id
+             AND evidence.project_id = link.project_id
+            WHERE fact.fact_id IS NULL OR evidence.evidence_id IS NULL
+        )
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_evidence_link {
+        return Err(user_schema_migration_error(
+            "evidence links must reference a fact and evidence item from their own project"
+                .to_owned(),
+        ));
+    }
+
+    let invalid_legal_basis: bool = connection.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM legal_basis AS basis
+            LEFT JOIN legal_issues AS issue
+              ON issue.issue_id = basis.issue_id
+             AND issue.project_id = basis.project_id
+            WHERE basis.issue_id IS NOT NULL AND issue.issue_id IS NULL
+        )
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_legal_basis {
+        return Err(user_schema_migration_error(
+            "legal basis issue must belong to the same project".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn user_schema_migration_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+        Some(message),
+    )
+}
+
+fn user_database_metadata_value(
+    connection: &rusqlite::Connection,
+    key: &str,
+) -> Result<Option<String>, DatabaseInitError> {
+    connection
+        .query_row(
+            "SELECT value FROM user_database_metadata WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), DatabaseInitError> {
-    if let Some(found) = existing_user_schema_version(connection)? {
+    let existing_version = existing_user_schema_version(connection)?;
+    let schema_version_value = USER_SCHEMA_VERSION.to_string();
+    let expected_canonical_marker = USER_CANONICAL_SCHEMA_MARKER_VALUE;
+    if let Some(found) = existing_version {
         if found > USER_SCHEMA_VERSION {
             return Err(DatabaseInitError::UnsupportedUserSchemaVersion {
                 found,
@@ -1445,7 +2016,36 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             });
         }
     }
-    let transaction = connection.transaction()?;
+    let canonical_schema_marker = if existing_version.is_some() {
+        user_database_metadata_value(connection, USER_CANONICAL_SCHEMA_MARKER_KEY)?
+    } else {
+        None
+    };
+    let mut known_user_table_exists = false;
+    for spec in USER_TABLE_MIGRATION_SPECS {
+        if sqlite_table_exists(connection, spec.name)? {
+            known_user_table_exists = true;
+            break;
+        }
+    }
+    let needs_canonical_rebuild = match existing_version {
+        Some(found) => {
+            found < USER_SCHEMA_VERSION
+                || (found == USER_SCHEMA_VERSION
+                    && canonical_schema_marker.as_deref() != Some(expected_canonical_marker))
+        }
+        // A truly empty database can be initialized in place. Known tables
+        // without a version are legacy or interrupted state and must not be
+        // blessed with the canonical marker without rebuilding their shape.
+        None => known_user_table_exists,
+    };
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let staged_tables = if needs_canonical_rebuild {
+        stage_legacy_user_tables(&transaction)?
+    } else {
+        HashSet::new()
+    };
 
     transaction.execute_batch(
         "
@@ -1525,7 +2125,8 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             confirmation_status TEXT NOT NULL CHECK (
                 confirmation_status IN ('model_suggested', 'confirmed')
             ),
-            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
+            UNIQUE(project_id, fact_id)
         );
 
         CREATE TABLE IF NOT EXISTS evidence_items (
@@ -1541,7 +2142,8 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
                 confirmation_status IN ('model_suggested', 'confirmed')
             ),
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
-            UNIQUE(project_id, evidence_number)
+            UNIQUE(project_id, evidence_number),
+            UNIQUE(project_id, evidence_id)
         );
 
         CREATE TABLE IF NOT EXISTS evidence_links (
@@ -1550,8 +2152,10 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             fact_id TEXT NOT NULL,
             evidence_id TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
-            FOREIGN KEY(fact_id) REFERENCES case_facts(fact_id) ON DELETE CASCADE,
-            FOREIGN KEY(evidence_id) REFERENCES evidence_items(evidence_id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id, fact_id)
+                REFERENCES case_facts(project_id, fact_id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id, evidence_id)
+                REFERENCES evidence_items(project_id, evidence_id) ON DELETE CASCADE,
             UNIQUE(fact_id, evidence_id)
         );
 
@@ -1613,6 +2217,26 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             FOREIGN KEY(issue_id) REFERENCES legal_issues(issue_id) ON DELETE SET NULL
         );
 
+        CREATE TRIGGER IF NOT EXISTS trg_legal_basis_issue_project_insert
+        BEFORE INSERT ON legal_basis
+        WHEN NEW.issue_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM legal_issues
+            WHERE issue_id = NEW.issue_id AND project_id = NEW.project_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legal basis issue must belong to the same project');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_legal_basis_issue_project_update
+        BEFORE UPDATE OF project_id, issue_id ON legal_basis
+        WHEN NEW.issue_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM legal_issues
+            WHERE issue_id = NEW.issue_id AND project_id = NEW.project_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legal basis issue must belong to the same project');
+        END;
+
         CREATE INDEX IF NOT EXISTS idx_projects_updated
             ON projects(updated_at);
         CREATE INDEX IF NOT EXISTS idx_case_files_project
@@ -1655,6 +2279,10 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
         ",
     )?;
 
+    if !staged_tables.is_empty() {
+        migrate_staged_user_tables(&transaction, &staged_tables)?;
+    }
+
     transaction.execute(
         "
         INSERT INTO user_database_metadata (key, value)
@@ -1663,7 +2291,17 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             value = excluded.value,
             updated_at = CURRENT_TIMESTAMP
         ",
-        [USER_SCHEMA_VERSION.to_string()],
+        [schema_version_value.as_str()],
+    )?;
+    transaction.execute(
+        "
+        INSERT INTO user_database_metadata (key, value)
+        VALUES (?1, ?2)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        ",
+        (USER_CANONICAL_SCHEMA_MARKER_KEY, expected_canonical_marker),
     )?;
 
     transaction.commit()?;
@@ -1710,6 +2348,194 @@ mod tests {
 
         assert_eq!(database_path, directory.path().join(USER_DB_FILE_NAME));
         assert!(database_path.is_file());
+    }
+
+    #[test]
+    fn user_database_waits_for_a_short_competing_writer_and_then_succeeds() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let mut first = open_user_database(&database_path).expect("first connection opens");
+        let second = open_user_database(&database_path).expect("second connection opens");
+        let configured_timeout_ms: i64 = second
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout reads");
+        assert_eq!(configured_timeout_ms, 5_000);
+
+        let first_write = first
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("first writer acquires lock");
+        first_write
+            .execute(
+                "INSERT INTO projects (project_id, title, status)
+                 VALUES ('writer-one', 'Writer one', 'active')",
+                [],
+            )
+            .expect("first writer inserts while holding transaction");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).expect("contender start signal sends");
+            let result = second
+                .execute(
+                    "INSERT INTO projects (project_id, title, status)
+                     VALUES ('writer-two', 'Writer two', 'active')",
+                    [],
+                )
+                .map_err(|error| error.to_string());
+            finished_tx
+                .send(result)
+                .expect("contender completion signal sends");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("contender starts");
+        assert!(finished_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err());
+        first_write.commit().expect("first writer releases lock");
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("contender finishes after lock release")
+            .expect("contending write succeeds within busy timeout");
+        contender.join().expect("contender exits");
+
+        let connection = open_user_database(&database_path).expect("database reopens");
+        let project_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE project_id LIKE 'writer-%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("both writes are visible");
+        assert_eq!(project_count, 2);
+    }
+
+    #[test]
+    fn read_then_write_command_waits_for_writer_before_starting_transaction() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let mut first = open_user_database(&database_path).expect("first connection opens");
+        seed_project(&first, "project-lock");
+        upsert_case_file(
+            &first,
+            &CaseFileRow {
+                file_id: "file-lock".to_owned(),
+                project_id: "project-lock".to_owned(),
+                title: "Lock test file".to_owned(),
+                file_type: String::new(),
+                storage_reference: String::new(),
+                summary: String::new(),
+                created_at: String::new(),
+            },
+        )
+        .expect("file inserts");
+        let mut second = open_user_database(&database_path).expect("second connection opens");
+
+        let first_write = first
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("first writer acquires lock");
+        first_write
+            .execute(
+                "UPDATE projects SET summary = 'writer-held' WHERE project_id = 'project-lock'",
+                [],
+            )
+            .expect("first writer updates while holding transaction");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).expect("contender start signal sends");
+            let result = delete_case_entity(&mut second, "case_files", "file_id", "file-lock")
+                .map_err(|error| error.to_string());
+            finished_tx
+                .send(result)
+                .expect("contender completion signal sends");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("contender starts");
+        assert!(finished_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err());
+        first_write.commit().expect("first writer releases lock");
+        assert!(finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("read-then-write command finishes after lock release")
+            .expect("read-then-write command succeeds within busy timeout"));
+        contender.join().expect("contender exits");
+
+        let connection = open_user_database(&database_path).expect("database reopens");
+        assert_eq!(table_row_count(&connection, "case_files"), 0);
+    }
+
+    #[test]
+    fn canonical_migration_waits_for_competing_writer_before_rebuild() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        seed_unversioned_weak_projects_database(&database_path, true);
+        {
+            let connection =
+                rusqlite::Connection::open(&database_path).expect("unmarked legacy database opens");
+            connection
+                .execute(
+                    "INSERT INTO user_database_metadata (key, value)
+                     VALUES ('schema_version', '6')",
+                    [],
+                )
+                .expect("legacy schema version inserts");
+        }
+
+        let mut first = open_user_database(&database_path).expect("first connection opens");
+        let first_write = first
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("first writer acquires lock");
+        first_write
+            .execute(
+                "UPDATE projects SET summary = 'committed-before-rebuild'
+                 WHERE project_id = 'unversioned-project'",
+                [],
+            )
+            .expect("legacy writer updates while holding transaction");
+
+        let directory_path = directory.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).expect("migration start signal sends");
+            let result = ensure_user_database(&directory_path).map_err(|error| error.to_string());
+            finished_tx
+                .send(result)
+                .expect("migration completion signal sends");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("migration starts");
+        assert!(finished_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err());
+        first_write.commit().expect("first writer releases lock");
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("migration finishes after lock release")
+            .expect("migration succeeds within busy timeout");
+        contender.join().expect("migration contender exits");
+
+        assert_rebuilt_unversioned_project_database(&database_path);
+        let connection = open_user_database(&database_path).expect("rebuilt database opens");
+        let summary: String = connection
+            .query_row(
+                "SELECT summary FROM projects WHERE project_id = 'unversioned-project'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("committed legacy update survives rebuild");
+        assert_eq!(summary, "committed-before-rebuild");
     }
 
     #[test]
@@ -1917,6 +2743,56 @@ mod tests {
                         status TEXT NOT NULL,
                         confirmation_status TEXT NOT NULL
                     );
+                    INSERT INTO provider_profiles (
+                        id, kind, display_name, model_id, base_url,
+                        credential_account_id, capabilities_json, options_json
+                    ) VALUES (
+                        'legacy-provider', 'deep_seek', 'Legacy Provider', 'legacy-model',
+                        'https://api.deepseek.com', 'legacy-account', '{}', '{}'
+                    );
+                    INSERT INTO projects (
+                        project_id, title, case_type, status, opened_on, summary
+                    ) VALUES (
+                        'legacy-project', 'Legacy project', 'contract', 'active',
+                        '2024-01-01', 'Preserved project'
+                    );
+                    INSERT INTO case_files (
+                        file_id, project_id, title, file_type, storage_reference, summary
+                    ) VALUES (
+                        'legacy-file', 'legacy-project', 'Legacy material', 'text',
+                        'legacy.txt', 'Preserved material'
+                    );
+                    INSERT INTO case_parties (
+                        party_id, project_id, name, normalized_name, role, contact, notes
+                    ) VALUES (
+                        'legacy-party', 'legacy-project', 'Legacy party', 'legacyparty',
+                        'plaintiff', '', 'Preserved party'
+                    );
+                    INSERT INTO case_facts (
+                        fact_id, project_id, occurred_on, title, description, source,
+                        confirmation_status
+                    ) VALUES (
+                        'legacy-fact', 'legacy-project', '2024-01-02', 'Legacy fact',
+                        'Preserved fact', 'manual', 'confirmed'
+                    );
+                    INSERT INTO evidence_items (
+                        evidence_id, project_id, evidence_number, title, source, formed_on,
+                        summary, storage_reference, confirmation_status
+                    ) VALUES (
+                        'legacy-evidence', 'legacy-project', 'E-1', 'Legacy evidence',
+                        'manual', '2024-01-03', 'Preserved evidence', 'evidence.txt', 'confirmed'
+                    );
+                    INSERT INTO evidence_links (link_id, project_id, fact_id, evidence_id)
+                    VALUES (
+                        'legacy-link', 'legacy-project', 'legacy-fact', 'legacy-evidence'
+                    );
+                    INSERT INTO legal_issues (
+                        issue_id, project_id, title, description, claim, status,
+                        confirmation_status
+                    ) VALUES (
+                        'legacy-issue', 'legacy-project', 'Legacy issue', 'Preserved issue',
+                        'Legacy claim', 'open', 'confirmed'
+                    );
                     INSERT INTO user_database_metadata (key, value)
                     VALUES ('schema_version', '3');
                     ",
@@ -1937,6 +2813,111 @@ mod tests {
         assert_eq!(schema_version, USER_SCHEMA_VERSION.to_string());
         assert_eq!(sqlite_master_count(&connection, "legal_answer_records"), 1);
         assert_eq!(sqlite_master_count(&connection, "legal_basis"), 1);
+
+        let migrated_fact: String = connection
+            .query_row(
+                "SELECT description FROM case_facts WHERE fact_id = 'legacy-fact'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("non-empty legacy fact survives migration");
+        assert_eq!(migrated_fact, "Preserved fact");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM evidence_links", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("migrated link count reads"),
+            1
+        );
+
+        let foreign_keys = {
+            let mut statement = connection
+                .prepare("PRAGMA foreign_key_list(evidence_links)")
+                .expect("foreign key list prepares");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .expect("foreign key list queries")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("foreign key list collects")
+        };
+        assert!(foreign_keys.contains(&(
+            "projects".to_owned(),
+            "project_id".to_owned(),
+            "CASCADE".to_owned()
+        )));
+        assert!(foreign_keys.contains(&(
+            "case_facts".to_owned(),
+            "fact_id".to_owned(),
+            "CASCADE".to_owned()
+        )));
+        assert!(foreign_keys.contains(&(
+            "evidence_items".to_owned(),
+            "evidence_id".to_owned(),
+            "CASCADE".to_owned()
+        )));
+
+        let evidence_indexes = {
+            let mut statement = connection
+                .prepare("PRAGMA index_list(evidence_items)")
+                .expect("index list prepares");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+                })
+                .expect("index list queries")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("index list collects")
+        };
+        assert!(evidence_indexes
+            .iter()
+            .any(|(name, _)| name == "idx_evidence_items_project"));
+        assert!(evidence_indexes.iter().any(|(_, unique)| *unique));
+
+        let check_error = connection
+            .execute(
+                "INSERT INTO projects (project_id, title, status) VALUES ('bad', 'Bad', 'invalid')",
+                [],
+            )
+            .expect_err("canonical project CHECK rejects invalid status");
+        assert!(matches!(check_error, rusqlite::Error::SqliteFailure(_, _)));
+        let unique_error = connection
+            .execute(
+                "INSERT INTO evidence_items (
+                    evidence_id, project_id, evidence_number, title, confirmation_status
+                 ) VALUES ('duplicate-evidence', 'legacy-project', 'E-1', 'Duplicate', 'confirmed')",
+                [],
+            )
+            .expect_err("canonical evidence UNIQUE rejects duplicate project number");
+        assert!(matches!(unique_error, rusqlite::Error::SqliteFailure(_, _)));
+
+        connection
+            .execute(
+                "DELETE FROM projects WHERE project_id = 'legacy-project'",
+                [],
+            )
+            .expect("canonical project cascade deletes migrated children");
+        for table in [
+            "case_files",
+            "case_parties",
+            "case_facts",
+            "evidence_items",
+            "evidence_links",
+            "legal_issues",
+        ] {
+            let remaining: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("child count reads after cascade");
+            assert_eq!(remaining, 0, "{table} cascades after migration");
+        }
     }
 
     #[test]
@@ -2139,6 +3120,342 @@ mod tests {
     }
 
     #[test]
+    fn invalid_legacy_rows_abort_canonical_rebuild_without_data_loss() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        {
+            let connection =
+                rusqlite::Connection::open(&database_path).expect("legacy database opens");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE user_database_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE projects (
+                        project_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        case_type TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        opened_on TEXT,
+                        summary TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO projects (project_id, title, status)
+                    VALUES ('invalid-project', 'Must survive rollback', 'legacy-invalid-status');
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('schema_version', '3');
+                    ",
+                )
+                .expect("invalid legacy row is representable before canonical migration");
+        }
+
+        let error = ensure_user_database(directory.path())
+            .expect_err("invalid legacy CHECK value aborts migration");
+        assert!(matches!(error, DatabaseInitError::Sqlite(_)));
+
+        let connection = rusqlite::Connection::open(&database_path).expect("database reopens");
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM user_database_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("old schema version survives rollback");
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM projects WHERE project_id = 'invalid-project'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("invalid legacy row is not silently deleted");
+
+        assert_eq!(schema_version, "3");
+        assert_eq!(status, "legacy-invalid-status");
+        assert_eq!(sqlite_master_count(&connection, "provider_profiles"), 0);
+        assert_eq!(
+            sqlite_master_count(&connection, "__lawyer_assistance_v6_legacy_projects"),
+            0
+        );
+    }
+
+    #[test]
+    fn cross_project_legacy_evidence_link_aborts_rebuild_without_data_loss() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        {
+            let connection =
+                rusqlite::Connection::open(&database_path).expect("legacy database opens");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE user_database_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE projects (
+                        project_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        status TEXT NOT NULL
+                    );
+                    CREATE TABLE case_facts (
+                        fact_id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        confirmation_status TEXT NOT NULL
+                    );
+                    CREATE TABLE evidence_items (
+                        evidence_id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        evidence_number TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        confirmation_status TEXT NOT NULL
+                    );
+                    CREATE TABLE evidence_links (
+                        link_id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        fact_id TEXT NOT NULL,
+                        evidence_id TEXT NOT NULL
+                    );
+                    INSERT INTO projects (project_id, title, status) VALUES
+                        ('project-a', 'Project A', 'active'),
+                        ('project-b', 'Project B', 'active');
+                    INSERT INTO case_facts (
+                        fact_id, project_id, title, confirmation_status
+                    ) VALUES ('fact-a', 'project-a', 'Fact A', 'confirmed');
+                    INSERT INTO evidence_items (
+                        evidence_id, project_id, evidence_number, title, confirmation_status
+                    ) VALUES ('evidence-b', 'project-b', 'B-1', 'Evidence B', 'confirmed');
+                    INSERT INTO evidence_links (link_id, project_id, fact_id, evidence_id)
+                    VALUES ('cross-link', 'project-a', 'fact-a', 'evidence-b');
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('schema_version', '3');
+                    ",
+                )
+                .expect("cross-project legacy link is representable");
+        }
+
+        let error = ensure_user_database(directory.path())
+            .expect_err("cross-project legacy evidence link aborts canonical rebuild");
+        assert!(matches!(error, DatabaseInitError::Sqlite(_)));
+
+        let connection =
+            rusqlite::Connection::open(&database_path).expect("legacy database reopens");
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM user_database_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy schema version survives rollback");
+        assert_eq!(schema_version, "3");
+        assert_eq!(table_row_count(&connection, "evidence_links"), 1);
+        assert_eq!(
+            sqlite_master_count(&connection, "__lawyer_assistance_v6_legacy_evidence_links"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM user_database_metadata WHERE key = ?1",
+                    [USER_CANONICAL_SCHEMA_MARKER_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("marker absence is queryable"),
+            0
+        );
+    }
+
+    #[test]
+    fn cross_project_legacy_legal_basis_aborts_rebuild_without_data_loss() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        {
+            let connection =
+                rusqlite::Connection::open(&database_path).expect("legacy database opens");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE user_database_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE projects (
+                        project_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        status TEXT NOT NULL
+                    );
+                    CREATE TABLE legal_issues (
+                        issue_id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        confirmation_status TEXT NOT NULL
+                    );
+                    CREATE TABLE legal_basis (
+                        basis_id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        issue_id TEXT,
+                        source_id TEXT NOT NULL,
+                        status TEXT NOT NULL
+                    );
+                    INSERT INTO projects (project_id, title, status) VALUES
+                        ('project-a', 'Project A', 'active'),
+                        ('project-b', 'Project B', 'active');
+                    INSERT INTO legal_issues (
+                        issue_id, project_id, title, status, confirmation_status
+                    ) VALUES ('issue-b', 'project-b', 'Issue B', 'open', 'confirmed');
+                    INSERT INTO legal_basis (basis_id, project_id, issue_id, source_id, status)
+                    VALUES ('cross-basis', 'project-a', 'issue-b', 'law:test', 'valid');
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('schema_version', '4');
+                    ",
+                )
+                .expect("cross-project legacy legal basis is representable");
+        }
+
+        let error = ensure_user_database(directory.path())
+            .expect_err("cross-project legacy legal basis aborts canonical rebuild");
+        assert!(matches!(error, DatabaseInitError::Sqlite(_)));
+
+        let connection =
+            rusqlite::Connection::open(&database_path).expect("legacy database reopens");
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM user_database_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy schema version survives rollback");
+        assert_eq!(schema_version, "4");
+        assert_eq!(table_row_count(&connection, "legal_basis"), 1);
+        assert_eq!(
+            sqlite_master_count(&connection, "__lawyer_assistance_v6_legacy_legal_basis"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM user_database_metadata WHERE key = ?1",
+                    [USER_CANONICAL_SCHEMA_MARKER_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("marker absence is queryable"),
+            0
+        );
+    }
+
+    #[test]
+    fn unmarked_v6_database_from_legacy_if_not_exists_path_is_repaired_once() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        {
+            let connection =
+                rusqlite::Connection::open(&database_path).expect("legacy database opens");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE user_database_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE projects (
+                        project_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        case_type TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        opened_on TEXT,
+                        summary TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO projects (project_id, title, status)
+                    VALUES ('mis-migrated-v6', 'Preserve me', 'active');
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('schema_version', '6');
+                    ",
+                )
+                .expect("previous IF NOT EXISTS migration shape is created");
+        }
+
+        ensure_user_database(directory.path()).expect("unmarked v6 schema is rebuilt");
+        {
+            let connection = open_user_database(&database_path).expect("repaired database opens");
+            let marker: String = connection
+                .query_row(
+                    "SELECT value FROM user_database_metadata WHERE key = ?1",
+                    [USER_CANONICAL_SCHEMA_MARKER_KEY],
+                    |row| row.get(0),
+                )
+                .expect("canonical marker is recorded");
+            let title: String = connection
+                .query_row(
+                    "SELECT title FROM projects WHERE project_id = 'mis-migrated-v6'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("pre-existing v6 data survives repair");
+            assert_eq!(marker, USER_CANONICAL_SCHEMA_MARKER_VALUE);
+            assert_eq!(title, "Preserve me");
+            connection
+                .execute(
+                    "INSERT INTO projects (project_id, title, status)
+                     VALUES ('bad-after-repair', 'Bad', 'not-a-status')",
+                    [],
+                )
+                .expect_err("repaired v6 table has canonical CHECK constraints");
+        }
+
+        ensure_user_database(directory.path()).expect("marked canonical v6 reopen is idempotent");
+        let connection = open_user_database(&database_path).expect("database opens after recheck");
+        let preserved: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE project_id = 'mis-migrated-v6'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved project remains after idempotent reopen");
+        assert_eq!(preserved, 1);
+    }
+
+    #[test]
+    fn unversioned_business_tables_without_metadata_are_rebuilt_before_marking() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        seed_unversioned_weak_projects_database(&database_path, false);
+
+        ensure_user_database(directory.path()).expect("unversioned business schema is rebuilt");
+        assert_rebuilt_unversioned_project_database(&database_path);
+    }
+
+    #[test]
+    fn metadata_without_schema_version_rebuilds_existing_business_tables() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        seed_unversioned_weak_projects_database(&database_path, true);
+
+        ensure_user_database(directory.path())
+            .expect("business schema without a version row is rebuilt");
+        assert_rebuilt_unversioned_project_database(&database_path);
+
+        let connection = open_user_database(&database_path).expect("rebuilt database opens");
+        let legacy_note: String = connection
+            .query_row(
+                "SELECT value FROM user_database_metadata WHERE key = 'legacy_note'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unrelated metadata survives rebuild");
+        assert_eq!(legacy_note, "preserve");
+    }
+
+    #[test]
     fn future_user_schema_is_rejected_without_downgrade_or_writes() {
         let directory = tempfile::tempdir().expect("tempdir exists");
         let database_path = directory.path().join(USER_DB_FILE_NAME);
@@ -2243,6 +3560,51 @@ mod tests {
         assert!(list_provider_profiles(&connection)
             .expect("provider profiles list after delete")
             .is_empty());
+    }
+
+    #[test]
+    fn provider_profile_kinds_remain_compatible_and_custom_is_schema_free() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let kinds = [
+            "deep_seek",
+            "qwen",
+            "silicon_flow",
+            "volcengine_ark",
+            "custom",
+        ];
+        {
+            let connection = open_user_database(&database_path).expect("user database opens");
+            for kind in kinds {
+                upsert_provider_profile(
+                    &connection,
+                    &ProviderProfileRow {
+                        id: format!("{kind}-main"),
+                        kind: kind.to_owned(),
+                        display_name: format!("{kind} profile"),
+                        model_id: "model-id".to_owned(),
+                        base_url: "https://models.example.com/v1".to_owned(),
+                        credential_account_id: "default".to_owned(),
+                        capabilities_json: r#"{"chat":true,"streaming":true}"#.to_owned(),
+                        options_json: "{}".to_owned(),
+                    },
+                )
+                .expect("provider kind inserts without a schema migration");
+            }
+        }
+
+        let connection = open_user_database(&database_path).expect("user database reopens");
+        let profiles = list_provider_profiles(&connection).expect("provider profiles list");
+        assert_eq!(profiles.len(), kinds.len());
+        for kind in kinds {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.id == format!("{kind}-main"))
+                .expect("provider kind survives restart");
+            assert_eq!(profile.kind, kind);
+            assert_eq!(profile.credential_account_id, "default");
+        }
     }
 
     #[test]
@@ -2427,6 +3789,414 @@ mod tests {
         ] {
             assert_eq!(table_row_count(&connection, table), 0, "{table} cascades");
         }
+    }
+
+    #[test]
+    fn child_upserts_reject_cross_project_id_reuse_without_mutating_owner() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let connection = open_user_database(&database_path).expect("user database opens");
+        seed_project(&connection, "project-a");
+        seed_project(&connection, "project-b");
+
+        let mut file = CaseFileRow {
+            file_id: "shared-file".to_owned(),
+            project_id: "project-a".to_owned(),
+            title: "Owned file".to_owned(),
+            file_type: "note".to_owned(),
+            storage_reference: String::new(),
+            summary: String::new(),
+            created_at: String::new(),
+        };
+        upsert_case_file(&connection, &file).expect("owned file inserts");
+        file.project_id = "project-b".to_owned();
+        file.title = "Hijacked file".to_owned();
+        assert_project_scope_error(
+            upsert_case_file(&connection, &file).expect_err("cross-project file update fails"),
+            "case file",
+        );
+        assert_eq!(
+            project_and_value(&connection, "case_files", "file_id", "shared-file", "title"),
+            ("project-a".to_owned(), "Owned file".to_owned())
+        );
+
+        let mut party = CasePartyRow {
+            party_id: "shared-party".to_owned(),
+            project_id: "project-a".to_owned(),
+            name: "Owned party".to_owned(),
+            normalized_name: "ownedparty".to_owned(),
+            role: "plaintiff".to_owned(),
+            contact: String::new(),
+            notes: String::new(),
+        };
+        upsert_case_party(&connection, &party).expect("owned party inserts");
+        party.project_id = "project-b".to_owned();
+        party.name = "Hijacked party".to_owned();
+        assert_project_scope_error(
+            upsert_case_party(&connection, &party).expect_err("cross-project party update fails"),
+            "case party",
+        );
+        assert_eq!(
+            project_and_value(
+                &connection,
+                "case_parties",
+                "party_id",
+                "shared-party",
+                "name"
+            ),
+            ("project-a".to_owned(), "Owned party".to_owned())
+        );
+
+        let mut fact = CaseFactRow {
+            fact_id: "shared-fact".to_owned(),
+            project_id: "project-a".to_owned(),
+            occurred_on: None,
+            title: "Owned fact".to_owned(),
+            description: String::new(),
+            source: String::new(),
+            confirmation_status: "confirmed".to_owned(),
+        };
+        upsert_case_fact(&connection, &fact).expect("owned fact inserts");
+        fact.project_id = "project-b".to_owned();
+        fact.title = "Hijacked fact".to_owned();
+        assert_project_scope_error(
+            upsert_case_fact(&connection, &fact).expect_err("cross-project fact update fails"),
+            "case fact",
+        );
+        assert_eq!(
+            project_and_value(&connection, "case_facts", "fact_id", "shared-fact", "title"),
+            ("project-a".to_owned(), "Owned fact".to_owned())
+        );
+
+        let mut evidence = EvidenceItemRow {
+            evidence_id: "shared-evidence".to_owned(),
+            project_id: "project-a".to_owned(),
+            evidence_number: "A-1".to_owned(),
+            title: "Owned evidence".to_owned(),
+            source: String::new(),
+            formed_on: None,
+            summary: String::new(),
+            storage_reference: String::new(),
+            confirmation_status: "confirmed".to_owned(),
+        };
+        upsert_evidence_item(&connection, &evidence).expect("owned evidence inserts");
+        evidence.project_id = "project-b".to_owned();
+        evidence.evidence_number = "B-1".to_owned();
+        evidence.title = "Hijacked evidence".to_owned();
+        assert_project_scope_error(
+            upsert_evidence_item(&connection, &evidence)
+                .expect_err("cross-project evidence update fails"),
+            "evidence item",
+        );
+        assert_eq!(
+            project_and_value(
+                &connection,
+                "evidence_items",
+                "evidence_id",
+                "shared-evidence",
+                "title"
+            ),
+            ("project-a".to_owned(), "Owned evidence".to_owned())
+        );
+
+        let mut issue = LegalIssueRow {
+            issue_id: "shared-issue".to_owned(),
+            project_id: "project-a".to_owned(),
+            title: "Owned issue".to_owned(),
+            description: String::new(),
+            claim: String::new(),
+            status: "open".to_owned(),
+            confirmation_status: "confirmed".to_owned(),
+        };
+        upsert_legal_issue(&connection, &issue).expect("owned issue inserts");
+        issue.project_id = "project-b".to_owned();
+        issue.title = "Hijacked issue".to_owned();
+        assert_project_scope_error(
+            upsert_legal_issue(&connection, &issue).expect_err("cross-project issue update fails"),
+            "legal issue",
+        );
+        assert_eq!(
+            project_and_value(
+                &connection,
+                "legal_issues",
+                "issue_id",
+                "shared-issue",
+                "title"
+            ),
+            ("project-a".to_owned(), "Owned issue".to_owned())
+        );
+
+        let mut uncertainty = CaseUncertaintyRow {
+            uncertainty_id: "shared-uncertainty".to_owned(),
+            project_id: "project-a".to_owned(),
+            description: "Owned uncertainty".to_owned(),
+            related_entity_type: "general".to_owned(),
+            related_entity_id: None,
+            source_file_ids_json: "[]".to_owned(),
+            status: "open".to_owned(),
+            resolution: String::new(),
+            confirmation_status: "confirmed".to_owned(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        upsert_case_uncertainty(&connection, &uncertainty).expect("owned uncertainty inserts");
+        uncertainty.project_id = "project-b".to_owned();
+        uncertainty.description = "Hijacked uncertainty".to_owned();
+        assert_project_scope_error(
+            upsert_case_uncertainty(&connection, &uncertainty)
+                .expect_err("cross-project uncertainty update fails"),
+            "case uncertainty",
+        );
+        assert_eq!(
+            project_and_value(
+                &connection,
+                "case_uncertainties",
+                "uncertainty_id",
+                "shared-uncertainty",
+                "description"
+            ),
+            ("project-a".to_owned(), "Owned uncertainty".to_owned())
+        );
+
+        let mut basis = LegalBasisRow {
+            basis_id: "shared-basis".to_owned(),
+            project_id: "project-a".to_owned(),
+            issue_id: None,
+            source_id: "law:test:version:art:1".to_owned(),
+            status: "valid".to_owned(),
+            invalid_reason: None,
+            case_date: None,
+            article_id: String::new(),
+            document_id: String::new(),
+            version_id: String::new(),
+            document_title: String::new(),
+            version_label: String::new(),
+            article_number: String::new(),
+            article_title: None,
+            canonical_label: String::new(),
+            effective_from: String::new(),
+            effective_to: None,
+            version_status: String::new(),
+            excerpt: String::new(),
+            note: "Owned basis".to_owned(),
+            created_at: String::new(),
+        };
+        upsert_legal_basis(&connection, &basis).expect("owned basis inserts");
+        basis.project_id = "project-b".to_owned();
+        basis.note = "Hijacked basis".to_owned();
+        assert_project_scope_error(
+            upsert_legal_basis(&connection, &basis).expect_err("cross-project basis update fails"),
+            "legal basis",
+        );
+        assert_eq!(
+            project_and_value(
+                &connection,
+                "legal_basis",
+                "basis_id",
+                "shared-basis",
+                "note"
+            ),
+            ("project-a".to_owned(), "Owned basis".to_owned())
+        );
+    }
+
+    #[test]
+    fn legal_basis_requires_same_project_issue_and_preserves_set_null_delete() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let connection = open_user_database(&database_path).expect("user database opens");
+        seed_project(&connection, "project-a");
+        seed_project(&connection, "project-b");
+
+        for (issue_id, project_id) in [("issue-a", "project-a"), ("issue-b", "project-b")] {
+            upsert_legal_issue(
+                &connection,
+                &LegalIssueRow {
+                    issue_id: issue_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    title: issue_id.to_owned(),
+                    description: String::new(),
+                    claim: String::new(),
+                    status: "open".to_owned(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("issue inserts");
+        }
+
+        let mut basis = LegalBasisRow {
+            basis_id: "basis-a".to_owned(),
+            project_id: "project-a".to_owned(),
+            issue_id: Some("issue-b".to_owned()),
+            source_id: "law:test:version:art:1".to_owned(),
+            status: "valid".to_owned(),
+            invalid_reason: None,
+            case_date: None,
+            article_id: String::new(),
+            document_id: String::new(),
+            version_id: String::new(),
+            document_title: String::new(),
+            version_label: String::new(),
+            article_number: String::new(),
+            article_title: None,
+            canonical_label: String::new(),
+            effective_from: String::new(),
+            effective_to: None,
+            version_status: String::new(),
+            excerpt: String::new(),
+            note: String::new(),
+            created_at: String::new(),
+        };
+        assert_project_scope_error(
+            upsert_legal_basis(&connection, &basis)
+                .expect_err("cross-project legal basis insert fails"),
+            "legal basis",
+        );
+        connection
+            .execute(
+                "INSERT INTO legal_basis (basis_id, project_id, issue_id, source_id, status)
+                 VALUES ('direct-cross-basis', 'project-a', 'issue-b', 'law:test', 'valid')",
+                [],
+            )
+            .expect_err("canonical trigger rejects direct mixed-project legal basis SQL");
+        assert_eq!(table_row_count(&connection, "legal_basis"), 0);
+
+        basis.issue_id = Some("issue-a".to_owned());
+        upsert_legal_basis(&connection, &basis).expect("same-project legal basis inserts");
+        connection
+            .execute("DELETE FROM legal_issues WHERE issue_id = 'issue-a'", [])
+            .expect("deleting the issue preserves its basis");
+        let remaining_issue_id: Option<String> = connection
+            .query_row(
+                "SELECT issue_id FROM legal_basis WHERE basis_id = 'basis-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("basis survives issue deletion");
+        assert_eq!(remaining_issue_id, None);
+    }
+
+    #[test]
+    fn evidence_links_require_project_fact_and_evidence_to_share_one_owner() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let connection = open_user_database(&database_path).expect("user database opens");
+        seed_project(&connection, "project-a");
+        seed_project(&connection, "project-b");
+
+        for (fact_id, project_id) in [("fact-a", "project-a"), ("fact-b", "project-b")] {
+            upsert_case_fact(
+                &connection,
+                &CaseFactRow {
+                    fact_id: fact_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    occurred_on: None,
+                    title: fact_id.to_owned(),
+                    description: String::new(),
+                    source: String::new(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("fact inserts");
+        }
+        for (evidence_id, project_id, evidence_number) in [
+            ("evidence-a-1", "project-a", "A-1"),
+            ("evidence-a-2", "project-a", "A-2"),
+            ("evidence-b", "project-b", "B-1"),
+        ] {
+            upsert_evidence_item(
+                &connection,
+                &EvidenceItemRow {
+                    evidence_id: evidence_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    evidence_number: evidence_number.to_owned(),
+                    title: evidence_id.to_owned(),
+                    source: String::new(),
+                    formed_on: None,
+                    summary: String::new(),
+                    storage_reference: String::new(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("evidence inserts");
+        }
+
+        let mixed_project_link = EvidenceLinkRow {
+            link_id: "mixed-project-link".to_owned(),
+            project_id: "project-a".to_owned(),
+            fact_id: "fact-a".to_owned(),
+            evidence_id: "evidence-b".to_owned(),
+        };
+        assert_project_scope_error(
+            upsert_evidence_link(&connection, &mixed_project_link)
+                .expect_err("mixed-project link insert fails"),
+            "evidence link",
+        );
+        assert_eq!(table_row_count(&connection, "evidence_links"), 0);
+        connection
+            .execute(
+                "INSERT INTO evidence_links (link_id, project_id, fact_id, evidence_id)
+                 VALUES ('direct-mixed-link', 'project-a', 'fact-a', 'evidence-b')",
+                [],
+            )
+            .expect_err("canonical composite foreign key rejects direct mixed-project SQL");
+        assert_eq!(table_row_count(&connection, "evidence_links"), 0);
+
+        let mut link = EvidenceLinkRow {
+            link_id: "owned-link".to_owned(),
+            project_id: "project-a".to_owned(),
+            fact_id: "fact-a".to_owned(),
+            evidence_id: "evidence-a-1".to_owned(),
+        };
+        upsert_evidence_link(&connection, &link).expect("valid link inserts");
+        link.evidence_id = "evidence-a-2".to_owned();
+        upsert_evidence_link(&connection, &link).expect("same-project link updates");
+
+        link.evidence_id = "evidence-b".to_owned();
+        assert_project_scope_error(
+            upsert_evidence_link(&connection, &link)
+                .expect_err("cross-project evidence replacement fails"),
+            "evidence link",
+        );
+        assert_eq!(
+            evidence_link_owner_and_targets(&connection, "owned-link"),
+            (
+                "project-a".to_owned(),
+                "fact-a".to_owned(),
+                "evidence-a-2".to_owned()
+            )
+        );
+
+        link.project_id = "project-b".to_owned();
+        link.fact_id = "fact-b".to_owned();
+        link.evidence_id = "evidence-b".to_owned();
+        assert_project_scope_error(
+            upsert_evidence_link(&connection, &link)
+                .expect_err("cross-project link id reuse fails"),
+            "evidence link",
+        );
+        assert_eq!(
+            evidence_link_owner_and_targets(&connection, "owned-link"),
+            (
+                "project-a".to_owned(),
+                "fact-a".to_owned(),
+                "evidence-a-2".to_owned()
+            )
+        );
+
+        let batch_mixed_project_link = EvidenceLinkRow {
+            link_id: "batch-mixed-project-link".to_owned(),
+            ..mixed_project_link
+        };
+        assert_project_scope_error(
+            insert_evidence_link(&connection, &batch_mixed_project_link)
+                .expect_err("batch link insert enforces the same ownership rule"),
+            "evidence link",
+        );
+        assert_eq!(table_row_count(&connection, "evidence_links"), 1);
     }
 
     #[test]
@@ -2688,6 +4458,132 @@ mod tests {
 
             assert_eq!(count, 1, "{table} should exist");
         }
+    }
+
+    fn seed_unversioned_weak_projects_database(
+        database_path: &std::path::Path,
+        include_metadata: bool,
+    ) {
+        let connection =
+            rusqlite::Connection::open(database_path).expect("unversioned database opens");
+        if include_metadata {
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE user_database_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('legacy_note', 'preserve');
+                    ",
+                )
+                .expect("unversioned metadata is created");
+        }
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE projects (
+                    project_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    case_type TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    opened_on TEXT,
+                    summary TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO projects (project_id, title, status)
+                VALUES ('unversioned-project', 'Preserve me', 'active');
+                ",
+            )
+            .expect("weak unversioned business table is created");
+    }
+
+    fn assert_rebuilt_unversioned_project_database(database_path: &std::path::Path) {
+        let connection = open_user_database(database_path).expect("rebuilt database opens");
+        let marker: String = connection
+            .query_row(
+                "SELECT value FROM user_database_metadata WHERE key = ?1",
+                [USER_CANONICAL_SCHEMA_MARKER_KEY],
+                |row| row.get(0),
+            )
+            .expect("canonical marker exists");
+        let title: String = connection
+            .query_row(
+                "SELECT title FROM projects WHERE project_id = 'unversioned-project'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy project survives rebuild");
+
+        assert_eq!(marker, USER_CANONICAL_SCHEMA_MARKER_VALUE);
+        assert_eq!(title, "Preserve me");
+        connection
+            .execute(
+                "INSERT INTO projects (project_id, title, status)
+                 VALUES ('invalid-after-rebuild', 'Invalid', 'legacy-status')",
+                [],
+            )
+            .expect_err("canonical project CHECK is present after rebuild");
+    }
+
+    fn seed_project(connection: &rusqlite::Connection, project_id: &str) {
+        upsert_case_project(
+            connection,
+            &CaseProjectRow {
+                project_id: project_id.to_owned(),
+                title: project_id.to_owned(),
+                case_type: "civil".to_owned(),
+                status: "active".to_owned(),
+                opened_on: None,
+                summary: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .expect("project inserts");
+    }
+
+    fn assert_project_scope_error(error: rusqlite::Error, expected_message: &str) {
+        assert!(
+            matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains(expected_message)
+            ),
+            "unexpected project-scope error: {error}"
+        );
+    }
+
+    fn project_and_value(
+        connection: &rusqlite::Connection,
+        table: &str,
+        id_column: &str,
+        id: &str,
+        value_column: &str,
+    ) -> (String, String) {
+        connection
+            .query_row(
+                &format!("SELECT project_id, {value_column} FROM {table} WHERE {id_column} = ?1"),
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("project-scoped row reads")
+    }
+
+    fn evidence_link_owner_and_targets(
+        connection: &rusqlite::Connection,
+        link_id: &str,
+    ) -> (String, String, String) {
+        connection
+            .query_row(
+                "SELECT project_id, fact_id, evidence_id FROM evidence_links WHERE link_id = ?1",
+                [link_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("evidence link reads")
     }
 
     fn sqlite_master_count(connection: &rusqlite::Connection, name: &str) -> i64 {

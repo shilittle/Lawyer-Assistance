@@ -54,6 +54,56 @@ export function markLegalAnswerCancelling(
   return { ...state, status: "cancelling", message: "正在取消生成…" };
 }
 
+export function shouldCancelLegalAnswerOnPageLeave(
+  state: LegalAnswerStreamState,
+  requestId: string | null,
+): boolean {
+  return (
+    requestId !== null &&
+    state.requestId === requestId &&
+    ["connecting", "streaming"].includes(state.status)
+  );
+}
+
+export function settleLegalAnswerCancellation(
+  state: LegalAnswerStreamState,
+  requestId: string,
+  cancelled: boolean,
+  message = "生成已取消",
+): LegalAnswerStreamState {
+  if (
+    !cancelled ||
+    state.requestId !== requestId ||
+    !["connecting", "streaming", "cancelling"].includes(state.status)
+  ) {
+    return state;
+  }
+
+  return {
+    ...state,
+    requestId: null,
+    status: "cancelled",
+    errorType: "cancelled",
+    message,
+  };
+}
+
+export function restoreLegalAnswerAfterRejectedCancellation(
+  state: LegalAnswerStreamState,
+  requestId: string,
+  previousStatus: "connecting" | "streaming",
+): LegalAnswerStreamState {
+  if (state.requestId !== requestId || state.status !== "cancelling") {
+    return state;
+  }
+
+  return {
+    ...state,
+    status: previousStatus,
+    message: "取消未生效，等待当前请求结束",
+  };
+}
+
 export function reduceLegalAnswerStreamEvent(
   state: LegalAnswerStreamState,
   event: LegalAnswerStreamEvent,
@@ -80,13 +130,16 @@ export function reduceLegalAnswerStreamEvent(
       };
     case "usage":
       return { ...state, usage: event.usage ?? null };
-    case "error":
+    case "error": {
+      const cancelled = event.errorType === "cancelled";
       return {
         ...state,
-        status: event.errorType === "cancelled" ? "cancelled" : "error",
+        requestId: cancelled ? null : state.requestId,
+        status: cancelled ? "cancelled" : "error",
         errorType: event.errorType ?? "stream_error",
         message: event.message ?? "生成过程中发生错误",
       };
+    }
     case "done":
       return {
         ...state,

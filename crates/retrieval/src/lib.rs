@@ -16,12 +16,16 @@ const MAX_SEARCH_LIMIT: u32 = 50;
 
 #[derive(Debug)]
 pub enum RetrievalError {
+    InvalidRequest(String),
     Sqlite(rusqlite::Error),
 }
 
 impl Display for RetrievalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidRequest(message) => {
+                write!(formatter, "invalid retrieval request: {message}")
+            }
             Self::Sqlite(error) => write!(formatter, "sqlite retrieval error: {error}"),
         }
     }
@@ -30,6 +34,7 @@ impl Display for RetrievalError {
 impl Error for RetrievalError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidRequest(_) => None,
             Self::Sqlite(error) => Some(error),
         }
     }
@@ -52,17 +57,25 @@ pub fn search_laws(
 
     let mut statement = connection.prepare(
         "
-        WITH current_versions AS (
-            SELECT versions.*
+        WITH ranked_current_versions AS (
+            SELECT
+                versions.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY versions.document_id
+                    ORDER BY versions.effective_from DESC, versions.id DESC
+                ) AS current_rank
             FROM law_versions versions
-            JOIN (
-                SELECT document_id, MAX(effective_from) AS latest_effective_from
-                FROM law_versions
-                WHERE status = 'in_force' OR effective_to IS NULL
-                GROUP BY document_id
-            ) latest
-              ON latest.document_id = versions.document_id
-             AND latest.latest_effective_from = versions.effective_from
+            WHERE versions.effective_from <= date('now', 'localtime')
+              AND (
+                versions.effective_to IS NULL
+                OR versions.effective_to >= date('now', 'localtime')
+              )
+              AND versions.status <> 'not_yet_effective'
+        ),
+        current_versions AS (
+            SELECT *
+            FROM ranked_current_versions
+            WHERE current_rank = 1
         )
         SELECT
             documents.id,
@@ -145,6 +158,14 @@ pub fn search_articles(
     connection: &rusqlite::Connection,
     request: SearchArticlesRequest,
 ) -> Result<SearchArticlesResponse, RetrievalError> {
+    if let Some(case_date) = request.case_date.as_deref() {
+        if !domain::date::is_iso_calendar_date(case_date) {
+            return Err(RetrievalError::InvalidRequest(
+                "case_date must be a valid YYYY-MM-DD calendar date".to_owned(),
+            ));
+        }
+    }
+
     let query = request.query.trim();
     let limit = bounded_limit(request.limit);
 
@@ -153,6 +174,7 @@ pub fn search_articles(
             Ok(results) if !results.is_empty() => return Ok(SearchArticlesResponse { results }),
             Ok(_) => {}
             Err(RetrievalError::Sqlite(_)) => {}
+            Err(error @ RetrievalError::InvalidRequest(_)) => return Err(error),
         }
     }
 
@@ -251,11 +273,13 @@ pub fn get_law_versions(
             versions.effective_to,
             versions.published_on,
             versions.source_reference,
-            COUNT(articles.id) AS article_count
+            (
+                SELECT COUNT(*)
+                FROM law_articles articles
+                WHERE articles.version_id = versions.id
+            ) AS article_count
         FROM law_versions versions
-        LEFT JOIN law_articles articles ON articles.version_id = versions.id
         WHERE versions.document_id = ?1
-        GROUP BY versions.id
         ORDER BY versions.effective_from DESC
         ",
     )?;
@@ -357,7 +381,7 @@ fn search_articles_fts(
             documents.title,
             articles.article_number,
             articles.title,
-            snippet(law_articles_fts, 6, '', '', '...', 28),
+            articles.content,
             citation_metadata.citation_id,
             versions.effective_from,
             versions.effective_to,
@@ -365,7 +389,7 @@ fn search_articles_fts(
             bm25(law_articles_fts) AS rank,
             articles.article_order
         FROM law_articles_fts
-        JOIN law_articles articles ON articles.id = law_articles_fts.article_id
+        JOIN law_articles articles ON articles.rowid = law_articles_fts.rowid
         JOIN law_documents documents ON documents.id = articles.document_id
         JOIN law_versions versions ON versions.id = articles.version_id
         LEFT JOIN citation_metadata ON citation_metadata.article_id = articles.id
@@ -393,6 +417,7 @@ fn search_articles_fts(
         |row| {
             let document_id: String = row.get(1)?;
             let version_id: String = row.get(2)?;
+            let content: String = row.get(6)?;
             let article_order: i64 = row.get(12)?;
             let citation_id = row.get::<_, Option<String>>(7)?.unwrap_or_else(|| {
                 generate_article_citation_id(&document_id, &version_id, &article_order.to_string())
@@ -406,7 +431,7 @@ fn search_articles_fts(
                 document_title: row.get(3)?,
                 article_number: row.get(4)?,
                 article_title: row.get(5)?,
-                snippet: row.get(6)?,
+                snippet: snippet_for(query, &content),
                 citation_id,
                 effective_from: row.get(8)?,
                 effective_to: row.get(9)?,
@@ -633,6 +658,49 @@ mod tests {
     }
 
     #[test]
+    fn law_search_does_not_present_a_future_version_as_current() {
+        let connection = fixture_connection();
+        connection
+            .execute(
+                "
+                INSERT INTO law_versions (
+                    id, document_id, version_label, status, effective_from, effective_to,
+                    published_on, source_reference
+                ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
+                ",
+                rusqlite::params![
+                    "cn-civil-code-29990101",
+                    "cn-civil-code",
+                    "未来版本",
+                    "not_yet_effective",
+                    "2999-01-01",
+                    "2998-12-01",
+                    "future-version-test"
+                ],
+            )
+            .expect("future fixture version inserts");
+
+        let response = search_laws(
+            &connection,
+            SearchLawsRequest {
+                query: "民法典".to_owned(),
+                limit: Some(10),
+            },
+        )
+        .expect("law search succeeds");
+        let civil_code = response
+            .results
+            .iter()
+            .find(|result| result.document_id == "cn-civil-code")
+            .expect("civil code is returned");
+
+        assert_eq!(
+            civil_code.current_version_id.as_deref(),
+            Some("cn-civil-code-20210101")
+        );
+    }
+
+    #[test]
     fn searches_articles_and_filters_effective_version_by_case_date() {
         let connection = fixture_connection();
         let old_case = search_articles(
@@ -668,6 +736,24 @@ mod tests {
             .results
             .iter()
             .any(|result| result.version_id == "cn-contract-law-19991001"));
+    }
+
+    #[test]
+    fn rejects_invalid_case_date_before_article_search() {
+        let connection = fixture_connection();
+        let error = search_articles(
+            &connection,
+            SearchArticlesRequest {
+                query: "违约责任".to_owned(),
+                document_id: None,
+                case_date: Some("2024-02-30".to_owned()),
+                limit: Some(10),
+            },
+        )
+        .expect_err("invalid calendar date is rejected");
+
+        assert!(matches!(error, RetrievalError::InvalidRequest(_)));
+        assert!(error.to_string().contains("valid YYYY-MM-DD"));
     }
 
     #[test]

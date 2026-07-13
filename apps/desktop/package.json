@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
+    "build:tauri": "pnpm run verify:legal-resource && pnpm build",
     "lint": "eslint . --max-warnings=0",
     "tauri": "tauri",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify:legal-resource": "python scripts/verify_legal_resource.py"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

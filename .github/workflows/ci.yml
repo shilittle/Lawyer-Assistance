@@ -40,18 +40,24 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Test legal database builder
-        run: python -m unittest data.build.test_build_legal_core
+      - name: Test all data build and audit tools
+        run: python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
 
-      - name: Prepare CI-only legal database fixture
+      - name: Audit provider secrets and sensitive logging
+        run: python data/build/audit_provider_security.py
+
+      - name: Prepare full CI-only legal database fixture
         shell: pwsh
         run: |
           @'
           from pathlib import Path
+          import hashlib
+          import json
+          import os
           import sqlite3
 
           root = Path.cwd()
-          output = root / "apps" / "desktop" / "src-tauri" / "resources" / "legal_core.sqlite"
+          output = Path(os.environ["RUNNER_TEMP"]) / "legal_core_full_fixture.sqlite"
           output.parent.mkdir(parents=True, exist_ok=True)
           if output.exists():
               output.unlink()
@@ -61,17 +67,266 @@ jobs:
               connection.executescript((root / "data" / "schema" / "legal_core.sql").read_text(encoding="utf-8"))
               connection.executescript((root / "data" / "fixtures" / "legal_core_retrieval_fixture.sql").read_text(encoding="utf-8"))
               connection.execute(
-                  "INSERT OR REPLACE INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)",
-                  ("dataset_name", "ci-fixture-not-for-release", "1970-01-01T00:00:00Z"),
+                  """
+                  INSERT INTO source_systems (
+                    id, name, base_url, official_scope, maintainer, retrieved_at, notes
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                  """,
+                  (
+                      "ci-official",
+                      "CI fixture source",
+                      "https://example.invalid/ci-fixture",
+                      "ci-fixture-only",
+                      "GitHub Actions",
+                      "1970-01-01T00:00:00Z",
+                      "Never distribute as legal data.",
+                  ),
               )
               connection.execute(
-                  "INSERT OR REPLACE INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)",
-                  ("coverage_status", "fixture", "1970-01-01T00:00:00Z"),
+                  """
+                  INSERT INTO source_records (
+                    id, source_system_id, external_id, record_type, source_url,
+                    retrieved_at, checksum, raw_json, raw_text
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  """,
+                  (
+                      "ci-source-record-1",
+                      "ci-official",
+                      "ci-record-1",
+                      "detail",
+                      "https://example.invalid/ci-fixture/1",
+                      "1970-01-01T00:00:00Z",
+                      "ci-fixture-checksum",
+                      "x" * 2_000_000,
+                      "\u6d4b\u8bd5\u539f\u59cb\u6b63\u6587" * 500_000,
+                  ),
+              )
+              connection.execute(
+                  """
+                  INSERT INTO legal_attachments (
+                    id, document_id, source_system_id, external_id, title,
+                    attachment_type, file_type, source_url, storage_path, raw_json
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  """,
+                  (
+                      "ci-attachment-1",
+                      "cn-civil-code",
+                      "ci-official",
+                      "ci-record-1",
+                      "CI archival payload",
+                      "source",
+                      "json",
+                      "https://example.invalid/ci-fixture/1",
+                      "ci-only/fixture.json",
+                      "{}",
+                  ),
+              )
+              timestamp = "1970-01-01T00:00:00Z"
+              metadata = {
+                  "dataset_name": "ci-fixture-not-for-release",
+                  "dataset_version": "ci-runtime-fixture-v1",
+                  "coverage_status": "fixture",
+                  "ci_fixture_id": "lawyer-assistance-github-actions-runtime-v1",
+              }
+              connection.executemany(
+                  """
+                  INSERT INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)
+                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                  """,
+                  [(key, value, timestamp) for key, value in metadata.items()],
+              )
+              digest = hashlib.sha256()
+              for row in connection.execute(
+                  """
+                  SELECT source_system_id, external_id, record_type, COALESCE(source_url, ''), checksum
+                  FROM source_records
+                  ORDER BY source_system_id, external_id, record_type
+                  """
+              ):
+                  digest.update(
+                      json.dumps(list(row), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                  )
+                  digest.update(b"\n")
+              connection.execute(
+                  """
+                  INSERT INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)
+                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                  """,
+                  ("source_manifest_sha256", digest.hexdigest(), timestamp),
               )
               connection.commit()
+              connection.execute("VACUUM")
+          finally:
+              connection.close()
+          print(output)
+          '@ | python -
+
+      - name: Verify full CI fixture identity before compaction
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import hashlib
+          import json
+          import os
+          import sqlite3
+
+          if os.environ.get("CI", "").lower() != "true" or os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+              raise RuntimeError("CI fixture validation is restricted to GitHub Actions")
+
+          fixture = Path(os.environ["RUNNER_TEMP"]) / "legal_core_full_fixture.sqlite"
+          connection = sqlite3.connect(f"file:{fixture.resolve().as_posix()}?mode=ro&immutable=1", uri=True)
+          try:
+              metadata = dict(connection.execute("SELECT key, value FROM database_metadata"))
+              expected = {
+                  "schema_version": "4",
+                  "dataset_name": "ci-fixture-not-for-release",
+                  "dataset_version": "ci-runtime-fixture-v1",
+                  "coverage_status": "fixture",
+                  "ci_fixture_id": "lawyer-assistance-github-actions-runtime-v1",
+              }
+              failures = [
+                  f"metadata:{key}:{metadata.get(key)}!={value}"
+                  for key, value in expected.items()
+                  if metadata.get(key) != value
+              ]
+              integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+              if integrity != "ok":
+                  failures.append(f"integrity:{integrity}")
+              foreign_key_errors = len(connection.execute("PRAGMA foreign_key_check").fetchall())
+              if foreign_key_errors:
+                  failures.append(f"foreign_keys:{foreign_key_errors}")
+              article_count = connection.execute("SELECT COUNT(*) FROM law_articles").fetchone()[0]
+              fts_count = connection.execute("SELECT COUNT(*) FROM law_articles_fts").fetchone()[0]
+              if article_count <= 0 or fts_count != article_count:
+                  failures.append(f"articles_and_fts:{article_count}:{fts_count}")
+              source_count, raw_bytes = connection.execute(
+                  """
+                  SELECT COUNT(*), COALESCE(SUM(length(raw_json) + length(raw_text)), 0)
+                  FROM source_records
+                  """
+              ).fetchone()
+              if source_count != 1 or raw_bytes < 1_000_000:
+                  failures.append(f"archival_payload:{source_count}:{raw_bytes}")
+              attachment_count = connection.execute("SELECT COUNT(*) FROM legal_attachments").fetchone()[0]
+              if attachment_count != 1:
+                  failures.append(f"attachments:{attachment_count}")
+              digest = hashlib.sha256()
+              for row in connection.execute(
+                  """
+                  SELECT source_system_id, external_id, record_type, COALESCE(source_url, ''), checksum
+                  FROM source_records
+                  ORDER BY source_system_id, external_id, record_type
+                  """
+              ):
+                  digest.update(
+                      json.dumps(list(row), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                  )
+                  digest.update(b"\n")
+              if metadata.get("source_manifest_sha256") != digest.hexdigest():
+                  failures.append("source_manifest_sha256_mismatch")
+              if failures:
+                  raise RuntimeError(f"full CI fixture rejected: {failures}")
+              print(
+                  json.dumps(
+                      {
+                          "status": "complete",
+                          "fixture": str(fixture),
+                          "article_count": article_count,
+                          "fts_count": fts_count,
+                          "raw_payload_bytes": raw_bytes,
+                      },
+                      indent=2,
+                  )
+              )
           finally:
               connection.close()
           '@ | python -
+
+      - name: Compact full CI fixture into runtime fixture
+        shell: pwsh
+        run: |
+          python data/build/compact_legal_core.py `
+            --input (Join-Path $env:RUNNER_TEMP "legal_core_full_fixture.sqlite") `
+            --output "apps/desktop/src-tauri/resources/legal_core.sqlite" `
+            --report (Join-Path $env:RUNNER_TEMP "legal_core_runtime_report.json") `
+            --manifest (Join-Path $env:RUNNER_TEMP "legal_core_runtime_manifest.json") `
+            --allow-unverified-source
+
+      - name: Prove CI fixture cannot pass the formal release gate
+        shell: pwsh
+        run: |
+          @'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          environment = os.environ.copy()
+          environment.pop("LAWYER_ASSISTANCE_ALLOW_CI_FIXTURE_BUILD", None)
+          result = subprocess.run(
+              [sys.executable, "apps/desktop/scripts/verify_legal_resource.py"],
+              cwd=Path.cwd(),
+              env=environment,
+              check=False,
+              capture_output=True,
+              text=True,
+          )
+          if result.returncode == 0:
+              raise RuntimeError("CI fixture unexpectedly passed the formal release gate")
+          if "formal legal resource rejected" not in result.stderr:
+              raise RuntimeError(
+                  f"formal gate failed for an unexpected reason: {result.stderr.strip()}"
+              )
+          print("formal release gate rejected the CI fixture as required")
+          '@ | python -
+
+      - name: Verify runtime fixture identity and schema with explicit CI opt-in
+        env:
+          LAWYER_ASSISTANCE_ALLOW_CI_FIXTURE_BUILD: "1"
+        run: pnpm --filter @lawyer-assistance/desktop run verify:legal-resource
+
+      - name: Normalize archive metadata in a benchmark-only copy
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import os
+          import shutil
+          import sqlite3
+
+          source = Path(os.environ["RUNNER_TEMP"]) / "legal_core_full_fixture.sqlite"
+          output = Path(os.environ["RUNNER_TEMP"]) / "legal_core_benchmark_archive.sqlite"
+          # The compactor deliberately rewrites the runtime dataset version to a
+          # non-release identity. Keep the verified compaction input untouched,
+          # and normalize only this disposable comparison copy because the Rust
+          # benchmark includes open_metadata in its equality checks.
+          shutil.copy2(source, output)
+          connection = sqlite3.connect(output)
+          try:
+              cursor = connection.execute(
+                  """
+                  UPDATE database_metadata
+                  SET value = 'ci-fixture-unverified', updated_at = '1970-01-01T00:00:00Z'
+                  WHERE key = 'dataset_version'
+                  """
+              )
+              if cursor.rowcount != 1:
+                  raise RuntimeError("benchmark metadata normalization updated an unexpected row count")
+              connection.commit()
+          finally:
+              connection.close()
+          print(output)
+          '@ | python -
+
+      - name: Run archive/runtime Rust retrieval benchmark smoke
+        shell: pwsh
+        run: |
+          cargo run -p retrieval --example benchmark_legal_core -- `
+            (Join-Path $env:RUNNER_TEMP "legal_core_benchmark_archive.sqlite") `
+            "apps/desktop/src-tauri/resources/legal_core.sqlite" `
+            5 `
+            (Join-Path $env:RUNNER_TEMP "legal_core_retrieval_benchmark.json")
 
       - name: Check Rust formatting
         run: cargo fmt --check
@@ -92,4 +347,6 @@ jobs:
         run: pnpm build
 
       - name: Build Tauri with CI fixture (packaging smoke test only)
+        env:
+          LAWYER_ASSISTANCE_ALLOW_CI_FIXTURE_BUILD: "1"
         run: pnpm tauri build

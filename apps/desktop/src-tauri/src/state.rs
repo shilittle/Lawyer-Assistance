@@ -22,6 +22,13 @@ pub struct PendingExtractionReview {
 struct ActiveExtractionReview {
     review: PendingExtractionReview,
     created_at: Instant,
+    phase: PendingExtractionReviewPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingExtractionReviewPhase {
+    Ready,
+    Claimed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +36,8 @@ pub enum PendingReviewRegistryError {
     Unavailable,
     CapacityExceeded,
     IdentifierCollision,
+    ReviewInFlight,
+    ClaimChanged,
 }
 
 impl Display for PendingReviewRegistryError {
@@ -37,6 +46,14 @@ impl Display for PendingReviewRegistryError {
             Self::Unavailable => write!(formatter, "pending review registry is unavailable"),
             Self::CapacityExceeded => write!(formatter, "pending review registry is full"),
             Self::IdentifierCollision => write!(formatter, "pending review identifier collision"),
+            Self::ReviewInFlight => write!(
+                formatter,
+                "pending review is currently being confirmed; retry after it finishes"
+            ),
+            Self::ClaimChanged => write!(
+                formatter,
+                "pending review claim changed unexpectedly; retry the operation"
+            ),
         }
     }
 }
@@ -193,6 +210,12 @@ impl AppState {
             Entry::Occupied(_) => return Err(PendingReviewRegistryError::IdentifierCollision),
             Entry::Vacant(_) => {}
         }
+        if reviews.values().any(|active| {
+            active.review.project_id == review.project_id
+                && active.phase == PendingExtractionReviewPhase::Claimed
+        }) {
+            return Err(PendingReviewRegistryError::ReviewInFlight);
+        }
         reviews.retain(|_, active| active.review.project_id != review.project_id);
         if reviews.len() >= MAX_PENDING_EXTRACTION_REVIEWS {
             return Err(PendingReviewRegistryError::CapacityExceeded);
@@ -202,67 +225,87 @@ impl AppState {
             ActiveExtractionReview {
                 review,
                 created_at: Instant::now(),
+                phase: PendingExtractionReviewPhase::Ready,
             },
         );
         Ok(())
     }
 
-    pub fn take_matching_extraction_review(
+    pub fn claim_matching_extraction_review(
         &self,
         review_id: &str,
         expected: &PendingExtractionReview,
-    ) -> Result<Option<PendingExtractionReview>, PendingReviewRegistryError> {
+    ) -> Result<Option<PendingExtractionReviewClaim>, PendingReviewRegistryError> {
         let mut reviews = self.pending_extraction_reviews()?;
         prune_expired_reviews(&mut reviews);
-        if reviews.get(review_id).map(|active| &active.review) != Some(expected) {
+        let Some(active) = reviews.get_mut(review_id) else {
+            return Ok(None);
+        };
+        if &active.review != expected {
             return Ok(None);
         }
-        Ok(reviews.remove(review_id).map(|active| active.review))
+        if active.phase == PendingExtractionReviewPhase::Claimed {
+            return Err(PendingReviewRegistryError::ReviewInFlight);
+        }
+        active.phase = PendingExtractionReviewPhase::Claimed;
+        Ok(Some(PendingExtractionReviewClaim {
+            state: self.clone(),
+            review_id: review_id.to_owned(),
+            review: expected.clone(),
+            finished: false,
+        }))
     }
 
     pub fn discard_extraction_review(
         &self,
         review_id: &str,
     ) -> Result<bool, PendingReviewRegistryError> {
-        Ok(self
-            .pending_extraction_reviews()?
-            .remove(review_id)
-            .is_some())
-    }
-
-    pub fn restore_extraction_review(
-        &self,
-        review_id: String,
-        review: PendingExtractionReview,
-    ) -> Result<(), PendingReviewRegistryError> {
         let mut reviews = self.pending_extraction_reviews()?;
         prune_expired_reviews(&mut reviews);
-        if reviews.contains_key(&review_id)
-            || reviews
-                .values()
-                .any(|active| active.review.project_id == review.project_id)
+        if reviews
+            .get(review_id)
+            .is_some_and(|active| active.phase == PendingExtractionReviewPhase::Claimed)
         {
-            return Err(PendingReviewRegistryError::IdentifierCollision);
+            return Err(PendingReviewRegistryError::ReviewInFlight);
         }
-        if reviews.len() >= MAX_PENDING_EXTRACTION_REVIEWS {
-            return Err(PendingReviewRegistryError::CapacityExceeded);
-        }
-        reviews.insert(
-            review_id,
-            ActiveExtractionReview {
-                review,
-                created_at: Instant::now(),
-            },
-        );
-        Ok(())
+        Ok(reviews.remove(review_id).is_some())
     }
 
     pub fn discard_project_extraction_reviews(
         &self,
         project_id: &str,
     ) -> Result<(), PendingReviewRegistryError> {
-        self.pending_extraction_reviews()?
-            .retain(|_, active| active.review.project_id != project_id);
+        let mut reviews = self.pending_extraction_reviews()?;
+        prune_expired_reviews(&mut reviews);
+        if reviews.values().any(|active| {
+            active.review.project_id == project_id
+                && active.phase == PendingExtractionReviewPhase::Claimed
+        }) {
+            return Err(PendingReviewRegistryError::ReviewInFlight);
+        }
+        reviews.retain(|_, active| active.review.project_id != project_id);
+        Ok(())
+    }
+
+    fn finish_extraction_review_claim(
+        &self,
+        review_id: &str,
+        expected: &PendingExtractionReview,
+        consume: bool,
+    ) -> Result<(), PendingReviewRegistryError> {
+        let mut reviews = self.pending_extraction_reviews()?;
+        let Some(active) = reviews.get_mut(review_id) else {
+            return Err(PendingReviewRegistryError::ClaimChanged);
+        };
+        if &active.review != expected || active.phase != PendingExtractionReviewPhase::Claimed {
+            return Err(PendingReviewRegistryError::ClaimChanged);
+        }
+
+        if consume {
+            reviews.remove(review_id);
+        } else {
+            active.phase = PendingExtractionReviewPhase::Ready;
+        }
         Ok(())
     }
 
@@ -278,7 +321,44 @@ impl AppState {
 }
 
 fn prune_expired_reviews(reviews: &mut HashMap<String, ActiveExtractionReview>) {
-    reviews.retain(|_, active| active.created_at.elapsed() <= PENDING_EXTRACTION_REVIEW_TTL);
+    reviews.retain(|_, active| {
+        active.phase == PendingExtractionReviewPhase::Claimed
+            || active.created_at.elapsed() <= PENDING_EXTRACTION_REVIEW_TTL
+    });
+}
+
+#[derive(Debug)]
+pub struct PendingExtractionReviewClaim {
+    state: AppState,
+    review_id: String,
+    review: PendingExtractionReview,
+    finished: bool,
+}
+
+impl PendingExtractionReviewClaim {
+    pub fn consume(mut self) -> Result<(), PendingReviewRegistryError> {
+        self.state
+            .finish_extraction_review_claim(&self.review_id, &self.review, true)?;
+        self.finished = true;
+        Ok(())
+    }
+
+    pub fn release(mut self) -> Result<(), PendingReviewRegistryError> {
+        self.state
+            .finish_extraction_review_claim(&self.review_id, &self.review, false)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingExtractionReviewClaim {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self
+                .state
+                .finish_extraction_review_claim(&self.review_id, &self.review, false);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,17 +447,22 @@ mod tests {
         let mut rebound = review();
         rebound.source_file_ids = vec!["file-2".to_owned()];
         assert!(state
-            .take_matching_extraction_review("review-1", &rebound)
+            .claim_matching_extraction_review("review-1", &rebound)
             .expect("registry reads")
             .is_none());
-        assert_eq!(
-            state
-                .take_matching_extraction_review("review-1", &review())
-                .expect("registry reads"),
-            Some(review())
-        );
+        let claim = state
+            .claim_matching_extraction_review("review-1", &review())
+            .expect("registry reads")
+            .expect("matching review claims");
+        assert!(matches!(
+            state.claim_matching_extraction_review("review-1", &review()),
+            Err(PendingReviewRegistryError::ReviewInFlight)
+        ));
+        claim
+            .consume()
+            .expect("successful confirmation consumes claim");
         assert!(state
-            .take_matching_extraction_review("review-1", &review())
+            .claim_matching_extraction_review("review-1", &review())
             .expect("registry reads")
             .is_none());
     }
@@ -392,7 +477,7 @@ mod tests {
             .discard_extraction_review("review-1")
             .expect("review discards"));
         assert!(state
-            .take_matching_extraction_review("review-1", &review())
+            .claim_matching_extraction_review("review-1", &review())
             .expect("registry reads")
             .is_none());
     }
@@ -408,13 +493,14 @@ mod tests {
             .expect("new review registers");
 
         assert!(state
-            .take_matching_extraction_review("old", &review())
+            .claim_matching_extraction_review("old", &review())
             .expect("registry reads")
             .is_none());
-        assert!(state
-            .take_matching_extraction_review("new", &review())
+        let claim = state
+            .claim_matching_extraction_review("new", &review())
             .expect("registry reads")
-            .is_some());
+            .expect("new review remains");
+        claim.consume().expect("claim consumes");
     }
 
     #[test]
@@ -432,6 +518,7 @@ mod tests {
                     created_at: Instant::now()
                         .checked_sub(PENDING_EXTRACTION_REVIEW_TTL + Duration::from_secs(1))
                         .expect("test instant can move backwards"),
+                    phase: PendingExtractionReviewPhase::Ready,
                 },
             );
         state
@@ -439,9 +526,86 @@ mod tests {
             .expect("fresh review registers");
 
         assert!(state
-            .take_matching_extraction_review("expired", &review())
+            .claim_matching_extraction_review("expired", &review())
             .expect("registry reads")
             .is_none());
+    }
+
+    #[test]
+    fn claimed_review_blocks_replacement_and_discard_until_released() {
+        let state = state();
+        state
+            .register_extraction_review("review-1".to_owned(), review())
+            .expect("review registers");
+        let created_at = state
+            .inner
+            .pending_extraction_reviews
+            .lock()
+            .expect("registry lock")
+            .get("review-1")
+            .expect("review exists")
+            .created_at;
+        let claim = state
+            .claim_matching_extraction_review("review-1", &review())
+            .expect("claim succeeds")
+            .expect("review exists");
+
+        assert_eq!(
+            state.register_extraction_review("review-2".to_owned(), review()),
+            Err(PendingReviewRegistryError::ReviewInFlight)
+        );
+        assert_eq!(
+            state.discard_extraction_review("review-1"),
+            Err(PendingReviewRegistryError::ReviewInFlight)
+        );
+
+        claim.release().expect("failed confirmation releases claim");
+        assert_eq!(
+            state
+                .inner
+                .pending_extraction_reviews
+                .lock()
+                .expect("registry lock")
+                .get("review-1")
+                .expect("review remains")
+                .created_at,
+            created_at,
+            "release preserves the original expiry instant"
+        );
+        state
+            .register_extraction_review("review-2".to_owned(), review())
+            .expect("new generation can replace a released review");
+    }
+
+    #[test]
+    fn dropping_a_claim_restores_the_same_review_without_resetting_ttl() {
+        let state = state();
+        state
+            .register_extraction_review("review-1".to_owned(), review())
+            .expect("review registers");
+        let created_at = state
+            .inner
+            .pending_extraction_reviews
+            .lock()
+            .expect("registry lock")
+            .get("review-1")
+            .expect("review exists")
+            .created_at;
+        let claim = state
+            .claim_matching_extraction_review("review-1", &review())
+            .expect("claim succeeds")
+            .expect("review exists");
+
+        drop(claim);
+
+        let reviews = state
+            .inner
+            .pending_extraction_reviews
+            .lock()
+            .expect("registry lock");
+        let active = reviews.get("review-1").expect("review is restored");
+        assert_eq!(active.phase, PendingExtractionReviewPhase::Ready);
+        assert_eq!(active.created_at, created_at);
     }
 
     #[test]

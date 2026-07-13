@@ -1,0 +1,90 @@
+{
+  "stage": "1C-official-corpora",
+  "generated_at": "2026-07-11T13:48:38+00:00",
+  "dataset_version": "2026.07.11-stage1c.1",
+  "source": {
+    "id": "spc_court",
+    "base_url": "https://www.court.gov.cn/",
+    "guiding_listing": "https://www.court.gov.cn/shenpan/gengduo/77.html",
+    "typical_listing": "https://www.court.gov.cn/zixun/gengduo/104.html",
+    "template_listing": "https://www.court.gov.cn/susong.html"
+  },
+  "counts": {
+    "guiding_cases": 278,
+    "guiding_notices": 15,
+    "typical_collections": 412,
+    "document_templates": 752,
+    "typical_cases": 597,
+    "history_exceptions": 1121
+  },
+  "metadata": {
+    "schema_version": "4",
+    "dataset_version": "2026.07.11-stage1c.1",
+    "data_scope": "statutory corpus, normalized official history families, SPC guiding cases, SPC typical-case collections, and SPC official document templates",
+    "source_manifest_sha256": "011551065b404507bce7b2cf542cb3b18da79a14437d094d067e685a438cd9fa",
+    "stage_1c_corpora_status": "complete",
+    "stage_1c_data_status": "complete_with_declared_history_date_exceptions",
+    "guiding_case_count": "278",
+    "guiding_case_batch_notice_count": "15",
+    "typical_case_collection_count": "412",
+    "typical_case_count": "597",
+    "document_template_count": "752",
+    "history_version_exception_count": "1121",
+    "stage_1c_corpora_snapshot_at": "2026-07-11T13:47:19+00:00",
+    "database_distribution_manifest": "data/generated/legal_core_distribution_manifest.json"
+  },
+  "audit": {
+    "status": "complete",
+    "failures": [],
+    "counts": {
+      "guiding_cases": 278,
+      "guiding_notices": 15,
+      "typical_collections": 412,
+      "typical_cases": 597,
+      "document_templates": 752,
+      "history_exceptions": 1121
+    },
+    "missing_case_provenance": 0,
+    "missing_template_provenance": 0,
+    "duplicate_guiding_numbers": 0,
+    "missing_guiding_numbers": [
+      45
+    ],
+    "coverage": [
+      [
+        "guiding_cases_and_batch_notices",
+        293,
+        293,
+        293,
+        "complete"
+      ],
+      [
+        "official_document_templates",
+        752,
+        752,
+        752,
+        "complete"
+      ],
+      [
+        "typical_case_collections",
+        412,
+        412,
+        412,
+        "complete"
+      ],
+      [
+        "typical_cases",
+        597,
+        597,
+        597,
+        "complete"
+      ]
+    ],
+    "history_exception_reasons": {
+      "duplicate_effective_date": 5,
+      "missing_or_placeholder_effective_date": 1116
+    },
+    "foreign_key_errors": 0,
+    "sqlite_integrity": "ok"
+  }
+}

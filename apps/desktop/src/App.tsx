@@ -72,7 +72,12 @@ import {
   formatEffectiveWindow,
   formatLegalSourceLabel,
   formatStatus,
+  segmentLegalAnswer,
 } from "./ipc/legal/format";
+import {
+  buildLegalAnswerCandidateRequest as createLegalAnswerCandidateRequest,
+  EFFECTIVENESS_LEVEL_OPTIONS,
+} from "./ipc/legal/query";
 import {
   formatLegalAnswerStreamStatus,
   INITIAL_LEGAL_ANSWER_STREAM_STATE,
@@ -80,6 +85,9 @@ import {
   isLegalAnswerStreamCancellable,
   markLegalAnswerCancelling,
   reduceLegalAnswerStreamEvent,
+  restoreLegalAnswerAfterRejectedCancellation,
+  settleLegalAnswerCancellation,
+  shouldCancelLegalAnswerOnPageLeave,
   startLegalAnswerStream,
 } from "./ipc/legal/stream";
 import type {
@@ -91,6 +99,7 @@ import type {
   LegalAnswerContext,
   LegalAnswerResponse,
   LegalSource,
+  ValidatedCitation,
 } from "./ipc/legal/types";
 import {
   deleteProviderApiKey,
@@ -102,16 +111,30 @@ import {
   writeProviderApiKey,
 } from "./ipc/provider/client";
 import {
+  createProviderProfileDraft,
+  DEFAULT_PROVIDER_KIND,
+  defaultProviderOptions,
+  providerCapabilities,
+  providerDefaults,
+  SELECTABLE_PROVIDER_KINDS,
+} from "./ipc/provider/catalog";
+import { ProviderCreateMenu } from "./ipc/provider/ProviderCreateMenu";
+import {
   formatConnectionResult,
   formatHttpStatus,
   formatKeyStatus,
   formatLatency,
   formatProviderKind,
 } from "./ipc/provider/format";
+import {
+  loadProviderKeyStatusesSettled,
+  normalizeProviderProfile,
+  providerKeyStatusForSavedDraft,
+  providerProfilesEqual,
+} from "./ipc/provider/profile";
 import type {
   ConnectionTest,
   ProviderApiKeyStatus,
-  ProviderCapabilities,
   ProviderKind,
   ProviderOptions,
   ProviderProfile,
@@ -130,48 +153,284 @@ type LoadState =
   | { kind: "loading" }
   | { kind: "error"; message: string };
 
+interface MutableEpoch {
+  current: number;
+}
+
+interface MutableLock {
+  current: boolean;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function advanceCaseWorkspaceEpoch(epoch: MutableEpoch): number {
+  epoch.current += 1;
+  return epoch.current;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function isCurrentCaseWorkspaceEpoch(
+  epoch: MutableEpoch,
+  requestEpoch: number,
+): boolean {
+  return epoch.current === requestEpoch;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function tryAcquireCaseMutation(
+  lock: MutableLock,
+  epoch: MutableEpoch,
+): number | null {
+  if (lock.current) {
+    return null;
+  }
+
+  lock.current = true;
+  return advanceCaseWorkspaceEpoch(epoch);
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function releaseCaseMutation(lock: MutableLock): void {
+  lock.current = false;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function isPersistedCaseWorkspace(
+  workspace: CaseWorkspace | null,
+  selectedProjectId: string | null,
+  draftProjectId: string,
+): boolean {
+  return (
+    workspace !== null &&
+    selectedProjectId === draftProjectId &&
+    workspace.project.projectId === draftProjectId
+  );
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function resolveSelectedQaSource(
+  context: LegalAnswerContext | null,
+  selectedSourceId: string | null,
+): LegalSource | null {
+  if (!context) {
+    return null;
+  }
+
+  if (selectedSourceId === null) {
+    return context.sources[0] ?? null;
+  }
+
+  return (
+    context.sources.find((source) => source.sourceId === selectedSourceId) ??
+    null
+  );
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function resolveLegalAnswerQuestion(
+  context: LegalAnswerContext | null,
+  submittedQuestion: string | null,
+): string | null {
+  const contextQuestion = context?.query.legalIssue.trim();
+  if (contextQuestion) {
+    return contextQuestion;
+  }
+
+  const normalizedSubmittedQuestion = submittedQuestion?.trim();
+  return normalizedSubmittedQuestion || null;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function citationHasTrustedSource(
+  citation: ValidatedCitation,
+): citation is ValidatedCitation & {
+  status: "valid";
+  source: LegalSource;
+} {
+  return citation.status === "valid" && citation.source != null;
+}
+
+export type CaseDraftKind =
+  | "project"
+  | "file"
+  | "party"
+  | "fact"
+  | "evidence"
+  | "legal_issue"
+  | "evidence_link"
+  | "legal_basis";
+
+export type CaseDraftDirtyState = Record<CaseDraftKind, boolean>;
+
+export interface CaseDraftComparisonState {
+  project: { draft: CaseProject; baseline: CaseProject };
+  file: { draft: CaseFile; baseline: CaseFile };
+  party: { draft: CaseParty; baseline: CaseParty };
+  fact: { draft: CaseFact; baseline: CaseFact };
+  evidence: { draft: EvidenceItem; baseline: EvidenceItem };
+  legalIssue: { draft: LegalIssue; baseline: LegalIssue };
+  evidenceLink: {
+    factId: string;
+    evidenceId: string;
+    baselineFactId: string;
+    baselineEvidenceId: string;
+  };
+  legalBasis: {
+    sourceId: string;
+    issueId: string;
+    caseDate: string;
+    includeExpired: boolean;
+    note: string;
+    baselineIssueId: string;
+    baselineCaseDate: string;
+  };
+}
+
+function fieldsDiffer<T extends object>(
+  draft: T,
+  baseline: T,
+  fields: readonly (keyof T)[],
+): boolean {
+  return fields.some((field) => draft[field] !== baseline[field]);
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function detectDirtyCaseDrafts(
+  state: CaseDraftComparisonState,
+): CaseDraftDirtyState {
+  return {
+    project: fieldsDiffer(state.project.draft, state.project.baseline, [
+      "title",
+      "caseType",
+      "status",
+      "openedOn",
+      "summary",
+    ]),
+    file: fieldsDiffer(state.file.draft, state.file.baseline, [
+      "title",
+      "fileType",
+      "storageReference",
+      "summary",
+    ]),
+    party: fieldsDiffer(state.party.draft, state.party.baseline, [
+      "name",
+      "normalizedName",
+      "role",
+      "contact",
+      "notes",
+    ]),
+    fact: fieldsDiffer(state.fact.draft, state.fact.baseline, [
+      "occurredOn",
+      "title",
+      "description",
+      "source",
+      "confirmationStatus",
+    ]),
+    evidence: fieldsDiffer(state.evidence.draft, state.evidence.baseline, [
+      "evidenceNumber",
+      "title",
+      "source",
+      "formedOn",
+      "summary",
+      "storageReference",
+      "confirmationStatus",
+    ]),
+    legal_issue: fieldsDiffer(
+      state.legalIssue.draft,
+      state.legalIssue.baseline,
+      ["title", "description", "claim", "status", "confirmationStatus"],
+    ),
+    evidence_link:
+      state.evidenceLink.factId !== state.evidenceLink.baselineFactId ||
+      state.evidenceLink.evidenceId !==
+        state.evidenceLink.baselineEvidenceId,
+    legal_basis:
+      state.legalBasis.sourceId.trim().length > 0 ||
+      state.legalBasis.note.trim().length > 0 ||
+      state.legalBasis.issueId !== state.legalBasis.baselineIssueId ||
+      state.legalBasis.caseDate !== state.legalBasis.baselineCaseDate ||
+      state.legalBasis.includeExpired,
+  };
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function blockingDirtyCaseDrafts(
+  dirty: CaseDraftDirtyState,
+  allowed: readonly CaseDraftKind[],
+): CaseDraftKind[] {
+  const allowedKinds = new Set(allowed);
+  return (Object.keys(dirty) as CaseDraftKind[]).filter(
+    (kind) => dirty[kind] && !allowedKinds.has(kind),
+  );
+}
+
+const CASE_DRAFT_LABELS: Record<CaseDraftKind, string> = {
+  project: "案件基本信息",
+  file: "案件材料",
+  party: "当事人",
+  fact: "事实",
+  evidence: "证据",
+  legal_issue: "争点",
+  evidence_link: "事实—证据关联",
+  legal_basis: "法律依据",
+};
+
+export type EditableCaseEntityType =
+  | "file"
+  | "party"
+  | "fact"
+  | "evidence"
+  | "legal_issue";
+
+export interface ActiveCaseEntityEditor {
+  entityType: EditableCaseEntityType;
+  entityId: string;
+}
+
+type EditableCaseEntity =
+  | CaseFile
+  | CaseParty
+  | CaseFact
+  | EvidenceItem
+  | LegalIssue;
+
+type CaseEntityEditTarget =
+  | { entityType: "file"; entity: CaseFile }
+  | { entityType: "party"; entity: CaseParty }
+  | { entityType: "fact"; entity: CaseFact }
+  | { entityType: "evidence"; entity: EvidenceItem }
+  | { entityType: "legal_issue"; entity: LegalIssue };
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function caseEntityEditorMatches(
+  editor: ActiveCaseEntityEditor | null,
+  entityType: EditableCaseEntityType,
+  entityId?: string,
+): boolean {
+  return (
+    editor?.entityType === entityType &&
+    (entityId === undefined || editor.entityId === entityId)
+  );
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function caseEntityEditorAllows(
+  editor: ActiveCaseEntityEditor | null,
+  entityType: EditableCaseEntityType,
+  entityId?: string,
+): boolean {
+  return (
+    editor === null || caseEntityEditorMatches(editor, entityType, entityId)
+  );
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function copyCaseEntityForEditing<T extends EditableCaseEntity>(
+  entity: T,
+): T {
+  return { ...entity };
+}
+
 const INITIAL_QUERY = "合同";
-
-const PROVIDER_KINDS: ProviderKind[] = [
-  "deep_seek",
-  "qwen",
-  "silicon_flow",
-  "volcengine_ark",
-];
-
-const DEFAULT_CAPABILITIES: ProviderCapabilities = {
-  chat: true,
-  streaming: true,
-  customModelId: true,
-  customBaseUrl: true,
-  reasoning: true,
-};
-
-const PROVIDER_DEFAULTS: Record<
-  ProviderKind,
-  { displayName: string; modelId: string; baseUrl: string }
-> = {
-  deep_seek: {
-    displayName: "DeepSeek",
-    modelId: "deepseek-v4-flash",
-    baseUrl: "https://api.deepseek.com",
-  },
-  qwen: {
-    displayName: "Qwen",
-    modelId: "qwen-plus",
-    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  },
-  silicon_flow: {
-    displayName: "SiliconFlow",
-    modelId: "deepseek-ai/DeepSeek-V3.2",
-    baseUrl: "https://api.siliconflow.cn/v1",
-  },
-  volcengine_ark: {
-    displayName: "Volcengine Ark",
-    modelId: "doubao-seed-2-0-lite-260215",
-    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
-  },
-};
 
 function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random()
@@ -180,24 +439,7 @@ function createId(prefix: string): string {
 }
 
 function createProviderProfile(kind: ProviderKind): ProviderProfile {
-  const defaults = PROVIDER_DEFAULTS[kind];
-
-  return {
-    id: createId(kind),
-    displayName: defaults.displayName,
-    kind,
-    modelId: defaults.modelId,
-    baseUrl: defaults.baseUrl,
-    credentialAccountId: "default",
-    capabilities: DEFAULT_CAPABILITIES,
-    options: defaultProviderOptions(kind),
-  };
-}
-
-function defaultProviderOptions(kind: ProviderKind): ProviderOptions {
-  return kind === "deep_seek" || kind === "volcengine_ark"
-    ? { thinking: false }
-    : { enableThinking: false };
+  return createProviderProfileDraft(kind, createId(kind));
 }
 
 function createCaseProject(): CaseProject {
@@ -310,36 +552,6 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-function normalizeProfile(profile: ProviderProfile): ProviderProfile {
-  return {
-    ...profile,
-    id: profile.id.trim(),
-    displayName: profile.displayName.trim(),
-    modelId: profile.modelId.trim(),
-    baseUrl: profile.baseUrl.trim(),
-    credentialAccountId: profile.credentialAccountId.trim() || "default",
-    options: normalizeOptions(profile.options),
-  };
-}
-
-function normalizeOptions(options: ProviderOptions): ProviderOptions {
-  return {
-    thinking: options.thinking ?? null,
-    enableThinking: options.enableThinking ?? null,
-    thinkingBudget: options.thinkingBudget ?? null,
-    reasoningEffort: options.reasoningEffort ?? null,
-    endpointId: options.endpointId?.trim() || null,
-    workspaceId: options.workspaceId?.trim() || null,
-  };
-}
-
-function splitKeywords(value: string): string[] {
-  return value
-    .split(/[\s,，、;；]+/u)
-    .map((keyword) => keyword.trim())
-    .filter(Boolean);
-}
-
 function createLegalAnswerRequestId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return `answer-${crypto.randomUUID()}`;
@@ -376,14 +588,23 @@ export function App() {
   const [qaArticleNumber, setQaArticleNumber] = useState("");
   const [qaKeywords, setQaKeywords] = useState("违约责任");
   const [qaCaseDate, setQaCaseDate] = useState("");
+  const [qaEffectivenessLevels, setQaEffectivenessLevels] = useState<string[]>(
+    [],
+  );
   const [qaIncludeExpired, setQaIncludeExpired] = useState(false);
   const [qaProviderId, setQaProviderId] = useState("");
   const [qaContext, setQaContext] = useState<LegalAnswerContext | null>(null);
   const [qaAnswer, setQaAnswer] = useState<LegalAnswerResponse | null>(null);
+  const [qaSubmittedQuestion, setQaSubmittedQuestion] = useState<string | null>(
+    null,
+  );
   const [qaStream, setQaStream] = useState(
     INITIAL_LEGAL_ANSWER_STREAM_STATE,
   );
   const activeQaRequestId = useRef<string | null>(null);
+  const qaStreamRef = useRef(qaStream);
+  qaStreamRef.current = qaStream;
+  const qaLeaveCancellationRequestId = useRef<string | null>(null);
   const [selectedQaSourceId, setSelectedQaSourceId] = useState<string | null>(
     null,
   );
@@ -395,7 +616,7 @@ export function App() {
     [],
   );
   const [providerDraft, setProviderDraft] = useState<ProviderProfile>(() =>
-    createProviderProfile("deep_seek"),
+    createProviderProfile(DEFAULT_PROVIDER_KIND),
   );
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(
     null,
@@ -416,6 +637,12 @@ export function App() {
   const [caseWorkspace, setCaseWorkspace] = useState<CaseWorkspace | null>(
     null,
   );
+  const caseWorkspaceEpoch = useRef(0);
+  const caseMutationLock = useRef(false);
+  const [caseMutationInFlight, setCaseMutationInFlight] = useState(false);
+  const extractionLifecycleLock = useRef(false);
+  const [activeCaseEntityEditor, setActiveCaseEntityEditor] =
+    useState<ActiveCaseEntityEditor | null>(null);
   const [caseProjectDraft, setCaseProjectDraft] = useState<CaseProject>(() =>
     createCaseProject(),
   );
@@ -446,7 +673,157 @@ export function App() {
   const [extractionState, dispatchExtraction] = useReducer(extractionReducer, {
     kind: "idle",
   });
+  const [extractionDiscarding, setExtractionDiscarding] = useState(false);
+  const extractionDiscardInFlight = useRef(false);
+  const [extractionDiscardError, setExtractionDiscardError] = useState<
+    string | null
+  >(null);
   const extractionSourcesLocked = extractionLocksSources(extractionState);
+
+  function beginCaseMutation(allowDuringExtraction = false): number | null {
+    if (
+      (!allowDuringExtraction && extractionLifecycleLock.current) ||
+      extractionDiscardInFlight.current
+    ) {
+      return null;
+    }
+
+    const requestEpoch = tryAcquireCaseMutation(
+      caseMutationLock,
+      caseWorkspaceEpoch,
+    );
+    if (requestEpoch !== null) {
+      setCaseMutationInFlight(true);
+    }
+    return requestEpoch;
+  }
+
+  function finishCaseMutation() {
+    releaseCaseMutation(caseMutationLock);
+    setCaseMutationInFlight(false);
+  }
+
+  function caseInteractionIsLocked(): boolean {
+    return (
+      caseMutationLock.current ||
+      extractionLifecycleLock.current ||
+      extractionDiscardInFlight.current
+    );
+  }
+
+  function currentCaseDraftDirtyState(): CaseDraftDirtyState {
+    const projectId = caseProjectDraft.projectId;
+    const editingFileBaseline = caseEntityEditorMatches(
+      activeCaseEntityEditor,
+      "file",
+    )
+      ? caseWorkspace?.files.find(
+          (item) => item.fileId === activeCaseEntityEditor?.entityId,
+        )
+      : undefined;
+    const editingPartyBaseline = caseEntityEditorMatches(
+      activeCaseEntityEditor,
+      "party",
+    )
+      ? caseWorkspace?.parties.find(
+          (item) => item.partyId === activeCaseEntityEditor?.entityId,
+        )
+      : undefined;
+    const editingFactBaseline = caseEntityEditorMatches(
+      activeCaseEntityEditor,
+      "fact",
+    )
+      ? caseWorkspace?.facts.find(
+          (item) => item.factId === activeCaseEntityEditor?.entityId,
+        )
+      : undefined;
+    const editingEvidenceBaseline = caseEntityEditorMatches(
+      activeCaseEntityEditor,
+      "evidence",
+    )
+      ? caseWorkspace?.evidence.find(
+          (item) => item.evidenceId === activeCaseEntityEditor?.entityId,
+        )
+      : undefined;
+    const editingIssueBaseline = caseEntityEditorMatches(
+      activeCaseEntityEditor,
+      "legal_issue",
+    )
+      ? caseWorkspace?.legalIssues.find(
+          (item) => item.issueId === activeCaseEntityEditor?.entityId,
+        )
+      : undefined;
+    const baselineFactId = caseWorkspace?.facts[0]?.factId ?? "";
+    const baselineEvidenceId =
+      caseWorkspace?.evidence[0]?.evidenceId ?? "";
+    const baselineIssueId = caseWorkspace?.legalIssues[0]?.issueId ?? "";
+    const baselineCaseDate = caseWorkspace?.project.openedOn ?? "";
+
+    return detectDirtyCaseDrafts({
+      project: {
+        draft: caseProjectDraft,
+        baseline: caseWorkspace?.project ?? caseProjectDraft,
+      },
+      file: {
+        draft: fileDraft,
+        baseline: editingFileBaseline ?? createCaseFile(projectId),
+      },
+      party: {
+        draft: partyDraft,
+        baseline: editingPartyBaseline ?? createParty(projectId),
+      },
+      fact: {
+        draft: factDraft,
+        baseline: editingFactBaseline ?? createFact(projectId),
+      },
+      evidence: {
+        draft: evidenceDraft,
+        baseline:
+          editingEvidenceBaseline ??
+          createEvidence(projectId, (caseWorkspace?.evidence.length ?? 0) + 1),
+      },
+      legalIssue: {
+        draft: issueDraft,
+        baseline: editingIssueBaseline ?? createIssue(projectId),
+      },
+      evidenceLink: {
+        factId: linkFactId,
+        evidenceId: linkEvidenceId,
+        baselineFactId,
+        baselineEvidenceId,
+      },
+      legalBasis: {
+        sourceId: basisSourceId,
+        issueId: basisIssueId,
+        caseDate: basisCaseDate,
+        includeExpired: basisIncludeExpired,
+        note: basisNote,
+        baselineIssueId,
+        baselineCaseDate,
+      },
+    });
+  }
+
+  function blockWorkspaceReloadForDirtyDrafts(
+    allowed: readonly CaseDraftKind[],
+    action: string,
+  ): boolean {
+    const blocking = blockingDirtyCaseDrafts(
+      currentCaseDraftDirtyState(),
+      allowed,
+    );
+    if (blocking.length === 0) {
+      return false;
+    }
+
+    setCaseState({
+      kind: "error",
+      message: `${action}会刷新案件工作区。请先保存或清空这些未保存内容：${blocking
+        .map((kind) => CASE_DRAFT_LABELS[kind])
+        .join("、")}。`,
+    });
+    return true;
+  }
 
   useEffect(() => {
     let isMounted = true;
@@ -509,18 +886,62 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (viewMode !== "qa" && activeQaRequestId.current) {
-      const requestId = activeQaRequestId.current;
-      activeQaRequestId.current = null;
-      setQaStream((current) => ({
-        ...current,
-        requestId: null,
-        status: "cancelled",
-        errorType: "cancelled",
-        message: "离开问答页面，生成已取消",
-      }));
-      void cancelLegalAnswer({ requestId });
+    const requestId = activeQaRequestId.current;
+    const stream = qaStreamRef.current;
+    if (
+      viewMode === "qa" ||
+      !requestId ||
+      !shouldCancelLegalAnswerOnPageLeave(stream, requestId) ||
+      qaLeaveCancellationRequestId.current === requestId
+    ) {
+      return;
     }
+
+    const previousStatus = stream.status === "streaming" ? "streaming" : "connecting";
+    qaLeaveCancellationRequestId.current = requestId;
+    setQaStream((current) => markLegalAnswerCancelling(current));
+    void cancelLegalAnswer({ requestId })
+      .then((response) => {
+        if (qaLeaveCancellationRequestId.current === requestId) {
+          qaLeaveCancellationRequestId.current = null;
+        }
+        if (activeQaRequestId.current !== requestId) {
+          return;
+        }
+        if (response.cancelled) {
+          activeQaRequestId.current = null;
+          setQaStream((current) =>
+            settleLegalAnswerCancellation(
+              current,
+              requestId,
+              true,
+              "离开问答页面，生成已取消",
+            ),
+          );
+          setQaState({ kind: "idle" });
+          return;
+        }
+
+        setQaStream((current) =>
+          restoreLegalAnswerAfterRejectedCancellation(
+            current,
+            requestId,
+            previousStatus,
+          ),
+        );
+      })
+      .catch(() => {
+        if (qaLeaveCancellationRequestId.current === requestId) {
+          qaLeaveCancellationRequestId.current = null;
+        }
+        setQaStream((current) =>
+          restoreLegalAnswerAfterRejectedCancellation(
+            current,
+            requestId,
+            previousStatus,
+          ),
+        );
+      });
   }, [viewMode]);
 
   useEffect(
@@ -548,6 +969,7 @@ export function App() {
 
   useEffect(() => {
     let isMounted = true;
+    setProviderState({ kind: "loading" });
 
     listProviderProfiles()
       .then(async (response) => {
@@ -556,7 +978,6 @@ export function App() {
         }
 
         setProviderProfiles(response.profiles);
-
         if (response.profiles.length > 0) {
           setSelectedProviderId(response.profiles[0].id);
           setQaProviderId(response.profiles[0].id);
@@ -564,19 +985,28 @@ export function App() {
           setProviderDraft(response.profiles[0]);
         }
 
-        const statuses = await Promise.all(
-          response.profiles.map(async (profile) => {
+        const statusResult = await loadProviderKeyStatusesSettled(
+          response.profiles,
+          async (profile) => {
             const statusResponse = await getProviderApiKeyStatus({
               providerId: profile.id,
               accountId: profile.credentialAccountId,
             });
 
-            return [profile.id, statusResponse.status] as const;
-          }),
+            return statusResponse.status;
+          },
         );
 
         if (isMounted) {
-          setKeyStatuses(Object.fromEntries(statuses));
+          setKeyStatuses(statusResult.statuses);
+          if (statusResult.failedCount > 0) {
+            setProviderState({
+              kind: "error",
+              message: `${statusResult.failedCount} 个 Provider 的凭据状态读取失败，可重试对应操作。`,
+            });
+          } else {
+            setProviderState({ kind: "idle" });
+          }
         }
       })
       .catch((error: unknown) => {
@@ -590,116 +1020,135 @@ export function App() {
     };
   }, []);
 
-  async function loadCaseWorkspace(projectId: string) {
+  function applyCaseWorkspace(workspace: CaseWorkspace) {
+    setActiveCaseEntityEditor(null);
+    setCaseWorkspace(workspace);
+    setSelectedCaseProjectId(workspace.project.projectId);
+    setCaseProjectDraft(workspace.project);
+    setFileDraft(createCaseFile(workspace.project.projectId));
+    setPartyDraft(createParty(workspace.project.projectId));
+    setFactDraft(createFact(workspace.project.projectId));
+    setEvidenceDraft(
+      createEvidence(workspace.project.projectId, workspace.evidence.length + 1),
+    );
+    setIssueDraft(createIssue(workspace.project.projectId));
+    setBasisSourceId("");
+    setBasisIssueId(workspace.legalIssues[0]?.issueId ?? "");
+    setBasisCaseDate(workspace.project.openedOn ?? "");
+    setBasisIncludeExpired(false);
+    setBasisNote("");
+    setLinkFactId(workspace.facts[0]?.factId ?? "");
+    setLinkEvidenceId(workspace.evidence[0]?.evidenceId ?? "");
+    const availableFileIds = new Set(workspace.files.map((file) => file.fileId));
+    setExtractionFileIds((current) =>
+      current.filter((fileId) => availableFileIds.has(fileId)),
+    );
+  }
+
+  async function loadCaseWorkspace(
+    projectId: string,
+    requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch),
+  ) {
+    if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+      return;
+    }
     setCaseState({ kind: "loading" });
 
     try {
       const response = await getCaseWorkspace({ projectId });
-      const workspace = response.workspace ?? null;
-      setCaseWorkspace(workspace);
-
-      if (workspace) {
-        setSelectedCaseProjectId(workspace.project.projectId);
-        setCaseProjectDraft(workspace.project);
-        setFileDraft(createCaseFile(workspace.project.projectId));
-        setPartyDraft(createParty(workspace.project.projectId));
-        setFactDraft(createFact(workspace.project.projectId));
-        setEvidenceDraft(
-          createEvidence(workspace.project.projectId, workspace.evidence.length + 1),
-        );
-        setIssueDraft(createIssue(workspace.project.projectId));
-        setBasisSourceId("");
-        setBasisIssueId(workspace.legalIssues[0]?.issueId ?? "");
-        setBasisCaseDate(workspace.project.openedOn ?? "");
-        setBasisIncludeExpired(false);
-        setBasisNote("");
-        setLinkFactId(workspace.facts[0]?.factId ?? "");
-        setLinkEvidenceId(workspace.evidence[0]?.evidenceId ?? "");
-        const availableFileIds = new Set(
-          workspace.files.map((file) => file.fileId),
-        );
-        setExtractionFileIds((current) =>
-          current.filter((fileId) => availableFileIds.has(fileId)),
-        );
+      if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        return;
       }
 
+      const workspace = response.workspace ?? null;
+      if (workspace) {
+        applyCaseWorkspace(workspace);
+      } else {
+        setActiveCaseEntityEditor(null);
+        setCaseWorkspace(null);
+        setSelectedCaseProjectId(null);
+      }
       setCaseState({ kind: "idle" });
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
     }
   }
 
-  async function refreshCaseProjects(preferredProjectId?: string) {
+  async function refreshCaseProjects(
+    preferredProjectId: string | undefined,
+    requestEpoch: number,
+  ) {
     try {
       const response = await listCaseProjects();
+      if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        return response.projects;
+      }
       setCaseProjects(response.projects);
+
       const nextProject =
         response.projects.find(
           (project) => project.projectId === preferredProjectId,
         ) ?? response.projects[0];
 
       if (nextProject) {
-        await loadCaseWorkspace(nextProject.projectId);
+        setSelectedCaseProjectId(nextProject.projectId);
+        setCaseWorkspace(null);
+        await loadCaseWorkspace(nextProject.projectId, requestEpoch);
+      } else {
+        setCaseState({ kind: "idle" });
       }
+      return response.projects;
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+      return undefined;
     }
   }
 
   useEffect(() => {
     let isMounted = true;
+    const requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
 
     listCaseProjects()
       .then(async (response) => {
-        if (!isMounted) {
+        if (
+          !isMounted ||
+          !isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)
+        ) {
           return;
         }
 
         setCaseProjects(response.projects);
         const firstProject = response.projects[0];
-
         if (firstProject) {
-          const workspaceResponse = await getCaseWorkspace({
-            projectId: firstProject.projectId,
-          });
-
-          if (isMounted && workspaceResponse.workspace) {
-            setSelectedCaseProjectId(firstProject.projectId);
-            setCaseWorkspace(workspaceResponse.workspace);
-            setCaseProjectDraft(workspaceResponse.workspace.project);
-            setFileDraft(createCaseFile(firstProject.projectId));
-            setPartyDraft(createParty(firstProject.projectId));
-            setFactDraft(createFact(firstProject.projectId));
-            setEvidenceDraft(
-              createEvidence(
-                firstProject.projectId,
-                workspaceResponse.workspace.evidence.length + 1,
-              ),
-            );
-            setIssueDraft(createIssue(firstProject.projectId));
-            setBasisSourceId("");
-            setBasisIssueId(
-              workspaceResponse.workspace.legalIssues[0]?.issueId ?? "",
-            );
-            setBasisCaseDate(workspaceResponse.workspace.project.openedOn ?? "");
-            setBasisIncludeExpired(false);
-            setBasisNote("");
-            setLinkFactId(workspaceResponse.workspace.facts[0]?.factId ?? "");
-            setLinkEvidenceId(
-              workspaceResponse.workspace.evidence[0]?.evidenceId ?? "",
-            );
-          }
+          setSelectedCaseProjectId(firstProject.projectId);
+          setCaseWorkspace(null);
+          await loadCaseWorkspace(firstProject.projectId, requestEpoch);
+        } else {
+          setCaseState({ kind: "idle" });
         }
       })
       .catch((error: unknown) => {
-        if (isMounted) {
+        if (
+          isMounted &&
+          isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)
+        ) {
           setCaseState({ kind: "error", message: errorMessage(error) });
         }
       });
 
     return () => {
       isMounted = false;
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
+      }
     };
+    // This mount request deliberately owns one fixed epoch; later navigation
+    // invalidates it instead of recreating the loader closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function runSearch(documentId: string | null) {
@@ -779,16 +1228,16 @@ export function App() {
   }
 
   function buildLegalAnswerCandidateRequest() {
-    return {
-      question: qaQuestion.trim(),
-      lawName: qaLawName.trim() || null,
-      articleNumber: qaArticleNumber.trim() || null,
-      keywords: splitKeywords(qaKeywords),
-      caseDate: qaCaseDate || null,
-      effectivenessLevels: [],
+    return createLegalAnswerCandidateRequest({
+      question: qaQuestion,
+      lawName: qaLawName,
+      articleNumber: qaArticleNumber,
+      keywords: qaKeywords,
+      caseDate: qaCaseDate,
+      effectivenessLevels: qaEffectivenessLevels,
       includeExpired: qaIncludeExpired,
       limit: 8,
-    };
+    });
   }
 
   async function previewLegalAnswerContext(event?: FormEvent<HTMLFormElement>) {
@@ -831,6 +1280,8 @@ export function App() {
 
     const requestId = createLegalAnswerRequestId();
     activeQaRequestId.current = requestId;
+    qaLeaveCancellationRequestId.current = null;
+    setQaSubmittedQuestion(request.question);
     setQaState({ kind: "loading" });
     setQaAnswer(null);
     setQaStream(startLegalAnswerStream(requestId));
@@ -880,6 +1331,9 @@ export function App() {
         setQaState({ kind: "idle" });
       }
     } finally {
+      if (qaLeaveCancellationRequestId.current === requestId) {
+        qaLeaveCancellationRequestId.current = null;
+      }
       if (activeQaRequestId.current === requestId) {
         activeQaRequestId.current = null;
       }
@@ -888,19 +1342,50 @@ export function App() {
 
   async function cancelCurrentLegalAnswer() {
     const requestId = activeQaRequestId.current;
-    if (!requestId) {
+    const stream = qaStreamRef.current;
+    if (
+      !requestId ||
+      !shouldCancelLegalAnswerOnPageLeave(stream, requestId)
+    ) {
       return;
     }
 
+    const previousStatus = stream.status === "streaming" ? "streaming" : "connecting";
     setQaStream((current) => markLegalAnswerCancelling(current));
     try {
-      await cancelLegalAnswer({ requestId });
+      const response = await cancelLegalAnswer({ requestId });
+      if (activeQaRequestId.current !== requestId) {
+        return;
+      }
+      if (response.cancelled) {
+        activeQaRequestId.current = null;
+        setQaStream((current) =>
+          settleLegalAnswerCancellation(current, requestId, true),
+        );
+        setQaState({ kind: "idle" });
+      } else {
+        setQaStream((current) =>
+          restoreLegalAnswerAfterRejectedCancellation(
+            current,
+            requestId,
+            previousStatus,
+          ),
+        );
+      }
     } catch (error: unknown) {
-      setQaStream((current) => ({
-        ...current,
-        status: "error",
-        message: errorMessage(error),
-      }));
+      setQaStream((current) => {
+        const restored = restoreLegalAnswerAfterRejectedCancellation(
+          current,
+          requestId,
+          previousStatus,
+        );
+        return restored === current
+          ? current
+          : {
+              ...restored,
+              message: `取消请求失败：${errorMessage(error)}；等待当前请求结束`,
+            };
+      });
     }
   }
 
@@ -908,7 +1393,111 @@ export function App() {
     setSelectedQaSourceId(source.sourceId);
   }
 
+  function resetAllCaseEntityDrafts(
+    projectId = caseProjectDraft.projectId,
+    nextEvidenceNumber = (caseWorkspace?.evidence.length ?? 0) + 1,
+  ) {
+    setFileDraft(createCaseFile(projectId));
+    setPartyDraft(createParty(projectId));
+    setFactDraft(createFact(projectId));
+    setEvidenceDraft(createEvidence(projectId, nextEvidenceNumber));
+    setIssueDraft(createIssue(projectId));
+  }
+
+  function startCaseEntityEdit(target: CaseEntityEditTarget) {
+    if (
+      !caseChildrenReady ||
+      caseNavigationLocked ||
+      caseInteractionIsLocked() ||
+      activeCaseEntityEditor !== null
+    ) {
+      return;
+    }
+    if (blockWorkspaceReloadForDirtyDrafts([], "开始编辑")) {
+      return;
+    }
+
+    resetAllCaseEntityDrafts(target.entity.projectId);
+    switch (target.entityType) {
+      case "file":
+        setFileDraft(copyCaseEntityForEditing(target.entity));
+        setActiveCaseEntityEditor({
+          entityType: "file",
+          entityId: target.entity.fileId,
+        });
+        break;
+      case "party":
+        setPartyDraft(copyCaseEntityForEditing(target.entity));
+        setActiveCaseEntityEditor({
+          entityType: "party",
+          entityId: target.entity.partyId,
+        });
+        break;
+      case "fact":
+        setFactDraft(copyCaseEntityForEditing(target.entity));
+        setActiveCaseEntityEditor({
+          entityType: "fact",
+          entityId: target.entity.factId,
+        });
+        break;
+      case "evidence":
+        setEvidenceDraft(copyCaseEntityForEditing(target.entity));
+        setActiveCaseEntityEditor({
+          entityType: "evidence",
+          entityId: target.entity.evidenceId,
+        });
+        break;
+      case "legal_issue":
+        setIssueDraft(copyCaseEntityForEditing(target.entity));
+        setActiveCaseEntityEditor({
+          entityType: "legal_issue",
+          entityId: target.entity.issueId,
+        });
+        break;
+    }
+    setCaseState({ kind: "idle" });
+  }
+
+  function cancelCaseEntityEdit() {
+    if (caseMutationLock.current) {
+      return;
+    }
+    const editor = activeCaseEntityEditor;
+    if (!editor) {
+      return;
+    }
+
+    switch (editor.entityType) {
+      case "file":
+        setFileDraft(createCaseFile(caseProjectDraft.projectId));
+        break;
+      case "party":
+        setPartyDraft(createParty(caseProjectDraft.projectId));
+        break;
+      case "fact":
+        setFactDraft(createFact(caseProjectDraft.projectId));
+        break;
+      case "evidence":
+        setEvidenceDraft(
+          createEvidence(
+            caseProjectDraft.projectId,
+            (caseWorkspace?.evidence.length ?? 0) + 1,
+          ),
+        );
+        break;
+      case "legal_issue":
+        setIssueDraft(createIssue(caseProjectDraft.projectId));
+        break;
+    }
+    setActiveCaseEntityEditor(null);
+  }
+
   function startNewCaseProject() {
+    if (caseInteractionIsLocked()) {
+      return;
+    }
+    advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
+    setActiveCaseEntityEditor(null);
     const project = createCaseProject();
     setSelectedCaseProjectId(null);
     setCaseWorkspace(null);
@@ -926,18 +1515,41 @@ export function App() {
     setLinkFactId("");
     setLinkEvidenceId("");
     setExtractionFileIds([]);
-    cancelExtractionReview();
+    setExtractionDiscardError(null);
+    extractionLifecycleLock.current = false;
+    dispatchExtraction({ type: "reset" });
     setCaseState({ kind: "idle" });
   }
 
   function selectCaseProject(project: CaseProject) {
+    if (caseInteractionIsLocked()) {
+      return;
+    }
+    const requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
+    setActiveCaseEntityEditor(null);
     setExtractionFileIds([]);
-    cancelExtractionReview();
-    void loadCaseWorkspace(project.projectId);
+    setExtractionDiscardError(null);
+    extractionLifecycleLock.current = false;
+    dispatchExtraction({ type: "reset" });
+    setSelectedCaseProjectId(project.projectId);
+    setCaseWorkspace(null);
+    resetAllCaseEntityDrafts(project.projectId, 1);
+    void loadCaseWorkspace(project.projectId, requestEpoch);
   }
 
   async function saveCaseProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (
+      caseNavigationLocked ||
+      caseInteractionIsLocked() ||
+      activeCaseEntityEditor !== null
+    ) {
+      setCaseState({
+        kind: "error",
+        message: "请先完成或取消当前子项编辑，再保存案件。",
+      });
+      return;
+    }
     const project = {
       ...caseProjectDraft,
       title: caseProjectDraft.title.trim() || "未命名案件",
@@ -945,41 +1557,136 @@ export function App() {
       summary: caseProjectDraft.summary.trim(),
       openedOn: caseProjectDraft.openedOn || null,
     };
-
-    setCaseState({ kind: "loading" });
-
-    try {
-      const response = await upsertCaseProject({ project });
-      setCaseProjectDraft(response.project);
-      setBasisCaseDate(response.project.openedOn ?? "");
-      await refreshCaseProjects(response.project.projectId);
-      setCaseState({ kind: "idle" });
-    } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+    if (blockWorkspaceReloadForDirtyDrafts(["project"], "保存案件")) {
+      return;
     }
-  }
-
-  async function removeCaseProject() {
-    if (!selectedCaseProjectId) {
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
       return;
     }
 
     setCaseState({ kind: "loading" });
 
     try {
-      await deleteCaseProject({ projectId: selectedCaseProjectId });
-      startNewCaseProject();
-      await refreshCaseProjects();
-      setCaseState({ kind: "idle" });
+      const response = await upsertCaseProject({ project });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseProjectDraft(response.project);
+        setBasisCaseDate(response.project.openedOn ?? "");
+      }
+      await refreshCaseProjects(response.project.projectId, requestEpoch);
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "idle" });
+      }
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
+  }
+
+  async function removeCaseProject() {
+    if (
+      !selectedCaseProjectId ||
+      caseNavigationLocked ||
+      caseInteractionIsLocked() ||
+      activeCaseEntityEditor !== null
+    ) {
+      return;
+    }
+
+    const projectId = selectedCaseProjectId;
+    if (blockWorkspaceReloadForDirtyDrafts([], "删除案件")) {
+      return;
+    }
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
+      return;
+    }
+    let startBlankProject = false;
+    setCaseState({ kind: "loading" });
+
+    try {
+      await deleteCaseProject({ projectId });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setSelectedCaseProjectId(null);
+        setCaseWorkspace(null);
+      }
+      const projects = await refreshCaseProjects(undefined, requestEpoch);
+      if (
+        isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch) &&
+        projects?.length === 0
+      ) {
+        startBlankProject = true;
+      }
+    } catch (error: unknown) {
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
+    }
+
+    if (
+      startBlankProject &&
+      isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)
+    ) {
+      startNewCaseProject();
+    }
+  }
+
+  function requirePersistedCaseWorkspace(
+    entityType?: EditableCaseEntityType,
+    entityId?: string,
+  ): boolean {
+    if (caseMutationLock.current) {
+      setCaseState({
+        kind: "error",
+        message: "案件数据正在写入，请等待当前操作完成。",
+      });
+      return false;
+    }
+
+    if (!caseChildrenReady) {
+      setCaseState({
+        kind: "error",
+        message: "请先保存案件，再操作案件子项。",
+      });
+      return false;
+    }
+
+    if (caseNavigationLocked || extractionLifecycleLock.current) {
+      setCaseState({
+        kind: "error",
+        message: "结构化抽取进行中，请先完成或丢弃当前抽取任务。",
+      });
+      return false;
+    }
+
+    if (
+      activeCaseEntityEditor !== null &&
+      (entityType === undefined ||
+        !caseEntityEditorMatches(
+          activeCaseEntityEditor,
+          entityType,
+          entityId,
+        ))
+    ) {
+      setCaseState({
+        kind: "error",
+        message: "请先完成或取消当前子项编辑。",
+      });
+      return false;
+    }
+
+    return true;
   }
 
   async function saveParty(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!caseWorkspace && !selectedCaseProjectId) {
+    if (!requirePersistedCaseWorkspace("party")) {
       return;
     }
 
@@ -993,18 +1700,31 @@ export function App() {
     if (!party.name) {
       return;
     }
+    if (blockWorkspaceReloadForDirtyDrafts(["party"], "保存当事人")) {
+      return;
+    }
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
+      return;
+    }
 
     try {
       await upsertCaseParty({ party });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
-      setPartyDraft(createParty(caseProjectDraft.projectId));
+      await loadCaseWorkspace(party.projectId, requestEpoch);
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
   async function saveFile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!requirePersistedCaseWorkspace("file")) {
+      return;
+    }
     const file = {
       ...fileDraft,
       projectId: caseProjectDraft.projectId,
@@ -1017,18 +1737,31 @@ export function App() {
     if (!file.title) {
       return;
     }
+    if (blockWorkspaceReloadForDirtyDrafts(["file"], "保存案件材料")) {
+      return;
+    }
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
+      return;
+    }
 
     try {
       await upsertCaseFile({ file });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
-      setFileDraft(createCaseFile(caseProjectDraft.projectId));
+      await loadCaseWorkspace(file.projectId, requestEpoch);
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
   async function saveFact(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!requirePersistedCaseWorkspace("fact")) {
+      return;
+    }
     const fact = {
       ...factDraft,
       projectId: caseProjectDraft.projectId,
@@ -1039,18 +1772,31 @@ export function App() {
     if (!fact.title) {
       return;
     }
+    if (blockWorkspaceReloadForDirtyDrafts(["fact"], "保存事实")) {
+      return;
+    }
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
+      return;
+    }
 
     try {
       await upsertCaseFact({ fact });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
-      setFactDraft(createFact(caseProjectDraft.projectId));
+      await loadCaseWorkspace(fact.projectId, requestEpoch);
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
   async function saveEvidence(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!requirePersistedCaseWorkspace("evidence")) {
+      return;
+    }
     const evidence = {
       ...evidenceDraft,
       projectId: caseProjectDraft.projectId,
@@ -1062,23 +1808,31 @@ export function App() {
     if (!evidence.evidenceNumber || !evidence.title) {
       return;
     }
+    if (blockWorkspaceReloadForDirtyDrafts(["evidence"], "保存证据")) {
+      return;
+    }
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
+      return;
+    }
 
     try {
       await upsertEvidenceItem({ evidence });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
-      setEvidenceDraft(
-        createEvidence(
-          caseProjectDraft.projectId,
-          (caseWorkspace?.evidence.length ?? 0) + 2,
-        ),
-      );
+      await loadCaseWorkspace(evidence.projectId, requestEpoch);
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
   async function saveIssue(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!requirePersistedCaseWorkspace("legal_issue")) {
+      return;
+    }
     const issue = {
       ...issueDraft,
       projectId: caseProjectDraft.projectId,
@@ -1088,42 +1842,81 @@ export function App() {
     if (!issue.title) {
       return;
     }
+    if (blockWorkspaceReloadForDirtyDrafts(["legal_issue"], "保存争点")) {
+      return;
+    }
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
+      return;
+    }
 
     try {
       await upsertLegalIssue({ issue });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
-      setIssueDraft(createIssue(caseProjectDraft.projectId));
+      await loadCaseWorkspace(issue.projectId, requestEpoch);
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
   async function saveLegalBasis(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!caseWorkspace || !basisSourceId.trim()) {
+    if (!requirePersistedCaseWorkspace() || !basisSourceId.trim()) {
+      return;
+    }
+    if (
+      blockWorkspaceReloadForDirtyDrafts(["legal_basis"], "添加法律依据")
+    ) {
+      return;
+    }
+    const projectId = caseProjectDraft.projectId;
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
       return;
     }
 
     try {
       await addCaseLegalBasis({
-        projectId: caseProjectDraft.projectId,
+        projectId,
         issueId: basisIssueId || null,
         sourceId: basisSourceId.trim(),
         caseDate: basisCaseDate || null,
         includeExpired: basisIncludeExpired,
         note: basisNote.trim(),
       });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
-      setBasisSourceId("");
-      setBasisNote("");
+      await loadCaseWorkspace(projectId, requestEpoch);
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setBasisSourceId("");
+        setBasisNote("");
+      }
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
   async function linkEvidenceToFact() {
-    if (!linkFactId || !linkEvidenceId) {
+    if (!requirePersistedCaseWorkspace() || !linkFactId || !linkEvidenceId) {
+      return;
+    }
+    if (
+      blockWorkspaceReloadForDirtyDrafts(
+        ["evidence_link"],
+        "保存事实—证据关联",
+      )
+    ) {
+      return;
+    }
+    const projectId = caseProjectDraft.projectId;
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
       return;
     }
 
@@ -1131,14 +1924,18 @@ export function App() {
       await upsertEvidenceLink({
         link: {
           linkId: createId("link"),
-          projectId: caseProjectDraft.projectId,
+          projectId,
           factId: linkFactId,
           evidenceId: linkEvidenceId,
         },
       });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
+      await loadCaseWorkspace(projectId, requestEpoch);
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
@@ -1154,23 +1951,55 @@ export function App() {
       | "uncertainty",
     id: string,
   ) {
+    const editableEntityType =
+      entityType === "file" ||
+      entityType === "party" ||
+      entityType === "fact" ||
+      entityType === "evidence" ||
+      entityType === "legal_issue"
+        ? entityType
+        : undefined;
+    if (!requirePersistedCaseWorkspace(editableEntityType, id)) {
+      return;
+    }
+    if (blockWorkspaceReloadForDirtyDrafts([], "删除案件子项")) {
+      return;
+    }
+    const projectId = caseProjectDraft.projectId;
+    const requestEpoch = beginCaseMutation();
+    if (requestEpoch === null) {
+      return;
+    }
     try {
       await deleteCaseEntity({ entityType, id });
-      await loadCaseWorkspace(caseProjectDraft.projectId);
+      await loadCaseWorkspace(projectId, requestEpoch);
     } catch (error: unknown) {
-      setCaseState({ kind: "error", message: errorMessage(error) });
+      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
+        setCaseState({ kind: "error", message: errorMessage(error) });
+      }
+    } finally {
+      finishCaseMutation();
     }
   }
 
   async function runStructuredExtraction() {
     if (
+      !caseChildrenReady ||
       !caseWorkspace ||
+      activeCaseEntityEditor !== null ||
       !extractionProviderId ||
-      extractionFileIds.length === 0
+      extractionFileIds.length === 0 ||
+      extractionSourcesLocked ||
+      caseInteractionIsLocked()
     ) {
       return;
     }
+    if (blockWorkspaceReloadForDirtyDrafts([], "开始结构化抽取")) {
+      return;
+    }
 
+    extractionLifecycleLock.current = true;
+    setExtractionDiscardError(null);
     const context = createExtractionContext(
       createId("extraction-request"),
       caseWorkspace.project.projectId,
@@ -1197,6 +2026,7 @@ export function App() {
           repaired: response.result.repaired,
         });
       } else {
+        extractionLifecycleLock.current = false;
         dispatchExtraction({
           type: "failed",
           requestId: context.requestId,
@@ -1207,6 +2037,7 @@ export function App() {
         });
       }
     } catch (error: unknown) {
+      extractionLifecycleLock.current = false;
       dispatchExtraction({
         type: "failed",
         requestId: context.requestId,
@@ -1227,15 +2058,44 @@ export function App() {
     }
   }
 
-  function cancelExtractionReview() {
-    if (extractionState.kind === "reviewing") {
-      void discardStructuredCaseExtraction({
-        reviewId: extractionState.reviewId,
-      }).catch((error: unknown) => {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      });
+  async function cancelExtractionReview() {
+    if (
+      extractionState.kind !== "reviewing" ||
+      extractionDiscardInFlight.current ||
+      caseMutationLock.current
+    ) {
+      return;
     }
-    dispatchExtraction({ type: "cancel" });
+
+    const reviewId = extractionState.reviewId;
+    extractionDiscardInFlight.current = true;
+    setExtractionDiscarding(true);
+    setExtractionDiscardError(null);
+    try {
+      await discardStructuredCaseExtraction({ reviewId });
+      extractionLifecycleLock.current = false;
+      dispatchExtraction({ type: "cancel" });
+    } catch (error: unknown) {
+      const message = errorMessage(error);
+      setExtractionDiscardError(
+        `取消失败，审阅草稿仍保留。请重试：${message}`,
+      );
+      setCaseState({ kind: "error", message });
+    } finally {
+      extractionDiscardInFlight.current = false;
+      setExtractionDiscarding(false);
+    }
+  }
+
+  function resetExtractionResult() {
+    if (
+      extractionState.kind === "failed" ||
+      extractionState.kind === "committed"
+    ) {
+      extractionLifecycleLock.current = false;
+      setExtractionDiscardError(null);
+      dispatchExtraction({ type: "reset" });
+    }
   }
 
   async function confirmExtractionReview() {
@@ -1243,10 +2103,19 @@ export function App() {
     if (!confirmation) {
       return;
     }
+    if (blockWorkspaceReloadForDirtyDrafts([], "确认结构化抽取")) {
+      return;
+    }
+    const requestEpoch = beginCaseMutation(true);
+    if (requestEpoch === null) {
+      return;
+    }
+    setExtractionDiscardError(null);
     dispatchExtraction({ type: "begin_commit" });
     try {
       const response = await confirmStructuredCaseExtraction(confirmation);
-      await loadCaseWorkspace(confirmation.projectId);
+      await loadCaseWorkspace(confirmation.projectId, requestEpoch);
+      extractionLifecycleLock.current = false;
       dispatchExtraction({
         type: "committed",
         message: `已原子写入 ${response.counts.facts} 项事实、${response.counts.evidence} 项证据和 ${response.counts.uncertainties} 项待核实事项。`,
@@ -1255,6 +2124,8 @@ export function App() {
       const message = errorMessage(error);
       dispatchExtraction({ type: "commit_failed", message });
       setCaseState({ kind: "error", message });
+    } finally {
+      finishCaseMutation();
     }
   }
 
@@ -1274,13 +2145,14 @@ export function App() {
   }
 
   function updateProviderKind(kind: ProviderKind) {
-    const defaults = PROVIDER_DEFAULTS[kind];
+    const defaults = providerDefaults(kind);
     setProviderDraft((current) => ({
       ...current,
       kind,
       displayName: defaults.displayName,
       modelId: defaults.modelId,
       baseUrl: defaults.baseUrl,
+      capabilities: providerCapabilities(kind),
       options: defaultProviderOptions(kind),
     }));
   }
@@ -1295,9 +2167,21 @@ export function App() {
     }));
   }
 
+  function clearProviderConnectionResult(profileId: string) {
+    setConnectionResults((current) => {
+      if (!(profileId in current)) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[profileId];
+      return next;
+    });
+  }
+
   async function saveProvider(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const profile = normalizeProfile(providerDraft);
+    const profile = normalizeProviderProfile(providerDraft);
 
     setProviderState({ kind: "loading" });
 
@@ -1310,6 +2194,7 @@ export function App() {
       setProviderDraft(response.profile);
       setSelectedProviderId(response.profile.id);
       setExtractionProviderId((current) => current || response.profile.id);
+      clearProviderConnectionResult(response.profile.id);
       await refreshKeyStatus(response.profile);
       setProviderState({ kind: "idle" });
     } catch (error: unknown) {
@@ -1318,7 +2203,7 @@ export function App() {
   }
 
   async function saveApiKey() {
-    const profile = normalizeProfile(providerDraft);
+    const profile = normalizeProviderProfile(providerDraft);
     const apiKey = apiKeyInput.trim();
 
     if (!apiKey) {
@@ -1337,6 +2222,7 @@ export function App() {
         ...current,
         [profile.id]: response.status,
       }));
+      clearProviderConnectionResult(profile.id);
       setApiKeyInput("");
       setProviderState({ kind: "idle" });
     } catch (error: unknown) {
@@ -1345,7 +2231,7 @@ export function App() {
   }
 
   async function removeApiKey() {
-    const profile = normalizeProfile(providerDraft);
+    const profile = normalizeProviderProfile(providerDraft);
     setProviderState({ kind: "loading" });
 
     try {
@@ -1357,6 +2243,7 @@ export function App() {
         ...current,
         [profile.id]: response.status,
       }));
+      clearProviderConnectionResult(profile.id);
       setProviderState({ kind: "idle" });
     } catch (error: unknown) {
       setProviderState({ kind: "error", message: errorMessage(error) });
@@ -1394,6 +2281,9 @@ export function App() {
         delete next[profileId];
         return next;
       });
+      setQaProviderId((current) =>
+        current === profileId ? (remaining[0]?.id ?? "") : current,
+      );
 
       if (remaining[0]) {
         setSelectedProviderId(remaining[0].id);
@@ -1413,7 +2303,7 @@ export function App() {
   }
 
   async function runProviderConnectionTest() {
-    const profile = normalizeProfile(providerDraft);
+    const profile = normalizeProviderProfile(providerDraft);
     setProviderState({ kind: "loading" });
 
     try {
@@ -1434,19 +2324,83 @@ export function App() {
       : health.kind === "error"
         ? health.message
         : "正在调用 Rust command...";
-  const currentKeyStatus = keyStatuses[providerDraft.id];
-  const currentConnectionResult = connectionResults[providerDraft.id];
-  const providerIsSaved = providerProfiles.some(
-    (profile) => profile.id === providerDraft.id,
+  const normalizedProviderDraft = normalizeProviderProfile(providerDraft);
+  const savedProviderProfile = providerProfiles.find(
+    (profile) => profile.id === normalizedProviderDraft.id,
   );
+  const providerIsSaved = savedProviderProfile !== undefined;
+  const providerDraftIsDirty =
+    savedProviderProfile !== undefined &&
+    !providerProfilesEqual(savedProviderProfile, normalizedProviderDraft);
+  const providerBusy = providerState.kind === "loading";
+  const currentKeyStatus = providerKeyStatusForSavedDraft(
+    savedProviderProfile,
+    normalizedProviderDraft,
+    keyStatuses[normalizedProviderDraft.id],
+  );
+  const currentConnectionResult = providerDraftIsDirty
+    ? undefined
+    : connectionResults[providerDraft.id];
   const providerHasKey = currentKeyStatus?.configured ?? false;
+  const caseNavigationLocked =
+    extractionSourcesLocked ||
+    extractionDiscarding ||
+    caseMutationInFlight;
+  const caseProjectMutationLocked =
+    caseNavigationLocked ||
+    caseState.kind === "loading" ||
+    activeCaseEntityEditor !== null;
+  const caseChildrenReady =
+    caseState.kind !== "loading" &&
+    isPersistedCaseWorkspace(
+      caseWorkspace,
+      selectedCaseProjectId,
+      caseProjectDraft.projectId,
+    );
+  const editingFile = caseEntityEditorMatches(activeCaseEntityEditor, "file");
+  const editingParty = caseEntityEditorMatches(activeCaseEntityEditor, "party");
+  const editingFact = caseEntityEditorMatches(activeCaseEntityEditor, "fact");
+  const editingEvidence = caseEntityEditorMatches(
+    activeCaseEntityEditor,
+    "evidence",
+  );
+  const editingIssue = caseEntityEditorMatches(
+    activeCaseEntityEditor,
+    "legal_issue",
+  );
   const activeQaContext = qaAnswer?.context ?? qaContext;
-  const selectedQaSource =
-    activeQaContext?.sources.find(
-      (source) => source.sourceId === selectedQaSourceId,
-    ) ??
-    activeQaContext?.sources[0] ??
-    null;
+  const selectedQaSource = resolveSelectedQaSource(
+    activeQaContext,
+    selectedQaSourceId,
+  );
+  const answeredQaQuestion = resolveLegalAnswerQuestion(
+    qaAnswer?.context ?? null,
+    qaSubmittedQuestion,
+  );
+  const answeredQaScope = qaAnswer
+    ? [
+        qaAnswer.context.query.lawNames.length > 0
+          ? `法律：${qaAnswer.context.query.lawNames.join("、")}`
+          : null,
+        qaAnswer.context.query.articleNumbers.length > 0
+          ? `条号：${qaAnswer.context.query.articleNumbers.join("、")}`
+          : null,
+        qaAnswer.context.query.keywords.length > 0
+          ? `关键词：${qaAnswer.context.query.keywords.join("、")}`
+          : null,
+        qaAnswer.context.query.caseDate
+          ? `案件日期：${qaAnswer.context.query.caseDate}`
+          : null,
+        qaAnswer.context.query.effectivenessLevels.length > 0
+          ? `效力层级：${qaAnswer.context.query.effectivenessLevels.join("、")}`
+          : null,
+        qaAnswer.context.query.includeExpired ? "包含失效版本" : null,
+      ]
+        .filter((item): item is string => item !== null)
+        .join("；")
+    : "";
+  const qaRequestLocked =
+    qaState.kind === "loading" || isLegalAnswerStreamActive(qaStream);
 
   return (
     <main className="app-shell">
@@ -1724,6 +2678,10 @@ export function App() {
               <span>{formatLegalAnswerStreamStatus(qaStream)}</span>
             </div>
             <form className="qa-form" onSubmit={submitLegalAnswer}>
+              <fieldset
+                className="qa-request-fields"
+                disabled={qaRequestLocked}
+              >
               <label>
                 <span>法律问题</span>
                 <textarea
@@ -1782,6 +2740,27 @@ export function App() {
                   </select>
                 </label>
               </div>
+              <fieldset className="qa-effectiveness-filter">
+                <legend>效力层级（可多选）</legend>
+                <div className="toggle-row">
+                  {EFFECTIVENESS_LEVEL_OPTIONS.map(([value, label]) => (
+                    <label key={value}>
+                      <input
+                        type="checkbox"
+                        checked={qaEffectivenessLevels.includes(value)}
+                        onChange={(event) =>
+                          setQaEffectivenessLevels((current) =>
+                            event.target.checked
+                              ? [...current, value]
+                              : current.filter((level) => level !== value),
+                          )
+                        }
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
               <label className="inline-check">
                 <input
                   type="checkbox"
@@ -1792,17 +2771,18 @@ export function App() {
                 />
                 <span>包含失效版本</span>
               </label>
+              </fieldset>
               <div className="command-row">
                 <button
                   type="button"
-                  disabled={isLegalAnswerStreamActive(qaStream)}
+                  disabled={qaRequestLocked}
                   onClick={() => void previewLegalAnswerContext()}
                 >
                   本地检索来源
                 </button>
                 <button
                   type="submit"
-                  disabled={!qaProviderId || isLegalAnswerStreamActive(qaStream)}
+                  disabled={!qaProviderId || qaRequestLocked}
                 >
                   生成带引用回答
                 </button>
@@ -1865,6 +2845,15 @@ export function App() {
                   : formatLegalAnswerStreamStatus(qaStream)}
               </span>
             </div>
+            {answeredQaQuestion ? (
+              <p className="answer-query" role="status">
+                <strong>本次回答对应问题</strong>
+                <span>{answeredQaQuestion}</span>
+                {answeredQaScope ? (
+                  <span className="answer-query-meta">{answeredQaScope}</span>
+                ) : null}
+              </p>
+            ) : null}
             {qaStream.status === "error" || qaStream.status === "cancelled" ? (
               <p className="error-text">
                 {qaStream.message ?? formatLegalAnswerStreamStatus(qaStream)}
@@ -1876,10 +2865,44 @@ export function App() {
                   <p className="risk-banner">存在未被有效来源支持的法律结论</p>
                 ) : null}
                 <article className="answer-box">
-                  <p>{qaAnswer.answer}</p>
+                  <p>
+                    {segmentLegalAnswer(
+                      qaAnswer.answer,
+                      qaAnswer.citationReport.citations,
+                    ).map((segment) =>
+                      segment.kind === "text" ? (
+                        <span key={segment.key}>{segment.text}</span>
+                      ) : citationHasTrustedSource(segment.citation) ? (
+                        <button
+                          className="answer-citation answer-citation--valid"
+                          key={segment.key}
+                          type="button"
+                          title="打开本地法条原文"
+                          onClick={() =>
+                            setSelectedQaSourceId(
+                              segment.citation.source!.sourceId,
+                            )
+                          }
+                        >
+                          {segment.text}
+                        </button>
+                      ) : (
+                        <span
+                          className="answer-citation answer-citation--invalid"
+                          key={segment.key}
+                          title={formatCitationInvalidReason(
+                            segment.citation.reason,
+                          )}
+                        >
+                          {segment.text}
+                        </span>
+                      ),
+                    )}
+                  </p>
                 </article>
                 <div className="answer-meta-row">
                   <span>记录：{qaAnswer.recordId ?? "未保存"}</span>
+                  <span>Provider：{qaAnswer.providerId}</span>
                   <span>
                     {qaStream.usage?.totalTokens
                       ? `${qaStream.usage.totalTokens} tokens`
@@ -1896,25 +2919,39 @@ export function App() {
                     </span>
                   </div>
                   <div className="citation-list">
-                    {qaAnswer.citationReport.citations.map((citation) => (
-                      <button
-                        className={`citation-item citation-item--${citation.status}`}
-                        key={`${citation.rawMarker}-${citation.sourceId}`}
-                        type="button"
-                        onClick={() =>
-                          citation.source
-                            ? setSelectedQaSourceId(citation.source.sourceId)
-                            : undefined
-                        }
-                      >
-                        <strong>{citation.rawMarker}</strong>
-                        <span>
-                          {citation.status === "valid"
-                            ? "已映射到本地原文"
-                            : formatCitationInvalidReason(citation.reason)}
-                        </span>
-                      </button>
-                    ))}
+                    {qaAnswer.citationReport.citations.map((citation, index) => {
+                      const key = `${citation.rawMarker}-${citation.sourceId}-${index}`;
+                      const content = (
+                        <>
+                          <strong>{citation.rawMarker}</strong>
+                          <span>
+                            {citation.status === "valid"
+                              ? "已映射到本地原文"
+                              : formatCitationInvalidReason(citation.reason)}
+                          </span>
+                        </>
+                      );
+
+                      return citationHasTrustedSource(citation) ? (
+                        <button
+                          className="citation-item citation-item--valid"
+                          key={key}
+                          type="button"
+                          onClick={() =>
+                            setSelectedQaSourceId(citation.source.sourceId)
+                          }
+                        >
+                          {content}
+                        </button>
+                      ) : (
+                        <div
+                          className="citation-item citation-item--invalid"
+                          key={key}
+                        >
+                          {content}
+                        </div>
+                      );
+                    })}
                     {qaAnswer.citationReport.citations.length === 0 ? (
                       <p className="empty-state">回答中没有可校验引用</p>
                     ) : null}
@@ -1976,14 +3013,18 @@ export function App() {
           </aside>
         </section>
       ) : viewMode === "cases" ? (
-        <section className="case-layout">
+        <section className="case-layout" aria-busy={caseState.kind === "loading"}>
           <aside className="panel case-list-panel" aria-labelledby="case-list-title">
             <div className="panel-heading">
               <h2 id="case-list-title">案件项目</h2>
               <span>{caseProjects.length}</span>
             </div>
             <div className="provider-create-row">
-              <button type="button" onClick={startNewCaseProject}>
+              <button
+                disabled={caseNavigationLocked}
+                type="button"
+                onClick={startNewCaseProject}
+              >
                 新建案件
               </button>
             </div>
@@ -1998,6 +3039,7 @@ export function App() {
                       ? "is-selected"
                       : ""
                   }`}
+                  disabled={caseNavigationLocked}
                   key={project.projectId}
                   type="button"
                   onClick={() => selectCaseProject(project)}
@@ -2023,6 +3065,10 @@ export function App() {
             </div>
             <div className="case-scroll">
               <form className="case-form" onSubmit={saveCaseProject}>
+                <fieldset
+                  className="case-entity-fields"
+                  disabled={caseProjectMutationLocked}
+                >
                 <div className="form-grid">
                   <label>
                     <span>案件名称</span>
@@ -2090,16 +3136,26 @@ export function App() {
                   />
                 </label>
                 <div className="command-row">
-                  <button type="submit">保存案件</button>
+                  <button disabled={caseProjectMutationLocked} type="submit">
+                    保存案件
+                  </button>
                   <button
-                    disabled={!selectedCaseProjectId}
+                    disabled={
+                      !selectedCaseProjectId || caseProjectMutationLocked
+                    }
                     type="button"
                     onClick={() => void removeCaseProject()}
                   >
                     删除案件
                   </button>
                 </div>
+                </fieldset>
               </form>
+              {!caseChildrenReady ? (
+                <p className="privacy-note">
+                  请先保存案件；保存成功后才能录入、关联或删除案件子项。
+                </p>
+              ) : null}
 
               <section className="case-section">
                 <div className="section-heading">
@@ -2107,6 +3163,19 @@ export function App() {
                   <span>{caseWorkspace?.files.length ?? 0}</span>
                 </div>
                 <form className="case-form compact-case-form" onSubmit={saveFile}>
+                  <fieldset
+                    className="case-entity-fields"
+                    disabled={
+                      !caseChildrenReady ||
+                      caseNavigationLocked ||
+                      !caseEntityEditorAllows(activeCaseEntityEditor, "file")
+                    }
+                  >
+                  {editingFile ? (
+                    <p className="case-edit-note" role="status">
+                      正在更新已保存的案件材料；保存后将覆盖原记录。
+                    </p>
+                  ) : null}
                   <div className="form-grid">
                     <label>
                       <span>标题</span>
@@ -2157,7 +3226,24 @@ export function App() {
                       }
                     />
                   </label>
-                  <button type="submit">添加材料</button>
+                  <div className="command-row">
+                    <button
+                      disabled={
+                        !caseChildrenReady ||
+                        caseNavigationLocked ||
+                        !caseEntityEditorAllows(activeCaseEntityEditor, "file")
+                      }
+                      type="submit"
+                    >
+                      {editingFile ? "更新材料" : "添加材料"}
+                    </button>
+                    {editingFile ? (
+                      <button type="button" onClick={cancelCaseEntityEdit}>
+                        取消编辑
+                      </button>
+                    ) : null}
+                  </div>
+                  </fieldset>
                 </form>
                 <div className="compact-list">
                   {caseWorkspace?.files.map((file) => (
@@ -2165,7 +3251,7 @@ export function App() {
                       <label className="material-select">
                         <input
                           checked={extractionFileIds.includes(file.fileId)}
-                          disabled={extractionSourcesLocked}
+                          disabled={caseProjectMutationLocked}
                           type="checkbox"
                           onChange={(event) =>
                             setExtractionFileIds((current) =>
@@ -2184,13 +3270,43 @@ export function App() {
                         {file.storageReference || "未登记位置"}
                       </span>
                       <span>{file.summary || "未填写材料文本或摘要"}</span>
-                      <button
-                        disabled={extractionSourcesLocked}
-                        type="button"
-                        onClick={() => void removeCaseEntity("file", file.fileId)}
-                      >
-                        删除
-                      </button>
+                      <div className="compact-row-actions">
+                        <button
+                          className="edit-action"
+                          disabled={
+                            caseNavigationLocked ||
+                            activeCaseEntityEditor !== null
+                          }
+                          type="button"
+                          onClick={() =>
+                            startCaseEntityEdit({ entityType: "file", entity: file })
+                          }
+                        >
+                          {caseEntityEditorMatches(
+                            activeCaseEntityEditor,
+                            "file",
+                            file.fileId,
+                          )
+                            ? "编辑中"
+                            : "编辑"}
+                        </button>
+                        <button
+                          disabled={
+                            extractionSourcesLocked ||
+                            !caseEntityEditorAllows(
+                              activeCaseEntityEditor,
+                              "file",
+                              file.fileId,
+                            )
+                          }
+                          type="button"
+                          onClick={() =>
+                            void removeCaseEntity("file", file.fileId)
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2202,6 +3318,19 @@ export function App() {
                   <span>{caseWorkspace?.parties.length ?? 0}</span>
                 </div>
                 <form className="case-form compact-case-form" onSubmit={saveParty}>
+                  <fieldset
+                    className="case-entity-fields"
+                    disabled={
+                      !caseChildrenReady ||
+                      caseNavigationLocked ||
+                      !caseEntityEditorAllows(activeCaseEntityEditor, "party")
+                    }
+                  >
+                  {editingParty ? (
+                    <p className="case-edit-note" role="status">
+                      正在更新已保存的当事人；保存后将覆盖原记录。
+                    </p>
+                  ) : null}
                   <div className="form-grid">
                     <label>
                       <span>名称</span>
@@ -2259,21 +3388,70 @@ export function App() {
                       />
                     </label>
                   </div>
-                  <button type="submit">添加当事人</button>
+                  <div className="command-row">
+                    <button
+                      disabled={
+                        !caseChildrenReady ||
+                        caseNavigationLocked ||
+                        !caseEntityEditorAllows(activeCaseEntityEditor, "party")
+                      }
+                      type="submit"
+                    >
+                      {editingParty ? "更新当事人" : "添加当事人"}
+                    </button>
+                    {editingParty ? (
+                      <button type="button" onClick={cancelCaseEntityEdit}>
+                        取消编辑
+                      </button>
+                    ) : null}
+                  </div>
+                  </fieldset>
                 </form>
                 <div className="compact-list">
                   {caseWorkspace?.parties.map((party) => (
                     <div className="compact-row" key={party.partyId}>
                       <strong>{party.name}</strong>
                       <span>{formatPartyRole(party.role)}</span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void removeCaseEntity("party", party.partyId)
-                        }
-                      >
-                        删除
-                      </button>
+                      <div className="compact-row-actions">
+                        <button
+                          className="edit-action"
+                          disabled={
+                            caseNavigationLocked ||
+                            activeCaseEntityEditor !== null
+                          }
+                          type="button"
+                          onClick={() =>
+                            startCaseEntityEdit({
+                              entityType: "party",
+                              entity: party,
+                            })
+                          }
+                        >
+                          {caseEntityEditorMatches(
+                            activeCaseEntityEditor,
+                            "party",
+                            party.partyId,
+                          )
+                            ? "编辑中"
+                            : "编辑"}
+                        </button>
+                        <button
+                          disabled={
+                            caseNavigationLocked ||
+                            !caseEntityEditorAllows(
+                              activeCaseEntityEditor,
+                              "party",
+                              party.partyId,
+                            )
+                          }
+                          type="button"
+                          onClick={() =>
+                            void removeCaseEntity("party", party.partyId)
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2285,6 +3463,19 @@ export function App() {
                   <span>{caseWorkspace?.facts.length ?? 0}</span>
                 </div>
                 <form className="case-form compact-case-form" onSubmit={saveFact}>
+                  <fieldset
+                    className="case-entity-fields"
+                    disabled={
+                      !caseChildrenReady ||
+                      caseNavigationLocked ||
+                      !caseEntityEditorAllows(activeCaseEntityEditor, "fact")
+                    }
+                  >
+                  {editingFact ? (
+                    <p className="case-edit-note" role="status">
+                      正在更新已保存的事实；保存后将覆盖原记录。
+                    </p>
+                  ) : null}
                   <div className="form-grid">
                     <label>
                       <span>日期</span>
@@ -2352,7 +3543,24 @@ export function App() {
                       }
                     />
                   </label>
-                  <button type="submit">添加事实</button>
+                  <div className="command-row">
+                    <button
+                      disabled={
+                        !caseChildrenReady ||
+                        caseNavigationLocked ||
+                        !caseEntityEditorAllows(activeCaseEntityEditor, "fact")
+                      }
+                      type="submit"
+                    >
+                      {editingFact ? "更新事实" : "添加事实"}
+                    </button>
+                    {editingFact ? (
+                      <button type="button" onClick={cancelCaseEntityEdit}>
+                        取消编辑
+                      </button>
+                    ) : null}
+                  </div>
+                  </fieldset>
                 </form>
                 <div className="compact-list">
                   {caseWorkspace?.facts.map((fact) => (
@@ -2363,12 +3571,43 @@ export function App() {
                         {formatConfirmationStatus(fact.confirmationStatus)}
                       </span>
                       <span>{fact.description}</span>
-                      <button
-                        type="button"
-                        onClick={() => void removeCaseEntity("fact", fact.factId)}
-                      >
-                        删除
-                      </button>
+                      <div className="compact-row-actions">
+                        <button
+                          className="edit-action"
+                          disabled={
+                            caseNavigationLocked ||
+                            activeCaseEntityEditor !== null
+                          }
+                          type="button"
+                          onClick={() =>
+                            startCaseEntityEdit({ entityType: "fact", entity: fact })
+                          }
+                        >
+                          {caseEntityEditorMatches(
+                            activeCaseEntityEditor,
+                            "fact",
+                            fact.factId,
+                          )
+                            ? "编辑中"
+                            : "编辑"}
+                        </button>
+                        <button
+                          disabled={
+                            caseNavigationLocked ||
+                            !caseEntityEditorAllows(
+                              activeCaseEntityEditor,
+                              "fact",
+                              fact.factId,
+                            )
+                          }
+                          type="button"
+                          onClick={() =>
+                            void removeCaseEntity("fact", fact.factId)
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2380,6 +3619,19 @@ export function App() {
                   <span>{caseWorkspace?.evidence.length ?? 0}</span>
                 </div>
                 <form className="case-form compact-case-form" onSubmit={saveEvidence}>
+                  <fieldset
+                    className="case-entity-fields"
+                    disabled={
+                      !caseChildrenReady ||
+                      caseNavigationLocked ||
+                      !caseEntityEditorAllows(activeCaseEntityEditor, "evidence")
+                    }
+                  >
+                  {editingEvidence ? (
+                    <p className="case-edit-note" role="status">
+                      正在更新已保存的证据；保存后将覆盖原记录。
+                    </p>
+                  ) : null}
                   <div className="form-grid">
                     <label>
                       <span>编号</span>
@@ -2443,7 +3695,24 @@ export function App() {
                       }
                     />
                   </label>
-                  <button type="submit">添加证据</button>
+                  <div className="command-row">
+                    <button
+                      disabled={
+                        !caseChildrenReady ||
+                        caseNavigationLocked ||
+                        !caseEntityEditorAllows(activeCaseEntityEditor, "evidence")
+                      }
+                      type="submit"
+                    >
+                      {editingEvidence ? "更新证据" : "添加证据"}
+                    </button>
+                    {editingEvidence ? (
+                      <button type="button" onClick={cancelCaseEntityEdit}>
+                        取消编辑
+                      </button>
+                    ) : null}
+                  </div>
+                  </fieldset>
                 </form>
                 <div className="compact-list">
                   {caseWorkspace?.evidence.map((item) => (
@@ -2455,14 +3724,46 @@ export function App() {
                         {item.source || "缺少来源"} ·{" "}
                         {item.formedOn ?? "缺少形成时间"}
                       </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void removeCaseEntity("evidence", item.evidenceId)
-                        }
-                      >
-                        删除
-                      </button>
+                      <div className="compact-row-actions">
+                        <button
+                          className="edit-action"
+                          disabled={
+                            caseNavigationLocked ||
+                            activeCaseEntityEditor !== null
+                          }
+                          type="button"
+                          onClick={() =>
+                            startCaseEntityEdit({
+                              entityType: "evidence",
+                              entity: item,
+                            })
+                          }
+                        >
+                          {caseEntityEditorMatches(
+                            activeCaseEntityEditor,
+                            "evidence",
+                            item.evidenceId,
+                          )
+                            ? "编辑中"
+                            : "编辑"}
+                        </button>
+                        <button
+                          disabled={
+                            caseNavigationLocked ||
+                            !caseEntityEditorAllows(
+                              activeCaseEntityEditor,
+                              "evidence",
+                              item.evidenceId,
+                            )
+                          }
+                          type="button"
+                          onClick={() =>
+                            void removeCaseEntity("evidence", item.evidenceId)
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2475,6 +3776,7 @@ export function App() {
                 </div>
                 <div className="case-link-row">
                   <select
+                    disabled={caseProjectMutationLocked}
                     value={linkFactId}
                     onChange={(event) => setLinkFactId(event.target.value)}
                   >
@@ -2486,6 +3788,7 @@ export function App() {
                     ))}
                   </select>
                   <select
+                    disabled={caseProjectMutationLocked}
                     value={linkEvidenceId}
                     onChange={(event) => setLinkEvidenceId(event.target.value)}
                   >
@@ -2496,7 +3799,15 @@ export function App() {
                       </option>
                     ))}
                   </select>
-                  <button type="button" onClick={() => void linkEvidenceToFact()}>
+                  <button
+                    disabled={
+                      !caseChildrenReady ||
+                      caseNavigationLocked ||
+                      activeCaseEntityEditor !== null
+                    }
+                    type="button"
+                    onClick={() => void linkEvidenceToFact()}
+                  >
                     关联
                   </button>
                 </div>
@@ -2514,6 +3825,10 @@ export function App() {
                         <strong>{fact?.title ?? link.factId}</strong>
                         <span>{evidence?.evidenceNumber ?? link.evidenceId}</span>
                         <button
+                          disabled={
+                            caseNavigationLocked ||
+                            activeCaseEntityEditor !== null
+                          }
                           type="button"
                           onClick={() =>
                             void removeCaseEntity("evidence_link", link.linkId)
@@ -2533,6 +3848,22 @@ export function App() {
                   <span>{caseWorkspace?.legalIssues.length ?? 0}</span>
                 </div>
                 <form className="case-form compact-case-form" onSubmit={saveIssue}>
+                  <fieldset
+                    className="case-entity-fields"
+                    disabled={
+                      !caseChildrenReady ||
+                      caseNavigationLocked ||
+                      !caseEntityEditorAllows(
+                        activeCaseEntityEditor,
+                        "legal_issue",
+                      )
+                    }
+                  >
+                  {editingIssue ? (
+                    <p className="case-edit-note" role="status">
+                      正在更新已保存的争点；保存后将覆盖原记录。
+                    </p>
+                  ) : null}
                   <div className="form-grid">
                     <label>
                       <span>争点</span>
@@ -2574,7 +3905,27 @@ export function App() {
                       }
                     />
                   </label>
-                  <button type="submit">添加争点</button>
+                  <div className="command-row">
+                    <button
+                      disabled={
+                        !caseChildrenReady ||
+                        caseNavigationLocked ||
+                        !caseEntityEditorAllows(
+                          activeCaseEntityEditor,
+                          "legal_issue",
+                        )
+                      }
+                      type="submit"
+                    >
+                      {editingIssue ? "更新争点" : "添加争点"}
+                    </button>
+                    {editingIssue ? (
+                      <button type="button" onClick={cancelCaseEntityEdit}>
+                        取消编辑
+                      </button>
+                    ) : null}
+                  </div>
+                  </fieldset>
                 </form>
                 <div className="compact-list">
                   {caseWorkspace?.legalIssues.map((issue) => (
@@ -2582,14 +3933,46 @@ export function App() {
                       <strong>{issue.title}</strong>
                       <span>{formatLegalIssueStatus(issue.status)}</span>
                       <span>{issue.claim}</span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void removeCaseEntity("legal_issue", issue.issueId)
-                        }
-                      >
-                        删除
-                      </button>
+                      <div className="compact-row-actions">
+                        <button
+                          className="edit-action"
+                          disabled={
+                            caseNavigationLocked ||
+                            activeCaseEntityEditor !== null
+                          }
+                          type="button"
+                          onClick={() =>
+                            startCaseEntityEdit({
+                              entityType: "legal_issue",
+                              entity: issue,
+                            })
+                          }
+                        >
+                          {caseEntityEditorMatches(
+                            activeCaseEntityEditor,
+                            "legal_issue",
+                            issue.issueId,
+                          )
+                            ? "编辑中"
+                            : "编辑"}
+                        </button>
+                        <button
+                          disabled={
+                            caseNavigationLocked ||
+                            !caseEntityEditorAllows(
+                              activeCaseEntityEditor,
+                              "legal_issue",
+                              issue.issueId,
+                            )
+                          }
+                          type="button"
+                          onClick={() =>
+                            void removeCaseEntity("legal_issue", issue.issueId)
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2604,6 +3987,10 @@ export function App() {
                   className="case-form compact-case-form"
                   onSubmit={saveLegalBasis}
                 >
+                  <fieldset
+                    className="case-entity-fields"
+                    disabled={caseProjectMutationLocked}
+                  >
                   <div className="form-grid">
                     <label>
                       <span>引用 ID</span>
@@ -2655,7 +4042,17 @@ export function App() {
                       <span>允许已失效版本</span>
                     </label>
                   </div>
-                  <button type="submit">添加依据</button>
+                  <button
+                    disabled={
+                      !caseChildrenReady ||
+                      caseNavigationLocked ||
+                      activeCaseEntityEditor !== null
+                    }
+                    type="submit"
+                  >
+                    添加依据
+                  </button>
+                  </fieldset>
                 </form>
                 <div className="compact-list">
                   {caseWorkspace?.legalBasis.map((basis) => {
@@ -2689,6 +4086,10 @@ export function App() {
                         {basis.excerpt ? <span>{basis.excerpt}</span> : null}
                         {basis.note ? <span>{basis.note}</span> : null}
                         <button
+                          disabled={
+                            caseNavigationLocked ||
+                            activeCaseEntityEditor !== null
+                          }
                           type="button"
                           onClick={() =>
                             void removeCaseEntity("legal_basis", basis.basisId)
@@ -2737,6 +4138,10 @@ export function App() {
                       {formatConfirmationStatus(uncertainty.confirmationStatus)}
                     </span>
                     <button
+                      disabled={
+                        caseNavigationLocked ||
+                        activeCaseEntityEditor !== null
+                      }
                       type="button"
                       onClick={() =>
                         void removeCaseEntity(
@@ -2763,7 +4168,7 @@ export function App() {
               <label>
                 <span>Provider</span>
                 <select
-                  disabled={extractionSourcesLocked}
+                  disabled={caseProjectMutationLocked}
                   value={extractionProviderId}
                   onChange={(event) =>
                     setExtractionProviderId(event.target.value)
@@ -2779,7 +4184,9 @@ export function App() {
               </label>
               <button
                 disabled={
-                  !caseWorkspace ||
+                  !caseChildrenReady ||
+                  caseProjectMutationLocked ||
+                  activeCaseEntityEditor !== null ||
                   !extractionProviderId ||
                   extractionFileIds.length === 0 ||
                   extractionLocksSources(extractionState)
@@ -3194,19 +4601,28 @@ export function App() {
                   extractionState.commitError ? (
                     <p className="error-text">{extractionState.commitError}</p>
                   ) : null}
+                  {extractionDiscardError ? (
+                    <p className="error-text">{extractionDiscardError}</p>
+                  ) : null}
 
                   <div className="review-actions">
                     <button
                       className="secondary-action"
-                      disabled={extractionState.kind === "committing"}
+                      disabled={
+                        extractionState.kind === "committing" ||
+                        extractionDiscarding
+                      }
                       type="button"
-                      onClick={cancelExtractionReview}
+                      onClick={() => void cancelExtractionReview()}
                     >
-                      取消，不写入
+                      {extractionDiscarding ? "正在取消…" : "取消，不写入"}
                     </button>
                     <button
                       className="confirm-action"
-                      disabled={extractionState.kind === "committing"}
+                      disabled={
+                        extractionState.kind === "committing" ||
+                        extractionDiscarding
+                      }
                       type="button"
                       onClick={() => void confirmExtractionReview()}
                     >
@@ -3242,7 +4658,7 @@ export function App() {
                       <pre>{extractionState.repairOutput}</pre>
                     </details>
                   ) : null}
-                  <button type="button" onClick={cancelExtractionReview}>
+                  <button type="button" onClick={resetExtractionResult}>
                     关闭
                   </button>
                 </div>
@@ -3258,29 +4674,23 @@ export function App() {
           </aside>
         </section>
       ) : (
-        <section className="provider-layout">
+        <section className="provider-layout" aria-busy={providerBusy}>
           <aside className="panel provider-list-panel" aria-labelledby="provider-list-title">
             <div className="panel-heading">
               <h2 id="provider-list-title">Profiles</h2>
               <span>{providerProfiles.length}</span>
             </div>
-            <div className="provider-create-row">
-              {PROVIDER_KINDS.map((kind) => (
-                <button
-                  key={kind}
-                  type="button"
-                  onClick={() => startNewProvider(kind)}
-                >
-                  新建 {formatProviderKind(kind)}
-                </button>
-              ))}
-            </div>
+            <ProviderCreateMenu
+              disabled={providerBusy}
+              onCreate={startNewProvider}
+            />
             <div className="provider-list">
               {providerProfiles.map((profile) => (
                 <button
                   className={`provider-item ${
                     selectedProviderId === profile.id ? "is-selected" : ""
                   }`}
+                  disabled={providerBusy}
                   key={profile.id}
                   type="button"
                   onClick={() => selectProvider(profile)}
@@ -3310,10 +4720,23 @@ export function App() {
             ) : null}
 
             <form className="provider-form" onSubmit={saveProvider}>
+              {providerDraft.kind === "custom" ? (
+                <p className="provider-custom-hint">
+                  自定义提供商使用通用 OpenAI Chat Completions 协议。请填写 HTTPS
+                  Base URL 和模型 ID；地址可以是 API 根路径，也可以直接以
+                  /chat/completions 结尾。
+                </p>
+              ) : null}
               <div className="form-grid">
                 <label>
                   <span>名称</span>
                   <input
+                    placeholder={
+                      providerDraft.kind === "custom"
+                        ? "例如：公司模型网关"
+                        : undefined
+                    }
+                    required
                     value={providerDraft.displayName}
                     onChange={(event) =>
                       setProviderDraft((current) => ({
@@ -3331,7 +4754,7 @@ export function App() {
                       updateProviderKind(event.target.value as ProviderKind)
                     }
                   >
-                    {PROVIDER_KINDS.map((kind) => (
+                    {SELECTABLE_PROVIDER_KINDS.map((kind) => (
                       <option key={kind} value={kind}>
                         {formatProviderKind(kind)}
                       </option>
@@ -3341,6 +4764,12 @@ export function App() {
                 <label>
                   <span>模型 ID</span>
                   <input
+                    placeholder={
+                      providerDraft.kind === "custom"
+                        ? "例如：my-chat-model"
+                        : undefined
+                    }
+                    required
                     value={providerDraft.modelId}
                     onChange={(event) =>
                       setProviderDraft((current) => ({
@@ -3353,6 +4782,12 @@ export function App() {
                 <label>
                   <span>Base URL</span>
                   <input
+                    placeholder={
+                      providerDraft.kind === "custom"
+                        ? "https://api.example.com/v1"
+                        : undefined
+                    }
+                    required
                     value={providerDraft.baseUrl}
                     onChange={(event) =>
                       setProviderDraft((current) => ({
@@ -3365,6 +4800,7 @@ export function App() {
                 <label>
                   <span>凭据账户</span>
                   <input
+                    required
                     value={providerDraft.credentialAccountId}
                     onChange={(event) =>
                       setProviderDraft((current) => ({
@@ -3477,9 +4913,11 @@ export function App() {
               </div>
 
               <div className="command-row">
-                <button type="submit">保存 Profile</button>
+                <button disabled={providerBusy} type="submit">
+                  保存 Profile
+                </button>
                 <button
-                  disabled={!providerIsSaved}
+                  disabled={providerBusy || !providerIsSaved}
                   type="button"
                   onClick={() => void removeProvider()}
                 >
@@ -3508,14 +4946,21 @@ export function App() {
               </label>
               <div className="command-row">
                 <button
-                  disabled={!providerIsSaved || apiKeyInput.trim().length === 0}
+                  disabled={
+                    providerBusy ||
+                    !providerIsSaved ||
+                    providerDraftIsDirty ||
+                    apiKeyInput.trim().length === 0
+                  }
                   type="button"
                   onClick={() => void saveApiKey()}
                 >
                   保存 Key
                 </button>
                 <button
-                  disabled={!providerHasKey}
+                  disabled={
+                    providerBusy || providerDraftIsDirty || !providerHasKey
+                  }
                   type="button"
                   onClick={() => void removeApiKey()}
                 >
@@ -3563,7 +5008,12 @@ export function App() {
                 </div>
               </dl>
               <button
-                disabled={!providerIsSaved || !providerHasKey}
+                disabled={
+                  providerBusy ||
+                  !providerIsSaved ||
+                  providerDraftIsDirty ||
+                  !providerHasKey
+                }
                 type="button"
                 onClick={() => void runProviderConnectionTest()}
               >

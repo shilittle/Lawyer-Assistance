@@ -37,14 +37,17 @@ impl<'de> Deserialize<'de> for ApiSecret {
 }
 
 pub fn mask_secret_last_four(secret: &str) -> String {
+    let character_count = secret.chars().count();
+    if character_count == 0 {
+        return "not_configured".to_owned();
+    }
+    if character_count <= 4 {
+        return "****".to_owned();
+    }
+
     let suffix_chars: Vec<char> = secret.chars().rev().take(4).collect();
     let suffix: String = suffix_chars.into_iter().rev().collect();
-
-    if suffix.is_empty() {
-        "not_configured".to_owned()
-    } else {
-        format!("****{suffix}")
-    }
+    format!("****{suffix}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -92,6 +95,16 @@ mod tests {
         let secret = ApiSecret::new("lawyer-assistance-secret-1234");
 
         assert_eq!(secret.masked_last_four(), "****1234");
+    }
+
+    #[test]
+    fn secret_mask_never_exposes_a_complete_short_secret() {
+        assert_eq!(mask_secret_last_four(""), "not_configured");
+        assert_eq!(mask_secret_last_four("a"), "****");
+        assert_eq!(mask_secret_last_four("abcd"), "****");
+        assert_eq!(mask_secret_last_four("abcde"), "****bcde");
+        assert_eq!(mask_secret_last_four("密钥一二"), "****");
+        assert_eq!(mask_secret_last_four("密钥一二三"), "****钥一二三");
     }
 
     #[test]

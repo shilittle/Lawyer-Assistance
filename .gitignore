@@ -1,4 +1,5 @@
 /target/
+/target-*/
 /node_modules/
 **/node_modules/
 /.pnpm-store/
@@ -17,6 +18,13 @@ data/generated/*
 !data/generated/.gitkeep
 !data/generated/legal_core_build_report.json
 !data/generated/legal_core_strict_audit_report.json
+!data/generated/stage_1c_history_report.json
+!data/generated/stage_1c_corpora_report.json
+!data/generated/legal_core_distribution_manifest.json
+!data/generated/legal_core_full_manifest.json
+!data/generated/legal_core_runtime_report.json
+!data/generated/legal_core_package_report.json
+!data/generated/legal_core_performance_report.json
 
 *.log
 *.tmp
