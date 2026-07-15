@@ -8,7 +8,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-const PENDING_EXTRACTION_REVIEW_TTL: Duration = Duration::from_secs(30 * 60);
+const PENDING_EXTRACTION_REVIEW_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_PENDING_EXTRACTION_REVIEWS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,8 +69,13 @@ pub struct AppState {
 struct AppStateInner {
     legal_core_path: PathBuf,
     user_database_path: PathBuf,
+    crash_log_path: PathBuf,
     legal_answer_cancellations: Mutex<HashMap<String, LegalAnswerCancellationEntry>>,
     pending_extraction_reviews: Mutex<HashMap<String, ActiveExtractionReview>>,
+    // A document export spans SQLite persistence, a crash-recovery marker and
+    // an atomic destination-file swap. Serialize the protocol so concurrent
+    // exports cannot race recovery-marker cleanup or overwrite one another.
+    document_export_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,12 +92,18 @@ struct LegalAnswerCancellationEntry {
 
 impl AppState {
     pub fn new(legal_core_path: PathBuf, user_database_path: PathBuf) -> Self {
+        let crash_log_path = user_database_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("crash-events.log");
         Self {
             inner: Arc::new(AppStateInner {
                 legal_core_path,
                 user_database_path,
+                crash_log_path,
                 legal_answer_cancellations: Mutex::new(HashMap::new()),
                 pending_extraction_reviews: Mutex::new(HashMap::new()),
+                document_export_lock: Mutex::new(()),
             }),
         }
     }
@@ -104,6 +115,19 @@ impl AppState {
     #[allow(dead_code)]
     pub fn user_database_path(&self) -> &Path {
         &self.inner.user_database_path
+    }
+
+    pub fn crash_log_path(&self) -> &Path {
+        &self.inner.crash_log_path
+    }
+
+    pub fn begin_document_export(&self) -> MutexGuard<'_, ()> {
+        self.inner
+            .document_export_lock
+            .lock()
+            // No protected value can be left inconsistent: the mutex is only
+            // an operation gate. Recovering after an unwind is therefore safe.
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn begin_legal_answer(
@@ -252,6 +276,31 @@ impl AppState {
             state: self.clone(),
             review_id: review_id.to_owned(),
             review: expected.clone(),
+            finished: false,
+        }))
+    }
+
+    pub fn claim_project_extraction_review(
+        &self,
+        review_id: &str,
+        project_id: &str,
+    ) -> Result<Option<PendingExtractionReviewClaim>, PendingReviewRegistryError> {
+        let mut reviews = self.pending_extraction_reviews()?;
+        prune_expired_reviews(&mut reviews);
+        let Some(active) = reviews.get_mut(review_id) else {
+            return Ok(None);
+        };
+        if active.review.project_id != project_id {
+            return Ok(None);
+        }
+        if active.phase == PendingExtractionReviewPhase::Claimed {
+            return Err(PendingReviewRegistryError::ReviewInFlight);
+        }
+        active.phase = PendingExtractionReviewPhase::Claimed;
+        Ok(Some(PendingExtractionReviewClaim {
+            state: self.clone(),
+            review_id: review_id.to_owned(),
+            review: active.review.clone(),
             finished: false,
         }))
     }
@@ -465,6 +514,31 @@ mod tests {
             .claim_matching_extraction_review("review-1", &review())
             .expect("registry reads")
             .is_none());
+    }
+
+    #[test]
+    fn project_scoped_claim_rejects_wrong_owner_and_serializes_discard_with_confirmation() {
+        let state = state();
+        state
+            .register_extraction_review("review-project".to_owned(), review())
+            .expect("review registers");
+        assert!(state
+            .claim_project_extraction_review("review-project", "other-project")
+            .expect("wrong-owner lookup succeeds")
+            .is_none());
+        let claim = state
+            .claim_project_extraction_review("review-project", "project-1")
+            .expect("owner claim succeeds")
+            .expect("owner review exists");
+        assert!(matches!(
+            state.claim_project_extraction_review("review-project", "project-1"),
+            Err(PendingReviewRegistryError::ReviewInFlight)
+        ));
+        claim.release().expect("claim releases");
+        assert!(state
+            .claim_project_extraction_review("review-project", "project-1")
+            .expect("released claim retries")
+            .is_some());
     }
 
     #[test]

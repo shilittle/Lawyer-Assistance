@@ -4,13 +4,13 @@ Windows-first Tauri 2 desktop application for legal assistance workflows.
 
 ## Current Scope
 
-This repository contains the Stage 0 foundation and the current implementation
-baseline for Stages 1 through 4: offline legal retrieval, provider
-configuration, citation-grounded answers, and the local case/evidence
-workspace. Stage 1 passed product acceptance on 2026-07-12. Stages 2 through 4
-have implementation and automated coverage but still require stage-specific
-provider-backed business-flow or GUI manual acceptance, so they remain
-partially complete:
+As of 2026-07-16, the engineering scope of Stages 0–7 is implemented: offline
+legal retrieval, provider configuration, citation-grounded answers, local
+case/evidence work, six legal-document workflows, case/law graphs, and the
+Windows release/update/backup lifecycle. Automated gates use the formal legal
+resource where product identity matters. Authenticode certification and
+clean-machine Windows 10/11 qualification are external release-operations
+gates, not unfinished application development:
 
 - Tauri 2 desktop shell for Windows x86_64
 - React, TypeScript, and Vite frontend
@@ -43,11 +43,16 @@ partially complete:
 - Legal answer records persisted with verified citation reports, not trusted raw model citations
 - React citation Q&A workspace with candidate sources, clickable verified inline citations, explicit invalid/duplicate marker styling, citation validation status, and local source text
 - Case project CRUD persisted in `user.sqlite`
-- Case workspace data model for files, parties, facts, evidence, fact-evidence links, legal issues, and validated legal basis records
+- Case workspace data model for files, parties, facts, evidence, legal issues, validated legal basis records, and explicit project-scoped fact-evidence/fact-issue links; composite database constraints reject cross-case relationships
 - Rust-side case gap analysis for timeline conflicts, party name inconsistencies, missing evidence support, missing source/date metadata, invalid evidence references, and open legal issues without validated legal basis
 - Case legal basis binding through local `[SRC:...]` source ids with Rust-side citation/effectiveness validation and read-only lookups against `legal_core.sqlite`
 - Structured case extraction JSON parser with strict Rust deserialization and one repair-attempt path
-- React case workspace with project list, editable persisted case files/parties/facts/evidence/issues, fact timeline, evidence catalog, legal basis panel, link editor, gap panel, and extraction review panel
+- React case workspace with project list, editable persisted case files/parties/facts/evidence/issues, fact timeline, evidence catalog, legal basis panel, explicit fact-evidence and fact-issue link editors, gap panel, and extraction review panel
+- Six reviewed legal-document templates with structured validation, confirmed-data-only assembly, local citation traceability, Markdown preview, pure-Rust DOCX generation, crash-safe export and persisted generation audit records
+- Case and formal-law graph workspaces with namespaced identities, confirmed nodes, persisted fact-evidence/fact-issue/issue-citation edges, formal `law_relations`, provenance, filtering, search, layout controls, details and exact source jumps
+- Version information, atomic backup, validated restart-time restore, payload-free crash/maintenance events and redacted diagnostic export
+- A signed-update protocol with strict GitHub URL policy, semantic-version checks, streaming download, Minisign verification, trusted-filename binding, NSIS handoff and stale-installer cleanup
+- Reproducible release scripts for Authenticode-signed NSIS, updater `latest.json`, deterministic portable ZIP, legal-resource identity verification and complete third-party notices
 - Rust unit tests, Vitest, ESLint, and Windows GitHub Actions CI
 
 The complete archival database is generated from official public sources and is
@@ -70,16 +75,13 @@ fetch/audit payloads and the case/template corpora that the current UI does not
 query. The archival database and its strict-audit reports remain the coverage
 and rebuild authority.
 
-Stage 3 implements Tauri Channel streaming,
-cancellation, local citation validation and verified persistence; its formal
-multi-version read-only integration suite passes, while real legal-answer flow
-and GUI citation/cancellation/paging acceptance remain. Stage 4 implements local
-case/evidence persistence, legal basis binding, provider-driven structured
-extraction, one automatic repair, bounded review state, user confirmation and
-atomic persistence; real provider-backed extraction and GUI review/restart
-acceptance remain. The current extraction scope sends selected material
-summaries rather than reading original files. The project still does not implement
-document generation, graph workflows, embeddings, or local model workflows.
+Stage 3 implements Tauri Channel streaming, cancellation, local citation
+validation and verified persistence. Stage 4 implements local case/evidence
+persistence, legal-basis binding, provider-driven structured extraction, one
+automatic repair, bounded review state, user confirmation and atomic
+persistence. The current extraction scope intentionally sends selected material
+summaries rather than reading original files. Embeddings and local-model
+workflows remain explicitly outside the product architecture.
 
 The 2026-07-13 hardening pass adds bounded IPC text/array/response inputs,
 strict Gregorian `YYYY-MM-DD` validation, UUID v4 answer record ids, correct
@@ -89,10 +91,9 @@ links. It also repairs unmarked or legacy `user.sqlite` v6 shapes through one
 atomic canonical rebuild, serializes read-then-write transactions with
 `BEGIN IMMEDIATE`, rejects stale case-workspace responses, preserves finalized
 Q&A context across page changes, locks extraction navigation correctly, and
-supports editing persisted case child records. These are implementation and
-automated-coverage results; Stages 2 through 4 remain partially complete until
-the documented stage-specific provider-backed business flows and GUI acceptance
-are executed.
+supports editing persisted case child records. The declared engineering scope
+is complete; optional hands-on GUI observations remain release-qualification
+evidence and do not reopen completed development.
 
 ## Repository Data Policy
 
@@ -101,10 +102,10 @@ blobs:
 
 - Archival/audit authority: `data/generated/legal_core_full.sqlite`,
   4,512,894,976 bytes, SHA-256
-  `ebd53e00fbcf17b176347731d2a7bf85d8d6c931e9a99530a3dfd078ec84209d`.
+  `31cf1995cc09f0e3e00f70bfcf20cf67548f1a6362706ccc11d1fd3b2ebc26ac`.
 - Bundled runtime projection: `apps/desktop/src-tauri/resources/legal_core.sqlite`,
   1,775,419,392 bytes, SHA-256
-  `37467b652d3345b46b0603a4e5330d808a8a8650d16b5f62c8f477aabd037c25`.
+  `86574bba91950b194c6530586eebbae31c689a5bd2a485877b3eed6b611f7d3c`.
 
 Both are intentionally excluded from source control because they exceed
 GitHub's ordinary Git object limits. The runtime distribution manifest records
@@ -148,13 +149,16 @@ pnpm install
 Run all required checks:
 
 ```powershell
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --offline -- -D warnings
+cargo test --locked --workspace --offline
 pnpm lint
 pnpm test
 pnpm build
-pnpm tauri build
+python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
+python data/build/audit_provider_security.py
+python apps/desktop/scripts/verify_legal_resource.py
+python scripts/generate_third_party_notices.py --check
 ```
 
 Run the repeatable Provider secret/logging audit:
@@ -169,14 +173,17 @@ Run the audit's own regression tests:
 python -m unittest data.build.test_audit_provider_security
 ```
 
-Run the four Stage 3 formal-database integration tests explicitly—three citation
-tests and one retrieval current-version test (they are ignored by ordinary CI
-so a fixture cannot masquerade as the product corpus):
+Run the formal-database integration gates explicitly. The current suite contains
+six citation tests, five retrieval/relationship-graph tests, and one Stage 5
+document-citation test. They are ignored by ordinary CI so a fixture cannot
+masquerade as the product corpus:
 
 ```powershell
 $env:LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE = (Resolve-Path apps\desktop\src-tauri\resources\legal_core.sqlite)
-cargo test -p citations --test formal_legal_core -- --ignored
-cargo test -p retrieval --test formal_legal_core -- --ignored
+cargo test --locked --offline -p citations --test formal_legal_core -- --ignored
+cargo test --locked --offline -p retrieval --test formal_legal_core -- --ignored
+cargo test --locked --offline -p lawyer-assistance-desktop commands::document::tests::acceptance_workspace_citations_match_the_formal_legal_database -- --ignored --exact
+Remove-Item Env:LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE
 ```
 
 Build only the frontend:
@@ -185,10 +192,26 @@ Build only the frontend:
 pnpm build
 ```
 
-Build the Tauri desktop binary:
+Build an unsigned technical packaging artifact for compilation/resource smoke
+testing only; this is not a formal release:
 
 ```powershell
-pnpm tauri build
+pnpm tauri build --config src-tauri/tauri.ci.conf.json
+```
+
+Build a fresh deterministic portable ZIP from a clean commit:
+
+```powershell
+pnpm --filter @lawyer-assistance/desktop release:portable
+```
+
+Build the formal Authenticode-signed NSIS, updater signature, `latest.json`, and
+signed portable ZIP. The updater key password must come from the release secret
+store and the certificate must be trusted and contain its private key:
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<from-secret-store>'
+pnpm --filter @lawyer-assistance/desktop release:signed -- -CodeSigningThumbprint <trusted-thumbprint>
 ```
 
 The local Tauri build requires the compact, audited runtime database at

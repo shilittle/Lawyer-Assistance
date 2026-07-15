@@ -49,6 +49,19 @@ impl ProviderKind {
             Self::Custom => ProviderOptions::default(),
         }
     }
+
+    /// Fills only provider-defined compatibility defaults while preserving
+    /// every explicitly stored option.  This keeps legacy profiles whose JSON
+    /// predates a newly required toggle deterministic.  In particular,
+    /// DeepSeek V4 defaults thinking to enabled server-side, while this
+    /// application deliberately defaults ordinary legal work to non-thinking
+    /// mode for bounded, visible answers.
+    pub fn options_with_defaults(self, mut options: ProviderOptions) -> ProviderOptions {
+        let defaults = self.default_options();
+        options.thinking = options.thinking.or(defaults.thinking);
+        options.enable_thinking = options.enable_thinking.or(defaults.enable_thinking);
+        options
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +111,11 @@ pub struct ProviderOptions {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub endpoint_id: Option<String>,
     pub workspace_id: Option<String>,
+    /// Explicitly permits a custom provider to target loopback, link-local, or
+    /// private-network IP literals. The default remains deny so importing a
+    /// profile cannot silently turn a provider request into an SSRF primitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_private_network: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +146,21 @@ impl ProviderProfile {
                 ProviderCapabilities::chat_defaults()
             },
             options: kind.default_options(),
+        }
+    }
+
+    pub fn thinking_enabled(&self) -> bool {
+        match self.kind {
+            ProviderKind::DeepSeek | ProviderKind::VolcengineArk => {
+                self.options.thinking.unwrap_or(false)
+            }
+            ProviderKind::Qwen => self.options.enable_thinking.unwrap_or(false),
+            ProviderKind::SiliconFlow => self
+                .options
+                .enable_thinking
+                .or(self.options.thinking)
+                .unwrap_or(false),
+            ProviderKind::Custom => false,
         }
     }
 }
@@ -359,6 +392,44 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn private_network_opt_in_is_explicit_and_legacy_compatible() {
+        let default_options = ProviderOptions::default();
+        let serialized = serde_json::to_value(&default_options).expect("options serialize");
+        assert!(serialized.get("allowPrivateNetwork").is_none());
+
+        let legacy: ProviderOptions = serde_json::from_value(serde_json::json!({
+            "thinking": false
+        }))
+        .expect("legacy options without the field still deserialize");
+        assert_eq!(legacy.allow_private_network, None);
+
+        let opted_in: ProviderOptions = serde_json::from_value(serde_json::json!({
+            "allowPrivateNetwork": true
+        }))
+        .expect("explicit opt-in deserializes");
+        assert_eq!(opted_in.allow_private_network, Some(true));
+    }
+
+    #[test]
+    fn thinking_state_uses_each_provider_contract_and_defaults_off() {
+        let deepseek = ProviderProfile::new_default("deepseek", ProviderKind::DeepSeek);
+        assert!(!deepseek.thinking_enabled());
+
+        let mut qwen = ProviderProfile::new_default("qwen", ProviderKind::Qwen);
+        qwen.options.enable_thinking = Some(true);
+        assert!(qwen.thinking_enabled());
+
+        let mut silicon = ProviderProfile::new_default("silicon", ProviderKind::SiliconFlow);
+        silicon.options.enable_thinking = None;
+        silicon.options.thinking = Some(true);
+        assert!(silicon.thinking_enabled());
+
+        let mut custom = ProviderProfile::new_default("custom", ProviderKind::Custom);
+        custom.options.thinking = Some(true);
+        assert!(!custom.thinking_enabled());
     }
 
     #[test]

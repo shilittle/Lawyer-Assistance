@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Lawyer Assistance",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.shilittle.lawyer-assistance",
   "build": {
-    "beforeBuildCommand": "pnpm run build:tauri",
+    "beforeBuildCommand": "node scripts/build_tauri_frontend.mjs",
     "frontendDist": "../frontend-dist"
   },
   "app": {
@@ -19,18 +19,44 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "style-src": "'self' 'unsafe-inline'",
+        "font-src": "'self' data:",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'self'"
+      }
     }
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis"],
-    "resources": ["resources/legal_core.sqlite"],
+    "resources": [
+      "resources/legal_core.sqlite",
+      "resources/LICENSE.txt",
+      "resources/THIRD_PARTY_NOTICES.txt",
+      "resources/DATA_SOURCES.md"
+    ],
     "windows": {
       "nsis": {
         "compression": "lzma",
         "installMode": "currentUser",
         "languages": ["SimpChinese", "English"]
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVGMDgxQzdERTY2ODRBMwpSV1NqaEdiZXg0SHdCVEVHQmx2dzg1NFVqd0hzTXZXVjBUeHljV1FyLytBYUxNd3RKK0trMmNKOQo=",
+      "endpoints": [
+        "https://github.com/shilittle/Lawyer-Assistance/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

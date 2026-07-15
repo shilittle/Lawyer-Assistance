@@ -151,6 +151,42 @@ class Stage1CHistoryTests(unittest.TestCase):
             self.connection.execute("SELECT COUNT(*) FROM law_documents").fetchone()[0], 2
         )
 
+    def test_civil_code_article_1260_bounds_repealed_contract_law(self) -> None:
+        self.add_version("contract-law", "1999-10-01")
+        self.connection.execute(
+            "UPDATE law_documents SET title = '中华人民共和国合同法' WHERE id = 'doc-contract-law'"
+        )
+        self.connection.execute(
+            "UPDATE law_versions SET status = 'repealed', effective_to = NULL "
+            "WHERE id = 'version-contract-law'"
+        )
+
+        changed = stage.apply_authoritative_terminal_dates(self.connection)
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT effective_to FROM law_versions WHERE id = 'version-contract-law'"
+            ).fetchone()[0],
+            "2020-12-31",
+        )
+        self.assertEqual(stage.apply_authoritative_terminal_dates(self.connection), 0)
+
+        audit = stage.authoritative_terminal_date_audit(self.connection)
+        self.assertEqual(audit["title_count"], 1)
+        self.assertEqual(audit["version_count"], 1)
+        self.assertEqual(audit["violation_count"], 0)
+        self.assertEqual(audit["missing_article_count"], 0)
+
+        self.connection.execute(
+            "UPDATE law_versions SET effective_to = '2021-01-01' "
+            "WHERE id = 'version-contract-law'"
+        )
+        corrupted = stage.authoritative_terminal_date_audit(self.connection)
+        self.assertEqual(corrupted["title_count"], 0)
+        self.assertEqual(corrupted["version_count"], 0)
+        self.assertEqual(corrupted["violation_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

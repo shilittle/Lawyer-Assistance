@@ -23,11 +23,23 @@ pub enum StreamEvent {
 #[derive(Debug, Default)]
 pub struct StreamParser {
     buffer: Vec<u8>,
+    saw_reasoning_content: bool,
 }
 
 impl StreamParser {
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: Vec::new(),
+            saw_reasoning_content: false,
+        }
+    }
+
+    /// Reports whether a non-empty hidden reasoning token has been observed.
+    ///
+    /// The reasoning text is deliberately never retained in a `StreamEvent`,
+    /// so ordinary consumers cannot accidentally render chain-of-thought.
+    pub fn saw_reasoning_content(&self) -> bool {
+        self.saw_reasoning_content
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Result<StreamEvent, ProviderError>> {
@@ -46,7 +58,7 @@ impl StreamParser {
                 continue;
             }
 
-            append_parsed_event(&mut events, &event_bytes);
+            append_parsed_event(&mut events, &event_bytes, &mut self.saw_reasoning_content);
         }
 
         if self.buffer.len() > MAX_PENDING_SSE_EVENT_BYTES {
@@ -70,15 +82,37 @@ impl StreamParser {
 
         let event_bytes = std::mem::take(&mut self.buffer);
         let mut events = Vec::new();
-        append_parsed_event(&mut events, &event_bytes);
+        append_parsed_event(&mut events, &event_bytes, &mut self.saw_reasoning_content);
         events
     }
 }
 
-fn append_parsed_event(events: &mut Vec<Result<StreamEvent, ProviderError>>, event_bytes: &[u8]) {
+fn append_parsed_event(
+    events: &mut Vec<Result<StreamEvent, ProviderError>>,
+    event_bytes: &[u8],
+    saw_reasoning_content: &mut bool,
+) {
     match parse_event_bytes(event_bytes) {
-        Ok(parsed_events) => events.extend(parsed_events.into_iter().map(Ok)),
+        Ok(parsed) => {
+            *saw_reasoning_content |= parsed.saw_reasoning_content;
+            events.extend(parsed.events.into_iter().map(Ok));
+        }
         Err(error) => events.push(Err(error)),
+    }
+}
+
+#[derive(Debug)]
+struct ParsedSseEvent {
+    events: Vec<StreamEvent>,
+    saw_reasoning_content: bool,
+}
+
+impl ParsedSseEvent {
+    fn visible(events: Vec<StreamEvent>) -> Self {
+        Self {
+            events,
+            saw_reasoning_content: false,
+        }
     }
 }
 
@@ -111,7 +145,7 @@ fn line_ending_len(buffer: &[u8], index: usize) -> Option<usize> {
     }
 }
 
-fn parse_event_bytes(bytes: &[u8]) -> Result<Vec<StreamEvent>, ProviderError> {
+fn parse_event_bytes(bytes: &[u8]) -> Result<ParsedSseEvent, ProviderError> {
     let text = std::str::from_utf8(bytes).map_err(|error| {
         ProviderError::new(
             ProviderErrorKind::Parse,
@@ -136,27 +170,27 @@ fn parse_event_bytes(bytes: &[u8]) -> Result<Vec<StreamEvent>, ProviderError> {
     // Per the SSE dispatch algorithm, comment/heartbeat events and events
     // without a data field are ignored rather than treated as malformed JSON.
     if data_lines.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ParsedSseEvent::visible(Vec::new()));
     }
 
     let data = data_lines.join("\n");
 
     if data.trim() == "[DONE]" {
-        return Ok(vec![StreamEvent::Done]);
+        return Ok(ParsedSseEvent::visible(vec![StreamEvent::Done]));
     }
 
     if event_name.as_deref() == Some("error") {
-        return parse_error_event(&data).map(|event| vec![event]);
+        return parse_error_event(&data).map(|event| ParsedSseEvent::visible(vec![event]));
     }
 
     if data.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ParsedSseEvent::visible(Vec::new()));
     }
 
     parse_data_events(&data)
 }
 
-fn parse_data_events(data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
+fn parse_data_events(data: &str) -> Result<ParsedSseEvent, ProviderError> {
     if data.trim().is_empty() {
         return Err(ProviderError::new(
             ProviderErrorKind::Parse,
@@ -172,7 +206,7 @@ fn parse_data_events(data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
     })?;
 
     if let Some(error) = value.get("error") {
-        return parse_error_value(error).map(|event| vec![event]);
+        return parse_error_value(error).map(|event| ParsedSseEvent::visible(vec![event]));
     }
 
     let usage = value
@@ -203,6 +237,10 @@ fn parse_data_events(data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let saw_reasoning_content = delta
+        .and_then(|delta| delta.get("reasoning_content"))
+        .and_then(Value::as_str)
+        .is_some_and(|content| !content.is_empty());
     let model = value
         .get("model")
         .and_then(Value::as_str)
@@ -225,7 +263,10 @@ fn parse_data_events(data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
         });
     }
 
-    Ok(events)
+    Ok(ParsedSseEvent {
+        events,
+        saw_reasoning_content,
+    })
 }
 
 fn parse_error_event(data: &str) -> Result<StreamEvent, ProviderError> {
@@ -344,6 +385,34 @@ data: {"error":{"type":"rate_limit","message":"too many requests"}}
         let mut parser = StreamParser::new();
 
         assert!(parser.push(b": keep-alive\n\n").is_empty());
+    }
+
+    #[test]
+    fn observes_reasoning_content_without_exposing_the_text() {
+        let mut parser = StreamParser::new();
+        let events = parser.push(
+            b"data: {\"model\":\"deepseek-v4-flash\",\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden chain\"}}]}\n\n",
+        );
+
+        assert!(parser.saw_reasoning_content());
+        assert_eq!(
+            events,
+            vec![Ok(StreamEvent::Delta {
+                content: String::new(),
+                model: Some("deepseek-v4-flash".to_owned()),
+            })]
+        );
+        assert!(!format!("{events:?}").contains("hidden chain"));
+    }
+
+    #[test]
+    fn empty_or_null_reasoning_content_is_not_activity() {
+        let mut parser = StreamParser::new();
+        parser.push(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":null}}]}\n\n",
+        );
+
+        assert!(!parser.saw_reasoning_content());
     }
 
     #[test]

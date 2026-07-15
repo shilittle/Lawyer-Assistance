@@ -147,7 +147,7 @@ export function reduceLegalAnswerStreamEvent(
         // before the invoke Promise resolves with the citation report. Keep a
         // distinct state so the UI does not claim it already has final data.
         status: "finalizing",
-        message: "引用已校验并保存，正在载入最终结果",
+        message: "来源标记已做结构校验并保存，正在载入最终结果",
       };
   }
 }
@@ -174,10 +174,10 @@ export function formatLegalAnswerStreamStatus(
     connecting: "正在连接 Provider",
     streaming: "正在生成（引用未校验）",
     cancelling: "正在取消",
-    finalizing: "引用已校验，正在载入结果",
+    finalizing: "来源标记已做结构校验，正在载入结果",
     cancelled: "已取消",
     error: state.message ?? "生成失败",
-    done: "已完成并校验引用",
+    done: "已完成；来源标记已映射（语义未核验）",
   };
 
   return labels[state.status];

@@ -646,6 +646,7 @@ def compact(
             "source_dataset_version": metadata.get("dataset_version", "unknown"),
             "coverage_status": verification["coverage_status"],
             "source_coverage_status": metadata.get("coverage_status", "unknown"),
+            "data_scope": metadata.get("data_scope", "unknown"),
             "generated_at": timestamp,
             "filename": output.name,
             "size_bytes": runtime_size,

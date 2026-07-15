@@ -55,6 +55,23 @@ describe("provider profile normalization", () => {
     ).toBe(false);
   });
 
+  it("normalizes legacy DeepSeek effort and keeps private-network access opt-in", () => {
+    const deepSeek = normalizeProviderProfile({
+      ...saved,
+      kind: "deep_seek",
+      options: { reasoningEffort: "medium" },
+    });
+    const custom = normalizeProviderProfile({
+      ...saved,
+      kind: "custom",
+      options: { allowPrivateNetwork: true },
+    });
+
+    expect(deepSeek.options.reasoningEffort).toBe("high");
+    expect(deepSeek.options.allowPrivateNetwork).toBe(false);
+    expect(custom.options.allowPrivateNetwork).toBe(true);
+  });
+
   it("hides stale key status for dirty profiles and mismatched accounts", () => {
     const status: ProviderApiKeyStatus = {
       providerId: saved.id,

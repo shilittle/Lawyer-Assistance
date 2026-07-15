@@ -14,7 +14,7 @@ export function normalizeProviderProfile(
     modelId: profile.modelId.trim(),
     baseUrl: profile.baseUrl.trim(),
     credentialAccountId: profile.credentialAccountId.trim() || "default",
-    options: normalizeProviderOptions(profile.options),
+    options: normalizeProviderOptions(profile.options, profile.kind),
   };
 }
 
@@ -67,13 +67,24 @@ export async function loadProviderKeyStatusesSettled(
   };
 }
 
-function normalizeProviderOptions(options: ProviderOptions): ProviderOptions {
+function normalizeProviderOptions(
+  options: ProviderOptions,
+  kind: ProviderProfile["kind"],
+): ProviderOptions {
+  const reasoningEffort =
+    kind === "deep_seek" &&
+    (options.reasoningEffort === "low" ||
+      options.reasoningEffort === "medium")
+      ? "high"
+      : (options.reasoningEffort ?? null);
   return {
     thinking: options.thinking ?? null,
     enableThinking: options.enableThinking ?? null,
     thinkingBudget: options.thinkingBudget ?? null,
-    reasoningEffort: options.reasoningEffort ?? null,
+    reasoningEffort,
     endpointId: options.endpointId?.trim() || null,
     workspaceId: options.workspaceId?.trim() || null,
+    allowPrivateNetwork:
+      kind === "custom" ? (options.allowPrivateNetwork ?? false) : false,
   };
 }

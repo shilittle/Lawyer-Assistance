@@ -2,20 +2,53 @@ import { describe, expect, it } from "vitest";
 
 import {
   advanceCaseWorkspaceEpoch,
+  advanceRequestEpoch,
+  articleMatchesDocumentCitation,
   blockingDirtyCaseDrafts,
+  caseGraphNodeDomId,
+  canBypassDirtyDraftsForWorkspaceRecovery,
+  caseEntityDeletionConfirmation,
+  caseProjectDeletionConfirmation,
+  caseProjectPageForId,
+  caseProjectToLoadAfterRefresh,
   caseEntityEditorAllows,
   caseEntityEditorMatches,
+  caseWorkspaceWritesAreSafe,
   citationHasTrustedSource,
   copyCaseEntityForEditing,
+  currentLawSearchCriteria,
   detectDirtyCaseDrafts,
+  decideWorkspaceClose,
+  extractionReviewDiscardConfirmation,
+  exactLawDocumentMatchesRequest,
+  formatCitationValidationSummary,
+  graphNodeDestination,
   isCurrentCaseWorkspaceEpoch,
+  isCurrentRequestEpoch,
   isPersistedCaseWorkspace,
+  legalAnswerContextFromRecord,
+  legalAnswerHistoryBelongsToProject,
+  legalAnswerPreviewStillOwnsCurrentScope,
+  legalAnswerRequestStillOwnsCurrentCase,
+  mergeLegalAnswerHistory,
+  paginateCaseProjects,
+  pendingReviewFilesStillExist,
+  providerNavigationHasUnsavedChanges,
+  providerApiKeyDeletionConfirmation,
+  providerApiKeyOverwriteConfirmation,
+  providerDeletionConfirmation,
+  qaFormDraftFromLegalAnswerRecord,
   releaseCaseMutation,
   resolveLegalAnswerQuestion,
   resolveSelectedQaSource,
+  runConfirmedDestructiveAction,
   tryAcquireCaseMutation,
+  unrestorableExtractionDiscardConfirmation,
+  validateFactIssueLinkSelection,
+  workspaceCloseWasApproved,
   type CaseDraftComparisonState,
 } from "./App";
+import type { GraphNode } from "./ipc/graph/types";
 import type {
   CaseFact,
   CaseFile,
@@ -25,7 +58,12 @@ import type {
   EvidenceItem,
   LegalIssue,
 } from "./ipc/case/types";
-import type { LegalAnswerContext, LegalSource } from "./ipc/legal/types";
+import type {
+  LegalAnswerContext,
+  LegalAnswerRecord,
+  LegalSource,
+} from "./ipc/legal/types";
+import type { ProviderProfile } from "./ipc/provider/types";
 
 function workspace(projectId: string): CaseWorkspace {
   return {
@@ -44,6 +82,7 @@ function workspace(projectId: string): CaseWorkspace {
     facts: [],
     evidence: [],
     evidenceLinks: [],
+    factIssueLinks: [],
     legalIssues: [],
     legalBasis: [],
     uncertainties: [],
@@ -162,6 +201,12 @@ function draftComparison(): CaseDraftComparisonState {
       baselineFactId: fact.factId,
       baselineEvidenceId: evidence.evidenceId,
     },
+    factIssueLink: {
+      factId: fact.factId,
+      issueId: legalIssue.issueId,
+      baselineFactId: fact.factId,
+      baselineIssueId: legalIssue.issueId,
+    },
     legalBasis: {
       sourceId: "",
       issueId: legalIssue.issueId,
@@ -195,6 +240,17 @@ describe("App case workspace state helpers", () => {
       false,
     );
     expect(isPersistedCaseWorkspace(saved, "case-saved", "case-other")).toBe(
+      false,
+    );
+  });
+
+  it("locks writes after a failed target load even while the old snapshot remains", () => {
+    const saved = workspace("case-a");
+
+    expect(caseWorkspaceWritesAreSafe(saved, "case-a", "case-a", false)).toBe(
+      true,
+    );
+    expect(caseWorkspaceWritesAreSafe(saved, "case-a", "case-a", true)).toBe(
       false,
     );
   });
@@ -316,6 +372,7 @@ describe("App case workspace state helpers", () => {
       false,
       false,
       false,
+      false,
     ]);
 
     state.project.draft.summary = "未保存的案件摘要";
@@ -325,6 +382,7 @@ describe("App case workspace state helpers", () => {
     state.evidence.draft.summary = "未保存证据";
     state.legalIssue.draft.claim = "未保存主张";
     state.evidenceLink.factId = "fact-other";
+    state.factIssueLink.issueId = "issue-other";
     state.legalBasis.note = "未保存依据备注";
 
     expect(detectDirtyCaseDrafts(state)).toEqual({
@@ -335,6 +393,7 @@ describe("App case workspace state helpers", () => {
       evidence: true,
       legal_issue: true,
       evidence_link: true,
+      fact_issue_link: true,
       legal_basis: true,
     });
   });
@@ -348,6 +407,7 @@ describe("App case workspace state helpers", () => {
       evidence: true,
       legal_issue: true,
       evidence_link: true,
+      fact_issue_link: true,
       legal_basis: true,
     } as const;
 
@@ -358,8 +418,539 @@ describe("App case workspace state helpers", () => {
       "evidence",
       "legal_issue",
       "evidence_link",
+      "fact_issue_link",
       "legal_basis",
     ]);
-    expect(blockingDirtyCaseDrafts(allDirty, [])).toHaveLength(8);
+    expect(blockingDirtyCaseDrafts(allDirty, [])).toHaveLength(9);
+  });
+
+  it("requires an explicit, non-duplicate fact-to-issue selection", () => {
+    const existing = [
+      {
+        linkId: "link-1",
+        projectId: "case-1",
+        factId: "fact-1",
+        issueId: "issue-1",
+      },
+    ];
+
+    expect(validateFactIssueLinkSelection("", "issue-1", existing)).toMatchObject({
+      valid: false,
+      targetId: "case-fact-issue-fact",
+    });
+    expect(validateFactIssueLinkSelection("fact-1", "", existing)).toMatchObject({
+      valid: false,
+      targetId: "case-fact-issue-issue",
+    });
+    expect(
+      validateFactIssueLinkSelection("fact-1", "issue-1", existing),
+    ).toMatchObject({ valid: false });
+    expect(
+      validateFactIssueLinkSelection("fact-1", "issue-2", existing),
+    ).toEqual({ valid: true });
+  });
+
+  it("paginates cases with clamped boundaries and locates the selected case", () => {
+    const projects = Array.from({ length: 19 }, (_, index) => ({
+      ...workspace(`case-${index + 1}`).project,
+      title: `案件 ${index + 1}`,
+    }));
+
+    expect(paginateCaseProjects(projects, 0, 8)).toMatchObject({
+      page: 1,
+      totalPages: 3,
+    });
+    expect(paginateCaseProjects(projects, 99, 8).projects).toHaveLength(3);
+    expect(caseProjectPageForId(projects, "case-17", 8)).toBe(3);
+    expect(caseProjectPageForId(projects, "missing", 8)).toBe(1);
+  });
+
+  it("never loads a different case when a persisted case is missing from a stale list", () => {
+    const projects = [workspace("case-a").project, workspace("case-b").project];
+
+    expect(
+      caseProjectToLoadAfterRefresh(projects, "case-saved", true),
+    ).toBeUndefined();
+    expect(
+      caseProjectToLoadAfterRefresh(projects, "case-saved", false)?.projectId,
+    ).toBe("case-a");
+    expect(
+      caseProjectToLoadAfterRefresh(projects, "case-b", true)?.projectId,
+    ).toBe("case-b");
+  });
+
+  it("blocks provider navigation for either profile edits or typed secrets", () => {
+    const profile: ProviderProfile = {
+      id: "provider-1",
+      displayName: "DeepSeek",
+      kind: "deep_seek",
+      baseUrl: "https://api.deepseek.com",
+      modelId: "deepseek-v4-flash",
+      credentialAccountId: "default",
+      capabilities: {
+        chat: true,
+        streaming: true,
+        customModelId: true,
+        customBaseUrl: true,
+        reasoning: true,
+      },
+      options: {
+        enableThinking: null,
+        thinkingBudget: null,
+        thinking: false,
+        reasoningEffort: null,
+        workspaceId: null,
+        endpointId: null,
+      },
+    };
+
+    expect(providerNavigationHasUnsavedChanges(profile, profile, "")).toBe(
+      false,
+    );
+    expect(
+      providerNavigationHasUnsavedChanges(
+        profile,
+        { ...profile, modelId: "changed" },
+        "",
+      ),
+    ).toBe(true);
+    expect(providerNavigationHasUnsavedChanges(profile, profile, "secret")).toBe(
+      true,
+    );
+  });
+
+  it("requires explicit close confirmation for case or provider drafts", () => {
+    const decision = decideWorkspaceClose({
+      dirtyCaseDrafts: ["project", "evidence"],
+      providerDraftDirty: true,
+      caseMutationInFlight: false,
+      providerMutationInFlight: false,
+      extractionMutationInFlight: false,
+    });
+
+    expect(decision.kind).toBe("confirm_discard");
+    expect("message" in decision ? decision.message : "").toContain(
+      "案件基本信息",
+    );
+    expect("message" in decision ? decision.message : "").toContain("证据");
+    expect("message" in decision ? decision.message : "").toContain(
+      "API Key",
+    );
+    let confirmations = 0;
+    expect(
+      workspaceCloseWasApproved(decision, () => {
+        confirmations += 1;
+        return false;
+      }),
+    ).toBe(false);
+    expect(confirmations).toBe(1);
+  });
+
+  it("blocks close while any persisted write is unresolved", () => {
+    for (const activeWrite of [
+      "caseMutationInFlight",
+      "providerMutationInFlight",
+      "extractionMutationInFlight",
+    ] as const) {
+      const decision = decideWorkspaceClose({
+        dirtyCaseDrafts: ["project"],
+        providerDraftDirty: true,
+        caseMutationInFlight: false,
+        providerMutationInFlight: false,
+        extractionMutationInFlight: false,
+        [activeWrite]: true,
+      });
+      expect(decision.kind).toBe("block");
+    }
+
+    expect(
+      decideWorkspaceClose({
+        dirtyCaseDrafts: [],
+        providerDraftDirty: false,
+        caseMutationInFlight: false,
+        providerMutationInFlight: false,
+        extractionMutationInFlight: false,
+      }),
+    ).toEqual({ kind: "proceed" });
+  });
+
+  it("bypasses dirty drafts only for the exact blocked case after a persisted mutation", () => {
+    expect(
+      canBypassDirtyDraftsForWorkspaceRecovery(
+        "case-a",
+        "case-a",
+        true,
+        "case-a",
+      ),
+    ).toBe(true);
+    expect(
+      canBypassDirtyDraftsForWorkspaceRecovery(
+        "case-b",
+        "case-a",
+        true,
+        "case-a",
+      ),
+    ).toBe(false);
+    expect(
+      canBypassDirtyDraftsForWorkspaceRecovery(
+        "case-a",
+        "case-a",
+        true,
+        "case-other",
+      ),
+    ).toBe(false);
+    expect(
+      canBypassDirtyDraftsForWorkspaceRecovery(
+        "case-a",
+        "case-a",
+        false,
+        "case-a",
+      ),
+    ).toBe(false);
+  });
+
+  it("reconstructs a traceable context from a saved answer record", () => {
+    const source = legalSource("source-history");
+    const unreferencedSource = legalSource("source-not-cited");
+    const record: LegalAnswerRecord = {
+      recordId: "record-1",
+      projectId: "case-1",
+      providerId: "provider-1",
+      question: "历史问题",
+      answer: "历史回答",
+      caseDate: "2025-01-01",
+      query: {
+        lawNames: ["中华人民共和国劳动合同法"],
+        articleNumbers: ["第四十七条"],
+        keywords: ["经济补偿"],
+        legalIssue: "历史问题",
+        caseDate: "2025-01-01",
+        effectivenessLevels: ["national_law"],
+        includeExpired: true,
+      },
+      sourceIds: [source.sourceId, unreferencedSource.sourceId],
+      sources: [source, unreferencedSource],
+      missingSourceIds: [],
+      citationReport: {
+        citations: [
+          {
+            rawMarker: "[SRC:source-history]",
+            sourceId: source.sourceId,
+            status: "valid",
+            source,
+          },
+        ],
+        validCount: 1,
+        invalidCount: 0,
+        unsupportedLegalConclusion: false,
+        semanticSupportVerified: false,
+      },
+      createdAt: "2026-07-14T00:00:00Z",
+    };
+
+    expect(legalAnswerContextFromRecord(record)).toMatchObject({
+      query: {
+        lawNames: ["中华人民共和国劳动合同法"],
+        articleNumbers: ["第四十七条"],
+        keywords: ["经济补偿"],
+        legalIssue: "历史问题",
+        caseDate: "2025-01-01",
+        effectivenessLevels: ["national_law"],
+        includeExpired: true,
+      },
+      sources: [
+        { sourceId: "source-history" },
+        { sourceId: "source-not-cited" },
+      ],
+    });
+    expect(qaFormDraftFromLegalAnswerRecord(record)).toEqual({
+      question: "历史问题",
+      lawName: "中华人民共和国劳动合同法",
+      articleNumber: "第四十七条",
+      keywords: "经济补偿",
+      caseDate: "2025-01-01",
+      effectivenessLevels: ["national_law"],
+      includeExpired: true,
+    });
+  });
+
+  it("rejects an in-flight answer as soon as the selected case changes", () => {
+    expect(legalAnswerRequestStillOwnsCurrentCase("case-a", "case-a")).toBe(
+      true,
+    );
+    expect(legalAnswerRequestStillOwnsCurrentCase("case-a", "case-b")).toBe(
+      false,
+    );
+    expect(legalAnswerRequestStillOwnsCurrentCase(null, "case-a")).toBe(false);
+  });
+
+  it("accepts a source preview only inside its original case scope", () => {
+    expect(legalAnswerPreviewStillOwnsCurrentScope("case-a", "case-a")).toBe(
+      true,
+    );
+    expect(legalAnswerPreviewStillOwnsCurrentScope("case-a", "case-b")).toBe(
+      false,
+    );
+    expect(legalAnswerPreviewStillOwnsCurrentScope(null, null)).toBe(true);
+    expect(legalAnswerPreviewStillOwnsCurrentScope(null, "case-a")).toBe(false);
+  });
+
+  it("requires every persisted extraction source to remain in the workspace", () => {
+    expect(
+      pendingReviewFilesStillExist(["file-a", "file-b"], ["file-b"]),
+    ).toBe(true);
+    expect(
+      pendingReviewFilesStillExist(["file-a"], ["file-a", "file-b"]),
+    ).toBe(false);
+  });
+
+  it("appends a same-createdAt page without duplicating its record-id boundary", () => {
+    const first: LegalAnswerRecord = {
+      recordId: "record-1",
+      projectId: "case-1",
+      providerId: "provider-1",
+      question: "问题一",
+      answer: "回答一",
+      query: {
+        lawNames: [],
+        articleNumbers: [],
+        keywords: [],
+        legalIssue: "问题一",
+        caseDate: null,
+        effectivenessLevels: [],
+        includeExpired: false,
+      },
+      sourceIds: [],
+      sources: [],
+      missingSourceIds: [],
+      citationReport: {
+        citations: [],
+        validCount: 0,
+        invalidCount: 0,
+        unsupportedLegalConclusion: true,
+        semanticSupportVerified: false,
+      },
+      createdAt: "2026-07-14T10:00:00Z",
+    };
+    const second = {
+      ...first,
+      recordId: "record-2",
+      question: "问题二",
+    };
+
+    expect(mergeLegalAnswerHistory([first], [first, second])).toEqual([
+      first,
+      second,
+    ]);
+    expect(legalAnswerHistoryBelongsToProject([first, second], "case-1")).toBe(
+      true,
+    );
+    expect(
+      legalAnswerHistoryBelongsToProject(
+        [{ ...second, projectId: "case-2" }],
+        "case-1",
+      ),
+    ).toBe(false);
+  });
+
+  it("never labels an empty citation report as valid", () => {
+    expect(
+      formatCitationValidationSummary({
+        citations: [],
+        validCount: 0,
+        invalidCount: 0,
+        unsupportedLegalConclusion: true,
+        semanticSupportVerified: false,
+      }),
+    ).toBe("无可校验来源标记");
+    expect(
+      formatCitationValidationSummary({
+        citations: [
+          {
+            rawMarker: "[SRC:missing]",
+            sourceId: "missing",
+            status: "invalid",
+            reason: "not_found",
+          },
+        ],
+        validCount: 0,
+        invalidCount: 1,
+        unsupportedLegalConclusion: true,
+        semanticSupportVerified: false,
+      }),
+    ).toBe("1 个无效");
+  });
+
+  it("rejects stale search and detail responses by monotonically advancing epochs", () => {
+    const epoch = { current: 0 };
+    const first = advanceRequestEpoch(epoch);
+    const second = advanceRequestEpoch(epoch);
+
+    expect(isCurrentRequestEpoch(epoch, first)).toBe(false);
+    expect(isCurrentRequestEpoch(epoch, second)).toBe(true);
+  });
+
+  it("reads the latest query after a delayed document-context request", async () => {
+    const query = { current: "旧查询 A" };
+    const caseDate = { current: "2024-01-01" };
+    let releaseContext: (() => void) | undefined;
+    const contextLoaded = new Promise<void>((resolve) => {
+      releaseContext = resolve;
+    });
+    const delayedSearch = (async () => {
+      await contextLoaded;
+      return currentLawSearchCriteria(query, caseDate);
+    })();
+
+    query.current = "新查询 B";
+    caseDate.current = "2025-02-03";
+    releaseContext?.();
+
+    await expect(delayedSearch).resolves.toEqual({
+      query: "新查询 B",
+      caseDate: "2025-02-03",
+    });
+  });
+
+  it("names destructive targets and discloses cascading deletion impact", () => {
+    expect(caseProjectDeletionConfirmation("劳动争议案")).toContain(
+      "劳动争议案",
+    );
+    expect(caseProjectDeletionConfirmation("劳动争议案")).toContain(
+      "法律问答历史",
+    );
+    expect(caseEntityDeletionConfirmation("evidence", "E-3 工资流水")).toBe(
+      "确定永久删除证据“E-3 工资流水”吗？其关联数据（如有）也会一并删除，此操作不可撤销。",
+    );
+    expect(
+      caseEntityDeletionConfirmation("fact_issue_link", "交付 ↔ 违约责任"),
+    ).toContain("事实—争点关联");
+    expect(providerDeletionConfirmation("DeepSeek", "default")).toContain(
+      "Windows 凭据库",
+    );
+    expect(
+      providerApiKeyDeletionConfirmation("DeepSeek", "default"),
+    ).toContain("重新录入");
+    expect(
+      providerApiKeyOverwriteConfirmation("DeepSeek", "default"),
+    ).toContain("覆盖旧 Key");
+    expect(extractionReviewDiscardConfirmation()).toContain("不可撤销");
+    expect(unrestorableExtractionDiscardConfirmation()).toContain("不可撤销");
+  });
+
+  it("never executes a destructive action after confirmation is declined", async () => {
+    const messages = [
+      caseProjectDeletionConfirmation("案件 A"),
+      caseEntityDeletionConfirmation("evidence", "E-1"),
+      providerDeletionConfirmation("DeepSeek", "default"),
+      providerApiKeyDeletionConfirmation("DeepSeek", "default"),
+      providerApiKeyOverwriteConfirmation("DeepSeek", "default"),
+      extractionReviewDiscardConfirmation(),
+      unrestorableExtractionDiscardConfirmation(),
+    ];
+    let ipcCalls = 0;
+
+    for (const message of messages) {
+      const result = await runConfirmedDestructiveAction(
+        message,
+        () => false,
+        async () => {
+          ipcCalls += 1;
+        },
+      );
+      expect(result).toEqual({ executed: false });
+    }
+
+    expect(ipcCalls).toBe(0);
+  });
+});
+
+describe("graph navigation targets", () => {
+  function node(sourceKind: string, sourceId = "source:1"): GraphNode {
+    return {
+      id: sourceId,
+      label: "来源记录",
+      category: "test",
+      sourceKind,
+      sourceId,
+    };
+  }
+
+  it("routes persisted case entities back to the case workspace", () => {
+    for (const sourceKind of [
+      "case_fact",
+      "evidence_item",
+      "legal_issue",
+      "verified_citation",
+    ]) {
+      expect(graphNodeDestination(node(sourceKind))).toBe("case");
+    }
+  });
+
+  it("routes legal-core nodes back to the law search workspace", () => {
+    expect(graphNodeDestination(node("legal_core", "law-1"))).toBe("law");
+    expect(graphNodeDestination(node("fixture"))).toBe("unsupported");
+  });
+
+  it("builds stable DOM targets without leaking reserved identifier characters", () => {
+    expect(caseGraphNodeDomId("verified_citation", "[SRC:law:article:1]")).toBe(
+      "case-graph-source-verified_citation-%5BSRC%3Alaw%3Aarticle%3A1%5D",
+    );
+  });
+});
+
+describe("document citation navigation", () => {
+  const citation = {
+    articleId: "article-577",
+    documentId: "civil-code",
+    versionId: "civil-code-2020",
+    sourceId: "law:civil-code:civil-code-2020:art:577",
+  };
+
+  it("opens only the exact article/version/source tuple returned by the local law database", () => {
+    expect(
+      articleMatchesDocumentCitation(
+        {
+          articleId: "article-577",
+          documentId: "civil-code",
+          versionId: "civil-code-2020",
+          citationId: "law:civil-code:civil-code-2020:art:577",
+        },
+        citation,
+      ),
+    ).toBe(true);
+    expect(
+      articleMatchesDocumentCitation(
+        {
+          articleId: "article-577",
+          documentId: "civil-code",
+          versionId: "civil-code-2020",
+          citationId: "law:invented:source:art:577",
+        },
+        citation,
+      ),
+    ).toBe(false);
+    expect(articleMatchesDocumentCitation(null, citation)).toBe(false);
+  });
+
+  it("accepts document metadata only when the exact requested id is returned", () => {
+    const document = {
+      documentId: "civil-code",
+      title: "中华人民共和国民法典",
+      documentType: "code",
+      authorityName: "全国人民代表大会",
+      effectivenessLevel: "national_law",
+      status: "in_force",
+      currentVersionId: "civil-code-2020",
+      currentEffectiveFrom: "2021-01-01",
+      currentEffectiveTo: null,
+      matchedAlias: null,
+      summary: "",
+      score: 1,
+    };
+
+    expect(exactLawDocumentMatchesRequest(document, "civil-code")).toBe(true);
+    expect(exactLawDocumentMatchesRequest(document, "different-id")).toBe(false);
+    expect(exactLawDocumentMatchesRequest(null, "civil-code")).toBe(false);
   });
 });

@@ -38,6 +38,20 @@ DEFAULT_REPORT = ROOT / "data" / "generated" / "legal_core_build_report.json"
 CACHE_DIR = ROOT / "data" / "build" / "cache"
 STATE_DB = ROOT / "data" / "build" / "state" / "legal_core_jobs.sqlite"
 
+CIVIL_CODE_REPEALED_TITLES = (
+    "中华人民共和国婚姻法",
+    "中华人民共和国继承法",
+    "中华人民共和国民法通则",
+    "中华人民共和国收养法",
+    "中华人民共和国担保法",
+    "中华人民共和国合同法",
+    "中华人民共和国物权法",
+    "中华人民共和国侵权责任法",
+    "中华人民共和国民法总则",
+)
+CIVIL_CODE_REPEAL_EFFECTIVE_TO = "2020-12-31"
+HISTORICAL_UNKNOWN_END_POLICY = "exclude_from_dated_queries"
+
 FLK_BASE = "https://flk.npc.gov.cn"
 FLK_SOURCE_ID = "flk_npc"
 GJGZK_BASE = "https://www.gov.cn/zhengce/xxgk/gjgzk/index.htm?searchWord="
@@ -2728,6 +2742,51 @@ def text_marker_hits(connection: sqlite3.Connection) -> int:
     return total
 
 
+def authoritative_terminal_date_audit(
+    connection: sqlite3.Connection,
+) -> dict[str, int]:
+    placeholders = ",".join("?" for _ in CIVIL_CODE_REPEALED_TITLES)
+    title_count, version_count, violation_count, missing_article_count = connection.execute(
+        f"""
+        SELECT
+          COUNT(DISTINCT CASE
+            WHEN versions.effective_to = ? THEN documents.title
+          END),
+          SUM(CASE WHEN versions.effective_to = ? THEN 1 ELSE 0 END),
+          SUM(CASE
+            WHEN versions.effective_from <= ?
+             AND (versions.effective_to IS NULL OR versions.effective_to > ?)
+            THEN 1 ELSE 0
+          END),
+          SUM(CASE
+            WHEN versions.effective_to = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM law_articles articles WHERE articles.version_id = versions.id
+             )
+            THEN 1 ELSE 0
+          END)
+        FROM law_versions versions
+        JOIN law_documents documents ON documents.id = versions.document_id
+        WHERE documents.title IN ({placeholders})
+          AND versions.status = 'repealed'
+        """,
+        (
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            *CIVIL_CODE_REPEALED_TITLES,
+        ),
+    ).fetchone()
+    return {
+        "title_count": int(title_count or 0),
+        "version_count": int(version_count or 0),
+        "violation_count": int(violation_count or 0),
+        "missing_article_count": int(missing_article_count or 0),
+    }
+
+
 def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -2873,6 +2932,21 @@ def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
         connection.execute("SELECT value FROM database_metadata WHERE key = 'stage_1c_data_status'").fetchone()
         or [None]
     )[0]
+    authoritative_terminal = authoritative_terminal_date_audit(connection)
+    authoritative_terminal_title_count = authoritative_terminal["title_count"]
+    repealed_unknown_terminal_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM law_versions "
+            "WHERE status = 'repealed' AND effective_to IS NULL"
+        ).fetchone()[0]
+    )
+    historical_unknown_end_policy = (
+        connection.execute(
+            "SELECT value FROM database_metadata "
+            "WHERE key = 'historical_unknown_end_policy'"
+        ).fetchone()
+        or [None]
+    )[0]
     failures: list[str] = []
     if integrity != "ok":
         failures.append(f"sqlite_integrity:{integrity}")
@@ -2918,6 +2992,34 @@ def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
             failures.append(f"missing_case_provenance:{missing_case_provenance}")
         if missing_template_provenance:
             failures.append(f"missing_template_provenance:{missing_template_provenance}")
+        if authoritative_terminal_title_count != len(CIVIL_CODE_REPEALED_TITLES):
+            failures.append(
+                "authoritative_terminal_title_count:"
+                f"{authoritative_terminal_title_count}!={len(CIVIL_CODE_REPEALED_TITLES)}"
+            )
+        if authoritative_terminal["version_count"] != len(CIVIL_CODE_REPEALED_TITLES):
+            failures.append(
+                "authoritative_terminal_version_count:"
+                f"{authoritative_terminal['version_count']}!={len(CIVIL_CODE_REPEALED_TITLES)}"
+            )
+        if authoritative_terminal["violation_count"]:
+            failures.append(
+                "authoritative_terminal_violation_count:"
+                f"{authoritative_terminal['violation_count']}"
+            )
+        if authoritative_terminal["missing_article_count"]:
+            failures.append(
+                "authoritative_terminal_missing_article_count:"
+                f"{authoritative_terminal['missing_article_count']}"
+            )
+        if (
+            repealed_unknown_terminal_count
+            and historical_unknown_end_policy != HISTORICAL_UNKNOWN_END_POLICY
+        ):
+            failures.append(
+                "historical_unknown_end_policy:"
+                f"{historical_unknown_end_policy}!={HISTORICAL_UNKNOWN_END_POLICY}"
+            )
     return {
         "audit_status": "complete" if not failures else "failed",
         "coverage_status": coverage_status,
@@ -2943,6 +3045,14 @@ def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
         "missing_case_provenance": missing_case_provenance,
         "missing_template_provenance": missing_template_provenance,
         "stage_1c_data_status": stage_1c_status,
+        "authoritative_terminal_title_count": authoritative_terminal_title_count,
+        "authoritative_terminal_version_count": authoritative_terminal["version_count"],
+        "authoritative_terminal_violation_count": authoritative_terminal["violation_count"],
+        "authoritative_terminal_missing_article_count": authoritative_terminal[
+            "missing_article_count"
+        ],
+        "repealed_unknown_terminal_count": repealed_unknown_terminal_count,
+        "historical_unknown_end_policy": historical_unknown_end_policy,
     }
 
 

@@ -37,7 +37,7 @@ describe("provider catalog", () => {
       modelId: "",
       baseUrl: "",
       credentialAccountId: "default",
-      options: {},
+      options: { allowPrivateNetwork: false },
     });
     expect(draft.capabilities).toMatchObject({
       chat: true,

@@ -17,17 +17,25 @@ tauri-build.workspace = true
 
 [dependencies]
 citations.workspace = true
+base64.workspace = true
 database.workspace = true
 domain.workspace = true
 providers.workspace = true
+minisign-verify.workspace = true
+reqwest.workspace = true
 retrieval.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
 tauri.workspace = true
+tauri-plugin-single-instance.workspace = true
 tokio = { version = "1.48.0", features = ["macros", "rt", "sync"] }
 tokio-util = "0.7.17"
 uuid.workspace = true
+windows-sys.workspace = true
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile.workspace = true

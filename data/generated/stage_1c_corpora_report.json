@@ -1,7 +1,7 @@
 {
   "stage": "1C-official-corpora",
-  "generated_at": "2026-07-11T13:48:38+00:00",
-  "dataset_version": "2026.07.11-stage1c.1",
+  "generated_at": "2026-07-14T15:23:31+00:00",
+  "dataset_version": "2026.07.14-stage1c.2",
   "source": {
     "id": "spc_court",
     "base_url": "https://www.court.gov.cn/",
@@ -19,7 +19,7 @@
   },
   "metadata": {
     "schema_version": "4",
-    "dataset_version": "2026.07.11-stage1c.1",
+    "dataset_version": "2026.07.14-stage1c.2",
     "data_scope": "statutory corpus, normalized official history families, SPC guiding cases, SPC typical-case collections, and SPC official document templates",
     "source_manifest_sha256": "011551065b404507bce7b2cf542cb3b18da79a14437d094d067e685a438cd9fa",
     "stage_1c_corpora_status": "complete",
@@ -30,7 +30,8 @@
     "typical_case_count": "597",
     "document_template_count": "752",
     "history_version_exception_count": "1121",
-    "stage_1c_corpora_snapshot_at": "2026-07-11T13:47:19+00:00",
+    "historical_unknown_end_policy": "exclude_from_dated_queries",
+    "stage_1c_corpora_snapshot_at": "2026-07-14T15:22:11+00:00",
     "database_distribution_manifest": "data/generated/legal_core_distribution_manifest.json"
   },
   "audit": {

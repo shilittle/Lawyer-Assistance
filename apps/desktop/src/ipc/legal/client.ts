@@ -5,6 +5,8 @@ import type {
   CancelLegalAnswerResponse,
   GetArticleRequest,
   GetArticleResponse,
+  GetLawDocumentRequest,
+  GetLawDocumentResponse,
   GetLawRelationsRequest,
   GetLawRelationsResponse,
   GetLawVersionsRequest,
@@ -12,6 +14,8 @@ import type {
   LegalAnswerCandidatesRequest,
   LegalAnswerCandidatesResponse,
   LegalAnswerRequest,
+  ListLegalAnswerRecordsRequest,
+  ListLegalAnswerRecordsResponse,
   LegalAnswerResponse,
   LegalAnswerStreamEvent,
   SearchArticlesRequest,
@@ -67,6 +71,20 @@ export function answerLegalQuestion(
   return invoke<LegalAnswerResponse>("answer_legal_question", {
     request,
     onEvent: eventChannel,
+  });
+}
+
+export function getLawDocument(
+  request: GetLawDocumentRequest,
+): Promise<GetLawDocumentResponse> {
+  return invoke<GetLawDocumentResponse>("get_law_document", { request });
+}
+
+export function listLegalAnswerRecords(
+  request: ListLegalAnswerRecordsRequest,
+): Promise<ListLegalAnswerRecordsResponse> {
+  return invoke<ListLegalAnswerRecordsResponse>("list_legal_answer_records", {
+    request,
   });
 }
 

@@ -1,5 +1,5 @@
 {
-  "built_at": "2026-07-13T15:56:02+00:00",
+  "built_at": "2026-07-15T18:23:10+00:00",
   "output": "data\\generated\\legal_core_full.sqlite",
   "stage": "audit",
   "metadata_only": false,
@@ -123,6 +123,12 @@
     "history_version_exception_count": 1121,
     "missing_case_provenance": 0,
     "missing_template_provenance": 0,
-    "stage_1c_data_status": "complete_with_declared_history_date_exceptions"
+    "stage_1c_data_status": "complete_with_declared_history_date_exceptions",
+    "authoritative_terminal_title_count": 9,
+    "authoritative_terminal_version_count": 9,
+    "authoritative_terminal_violation_count": 0,
+    "authoritative_terminal_missing_article_count": 0,
+    "repealed_unknown_terminal_count": 2645,
+    "historical_unknown_end_policy": "exclude_from_dated_queries"
   }
 }

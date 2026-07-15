@@ -6,7 +6,7 @@
 
 use providers::{
     ApiSecret, ConnectionTestStatus, OpenAiCompatibleAdapter, ProviderKind, ProviderProfile,
-    ReqwestTransport,
+    ReasoningEffort, ReqwestTransport,
 };
 use serde_json::json;
 use std::{
@@ -23,6 +23,7 @@ struct ProbeTarget {
     kind: ProviderKind,
     name: &'static str,
     base_url_override: Option<&'static str>,
+    thinking: bool,
 }
 
 fn main() -> ExitCode {
@@ -59,6 +60,10 @@ fn run() -> Result<ExitCode, &'static str> {
         ProviderProfile::new_default(format!("acceptance-{}", target.name), target.kind);
     if let Some(base_url) = target.base_url_override {
         profile.base_url = base_url.to_owned();
+    }
+    if target.thinking {
+        profile.options.thinking = Some(true);
+        profile.options.reasoning_effort = Some(ReasoningEffort::Max);
     }
     let transport = ReqwestTransport::new(Duration::from_secs(60))
         .map_err(|_| "could not initialize the HTTPS transport")?;
@@ -128,36 +133,49 @@ fn parse_target(value: &str) -> Result<ProbeTarget, &'static str> {
             kind: ProviderKind::DeepSeek,
             name: "deep_seek",
             base_url_override: None,
+            thinking: false,
+        }),
+        "deepseek_thinking" => Ok(ProbeTarget {
+            kind: ProviderKind::DeepSeek,
+            name: "deep_seek_thinking",
+            base_url_override: None,
+            thinking: true,
         }),
         "qwen" => Ok(ProbeTarget {
             kind: ProviderKind::Qwen,
             name: "qwen_china_beijing",
             base_url_override: None,
+            thinking: false,
         }),
         "qwen_singapore" => Ok(ProbeTarget {
             kind: ProviderKind::Qwen,
             name: "qwen_singapore",
             base_url_override: Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+            thinking: false,
         }),
         "qwen_us" => Ok(ProbeTarget {
             kind: ProviderKind::Qwen,
             name: "qwen_us_virginia",
             base_url_override: Some("https://dashscope-us.aliyuncs.com/compatible-mode/v1"),
+            thinking: false,
         }),
         "silicon_flow" | "siliconflow" => Ok(ProbeTarget {
             kind: ProviderKind::SiliconFlow,
             name: "silicon_flow_china",
             base_url_override: None,
+            thinking: false,
         }),
         "silicon_flow_global" => Ok(ProbeTarget {
             kind: ProviderKind::SiliconFlow,
             name: "silicon_flow_global",
             base_url_override: Some("https://api.siliconflow.com/v1"),
+            thinking: false,
         }),
         "volcengine_ark" | "volcengine" => Ok(ProbeTarget {
             kind: ProviderKind::VolcengineArk,
             name: "volcengine_ark",
             base_url_override: None,
+            thinking: false,
         }),
         _ => Err("unsupported provider probe target"),
     }
@@ -203,58 +221,86 @@ mod tests {
     #[test]
     fn maps_every_supported_probe_target_to_the_expected_provider_and_region() {
         let cases = [
-            ("deep_seek", "deep_seek", ProviderKind::DeepSeek, None),
-            ("deepseek", "deep_seek", ProviderKind::DeepSeek, None),
-            ("qwen", "qwen_china_beijing", ProviderKind::Qwen, None),
+            (
+                "deep_seek",
+                "deep_seek",
+                ProviderKind::DeepSeek,
+                None,
+                false,
+            ),
+            ("deepseek", "deep_seek", ProviderKind::DeepSeek, None, false),
+            (
+                "deepseek_thinking",
+                "deep_seek_thinking",
+                ProviderKind::DeepSeek,
+                None,
+                true,
+            ),
+            (
+                "qwen",
+                "qwen_china_beijing",
+                ProviderKind::Qwen,
+                None,
+                false,
+            ),
             (
                 "qwen_singapore",
                 "qwen_singapore",
                 ProviderKind::Qwen,
                 Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+                false,
             ),
             (
                 "qwen_us",
                 "qwen_us_virginia",
                 ProviderKind::Qwen,
                 Some("https://dashscope-us.aliyuncs.com/compatible-mode/v1"),
+                false,
             ),
             (
                 "silicon_flow",
                 "silicon_flow_china",
                 ProviderKind::SiliconFlow,
                 None,
+                false,
             ),
             (
                 "siliconflow",
                 "silicon_flow_china",
                 ProviderKind::SiliconFlow,
                 None,
+                false,
             ),
             (
                 "silicon_flow_global",
                 "silicon_flow_global",
                 ProviderKind::SiliconFlow,
                 Some("https://api.siliconflow.com/v1"),
+                false,
             ),
             (
                 "volcengine_ark",
                 "volcengine_ark",
                 ProviderKind::VolcengineArk,
                 None,
+                false,
             ),
             (
                 "volcengine",
                 "volcengine_ark",
                 ProviderKind::VolcengineArk,
                 None,
+                false,
             ),
         ];
 
-        for (argument, expected_name, expected_kind, expected_base_url) in cases {
+        for (argument, expected_name, expected_kind, expected_base_url, expected_thinking) in cases
+        {
             let target = parse_target(argument).unwrap();
             assert_eq!(target.name, expected_name);
             assert_eq!(target.kind, expected_kind);
             assert_eq!(target.base_url_override, expected_base_url);
+            assert_eq!(target.thinking, expected_thinking);
         }
         assert!(parse_target("unsupported").is_err());
     }

@@ -31,7 +31,7 @@ DEFAULT_REPORT = ROOT / "data" / "generated" / "stage_1c_corpora_report.json"
 DEFAULT_MANIFEST = ROOT / "data" / "generated" / "legal_core_full_manifest.json"
 BASE_URL = "https://www.court.gov.cn/"
 SOURCE_ID = "spc_court"
-DATASET_VERSION = "2026.07.11-stage1c.1"
+DATASET_VERSION = "2026.07.14-stage1c.2"
 USER_AGENT = "Lawyer-Assistance legal-data builder/0.1 (+official public data; contact project maintainer)"
 
 
@@ -828,6 +828,7 @@ def update_metadata(connection: sqlite3.Connection, counts: dict[str, int]) -> d
         "typical_case_count": str(counts["typical_cases"]),
         "document_template_count": str(counts["document_templates"]),
         "history_version_exception_count": str(counts["history_exceptions"]),
+        "historical_unknown_end_policy": "exclude_from_dated_queries",
         "stage_1c_corpora_snapshot_at": timestamp,
         "database_distribution_manifest": "data/generated/legal_core_distribution_manifest.json",
     }

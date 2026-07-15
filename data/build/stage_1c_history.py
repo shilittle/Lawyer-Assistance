@@ -25,7 +25,25 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE = ROOT / "data" / "generated" / "legal_core_full.sqlite"
 DEFAULT_REPORT = ROOT / "data" / "generated" / "stage_1c_history_report.json"
 DEFAULT_MANIFEST = ROOT / "data" / "generated" / "legal_core_full_manifest.json"
-DATASET_VERSION = "2026.07.11-history.1"
+DATASET_VERSION = "2026.07.14-history.2"
+
+# Civil Code article 1260 makes these nine statutes cease to be effective when
+# the Civil Code takes effect on 2021-01-01. The FLK snapshot marks the
+# versions repealed but omits their terminal dates, so this primary-source rule
+# is applied explicitly rather than guessed by query code.
+# Source: https://wb.flk.npc.gov.cn/flfg/PDF/bd53dd912c1048f2aecbaa229238334b.pdf
+CIVIL_CODE_REPEALED_TITLES = (
+    "中华人民共和国婚姻法",
+    "中华人民共和国继承法",
+    "中华人民共和国民法通则",
+    "中华人民共和国收养法",
+    "中华人民共和国担保法",
+    "中华人民共和国合同法",
+    "中华人民共和国物权法",
+    "中华人民共和国侵权责任法",
+    "中华人民共和国民法总则",
+)
+CIVIL_CODE_REPEAL_EFFECTIVE_TO = "2020-12-31"
 
 
 def now_iso() -> str:
@@ -72,6 +90,7 @@ class HistoryNormalizationReport:
     removed_document_count: int
     reparented_version_count: int
     bounded_version_count: int
+    authoritatively_bounded_version_count: int
     skipped_families: list[dict[str, object]]
 
 
@@ -253,6 +272,8 @@ def normalize_history(connection: sqlite3.Connection) -> HistoryNormalizationRep
             reparented_versions += reparented
             bounded_versions += bounded
 
+    authoritative_bounded = apply_authoritative_terminal_dates(connection)
+
     return HistoryNormalizationReport(
         relation_count=relation_count,
         component_count=len(components),
@@ -261,8 +282,76 @@ def normalize_history(connection: sqlite3.Connection) -> HistoryNormalizationRep
         removed_document_count=removed_documents,
         reparented_version_count=reparented_versions,
         bounded_version_count=bounded_versions,
+        authoritatively_bounded_version_count=authoritative_bounded,
         skipped_families=skipped,
     )
+
+
+def apply_authoritative_terminal_dates(connection: sqlite3.Connection) -> int:
+    placeholders = _placeholders(len(CIVIL_CODE_REPEALED_TITLES))
+    cursor = connection.execute(
+        f"""
+        UPDATE law_versions
+        SET effective_to = ?
+        WHERE status = 'repealed'
+          AND effective_to IS NULL
+          AND effective_from <= ?
+          AND document_id IN (
+            SELECT id FROM law_documents WHERE title IN ({placeholders})
+          )
+        """,
+        (
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            *CIVIL_CODE_REPEALED_TITLES,
+        ),
+    )
+    return int(cursor.rowcount)
+
+
+def authoritative_terminal_date_audit(
+    connection: sqlite3.Connection,
+) -> dict[str, int]:
+    placeholders = _placeholders(len(CIVIL_CODE_REPEALED_TITLES))
+    title_count, version_count, violation_count, missing_article_count = connection.execute(
+        f"""
+        SELECT
+          COUNT(DISTINCT CASE
+            WHEN versions.effective_to = ? THEN documents.title
+          END),
+          SUM(CASE WHEN versions.effective_to = ? THEN 1 ELSE 0 END),
+          SUM(CASE
+            WHEN versions.effective_from <= ?
+             AND (versions.effective_to IS NULL OR versions.effective_to > ?)
+            THEN 1 ELSE 0
+          END),
+          SUM(CASE
+            WHEN versions.effective_to = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM law_articles articles WHERE articles.version_id = versions.id
+             )
+            THEN 1 ELSE 0
+          END)
+        FROM law_versions versions
+        JOIN law_documents documents ON documents.id = versions.document_id
+        WHERE documents.title IN ({placeholders})
+          AND versions.status = 'repealed'
+        """,
+        (
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            *CIVIL_CODE_REPEALED_TITLES,
+        ),
+    ).fetchone()
+    return {
+        "title_count": int(title_count or 0),
+        "version_count": int(version_count or 0),
+        "violation_count": int(violation_count or 0),
+        "missing_article_count": int(missing_article_count or 0),
+    }
 
 
 def refresh_fts(connection: sqlite3.Connection) -> None:
@@ -335,6 +424,13 @@ def upsert_metadata(
         "history_version_status": history_status,
         "history_version_family_count": str(family_count),
         "history_version_exception_count": str(normalization.skipped_family_count),
+        "authoritative_terminal_date_count": str(
+            normalization.authoritatively_bounded_version_count
+        ),
+        "authoritative_terminal_date_source": (
+            "中华人民共和国民法典第一千二百六十条（2021-01-01施行）"
+        ),
+        "historical_unknown_end_policy": "exclude_from_dated_queries",
         "database_distribution_manifest": "data/generated/legal_core_distribution_manifest.json",
         "history_normalized_at": timestamp,
     }
@@ -387,6 +483,8 @@ def audit_history(connection: sqlite3.Connection) -> dict[str, object]:
     article_count = connection.execute("SELECT COUNT(*) FROM law_articles").fetchone()[0]
     foreign_key_errors = len(connection.execute("PRAGMA foreign_key_check").fetchall())
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    authoritative_terminal = authoritative_terminal_date_audit(connection)
+    authoritative_terminal_title_count = authoritative_terminal["title_count"]
     examples = [
         {"document_id": row[0], "title": row[1], "version_count": row[2]}
         for row in connection.execute(
@@ -416,6 +514,26 @@ def audit_history(connection: sqlite3.Connection) -> dict[str, object]:
         failures.append(f"foreign_key_errors:{foreign_key_errors}")
     if integrity != "ok":
         failures.append(f"sqlite_integrity:{integrity}")
+    if authoritative_terminal_title_count != len(CIVIL_CODE_REPEALED_TITLES):
+        failures.append(
+            "authoritative_terminal_title_count:"
+            f"{authoritative_terminal_title_count}!={len(CIVIL_CODE_REPEALED_TITLES)}"
+        )
+    if authoritative_terminal["version_count"] != len(CIVIL_CODE_REPEALED_TITLES):
+        failures.append(
+            "authoritative_terminal_version_count:"
+            f"{authoritative_terminal['version_count']}!={len(CIVIL_CODE_REPEALED_TITLES)}"
+        )
+    if authoritative_terminal["violation_count"]:
+        failures.append(
+            "authoritative_terminal_violation_count:"
+            f"{authoritative_terminal['violation_count']}"
+        )
+    if authoritative_terminal["missing_article_count"]:
+        failures.append(
+            "authoritative_terminal_missing_article_count:"
+            f"{authoritative_terminal['missing_article_count']}"
+        )
     return {
         "status": "complete" if not failures else "failed",
         "failures": failures,
@@ -427,6 +545,12 @@ def audit_history(connection: sqlite3.Connection) -> dict[str, object]:
         "fts_count": fts_count,
         "foreign_key_errors": foreign_key_errors,
         "sqlite_integrity": integrity,
+        "authoritative_terminal_title_count": authoritative_terminal_title_count,
+        "authoritative_terminal_version_count": authoritative_terminal["version_count"],
+        "authoritative_terminal_violation_count": authoritative_terminal["violation_count"],
+        "authoritative_terminal_missing_article_count": authoritative_terminal[
+            "missing_article_count"
+        ],
         "examples": examples,
     }
 

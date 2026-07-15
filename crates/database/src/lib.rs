@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     error::Error,
     fmt::{self, Display},
     fs,
@@ -8,15 +8,22 @@ use std::{
 };
 
 use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 pub const LEGAL_CORE_DB_FILE_NAME: &str = "legal_core.sqlite";
 pub const USER_DB_FILE_NAME: &str = "user.sqlite";
-pub const USER_SCHEMA_VERSION: i64 = 6;
+pub const USER_SCHEMA_VERSION: i64 = 8;
 const USER_CANONICAL_SCHEMA_MARKER_KEY: &str = "canonical_schema_version";
-// This marker describes the exact canonical shape within schema version 6.
+// This marker describes the exact canonical shape within schema version 8.
 // Keep it independent from USER_SCHEMA_VERSION so constraint-only repairs can
 // be applied once without pretending that an unverified v6 database is sound.
-const USER_CANONICAL_SCHEMA_MARKER_VALUE: &str = "v6-project-scope-integrity-20260713";
+const USER_CANONICAL_SCHEMA_MARKER_VALUE: &str = "v8-fact-issue-links-20260716";
+const PENDING_EXTRACTION_REVIEW_RETENTION_SQL: &str = "+7 days";
+const CASE_MATERIAL_DIGEST_DOMAIN: &[u8] = b"lawyer-assistance-case-materials-v1\0";
+const LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX: &str = "migration-unassigned-legal-answers";
+const LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE: &str = "迁移隔离：旧版未归属问答记录";
+const LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY: &str =
+    "这些问答记录来自旧版数据库，旧版未保存案件归属，不能推断其真实案件。可在此查看恢复；删除本隔离项目会级联彻底清除全部记录。";
 pub const LEGAL_CORE_SCHEMA_SQL: &str = include_str!("../../../data/schema/legal_core.sql");
 
 #[derive(Debug)]
@@ -78,10 +85,48 @@ pub fn ensure_user_database(
         fs::create_dir_all(parent)?;
     }
 
-    let mut connection = open_user_database(&database_path)?;
-    run_user_migrations(&mut connection)?;
+    validate_and_migrate_user_database(&database_path)?;
 
     Ok(database_path)
+}
+
+/// Migrates a user database copy and proves that its final schema and
+/// referential integrity match the canonical contract. Restore staging uses
+/// this before it can mark a file as pending for the next process start.
+pub fn validate_and_migrate_user_database(
+    user_database_path: impl AsRef<Path>,
+) -> Result<(), DatabaseInitError> {
+    let mut connection = open_user_database(user_database_path)?;
+    let claims_current_canonical_schema = existing_user_schema_version(&connection)?
+        == Some(USER_SCHEMA_VERSION)
+        && user_database_metadata_value(&connection, USER_CANONICAL_SCHEMA_MARKER_KEY)?.as_deref()
+            == Some(USER_CANONICAL_SCHEMA_MARKER_VALUE);
+    if claims_current_canonical_schema {
+        // A file that claims the exact current schema must already contain that
+        // schema. Do not silently bless a damaged or fabricated current backup
+        // by creating whichever tables it omitted.
+        validate_canonical_user_table_shapes(&connection)?;
+    }
+    run_user_migrations(&mut connection)?;
+    cleanup_expired_pending_extraction_reviews(&connection)?;
+    validate_canonical_user_database(&connection)?;
+    Ok(())
+}
+
+/// Validates an already migrated database without changing a byte. Restore
+/// recovery uses this after hashing a staged copy so the marker remains valid
+/// even if the process stops between the atomic swap and marker cleanup.
+pub fn validate_user_database_read_only(
+    user_database_path: impl AsRef<Path>,
+) -> Result<(), DatabaseInitError> {
+    let connection = rusqlite::Connection::open_with_flags(
+        user_database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "trusted_schema", "OFF")?;
+    validate_canonical_user_database(&connection)
 }
 
 pub fn open_user_database(
@@ -275,6 +320,196 @@ pub struct CaseFileRow {
     pub created_at: String,
 }
 
+/// Hashes exactly the ordered material fields included in the extraction
+/// prompt. Length-prefixing every field makes the encoding unambiguous even
+/// when user text contains separators or NUL-like boundary patterns.
+pub fn case_materials_digest_from_rows(
+    files: &[CaseFileRow],
+    source_file_ids: &[String],
+) -> Option<String> {
+    let files_by_id = files
+        .iter()
+        .map(|file| (file.file_id.as_str(), file))
+        .collect::<std::collections::HashMap<_, _>>();
+    let selected = source_file_ids
+        .iter()
+        .map(|file_id| files_by_id.get(file_id.as_str()).copied())
+        .collect::<Option<Vec<_>>>()?;
+    Some(case_materials_digest(&selected))
+}
+
+fn case_materials_digest(files: &[&CaseFileRow]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CASE_MATERIAL_DIGEST_DOMAIN);
+    hasher.update((files.len() as u64).to_be_bytes());
+    for file in files {
+        for value in [
+            file.file_id.as_str(),
+            file.title.as_str(),
+            file.file_type.as_str(),
+            file.summary.as_str(),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn current_case_materials_digest(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    source_file_ids: &[String],
+) -> rusqlite::Result<Option<String>> {
+    let mut selected = Vec::with_capacity(source_file_ids.len());
+    for file_id in source_file_ids {
+        let file = connection
+            .query_row(
+                "SELECT file_id, project_id, title, file_type, storage_reference, summary, created_at
+                 FROM case_files WHERE project_id = ?1 AND file_id = ?2",
+                params![project_id, file_id],
+                case_file_from_row,
+            )
+            .optional()?;
+        let Some(file) = file else {
+            return Ok(None);
+        };
+        selected.push(file);
+    }
+    let references = selected.iter().collect::<Vec<_>>();
+    Ok(Some(case_materials_digest(&references)))
+}
+
+fn validate_provider_audit_snapshot_json(snapshot_json: &str) -> rusqlite::Result<()> {
+    let value = serde_json::from_str::<serde_json::Value>(snapshot_json)
+        .map_err(|_| invalid_provider_audit_snapshot())?;
+    let Some(snapshot) = value.as_object() else {
+        return Err(invalid_provider_audit_snapshot());
+    };
+    if !has_exact_json_keys(
+        snapshot,
+        &["kind", "modelId", "baseUrl", "capabilities", "options"],
+    ) || !bounded_single_line_json_string(snapshot.get("kind"), 64)
+        || !snapshot
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "silicon_flow" | "volcengine_ark" | "deep_seek" | "qwen" | "custom"
+                )
+            })
+        || !bounded_single_line_json_string(snapshot.get("modelId"), 512)
+        || !bounded_single_line_json_string(snapshot.get("baseUrl"), 2_048)
+    {
+        return Err(invalid_provider_audit_snapshot());
+    }
+
+    let Some(capabilities) = snapshot
+        .get("capabilities")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(invalid_provider_audit_snapshot());
+    };
+    let capability_keys = [
+        "chat",
+        "streaming",
+        "customModelId",
+        "customBaseUrl",
+        "reasoning",
+    ];
+    if !has_exact_json_keys(capabilities, &capability_keys)
+        || capability_keys.iter().any(|key| {
+            !capabilities
+                .get(*key)
+                .is_some_and(serde_json::Value::is_boolean)
+        })
+    {
+        return Err(invalid_provider_audit_snapshot());
+    }
+
+    let Some(options) = snapshot
+        .get("options")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(invalid_provider_audit_snapshot());
+    };
+    if !has_exact_json_keys(
+        options,
+        &[
+            "thinking",
+            "enableThinking",
+            "thinkingBudget",
+            "reasoningEffort",
+            "endpointId",
+            "workspaceId",
+            "allowPrivateNetwork",
+        ],
+    ) || !optional_json_bool(options.get("thinking"))
+        || !optional_json_bool(options.get("enableThinking"))
+        || !optional_json_u32(options.get("thinkingBudget"))
+        || !optional_reasoning_effort(options.get("reasoningEffort"))
+        || !optional_bounded_json_string(options.get("endpointId"), 512)
+        || !optional_bounded_json_string(options.get("workspaceId"), 512)
+        || !optional_json_bool(options.get("allowPrivateNetwork"))
+    {
+        return Err(invalid_provider_audit_snapshot());
+    }
+
+    Ok(())
+}
+
+fn has_exact_json_keys(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
+    object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+}
+
+fn bounded_single_line_json_string(value: Option<&serde_json::Value>, max_bytes: usize) -> bool {
+    value
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|text| {
+            !text.is_empty() && text.len() <= max_bytes && !text.chars().any(char::is_control)
+        })
+}
+
+fn optional_bounded_json_string(value: Option<&serde_json::Value>, max_bytes: usize) -> bool {
+    value.is_some_and(|value| {
+        value.is_null() || bounded_single_line_json_string(Some(value), max_bytes)
+    })
+}
+
+fn optional_json_bool(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| value.is_null() || value.is_boolean())
+}
+
+fn optional_json_u32(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| {
+        value.is_null()
+            || value
+                .as_u64()
+                .is_some_and(|number| u32::try_from(number).is_ok())
+    })
+}
+
+fn optional_reasoning_effort(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| {
+        value.is_null()
+            || value
+                .as_str()
+                .is_some_and(|effort| matches!(effort, "low" | "medium" | "high" | "max"))
+    })
+}
+
+fn invalid_provider_audit_snapshot() -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "provider audit snapshot does not match the fixed no-credential schema",
+    )))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasePartyRow {
     pub party_id: String,
@@ -316,6 +551,14 @@ pub struct EvidenceLinkRow {
     pub project_id: String,
     pub fact_id: String,
     pub evidence_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactIssueLinkRow {
+    pub link_id: String,
+    pub project_id: String,
+    pub fact_id: String,
+    pub issue_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +620,7 @@ pub struct CaseWorkspaceRows {
     pub facts: Vec<CaseFactRow>,
     pub evidence: Vec<EvidenceItemRow>,
     pub evidence_links: Vec<EvidenceLinkRow>,
+    pub fact_issue_links: Vec<FactIssueLinkRow>,
     pub legal_issues: Vec<LegalIssueRow>,
     pub legal_basis: Vec<LegalBasisRow>,
     pub uncertainties: Vec<CaseUncertaintyRow>,
@@ -388,6 +632,13 @@ pub struct ConfirmedCaseExtractionRows {
     pub project_id: String,
     pub provider_id: String,
     pub source_file_ids: Vec<String>,
+    /// Optimistic-concurrency revision of the exact pending payload being
+    /// confirmed. Confirmation consumes only this revision.
+    pub expected_revision: i64,
+    /// Canonical JSON serialized from the exact typed extraction the user is
+    /// confirming. The confirmation transaction compares it with the latest
+    /// autosaved pending payload so a stale window cannot replay an older edit.
+    pub reviewed_extraction_json: String,
     pub parties: Vec<CasePartyRow>,
     pub facts: Vec<CaseFactRow>,
     pub evidence: Vec<EvidenceItemRow>,
@@ -397,9 +648,41 @@ pub struct ConfirmedCaseExtractionRows {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingExtractionReviewRow {
+    pub review_id: String,
+    pub project_id: String,
+    pub provider_id: String,
+    pub provider_snapshot_json: String,
+    pub source_file_ids_json: String,
+    /// SHA-256 over the exact ordered material fields sent to the provider.
+    /// An empty value is reserved for migrated legacy drafts, which cannot be
+    /// confirmed because their original prompt snapshot is unknowable.
+    pub source_materials_digest: String,
+    pub extraction_json: String,
+    pub revision: i64,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingExtractionReviewUpdate {
+    pub revision: i64,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingExtractionReviewUpdateResult {
+    Updated(PendingExtractionReviewUpdate),
+    Conflict,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegalAnswerRecordRow {
     pub record_id: String,
+    pub project_id: Option<String>,
     pub provider_id: String,
+    pub provider_snapshot_json: String,
     pub question: String,
     pub answer_text: String,
     pub case_date: Option<String>,
@@ -409,6 +692,68 @@ pub struct LegalAnswerRecordRow {
     pub invalid_citations_json: String,
     pub unsupported_legal_conclusion: bool,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentGenerationRecordRow {
+    pub record_id: String,
+    pub project_id: String,
+    pub template_id: String,
+    pub template_version: String,
+    pub source_ids_json: String,
+    pub citation_ids_json: String,
+    pub export_path: String,
+    pub exported_at: String,
+}
+
+pub fn insert_document_generation_record(
+    connection: &rusqlite::Connection,
+    row: &DocumentGenerationRecordRow,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO document_generation_records
+         (record_id, project_id, template_id, template_version, source_ids_json,
+          citation_ids_json, export_path, exported_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row.record_id,
+            row.project_id,
+            row.template_id,
+            row.template_version,
+            row.source_ids_json,
+            row.citation_ids_json,
+            row.export_path,
+            row.exported_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_document_generation_records(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Vec<DocumentGenerationRecordRow>> {
+    let mut statement = connection.prepare(
+        "SELECT record_id, project_id, template_id, template_version, source_ids_json,
+                citation_ids_json, export_path, exported_at
+         FROM document_generation_records WHERE project_id = ?1
+         ORDER BY exported_at DESC, record_id DESC",
+    )?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok(DocumentGenerationRecordRow {
+                record_id: row.get(0)?,
+                project_id: row.get(1)?,
+                template_id: row.get(2)?,
+                template_version: row.get(3)?,
+                source_ids_json: row.get(4)?,
+                citation_ids_json: row.get(5)?,
+                export_path: row.get(6)?,
+                exported_at: row.get(7)?,
+            })
+        })?
+        .collect();
+    rows
 }
 
 pub fn list_case_projects(
@@ -428,11 +773,27 @@ pub fn list_case_projects(
     Ok(rows)
 }
 
+pub fn case_project_exists(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE project_id = ?1)",
+        [project_id],
+        |row| row.get(0),
+    )
+}
+
 pub fn get_case_workspace_rows(
     connection: &rusqlite::Connection,
     project_id: &str,
 ) -> rusqlite::Result<Option<CaseWorkspaceRows>> {
-    let project = connection
+    // Every component must come from one SQLite read snapshot. Without an
+    // explicit transaction a concurrent confirmation/delete can commit
+    // between the project SELECT and any child SELECT, producing a workspace
+    // assembled from different points in time.
+    let transaction = connection.unchecked_transaction()?;
+    let project = transaction
         .query_row(
             "
             SELECT project_id, title, case_type, status, opened_on, summary, created_at, updated_at
@@ -444,21 +805,24 @@ pub fn get_case_workspace_rows(
         )
         .optional()?;
 
-    project
+    let workspace = project
         .map(|project| {
-            Ok(CaseWorkspaceRows {
+            Ok::<_, rusqlite::Error>(CaseWorkspaceRows {
                 project,
-                files: list_case_files(connection, project_id)?,
-                parties: list_case_parties(connection, project_id)?,
-                facts: list_case_facts(connection, project_id)?,
-                evidence: list_evidence_items(connection, project_id)?,
-                evidence_links: list_evidence_links(connection, project_id)?,
-                legal_issues: list_legal_issues(connection, project_id)?,
-                legal_basis: list_legal_basis(connection, project_id)?,
-                uncertainties: list_case_uncertainties(connection, project_id)?,
+                files: list_case_files(&transaction, project_id)?,
+                parties: list_case_parties(&transaction, project_id)?,
+                facts: list_case_facts(&transaction, project_id)?,
+                evidence: list_evidence_items(&transaction, project_id)?,
+                evidence_links: list_evidence_links(&transaction, project_id)?,
+                fact_issue_links: list_fact_issue_links(&transaction, project_id)?,
+                legal_issues: list_legal_issues(&transaction, project_id)?,
+                legal_basis: list_legal_basis(&transaction, project_id)?,
+                uncertainties: list_case_uncertainties(&transaction, project_id)?,
             })
         })
-        .transpose()
+        .transpose()?;
+    transaction.commit()?;
+    Ok(workspace)
 }
 
 pub fn upsert_case_project(
@@ -719,29 +1083,92 @@ pub fn insert_confirmed_case_extraction(
     connection: &mut rusqlite::Connection,
     rows: &ConfirmedCaseExtractionRows,
 ) -> rusqlite::Result<()> {
+    // Expired review payloads are retention-bounded data, not merely hidden
+    // rows. Do this before opening the confirmation transaction so the cleanup
+    // is committed even when confirmation is rejected as expired.
+    cleanup_expired_pending_extraction_reviews(connection)?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-    for file_id in &rows.source_file_ids {
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM case_files WHERE file_id = ?1 AND project_id = ?2)",
-            params![file_id, rows.project_id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(rusqlite::Error::QueryReturnedNoRows);
-        }
+    let persisted_provenance = transaction
+        .query_row(
+            "
+            SELECT provider_id, provider_snapshot_json, source_file_ids_json,
+                   source_materials_digest, extraction_json, revision
+            FROM pending_extraction_reviews
+            WHERE review_id = ?1
+              AND project_id = ?2
+              AND expires_at > CURRENT_TIMESTAMP
+            ",
+            params![rows.review_id, rows.project_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        persisted_provider_id,
+        persisted_provider_snapshot_json,
+        persisted_source_file_ids_json,
+        persisted_source_materials_digest,
+        persisted_extraction_json,
+        persisted_revision,
+    )) = persisted_provenance
+    else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    let persisted_source_file_ids =
+        serde_json::from_str::<Vec<String>>(&persisted_source_file_ids_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let persisted_extraction =
+        serde_json::from_str::<serde_json::Value>(&persisted_extraction_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let reviewed_extraction =
+        serde_json::from_str::<serde_json::Value>(&rows.reviewed_extraction_json)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    validate_provider_audit_snapshot_json(&persisted_provider_snapshot_json)?;
+    let current_source_materials_digest =
+        current_case_materials_digest(&transaction, &rows.project_id, &rows.source_file_ids)?;
+    if persisted_provider_id != rows.provider_id
+        || persisted_source_file_ids != rows.source_file_ids
+        || persisted_source_materials_digest.len() != 64
+        || current_source_materials_digest.as_deref()
+            != Some(persisted_source_materials_digest.as_str())
+        || persisted_extraction != reviewed_extraction
+        || persisted_revision != rows.expected_revision
+    {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
     }
+
     transaction.execute(
         "
         INSERT INTO case_extraction_confirmations (
-            review_id, project_id, provider_id, source_file_ids_json
-        ) VALUES (?1, ?2, ?3, ?4)
+            review_id, project_id, provider_id, provider_snapshot_json,
+            source_file_ids_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
         ",
         params![
             rows.review_id,
             rows.project_id,
             rows.provider_id,
+            persisted_provider_snapshot_json,
             serde_json::to_string(&rows.source_file_ids)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
         ],
@@ -766,7 +1193,227 @@ pub fn insert_confirmed_case_extraction(
         insert_case_uncertainty(&transaction, uncertainty)?;
     }
 
+    // Confirmation and pending-review consumption are one atomic operation.
+    // A crash cannot leave an already-applied review available for replay.
+    let consumed = transaction.execute(
+        "DELETE FROM pending_extraction_reviews
+         WHERE review_id = ?1 AND project_id = ?2 AND revision = ?3",
+        params![rows.review_id, rows.project_id, rows.expected_revision],
+    )?;
+    if consumed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+
     transaction.commit()
+}
+
+pub fn insert_pending_extraction_review(
+    connection: &mut rusqlite::Connection,
+    review: &PendingExtractionReviewRow,
+) -> rusqlite::Result<bool> {
+    validate_provider_audit_snapshot_json(&review.provider_snapshot_json)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "DELETE FROM pending_extraction_reviews WHERE expires_at <= CURRENT_TIMESTAMP",
+        [],
+    )?;
+    let inserted = transaction.execute(
+        "
+        INSERT INTO pending_extraction_reviews (
+            review_id, project_id, provider_id, provider_snapshot_json,
+            source_file_ids_json, source_materials_digest, extraction_json,
+            revision, created_at, expires_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, CURRENT_TIMESTAMP,
+            datetime(CURRENT_TIMESTAMP, ?8)
+        )
+        ON CONFLICT DO NOTHING
+        ",
+        params![
+            review.review_id,
+            review.project_id,
+            review.provider_id,
+            review.provider_snapshot_json,
+            review.source_file_ids_json,
+            review.source_materials_digest,
+            review.extraction_json,
+            PENDING_EXTRACTION_REVIEW_RETENTION_SQL,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(inserted == 1)
+}
+
+pub fn cleanup_expired_pending_extraction_reviews(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "DELETE FROM pending_extraction_reviews WHERE expires_at <= CURRENT_TIMESTAMP",
+        [],
+    )
+}
+
+pub fn get_pending_extraction_review(
+    connection: &rusqlite::Connection,
+    review_id: &str,
+) -> rusqlite::Result<Option<PendingExtractionReviewRow>> {
+    cleanup_expired_pending_extraction_reviews(connection)?;
+    connection
+        .query_row(
+            "
+        SELECT review_id, project_id, provider_id, provider_snapshot_json,
+               source_file_ids_json, source_materials_digest, extraction_json,
+               revision, created_at, expires_at
+        FROM pending_extraction_reviews
+        WHERE review_id = ?1 AND expires_at > CURRENT_TIMESTAMP
+        ",
+            [review_id],
+            pending_extraction_review_from_row,
+        )
+        .optional()
+}
+
+pub fn get_pending_extraction_review_for_project(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<PendingExtractionReviewRow>> {
+    cleanup_expired_pending_extraction_reviews(connection)?;
+    connection
+        .query_row(
+            "
+        SELECT review_id, project_id, provider_id, provider_snapshot_json,
+               source_file_ids_json, source_materials_digest, extraction_json,
+               revision, created_at, expires_at
+        FROM pending_extraction_reviews
+        WHERE project_id = ?1 AND expires_at > CURRENT_TIMESTAMP
+        ",
+            [project_id],
+            pending_extraction_review_from_row,
+        )
+        .optional()
+}
+
+pub fn delete_pending_extraction_review(
+    connection: &rusqlite::Connection,
+    review_id: &str,
+    project_id: &str,
+    expected_revision: i64,
+) -> rusqlite::Result<bool> {
+    Ok(connection.execute(
+        "DELETE FROM pending_extraction_reviews
+         WHERE review_id = ?1
+           AND project_id = ?2
+           AND revision = ?3
+           AND expires_at > CURRENT_TIMESTAMP",
+        params![review_id, project_id, expected_revision],
+    )? > 0)
+}
+
+pub fn update_pending_extraction_review_payload(
+    connection: &mut rusqlite::Connection,
+    review_id: &str,
+    project_id: &str,
+    provider_id: &str,
+    source_file_ids: &[String],
+    extraction_json: &str,
+    expected_revision: i64,
+) -> rusqlite::Result<PendingExtractionReviewUpdateResult> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "DELETE FROM pending_extraction_reviews WHERE expires_at <= CURRENT_TIMESTAMP",
+        [],
+    )?;
+    let persisted = transaction
+        .query_row(
+            "
+            SELECT source_file_ids_json, revision
+            FROM pending_extraction_reviews
+            WHERE review_id = ?1
+              AND project_id = ?2
+              AND provider_id = ?3
+              AND expires_at > CURRENT_TIMESTAMP
+            ",
+            params![review_id, project_id, provider_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((persisted_source_file_ids_json, persisted_revision)) = persisted else {
+        transaction.commit()?;
+        return Ok(PendingExtractionReviewUpdateResult::NotFound);
+    };
+    let persisted_source_file_ids =
+        serde_json::from_str::<Vec<String>>(&persisted_source_file_ids_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    if persisted_source_file_ids != source_file_ids {
+        transaction.commit()?;
+        return Ok(PendingExtractionReviewUpdateResult::NotFound);
+    }
+    if persisted_revision != expected_revision {
+        transaction.commit()?;
+        return Ok(PendingExtractionReviewUpdateResult::Conflict);
+    }
+
+    let affected = transaction.execute(
+        "
+        UPDATE pending_extraction_reviews
+        SET extraction_json = ?1,
+            revision = revision + 1,
+            expires_at = datetime(CURRENT_TIMESTAMP, ?6)
+        WHERE review_id = ?2
+          AND project_id = ?3
+          AND provider_id = ?4
+          AND revision = ?5
+          AND expires_at > CURRENT_TIMESTAMP
+        ",
+        params![
+            extraction_json,
+            review_id,
+            project_id,
+            provider_id,
+            expected_revision,
+            PENDING_EXTRACTION_REVIEW_RETENTION_SQL,
+        ],
+    )?;
+    if affected != 1 {
+        transaction.commit()?;
+        return Ok(PendingExtractionReviewUpdateResult::Conflict);
+    }
+    let (revision, expires_at) = transaction.query_row(
+        "SELECT revision, expires_at FROM pending_extraction_reviews WHERE review_id = ?1",
+        [review_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    transaction.commit()?;
+    Ok(PendingExtractionReviewUpdateResult::Updated(
+        PendingExtractionReviewUpdate {
+            revision,
+            expires_at,
+        },
+    ))
+}
+
+fn pending_extraction_review_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PendingExtractionReviewRow> {
+    Ok(PendingExtractionReviewRow {
+        review_id: row.get(0)?,
+        project_id: row.get(1)?,
+        provider_id: row.get(2)?,
+        provider_snapshot_json: row.get(3)?,
+        source_file_ids_json: row.get(4)?,
+        source_materials_digest: row.get(5)?,
+        extraction_json: row.get(6)?,
+        revision: row.get(7)?,
+        created_at: row.get(8)?,
+        expires_at: row.get(9)?,
+    })
 }
 
 fn insert_case_party(
@@ -1037,6 +1684,35 @@ pub fn upsert_evidence_link(
     )
 }
 
+pub fn upsert_fact_issue_link(
+    connection: &rusqlite::Connection,
+    link: &FactIssueLinkRow,
+) -> rusqlite::Result<()> {
+    let affected_rows = connection.execute(
+        "
+        INSERT INTO fact_issue_links (link_id, project_id, fact_id, issue_id)
+        SELECT ?1, ?2, ?3, ?4
+        WHERE EXISTS (
+            SELECT 1 FROM case_facts
+            WHERE fact_id = ?3 AND project_id = ?2
+        ) AND EXISTS (
+            SELECT 1 FROM legal_issues
+            WHERE issue_id = ?4 AND project_id = ?2
+        )
+        ON CONFLICT(link_id) DO UPDATE SET
+            fact_id = excluded.fact_id,
+            issue_id = excluded.issue_id
+        WHERE fact_issue_links.project_id = excluded.project_id
+        ",
+        params![link.link_id, link.project_id, link.fact_id, link.issue_id],
+    )?;
+
+    ensure_project_scoped_write(
+        affected_rows,
+        "fact-issue link id must stay in its project, and its fact and issue must belong to that project",
+    )
+}
+
 fn ensure_project_scoped_write(affected_rows: usize, message: &str) -> rusqlite::Result<()> {
     if affected_rows == 0 {
         return Err(rusqlite::Error::SqliteFailure(
@@ -1053,17 +1729,35 @@ pub fn delete_case_entity(
     table: &str,
     id_column: &str,
     id: &str,
+    project_id: &str,
 ) -> rusqlite::Result<bool> {
     let sql = match (table, id_column) {
-        ("case_files", "file_id") => "DELETE FROM case_files WHERE file_id = ?1",
-        ("case_parties", "party_id") => "DELETE FROM case_parties WHERE party_id = ?1",
-        ("case_facts", "fact_id") => "DELETE FROM case_facts WHERE fact_id = ?1",
-        ("evidence_items", "evidence_id") => "DELETE FROM evidence_items WHERE evidence_id = ?1",
-        ("evidence_links", "link_id") => "DELETE FROM evidence_links WHERE link_id = ?1",
-        ("legal_issues", "issue_id") => "DELETE FROM legal_issues WHERE issue_id = ?1",
-        ("legal_basis", "basis_id") => "DELETE FROM legal_basis WHERE basis_id = ?1",
+        ("case_files", "file_id") => {
+            "DELETE FROM case_files WHERE file_id = ?1 AND project_id = ?2"
+        }
+        ("case_parties", "party_id") => {
+            "DELETE FROM case_parties WHERE party_id = ?1 AND project_id = ?2"
+        }
+        ("case_facts", "fact_id") => {
+            "DELETE FROM case_facts WHERE fact_id = ?1 AND project_id = ?2"
+        }
+        ("evidence_items", "evidence_id") => {
+            "DELETE FROM evidence_items WHERE evidence_id = ?1 AND project_id = ?2"
+        }
+        ("evidence_links", "link_id") => {
+            "DELETE FROM evidence_links WHERE link_id = ?1 AND project_id = ?2"
+        }
+        ("fact_issue_links", "link_id") => {
+            "DELETE FROM fact_issue_links WHERE link_id = ?1 AND project_id = ?2"
+        }
+        ("legal_issues", "issue_id") => {
+            "DELETE FROM legal_issues WHERE issue_id = ?1 AND project_id = ?2"
+        }
+        ("legal_basis", "basis_id") => {
+            "DELETE FROM legal_basis WHERE basis_id = ?1 AND project_id = ?2"
+        }
         ("case_uncertainties", "uncertainty_id") => {
-            "DELETE FROM case_uncertainties WHERE uncertainty_id = ?1"
+            "DELETE FROM case_uncertainties WHERE uncertainty_id = ?1 AND project_id = ?2"
         }
         _ => return Err(rusqlite::Error::InvalidParameterName(table.to_owned())),
     };
@@ -1077,9 +1771,10 @@ pub fn delete_case_entity(
                 FROM case_extraction_confirmations AS confirmation,
                      json_each(confirmation.source_file_ids_json) AS source_file
                 WHERE source_file.value = ?1
+                  AND confirmation.project_id = ?2
             )
             ",
-            [id],
+            params![id, project_id],
             |row| row.get(0),
         )?;
         if referenced {
@@ -1100,12 +1795,12 @@ pub fn delete_case_entity(
             "
             UPDATE case_uncertainties
             SET related_entity_type = 'general', related_entity_id = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE related_entity_type = ?1 AND related_entity_id = ?2
+            WHERE related_entity_type = ?1 AND related_entity_id = ?2 AND project_id = ?3
             ",
-            params![related_entity_type, id],
+            params![related_entity_type, id, project_id],
         )?;
     }
-    let affected_rows = transaction.execute(sql, [id])?;
+    let affected_rows = transaction.execute(sql, params![id, project_id])?;
     transaction.commit()?;
 
     Ok(affected_rows > 0)
@@ -1208,6 +1903,25 @@ fn list_evidence_links(
     Ok(rows)
 }
 
+fn list_fact_issue_links(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Vec<FactIssueLinkRow>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT link_id, project_id, fact_id, issue_id
+        FROM fact_issue_links
+        WHERE project_id = ?1
+        ORDER BY link_id ASC
+        ",
+    )?;
+    let rows = statement
+        .query_map([project_id], fact_issue_link_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(rows)
+}
+
 fn list_legal_issues(
     connection: &rusqlite::Connection,
     project_id: &str,
@@ -1292,11 +2006,14 @@ pub fn insert_legal_answer_record(
     connection: &rusqlite::Connection,
     record: &LegalAnswerRecordRow,
 ) -> rusqlite::Result<()> {
+    validate_provider_audit_snapshot_json(&record.provider_snapshot_json)?;
     connection.execute(
         "
         INSERT INTO legal_answer_records (
             record_id,
+            project_id,
             provider_id,
+            provider_snapshot_json,
             question,
             answer_text,
             case_date,
@@ -1306,11 +2023,13 @@ pub fn insert_legal_answer_record(
             invalid_citations_json,
             unsupported_legal_conclusion
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ",
         params![
             record.record_id,
+            record.project_id,
             record.provider_id,
+            record.provider_snapshot_json,
             record.question,
             record.answer_text,
             record.case_date,
@@ -1338,7 +2057,9 @@ pub fn list_legal_answer_records(
         "
         SELECT
             record_id,
+            project_id,
             provider_id,
+            provider_snapshot_json,
             question,
             answer_text,
             case_date,
@@ -1358,6 +2079,58 @@ pub fn list_legal_answer_records(
         .query_map([limit], legal_answer_record_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    Ok(rows)
+}
+
+pub fn list_legal_answer_records_for_project(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<LegalAnswerRecordRow>> {
+    list_legal_answer_records_for_project_before(connection, project_id, None, None, limit)
+}
+
+pub fn list_legal_answer_records_for_project_before(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    before_created_at: Option<&str>,
+    before_record_id: Option<&str>,
+    limit: u32,
+) -> rusqlite::Result<Vec<LegalAnswerRecordRow>> {
+    let limit = i64::from(limit.clamp(1, 100));
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            record_id,
+            project_id,
+            provider_id,
+            provider_snapshot_json,
+            question,
+            answer_text,
+            case_date,
+            query_json,
+            source_ids_json,
+            verified_citations_json,
+            invalid_citations_json,
+            unsupported_legal_conclusion,
+            created_at
+        FROM legal_answer_records
+        WHERE project_id = ?1
+          AND (
+              ?2 IS NULL
+              OR created_at < ?2
+              OR (created_at = ?2 AND record_id < ?3)
+          )
+        ORDER BY created_at DESC, record_id DESC
+        LIMIT ?4
+        ",
+    )?;
+    let rows = statement
+        .query_map(
+            params![project_id, before_created_at, before_record_id, limit],
+            legal_answer_record_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -1433,6 +2206,15 @@ fn evidence_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceL
     })
 }
 
+fn fact_issue_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactIssueLinkRow> {
+    Ok(FactIssueLinkRow {
+        link_id: row.get(0)?,
+        project_id: row.get(1)?,
+        fact_id: row.get(2)?,
+        issue_id: row.get(3)?,
+    })
+}
+
 fn legal_issue_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LegalIssueRow> {
     Ok(LegalIssueRow {
         issue_id: row.get(0)?,
@@ -1488,20 +2270,22 @@ fn case_uncertainty_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaseUn
 }
 
 fn legal_answer_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LegalAnswerRecordRow> {
-    let unsupported: i64 = row.get(9)?;
+    let unsupported: i64 = row.get(11)?;
 
     Ok(LegalAnswerRecordRow {
         record_id: row.get(0)?,
-        provider_id: row.get(1)?,
-        question: row.get(2)?,
-        answer_text: row.get(3)?,
-        case_date: row.get(4)?,
-        query_json: row.get(5)?,
-        source_ids_json: row.get(6)?,
-        verified_citations_json: row.get(7)?,
-        invalid_citations_json: row.get(8)?,
+        project_id: row.get(1)?,
+        provider_id: row.get(2)?,
+        provider_snapshot_json: row.get(3)?,
+        question: row.get(4)?,
+        answer_text: row.get(5)?,
+        case_date: row.get(6)?,
+        query_json: row.get(7)?,
+        source_ids_json: row.get(8)?,
+        verified_citations_json: row.get(9)?,
+        invalid_citations_json: row.get(10)?,
         unsupported_legal_conclusion: unsupported != 0,
-        created_at: row.get(10)?,
+        created_at: row.get(12)?,
     })
 }
 
@@ -1510,6 +2294,11 @@ fn configure_legal_core_connection(
 ) -> Result<(), DatabaseInitError> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "trusted_schema", "OFF")?;
+    // The legal corpus is immutable for application connections and is much
+    // larger than SQLite's page cache.  Mapping a bounded 1 GiB window lets
+    // the operating system share hot FTS/index pages across short-lived
+    // read-only connections without reserving an equally large heap cache.
+    connection.pragma_update(None, "mmap_size", 1_073_741_824_i64)?;
     connection.pragma_update(None, "query_only", "ON")?;
 
     Ok(())
@@ -1579,6 +2368,28 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
             "created_at",
         ],
         required_legacy_columns: &["file_id", "project_id", "title"],
+    },
+    UserTableMigrationSpec {
+        name: "pending_extraction_reviews",
+        canonical_columns: &[
+            "review_id",
+            "project_id",
+            "provider_id",
+            "provider_snapshot_json",
+            "source_file_ids_json",
+            "source_materials_digest",
+            "extraction_json",
+            "revision",
+            "created_at",
+            "expires_at",
+        ],
+        required_legacy_columns: &[
+            "review_id",
+            "project_id",
+            "provider_id",
+            "source_file_ids_json",
+            "extraction_json",
+        ],
     },
     UserTableMigrationSpec {
         name: "case_parties",
@@ -1652,11 +2463,17 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
         required_legacy_columns: &["link_id", "project_id", "fact_id", "evidence_id"],
     },
     UserTableMigrationSpec {
+        name: "fact_issue_links",
+        canonical_columns: &["link_id", "project_id", "fact_id", "issue_id"],
+        required_legacy_columns: &["link_id", "project_id", "fact_id", "issue_id"],
+    },
+    UserTableMigrationSpec {
         name: "case_extraction_confirmations",
         canonical_columns: &[
             "review_id",
             "project_id",
             "provider_id",
+            "provider_snapshot_json",
             "source_file_ids_json",
             "confirmed_at",
         ],
@@ -1721,7 +2538,9 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
         name: "legal_answer_records",
         canonical_columns: &[
             "record_id",
+            "project_id",
             "provider_id",
+            "provider_snapshot_json",
             "question",
             "answer_text",
             "case_date",
@@ -1743,21 +2562,48 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
             "unsupported_legal_conclusion",
         ],
     },
+    UserTableMigrationSpec {
+        name: "document_generation_records",
+        canonical_columns: &[
+            "record_id",
+            "project_id",
+            "template_id",
+            "template_version",
+            "source_ids_json",
+            "citation_ids_json",
+            "export_path",
+            "exported_at",
+        ],
+        required_legacy_columns: &[
+            "record_id",
+            "project_id",
+            "template_id",
+            "template_version",
+            "source_ids_json",
+            "citation_ids_json",
+            "export_path",
+            "exported_at",
+        ],
+    },
 ];
 
 const USER_SCHEMA_INDEX_NAMES: &[&str] = &[
     "idx_provider_profiles_kind",
     "idx_projects_updated",
     "idx_case_files_project",
+    "idx_pending_extraction_reviews_expires",
     "idx_case_extraction_confirmations_project",
     "idx_case_parties_project",
     "idx_case_facts_project",
     "idx_evidence_items_project",
     "idx_evidence_links_project",
+    "idx_fact_issue_links_project",
     "idx_legal_issues_project",
     "idx_case_uncertainties_project",
     "idx_legal_basis_project",
     "idx_legal_answer_records_created",
+    "idx_legal_answer_records_project_created",
+    "idx_document_generation_project_exported",
 ];
 
 const USER_SCHEMA_TRIGGER_NAMES: &[&str] = &[
@@ -1767,8 +2613,12 @@ const USER_SCHEMA_TRIGGER_NAMES: &[&str] = &[
 
 const LEGACY_USER_TABLE_DROP_ORDER: &[&str] = &[
     "case_extraction_confirmations",
+    "pending_extraction_reviews",
+    "legal_answer_records",
     "evidence_links",
+    "fact_issue_links",
     "legal_basis",
+    "document_generation_records",
     "case_uncertainties",
     "case_files",
     "case_parties",
@@ -1777,7 +2627,6 @@ const LEGACY_USER_TABLE_DROP_ORDER: &[&str] = &[
     "legal_issues",
     "projects",
     "provider_profiles",
-    "legal_answer_records",
 ];
 
 fn legacy_user_table_name(table: &str) -> String {
@@ -1843,6 +2692,135 @@ fn table_columns(
     Ok(columns)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForeignKeyContract {
+    target_table: String,
+    on_delete: String,
+    columns: Vec<(i64, String, String)>,
+}
+
+fn table_foreign_key_contracts(
+    connection: &rusqlite::Connection,
+    table: &str,
+) -> rusqlite::Result<Vec<ForeignKeyContract>> {
+    let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list(\"{table}\")"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut grouped = BTreeMap::<i64, ForeignKeyContract>::new();
+    for (id, sequence, target_table, from, to, on_delete) in rows {
+        let contract = grouped.entry(id).or_insert_with(|| ForeignKeyContract {
+            target_table,
+            on_delete,
+            columns: Vec::new(),
+        });
+        contract.columns.push((sequence, from, to));
+    }
+    let mut contracts = grouped.into_values().collect::<Vec<_>>();
+    for contract in &mut contracts {
+        contract.columns.sort_by_key(|column| column.0);
+    }
+    Ok(contracts)
+}
+
+fn table_has_unique_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+    expected_columns: &[&str],
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA index_list(\"{table}\")"))?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (index_name, unique, partial) in indexes {
+        if !unique || partial {
+            continue;
+        }
+        let mut columns = connection.prepare(&format!("PRAGMA index_info(\"{index_name}\")"))?;
+        let found = columns
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if found
+            .iter()
+            .map(String::as_str)
+            .eq(expected_columns.iter().copied())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_fact_issue_schema_contract(
+    connection: &rusqlite::Connection,
+) -> Result<(), DatabaseInitError> {
+    for (table, columns) in [
+        ("case_facts", &["project_id", "fact_id"][..]),
+        ("legal_issues", &["project_id", "issue_id"][..]),
+        (
+            "fact_issue_links",
+            &["project_id", "fact_id", "issue_id"][..],
+        ),
+    ] {
+        if !table_has_unique_columns(connection, table, columns)? {
+            return Err(user_schema_migration_error(format!(
+                "canonical {table} unique project-scope contract is missing"
+            ))
+            .into());
+        }
+    }
+
+    let mut found = table_foreign_key_contracts(connection, "fact_issue_links")?;
+    found.sort_by(|left, right| left.target_table.cmp(&right.target_table));
+    let mut expected = vec![
+        ForeignKeyContract {
+            target_table: "case_facts".to_owned(),
+            on_delete: "CASCADE".to_owned(),
+            columns: vec![
+                (0, "project_id".to_owned(), "project_id".to_owned()),
+                (1, "fact_id".to_owned(), "fact_id".to_owned()),
+            ],
+        },
+        ForeignKeyContract {
+            target_table: "legal_issues".to_owned(),
+            on_delete: "CASCADE".to_owned(),
+            columns: vec![
+                (0, "project_id".to_owned(), "project_id".to_owned()),
+                (1, "issue_id".to_owned(), "issue_id".to_owned()),
+            ],
+        },
+        ForeignKeyContract {
+            target_table: "projects".to_owned(),
+            on_delete: "CASCADE".to_owned(),
+            columns: vec![(0, "project_id".to_owned(), "project_id".to_owned())],
+        },
+    ];
+    expected.sort_by(|left, right| left.target_table.cmp(&right.target_table));
+    if found != expected {
+        return Err(user_schema_migration_error(
+            "canonical fact_issue_links foreign-key contract is invalid".to_owned(),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 fn copy_legacy_user_table(
     transaction: &rusqlite::Transaction<'_>,
     spec: &UserTableMigrationSpec,
@@ -1904,13 +2882,152 @@ fn copy_legacy_user_table(
     Ok(())
 }
 
+fn legacy_legal_answer_unowned_count(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<i64> {
+    let legacy_name = legacy_user_table_name("legal_answer_records");
+    let source_columns = table_columns(transaction, &legacy_name)?;
+    if source_columns.contains("project_id") {
+        transaction.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM \"{legacy_name}\"
+                 WHERE project_id IS NULL OR length(project_id) = 0"
+            ),
+            [],
+            |row| row.get(0),
+        )
+    } else {
+        transaction.query_row(
+            &format!("SELECT COUNT(*) FROM \"{legacy_name}\""),
+            [],
+            |row| row.get(0),
+        )
+    }
+}
+
+fn create_legacy_answer_quarantine_project(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<String> {
+    // Never reuse an existing project with the reserved-looking ID: it may be
+    // genuine user data. Select the first unused deterministic suffix instead.
+    for suffix in 0..10_000_u32 {
+        let project_id = if suffix == 0 {
+            LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX.to_owned()
+        } else {
+            format!("{LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX}-{suffix}")
+        };
+        if case_project_exists(transaction, &project_id)? {
+            continue;
+        }
+        transaction.execute(
+            "
+            INSERT INTO projects (project_id, title, case_type, status, summary)
+            VALUES (?1, ?2, 'migration_quarantine', 'archived', ?3)
+            ",
+            params![
+                project_id,
+                LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE,
+                LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
+            ],
+        )?;
+        return Ok(project_id);
+    }
+
+    Err(user_schema_migration_error(
+        "could not allocate a collision-safe legacy answer quarantine project".to_owned(),
+    ))
+}
+
+fn copy_legacy_legal_answers_into_quarantine(
+    transaction: &rusqlite::Transaction<'_>,
+    spec: &UserTableMigrationSpec,
+    quarantine_project_id: &str,
+) -> rusqlite::Result<()> {
+    let legacy_name = legacy_user_table_name(spec.name);
+    let source_columns = table_columns(transaction, &legacy_name)?;
+    let canonical_columns = spec
+        .canonical_columns
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = source_columns
+        .iter()
+        .find(|column| !canonical_columns.contains(column.as_str()))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} contains unsupported column {unknown}; refusing to drop user data",
+            spec.name
+        )));
+    }
+    if let Some(missing) = spec
+        .required_legacy_columns
+        .iter()
+        .find(|column| !source_columns.contains(**column))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} is missing required column {missing}",
+            spec.name
+        )));
+    }
+
+    let mut destination_columns = Vec::new();
+    let mut select_expressions = Vec::new();
+    for column in spec.canonical_columns {
+        if *column == "project_id" {
+            destination_columns.push("\"project_id\"".to_owned());
+            select_expressions.push(if source_columns.contains("project_id") {
+                "CASE WHEN project_id IS NULL OR length(project_id) = 0 THEN ?1 ELSE project_id END"
+                    .to_owned()
+            } else {
+                "?1".to_owned()
+            });
+        } else if source_columns.contains(*column) {
+            destination_columns.push(format!("\"{column}\""));
+            select_expressions.push(format!("\"{column}\""));
+        }
+    }
+    let source_count: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM \"{legacy_name}\""),
+        [],
+        |row| row.get(0),
+    )?;
+    let copied = transaction.execute(
+        &format!(
+            "INSERT INTO \"{}\" ({}) SELECT {} FROM \"{legacy_name}\"",
+            spec.name,
+            destination_columns.join(", "),
+            select_expressions.join(", ")
+        ),
+        [quarantine_project_id],
+    )?;
+    if i64::try_from(copied).ok() != Some(source_count) {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} row count changed during migration",
+            spec.name
+        )));
+    }
+
+    Ok(())
+}
+
 fn migrate_staged_user_tables(
     transaction: &rusqlite::Transaction<'_>,
     staged: &HashSet<&str>,
 ) -> rusqlite::Result<()> {
     for spec in USER_TABLE_MIGRATION_SPECS {
         if staged.contains(spec.name) {
-            copy_legacy_user_table(transaction, spec)?;
+            if spec.name == "legal_answer_records"
+                && legacy_legal_answer_unowned_count(transaction)? > 0
+            {
+                let quarantine_project_id = create_legacy_answer_quarantine_project(transaction)?;
+                copy_legacy_legal_answers_into_quarantine(
+                    transaction,
+                    spec,
+                    &quarantine_project_id,
+                )?;
+            } else {
+                copy_legacy_user_table(transaction, spec)?;
+            }
         }
     }
 
@@ -1960,6 +3077,30 @@ fn validate_project_scoped_relations(connection: &rusqlite::Connection) -> rusql
         ));
     }
 
+    let invalid_fact_issue_link: bool = connection.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM fact_issue_links AS link
+            LEFT JOIN case_facts AS fact
+              ON fact.fact_id = link.fact_id
+             AND fact.project_id = link.project_id
+            LEFT JOIN legal_issues AS issue
+              ON issue.issue_id = link.issue_id
+             AND issue.project_id = link.project_id
+            WHERE fact.fact_id IS NULL OR issue.issue_id IS NULL
+        )
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_fact_issue_link {
+        return Err(user_schema_migration_error(
+            "fact-issue links must reference a fact and legal issue from their own project"
+                .to_owned(),
+        ));
+    }
+
     let invalid_legal_basis: bool = connection.query_row(
         "
         SELECT EXISTS(
@@ -1979,6 +3120,129 @@ fn validate_project_scoped_relations(connection: &rusqlite::Connection) -> rusql
             "legal basis issue must belong to the same project".to_owned(),
         ));
     }
+
+    Ok(())
+}
+
+fn validate_canonical_user_database(
+    connection: &rusqlite::Connection,
+) -> Result<(), DatabaseInitError> {
+    validate_canonical_user_table_shapes(connection)?;
+
+    let marker = user_database_metadata_value(connection, USER_CANONICAL_SCHEMA_MARKER_KEY)?;
+    if marker.as_deref() != Some(USER_CANONICAL_SCHEMA_MARKER_VALUE) {
+        return Err(user_schema_migration_error(
+            "canonical user schema marker is missing or invalid".to_owned(),
+        )
+        .into());
+    }
+    validate_exact_canonical_user_schema(connection)?;
+    validate_project_scoped_relations(connection)?;
+    let mut foreign_keys = connection.prepare("PRAGMA foreign_key_check")?;
+    if foreign_keys.query([])?.next()?.is_some() {
+        return Err(user_schema_migration_error(
+            "foreign key violations remain in user database".to_owned(),
+        )
+        .into());
+    }
+    let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(
+            user_schema_migration_error("user database quick_check failed".to_owned()).into(),
+        );
+    }
+    Ok(())
+}
+
+type UserSchemaObject = (String, String, String, String);
+
+fn user_schema_objects(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<UserSchemaObject>, DatabaseInitError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT type, name, tbl_name, COALESCE(sql, '')
+        FROM sqlite_master
+        WHERE type IN ('table', 'index', 'trigger', 'view')
+          AND name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        ",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            let sql = row.get::<_, String>(3)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                sql.split_whitespace().collect::<Vec<_>>().join(" "),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(objects)
+}
+
+fn validate_exact_canonical_user_schema(
+    connection: &rusqlite::Connection,
+) -> Result<(), DatabaseInitError> {
+    // Generate the expected schema through the same canonical migration code
+    // in a separate empty database. Comparing every non-internal sqlite_master
+    // object proves PK/UNIQUE/CHECK/FK clauses, index definitions and complete
+    // trigger bodies; matching column names or object names alone is not
+    // sufficient for a restore trust boundary.
+    let mut canonical = rusqlite::Connection::open_in_memory()?;
+    canonical.pragma_update(None, "foreign_keys", "ON")?;
+    canonical.pragma_update(None, "trusted_schema", "OFF")?;
+    run_user_migrations(&mut canonical)?;
+
+    if user_schema_objects(connection)? != user_schema_objects(&canonical)? {
+        return Err(user_schema_migration_error(
+            "user database sqlite_master does not match the exact canonical schema".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_canonical_user_table_shapes(
+    connection: &rusqlite::Connection,
+) -> Result<(), DatabaseInitError> {
+    let metadata_columns = table_columns(connection, "user_database_metadata")?;
+    let expected_metadata_columns = ["key", "value", "updated_at"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    if metadata_columns != expected_metadata_columns {
+        return Err(user_schema_migration_error(
+            "user_database_metadata does not match the canonical schema".to_owned(),
+        )
+        .into());
+    }
+
+    for spec in USER_TABLE_MIGRATION_SPECS {
+        if !sqlite_table_exists(connection, spec.name)? {
+            return Err(user_schema_migration_error(format!(
+                "canonical user table is missing: {}",
+                spec.name
+            ))
+            .into());
+        }
+        let found = table_columns(connection, spec.name)?;
+        let expected = spec
+            .canonical_columns
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<HashSet<_>>();
+        if found != expected {
+            return Err(user_schema_migration_error(format!(
+                "canonical user table has an unexpected shape: {}",
+                spec.name
+            ))
+            .into());
+        }
+    }
+
+    validate_fact_issue_schema_contract(connection)?;
 
     Ok(())
 }
@@ -2093,10 +3357,33 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS pending_extraction_reviews (
+            review_id TEXT PRIMARY KEY CHECK (length(review_id) > 0),
+            project_id TEXT NOT NULL UNIQUE,
+            provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+            provider_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(provider_snapshot_json)
+                AND length(provider_snapshot_json) <= 65536
+            ),
+            source_file_ids_json TEXT NOT NULL,
+            source_materials_digest TEXT NOT NULL DEFAULT '' CHECK (
+                length(source_materials_digest) IN (0, 64)
+            ),
+            extraction_json TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL DEFAULT (datetime(CURRENT_TIMESTAMP, '+7 days')),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS case_extraction_confirmations (
             review_id TEXT PRIMARY KEY CHECK (length(review_id) > 0),
             project_id TEXT NOT NULL,
             provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+            provider_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(provider_snapshot_json)
+                AND length(provider_snapshot_json) <= 65536
+            ),
             source_file_ids_json TEXT NOT NULL,
             confirmed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
@@ -2169,7 +3456,21 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             confirmation_status TEXT NOT NULL CHECK (
                 confirmation_status IN ('model_suggested', 'confirmed')
             ),
-            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
+            UNIQUE(project_id, issue_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_issue_links (
+            link_id TEXT PRIMARY KEY CHECK (length(link_id) > 0),
+            project_id TEXT NOT NULL,
+            fact_id TEXT NOT NULL,
+            issue_id TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id, fact_id)
+                REFERENCES case_facts(project_id, fact_id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id, issue_id)
+                REFERENCES legal_issues(project_id, issue_id) ON DELETE CASCADE,
+            UNIQUE(project_id, fact_id, issue_id)
         );
 
         CREATE TABLE IF NOT EXISTS case_uncertainties (
@@ -2241,6 +3542,8 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             ON projects(updated_at);
         CREATE INDEX IF NOT EXISTS idx_case_files_project
             ON case_files(project_id);
+        CREATE INDEX IF NOT EXISTS idx_pending_extraction_reviews_expires
+            ON pending_extraction_reviews(expires_at);
         CREATE INDEX IF NOT EXISTS idx_case_extraction_confirmations_project
             ON case_extraction_confirmations(project_id, confirmed_at);
         CREATE INDEX IF NOT EXISTS idx_case_parties_project
@@ -2251,6 +3554,8 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             ON evidence_items(project_id, evidence_number);
         CREATE INDEX IF NOT EXISTS idx_evidence_links_project
             ON evidence_links(project_id);
+        CREATE INDEX IF NOT EXISTS idx_fact_issue_links_project
+            ON fact_issue_links(project_id, issue_id, fact_id);
         CREATE INDEX IF NOT EXISTS idx_legal_issues_project
             ON legal_issues(project_id);
         CREATE INDEX IF NOT EXISTS idx_case_uncertainties_project
@@ -2260,7 +3565,12 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
 
         CREATE TABLE IF NOT EXISTS legal_answer_records (
             record_id TEXT PRIMARY KEY CHECK (length(record_id) > 0),
+            project_id TEXT NOT NULL CHECK (length(project_id) > 0),
             provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+            provider_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(provider_snapshot_json)
+                AND length(provider_snapshot_json) <= 65536
+            ),
             question TEXT NOT NULL CHECK (length(question) > 0),
             answer_text TEXT NOT NULL DEFAULT '',
             case_date TEXT,
@@ -2271,11 +3581,28 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             unsupported_legal_conclusion INTEGER NOT NULL CHECK (
                 unsupported_legal_conclusion IN (0, 1)
             ),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_legal_answer_records_created
             ON legal_answer_records(created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_answer_records_project_created
+            ON legal_answer_records(project_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS document_generation_records (
+            record_id TEXT PRIMARY KEY CHECK (length(record_id) > 0),
+            project_id TEXT NOT NULL,
+            template_id TEXT NOT NULL CHECK (length(template_id) > 0),
+            template_version TEXT NOT NULL CHECK (length(template_version) > 0),
+            source_ids_json TEXT NOT NULL CHECK (json_valid(source_ids_json)),
+            citation_ids_json TEXT NOT NULL CHECK (json_valid(citation_ids_json)),
+            export_path TEXT NOT NULL DEFAULT '',
+            exported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_document_generation_project_exported
+            ON document_generation_records(project_id, exported_at);
         ",
     )?;
 
@@ -2449,8 +3776,14 @@ mod tests {
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let contender = std::thread::spawn(move || {
             started_tx.send(()).expect("contender start signal sends");
-            let result = delete_case_entity(&mut second, "case_files", "file_id", "file-lock")
-                .map_err(|error| error.to_string());
+            let result = delete_case_entity(
+                &mut second,
+                "case_files",
+                "file_id",
+                "file-lock",
+                "project-lock",
+            )
+            .map_err(|error| error.to_string());
             finished_tx
                 .send(result)
                 .expect("contender completion signal sends");
@@ -2557,6 +3890,144 @@ mod tests {
     }
 
     #[test]
+    fn claimed_current_backup_rejects_weakened_fact_issue_schema_contract() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("canonical database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            connection
+                .execute_batch(
+                    "DROP TABLE fact_issue_links;
+                     CREATE TABLE fact_issue_links (
+                         link_id TEXT PRIMARY KEY,
+                         project_id TEXT NOT NULL,
+                         fact_id TEXT NOT NULL,
+                         issue_id TEXT NOT NULL,
+                         UNIQUE(project_id, fact_id, issue_id)
+                     );
+                     CREATE INDEX idx_fact_issue_links_project
+                         ON fact_issue_links(project_id, issue_id, fact_id);",
+                )
+                .expect("fact-issue table is replaced by a shape-compatible weak table");
+        }
+
+        let error = validate_and_migrate_user_database(&database_path)
+            .expect_err("a current marker cannot bless missing project-scope foreign keys");
+        assert!(error
+            .to_string()
+            .contains("fact_issue_links foreign-key contract"));
+    }
+
+    #[test]
+    fn claimed_current_backup_rejects_same_columns_with_weakened_legacy_constraints() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("canonical database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            connection
+                .execute_batch(
+                    "DROP TABLE evidence_links;
+                     CREATE TABLE evidence_links (
+                         link_id TEXT,
+                         project_id TEXT,
+                         fact_id TEXT,
+                         evidence_id TEXT
+                     );
+                     CREATE INDEX idx_evidence_links_project
+                         ON evidence_links(link_id);
+                     DROP TRIGGER trg_legal_basis_issue_project_insert;
+                     CREATE TRIGGER trg_legal_basis_issue_project_insert
+                     BEFORE INSERT ON legal_basis
+                     BEGIN
+                         SELECT 1;
+                     END;",
+                )
+                .expect("legacy relationship constraints are weakened without changing names");
+        }
+
+        let error = validate_and_migrate_user_database(&database_path)
+            .expect_err("a current marker cannot bless weak tables, indexes or trigger bodies");
+        assert!(error
+            .to_string()
+            .contains("sqlite_master does not match the exact canonical schema"));
+    }
+
+    #[test]
+    fn canonical_migration_adds_zero_revision_to_existing_pending_reviews() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        let connection = rusqlite::Connection::open(&database_path).expect("legacy database opens");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE user_database_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO user_database_metadata (key, value)
+                VALUES ('schema_version', '7');
+                INSERT INTO user_database_metadata (key, value)
+                VALUES (
+                    'canonical_schema_version',
+                    'v7-answer-ownership-pending-review-quarantine-20260714'
+                );
+                CREATE TABLE projects (
+                    project_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                INSERT INTO projects (project_id, title, status)
+                VALUES ('project-pending-migration', 'Pending migration', 'active');
+                CREATE TABLE pending_extraction_reviews (
+                    review_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL UNIQUE,
+                    provider_id TEXT NOT NULL,
+                    source_file_ids_json TEXT NOT NULL,
+                    extraction_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TEXT NOT NULL
+                );
+                INSERT INTO pending_extraction_reviews (
+                    review_id, project_id, provider_id, source_file_ids_json,
+                    extraction_json, expires_at
+                ) VALUES (
+                    'review-pending-migration', 'project-pending-migration', 'provider',
+                    '[\"file\"]',
+                    '{\"parties\":[],\"facts\":[],\"evidence\":[],\"legalIssues\":[],\"uncertainties\":[]}',
+                    datetime(CURRENT_TIMESTAMP, '+30 minutes')
+                );
+                ",
+            )
+            .expect("legacy pending review schema seeds");
+        drop(connection);
+
+        ensure_user_database(directory.path()).expect("pending review schema migrates");
+        let connection = open_user_database(&database_path).expect("migrated database opens");
+        let row = get_pending_extraction_review(&connection, "review-pending-migration")
+            .expect("migrated review reads")
+            .expect("migrated review remains");
+        assert_eq!(row.revision, 0);
+        assert_eq!(
+            row.provider_snapshot_json, "{}",
+            "legacy review must not invent a provider audit snapshot"
+        );
+        assert_eq!(
+            row.source_materials_digest, "",
+            "legacy review has no trustworthy prompt snapshot and must fail closed on confirm"
+        );
+        connection
+            .execute(
+                "UPDATE pending_extraction_reviews SET revision = -1
+                 WHERE review_id = 'review-pending-migration'",
+                [],
+            )
+            .expect_err("canonical revision constraint rejects negative revisions");
+    }
+
+    #[test]
     fn user_database_migrates_v1_to_provider_profile_schema() {
         let directory = tempfile::tempdir().expect("tempdir exists");
         let database_path = directory.path().join(USER_DB_FILE_NAME);
@@ -2639,11 +4110,13 @@ mod tests {
         for table in [
             "projects",
             "case_files",
+            "pending_extraction_reviews",
             "case_extraction_confirmations",
             "case_parties",
             "case_facts",
             "evidence_items",
             "evidence_links",
+            "fact_issue_links",
             "legal_issues",
             "case_uncertainties",
             "legal_basis",
@@ -2909,6 +4382,7 @@ mod tests {
             "case_facts",
             "evidence_items",
             "evidence_links",
+            "fact_issue_links",
             "legal_issues",
         ] {
             let remaining: i64 = connection
@@ -2998,6 +4472,171 @@ mod tests {
 
         assert_eq!(schema_version, USER_SCHEMA_VERSION.to_string());
         assert_eq!(sqlite_master_count(&connection, "legal_basis"), 1);
+        assert_eq!(
+            table_row_count(&connection, "projects"),
+            0,
+            "an empty legacy answer table must not create a quarantine project"
+        );
+    }
+
+    #[test]
+    fn user_database_migrates_v6_answers_into_collision_safe_deletable_quarantine() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        {
+            let connection =
+                rusqlite::Connection::open(&database_path).expect("legacy database opens");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE user_database_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE projects (
+                        project_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        case_type TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        opened_on TEXT,
+                        summary TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE legal_answer_records (
+                        record_id TEXT PRIMARY KEY,
+                        provider_id TEXT NOT NULL,
+                        question TEXT NOT NULL,
+                        answer_text TEXT NOT NULL DEFAULT '',
+                        case_date TEXT,
+                        query_json TEXT NOT NULL,
+                        source_ids_json TEXT NOT NULL,
+                        verified_citations_json TEXT NOT NULL,
+                        invalid_citations_json TEXT NOT NULL,
+                        unsupported_legal_conclusion INTEGER NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO projects (project_id, title, status)
+                    VALUES ('legacy-project', 'Legacy project', 'active');
+                    INSERT INTO projects (project_id, title, status)
+                    VALUES (
+                        'migration-unassigned-legal-answers',
+                        'User project occupying the reserved-looking ID',
+                        'active'
+                    );
+                    INSERT INTO legal_answer_records (
+                        record_id, provider_id, question, answer_text, case_date,
+                        query_json, source_ids_json, verified_citations_json,
+                        invalid_citations_json, unsupported_legal_conclusion, created_at
+                    ) VALUES (
+                        'legacy-answer', 'legacy-provider', 'Preserve question',
+                        'Preserve answer', '2024-01-02', '{\"keywords\":[\"breach\"]}',
+                        '[\"source-1\"]',
+                        '[{\"rawMarker\":\"[SRC:source-1]\",\"sourceId\":\"source-1\",\"status\":\"valid\",\"reason\":null,\"source\":null}]',
+                        '[]', 0,
+                        '2026-07-13 10:00:00'
+                    );
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('schema_version', '6');
+                    INSERT INTO user_database_metadata (key, value)
+                    VALUES ('canonical_schema_version', 'v6-project-scope-integrity-20260713');
+                    ",
+                )
+                .expect("v6 fixture writes");
+        }
+
+        ensure_user_database(directory.path()).expect("v6 database migrates");
+        let connection = open_user_database(&database_path).expect("migrated database opens");
+        let migrated = connection
+            .query_row(
+                "SELECT project_id, provider_id, question, answer_text, case_date,
+                        query_json, source_ids_json, verified_citations_json,
+                        invalid_citations_json, unsupported_legal_conclusion, created_at
+                 FROM legal_answer_records WHERE record_id = 'legacy-answer'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                },
+            )
+            .expect("legacy answer survives");
+        let quarantine_project_id = format!("{LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX}-1");
+        assert_eq!(
+            migrated.0, quarantine_project_id,
+            "the pre-existing base ID must never receive unowned records"
+        );
+        assert_eq!(migrated.1, "legacy-provider");
+        assert_eq!(migrated.2, "Preserve question");
+        assert_eq!(migrated.3, "Preserve answer");
+        assert_eq!(migrated.4.as_deref(), Some("2024-01-02"));
+        assert_eq!(migrated.5, r#"{"keywords":["breach"]}"#);
+        assert_eq!(migrated.6, r#"["source-1"]"#);
+        assert_eq!(
+            migrated.7,
+            r#"[{"rawMarker":"[SRC:source-1]","sourceId":"source-1","status":"valid","reason":null,"source":null}]"#
+        );
+        assert_eq!(migrated.8, "[]");
+        assert_eq!(migrated.9, 0);
+        assert_eq!(migrated.10, "2026-07-13 10:00:00");
+
+        let quarantine = connection
+            .query_row(
+                "SELECT title, status, summary FROM projects WHERE project_id = ?1",
+                [&quarantine_project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("quarantine project is visible and recoverable");
+        assert_eq!(quarantine.0, LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE);
+        assert_eq!(quarantine.1, "archived");
+        assert_eq!(quarantine.2, LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY);
+        let project_id_not_null: i64 = connection
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('legal_answer_records')
+                 WHERE name = 'project_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("canonical project ownership constraint reads");
+        assert_eq!(project_id_not_null, 1);
+        assert_eq!(
+            list_legal_answer_records_for_project(&connection, &quarantine_project_id, 10)
+                .expect("quarantined history is readable")
+                .len(),
+            1
+        );
+        assert!(
+            case_project_exists(&connection, LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX)
+                .expect("colliding user project remains")
+        );
+        assert!(delete_case_project(&connection, &quarantine_project_id)
+            .expect("quarantine project deletes"));
+        assert_eq!(
+            table_row_count(&connection, "legal_answer_records"),
+            0,
+            "deleting the quarantine project removes every legacy sensitive answer"
+        );
+        assert!(
+            case_project_exists(&connection, LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX)
+                .expect("colliding user project still remains after quarantine deletion")
+        );
     }
 
     #[test]
@@ -3705,6 +5344,16 @@ mod tests {
                 },
             )
             .expect("issue inserts");
+            upsert_fact_issue_link(
+                &connection,
+                &FactIssueLinkRow {
+                    link_id: "fact-issue-1".to_owned(),
+                    project_id: "project-1".to_owned(),
+                    fact_id: "fact-1".to_owned(),
+                    issue_id: "issue-1".to_owned(),
+                },
+            )
+            .expect("fact-issue link inserts");
             upsert_case_uncertainty(
                 &connection,
                 &CaseUncertaintyRow {
@@ -3759,6 +5408,7 @@ mod tests {
         assert_eq!(workspace.facts.len(), 1);
         assert_eq!(workspace.evidence.len(), 1);
         assert_eq!(workspace.evidence_links.len(), 1);
+        assert_eq!(workspace.fact_issue_links.len(), 1);
         assert_eq!(workspace.legal_issues.len(), 1);
         assert_eq!(workspace.legal_basis.len(), 1);
         assert_eq!(workspace.uncertainties.len(), 1);
@@ -3783,6 +5433,7 @@ mod tests {
             "case_facts",
             "evidence_items",
             "evidence_links",
+            "fact_issue_links",
             "legal_issues",
             "case_uncertainties",
             "legal_basis",
@@ -3796,7 +5447,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir exists");
         let database_path =
             ensure_user_database(directory.path()).expect("user database is created");
-        let connection = open_user_database(&database_path).expect("user database opens");
+        let mut connection = open_user_database(&database_path).expect("user database opens");
         seed_project(&connection, "project-a");
         seed_project(&connection, "project-b");
 
@@ -3999,6 +5650,19 @@ mod tests {
             ),
             ("project-a".to_owned(), "Owned basis".to_owned())
         );
+
+        assert!(!delete_case_entity(
+            &mut connection,
+            "case_facts",
+            "fact_id",
+            "shared-fact",
+            "project-b",
+        )
+        .expect("cross-project delete is rejected as not owned"));
+        assert_eq!(
+            project_and_value(&connection, "case_facts", "fact_id", "shared-fact", "title"),
+            ("project-a".to_owned(), "Owned fact".to_owned())
+        );
     }
 
     #[test]
@@ -4200,6 +5864,613 @@ mod tests {
     }
 
     #[test]
+    fn fact_issue_links_are_strictly_project_scoped_unique_and_cascade() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let connection = open_user_database(&database_path).expect("user database opens");
+        seed_project(&connection, "project-a");
+        seed_project(&connection, "project-b");
+
+        for (fact_id, project_id) in [("fact-a", "project-a"), ("fact-b", "project-b")] {
+            upsert_case_fact(
+                &connection,
+                &CaseFactRow {
+                    fact_id: fact_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    occurred_on: None,
+                    title: fact_id.to_owned(),
+                    description: String::new(),
+                    source: String::new(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("fact inserts");
+        }
+        for (issue_id, project_id) in [("issue-a", "project-a"), ("issue-b", "project-b")] {
+            upsert_legal_issue(
+                &connection,
+                &LegalIssueRow {
+                    issue_id: issue_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    title: issue_id.to_owned(),
+                    description: String::new(),
+                    claim: String::new(),
+                    status: "open".to_owned(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("issue inserts");
+        }
+
+        let mixed = FactIssueLinkRow {
+            link_id: "mixed-link".to_owned(),
+            project_id: "project-a".to_owned(),
+            fact_id: "fact-a".to_owned(),
+            issue_id: "issue-b".to_owned(),
+        };
+        assert_project_scope_error(
+            upsert_fact_issue_link(&connection, &mixed)
+                .expect_err("mixed-project relationship is rejected"),
+            "fact-issue link",
+        );
+        connection
+            .execute(
+                "INSERT INTO fact_issue_links (link_id, project_id, fact_id, issue_id)
+                 VALUES ('direct-mixed', 'project-a', 'fact-a', 'issue-b')",
+                [],
+            )
+            .expect_err("composite foreign key rejects direct mixed-project SQL");
+
+        let valid = FactIssueLinkRow {
+            link_id: "owned-link".to_owned(),
+            project_id: "project-a".to_owned(),
+            fact_id: "fact-a".to_owned(),
+            issue_id: "issue-a".to_owned(),
+        };
+        upsert_fact_issue_link(&connection, &valid).expect("same-project relationship inserts");
+        assert_project_scope_error(
+            upsert_fact_issue_link(
+                &connection,
+                &FactIssueLinkRow {
+                    link_id: "duplicate-link".to_owned(),
+                    ..valid.clone()
+                },
+            )
+            .expect_err("one fact/issue pair cannot be duplicated"),
+            "UNIQUE",
+        );
+        assert_project_scope_error(
+            upsert_fact_issue_link(
+                &connection,
+                &FactIssueLinkRow {
+                    link_id: valid.link_id.clone(),
+                    project_id: "project-b".to_owned(),
+                    fact_id: "fact-b".to_owned(),
+                    issue_id: "issue-b".to_owned(),
+                },
+            )
+            .expect_err("relationship id cannot move between projects"),
+            "fact-issue link",
+        );
+        let workspace = get_case_workspace_rows(&connection, "project-a")
+            .expect("workspace reads")
+            .expect("project exists");
+        assert_eq!(workspace.fact_issue_links, vec![valid.clone()]);
+
+        connection
+            .execute("DELETE FROM case_facts WHERE fact_id = 'fact-a'", [])
+            .expect("fact deletes");
+        assert_eq!(table_row_count(&connection, "fact_issue_links"), 0);
+        upsert_case_fact(
+            &connection,
+            &CaseFactRow {
+                fact_id: "fact-a".to_owned(),
+                project_id: "project-a".to_owned(),
+                occurred_on: None,
+                title: "fact-a".to_owned(),
+                description: String::new(),
+                source: String::new(),
+                confirmation_status: "confirmed".to_owned(),
+            },
+        )
+        .expect("fact reinserts");
+        upsert_fact_issue_link(&connection, &valid).expect("relationship reinserts");
+        connection
+            .execute("DELETE FROM legal_issues WHERE issue_id = 'issue-a'", [])
+            .expect("issue deletes");
+        assert_eq!(table_row_count(&connection, "fact_issue_links"), 0);
+    }
+
+    #[test]
+    fn version_seven_migration_preserves_entities_and_adds_empty_fact_issue_links() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("current database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            seed_project(&connection, "legacy-project");
+            upsert_case_fact(
+                &connection,
+                &CaseFactRow {
+                    fact_id: "legacy-fact".to_owned(),
+                    project_id: "legacy-project".to_owned(),
+                    occurred_on: None,
+                    title: "Preserved fact".to_owned(),
+                    description: String::new(),
+                    source: String::new(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("legacy fact inserts");
+            upsert_legal_issue(
+                &connection,
+                &LegalIssueRow {
+                    issue_id: "legacy-issue".to_owned(),
+                    project_id: "legacy-project".to_owned(),
+                    title: "Preserved issue".to_owned(),
+                    description: String::new(),
+                    claim: String::new(),
+                    status: "open".to_owned(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("legacy issue inserts");
+            connection
+                .execute_batch(
+                    "DROP TABLE fact_issue_links;
+                     UPDATE user_database_metadata SET value = '7'
+                     WHERE key = 'schema_version';
+                     UPDATE user_database_metadata
+                     SET value = 'v7-document-generation-records-20260715'
+                     WHERE key = 'canonical_schema_version';",
+                )
+                .expect("database is reduced to the v7 contract");
+        }
+
+        ensure_user_database(directory.path()).expect("v7 database migrates to v8");
+        let connection = open_user_database(&database_path).expect("migrated database opens");
+        let workspace = get_case_workspace_rows(&connection, "legacy-project")
+            .expect("workspace reads")
+            .expect("project survives");
+        assert_eq!(workspace.facts[0].title, "Preserved fact");
+        assert_eq!(workspace.legal_issues[0].title, "Preserved issue");
+        assert!(workspace.fact_issue_links.is_empty());
+    }
+
+    #[test]
+    fn canonical_rebuild_preserves_existing_fact_issue_links() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("current database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            seed_project(&connection, "project-rebuild");
+            upsert_case_fact(
+                &connection,
+                &CaseFactRow {
+                    fact_id: "fact-rebuild".to_owned(),
+                    project_id: "project-rebuild".to_owned(),
+                    occurred_on: None,
+                    title: "Fact".to_owned(),
+                    description: String::new(),
+                    source: String::new(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("fact inserts");
+            upsert_legal_issue(
+                &connection,
+                &LegalIssueRow {
+                    issue_id: "issue-rebuild".to_owned(),
+                    project_id: "project-rebuild".to_owned(),
+                    title: "Issue".to_owned(),
+                    description: String::new(),
+                    claim: String::new(),
+                    status: "open".to_owned(),
+                    confirmation_status: "confirmed".to_owned(),
+                },
+            )
+            .expect("issue inserts");
+            upsert_fact_issue_link(
+                &connection,
+                &FactIssueLinkRow {
+                    link_id: "link-rebuild".to_owned(),
+                    project_id: "project-rebuild".to_owned(),
+                    fact_id: "fact-rebuild".to_owned(),
+                    issue_id: "issue-rebuild".to_owned(),
+                },
+            )
+            .expect("relationship inserts");
+            connection
+                .execute(
+                    "UPDATE user_database_metadata SET value = 'precanonical-v8'
+                     WHERE key = 'canonical_schema_version'",
+                    [],
+                )
+                .expect("marker is made stale");
+        }
+
+        ensure_user_database(directory.path()).expect("canonical rebuild succeeds");
+        let connection = open_user_database(&database_path).expect("rebuilt database opens");
+        let workspace = get_case_workspace_rows(&connection, "project-rebuild")
+            .expect("workspace reads")
+            .expect("project survives");
+        assert_eq!(workspace.fact_issue_links.len(), 1);
+        assert_eq!(workspace.fact_issue_links[0].link_id, "link-rebuild");
+        assert_eq!(
+            sqlite_master_count(
+                &connection,
+                "__lawyer_assistance_v6_legacy_fact_issue_links"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn pending_extraction_review_survives_restart_is_project_scoped_and_expires() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        {
+            let mut connection = open_user_database(&database_path).expect("database opens");
+            seed_project(&connection, "project-pending");
+            insert_pending_extraction_review(
+                &mut connection,
+                &PendingExtractionReviewRow {
+                    review_id: "review-pending".to_owned(),
+                    project_id: "project-pending".to_owned(),
+                    provider_id: "provider-pending".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                    source_file_ids_json: r#"["file-1"]"#.to_owned(),
+                    source_materials_digest: "0".repeat(64),
+                    extraction_json: r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[]}"#.to_owned(),
+                    revision: 0,
+                    created_at: String::new(),
+                    expires_at: String::new(),
+                },
+            )
+            .expect("pending review inserts");
+        }
+
+        let connection = open_user_database(&database_path).expect("database reopens");
+        let restored = get_pending_extraction_review_for_project(&connection, "project-pending")
+            .expect("pending project lookup succeeds")
+            .expect("pending review survives restart");
+        assert_eq!(restored.review_id, "review-pending");
+        assert!(!delete_pending_extraction_review(
+            &connection,
+            "review-pending",
+            "different-project",
+            0,
+        )
+        .expect("wrong-owner deletion is rejected"));
+        connection
+            .execute(
+                "UPDATE pending_extraction_reviews SET expires_at = '2000-01-01 00:00:00'",
+                [],
+            )
+            .expect("fixture expiry updates");
+        assert!(get_pending_extraction_review(&connection, "review-pending")
+            .expect("expired lookup succeeds")
+            .is_none());
+        let retained: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pending_extraction_reviews",
+                [],
+                |row| row.get(0),
+            )
+            .expect("physical retention count reads");
+        assert_eq!(
+            retained, 0,
+            "expired sensitive payload is physically removed"
+        );
+    }
+
+    #[test]
+    fn confirmation_requires_matching_unexpired_persisted_provenance() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_extraction_project_and_file(&connection);
+        let rows = confirmed_extraction_rows();
+
+        assert!(matches!(
+            insert_confirmed_case_extraction(&mut connection, &rows),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        persist_pending_for_confirmed_rows(&mut connection, &rows);
+
+        let mut wrong_provider = rows.clone();
+        wrong_provider.provider_id = "other-provider".to_owned();
+        assert!(matches!(
+            insert_confirmed_case_extraction(&mut connection, &wrong_provider),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        let mut wrong_sources = rows.clone();
+        wrong_sources.source_file_ids = vec!["different-file".to_owned()];
+        assert!(matches!(
+            insert_confirmed_case_extraction(&mut connection, &wrong_sources),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        let mut stale_payload = rows.clone();
+        stale_payload.reviewed_extraction_json =
+            r#"{"parties":[{"name":"stale-window","role":"plaintiff"}],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
+                .to_owned();
+        assert!(matches!(
+            insert_confirmed_case_extraction(&mut connection, &stale_payload),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        assert_eq!(
+            table_row_count(&connection, "case_extraction_confirmations"),
+            0
+        );
+        assert!(get_pending_extraction_review(&connection, &rows.review_id)
+            .expect("pending lookup succeeds")
+            .is_some());
+
+        insert_confirmed_case_extraction(&mut connection, &rows)
+            .expect("matching persisted provenance confirms");
+        assert_eq!(
+            table_row_count(&connection, "case_extraction_confirmations"),
+            1
+        );
+        let confirmed_snapshot: String = connection
+            .query_row(
+                "SELECT provider_snapshot_json FROM case_extraction_confirmations
+                 WHERE review_id = ?1",
+                [&rows.review_id],
+                |row| row.get(0),
+            )
+            .expect("confirmed provider snapshot reads");
+        assert_eq!(
+            confirmed_snapshot,
+            provider_snapshot_json(),
+            "confirmation must copy the immutable generation-time provider snapshot"
+        );
+        assert!(get_pending_extraction_review(&connection, &rows.review_id)
+            .expect("consumed lookup succeeds")
+            .is_none());
+    }
+
+    #[test]
+    fn expired_review_is_physically_removed_and_cannot_confirm() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_extraction_project_and_file(&connection);
+        let rows = confirmed_extraction_rows();
+        persist_pending_for_confirmed_rows(&mut connection, &rows);
+        connection
+            .execute(
+                "UPDATE pending_extraction_reviews SET expires_at = '2000-01-01 00:00:00'",
+                [],
+            )
+            .expect("fixture expires");
+
+        assert!(matches!(
+            insert_confirmed_case_extraction(&mut connection, &rows),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        let retained: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pending_extraction_reviews",
+                [],
+                |row| row.get(0),
+            )
+            .expect("retention count reads");
+        assert_eq!(retained, 0);
+        assert_eq!(
+            table_row_count(&connection, "case_extraction_confirmations"),
+            0
+        );
+    }
+
+    #[test]
+    fn pending_review_payload_update_is_provenance_scoped_and_extends_expiry() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_extraction_project_and_file(&connection);
+        let rows = confirmed_extraction_rows();
+        persist_pending_for_confirmed_rows(&mut connection, &rows);
+        connection
+            .execute(
+                "UPDATE pending_extraction_reviews
+                 SET expires_at = datetime(CURRENT_TIMESTAMP, '+1 minute')",
+                [],
+            )
+            .expect("fixture shortens expiry");
+        let revised = r#"{"parties":[],"facts":[{"occurredOn":null,"title":"Reviewed","description":"Edited","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#;
+
+        assert!(
+            update_pending_extraction_review_payload(
+                &mut connection,
+                &rows.review_id,
+                &rows.project_id,
+                "wrong-provider",
+                &rows.source_file_ids,
+                revised,
+                0,
+            )
+            .expect("wrong-provider update is typed")
+                == PendingExtractionReviewUpdateResult::NotFound
+        );
+        assert!(
+            update_pending_extraction_review_payload(
+                &mut connection,
+                &rows.review_id,
+                &rows.project_id,
+                &rows.provider_id,
+                &["wrong-file".to_owned()],
+                revised,
+                0,
+            )
+            .expect("wrong-source update is typed")
+                == PendingExtractionReviewUpdateResult::NotFound
+        );
+
+        let updated = update_pending_extraction_review_payload(
+            &mut connection,
+            &rows.review_id,
+            &rows.project_id,
+            &rows.provider_id,
+            &rows.source_file_ids,
+            revised,
+            0,
+        )
+        .expect("matching update succeeds");
+        let PendingExtractionReviewUpdateResult::Updated(updated) = updated else {
+            panic!("matching update must return the advanced revision");
+        };
+        assert_eq!(updated.revision, 1);
+        let stored: (String, i64, String) = connection
+            .query_row(
+                "SELECT extraction_json, revision, expires_at FROM pending_extraction_reviews
+                 WHERE review_id = ?1",
+                [&rows.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("updated review reads");
+        assert_eq!(stored.0, revised);
+        assert_eq!(stored.1, 1);
+        assert_eq!(stored.2, updated.expires_at);
+        let remaining_days: f64 = connection
+            .query_row(
+                "SELECT julianday(expires_at) - julianday(CURRENT_TIMESTAMP)
+                 FROM pending_extraction_reviews WHERE review_id = ?1",
+                [&rows.review_id],
+                |row| row.get(0),
+            )
+            .expect("expiry duration reads");
+        assert!(remaining_days > 6.9, "expiry is renewed for seven days");
+    }
+
+    #[test]
+    fn pending_review_revision_cas_rejects_stale_cross_connection_mutations() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let mut first = open_user_database(&database_path).expect("first database opens");
+        seed_extraction_project_and_file(&first);
+        let rows = confirmed_extraction_rows();
+        persist_pending_for_confirmed_rows(&mut first, &rows);
+        let mut second = open_user_database(&database_path).expect("second database opens");
+        let material_digest =
+            current_case_materials_digest(&second, &rows.project_id, &rows.source_file_ids)
+                .expect("material digest reads")
+                .expect("material exists");
+
+        assert!(!insert_pending_extraction_review(
+            &mut second,
+            &PendingExtractionReviewRow {
+                review_id: "review-from-another-window".to_owned(),
+                project_id: rows.project_id.clone(),
+                provider_id: "other-provider".to_owned(),
+                provider_snapshot_json: provider_snapshot_json(),
+                source_file_ids_json: r#"["file-source"]"#.to_owned(),
+                source_materials_digest: material_digest,
+                extraction_json:
+                    r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
+                        .to_owned(),
+                revision: 0,
+                created_at: String::new(),
+                expires_at: String::new(),
+            },
+        )
+        .expect("conflicting create is typed"));
+        let original = get_pending_extraction_review_for_project(&second, &rows.project_id)
+            .expect("authoritative pending review reads")
+            .expect("authoritative pending review remains");
+        assert_eq!(original.review_id, rows.review_id);
+        assert_eq!(original.provider_id, rows.provider_id);
+        assert_eq!(original.revision, 0);
+
+        let first_edit = r#"{"parties":[],"facts":[{"occurredOn":null,"title":"First window","description":"Newest","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#;
+        let stale_edit = r#"{"parties":[],"facts":[{"occurredOn":null,"title":"Stale window","description":"Must not win","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#;
+        let first_result = update_pending_extraction_review_payload(
+            &mut first,
+            &rows.review_id,
+            &rows.project_id,
+            &rows.provider_id,
+            &rows.source_file_ids,
+            first_edit,
+            0,
+        )
+        .expect("first autosave succeeds");
+        assert!(matches!(
+            first_result,
+            PendingExtractionReviewUpdateResult::Updated(PendingExtractionReviewUpdate {
+                revision: 1,
+                ..
+            })
+        ));
+
+        let stale_autosave = update_pending_extraction_review_payload(
+            &mut second,
+            &rows.review_id,
+            &rows.project_id,
+            &rows.provider_id,
+            &rows.source_file_ids,
+            stale_edit,
+            0,
+        )
+        .expect("stale autosave is typed");
+        assert_eq!(
+            stale_autosave,
+            PendingExtractionReviewUpdateResult::Conflict
+        );
+        let stored = get_pending_extraction_review(&second, &rows.review_id)
+            .expect("pending review reads")
+            .expect("pending review remains");
+        assert_eq!(stored.extraction_json, first_edit);
+        assert_eq!(stored.revision, 1);
+
+        let mut stale_confirmation = rows.clone();
+        stale_confirmation.reviewed_extraction_json = first_edit.to_owned();
+        stale_confirmation.expected_revision = 0;
+        assert!(matches!(
+            insert_confirmed_case_extraction(&mut second, &stale_confirmation),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        assert_eq!(table_row_count(&second, "case_extraction_confirmations"), 0);
+        assert!(
+            !delete_pending_extraction_review(&second, &rows.review_id, &rows.project_id, 0,)
+                .expect("stale discard is rejected")
+        );
+
+        let second_edit = r#"{"parties":[],"facts":[{"occurredOn":null,"title":"First window again","description":"Queued second save","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[]}"#;
+        let second_result = update_pending_extraction_review_payload(
+            &mut first,
+            &rows.review_id,
+            &rows.project_id,
+            &rows.provider_id,
+            &rows.source_file_ids,
+            second_edit,
+            1,
+        )
+        .expect("consecutive autosave succeeds");
+        assert!(matches!(
+            second_result,
+            PendingExtractionReviewUpdateResult::Updated(PendingExtractionReviewUpdate {
+                revision: 2,
+                ..
+            })
+        ));
+        assert!(
+            !delete_pending_extraction_review(&second, &rows.review_id, &rows.project_id, 1,)
+                .expect("discard cannot delete a newer queued save")
+        );
+        assert!(
+            delete_pending_extraction_review(&second, &rows.review_id, &rows.project_id, 2,)
+                .expect("current revision can be discarded")
+        );
+    }
+
+    #[test]
     fn confirmed_extraction_is_atomic_preserves_materials_and_survives_restart() {
         let directory = tempfile::tempdir().expect("tempdir exists");
         let database_path =
@@ -4208,9 +6479,35 @@ mod tests {
             let mut connection = open_user_database(&database_path).expect("database opens");
             seed_extraction_project_and_file(&connection);
             let rows = confirmed_extraction_rows();
+            let material_digest =
+                current_case_materials_digest(&connection, &rows.project_id, &rows.source_file_ids)
+                    .expect("material digest reads")
+                    .expect("material exists");
+            insert_pending_extraction_review(
+                &mut connection,
+                &PendingExtractionReviewRow {
+                    review_id: rows.review_id.clone(),
+                    project_id: rows.project_id.clone(),
+                    provider_id: rows.provider_id.clone(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                    source_file_ids_json: r#"["file-source"]"#.to_owned(),
+                    source_materials_digest: material_digest,
+                    extraction_json: r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[]}"#.to_owned(),
+                    revision: 0,
+                    created_at: String::new(),
+                    expires_at: String::new(),
+                },
+            )
+            .expect("pending review persists");
 
             insert_confirmed_case_extraction(&mut connection, &rows)
                 .expect("confirmed extraction commits");
+            assert!(
+                get_pending_extraction_review(&connection, &rows.review_id)
+                    .expect("pending review lookup succeeds")
+                    .is_none(),
+                "confirmation consumes the persistent review atomically"
+            );
             insert_confirmed_case_extraction(&mut connection, &rows)
                 .expect_err("review confirmation is idempotency-protected");
             assert_eq!(
@@ -4266,6 +6563,8 @@ mod tests {
             ensure_user_database(directory.path()).expect("user database is created");
         let mut connection = open_user_database(&database_path).expect("database opens");
         seed_extraction_project_and_file(&connection);
+        let rows = confirmed_extraction_rows();
+        persist_pending_for_confirmed_rows(&mut connection, &rows);
         connection
             .execute_batch(
                 "
@@ -4278,7 +6577,7 @@ mod tests {
             )
             .expect("failure trigger installs");
 
-        let error = insert_confirmed_case_extraction(&mut connection, &confirmed_extraction_rows())
+        let error = insert_confirmed_case_extraction(&mut connection, &rows)
             .expect_err("late failure aborts transaction");
         assert!(error.to_string().contains("late uncertainty failure"));
 
@@ -4287,12 +6586,19 @@ mod tests {
             "case_facts",
             "evidence_items",
             "evidence_links",
+            "fact_issue_links",
             "legal_issues",
             "case_uncertainties",
         ] {
             assert_eq!(table_row_count(&connection, table), 0, "{table} rolls back");
         }
         assert_eq!(table_row_count(&connection, "case_files"), 1);
+        assert!(
+            get_pending_extraction_review(&connection, &rows.review_id)
+                .expect("pending review lookup succeeds")
+                .is_some(),
+            "failed confirmation keeps the authoritative pending review for retry"
+        );
     }
 
     #[test]
@@ -4302,15 +6608,27 @@ mod tests {
             ensure_user_database(directory.path()).expect("user database is created");
         let mut connection = open_user_database(&database_path).expect("database opens");
         seed_extraction_project_and_file(&connection);
-        insert_confirmed_case_extraction(&mut connection, &confirmed_extraction_rows())
+        let rows = confirmed_extraction_rows();
+        persist_pending_for_confirmed_rows(&mut connection, &rows);
+        insert_confirmed_case_extraction(&mut connection, &rows)
             .expect("confirmed extraction commits");
 
-        delete_case_entity(&mut connection, "case_files", "file_id", "file-source")
-            .expect_err("confirmed source material cannot be deleted silently");
-        assert!(
-            delete_case_entity(&mut connection, "case_facts", "fact_id", "batch-fact")
-                .expect("fact deletes")
-        );
+        delete_case_entity(
+            &mut connection,
+            "case_files",
+            "file_id",
+            "file-source",
+            "project-extraction",
+        )
+        .expect_err("confirmed source material cannot be deleted silently");
+        assert!(delete_case_entity(
+            &mut connection,
+            "case_facts",
+            "fact_id",
+            "batch-fact",
+            "project-extraction",
+        )
+        .expect("fact deletes"));
 
         let workspace = get_case_workspace_rows(&connection, "project-extraction")
             .expect("workspace reads")
@@ -4328,11 +6646,14 @@ mod tests {
             ensure_user_database(directory.path()).expect("user database is created");
         {
             let connection = open_user_database(&database_path).expect("user database opens");
+            seed_project(&connection, "project-answer");
             insert_legal_answer_record(
                 &connection,
                 &LegalAnswerRecordRow {
                     record_id: "answer-1".to_owned(),
+                    project_id: Some("project-answer".to_owned()),
                     provider_id: "deepseek-main".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
                     question: "What is breach liability?".to_owned(),
                     answer_text: "Answer with [SRC:law:a:b:art:1]".to_owned(),
                     case_date: Some("2024-01-01".to_owned()),
@@ -4345,18 +6666,129 @@ mod tests {
                 },
             )
             .expect("answer record inserts");
+            seed_project(&connection, "project-answer-other");
+            insert_legal_answer_record(
+                &connection,
+                &LegalAnswerRecordRow {
+                    record_id: "answer-2".to_owned(),
+                    project_id: Some("project-answer-other".to_owned()),
+                    provider_id: "deepseek-main".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                    question: "Other case question".to_owned(),
+                    answer_text: "Other case answer".to_owned(),
+                    case_date: None,
+                    query_json: "{}".to_owned(),
+                    source_ids_json: "[]".to_owned(),
+                    verified_citations_json: "[]".to_owned(),
+                    invalid_citations_json: "[]".to_owned(),
+                    unsupported_legal_conclusion: true,
+                    created_at: String::new(),
+                },
+            )
+            .expect("other case answer inserts");
         }
 
         let connection = open_user_database(&database_path).expect("user database reopens");
         let records = list_legal_answer_records(&connection, 10).expect("answer records list");
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].record_id, "answer-1");
+        assert_eq!(records.len(), 2);
+        let project_records =
+            list_legal_answer_records_for_project(&connection, "project-answer", 10)
+                .expect("project answer records list");
+        assert_eq!(project_records.len(), 1);
+        assert_eq!(project_records[0].record_id, "answer-1");
         assert_eq!(
-            records[0].verified_citations_json,
+            project_records[0].provider_snapshot_json,
+            provider_snapshot_json()
+        );
+        assert_eq!(
+            project_records[0].verified_citations_json,
             r#"[{"sourceId":"law:a:b:art:1"}]"#
         );
-        assert!(!records[0].answer_text.contains("full provider response"));
+        assert!(!project_records[0]
+            .answer_text
+            .contains("full provider response"));
+        assert!(delete_case_project(&connection, "project-answer").expect("project deletes"));
+        assert!(
+            list_legal_answer_records_for_project(&connection, "project-answer", 10)
+                .expect("deleted project records list")
+                .is_empty()
+        );
+        assert_eq!(
+            list_legal_answer_records(&connection, 10)
+                .expect("other project's answer remains")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legal_answer_project_history_uses_stable_created_at_record_id_cursor() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "project-history");
+        for record_id in ["answer-1", "answer-2", "answer-3"] {
+            insert_legal_answer_record(
+                &connection,
+                &LegalAnswerRecordRow {
+                    record_id: record_id.to_owned(),
+                    project_id: Some("project-history".to_owned()),
+                    provider_id: "provider".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                    question: format!("question {record_id}"),
+                    answer_text: format!("answer {record_id}"),
+                    case_date: None,
+                    query_json: "{}".to_owned(),
+                    source_ids_json: "[]".to_owned(),
+                    verified_citations_json: "[]".to_owned(),
+                    invalid_citations_json: "[]".to_owned(),
+                    unsupported_legal_conclusion: false,
+                    created_at: String::new(),
+                },
+            )
+            .expect("history row inserts");
+        }
+        connection
+            .execute_batch(
+                "UPDATE legal_answer_records SET created_at = '2026-07-14 10:00:03'
+                   WHERE record_id = 'answer-3';
+                 UPDATE legal_answer_records SET created_at = '2026-07-14 10:00:02'
+                   WHERE record_id IN ('answer-1', 'answer-2');",
+            )
+            .expect("history timestamps set");
+
+        let first = list_legal_answer_records_for_project_before(
+            &connection,
+            "project-history",
+            None,
+            None,
+            2,
+        )
+        .expect("first page reads");
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.record_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["answer-3", "answer-2"]
+        );
+        let second = list_legal_answer_records_for_project_before(
+            &connection,
+            "project-history",
+            Some(&first[1].created_at),
+            Some(&first[1].record_id),
+            2,
+        )
+        .expect("second page reads");
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.record_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["answer-1"]
+        );
     }
 
     #[test]
@@ -4375,6 +6807,7 @@ mod tests {
             "case_facts",
             "evidence_items",
             "evidence_links",
+            "fact_issue_links",
             "legal_issues",
             "case_uncertainties",
             "legal_basis",
@@ -4413,12 +6846,16 @@ mod tests {
         let trusted_schema: i64 = read_only_connection
             .query_row("PRAGMA trusted_schema", [], |row| row.get(0))
             .expect("trusted_schema pragma is readable");
+        let mmap_size: i64 = read_only_connection
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .expect("mmap_size pragma is readable");
         let error = read_only_connection
             .execute("CREATE TABLE write_probe (id INTEGER PRIMARY KEY)", [])
             .expect_err("read-only legal core rejects writes");
 
         assert_eq!(query_only, 1);
         assert_eq!(trusted_schema, 0);
+        assert_eq!(mmap_size, 1_073_741_824);
         assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
     }
 
@@ -4529,6 +6966,38 @@ mod tests {
             .expect_err("canonical project CHECK is present after rebuild");
     }
 
+    #[test]
+    fn provider_audit_snapshot_schema_rejects_unknown_secret_fields_and_partial_shapes() {
+        validate_provider_audit_snapshot_json(&provider_snapshot_json())
+            .expect("fixed provider audit snapshot is accepted");
+        for kind in [
+            "deep_seek",
+            "qwen",
+            "silicon_flow",
+            "volcengine_ark",
+            "custom",
+        ] {
+            let snapshot = provider_snapshot_json().replace("deep_seek", kind);
+            validate_provider_audit_snapshot_json(&snapshot)
+                .unwrap_or_else(|_| panic!("provider kind {kind} must remain supported"));
+        }
+
+        for invalid in [
+            "{}",
+            r#"{"apiKey":"must-never-persist"}"#,
+            r#"{"kind":"deep_seek","modelId":"model","baseUrl":"https://api.example.invalid","capabilities":{},"options":{}}"#,
+            r#"{"kind":"deep_seek","modelId":"model","baseUrl":"https://api.example.invalid","capabilities":{"chat":true,"streaming":true,"customModelId":true,"customBaseUrl":true,"reasoning":true},"options":{"thinking":false,"enableThinking":null,"thinkingBudget":null,"reasoningEffort":null,"endpointId":null,"workspaceId":null,"allowPrivateNetwork":false},"apiKey":"must-never-persist"}"#,
+        ] {
+            let error = validate_provider_audit_snapshot_json(invalid)
+                .expect_err("non-contract provider snapshot is rejected");
+            assert!(!error.to_string().contains("must-never-persist"));
+        }
+    }
+
+    fn provider_snapshot_json() -> String {
+        r#"{"kind":"deep_seek","modelId":"test-model","baseUrl":"https://api.example.invalid/v1","capabilities":{"chat":true,"streaming":true,"customModelId":true,"customBaseUrl":true,"reasoning":true},"options":{"thinking":false,"enableThinking":null,"thinkingBudget":null,"reasoningEffort":null,"endpointId":null,"workspaceId":null,"allowPrivateNetwork":false}}"#.to_owned()
+    }
+
     fn seed_project(connection: &rusqlite::Connection, project_id: &str) {
         upsert_case_project(
             connection,
@@ -4632,6 +7101,10 @@ mod tests {
             project_id: "project-extraction".to_owned(),
             provider_id: "mock-provider".to_owned(),
             source_file_ids: vec!["file-source".to_owned()],
+            expected_revision: 0,
+            reviewed_extraction_json:
+                r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[]}"#
+                    .to_owned(),
             parties: vec![CasePartyRow {
                 party_id: "batch-party".to_owned(),
                 project_id: "project-extraction".to_owned(),
@@ -4692,17 +7165,47 @@ mod tests {
         }
     }
 
+    fn persist_pending_for_confirmed_rows(
+        connection: &mut rusqlite::Connection,
+        rows: &ConfirmedCaseExtractionRows,
+    ) {
+        let material_digest =
+            current_case_materials_digest(connection, &rows.project_id, &rows.source_file_ids)
+                .expect("material digest reads")
+                .expect("material exists");
+        insert_pending_extraction_review(
+            connection,
+            &PendingExtractionReviewRow {
+                review_id: rows.review_id.clone(),
+                project_id: rows.project_id.clone(),
+                provider_id: rows.provider_id.clone(),
+                provider_snapshot_json: provider_snapshot_json(),
+                source_file_ids_json: serde_json::to_string(&rows.source_file_ids)
+                    .expect("source IDs serialize"),
+                source_materials_digest: material_digest,
+                extraction_json: rows.reviewed_extraction_json.clone(),
+                revision: rows.expected_revision,
+                created_at: String::new(),
+                expires_at: String::new(),
+            },
+        )
+        .expect("pending review persists");
+    }
+
     fn table_row_count(connection: &rusqlite::Connection, table: &str) -> i64 {
         let sql = match table {
+            "projects" => "SELECT COUNT(*) FROM projects",
             "case_files" => "SELECT COUNT(*) FROM case_files",
             "case_extraction_confirmations" => "SELECT COUNT(*) FROM case_extraction_confirmations",
             "case_parties" => "SELECT COUNT(*) FROM case_parties",
             "case_facts" => "SELECT COUNT(*) FROM case_facts",
             "evidence_items" => "SELECT COUNT(*) FROM evidence_items",
             "evidence_links" => "SELECT COUNT(*) FROM evidence_links",
+            "fact_issue_links" => "SELECT COUNT(*) FROM fact_issue_links",
             "legal_issues" => "SELECT COUNT(*) FROM legal_issues",
             "case_uncertainties" => "SELECT COUNT(*) FROM case_uncertainties",
             "legal_basis" => "SELECT COUNT(*) FROM legal_basis",
+            "legal_answer_records" => "SELECT COUNT(*) FROM legal_answer_records",
             _ => panic!("unexpected table: {table}"),
         };
 

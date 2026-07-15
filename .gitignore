@@ -3,15 +3,19 @@
 /node_modules/
 **/node_modules/
 /.pnpm-store/
+/apikey.txt
+/.release-secrets/
 
 **/dist/
 **/target/
 
 apps/desktop/frontend-dist/*
-!apps/desktop/frontend-dist/.gitkeep
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/resources/*
 !apps/desktop/src-tauri/resources/.gitkeep
+!apps/desktop/src-tauri/resources/LICENSE.txt
+!apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt
+!apps/desktop/src-tauri/resources/DATA_SOURCES.md
 data/build/cache/
 data/build/state/
 data/generated/*

@@ -1,16 +1,17 @@
 {
   "stage": "1C-history-normalization",
-  "generated_at": "2026-07-11T12:40:09+00:00",
-  "dataset_version": "2026.07.11-history.1",
-  "database": "apps\\desktop\\src-tauri\\resources\\legal_core.sqlite",
+  "generated_at": "2026-07-14T15:17:02+00:00",
+  "dataset_version": "2026.07.14-history.2",
+  "database": "data\\generated\\legal_core_full.sqlite",
   "normalization": {
-    "relation_count": 18229,
-    "component_count": 5602,
-    "merged_family_count": 4481,
+    "relation_count": 3675,
+    "component_count": 1121,
+    "merged_family_count": 0,
     "skipped_family_count": 1121,
-    "removed_document_count": 5744,
-    "reparented_version_count": 10225,
-    "bounded_version_count": 5744,
+    "removed_document_count": 0,
+    "reparented_version_count": 0,
+    "bounded_version_count": 0,
+    "authoritatively_bounded_version_count": 9,
     "skipped_families": [
       {
         "reason": "missing_or_invalid_effective_date",
@@ -16415,14 +16416,16 @@
     ]
   },
   "metadata": {
-    "dataset_version": "2026.07.11-history.1",
+    "dataset_version": "2026.07.14-history.2",
     "data_scope": "stage-1b statutory corpus plus normalized FLK historical version families; Stage 1C case/template corpora pending",
-    "source_manifest_sha256": "4dd3dc09d6bf6810608ba9de4d8b41c3375fd43a4a3e2708a1f6ddf50c727085",
+    "source_manifest_sha256": "011551065b404507bce7b2cf542cb3b18da79a14437d094d067e685a438cd9fa",
     "history_version_status": "complete_with_declared_exceptions",
     "history_version_family_count": "4481",
     "history_version_exception_count": "1121",
+    "authoritative_terminal_date_count": "9",
+    "authoritative_terminal_date_source": "中华人民共和国民法典第一千二百六十条（2021-01-01施行）",
     "database_distribution_manifest": "data/generated/legal_core_distribution_manifest.json",
-    "history_normalized_at": "2026-07-11T12:38:00+00:00"
+    "history_normalized_at": "2026-07-14T15:15:30+00:00"
   },
   "audit": {
     "status": "complete",
@@ -16435,6 +16438,7 @@
     "fts_count": 1181655,
     "foreign_key_errors": 0,
     "sqlite_integrity": "ok",
+    "authoritative_terminal_title_count": 9,
     "examples": [
       {
         "document_id": "flk-ff8081819b697220019b6de33b3e1bd1",

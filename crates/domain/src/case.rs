@@ -114,6 +114,18 @@ pub struct EvidenceLink {
     pub evidence_id: String,
 }
 
+/// An explicit, user-persisted relationship between a case fact and a legal
+/// issue.  The application never infers these links from text similarity or
+/// from the mere presence of both entities in the same project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactIssueLink {
+    pub link_id: String,
+    pub project_id: String,
+    pub fact_id: String,
+    pub issue_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegalIssueStatus {
@@ -201,6 +213,7 @@ pub struct CaseWorkspace {
     pub facts: Vec<CaseFact>,
     pub evidence: Vec<EvidenceItem>,
     pub evidence_links: Vec<EvidenceLink>,
+    pub fact_issue_links: Vec<FactIssueLink>,
     pub legal_issues: Vec<LegalIssue>,
     pub legal_basis: Vec<LegalBasis>,
     pub uncertainties: Vec<CaseUncertainty>,
@@ -571,6 +584,94 @@ pub fn parse_structured_case_extraction(
     Ok(extraction)
 }
 
+/// Applies a deliberately narrow, non-inventive repair to model-produced
+/// uncertainty links. The uncertainty text is preserved. A reference is
+/// canonicalized only when it uniquely matches an entity label after removing
+/// punctuation/spacing; otherwise the uncertainty is safely downgraded to a
+/// general (unlinked) item. All other schema and semantic checks stay strict.
+pub fn parse_structured_case_extraction_with_safe_reference_repair(
+    raw_output: &str,
+) -> Result<StructuredCaseExtraction, StructuredExtractionParseError> {
+    let mut extraction =
+        serde_json::from_str::<StructuredCaseExtraction>(raw_output).map_err(|_| {
+            StructuredExtractionParseError {
+                message: "structured extraction JSON did not match the required schema".to_owned(),
+            }
+        })?;
+    let party_names = extraction
+        .parties
+        .iter()
+        .map(|party| party.name.trim().to_owned())
+        .collect::<Vec<_>>();
+    let fact_titles = extraction
+        .facts
+        .iter()
+        .map(|fact| fact.title.trim().to_owned())
+        .collect::<Vec<_>>();
+    let evidence_labels = extraction
+        .evidence
+        .iter()
+        .flat_map(|evidence| {
+            [
+                evidence.evidence_number.trim().to_owned(),
+                evidence.title.trim().to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let legal_issue_titles = extraction
+        .legal_issues
+        .iter()
+        .map(|issue| issue.title.trim().to_owned())
+        .collect::<Vec<_>>();
+
+    for uncertainty in &mut extraction.uncertainties {
+        let candidates = match uncertainty.related_entity_type {
+            UncertaintyRelatedEntityType::General => {
+                uncertainty.related_reference = None;
+                continue;
+            }
+            UncertaintyRelatedEntityType::Party => &party_names,
+            UncertaintyRelatedEntityType::Fact => &fact_titles,
+            UncertaintyRelatedEntityType::Evidence => &evidence_labels,
+            UncertaintyRelatedEntityType::LegalIssue => &legal_issue_titles,
+        };
+        let Some(reference) = uncertainty
+            .related_reference
+            .as_deref()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty())
+        else {
+            uncertainty.related_entity_type = UncertaintyRelatedEntityType::General;
+            uncertainty.related_reference = None;
+            continue;
+        };
+        let canonical = candidates
+            .iter()
+            .find(|candidate| candidate.as_str() == reference)
+            .cloned()
+            .or_else(|| {
+                let normalized_reference = normalize_text(reference);
+                if normalized_reference.is_empty() {
+                    return None;
+                }
+                let mut matches = candidates
+                    .iter()
+                    .filter(|candidate| normalize_text(candidate) == normalized_reference);
+                let candidate = matches.next()?.clone();
+                matches.next().is_none().then_some(candidate)
+            });
+        if let Some(canonical) = canonical {
+            uncertainty.related_reference = Some(canonical);
+        } else {
+            uncertainty.related_entity_type = UncertaintyRelatedEntityType::General;
+            uncertainty.related_reference = None;
+        }
+    }
+
+    validate_structured_case_extraction(&extraction)?;
+    Ok(extraction)
+}
+
 pub fn validate_structured_case_extraction(
     extraction: &StructuredCaseExtraction,
 ) -> Result<(), StructuredExtractionParseError> {
@@ -624,6 +725,11 @@ pub fn validate_structured_case_extraction(
             .map(|evidence| evidence.title.as_str()),
         "evidence titles",
     )?;
+    if !evidence_numbers.is_disjoint(&evidence_titles) {
+        return Err(extraction_validation_error(
+            "evidence numbers and titles must use distinct reference labels",
+        ));
+    }
     let legal_issue_titles = unique_labels(
         extraction
             .legal_issues
@@ -674,6 +780,192 @@ pub fn validate_structured_case_extraction(
             return Err(extraction_validation_error(
                 "uncertainty relatedReference does not match its related entity type",
             ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates an in-progress review draft without requiring it to be ready for
+/// confirmation. Lawyers must be able to clear a required field or temporarily
+/// break a cross-reference while editing without losing the draft. Shape,
+/// array, byte and control-character limits remain enforced here; the strict
+/// validator above is still mandatory immediately before confirmation.
+pub fn validate_structured_case_extraction_draft(
+    extraction: &StructuredCaseExtraction,
+) -> Result<(), StructuredExtractionParseError> {
+    use crate::validation::{self, TextMode};
+
+    for (field, count, max) in [
+        ("parties", extraction.parties.len(), MAX_EXTRACTED_PARTIES),
+        ("facts", extraction.facts.len(), MAX_EXTRACTED_FACTS),
+        (
+            "evidence",
+            extraction.evidence.len(),
+            MAX_EXTRACTED_EVIDENCE,
+        ),
+        (
+            "legalIssues",
+            extraction.legal_issues.len(),
+            MAX_EXTRACTED_LEGAL_ISSUES,
+        ),
+        (
+            "uncertainties",
+            extraction.uncertainties.len(),
+            MAX_EXTRACTED_UNCERTAINTIES,
+        ),
+    ] {
+        validation::item_count(field, count, max)
+            .map_err(|error| extraction_validation_error(error.to_string()))?;
+    }
+
+    for party in &extraction.parties {
+        validation::bounded_text(
+            "party.name",
+            &party.name,
+            MAX_EXTRACTED_LABEL_BYTES,
+            TextMode::SingleLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+    }
+
+    let mut total_evidence_references = 0usize;
+    for fact in &extraction.facts {
+        for (field, value, max, mode) in [
+            (
+                "fact.title",
+                fact.title.as_str(),
+                MAX_EXTRACTED_LABEL_BYTES,
+                TextMode::SingleLine,
+            ),
+            (
+                "fact.description",
+                fact.description.as_str(),
+                MAX_EXTRACTED_TEXT_BYTES,
+                TextMode::MultiLine,
+            ),
+        ] {
+            validation::bounded_text(field, value, max, mode)
+                .map_err(|error| extraction_validation_error(error.to_string()))?;
+        }
+        validation::item_count(
+            "fact.evidenceNumbers",
+            fact.evidence_numbers.len(),
+            MAX_EVIDENCE_REFERENCES_PER_FACT,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        for reference in &fact.evidence_numbers {
+            validation::bounded_text(
+                "fact.evidenceNumbers",
+                reference,
+                MAX_EXTRACTED_REFERENCE_BYTES,
+                TextMode::SingleLine,
+            )
+            .map_err(|error| extraction_validation_error(error.to_string()))?;
+        }
+        total_evidence_references = total_evidence_references
+            .checked_add(fact.evidence_numbers.len())
+            .ok_or_else(|| extraction_validation_error("evidence reference count overflow"))?;
+    }
+    validation::item_count(
+        "total evidence references",
+        total_evidence_references,
+        MAX_TOTAL_EVIDENCE_REFERENCES,
+    )
+    .map_err(|error| extraction_validation_error(error.to_string()))?;
+
+    for evidence in &extraction.evidence {
+        for (field, value, max, mode) in [
+            (
+                "evidence.evidenceNumber",
+                evidence.evidence_number.as_str(),
+                MAX_EXTRACTED_REFERENCE_BYTES,
+                TextMode::SingleLine,
+            ),
+            (
+                "evidence.title",
+                evidence.title.as_str(),
+                MAX_EXTRACTED_LABEL_BYTES,
+                TextMode::SingleLine,
+            ),
+            (
+                "evidence.source",
+                evidence.source.as_str(),
+                MAX_EXTRACTED_SOURCE_BYTES,
+                TextMode::MultiLine,
+            ),
+            (
+                "evidence.summary",
+                evidence.summary.as_str(),
+                MAX_EXTRACTED_TEXT_BYTES,
+                TextMode::MultiLine,
+            ),
+        ] {
+            validation::bounded_text(field, value, max, mode)
+                .map_err(|error| extraction_validation_error(error.to_string()))?;
+        }
+    }
+
+    for issue in &extraction.legal_issues {
+        for (field, value, max, mode) in [
+            (
+                "legalIssue.title",
+                issue.title.as_str(),
+                MAX_EXTRACTED_LABEL_BYTES,
+                TextMode::SingleLine,
+            ),
+            (
+                "legalIssue.description",
+                issue.description.as_str(),
+                MAX_EXTRACTED_TEXT_BYTES,
+                TextMode::MultiLine,
+            ),
+            (
+                "legalIssue.claim",
+                issue.claim.as_str(),
+                MAX_EXTRACTED_TEXT_BYTES,
+                TextMode::MultiLine,
+            ),
+        ] {
+            validation::bounded_text(field, value, max, mode)
+                .map_err(|error| extraction_validation_error(error.to_string()))?;
+        }
+    }
+
+    for uncertainty in &extraction.uncertainties {
+        validation::bounded_text(
+            "uncertainty.description",
+            &uncertainty.description,
+            MAX_EXTRACTED_TEXT_BYTES,
+            TextMode::MultiLine,
+        )
+        .map_err(|error| extraction_validation_error(error.to_string()))?;
+        if let Some(reference) = uncertainty.related_reference.as_deref() {
+            validation::bounded_text(
+                "uncertainty.relatedReference",
+                reference,
+                MAX_EXTRACTED_LABEL_BYTES,
+                TextMode::SingleLine,
+            )
+            .map_err(|error| extraction_validation_error(error.to_string()))?;
+        }
+    }
+
+    for (label, date) in
+        extraction
+            .facts
+            .iter()
+            .filter_map(|fact| fact.occurred_on.as_deref().map(|date| ("occurredOn", date)))
+            .chain(extraction.evidence.iter().filter_map(|evidence| {
+                evidence.formed_on.as_deref().map(|date| ("formedOn", date))
+            }))
+    {
+        if !date.trim().is_empty() && !crate::date::is_iso_calendar_date(date) {
+            return Err(StructuredExtractionParseError {
+                message: format!(
+                    "{label} must be a valid YYYY-MM-DD calendar date, blank, or null"
+                ),
+            });
         }
     }
 
@@ -1194,6 +1486,42 @@ mod tests {
             r#"{"parties":[],"facts":[],"evidence":[],"legalIssues":[],"uncertainties":[{"description":"general","relatedEntityType":"general","relatedReference":"unexpected"}]}"#
         )
         .is_err());
+        assert!(parse_structured_case_extraction(
+            r#"{"parties":[],"facts":[],"evidence":[{"evidenceNumber":"E-1","title":"合同","source":"","formedOn":null,"summary":""},{"evidenceNumber":"E-2","title":"E-1","source":"","formedOn":null,"summary":""}],"legalIssues":[],"uncertainties":[{"description":"ambiguous","relatedEntityType":"evidence","relatedReference":"E-1"}]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn draft_validation_allows_intermediate_edits_but_keeps_resource_bounds() {
+        let mut draft = parse_structured_case_extraction(valid_extraction_json())
+            .expect("baseline extraction parses");
+        draft.facts[0].title.clear();
+        draft.uncertainties[0].related_reference = Some("temporarily missing".to_owned());
+        validate_structured_case_extraction_draft(&draft)
+            .expect("blank required field and dangling draft reference persist");
+        assert!(validate_structured_case_extraction(&draft).is_err());
+
+        draft.facts[0].description = "x".repeat(MAX_EXTRACTED_TEXT_BYTES + 1);
+        assert!(validate_structured_case_extraction_draft(&draft).is_err());
+    }
+
+    #[test]
+    fn safe_reference_repair_canonicalizes_unique_labels_and_unlinks_unknown_ones() {
+        let repaired = parse_structured_case_extraction_with_safe_reference_repair(
+            r#"{"parties":[],"facts":[{"occurredOn":null,"title":"付款日期（约定）","description":"待核实","evidenceNumbers":[]}],"evidence":[],"legalIssues":[],"uncertainties":[{"description":"日期需核实","relatedEntityType":"fact","relatedReference":"付款日期 约定"},{"description":"未知对象","relatedEntityType":"party","relatedReference":"未列出的主体"}]}"#,
+        )
+        .expect("narrow reference repair succeeds");
+
+        assert_eq!(
+            repaired.uncertainties[0].related_reference.as_deref(),
+            Some("付款日期（约定）")
+        );
+        assert_eq!(
+            repaired.uncertainties[1].related_entity_type,
+            UncertaintyRelatedEntityType::General
+        );
+        assert!(repaired.uncertainties[1].related_reference.is_none());
     }
 
     #[test]

@@ -219,6 +219,69 @@ class LegalCoreBuildTests(unittest.TestCase):
 
         self.assertEqual(build.text_marker_hits(connection), 1)
 
+    def test_authoritative_terminal_audit_checks_rows_not_metadata(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.executescript(
+            (build.ROOT / "data" / "schema" / "legal_core.sql").read_text(
+                encoding="utf-8"
+            )
+        )
+        connection.execute(
+            """
+            INSERT INTO source_systems (id, name, base_url, official_scope, maintainer, notes)
+            VALUES ('test_source', 'test source', 'https://example.test', 'test', 'test', 'test')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO issuing_authorities (id, name, authority_type, country_region)
+            VALUES ('auth-test', 'test authority', 'test', 'CN')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO law_documents (
+              id, title, document_type, authority_id, jurisdiction, effectiveness_level,
+              status, summary, source_system_id, source_external_id
+            ) VALUES ('contract-law', '中华人民共和国合同法', 'law', 'auth-test', 'CN',
+                      'national_law', 'repealed', 'test', 'test_source', 'contract-law')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO law_versions (
+              id, document_id, version_label, status, effective_from, effective_to,
+              source_reference
+            ) VALUES ('contract-law-version', 'contract-law', '1999 version', 'repealed',
+                      '1999-10-01', '2020-12-31', 'test')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO law_articles (
+              id, document_id, version_id, article_number, article_order, content
+            ) VALUES ('contract-law-107', 'contract-law', 'contract-law-version',
+                      '第一百零七条', 107, '违约责任')
+            """
+        )
+
+        valid = build.authoritative_terminal_date_audit(connection)
+        self.assertEqual(valid["title_count"], 1)
+        self.assertEqual(valid["version_count"], 1)
+        self.assertEqual(valid["violation_count"], 0)
+        self.assertEqual(valid["missing_article_count"], 0)
+
+        # A forged metadata flag cannot hide a row that still extends into 2021.
+        connection.execute(
+            "UPDATE law_versions SET effective_to = '2021-01-01' "
+            "WHERE id = 'contract-law-version'"
+        )
+        corrupted = build.authoritative_terminal_date_audit(connection)
+        self.assertEqual(corrupted["title_count"], 0)
+        self.assertEqual(corrupted["version_count"], 0)
+        self.assertEqual(corrupted["violation_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

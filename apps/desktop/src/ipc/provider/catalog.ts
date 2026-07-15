@@ -78,7 +78,7 @@ export function defaultProviderOptions(kind: ProviderKind): ProviderOptions {
   if (kind === "qwen" || kind === "silicon_flow") {
     return { enableThinking: false };
   }
-  return {};
+  return { allowPrivateNetwork: false };
 }
 
 export function createProviderProfileDraft(

@@ -40,6 +40,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+
       - name: Test all data build and audit tools
         run: python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
 
@@ -322,7 +325,7 @@ jobs:
       - name: Run archive/runtime Rust retrieval benchmark smoke
         shell: pwsh
         run: |
-          cargo run -p retrieval --example benchmark_legal_core -- `
+          cargo run --locked -p retrieval --example benchmark_legal_core -- `
             (Join-Path $env:RUNNER_TEMP "legal_core_benchmark_archive.sqlite") `
             "apps/desktop/src-tauri/resources/legal_core.sqlite" `
             5 `
@@ -332,10 +335,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint Rust
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test Rust
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+
+      - name: Verify complete third-party notices
+        run: python scripts/generate_third_party_notices.py --check
 
       - name: Lint frontend
         run: pnpm lint
@@ -349,4 +355,4 @@ jobs:
       - name: Build Tauri with CI fixture (packaging smoke test only)
         env:
           LAWYER_ASSISTANCE_ALLOW_CI_FIXTURE_BUILD: "1"
-        run: pnpm tauri build
+        run: pnpm tauri build --config src-tauri/tauri.ci.conf.json

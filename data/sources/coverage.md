@@ -12,9 +12,9 @@ Archival/audit database: `data/generated/legal_core_full.sqlite`
 Bundled runtime projection: `apps/desktop/src-tauri/resources/legal_core.sqlite`
 
 - Archival size/SHA-256: `4512894976` /
-  `ebd53e00fbcf17b176347731d2a7bf85d8d6c931e9a99530a3dfd078ec84209d`
+  `31cf1995cc09f0e3e00f70bfcf20cf67548f1a6362706ccc11d1fd3b2ebc26ac`
 - Runtime size/SHA-256: `1775419392` /
-  `6133d27cb98d61d6cb7280cdae355a01ea14081e4e11da4a535425147c743aad`
+  `86574bba91950b194c6530586eebbae31c689a5bd2a485877b3eed6b611f7d3c`
 - Runtime profile: `runtime-slim-v1`
 
 Current declared-source coverage status: `complete`

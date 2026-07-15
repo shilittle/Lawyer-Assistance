@@ -9,6 +9,7 @@ use tauri::State;
 
 use crate::state::AppState;
 
+use domain::qa::{ProviderAuditCapabilities, ProviderAuditOptions, ProviderAuditSnapshot};
 use domain::validation::{self, TextMode};
 
 const MAX_PROVIDER_ID_BYTES: usize = 128;
@@ -160,15 +161,15 @@ pub fn upsert_provider_profile(
     state: State<'_, AppState>,
     request: UpsertProviderProfileRequest,
 ) -> Result<ProviderProfileResponse, IpcError> {
-    validate_profile(&request.profile)?;
+    let mut profile = request.profile;
+    profile.options = profile.kind.options_with_defaults(profile.options);
+    validate_profile(&profile)?;
     let _provider_store_lock = ProviderStoreLock::acquire()?;
     let connection = database::open_user_database(state.user_database_path())?;
     let store = providers::windows_credentials::WindowsCredentialStore::new();
-    upsert_profile_with_store(&connection, &request.profile, &store)?;
+    upsert_profile_with_store(&connection, &profile, &store)?;
 
-    Ok(ProviderProfileResponse {
-        profile: request.profile,
-    })
+    Ok(ProviderProfileResponse { profile })
 }
 
 #[tauri::command]
@@ -603,12 +604,17 @@ fn row_from_profile(
 pub(crate) fn profile_from_row(
     row: database::ProviderProfileRow,
 ) -> Result<ProviderProfile, ProviderError> {
+    let kind = serde_json::from_value::<ProviderKind>(serde_json::Value::String(row.kind))
+        .map_err(|error| {
+            ProviderError::new(ProviderErrorKind::InvalidProfile, error.to_string())
+        })?;
+    let options = serde_json::from_str::<ProviderOptions>(&row.options_json).map_err(|error| {
+        ProviderError::new(ProviderErrorKind::InvalidProfile, error.to_string())
+    })?;
     let profile = ProviderProfile {
         id: row.id,
         display_name: row.display_name,
-        kind: serde_json::from_value::<ProviderKind>(serde_json::Value::String(row.kind)).map_err(
-            |error| ProviderError::new(ProviderErrorKind::InvalidProfile, error.to_string()),
-        )?,
+        kind,
         model_id: row.model_id,
         base_url: row.base_url,
         credential_account_id: row.credential_account_id,
@@ -616,12 +622,45 @@ pub(crate) fn profile_from_row(
             .map_err(|error| {
                 ProviderError::new(ProviderErrorKind::InvalidProfile, error.to_string())
             })?,
-        options: serde_json::from_str::<ProviderOptions>(&row.options_json).map_err(|error| {
-            ProviderError::new(ProviderErrorKind::InvalidProfile, error.to_string())
-        })?,
+        options: kind.options_with_defaults(options),
     };
     validate_profile(&profile)?;
     Ok(profile)
+}
+
+pub(crate) fn provider_audit_snapshot(
+    profile: &ProviderProfile,
+) -> Result<ProviderAuditSnapshot, IpcError> {
+    let kind = serde_json::to_value(profile.kind)?
+        .as_str()
+        .ok_or_else(|| IpcError::new("serialization", "provider kind is not a string"))?
+        .to_owned();
+    Ok(ProviderAuditSnapshot {
+        kind,
+        model_id: profile.model_id.clone(),
+        base_url: profile.base_url.clone(),
+        capabilities: ProviderAuditCapabilities {
+            chat: profile.capabilities.chat,
+            streaming: profile.capabilities.streaming,
+            custom_model_id: profile.capabilities.custom_model_id,
+            custom_base_url: profile.capabilities.custom_base_url,
+            reasoning: profile.capabilities.reasoning,
+        },
+        options: ProviderAuditOptions {
+            thinking: profile.options.thinking,
+            enable_thinking: profile.options.enable_thinking,
+            thinking_budget: profile.options.thinking_budget,
+            reasoning_effort: profile
+                .options
+                .reasoning_effort
+                .map(serde_json::to_value)
+                .transpose()?
+                .and_then(|value| value.as_str().map(ToOwned::to_owned)),
+            endpoint_id: profile.options.endpoint_id.clone(),
+            workspace_id: profile.options.workspace_id.clone(),
+            allow_private_network: profile.options.allow_private_network,
+        },
+    })
 }
 
 fn kind_to_string(kind: ProviderKind) -> Result<String, serde_json::Error> {
@@ -701,6 +740,39 @@ mod tests {
         assert_eq!(restored.kind, ProviderKind::Qwen);
         assert_eq!(restored.options.enable_thinking, Some(false));
         assert_eq!(restored.options.thinking_budget, Some(512));
+    }
+
+    #[test]
+    fn legacy_deepseek_profile_without_options_restores_non_thinking_default() {
+        let profile = ProviderProfile::new_default("deepseek-legacy", ProviderKind::DeepSeek);
+        let mut row = row_from_profile(&profile).expect("profile maps to row");
+        row.options_json = "{}".to_owned();
+
+        let restored = profile_from_row(row).expect("legacy row maps to profile");
+
+        assert_eq!(restored.options.thinking, Some(false));
+    }
+
+    #[test]
+    fn provider_audit_snapshot_is_exact_and_never_contains_credentials() {
+        let secret = ApiSecret::new("snapshot-must-not-contain-this-secret-1234");
+        let mut profile = ProviderProfile::new_default("deepseek-main", ProviderKind::DeepSeek);
+        profile.model_id = "deepseek-v4-pro".to_owned();
+        profile.options.thinking = Some(true);
+        profile.options.reasoning_effort = Some(providers::ReasoningEffort::Max);
+        profile.options.allow_private_network = Some(false);
+
+        let snapshot = provider_audit_snapshot(&profile).expect("audit snapshot serializes");
+        let serialized = serde_json::to_string(&snapshot).expect("snapshot JSON serializes");
+
+        assert_eq!(snapshot.kind, "deep_seek");
+        assert_eq!(snapshot.model_id, "deepseek-v4-pro");
+        assert_eq!(snapshot.base_url, profile.base_url);
+        assert_eq!(snapshot.options.thinking, Some(true));
+        assert_eq!(snapshot.options.reasoning_effort.as_deref(), Some("max"));
+        assert!(!serialized.contains(secret.expose_secret()));
+        assert!(!serialized.contains(&profile.credential_account_id));
+        assert!(!serialized.contains(&profile.id));
     }
 
     #[test]

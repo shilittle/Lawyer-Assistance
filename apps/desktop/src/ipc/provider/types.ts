@@ -22,6 +22,34 @@ export interface ProviderOptions {
   reasoningEffort?: ReasoningEffort | null;
   endpointId?: string | null;
   workspaceId?: string | null;
+  allowPrivateNetwork?: boolean | null;
+}
+
+export interface ProviderAuditCapabilities {
+  chat: boolean;
+  streaming: boolean;
+  customModelId: boolean;
+  customBaseUrl: boolean;
+  reasoning: boolean;
+}
+
+export interface ProviderAuditOptions {
+  thinking?: boolean | null;
+  enableThinking?: boolean | null;
+  thinkingBudget?: number | null;
+  reasoningEffort?: string | null;
+  endpointId?: string | null;
+  workspaceId?: string | null;
+  allowPrivateNetwork?: boolean | null;
+}
+
+/** Immutable, credential-free configuration captured for one model call. */
+export interface ProviderAuditSnapshot {
+  kind: string;
+  modelId: string;
+  baseUrl: string;
+  capabilities: ProviderAuditCapabilities;
+  options: ProviderAuditOptions;
 }
 
 export interface ProviderProfile {
