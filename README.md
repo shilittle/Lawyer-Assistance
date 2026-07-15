@@ -158,6 +158,7 @@ pnpm build
 python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
 python data/build/audit_provider_security.py
 python apps/desktop/scripts/verify_legal_resource.py
+python -m unittest scripts.test_generate_third_party_notices
 python scripts/generate_third_party_notices.py --check
 ```
 

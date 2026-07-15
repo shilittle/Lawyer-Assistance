@@ -341,7 +341,9 @@ jobs:
         run: cargo test --locked --workspace
 
       - name: Verify complete third-party notices
-        run: python scripts/generate_third_party_notices.py --check
+        run: |
+          python -m unittest scripts.test_generate_third_party_notices
+          python scripts/generate_third_party_notices.py --check
 
       - name: Lint frontend
         run: pnpm lint
