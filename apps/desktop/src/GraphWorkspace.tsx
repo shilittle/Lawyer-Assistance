@@ -1,6 +1,7 @@
 import cytoscape, { type Core } from "cytoscape";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
+import { syncGraphVisualSelection } from "./graphVisualSelection";
 import { getCaseGraph, getLawGraph } from "./ipc/graph/client";
 import {
   graphContainsSelection,
@@ -29,6 +30,77 @@ function errorMessage(error: unknown): string {
     return String((error as { message: unknown }).message);
   }
   return String(error);
+}
+
+interface GraphTextAlternativeProps {
+  graph: GraphData;
+  selection: GraphSelection | null;
+  onSelect: (selection: GraphSelection) => void;
+}
+
+export function GraphTextAlternative({
+  graph,
+  selection,
+  onSelect,
+}: GraphTextAlternativeProps) {
+  const nodeLabels = new Map(graph.nodes.map((node) => [node.id, node.label]));
+  const nodeTitleId = useId();
+  const edgeTitleId = useId();
+
+  return (
+    <details className="graph-text-alternative">
+      <summary>
+        关系图文字列表（{graph.nodes.length} 个节点，{graph.edges.length} 条关系）
+      </summary>
+      <div className="graph-text-grid">
+        <section aria-labelledby={nodeTitleId}>
+          <h3 id={nodeTitleId}>节点</h3>
+          {graph.nodes.length > 0 ? (
+            <ul>
+              {graph.nodes.map((node) => (
+                <li key={node.id}>
+                  <button
+                    aria-pressed={
+                      selection?.kind === "node" && selection.node.id === node.id
+                    }
+                    type="button"
+                    onClick={() => onSelect({ kind: "node", node })}
+                  >
+                    {node.label}（{node.category}）
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">当前没有可显示的节点。</p>
+          )}
+        </section>
+        <section aria-labelledby={edgeTitleId}>
+          <h3 id={edgeTitleId}>关系</h3>
+          {graph.edges.length > 0 ? (
+            <ul>
+              {graph.edges.map((edge) => (
+                <li key={edge.id}>
+                  <button
+                    aria-pressed={
+                      selection?.kind === "edge" && selection.edge.id === edge.id
+                    }
+                    type="button"
+                    onClick={() => onSelect({ kind: "edge", edge })}
+                  >
+                    {nodeLabels.get(edge.from) ?? edge.from} → {edge.label} →{" "}
+                    {nodeLabels.get(edge.to) ?? edge.to}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">当前没有可显示的关系。</p>
+          )}
+        </section>
+      </div>
+    </details>
+  );
 }
 
 export function GraphWorkspace({
@@ -204,6 +276,12 @@ export function GraphWorkspace({
     };
   }, [layout, shown, sourceKey]);
 
+  useEffect(() => {
+    // Keep keyboard/text-list selection and the visual graph highlight in
+    // sync, including immediately after a layout or filter recreates Cytoscape.
+    syncGraphVisualSelection(cyRef.current, visibleSelection);
+  });
+
   function toggleCategory(
     category: string,
     update: React.Dispatch<React.SetStateAction<Set<string>>>,
@@ -242,22 +320,20 @@ export function GraphWorkspace({
           <h2>{activeMode === "case" ? "案件关系图" : "法律关系图"}</h2>
           <p className="muted">只展示数据库和案件中已存在且带来源记录的关系。</p>
         </div>
-        <div className="graph-source-tabs" role="tablist" aria-label="关系图数据源">
+        <div className="graph-source-tabs" role="group" aria-label="关系图数据源">
           <button
-            aria-selected={activeMode === "case"}
+            aria-pressed={activeMode === "case"}
             className={activeMode === "case" ? "is-active" : ""}
             disabled={!projectId}
-            role="tab"
             type="button"
             onClick={() => onModeChange("case")}
           >
             当前案件
           </button>
           <button
-            aria-selected={activeMode === "law"}
+            aria-pressed={activeMode === "law"}
             className={activeMode === "law" ? "is-active" : ""}
             disabled={!documentId}
-            role="tab"
             type="button"
             onClick={() => onModeChange("law")}
           >
@@ -332,9 +408,15 @@ export function GraphWorkspace({
         </div>
       </details>
 
+      <GraphTextAlternative
+        graph={shown}
+        selection={visibleSelection}
+        onSelect={(value) => setSelection({ sourceKey, value })}
+      />
+
       <div className="graph-layout">
         <div>
-          <div ref={host} className="graph-canvas" aria-label="可交互关系图" />
+          <div ref={host} className="graph-canvas" aria-hidden="true" />
           {graph.nodes.length > 0 && shown.nodes.length === 0 && (
             <p className="muted" role="status">
               没有匹配当前搜索和类型过滤条件的节点。

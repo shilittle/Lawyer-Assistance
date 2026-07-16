@@ -32,6 +32,7 @@ function formatReleaseDate(value?: string): string {
 
 export function ReleaseWorkspace() {
   const [info, setInfo] = useState<VersionInfo | null>(null);
+  const [versionInfoError, setVersionInfoError] = useState("");
   const [databasePath, setDatabasePath] = useState("");
   const [diagnosticPath, setDiagnosticPath] = useState("");
   const [status, setStatus] = useState("");
@@ -42,7 +43,7 @@ export function ReleaseWorkspace() {
 
   useEffect(() => {
     void getVersionInfo().then(setInfo).catch((error: unknown) => {
-      setStatus(formatIpcError(error));
+      setVersionInfoError(formatIpcError(error));
     });
   }, []);
 
@@ -169,7 +170,7 @@ export function ReleaseWorkspace() {
     : undefined;
 
   return (
-    <section className="workspace-card">
+    <section className="workspace-card release-workspace">
       <h2>版本与数据维护</h2>
       {info ? (
         <dl className="metadata-list">
@@ -180,7 +181,13 @@ export function ReleaseWorkspace() {
           <div><dt>数据范围</dt><dd>{info.legalDataScope}</dd></div>
           <div><dt>来源清单 hash</dt><dd><code>{info.sourceManifestHash}</code></dd></div>
         </dl>
-      ) : <p>正在读取版本信息……</p>}
+      ) : versionInfoError ? (
+        <p className="notice warning" role="alert">
+          版本信息读取失败：{versionInfoError}。请重启应用重试，或导出诊断报告。
+        </p>
+      ) : (
+        <p role="status">正在读取版本信息……</p>
+      )}
 
       <h3>应用更新</h3>
       <div className="button-row">

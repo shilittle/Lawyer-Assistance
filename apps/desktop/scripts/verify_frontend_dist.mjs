@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const distRoot = resolve(desktopRoot, "frontend-dist");
 const entry = "index.html";
+const ignoredPlaceholders = new Set([".gitkeep"]);
 
 function normalizeRelative(path) {
   return path.split(sep).join("/");
@@ -53,7 +54,9 @@ if (!existsSync(resolve(distRoot, entry))) {
   throw new Error(`missing frontend entry: ${resolve(distRoot, entry)}`);
 }
 
-const allFiles = new Set(listFiles(distRoot));
+const allFiles = new Set(
+  listFiles(distRoot).filter((file) => !ignoredPlaceholders.has(file)),
+);
 const reachable = new Set([entry]);
 const queue = [entry];
 const textExtensions = /\.(?:html|css|js|mjs|json|svg)$/i;

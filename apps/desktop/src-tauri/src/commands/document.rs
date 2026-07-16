@@ -658,6 +658,7 @@ fn write_docx_payload(path: &Path, document: &GeneratedDocument) -> Result<(), I
     let header = header_xml(&document.template.name);
     let footer = footer_xml();
     let core = core_properties_xml(&document.title);
+    let styles = styles_xml();
     for (name, content) in [
         ("[Content_Types].xml", types.as_str()),
         ("_rels/.rels", rels.as_str()),
@@ -665,7 +666,7 @@ fn write_docx_payload(path: &Path, document: &GeneratedDocument) -> Result<(), I
         ("docProps/app.xml", APP_PROPERTIES_XML),
         ("word/document.xml", xml.as_str()),
         ("word/_rels/document.xml.rels", document_rels.as_str()),
-        ("word/styles.xml", STYLES_XML),
+        ("word/styles.xml", styles.as_str()),
         ("word/numbering.xml", NUMBERING_XML),
         ("word/settings.xml", SETTINGS_XML),
         ("word/fontTable.xml", FONT_TABLE_XML),
@@ -736,6 +737,23 @@ fn header_xml(template_name: &str) -> String {
 
 fn footer_xml() -> String {
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:pStyle w:val="SourceNote"/><w:jc w:val="right"/><w:spacing w:before="0" w:after="0"/></w:pPr><w:r><w:t>第 </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t> 页</w:t></w:r></w:p></w:ftr>"#.to_owned()
+}
+
+fn styles_xml() -> String {
+    // A 22-point CJK title leaves a single orphan character for ordinary
+    // matter names such as the acceptance case. Keep the same centered title
+    // hierarchy at 18 points so the complete title fits the printable width.
+    STYLES_XML
+        .replacen(
+            "w:after=\"240\" w:line=\"528\" w:lineRule=\"auto\"",
+            "w:after=\"240\" w:line=\"432\" w:lineRule=\"auto\"",
+            1,
+        )
+        .replacen(
+            "<w:sz w:val=\"44\"/><w:szCs w:val=\"44\"/>",
+            "<w:sz w:val=\"36\"/><w:szCs w:val=\"36\"/>",
+            1,
+        )
 }
 
 fn styled_paragraph(text: &str, style: &str) -> String {
@@ -1156,6 +1174,14 @@ mod tests {
         assert!(styles.contains("w:eastAsia=\"微软雅黑\""));
         assert!(styles.contains("w:styleId=\"Heading2\""));
         assert!(styles.contains("w:styleId=\"TableHeader\""));
+        let title_style = styles
+            .split("w:styleId=\"Title\"")
+            .nth(1)
+            .and_then(|suffix| suffix.split("</w:style>").next())
+            .expect("Title style exists");
+        assert!(title_style.contains("w:line=\"432\""));
+        assert!(title_style.contains("w:sz w:val=\"36\""));
+        assert!(title_style.contains("w:szCs w:val=\"36\""));
         assert!(read_part(&path, "word/footer1.xml").contains("PAGE"));
     }
 
@@ -1192,7 +1218,8 @@ mod tests {
     #[test]
     #[ignore = "requires the formal 1.18-million-article legal resource"]
     fn acceptance_workspace_citations_match_the_formal_legal_database() {
-        let database_path = std::env::var_os("LAWYER_ASSISTANCE_FORMAL_LEGAL_DB")
+        let database_path = std::env::var_os("LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE")
+            .or_else(|| std::env::var_os("LAWYER_ASSISTANCE_FORMAL_LEGAL_DB"))
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/legal_core.sqlite")

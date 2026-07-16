@@ -500,8 +500,12 @@ fn validate_declared_download_url(
         .and_then(|mut segments| segments.next_back())
         .ok_or_else(|| IpcError::new("updater_security", "The update URL has no filename"))?;
     let filename = percent_decode_filename(encoded_filename)?;
-    let expected_filename = format!("Lawyer Assistance_{version}_x64-setup.exe");
-    if filename != expected_filename || url.path() != format!("{expected_prefix}{encoded_filename}")
+    // GitHub normalizes spaces in uploaded asset names to periods, while the
+    // Tauri minisign trusted comment remains bound to the local product name.
+    let expected_asset_filename = format!("Lawyer.Assistance_{version}_x64-setup.exe");
+    if filename != expected_asset_filename
+        || encoded_filename != expected_asset_filename
+        || url.path() != format!("{expected_prefix}{expected_asset_filename}")
     {
         return Err(IpcError::new(
             "updater_security",
@@ -509,7 +513,8 @@ fn validate_declared_download_url(
         ));
     }
 
-    Ok((url, filename))
+    let signed_filename = format!("Lawyer Assistance_{version}_x64-setup.exe");
+    Ok((url, signed_filename))
 }
 
 fn percent_decode_filename(value: &str) -> Result<String, IpcError> {
@@ -898,7 +903,7 @@ mod tests {
               "platforms": {{
                 "windows-x86_64": {{
                   "signature": "{}",
-                  "url": "https://github.com/shilittle/Lawyer-Assistance/releases/download/v{version}/Lawyer%20Assistance_{version}_x64-setup.exe"
+                  "url": "https://github.com/shilittle/Lawyer-Assistance/releases/download/v{version}/Lawyer.Assistance_{version}_x64-setup.exe"
                 }}
               }}
             }}"#,
@@ -952,16 +957,18 @@ mod tests {
     #[test]
     fn download_url_is_limited_to_the_official_github_release() {
         let version = Version::parse("0.2.1").unwrap();
-        let valid = "https://github.com/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer%20Assistance_0.2.1_x64-setup.exe";
+        let valid = "https://github.com/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer.Assistance_0.2.1_x64-setup.exe";
         assert_eq!(
             validate_declared_download_url(valid, &version).unwrap().1,
             "Lawyer Assistance_0.2.1_x64-setup.exe"
         );
 
         for invalid in [
-            "http://github.com/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer%20Assistance_0.2.1_x64-setup.exe",
-            "https://github.example/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer%20Assistance_0.2.1_x64-setup.exe",
-            "https://github.com/other/Lawyer-Assistance/releases/download/v0.2.1/Lawyer%20Assistance_0.2.1_x64-setup.exe",
+            "http://github.com/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer.Assistance_0.2.1_x64-setup.exe",
+            "https://github.example/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer.Assistance_0.2.1_x64-setup.exe",
+            "https://github.com/other/Lawyer-Assistance/releases/download/v0.2.1/Lawyer.Assistance_0.2.1_x64-setup.exe",
+            "https://github.com/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer%20Assistance_0.2.1_x64-setup.exe",
+            "https://github.com/shilittle/Lawyer-Assistance/releases/download/v0.2.1/Lawyer%2EAssistance_0.2.1_x64-setup.exe",
             "https://github.com/shilittle/Lawyer-Assistance/releases/download/v0.2.1/other.exe",
         ] {
             assert!(validate_declared_download_url(invalid, &version).is_err());

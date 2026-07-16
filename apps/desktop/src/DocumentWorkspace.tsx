@@ -257,7 +257,7 @@ export function DocumentWorkspace({
   }
 
   return (
-    <section className="workspace-card">
+    <section className="workspace-card document-workspace">
       <h2>文书生成</h2>
       <p className="muted">
         以案件事实和已校验本地引用组装文书；缺少必填字段时不会导出半成品。

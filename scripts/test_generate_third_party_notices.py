@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.generate_third_party_notices import canonical_text_sha256
+if __package__:
+    from scripts.generate_third_party_notices import canonical_text_sha256
+else:
+    # Keep the regression test runnable both as a module (the CI entry point)
+    # and as a standalone file from the repository root.
+    from generate_third_party_notices import canonical_text_sha256
 
 
 class CanonicalTextSha256Tests(unittest.TestCase):

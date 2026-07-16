@@ -1297,6 +1297,209 @@ h1 {
   margin: 0;
 }
 
+.workspace-card {
+  min-width: 0;
+  border: 1px solid #cdd8d5;
+  border-radius: 10px;
+  padding: 18px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgb(28 51 43 / 6%);
+}
+
+.workspace-card > :first-child {
+  margin-top: 0;
+}
+
+.workspace-card h2,
+.workspace-card h3,
+.workspace-card h4 {
+  color: #1c2b34;
+}
+
+.workspace-card .muted {
+  color: #5e6c66;
+  line-height: 1.65;
+}
+
+.document-workspace label,
+.release-workspace label {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: #52635b;
+  font-size: 0.86rem;
+  font-weight: 750;
+}
+
+.workspace-card input:not([type="checkbox"]):not([type="radio"]),
+.workspace-card select,
+.workspace-card textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #bac8c4;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #ffffff;
+  color: #1f2d35;
+}
+
+.workspace-card input:not([type="checkbox"]):not([type="radio"]),
+.workspace-card select {
+  min-height: 38px;
+}
+
+.workspace-card textarea {
+  min-height: 92px;
+  padding: 9px 10px;
+  resize: vertical;
+}
+
+.workspace-card input:not([type="checkbox"]):not([type="radio"]):focus-visible,
+.workspace-card select:focus-visible,
+.workspace-card textarea:focus-visible {
+  border-color: #2d6cdf;
+  outline: 3px solid rgb(45 108 223 / 20%);
+  outline-offset: 1px;
+}
+
+.workspace-card button {
+  min-height: 38px;
+  border: 1px solid #1d6655;
+  border-radius: 6px;
+  padding: 6px 14px;
+  background: #237462;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.workspace-card button:hover:not(:disabled) {
+  background: #1d6655;
+}
+
+.workspace-card button:focus-visible,
+.workspace-card summary:focus-visible {
+  outline: 3px solid #2d6cdf;
+  outline-offset: 2px;
+}
+
+.workspace-card button.danger {
+  border-color: #9d2418;
+  background: #b42318;
+}
+
+.workspace-card .button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 14px 0;
+}
+
+.workspace-card .full-width {
+  grid-column: 1 / -1;
+}
+
+.workspace-card .notice {
+  border: 1px solid #a8c8bf;
+  border-radius: 7px;
+  padding: 10px 12px;
+  background: #f0f8f5;
+  color: #24594e;
+  overflow-wrap: anywhere;
+}
+
+.workspace-card .notice.warning {
+  border-color: #d9bd7c;
+  background: #fff9eb;
+  color: #684b15;
+}
+
+.metadata-list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 18px;
+}
+
+.metadata-list > div {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.28fr) minmax(0, 1fr);
+  gap: 12px;
+  border-bottom: 1px solid #e3e9e6;
+  padding-bottom: 7px;
+}
+
+.metadata-list dt {
+  color: #52635b;
+  font-weight: 750;
+}
+
+.metadata-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.release-workspace > label {
+  margin: 10px 0;
+}
+
+.release-workspace progress {
+  width: min(420px, 100%);
+  height: 14px;
+}
+
+.graph-text-alternative {
+  margin-bottom: 0.8rem;
+  border: 1px solid #d8dfdc;
+  border-radius: 0.55rem;
+  padding: 0.55rem 0.75rem;
+  background: #f8faf8;
+}
+
+.graph-text-alternative summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.graph-text-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.graph-text-grid h3 {
+  margin: 0 0 0.55rem;
+}
+
+.graph-text-grid ul {
+  display: grid;
+  gap: 0.45rem;
+  max-height: 300px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.graph-text-grid button {
+  width: 100%;
+  border-color: #b8c6c1;
+  background: #ffffff;
+  color: #34443d;
+  text-align: left;
+}
+
+.graph-text-grid button:hover:not(:disabled) {
+  background: #eef7f4;
+}
+
+.graph-text-grid button[aria-pressed="true"] {
+  border-color: #275d55;
+  background: #275d55;
+  color: #ffffff;
+}
+
 .graph-jump-target {
   outline: 3px solid #cf7d2c;
   outline-offset: 3px;
@@ -1312,5 +1515,16 @@ h1 {
   .graph-detail {
     border-left-width: 0;
     border-top: 4px solid #275d55;
+  }
+}
+
+@media (max-width: 760px) {
+  .workspace-card {
+    padding: 14px;
+  }
+
+  .metadata-list > div,
+  .graph-text-grid {
+    grid-template-columns: 1fr;
   }
 }

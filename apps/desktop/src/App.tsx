@@ -4528,6 +4528,7 @@ export function App() {
         <div className="top-actions">
           <nav className="view-tabs" aria-label="主视图">
             <button
+              aria-current={viewMode === "search" ? "page" : undefined}
               className={viewMode === "search" ? "is-active" : ""}
               type="button"
               onClick={() => setViewMode("search")}
@@ -4535,6 +4536,7 @@ export function App() {
               法律检索
             </button>
             <button
+              aria-current={viewMode === "qa" ? "page" : undefined}
               className={viewMode === "qa" ? "is-active" : ""}
               type="button"
               onClick={() => setViewMode("qa")}
@@ -4542,6 +4544,7 @@ export function App() {
               引用问答
             </button>
             <button
+              aria-current={viewMode === "cases" ? "page" : undefined}
               className={viewMode === "cases" ? "is-active" : ""}
               type="button"
               onClick={() => setViewMode("cases")}
@@ -4549,14 +4552,23 @@ export function App() {
               案件工作台
             </button>
             <button
+              aria-current={viewMode === "providers" ? "page" : undefined}
               className={viewMode === "providers" ? "is-active" : ""}
               type="button"
               onClick={() => setViewMode("providers")}
             >
               Provider 设置
             </button>
-            <button className={viewMode === "documents" ? "is-active" : ""} type="button" onClick={() => setViewMode("documents")}>文书生成</button>
             <button
+              aria-current={viewMode === "documents" ? "page" : undefined}
+              className={viewMode === "documents" ? "is-active" : ""}
+              type="button"
+              onClick={() => setViewMode("documents")}
+            >
+              文书生成
+            </button>
+            <button
+              aria-current={viewMode === "graph" ? "page" : undefined}
               className={viewMode === "graph" ? "is-active" : ""}
               type="button"
               onClick={() => {
@@ -4570,7 +4582,14 @@ export function App() {
             >
               关系图
             </button>
-            <button className={viewMode === "release" ? "is-active" : ""} type="button" onClick={() => setViewMode("release")}>版本与备份</button>
+            <button
+              aria-current={viewMode === "release" ? "page" : undefined}
+              className={viewMode === "release" ? "is-active" : ""}
+              type="button"
+              onClick={() => setViewMode("release")}
+            >
+              版本与备份
+            </button>
           </nav>
           <div className="health-chip" role="status" aria-live="polite">
             <span className={`status-dot status-dot--${health.kind}`} />

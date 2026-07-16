@@ -7,13 +7,18 @@ param(
   [Parameter(Mandatory = $true)][string]$OutputPath
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "release_filenames.ps1")
 $ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
-if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { throw "Version must be valid semantic version text" }
+$releaseFilenames = Get-LawyerAssistanceReleaseFilenames -Version $Version
 $downloadUri = [Uri]$DownloadUrl
 if ($downloadUri.Scheme -ne 'https' -or $downloadUri.DnsSafeHost -ne 'github.com' -or
     -not [string]::IsNullOrEmpty($downloadUri.UserInfo) -or $downloadUri.Port -ne 443 -or
     -not [string]::IsNullOrEmpty($downloadUri.Query) -or -not [string]::IsNullOrEmpty($downloadUri.Fragment)) {
   throw "Updater URL must be an HTTPS github.com URL without credentials, query, or fragment"
+}
+$expectedDownloadPath = "/shilittle/Lawyer-Assistance/releases/download/v$Version/$($releaseFilenames.GitHubAsset)"
+if ($downloadUri.AbsolutePath -cne $expectedDownloadPath) {
+  throw "Updater URL must bind the fixed GitHub release asset $($releaseFilenames.GitHubAsset)"
 }
 $signatureBase64 = $UpdaterSignature.Trim()
 if ([string]::IsNullOrWhiteSpace($signatureBase64)) { throw "An updater signature is required" }
@@ -24,19 +29,17 @@ try {
 }
 $signatureLines = @($signatureText -split "`r?`n")
 if ([string]::IsNullOrWhiteSpace($signatureText) -or $signatureLines.Count -ne 4) { throw "A four-line minisign signature is required" }
-$downloadFilename = [Uri]::UnescapeDataString([IO.Path]::GetFileName($downloadUri.AbsolutePath))
-$trustedFilenameMarker = "`tfile:$downloadFilename"
+$trustedFilenameMarker = "`tfile:$($releaseFilenames.SignedArtifact)"
 if (-not $signatureLines[2].StartsWith('trusted comment: timestamp:') -or
     -not $signatureLines[2].EndsWith($trustedFilenameMarker)) {
-  throw "The minisign trusted comment must bind the exact updater filename"
+  throw "The minisign trusted comment must bind the exact signed installer filename"
 }
 $ArtifactPath = [IO.Path]::GetFullPath($ArtifactPath)
 $UpdaterPublicKeyPath = [IO.Path]::GetFullPath($UpdaterPublicKeyPath)
 if (-not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) { throw "Updater artifact not found" }
 if (-not (Test-Path -LiteralPath $UpdaterPublicKeyPath -PathType Leaf)) { throw "Updater public key not found" }
-$uri = [Uri]$DownloadUrl
-if ([Uri]::UnescapeDataString([IO.Path]::GetFileName($uri.AbsolutePath)) -ne [IO.Path]::GetFileName($ArtifactPath)) {
-  throw "Updater URL filename does not match the signed artifact"
+if ([IO.Path]::GetFileName($ArtifactPath) -cne $releaseFilenames.SignedArtifact) {
+  throw "Updater artifact must use the fixed signed installer filename $($releaseFilenames.SignedArtifact)"
 }
 
 $verifyDirectory = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($OutputPath))) (".updater-verify-" + [Guid]::NewGuid().ToString("N"))

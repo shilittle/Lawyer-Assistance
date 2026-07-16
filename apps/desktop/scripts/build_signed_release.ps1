@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "release_filenames.ps1")
 $ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
 
 function Assert-CleanGitWorktree([string]$Root, [string]$Message) {
@@ -29,6 +30,10 @@ if (@($config.plugins.updater.endpoints).Count -ne 1 -or
 }
 $version = [string]$config.version
 $productName = [string]$config.productName
+$releaseFilenames = Get-LawyerAssistanceReleaseFilenames -Version $version
+if ($productName -cne "Lawyer Assistance") {
+  throw "The signed release product name must remain Lawyer Assistance"
+}
 if (([string](Get-Content -LiteralPath (Join-Path $ProjectRoot "apps\desktop\package.json") -Raw | ConvertFrom-Json).version) -ne $version -or
     ([string](Get-Content -LiteralPath (Join-Path $ProjectRoot "package.json") -Raw | ConvertFrom-Json).version) -ne $version) {
   throw "Root, desktop and Tauri versions must match $version"
@@ -111,6 +116,9 @@ $buildCompletedAt = (Get-Date).ToUniversalTime()
 if (-not $appExe -or -not $installer -or -not $signature) {
   throw "Signed executable, installer or updater signature was not generated"
 }
+if ($installer.Name -cne $releaseFilenames.SignedArtifact) {
+  throw "Tauri generated an unexpected signed installer filename: $($installer.Name)"
+}
 foreach ($artifact in @($appExe, $installer, $signature)) {
   if ($artifact.LastWriteTimeUtc -lt $buildStartedAt.AddSeconds(-2) -or
       $artifact.LastWriteTimeUtc -gt $buildCompletedAt.AddSeconds(5)) {
@@ -153,8 +161,7 @@ try {
 } finally {
   Remove-Item -LiteralPath $portableProvenancePath -Force -ErrorAction SilentlyContinue
 }
-$downloadName = [Uri]::EscapeDataString($installer.Name).Replace('%2F','/')
-$downloadUrl = "https://github.com/$Repository/releases/download/v$version/$downloadName"
+$downloadUrl = "https://github.com/$Repository/releases/download/v$version/$($releaseFilenames.GitHubAsset)"
 & (Join-Path $PSScriptRoot "build_latest_json.ps1") `
   -Version $version `
   -DownloadUrl $downloadUrl `

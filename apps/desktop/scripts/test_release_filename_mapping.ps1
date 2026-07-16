@@ -1,0 +1,64 @@
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "release_filenames.ps1")
+
+$filenames = Get-LawyerAssistanceReleaseFilenames -Version "0.2.1"
+if ($filenames.SignedArtifact -cne "Lawyer Assistance_0.2.1_x64-setup.exe") {
+  throw "The signed installer filename mapping changed unexpectedly"
+}
+if ($filenames.GitHubAsset -cne "Lawyer.Assistance_0.2.1_x64-setup.exe") {
+  throw "The GitHub asset filename mapping changed unexpectedly"
+}
+if ($filenames.SignedArtifact -ceq $filenames.GitHubAsset) {
+  throw "The signed and GitHub filenames must remain distinct"
+}
+
+foreach ($validVersion in @("0.0.0", "1.2.3-alpha.1", "1.2.3+build.01", "1.2.3-rc.1+build.7")) {
+  Get-LawyerAssistanceReleaseFilenames -Version $validVersion | Out-Null
+}
+
+foreach ($invalidVersion in @(
+  "",
+  "v0.2.1",
+  "0.2",
+  "0.2.1/other",
+  "01.2.3",
+  "1.02.3",
+  "1.2.03",
+  "1.2.3-a..b",
+  "1.2.3-01"
+)) {
+  $rejected = $false
+  try {
+    Get-LawyerAssistanceReleaseFilenames -Version $invalidVersion | Out-Null
+  } catch {
+    $rejected = $true
+  }
+  if (-not $rejected) {
+    throw "Invalid release version was accepted: '$invalidVersion'"
+  }
+}
+
+$parseFailures = @()
+foreach ($script in @(
+  "release_filenames.ps1",
+  "build_latest_json.ps1",
+  "build_portable_release.ps1",
+  "build_signed_release.ps1",
+  "test_release_filename_mapping.ps1"
+)) {
+  $tokens = $null
+  $errors = $null
+  [Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $PSScriptRoot $script),
+    [ref]$tokens,
+    [ref]$errors
+  ) | Out-Null
+  if ($errors.Count -gt 0) {
+    $parseFailures += "$script`: $($errors -join '; ')"
+  }
+}
+if ($parseFailures.Count -gt 0) {
+  throw "Release PowerShell AST validation failed: $($parseFailures -join ' | ')"
+}
+
+Write-Output "release filename mapping and PowerShell AST validation passed"
