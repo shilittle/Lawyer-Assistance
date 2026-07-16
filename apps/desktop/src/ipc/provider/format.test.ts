@@ -14,6 +14,7 @@ describe("provider IPC format helpers", () => {
     expect(formatProviderKind("qwen")).toContain("Alibaba");
     expect(formatProviderKind("silicon_flow")).toBe("SiliconFlow");
     expect(formatProviderKind("volcengine_ark")).toBe("Volcengine Ark");
+    expect(formatProviderKind("custom")).toBe("自定义 OpenAI 兼容提供商");
   });
 
   it("formats masked key status without exposing a full key", () => {

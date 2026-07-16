@@ -1,0 +1,87 @@
+{
+  "generated_at": "2026-07-14T15:33:24+00:00",
+  "runtime_profile": "runtime-slim-v1",
+  "runtime_schema_version": "1",
+  "source_verification": "trusted_archival_manifest",
+  "ci_fixture_allowed": false,
+  "input": "<WORKSPACE>/data\\generated\\legal_core_full.sqlite",
+  "output": "<WORKSPACE>/apps\\desktop\\src-tauri\\resources\\legal_core.sqlite",
+  "input_size_bytes": 4512894976,
+  "output_size_bytes": 1775419392,
+  "reduction_bytes": 2737475584,
+  "reduction_percent": 60.66,
+  "input_sha256": "31cf1995cc09f0e3e00f70bfcf20cf67548f1a6362706ccc11d1fd3b2ebc26ac",
+  "output_sha256": "86574bba91950b194c6530586eebbae31c689a5bd2a485877b3eed6b611f7d3c",
+  "source_stat_before": {
+    "size_bytes": 4512894976,
+    "mtime_ns": 1784042533211071800,
+    "ctime_ns": 1784042530424569200,
+    "device": 2650409714535720942,
+    "inode": 34058472185877578
+  },
+  "source_stat_after": {
+    "size_bytes": 4512894976,
+    "mtime_ns": 1784042533211071800,
+    "ctime_ns": 1784042530424569200,
+    "device": 2650409714535720942,
+    "inode": 34058472185877578
+  },
+  "source_revalidated_after_compaction": true,
+  "archival_manifest": {
+    "path": "<WORKSPACE>/data\\generated\\legal_core_full_manifest.json",
+    "sha256": "dc7c350c7c681da073a3a43f48866b5bcf5a0cdb740ed86565f4270a10c5d824",
+    "filename": "legal_core_full.sqlite"
+  },
+  "counts": {
+    "documents": 34549,
+    "versions": 40293,
+    "articles": 1181655,
+    "article_rows": 1181655,
+    "distinct_article_contents": 955706,
+    "fts_rows": 1181655,
+    "relations": 12141,
+    "citations": 1181655,
+    "source_records": 111733
+  },
+  "elapsed_seconds": 210.33,
+  "compaction": {
+    "original_content_bytes": 588894532,
+    "distinct_content_bytes": 519047031,
+    "deduplicated_content_bytes": 69847501,
+    "raw_source_payload_bytes_omitted": 821985049,
+    "omitted_table_rows": {
+      "source_categories": 75,
+      "coverage_audit": 8,
+      "history_version_exceptions": 1121,
+      "ingestion_audit": 42347,
+      "legal_attachments": 88890,
+      "guiding_cases": 1302,
+      "document_templates": 752
+    }
+  },
+  "verification": {
+    "status": "complete",
+    "failures": [],
+    "sqlite_integrity": "ok",
+    "foreign_key_errors": 0,
+    "runtime_profile": "runtime-slim-v1",
+    "runtime_schema_version": "1",
+    "dataset_name": "official-china-legal-core",
+    "dataset_version": "2026.07.14-stage1c.2",
+    "coverage_status": "complete",
+    "document_count": 34549,
+    "version_count": 40293,
+    "article_count": 1181655,
+    "article_row_count": 1181655,
+    "distinct_content_count": 955706,
+    "fts_count": 1181655,
+    "relation_count": 12141,
+    "citation_count": 1181655,
+    "source_record_count": 111733,
+    "source_manifest_sha256": "011551065b404507bce7b2cf542cb3b18da79a14437d094d067e685a438cd9fa",
+    "page_size": 8192,
+    "page_count": 216726,
+    "freelist_count": 0,
+    "fts_probe_ms": 0.57
+  }
+}

@@ -1,6 +1,6 @@
 {
-  "built_at": "2026-07-11T04:53:24+00:00",
-  "output": "apps\\desktop\\src-tauri\\resources\\legal_core.sqlite",
+  "built_at": "2026-07-15T18:23:10+00:00",
+  "output": "data\\generated\\legal_core_full.sqlite",
   "stage": "audit",
   "metadata_only": false,
   "limit": null,
@@ -14,6 +14,16 @@
       "text_fetched_total": 29689,
       "status": "complete",
       "notes": "FLK list total matched fetched rows; detail and text counts recorded separately."
+    },
+    {
+      "source": "flk_npc",
+      "scope": "history_version_declared_exceptions",
+      "expected_total": 1121,
+      "fetched_total": 1121,
+      "detail_fetched_total": 1121,
+      "text_fetched_total": 1121,
+      "status": "complete",
+      "notes": "Every remaining official lsyg family is retained separately with a machine-readable reason; no effective date was inferred."
     },
     {
       "source": "gjgzk_gov",
@@ -34,22 +44,65 @@
       "text_fetched_total": 2663,
       "status": "complete",
       "notes": "部门规章 official total matched fetched rows."
+    },
+    {
+      "source": "spc_court",
+      "scope": "guiding_cases_and_batch_notices",
+      "expected_total": 293,
+      "fetched_total": 293,
+      "detail_fetched_total": 293,
+      "text_fetched_total": 293,
+      "status": "complete",
+      "notes": "Official listing snapshot and every listed detail page fetched with non-empty text."
+    },
+    {
+      "source": "spc_court",
+      "scope": "official_document_templates",
+      "expected_total": 752,
+      "fetched_total": 752,
+      "detail_fetched_total": 752,
+      "text_fetched_total": 752,
+      "status": "complete",
+      "notes": "Official listing snapshot and every listed detail page fetched with non-empty text."
+    },
+    {
+      "source": "spc_court",
+      "scope": "typical_case_collections",
+      "expected_total": 412,
+      "fetched_total": 412,
+      "detail_fetched_total": 412,
+      "text_fetched_total": 412,
+      "status": "complete",
+      "notes": "Official listing snapshot and every listed detail page fetched with non-empty text."
+    },
+    {
+      "source": "spc_court",
+      "scope": "typical_cases",
+      "expected_total": 597,
+      "fetched_total": 597,
+      "detail_fetched_total": 597,
+      "text_fetched_total": 597,
+      "status": "complete",
+      "notes": "Official listing snapshot and every listed detail page fetched with non-empty text."
     }
   ],
   "counts": {
-    "law_documents": 40293,
+    "law_documents": 34549,
     "law_versions": 40293,
     "law_articles": 1181655,
-    "law_relations": 26699,
+    "law_relations": 12141,
     "law_articles_fts": 1181655,
-    "source_records": 110276,
+    "source_records": 111733,
     "legal_attachments": 88890,
-    "ingestion_audit": 40293
+    "ingestion_audit": 42347,
+    "guiding_cases": 1302,
+    "document_templates": 752,
+    "history_version_exceptions": 1121
   },
   "audit": {
     "audit_status": "complete",
     "coverage_status": "complete",
-    "schema_version": "3",
+    "schema_version": "4",
     "failures": [],
     "sqlite_integrity": "ok",
     "foreign_key_errors": 0,
@@ -64,6 +117,18 @@
     "missing_article_record_count": 0,
     "missing_date_count": 3344,
     "duplicate_source_id_count": 0,
-    "fixture_demo_marker_hits": 0
+    "fixture_demo_marker_hits": 0,
+    "guiding_case_count": 1302,
+    "document_template_count": 752,
+    "history_version_exception_count": 1121,
+    "missing_case_provenance": 0,
+    "missing_template_provenance": 0,
+    "stage_1c_data_status": "complete_with_declared_history_date_exceptions",
+    "authoritative_terminal_title_count": 9,
+    "authoritative_terminal_version_count": 9,
+    "authoritative_terminal_violation_count": 0,
+    "authoritative_terminal_missing_article_count": 0,
+    "repealed_unknown_terminal_count": 2645,
+    "historical_unknown_end_policy": "exclude_from_dated_queries"
   }
 }

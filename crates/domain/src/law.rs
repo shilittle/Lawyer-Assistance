@@ -32,6 +32,18 @@ pub struct LawSearchResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetLawDocumentRequest {
+    pub document_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLawDocumentResponse {
+    pub document: Option<LawSearchResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchArticlesRequest {
     pub query: String,
     pub document_id: Option<String>,
@@ -197,5 +209,15 @@ mod tests {
             serde_json::to_value(RelationDirection::Outgoing).expect("direction serializes");
 
         assert_eq!(serialized, "outgoing");
+    }
+
+    #[test]
+    fn exact_law_document_request_serializes_for_ipc() {
+        let serialized = serde_json::to_value(GetLawDocumentRequest {
+            document_id: "cn-civil-code".to_owned(),
+        })
+        .expect("request serializes");
+
+        assert_eq!(serialized["documentId"], "cn-civil-code");
     }
 }

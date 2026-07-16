@@ -1,3 +1,5 @@
+import type { ProviderAuditSnapshot } from "../provider/types";
+
 export type CaseProjectStatus = "active" | "archived";
 export type PartyRole =
   | "plaintiff"
@@ -85,6 +87,13 @@ export interface EvidenceLink {
   evidenceId: string;
 }
 
+export interface FactIssueLink {
+  linkId: string;
+  projectId: string;
+  factId: string;
+  issueId: string;
+}
+
 export interface LegalIssue {
   issueId: string;
   projectId: string;
@@ -160,6 +169,7 @@ export interface CaseWorkspace {
   facts: CaseFact[];
   evidence: EvidenceItem[];
   evidenceLinks: EvidenceLink[];
+  factIssueLinks: FactIssueLink[];
   legalIssues: LegalIssue[];
   legalBasis: LegalBasis[];
   uncertainties: CaseUncertainty[];
@@ -214,6 +224,10 @@ export interface UpsertEvidenceLinkRequest {
   link: EvidenceLink;
 }
 
+export interface UpsertFactIssueLinkRequest {
+  link: FactIssueLink;
+}
+
 export interface UpsertLegalIssueRequest {
   issue: LegalIssue;
 }
@@ -241,11 +255,13 @@ export type CaseEntityType =
   | "fact"
   | "evidence"
   | "evidence_link"
+  | "fact_issue_link"
   | "legal_issue"
   | "legal_basis"
   | "uncertainty";
 
 export interface DeleteCaseEntityRequest {
+  projectId: string;
   entityType: CaseEntityType;
   id: string;
 }
@@ -325,6 +341,8 @@ export interface StructuredCaseExtractionResponse {
 
 export interface GenerateStructuredCaseExtractionResponse {
   result: StructuredCaseExtractionResponse;
+  reviewRevision: number | null;
+  providerSnapshot?: ProviderAuditSnapshot | null;
 }
 
 export interface ConfirmStructuredCaseExtractionRequest {
@@ -333,6 +351,7 @@ export interface ConfirmStructuredCaseExtractionRequest {
   providerId: string;
   fileIds: string[];
   extraction: StructuredCaseExtraction;
+  expectedRevision: number;
   confirmed: boolean;
 }
 
@@ -352,8 +371,45 @@ export interface ConfirmStructuredCaseExtractionResponse {
 
 export interface DiscardStructuredCaseExtractionRequest {
   reviewId: string;
+  projectId: string;
+  expectedRevision: number;
 }
 
 export interface DiscardStructuredCaseExtractionResponse {
   discarded: boolean;
+}
+
+export interface PendingStructuredCaseExtraction {
+  reviewId: string;
+  projectId: string;
+  providerId: string;
+  providerSnapshot: ProviderAuditSnapshot | null;
+  fileIds: string[];
+  extraction: StructuredCaseExtraction;
+  revision: number;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface GetPendingStructuredCaseExtractionRequest {
+  projectId: string;
+}
+
+export interface GetPendingStructuredCaseExtractionResponse {
+  pending: PendingStructuredCaseExtraction | null;
+}
+
+export interface UpdatePendingStructuredCaseExtractionRequest {
+  reviewId: string;
+  projectId: string;
+  providerId: string;
+  fileIds: string[];
+  extraction: StructuredCaseExtraction;
+  expectedRevision: number;
+}
+
+export interface UpdatePendingStructuredCaseExtractionResponse {
+  updated: boolean;
+  revision: number;
+  expiresAt: string;
 }

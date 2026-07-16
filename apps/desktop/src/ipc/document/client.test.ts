@@ -1,0 +1,4 @@
+import { beforeEach,describe,expect,it,vi } from "vitest";
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() })); vi.mock("@tauri-apps/api/core",()=>({invoke}));
+import { exportDocument,previewDocument } from "./client";
+describe("document IPC",()=>{beforeEach(()=>invoke.mockReset());it("keeps export paths and draft inside typed request envelope",async()=>{invoke.mockResolvedValue({recordId:"r",exportPath:"C:/x.docx",citationCount:1});await exportDocument({projectId:"p",templateId:"complaint",modelDraft:"draft",exportPath:"C:/x.docx"});expect(invoke).toHaveBeenCalledWith("export_document",{request:{projectId:"p",templateId:"complaint",modelDraft:"draft",exportPath:"C:/x.docx"}})});it("unwraps preview document",async()=>{invoke.mockResolvedValue({document:{title:"t"}});expect((await previewDocument({projectId:"p",templateId:"defence"})).title).toBe("t")})});

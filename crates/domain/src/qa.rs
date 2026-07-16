@@ -105,13 +105,20 @@ pub struct CitationValidationReport {
     pub citations: Vec<ValidatedCitation>,
     pub valid_count: u32,
     pub invalid_count: u32,
+    /// True when at least one legal sub-clause lacks an adjacent, valid local
+    /// source marker. A false value is structural coverage, not entailment.
     pub unsupported_legal_conclusion: bool,
+    /// Reserved for an explicit human or separately auditable semantic review.
+    /// The current deterministic validator never claims this capability.
+    #[serde(default)]
+    pub semantic_support_verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegalAnswerRequest {
     pub request_id: String,
+    pub project_id: String,
     pub provider_id: String,
     pub question: String,
     pub law_name: Option<String>,
@@ -123,6 +130,76 @@ pub struct LegalAnswerRequest {
     pub limit: Option<u32>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderAuditSnapshot {
+    pub kind: String,
+    pub model_id: String,
+    pub base_url: String,
+    pub capabilities: ProviderAuditCapabilities,
+    pub options: ProviderAuditOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderAuditCapabilities {
+    pub chat: bool,
+    pub streaming: bool,
+    pub custom_model_id: bool,
+    pub custom_base_url: bool,
+    pub reasoning: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderAuditOptions {
+    pub thinking: Option<bool>,
+    pub enable_thinking: Option<bool>,
+    pub thinking_budget: Option<u32>,
+    pub reasoning_effort: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub allow_private_network: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListLegalAnswerRecordsRequest {
+    pub project_id: String,
+    pub limit: Option<u32>,
+    pub before_created_at: Option<String>,
+    pub before_record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegalAnswerHistoryRecord {
+    pub record_id: String,
+    pub project_id: String,
+    pub provider_id: String,
+    pub provider_snapshot: Option<ProviderAuditSnapshot>,
+    pub question: String,
+    pub answer: String,
+    pub case_date: Option<String>,
+    pub query: StructuredLegalQuery,
+    pub source_ids: Vec<String>,
+    /// Complete ordered candidate set that was sent to the provider, hydrated
+    /// by its immutable citation IDs when history is read.
+    pub sources: Vec<LegalSource>,
+    /// IDs retained for audit when an older/newer legal-core distribution can
+    /// no longer hydrate a historical candidate.
+    pub missing_source_ids: Vec<String>,
+    pub citation_report: CitationValidationReport,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListLegalAnswerRecordsResponse {
+    pub records: Vec<LegalAnswerHistoryRecord>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +261,7 @@ mod tests {
     fn legal_answer_request_uses_camel_case_contract() {
         let request = LegalAnswerRequest {
             request_id: "answer-test-1".to_owned(),
+            project_id: "case-1".to_owned(),
             provider_id: "deepseek-main".to_owned(),
             question: "合同违约责任是什么？".to_owned(),
             law_name: Some("民法典".to_owned()),
@@ -200,9 +278,26 @@ mod tests {
         let serialized = serde_json::to_value(request).expect("request serializes");
 
         assert_eq!(serialized["providerId"], "deepseek-main");
+        assert_eq!(serialized["projectId"], "case-1");
         assert_eq!(serialized["requestId"], "answer-test-1");
         assert_eq!(serialized["caseDate"], "2024-01-01");
         assert_eq!(serialized["includeExpired"], false);
         assert_eq!(serialized["maxTokens"], 512);
+    }
+
+    #[test]
+    fn legal_answer_history_cursor_uses_camel_case_contract() {
+        let request = ListLegalAnswerRecordsRequest {
+            project_id: "case-1".to_owned(),
+            limit: Some(25),
+            before_created_at: Some("2026-07-14 12:00:00".to_owned()),
+            before_record_id: Some("record-25".to_owned()),
+        };
+
+        let serialized = serde_json::to_value(request).expect("history request serializes");
+
+        assert_eq!(serialized["projectId"], "case-1");
+        assert_eq!(serialized["beforeCreatedAt"], "2026-07-14 12:00:00");
+        assert_eq!(serialized["beforeRecordId"], "record-25");
     }
 }

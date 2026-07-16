@@ -7,6 +7,9 @@ import {
   isLegalAnswerStreamCancellable,
   markLegalAnswerCancelling,
   reduceLegalAnswerStreamEvent,
+  restoreLegalAnswerAfterRejectedCancellation,
+  settleLegalAnswerCancellation,
+  shouldCancelLegalAnswerOnPageLeave,
   startLegalAnswerStream,
 } from "./stream";
 
@@ -60,6 +63,7 @@ describe("legal answer stream state", () => {
       message: "legal answer request was cancelled",
     });
     expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.requestId).toBeNull();
 
     const failed = reduceLegalAnswerStreamEvent(
       startLegalAnswerStream("answer-3"),
@@ -103,5 +107,67 @@ describe("legal answer stream state", () => {
 
     expect(state.status).toBe("finalizing");
     expect(state.answer).toBe("");
+  });
+
+  it("does not cancel or relabel a request that is already finalizing", () => {
+    const finalizing = reduceLegalAnswerStreamEvent(
+      startLegalAnswerStream("answer-finalizing"),
+      {
+        requestId: "answer-finalizing",
+        eventType: "done",
+      },
+    );
+
+    expect(
+      shouldCancelLegalAnswerOnPageLeave(finalizing, "answer-finalizing"),
+    ).toBe(false);
+    expect(
+      settleLegalAnswerCancellation(
+        finalizing,
+        "answer-finalizing",
+        true,
+        "离开问答页面，生成已取消",
+      ),
+    ).toBe(finalizing);
+  });
+
+  it("uses the cancel command result as the cancellation authority", () => {
+    const streaming = reduceLegalAnswerStreamEvent(
+      startLegalAnswerStream("answer-cancel-result"),
+      {
+        requestId: "answer-cancel-result",
+        eventType: "delta",
+        content: "partial",
+      },
+    );
+    const cancelling = markLegalAnswerCancelling(streaming);
+
+    expect(
+      shouldCancelLegalAnswerOnPageLeave(streaming, "answer-cancel-result"),
+    ).toBe(true);
+    expect(
+      settleLegalAnswerCancellation(
+        cancelling,
+        "answer-cancel-result",
+        false,
+      ),
+    ).toBe(cancelling);
+
+    const restored = restoreLegalAnswerAfterRejectedCancellation(
+      cancelling,
+      "answer-cancel-result",
+      "streaming",
+    );
+    expect(restored.status).toBe("streaming");
+    expect(restored.message).toContain("取消未生效");
+
+    const cancelled = settleLegalAnswerCancellation(
+      cancelling,
+      "answer-cancel-result",
+      true,
+    );
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.requestId).toBeNull();
+    expect(cancelled.answer).toBe("partial");
   });
 });

@@ -3,7 +3,17 @@ import type {
   CitationInvalidReason,
   LawArticleDetail,
   LegalSource,
+  ValidatedCitation,
 } from "./types";
+
+export type LegalAnswerSegment =
+  | { kind: "text"; key: string; text: string }
+  | {
+      kind: "citation";
+      key: string;
+      text: string;
+      citation: ValidatedCitation;
+    };
 
 export function formatEffectiveWindow(
   effectiveFrom: string,
@@ -54,4 +64,46 @@ export function formatCitationInvalidReason(
   };
 
   return reason ? labels[reason] : "未知原因";
+}
+
+export function segmentLegalAnswer(
+  answer: string,
+  citations: ValidatedCitation[],
+): LegalAnswerSegment[] {
+  const segments: LegalAnswerSegment[] = [];
+  let cursor = 0;
+
+  citations.forEach((citation, citationIndex) => {
+    const markerIndex = answer.indexOf(citation.rawMarker, cursor);
+    if (markerIndex < 0) {
+      return;
+    }
+
+    if (markerIndex > cursor) {
+      segments.push({
+        kind: "text",
+        key: `text-${cursor}-${markerIndex}`,
+        text: answer.slice(cursor, markerIndex),
+      });
+    }
+
+    const markerEnd = markerIndex + citation.rawMarker.length;
+    segments.push({
+      kind: "citation",
+      key: `citation-${citationIndex}-${markerIndex}`,
+      text: answer.slice(markerIndex, markerEnd),
+      citation,
+    });
+    cursor = markerEnd;
+  });
+
+  if (cursor < answer.length || segments.length === 0) {
+    segments.push({
+      kind: "text",
+      key: `text-${cursor}-${answer.length}`,
+      text: answer.slice(cursor),
+    });
+  }
+
+  return segments;
 }

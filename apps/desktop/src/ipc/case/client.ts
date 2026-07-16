@@ -19,6 +19,10 @@ import type {
   GetCaseWorkspaceRequest,
   GetCaseWorkspaceResponse,
   GenerateStructuredCaseExtractionResponse,
+  GetPendingStructuredCaseExtractionRequest,
+  GetPendingStructuredCaseExtractionResponse,
+  UpdatePendingStructuredCaseExtractionRequest,
+  UpdatePendingStructuredCaseExtractionResponse,
   StructuredCaseExtractionRequest,
   UpsertCaseFileRequest,
   UpsertCaseFactRequest,
@@ -26,6 +30,7 @@ import type {
   UpsertCaseProjectRequest,
   UpsertEvidenceItemRequest,
   UpsertEvidenceLinkRequest,
+  UpsertFactIssueLinkRequest,
   UpsertLegalIssueRequest,
 } from "./types";
 
@@ -130,6 +135,30 @@ export function discardStructuredCaseExtraction(
 ): Promise<DiscardStructuredCaseExtractionResponse> {
   return invoke<DiscardStructuredCaseExtractionResponse>(
     "discard_structured_case_extraction",
+    { request },
+  );
+}
+
+export function upsertFactIssueLink(
+  request: UpsertFactIssueLinkRequest,
+): Promise<EntitySavedResponse> {
+  return invoke<EntitySavedResponse>("upsert_fact_issue_link", { request });
+}
+
+export function getPendingStructuredCaseExtraction(
+  request: GetPendingStructuredCaseExtractionRequest,
+): Promise<GetPendingStructuredCaseExtractionResponse> {
+  return invoke<GetPendingStructuredCaseExtractionResponse>(
+    "get_pending_structured_case_extraction",
+    { request },
+  );
+}
+
+export function updatePendingStructuredCaseExtraction(
+  request: UpdatePendingStructuredCaseExtractionRequest,
+): Promise<UpdatePendingStructuredCaseExtractionResponse> {
+  return invoke<UpdatePendingStructuredCaseExtractionResponse>(
+    "update_pending_structured_case_extraction",
     { request },
   );
 }

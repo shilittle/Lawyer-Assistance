@@ -33,10 +33,24 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_SQL = ROOT / "data" / "schema" / "legal_core.sql"
-DEFAULT_OUTPUT = ROOT / "apps" / "desktop" / "src-tauri" / "resources" / "legal_core.sqlite"
+DEFAULT_OUTPUT = ROOT / "data" / "generated" / "legal_core_full.sqlite"
 DEFAULT_REPORT = ROOT / "data" / "generated" / "legal_core_build_report.json"
 CACHE_DIR = ROOT / "data" / "build" / "cache"
 STATE_DB = ROOT / "data" / "build" / "state" / "legal_core_jobs.sqlite"
+
+CIVIL_CODE_REPEALED_TITLES = (
+    "中华人民共和国婚姻法",
+    "中华人民共和国继承法",
+    "中华人民共和国民法通则",
+    "中华人民共和国收养法",
+    "中华人民共和国担保法",
+    "中华人民共和国合同法",
+    "中华人民共和国物权法",
+    "中华人民共和国侵权责任法",
+    "中华人民共和国民法总则",
+)
+CIVIL_CODE_REPEAL_EFFECTIVE_TO = "2020-12-31"
+HISTORICAL_UNKNOWN_END_POLICY = "exclude_from_dated_queries"
 
 FLK_BASE = "https://flk.npc.gov.cn"
 FLK_SOURCE_ID = "flk_npc"
@@ -1784,7 +1798,21 @@ def amendment_relation_types(item: dict[str, Any]) -> tuple[str, str]:
 
 
 def refresh_fts(connection: sqlite3.Connection) -> None:
-    connection.execute("DELETE FROM law_articles_fts")
+    connection.execute("DROP TABLE IF EXISTS law_articles_fts")
+    connection.execute(
+        """
+        CREATE VIRTUAL TABLE law_articles_fts USING fts5(
+          article_id UNINDEXED,
+          document_id UNINDEXED,
+          version_id UNINDEXED,
+          document_title,
+          article_number,
+          article_title,
+          content,
+          tokenize = 'unicode61 remove_diacritics 2'
+        )
+        """
+    )
     connection.execute(
         """
         INSERT INTO law_articles_fts (
@@ -1804,6 +1832,7 @@ def refresh_fts(connection: sqlite3.Connection) -> None:
         JOIN law_documents ON law_documents.id = law_articles.document_id
         """
     )
+    connection.execute("INSERT INTO law_articles_fts(law_articles_fts) VALUES('optimize')")
 
 
 def insert_coverage(
@@ -2602,7 +2631,7 @@ def update_metadata(connection: sqlite3.Connection, report: dict[str, Any]) -> N
     else:
         coverage_status = "incomplete"
     for key, value in {
-        "schema_version": "3",
+        "schema_version": "4",
         "dataset_name": "official-china-legal-core",
         "build_completed_at": timestamp,
         "coverage_status": coverage_status,
@@ -2711,6 +2740,51 @@ def text_marker_hits(connection: sqlite3.Connection) -> int:
             ).fetchone()[0]
         )
     return total
+
+
+def authoritative_terminal_date_audit(
+    connection: sqlite3.Connection,
+) -> dict[str, int]:
+    placeholders = ",".join("?" for _ in CIVIL_CODE_REPEALED_TITLES)
+    title_count, version_count, violation_count, missing_article_count = connection.execute(
+        f"""
+        SELECT
+          COUNT(DISTINCT CASE
+            WHEN versions.effective_to = ? THEN documents.title
+          END),
+          SUM(CASE WHEN versions.effective_to = ? THEN 1 ELSE 0 END),
+          SUM(CASE
+            WHEN versions.effective_from <= ?
+             AND (versions.effective_to IS NULL OR versions.effective_to > ?)
+            THEN 1 ELSE 0
+          END),
+          SUM(CASE
+            WHEN versions.effective_to = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM law_articles articles WHERE articles.version_id = versions.id
+             )
+            THEN 1 ELSE 0
+          END)
+        FROM law_versions versions
+        JOIN law_documents documents ON documents.id = versions.document_id
+        WHERE documents.title IN ({placeholders})
+          AND versions.status = 'repealed'
+        """,
+        (
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            CIVIL_CODE_REPEAL_EFFECTIVE_TO,
+            *CIVIL_CODE_REPEALED_TITLES,
+        ),
+    ).fetchone()
+    return {
+        "title_count": int(title_count or 0),
+        "version_count": int(version_count or 0),
+        "violation_count": int(violation_count or 0),
+        "missing_article_count": int(missing_article_count or 0),
+    }
 
 
 def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -2829,6 +2903,50 @@ def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchone()[0]
     )
+    guiding_case_count = count_optional_table(connection, "guiding_cases")
+    document_template_count = count_optional_table(connection, "document_templates")
+    history_exception_count = count_optional_table(connection, "history_version_exceptions")
+    missing_case_provenance = 0
+    missing_template_provenance = 0
+    if guiding_case_count:
+        missing_case_provenance = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM guiding_cases
+                WHERE source_system_id IS NULL OR source_external_id IS NULL
+                   OR source_record_id IS NULL OR source_url = '' OR content = ''
+                """
+            ).fetchone()[0]
+        )
+    if document_template_count:
+        missing_template_provenance = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM document_templates
+                WHERE source_system_id IS NULL OR source_external_id IS NULL
+                   OR source_record_id IS NULL OR source_url = '' OR content = ''
+                """
+            ).fetchone()[0]
+        )
+    stage_1c_status = (
+        connection.execute("SELECT value FROM database_metadata WHERE key = 'stage_1c_data_status'").fetchone()
+        or [None]
+    )[0]
+    authoritative_terminal = authoritative_terminal_date_audit(connection)
+    authoritative_terminal_title_count = authoritative_terminal["title_count"]
+    repealed_unknown_terminal_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM law_versions "
+            "WHERE status = 'repealed' AND effective_to IS NULL"
+        ).fetchone()[0]
+    )
+    historical_unknown_end_policy = (
+        connection.execute(
+            "SELECT value FROM database_metadata "
+            "WHERE key = 'historical_unknown_end_policy'"
+        ).fetchone()
+        or [None]
+    )[0]
     failures: list[str] = []
     if integrity != "ok":
         failures.append(f"sqlite_integrity:{integrity}")
@@ -2838,7 +2956,7 @@ def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
         failures.append(f"fts_mismatch:{fts_count}!={article_count}")
     if coverage_status != "complete":
         failures.append(f"coverage_status:{coverage_status}")
-    if schema_version != "3":
+    if schema_version != "4":
         failures.append(f"schema_version:{schema_version}")
     if not has_ingestion_audit:
         failures.append("missing_ingestion_audit_table")
@@ -2863,6 +2981,45 @@ def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
         failures.append(f"fixture_demo_marker_hits:{fixture_hits}")
     if duplicate_source_ids:
         failures.append(f"duplicate_source_ids:{duplicate_source_ids}")
+    if stage_1c_status:
+        if not guiding_case_count:
+            failures.append("stage_1c_missing_guiding_cases")
+        if not document_template_count:
+            failures.append("stage_1c_missing_document_templates")
+        if not history_exception_count:
+            failures.append("stage_1c_missing_history_exception_audit")
+        if missing_case_provenance:
+            failures.append(f"missing_case_provenance:{missing_case_provenance}")
+        if missing_template_provenance:
+            failures.append(f"missing_template_provenance:{missing_template_provenance}")
+        if authoritative_terminal_title_count != len(CIVIL_CODE_REPEALED_TITLES):
+            failures.append(
+                "authoritative_terminal_title_count:"
+                f"{authoritative_terminal_title_count}!={len(CIVIL_CODE_REPEALED_TITLES)}"
+            )
+        if authoritative_terminal["version_count"] != len(CIVIL_CODE_REPEALED_TITLES):
+            failures.append(
+                "authoritative_terminal_version_count:"
+                f"{authoritative_terminal['version_count']}!={len(CIVIL_CODE_REPEALED_TITLES)}"
+            )
+        if authoritative_terminal["violation_count"]:
+            failures.append(
+                "authoritative_terminal_violation_count:"
+                f"{authoritative_terminal['violation_count']}"
+            )
+        if authoritative_terminal["missing_article_count"]:
+            failures.append(
+                "authoritative_terminal_missing_article_count:"
+                f"{authoritative_terminal['missing_article_count']}"
+            )
+        if (
+            repealed_unknown_terminal_count
+            and historical_unknown_end_policy != HISTORICAL_UNKNOWN_END_POLICY
+        ):
+            failures.append(
+                "historical_unknown_end_policy:"
+                f"{historical_unknown_end_policy}!={HISTORICAL_UNKNOWN_END_POLICY}"
+            )
     return {
         "audit_status": "complete" if not failures else "failed",
         "coverage_status": coverage_status,
@@ -2882,6 +3039,20 @@ def audit_connection(connection: sqlite3.Connection) -> dict[str, Any]:
         "missing_date_count": missing_dates,
         "duplicate_source_id_count": duplicate_source_ids,
         "fixture_demo_marker_hits": fixture_hits,
+        "guiding_case_count": guiding_case_count,
+        "document_template_count": document_template_count,
+        "history_version_exception_count": history_exception_count,
+        "missing_case_provenance": missing_case_provenance,
+        "missing_template_provenance": missing_template_provenance,
+        "stage_1c_data_status": stage_1c_status,
+        "authoritative_terminal_title_count": authoritative_terminal_title_count,
+        "authoritative_terminal_version_count": authoritative_terminal["version_count"],
+        "authoritative_terminal_violation_count": authoritative_terminal["violation_count"],
+        "authoritative_terminal_missing_article_count": authoritative_terminal[
+            "missing_article_count"
+        ],
+        "repealed_unknown_terminal_count": repealed_unknown_terminal_count,
+        "historical_unknown_end_policy": historical_unknown_end_policy,
     }
 
 
@@ -2902,6 +3073,9 @@ def build_report_from_connection(connection: sqlite3.Connection, options: BuildO
             "source_records": count_table(connection, "source_records"),
             "legal_attachments": count_table(connection, "legal_attachments"),
             "ingestion_audit": count_optional_table(connection, "ingestion_audit"),
+            "guiding_cases": count_optional_table(connection, "guiding_cases"),
+            "document_templates": count_optional_table(connection, "document_templates"),
+            "history_version_exceptions": count_optional_table(connection, "history_version_exceptions"),
         },
     }
 

@@ -1,0 +1,14 @@
+== multi-law ==
+law_names=["中华人民共和国民法典", "中华人民共和国劳动合同法"]
+article_numbers=["第五百七十七条", "第八十二条"]
+中华人民共和国劳动合同法 | cn-labor-contract-law-20130701 | 第八十二条 | law:cn-labor-contract-law:cn-labor-contract-law-20130701:art:82
+中华人民共和国民法典 | cn-civil-code-20210101 | 第五百七十七条 | law:cn-civil-code:cn-civil-code-20210101:art:577
+== multi-version ==
+中华人民共和国民法典 | cn-civil-code-20210101 | 第五百七十七条 | law:cn-civil-code:cn-civil-code-20210101:art:577
+中华人民共和国民法典 | cn-civil-code-20150101 | 第五百七十七条 | law:cn-civil-code:cn-civil-code-20150101:art:577
+== truncation ==
+warnings=["source_truncated:law:cn-civil-code:cn-civil-code-20210101:art:577"]
+retained_long_chars=1600 tail_visible=false
+== expired-filter ==
+filtered_count=0
+中华人民共和国合同法 | cn-contract-law-19991001 | 第一百零七条 | law:cn-contract-law-1999:cn-contract-law-19991001:art:107

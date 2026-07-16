@@ -13,7 +13,12 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock,
 }));
 
-import { answerLegalQuestion, cancelLegalAnswer } from "./client";
+import {
+  answerLegalQuestion,
+  cancelLegalAnswer,
+  getLawDocument,
+  listLegalAnswerRecords,
+} from "./client";
 import type { LegalAnswerRequest, LegalAnswerStreamEvent } from "./types";
 
 describe("legal answer streaming IPC client", () => {
@@ -54,11 +59,52 @@ describe("legal answer streaming IPC client", () => {
       request: { requestId: "answer-2" },
     });
   });
+
+  it("lists only records owned by the requested case", async () => {
+    invokeMock.mockResolvedValue({ records: [] });
+
+    await listLegalAnswerRecords({ projectId: "case-1", limit: 50 });
+
+    expect(invokeMock).toHaveBeenCalledWith("list_legal_answer_records", {
+      request: { projectId: "case-1", limit: 50 },
+    });
+  });
+
+  it("passes a stable two-column cursor when loading older records", async () => {
+    invokeMock.mockResolvedValue({ records: [], hasMore: false });
+
+    await listLegalAnswerRecords({
+      projectId: "case-1",
+      limit: 25,
+      beforeCreatedAt: "2026-07-14T10:00:00Z",
+      beforeRecordId: "record-25",
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("list_legal_answer_records", {
+      request: {
+        projectId: "case-1",
+        limit: 25,
+        beforeCreatedAt: "2026-07-14T10:00:00Z",
+        beforeRecordId: "record-25",
+      },
+    });
+  });
+
+  it("looks up law metadata by the exact document id", async () => {
+    invokeMock.mockResolvedValue({ document: { documentId: "law-1" } });
+
+    await getLawDocument({ documentId: "law-1" });
+
+    expect(invokeMock).toHaveBeenCalledWith("get_law_document", {
+      request: { documentId: "law-1" },
+    });
+  });
 });
 
 function requestFixture(): LegalAnswerRequest {
   return {
     requestId: "answer-1",
+    projectId: "case-1",
     providerId: "provider",
     question: "违约责任是什么？",
     lawName: null,

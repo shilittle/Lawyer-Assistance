@@ -1,3 +1,7 @@
+import type { ProviderAuditSnapshot } from "../provider/types";
+
+export type { ProviderAuditSnapshot } from "../provider/types";
+
 export interface SearchLawsRequest {
   query: string;
   limit?: number;
@@ -20,6 +24,14 @@ export interface LawSearchResult {
   matchedAlias?: string | null;
   summary: string;
   score: number;
+}
+
+export interface GetLawDocumentRequest {
+  documentId: string;
+}
+
+export interface GetLawDocumentResponse {
+  document?: LawSearchResult | null;
 }
 
 export interface SearchArticlesRequest {
@@ -188,10 +200,12 @@ export interface CitationValidationReport {
   validCount: number;
   invalidCount: number;
   unsupportedLegalConclusion: boolean;
+  semanticSupportVerified: boolean;
 }
 
 export interface LegalAnswerRequest extends LegalAnswerCandidatesRequest {
   requestId: string;
+  projectId: string;
   providerId: string;
   temperature?: number | null;
   maxTokens?: number | null;
@@ -220,6 +234,34 @@ export interface LegalAnswerResponse {
   context: LegalAnswerContext;
   citationReport: CitationValidationReport;
   recordId?: string | null;
+}
+
+export interface LegalAnswerRecord {
+  recordId: string;
+  projectId: string;
+  providerId: string;
+  providerSnapshot?: ProviderAuditSnapshot | null;
+  question: string;
+  answer: string;
+  caseDate?: string | null;
+  query: StructuredLegalQuery;
+  sourceIds: string[];
+  sources: LegalSource[];
+  missingSourceIds: string[];
+  citationReport: CitationValidationReport;
+  createdAt: string;
+}
+
+export interface ListLegalAnswerRecordsRequest {
+  projectId: string;
+  limit?: number | null;
+  beforeCreatedAt?: string | null;
+  beforeRecordId?: string | null;
+}
+
+export interface ListLegalAnswerRecordsResponse {
+  records: LegalAnswerRecord[];
+  hasMore: boolean;
 }
 
 export interface CancelLegalAnswerRequest {

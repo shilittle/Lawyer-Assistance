@@ -10,4 +10,6 @@ domain.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

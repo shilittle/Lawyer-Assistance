@@ -1,16 +1,23 @@
 {
   "name": "@lawyer-assistance/desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && pnpm run verify:frontend-dist",
+    "build:tauri": "node scripts/build_tauri_frontend.mjs",
     "lint": "eslint . --max-warnings=0",
     "tauri": "tauri",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify:frontend-dist": "node scripts/verify_frontend_dist.mjs",
+    "verify:legal-resource": "python scripts/verify_legal_resource.py",
+    "release:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_portable_release.ps1",
+    "release:signed": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_signed_release.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
+    "@types/cytoscape": "^3.31.0",
+    "cytoscape": "^3.34.0",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },

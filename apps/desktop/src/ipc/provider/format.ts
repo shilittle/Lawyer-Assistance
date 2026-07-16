@@ -10,6 +10,7 @@ export function formatProviderKind(kind: ProviderKind): string {
     qwen: "Qwen / Alibaba Cloud Model Studio",
     silicon_flow: "SiliconFlow",
     volcengine_ark: "Volcengine Ark",
+    custom: "自定义 OpenAI 兼容提供商",
   };
 
   return labels[kind];

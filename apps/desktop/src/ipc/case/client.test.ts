@@ -3,8 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   confirmStructuredCaseExtraction,
+  deleteCaseEntity,
   discardStructuredCaseExtraction,
   generateStructuredCaseExtraction,
+  getPendingStructuredCaseExtraction,
+  upsertFactIssueLink,
+  updatePendingStructuredCaseExtraction,
 } from "./client";
 import type { StructuredCaseExtraction } from "./types";
 
@@ -74,6 +78,7 @@ describe("case extraction IPC client", () => {
       providerId: "provider-1",
       fileIds: ["file-1"],
       extraction,
+      expectedRevision: 7,
       confirmed: true,
     });
 
@@ -84,16 +89,97 @@ describe("case extraction IPC client", () => {
         providerId: "provider-1",
         fileIds: ["file-1"],
         extraction,
+        expectedRevision: 7,
         confirmed: true,
       },
     });
   });
 
   it("discards the server-side review token when the user cancels", async () => {
-    await discardStructuredCaseExtraction({ reviewId: "review-1" });
+    await discardStructuredCaseExtraction({
+      reviewId: "review-1",
+      projectId: "case-1",
+      expectedRevision: 3,
+    });
 
     expect(invoke).toHaveBeenCalledWith("discard_structured_case_extraction", {
-      request: { reviewId: "review-1" },
+      request: {
+        reviewId: "review-1",
+        projectId: "case-1",
+        expectedRevision: 3,
+      },
     });
+  });
+
+  it("restores a pending review within its owning project", async () => {
+    await getPendingStructuredCaseExtraction({ projectId: "case-1" });
+
+    expect(invoke).toHaveBeenCalledWith(
+      "get_pending_structured_case_extraction",
+      { request: { projectId: "case-1" } },
+    );
+  });
+
+  it("sends the owning project id when deleting an entity", async () => {
+    await deleteCaseEntity({
+      projectId: "case-owner",
+      entityType: "evidence",
+      id: "evidence-1",
+    });
+
+    expect(invoke).toHaveBeenCalledWith("delete_case_entity", {
+      request: {
+        projectId: "case-owner",
+        entityType: "evidence",
+        id: "evidence-1",
+      },
+    });
+  });
+
+  it("persists an explicit fact-to-issue link through its dedicated command", async () => {
+    await upsertFactIssueLink({
+      link: {
+        linkId: "fact-issue-link-1",
+        projectId: "case-1",
+        factId: "fact-1",
+        issueId: "issue-1",
+      },
+    });
+
+    expect(invoke).toHaveBeenCalledWith("upsert_fact_issue_link", {
+      request: {
+        link: {
+          linkId: "fact-issue-link-1",
+          projectId: "case-1",
+          factId: "fact-1",
+          issueId: "issue-1",
+        },
+      },
+    });
+  });
+
+  it("persists a reviewed edit with immutable generation provenance", async () => {
+    await updatePendingStructuredCaseExtraction({
+      reviewId: "review-1",
+      projectId: "case-1",
+      providerId: "provider-1",
+      fileIds: ["file-1"],
+      extraction,
+      expectedRevision: 11,
+    });
+
+    expect(invoke).toHaveBeenCalledWith(
+      "update_pending_structured_case_extraction",
+      {
+        request: {
+          reviewId: "review-1",
+          projectId: "case-1",
+          providerId: "provider-1",
+          fileIds: ["file-1"],
+          extraction,
+          expectedRevision: 11,
+        },
+      },
+    );
   });
 });
