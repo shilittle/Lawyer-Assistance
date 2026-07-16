@@ -856,6 +856,11 @@ fn markdown_cell(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::case::*;
+
+    fn normalize_golden_text(value: &str) -> String {
+        value.replace("\r\n", "\n").trim_end().to_owned()
+    }
+
     fn workspace() -> CaseWorkspace {
         CaseWorkspace {
             project: CaseProject {
@@ -989,9 +994,15 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let expected = normalize_golden_text(include_str!("../testdata/document_templates.golden"));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn template_golden_comparison_normalizes_windows_line_endings() {
         assert_eq!(
-            actual,
-            include_str!("../testdata/document_templates.golden").trim_end()
+            normalize_golden_text("第一行\r\n第二行\r\n"),
+            "第一行\n第二行"
         );
     }
     #[test]

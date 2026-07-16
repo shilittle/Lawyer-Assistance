@@ -1,1 +1,2 @@
 *.sqlite binary
+*.golden text eol=lf
