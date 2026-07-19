@@ -4,6 +4,7 @@ import type {
   UpdatePendingStructuredCaseExtractionRequest,
 } from "./types";
 import type { ProviderAuditSnapshot } from "../provider/types";
+import { hasInternalEngineeringDetail } from "../../publicOutput";
 
 export type PendingExtractionDraftSaveRequest = Omit<
   UpdatePendingStructuredCaseExtractionRequest,
@@ -105,6 +106,76 @@ export function createExtractionContext(
   };
 }
 
+const EXTRACTION_MACHINE_FIELD_PATTERN =
+  /\b(?:file[_-]?id|source[_-]?refs?|proposal[_-]?hash|provider[_-]?snapshot|review[_-]?id|request[_-]?id|run[_-]?id|raw[_-]?output|repair[_-]?output|schema[_-]?version|payload|metadata|uuid|sha256?)\b/iu;
+const EXTRACTION_JSON_MEMBER_PATTERN = /["'][^"'\r\n]+["']\s*:/u;
+const EXTRACTION_URI_OR_PATH_PATTERN =
+  /(?:[A-Za-z]:[\\/]|\\\\|\b[A-Za-z][A-Za-z0-9+.-]*:\/\/|\bfile:\/{1,3}|\/(?:Users|home|tmp|var|etc|workspace|mnt|ProgramData)\/)/iu;
+const EXTRACTION_PROCESS_TEXT_PATTERN =
+  /(?:内部字段|内部标识|内部编号|内部路径|本地路径|系统字段|工程字段|技术字段|原始\s*JSON|模型输出|模型抽取|模型建议|服务端字段|internal\s+(?:field|id)|raw\s+json|model\s+(?:output|extraction))/iu;
+
+function isStructuredMachineValue(value: string): boolean {
+  const trimmed = value.trim();
+  if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) return false;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return parsed !== null && typeof parsed === "object";
+  } catch {
+    return false;
+  }
+}
+
+/** Business strings may be displayed and persisted; bindings stay elsewhere. */
+export function extractionBusinessTextIsPublic(value: string): boolean {
+  const normalized = value.trim();
+  if (!normalized) return true;
+  return !(
+    isStructuredMachineValue(normalized) ||
+    EXTRACTION_JSON_MEMBER_PATTERN.test(normalized) ||
+    EXTRACTION_MACHINE_FIELD_PATTERN.test(normalized) ||
+    EXTRACTION_URI_OR_PATH_PATTERN.test(normalized) ||
+    EXTRACTION_PROCESS_TEXT_PATTERN.test(normalized) ||
+    hasInternalEngineeringDetail(normalized)
+  );
+}
+
+export function structuredCaseExtractionIsPublic(
+  extraction: StructuredCaseExtraction,
+): boolean {
+  const values = [
+    ...extraction.parties.map((party) => party.name),
+    ...extraction.facts.flatMap((fact) => [
+      fact.title,
+      fact.description,
+      ...fact.evidenceNumbers,
+    ]),
+    ...extraction.evidence.flatMap((evidence) => [
+      evidence.evidenceNumber,
+      evidence.title,
+      evidence.source,
+      evidence.summary,
+    ]),
+    ...extraction.legalIssues.flatMap((issue) => [
+      issue.title,
+      issue.description,
+      issue.claim,
+    ]),
+    ...extraction.uncertainties.flatMap((uncertainty) => [
+      uncertainty.description,
+      uncertainty.relatedReference ?? "",
+    ]),
+  ];
+  return values.every(extractionBusinessTextIsPublic);
+}
+
+function rejectedUnsafeDraft(repairAttempted: boolean): ExtractionState {
+  return {
+    kind: "failed",
+    message: "待审阅内容未通过安全检查，已拒绝载入。",
+    repairAttempted,
+  };
+}
+
 export function extractionReducer(
   state: ExtractionState,
   action: ExtractionAction,
@@ -122,6 +193,9 @@ export function extractionReducer(
         state.context.requestId !== action.requestId
       ) {
         return state;
+      }
+      if (!structuredCaseExtractionIsPublic(action.draft)) {
+        return rejectedUnsafeDraft(action.repaired);
       }
       return {
         kind: "reviewing",
@@ -142,6 +216,9 @@ export function extractionReducer(
         state.kind === "committing"
       ) {
         return state;
+      }
+      if (!structuredCaseExtractionIsPublic(action.draft)) {
+        return rejectedUnsafeDraft(false);
       }
       return {
         kind: "reviewing",
@@ -169,7 +246,8 @@ export function extractionReducer(
         repairOutput: action.repairOutput,
       };
     case "edit":
-      return state.kind === "reviewing"
+      return state.kind === "reviewing" &&
+        structuredCaseExtractionIsPublic(action.draft)
         ? { ...state, draft: action.draft, commitError: undefined }
         : state;
     case "saved":
@@ -222,7 +300,10 @@ export function extractionReducer(
 export function buildConfirmationRequest(
   state: ExtractionState,
 ): ConfirmStructuredCaseExtractionRequest | null {
-  if (state.kind !== "reviewing") {
+  if (
+    state.kind !== "reviewing" ||
+    !structuredCaseExtractionIsPublic(state.draft)
+  ) {
     return null;
   }
   return {
@@ -321,9 +402,10 @@ export async function guardExtractionClose(
     }
     await guard.destroyWindow();
     return "saved_and_closed";
-  } catch (error: unknown) {
-    const detail = error instanceof Error ? error.message : String(error);
-    guard.onBlocked(`关闭前保存审阅修改失败，窗口已保持打开：${detail}`);
+  } catch {
+    guard.onBlocked(
+      "关闭前未能安全保存审阅修改，窗口已保持打开。请重试；如仍失败，请导出诊断报告。",
+    );
     return "blocked";
   }
 }

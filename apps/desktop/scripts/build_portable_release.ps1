@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot "release_file_ops.ps1")
 
 function Invoke-Checked([string]$Description, [scriptblock]$Command) {
   & $Command
@@ -206,6 +207,16 @@ Invoke-Checked "Third-party notice verification" {
   python (Join-Path $ProjectRoot "scripts\generate_third_party_notices.py") --check
 }
 
+# Cargo/Tauri and workspace snapshot tooling may optimize very large resource
+# copies as hard links. Runtime database opens intentionally reject hard-linked
+# files, so always materialize an independent release-tree copy after the build.
+$targetLegalResource = Join-Path $TargetDir "resources\legal_core.sqlite"
+Install-LawyerAssistanceIndependentFile $legalResource $targetLegalResource
+if ((Get-Item -LiteralPath $targetLegalResource).Length -ne $actualLegalSize -or
+    (Get-FileHash -LiteralPath $targetLegalResource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $actualLegalHash) {
+  throw "Independent target legal database differs from the verified release resource"
+}
+
 $tauriPackagePath = Join-Path $ProjectRoot "apps\desktop\node_modules\@tauri-apps\cli\package.json"
 if (-not (Test-Path -LiteralPath $tauriPackagePath -PathType Leaf)) { throw "Tauri CLI package is not installed" }
 $tauriCliVersion = [string](Get-Content -LiteralPath $tauriPackagePath -Raw -Encoding UTF8 | ConvertFrom-Json).version
@@ -219,7 +230,12 @@ Copy-Item -LiteralPath $exe -Destination $stage
 foreach ($name in @("legal_core.sqlite", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "DATA_SOURCES.md")) {
   $source = Join-Path $resourceRoot $name
   if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required release resource missing: $source" }
-  Copy-Item -LiteralPath $source -Destination (Join-Path $stage "resources\$name")
+  $destination = Join-Path $stage "resources\$name"
+  if ($name -eq "legal_core.sqlite") {
+    Install-LawyerAssistanceIndependentFile $source $destination
+  } else {
+    Copy-Item -LiteralPath $source -Destination $destination
+  }
 }
 
 $copiedLegalResource = Join-Path $stage "resources\legal_core.sqlite"
@@ -231,6 +247,7 @@ if ((Get-Item -LiteralPath $copiedLegalResource).Length -ne $actualLegalSize -or
     (Get-FileHash -LiteralPath $copiedLegalResource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $actualLegalHash) {
   throw "Copied legal database differs from the verified release resource"
 }
+Assert-LawyerAssistanceSingleLinkFile $copiedLegalResource
 
 $forbidden = Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
   $_.Name -match '^(python|node|postgres|mysqld|mongod)(\.exe)?$' -or

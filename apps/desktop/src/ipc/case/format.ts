@@ -22,7 +22,7 @@ export function formatPartyRole(role: PartyRole): string {
 }
 
 export function formatConfirmationStatus(status: ConfirmationStatus): string {
-  return status === "confirmed" ? "已确认事实" : "模型建议";
+  return status === "confirmed" ? "已确认事实" : "待审阅内容";
 }
 
 export function formatLegalIssueStatus(status: LegalIssueStatus): string {

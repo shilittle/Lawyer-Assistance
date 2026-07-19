@@ -5,6 +5,8 @@
 /.pnpm-store/
 /apikey.txt
 /.release-secrets/
+/tmp/
+/output/
 
 **/dist/
 **/target/
@@ -32,6 +34,14 @@ data/generated/*
 
 *.log
 *.tmp
+**/user.sqlite
+**/user.sqlite-shm
+**/user.sqlite-wal
+**/user.sqlite-journal
+**/legal_core.sqlite
+**/legal_core.sqlite-shm
+**/legal_core.sqlite-wal
+**/legal_core.sqlite-journal
 __pycache__/
 *.pyc
 .DS_Store

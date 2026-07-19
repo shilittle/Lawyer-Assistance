@@ -42,6 +42,7 @@ $parseFailures = @()
 foreach ($script in @(
   "release_filenames.ps1",
   "build_latest_json.ps1",
+  "release_file_ops.ps1",
   "build_portable_release.ps1",
   "build_signed_release.ps1",
   "test_release_filename_mapping.ps1"

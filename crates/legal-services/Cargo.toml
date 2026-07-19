@@ -1,0 +1,29 @@
+[package]
+name = "legal-services"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+assistant.workspace = true
+citations.workspace = true
+database.workspace = true
+domain.workspace = true
+file-ingest.workspace = true
+retrieval.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+zip = { version = "=2.4.2", default-features = false }

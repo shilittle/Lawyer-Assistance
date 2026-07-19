@@ -85,6 +85,12 @@ pub fn get_version_info(state: State<'_, AppState>) -> Result<VersionInfo, IpcEr
         source_manifest_hash: metadata("source_manifest_sha256"),
     })
 }
+fn require_protected_database_backup() -> Result<(), IpcError> {
+    Err(IpcError::new(
+        "privacy_required",
+        "Plaintext user database backup is disabled until encrypted local-only backup is available.",
+    ))
+}
 #[tauri::command]
 pub fn backup_user_database(
     state: State<'_, AppState>,
@@ -93,6 +99,7 @@ pub fn backup_user_database(
     let Some(path) = request.destination_path.filter(|p| !p.trim().is_empty()) else {
         return Ok(cancelled());
     };
+    require_protected_database_backup()?;
     let restore = restore_paths(state.user_database_path())?;
     let protected = protected_application_paths(
         state.user_database_path(),
@@ -474,7 +481,7 @@ fn file_sha256(path: &Path) -> Result<String, IpcError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn paths_refer_to_same_file(first: &Path, second: &Path) -> bool {
+pub(crate) fn paths_refer_to_same_file(first: &Path, second: &Path) -> bool {
     if first == second {
         return true;
     }
@@ -579,6 +586,15 @@ pub fn sanitize_diagnostic_text(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plaintext_user_database_backup_is_disabled() {
+        let error = require_protected_database_backup().unwrap_err();
+        assert_eq!(error.error_type, "privacy_required");
+        assert!(error
+            .message
+            .contains("Plaintext user database backup is disabled"));
+        assert!(!error.message.contains("sqlite"));
+    }
     use super::*;
     #[test]
     fn diagnostics_remove_secrets_bodies_and_case_text() {
@@ -674,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_and_restore_roundtrip_user_projects() {
+    fn backup_and_restore_roundtrip_v9_assistant_workspace() {
         let directory = tempfile::tempdir().expect("temp directory");
         let active = database::ensure_user_database(directory.path()).expect("user database");
         {
@@ -693,6 +709,116 @@ mod tests {
                 },
             )
             .expect("project inserts");
+            database::create_conversation(
+                &connection,
+                "conversation-backup",
+                Some("project-backup"),
+                "备份中的助理会话",
+            )
+            .expect("conversation inserts");
+            database::create_message(
+                &connection,
+                &database::NewMessageRow {
+                    message_id: "message-backup-user".into(),
+                    conversation_id: "conversation-backup".into(),
+                    role: "user".into(),
+                    kind: "text".into(),
+                    text_summary: "请梳理材料".into(),
+                    artifact_id: None,
+                    run_id: None,
+                },
+            )
+            .expect("user message inserts");
+            database::insert_attachment(
+                &connection,
+                &database::NewAttachmentRow {
+                    attachment_id: "attachment:backup".into(),
+                    project_id: Some("project-backup".into()),
+                    original_name: "backup.txt".into(),
+                    extension: "txt".into(),
+                    detected_mime: "text/plain".into(),
+                    sha256: "b".repeat(64),
+                    size_bytes: 6,
+                    content_blob: b"backup".to_vec(),
+                    extraction_status: "succeeded".into(),
+                    extracted_text: Some("backup".into()),
+                    segments_json: "[]".into(),
+                    error_code: None,
+                },
+            )
+            .expect("attachment inserts");
+            database::attach_to_message(&connection, "message-backup-user", "attachment:backup", 0)
+                .expect("attachment links");
+            database::add_conversation_source(
+                &connection,
+                "conversation-backup",
+                "legal-source-backup",
+            )
+            .expect("source links");
+            database::create_agent_run(
+                &connection,
+                &database::NewAgentRunRow {
+                    run_id: "run-backup".into(),
+                    conversation_id: "conversation-backup".into(),
+                    user_message_id: "message-backup-user".into(),
+                    provider_id: None,
+                    provider_snapshot_json: "{}".into(),
+                    intent: "case_analysis".into(),
+                    status: "queued".into(),
+                    budget_json: r#"{"maxToolCalls":8}"#.into(),
+                },
+            )
+            .expect("run inserts");
+            database::create_tool_call(
+                &connection,
+                &database::NewToolCallRow {
+                    tool_call_id: "tool-backup".into(),
+                    run_id: "run-backup".into(),
+                    ordinal: 0,
+                    capability_name: "case.read".into(),
+                    status: "queued".into(),
+                    access_mode: "read".into(),
+                    requires_confirmation: false,
+                    input_audit_json: r#"{"projectId":"project-backup"}"#.into(),
+                    output_audit_json: "{}".into(),
+                    source_audit_json: "[]".into(),
+                },
+            )
+            .expect("tool call inserts");
+            database::create_artifact(
+                &connection,
+                &database::NewArtifactRow {
+                    artifact_id: "artifact-backup".into(),
+                    conversation_id: Some("conversation-backup".into()),
+                    project_id: Some("project-backup".into()),
+                    kind: "research".into(),
+                    title: "备份研究产物".into(),
+                    status: "draft".into(),
+                },
+                &database::NewArtifactVersionRow {
+                    version_id: "artifact-backup-v1".into(),
+                    artifact_id: "artifact-backup".into(),
+                    content_json: r#"{"schemaVersion":1}"#.into(),
+                    rendered_text: "备份研究产物正文".into(),
+                    source_refs_json: r#"["attachment:backup"]"#.into(),
+                    citation_report_json: "{}".into(),
+                    provider_snapshot_json: "{}".into(),
+                },
+            )
+            .expect("artifact inserts");
+            database::create_case_change_proposal(
+                &connection,
+                &database::NewCaseChangeProposalRow {
+                    proposal_id: "proposal-backup".into(),
+                    conversation_id: "conversation-backup".into(),
+                    project_id: "project-backup".into(),
+                    run_id: Some("run-backup".into()),
+                    base_case_digest: "c".repeat(64),
+                    changes_json: r#"{"facts":[]}"#.into(),
+                    source_refs_json: r#"["attachment:backup"]"#.into(),
+                },
+            )
+            .expect("proposal inserts");
         }
         let backup = directory.path().join("backup.sqlite");
         backup_database(&active, &backup, &[&active]).expect("backup succeeds");
@@ -703,6 +829,16 @@ mod tests {
                 .remove(0);
             project.title = "修改后标题".into();
             database::upsert_case_project(&connection, &project).expect("project changes");
+            database::archive_conversation(&connection, "conversation-backup")
+                .expect("conversation archives");
+            database::compare_and_set_case_change_proposal_status(
+                &connection,
+                "proposal-backup",
+                "project-backup",
+                &"c".repeat(64),
+                "rejected",
+            )
+            .expect("proposal rejects before restore");
         }
         stage_database_restore(&backup, &active).expect("restore stages");
         {
@@ -719,6 +855,54 @@ mod tests {
             database::list_case_projects(&connection).unwrap()[0].title,
             "备份时标题"
         );
+        assert_eq!(
+            database::get_conversation(&connection, "conversation-backup")
+                .unwrap()
+                .unwrap()
+                .status,
+            "open"
+        );
+        assert_eq!(
+            database::list_messages(&connection, "conversation-backup")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database::list_message_attachments(&connection, "message-backup-user")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database::list_conversation_sources(&connection, "conversation-backup").unwrap()[0]
+                .source_id,
+            "legal-source-backup"
+        );
+        assert!(database::get_agent_run(&connection, "run-backup")
+            .unwrap()
+            .is_some());
+        assert!(database::get_tool_call(&connection, "tool-backup")
+            .unwrap()
+            .is_some());
+        assert!(database::get_attachment(&connection, "attachment:backup")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            database::list_artifact_versions(&connection, "artifact-backup")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database::get_case_change_proposal(&connection, "proposal-backup")
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        database::validate_user_database_read_only(&active)
+            .expect("restored v9 assistant workspace remains canonical");
     }
 
     #[test]

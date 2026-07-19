@@ -63,6 +63,285 @@ pub fn bounded_text(
     validate_text(field, value, max_bytes, mode)
 }
 
+/// Rejects machine-only or engineering text before it can enter a
+/// lawyer-facing business field. Identifiers used for provenance and
+/// persistence must travel in their dedicated typed fields instead.
+pub fn public_business_text(field: &str, value: &str) -> Result<(), InputValidationError> {
+    if business_text_contains_internal_detail(value) {
+        return Err(InputValidationError::new(format!(
+            "{field} contains content that is not permitted in a business field"
+        )));
+    }
+    Ok(())
+}
+
+pub fn business_text_contains_internal_detail(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if matches!(
+        serde_json::from_str::<serde_json::Value>(trimmed),
+        Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_))
+    ) || contains_json_member(trimmed)
+        || contains_internal_field_token(&lower)
+        || contains_path_or_uri(trimmed, &lower)
+        || contains_uuid(trimmed)
+        || contains_hash(trimmed)
+        || contains_opaque_internal_identifier(&lower)
+        || contains_namespaced_identifier(trimmed)
+        || [
+            "[src:",
+            "[cit:",
+            "internal field",
+            "internal id",
+            "raw json",
+            "model output",
+            "model extraction",
+            "system field",
+            "内部字段",
+            "内部标识",
+            "内部编号",
+            "内部路径",
+            "本地路径",
+            "系统字段",
+            "工程字段",
+            "技术字段",
+            "原始json",
+            "原始 json",
+            "模型输出",
+            "模型抽取",
+            "模型建议",
+            "服务端字段",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn contains_json_member(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let mut escaped = false;
+        while index < bytes.len() {
+            match (bytes[index], escaped) {
+                (_, true) => escaped = false,
+                (b'\\', false) => escaped = true,
+                (b'"', false) => break,
+                _ => {}
+            }
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return false;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b':') {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_internal_field_token(lower: &str) -> bool {
+    lower
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            matches!(
+                token,
+                "id" | "fileid"
+                    | "file_id"
+                    | "sourceid"
+                    | "source_id"
+                    | "sourceref"
+                    | "source_ref"
+                    | "sourcerefs"
+                    | "source_refs"
+                    | "proposalhash"
+                    | "proposal_hash"
+                    | "providerid"
+                    | "provider_id"
+                    | "providersnapshot"
+                    | "provider_snapshot"
+                    | "reviewid"
+                    | "review_id"
+                    | "requestid"
+                    | "request_id"
+                    | "runid"
+                    | "run_id"
+                    | "articleid"
+                    | "article_id"
+                    | "attachmentid"
+                    | "attachment_id"
+                    | "artifactid"
+                    | "artifact_id"
+                    | "documentid"
+                    | "document_id"
+                    | "versionid"
+                    | "version_id"
+                    | "schema"
+                    | "schemaversion"
+                    | "schema_version"
+                    | "rawoutput"
+                    | "raw_output"
+                    | "repairoutput"
+                    | "repair_output"
+                    | "payload"
+                    | "metadata"
+                    | "endpoint"
+                    | "localpath"
+                    | "uuid"
+                    | "hash"
+                    | "sha256"
+            )
+        })
+}
+
+fn contains_path_or_uri(value: &str, lower: &str) -> bool {
+    if value.contains('\\')
+        || value.contains("](")
+        || lower.contains("://")
+        || lower.contains("file:/")
+        || [
+            "/users/",
+            "/home/",
+            "/tmp/",
+            "/var/",
+            "/etc/",
+            "/workspace/",
+            "/mnt/",
+            "/programdata/",
+        ]
+        .iter()
+        .any(|prefix| lower.contains(prefix))
+    {
+        return true;
+    }
+    value.as_bytes().windows(3).any(|part| {
+        part[0].is_ascii_alphabetic() && part[1] == b':' && matches!(part[2], b'/' | b'\\')
+    })
+}
+
+fn contains_uuid(value: &str) -> bool {
+    value.as_bytes().windows(36).any(|candidate| {
+        [8, 13, 18, 23]
+            .iter()
+            .all(|index| candidate[*index] == b'-')
+            && candidate
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+    })
+}
+
+fn contains_hash(value: &str) -> bool {
+    let mut length = 0usize;
+    let mut has_digit = false;
+    let mut has_hex_letter = false;
+    for byte in value.bytes().chain(std::iter::once(b' ')) {
+        if byte.is_ascii_hexdigit() {
+            length += 1;
+            has_digit |= byte.is_ascii_digit();
+            has_hex_letter |= matches!(byte.to_ascii_lowercase(), b'a'..=b'f');
+        } else {
+            if length >= 16 && has_digit && has_hex_letter {
+                return true;
+            }
+            length = 0;
+            has_digit = false;
+            has_hex_letter = false;
+        }
+    }
+    false
+}
+
+fn contains_opaque_internal_identifier(lower: &str) -> bool {
+    lower
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+        .filter_map(|token| token.split_once('-'))
+        .any(|(prefix, suffix)| {
+            matches!(
+                prefix,
+                "art"
+                    | "att"
+                    | "attachment"
+                    | "artifact"
+                    | "case"
+                    | "citation"
+                    | "conversation"
+                    | "doc"
+                    | "document"
+                    | "evidence"
+                    | "fact"
+                    | "file"
+                    | "issue"
+                    | "message"
+                    | "msg"
+                    | "project"
+                    | "proj"
+                    | "proposal"
+                    | "prop"
+                    | "provider"
+                    | "record"
+                    | "request"
+                    | "req"
+                    | "review"
+                    | "run"
+                    | "service"
+                    | "source"
+                    | "src"
+                    | "tool"
+                    | "version"
+            ) && !suffix.is_empty()
+                && suffix.bytes().any(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn contains_namespaced_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b':' || bytes.get(index + 1) == Some(&b'/') {
+            continue;
+        }
+        let left_start = bytes[..index]
+            .iter()
+            .rposition(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+            .map_or(0, |position| position + 1);
+        let right_end = bytes[index + 1..]
+            .iter()
+            .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+            .map_or(bytes.len(), |position| index + 1 + position);
+        let left = &bytes[left_start..index];
+        let right = &bytes[index + 1..right_end];
+        if left.len() >= 2
+            && left[0].is_ascii_alphabetic()
+            && !right.is_empty()
+            && right.iter().any(|byte| byte.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn identifier(field: &str, value: &str, max_bytes: usize) -> Result<(), InputValidationError> {
     required_text(field, value, max_bytes, TextMode::SingleLine)?;
     if value.trim() != value || value.chars().any(char::is_whitespace) {

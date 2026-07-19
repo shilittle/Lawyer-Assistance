@@ -29,7 +29,7 @@ export function formatLatency(value?: number | null): string {
 }
 
 export function formatHttpStatus(value?: number | null): string {
-  return typeof value === "number" ? `HTTP ${value}` : "无 HTTP 状态";
+  return typeof value === "number" ? `状态码 ${value}` : "未返回状态码";
 }
 
 export function formatConnectionResult(result?: ConnectionTest): string {
@@ -38,10 +38,8 @@ export function formatConnectionResult(result?: ConnectionTest): string {
   }
 
   if (result.status === "succeeded") {
-    return `成功 · ${formatHttpStatus(result.httpStatus)} · ${
-      result.model ?? "未返回模型名"
-    }`;
+    return "连接成功";
   }
 
-  return `失败 · ${result.errorType ?? "unknown"} · ${result.message}`;
+  return "连接失败，请检查配置和网络后重试。";
 }

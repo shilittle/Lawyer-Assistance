@@ -143,11 +143,10 @@ export function reduceLegalAnswerStreamEvent(
     case "done":
       return {
         ...state,
-        // The channel event is emitted after validation/persistence but just
-        // before the invoke Promise resolves with the citation report. Keep a
-        // distinct state so the UI does not claim it already has final data.
+        // The channel event is emitted after the answer has been saved but just
+        // before the invoke Promise resolves with its supporting-law details.
         status: "finalizing",
-        message: "来源标记已做结构校验并保存，正在载入最终结果",
+        message: "回答已保存，正在载入法条依据",
       };
   }
 }
@@ -171,13 +170,13 @@ export function formatLegalAnswerStreamStatus(
 ): string {
   const labels: Record<LegalAnswerStreamStatus, string> = {
     idle: "等待生成",
-    connecting: "正在连接 Provider",
-    streaming: "正在生成（引用未校验）",
+    connecting: "正在准备回答",
+    streaming: "正在整理回答",
     cancelling: "正在取消",
-    finalizing: "来源标记已做结构校验，正在载入结果",
+    finalizing: "回答已保存，正在载入法条依据",
     cancelled: "已取消",
     error: state.message ?? "生成失败",
-    done: "已完成；来源标记已映射（语义未核验）",
+    done: "回答已完成",
   };
 
   return labels[state.status];

@@ -263,20 +263,37 @@ pub fn search_articles(
         }
     }
 
-    let query = request.query.trim();
+    let original_query = request.query.trim().to_owned();
     let limit = bounded_limit(request.limit);
 
-    if let Some(structured_query) = parse_structured_article_query(query) {
+    if let Some(structured_query) = parse_structured_article_query(&original_query) {
         let results = search_articles_structured(connection, &request, &structured_query, limit)?;
         return Ok(SearchArticlesResponse { results });
     }
 
+    let mut effective_request = request;
+    let mut query = original_query;
+    if effective_request.document_id.is_none() {
+        let original_terms = split_raw_search_terms(&query);
+        if let Some((document_id, law_name_terms)) =
+            infer_unique_document_scope(connection, &original_terms)?
+        {
+            query = original_terms
+                .into_iter()
+                .filter(|term| !law_name_terms.contains(term))
+                .collect::<Vec<_>>()
+                .join(" ");
+            effective_request.document_id = Some(document_id);
+            effective_request.query = query.clone();
+        }
+    }
+
     if query.is_empty() {
-        let results = search_articles_like(connection, &request, query, limit)?;
+        let results = search_articles_like(connection, &effective_request, &query, limit)?;
         return Ok(SearchArticlesResponse { results });
     }
 
-    let search_terms = split_search_terms(query);
+    let search_terms = split_search_terms(&query);
     let may_expand_like = requires_bounded_like_expansion(&search_terms);
     // A saturated single-term FTS page already has enough deterministic
     // candidates. Running `%term%` over every row in all seed versions adds no
@@ -287,7 +304,7 @@ pub fn search_articles(
     } else {
         limit
     };
-    let fts_results = match search_articles_fts(connection, &request, query, fts_limit) {
+    let fts_results = match search_articles_fts(connection, &effective_request, &query, fts_limit) {
         Ok(results) => results,
         Err(RetrievalError::Sqlite(_)) => Vec::new(),
         Err(error @ RetrievalError::InvalidRequest(_)) => return Err(error),
@@ -309,7 +326,7 @@ pub fn search_articles(
         .collect::<Vec<_>>();
     let like_results = search_articles_like_candidates(
         connection,
-        &request,
+        &effective_request,
         &search_terms,
         (!seed_versions.is_empty()).then_some(seed_versions.as_slice()),
         MAX_LIKE_CANDIDATES,
@@ -317,6 +334,57 @@ pub fn search_articles(
     let results = merge_article_candidates(fts_results, like_results, limit);
 
     Ok(SearchArticlesResponse { results })
+}
+
+fn infer_unique_document_scope(
+    connection: &rusqlite::Connection,
+    search_terms: &[String],
+) -> Result<Option<(String, HashSet<String>)>, RetrievalError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT DISTINCT documents.id
+        FROM law_documents documents
+        LEFT JOIN law_aliases aliases ON aliases.document_id = documents.id
+        WHERE documents.title = ?1 OR aliases.normalized_alias = ?1
+        ORDER BY documents.id
+        LIMIT 2
+        ",
+    )?;
+    let mut document_id: Option<String> = None;
+    let mut matched_terms = HashSet::new();
+
+    for original_term in search_terms {
+        let term = trim_explicit_law_name_token(original_term);
+        if term.is_empty() {
+            continue;
+        }
+        let matches = statement
+            .query_map([term], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let [matched_document_id] = matches.as_slice() else {
+            if matches.len() > 1 {
+                return Ok(None);
+            }
+            continue;
+        };
+        if document_id
+            .as_deref()
+            .is_some_and(|existing| existing != matched_document_id)
+        {
+            return Ok(None);
+        }
+        document_id = Some(matched_document_id.clone());
+        matched_terms.insert(original_term.clone());
+    }
+
+    Ok(document_id.map(|document_id| (document_id, matched_terms)))
+}
+
+fn trim_explicit_law_name_token(value: &str) -> &str {
+    value.trim().trim_matches([
+        '《', '》', '“', '”', '「', '」', '（', '）', '(', ')', '，', ',', '。', '；', ';', '：',
+        ':', '、', '！', '!', '？', '?',
+    ])
 }
 
 pub fn get_article(
@@ -386,6 +454,13 @@ pub fn get_article(
     let article = match article {
         Some(mut article) => {
             article.topics = article_topics(connection, &article.article_id)?;
+            if article.topics.is_empty() {
+                article.topics = infer_article_topics(
+                    &article.document_title,
+                    article.article_title.as_deref(),
+                    &article.content,
+                );
+            }
             Some(article)
         }
         None => None,
@@ -1086,6 +1161,49 @@ fn article_topics(
     Ok(topics)
 }
 
+fn infer_article_topics(
+    document_title: &str,
+    article_title: Option<&str>,
+    content: &str,
+) -> Vec<String> {
+    let searchable = format!(
+        "{document_title} {} {content}",
+        article_title.unwrap_or_default()
+    );
+    let rules: &[(&[&str], &str)] = &[
+        (&["犯罪", "刑罚", "有期徒刑", "拘役", "罚金"], "刑事责任"),
+        (&["劳动", "用人单位", "劳动者", "工资"], "劳动用工"),
+        (&["公司", "股东", "董事", "监事", "企业"], "公司治理"),
+        (&["清算", "破产", "解散"], "清算与破产"),
+        (&["合同", "违约", "债权", "债务", "履行"], "合同与债务"),
+        (
+            &["诉讼", "人民法院", "起诉", "审判", "仲裁"],
+            "争议解决程序",
+        ),
+        (&["婚姻", "夫妻", "离婚", "继承", "监护"], "婚姻家庭与继承"),
+        (&["专利", "商标", "著作权", "知识产权"], "知识产权"),
+        (
+            &["行政许可", "行政处罚", "行政复议", "行政机关"],
+            "行政管理",
+        ),
+        (&["证券", "保险", "银行", "金融"], "金融业务"),
+        (&["土地", "房屋", "不动产", "房地产"], "不动产"),
+        (&["侵权", "损害", "赔偿"], "侵权与赔偿"),
+    ];
+
+    let topics = rules
+        .iter()
+        .filter(|(keywords, _)| keywords.iter().any(|keyword| searchable.contains(keyword)))
+        .map(|(_, topic)| (*topic).to_owned())
+        .take(3)
+        .collect::<Vec<_>>();
+    if topics.is_empty() {
+        vec!["综合法律规范".to_owned()]
+    } else {
+        topics
+    }
+}
+
 fn bounded_limit(limit: Option<u32>) -> i64 {
     i64::from(
         limit
@@ -1538,14 +1656,7 @@ fn expanded_article_numbers(value: ParsedArticleNumber) -> Vec<String> {
 }
 
 fn split_search_terms(query: &str) -> Vec<String> {
-    let raw_terms = query
-        .split(|character: char| {
-            character.is_whitespace()
-                || matches!(character, ',' | '，' | '、' | ';' | '；' | '|' | '｜')
-        })
-        .map(str::trim)
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
+    let raw_terms = split_raw_search_terms(query);
     if raw_terms.len() == 1 {
         let term = raw_terms[0]
             .trim_matches(['。', '？', '?', '！', '!', '，', ','])
@@ -1576,9 +1687,18 @@ fn split_search_terms(query: &str) -> Vec<String> {
         }
     }
 
-    let mut seen = HashSet::new();
     raw_terms
-        .into_iter()
+}
+
+fn split_raw_search_terms(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    query
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ',' | '，' | '、' | ';' | '；' | '|' | '｜')
+        })
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
         .filter_map(|term| {
             if !seen.insert(term.to_lowercase()) {
                 None
@@ -1832,6 +1952,156 @@ mod tests {
         assert!(like_results
             .windows(2)
             .all(|pair| pair[0].score >= pair[1].score));
+    }
+
+    #[test]
+    fn exact_law_alias_scopes_multi_term_search_before_relevance_ranking() {
+        let connection = fixture_connection();
+        connection
+            .execute(
+                "
+                INSERT INTO law_articles (
+                  id, document_id, version_id, article_number, article_order, title, content,
+                  updated_on
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ",
+                rusqlite::params![
+                    "cn-labor-contract-law-20130701-decoy",
+                    "cn-labor-contract-law",
+                    "cn-labor-contract-law-20130701",
+                    "附录测试条款",
+                    99_999,
+                    "修改决定中的文字替换",
+                    "排序回归夹具：民法典、合同履行、逾期交付。",
+                    "2026-07-17"
+                ],
+            )
+            .expect("decoy article inserts");
+        connection
+            .execute(
+                "
+                INSERT INTO law_articles_fts (
+                  rowid, article_id, document_id, version_id, document_title,
+                  article_number, article_title, content
+                )
+                SELECT articles.rowid, articles.id, articles.document_id, articles.version_id,
+                       documents.title, articles.article_number, articles.title, articles.content
+                FROM law_articles articles
+                JOIN law_documents documents ON documents.id = articles.document_id
+                WHERE articles.id = ?1
+                ",
+                ["cn-labor-contract-law-20130701-decoy"],
+            )
+            .expect("decoy FTS row inserts");
+
+        for query in ["民法典 合同履行 逾期交付", "《民法典》 合同履行 逾期交付"]
+        {
+            let response = search_articles(
+                &connection,
+                SearchArticlesRequest {
+                    query: query.to_owned(),
+                    document_id: None,
+                    case_date: Some("2025-11-10".to_owned()),
+                    limit: Some(3),
+                },
+            )
+            .expect("explicit law alias search succeeds");
+
+            assert!(!response.results.is_empty(), "query={query}");
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .all(|result| result.document_id == "cn-civil-code"),
+                "query={query}, results={:?}",
+                response.results
+            );
+            assert_eq!(
+                response.results[0].article_id, "cn-civil-code-20210101-509",
+                "query={query}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_document_scope_fails_open_for_multiple_law_names() {
+        let connection = fixture_connection();
+        let terms = split_raw_search_terms("民法典 合同法 违约责任");
+
+        assert!(infer_unique_document_scope(&connection, &terms)
+            .expect("scope lookup succeeds")
+            .is_none());
+    }
+
+    #[test]
+    fn continuous_chinese_text_is_not_treated_as_an_explicit_law_token() {
+        let connection = fixture_connection();
+        for query in ["民法典合同履行", "劳动合同法违约责任"] {
+            let terms = split_raw_search_terms(query);
+            assert!(
+                infer_unique_document_scope(&connection, &terms)
+                    .expect("scope lookup succeeds")
+                    .is_none(),
+                "query={query}"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_for_the_same_law_share_one_implicit_scope() {
+        let connection = fixture_connection();
+        let terms = split_raw_search_terms("民法典 民法 违约责任");
+        let (document_id, matched_terms) = infer_unique_document_scope(&connection, &terms)
+            .expect("scope lookup succeeds")
+            .expect("one Civil Code scope is inferred");
+
+        assert_eq!(document_id, "cn-civil-code");
+        assert_eq!(
+            matched_terms,
+            HashSet::from(["民法典".to_owned(), "民法".to_owned()])
+        );
+    }
+
+    #[test]
+    fn alias_only_search_returns_articles_from_that_law() {
+        let connection = fixture_connection();
+        let response = search_articles(
+            &connection,
+            SearchArticlesRequest {
+                query: "民法典".to_owned(),
+                document_id: None,
+                case_date: Some("2025-11-10".to_owned()),
+                limit: Some(3),
+            },
+        )
+        .expect("alias-only search succeeds");
+
+        assert_eq!(response.results.len(), 3);
+        assert!(response
+            .results
+            .iter()
+            .all(|result| result.document_id == "cn-civil-code"));
+    }
+
+    #[test]
+    fn explicit_document_id_takes_precedence_over_a_law_alias_in_the_query() {
+        let connection = fixture_connection();
+        let response = search_articles(
+            &connection,
+            SearchArticlesRequest {
+                query: "民法典 违约责任".to_owned(),
+                document_id: Some("cn-contract-law-1999".to_owned()),
+                case_date: Some("2019-01-01".to_owned()),
+                limit: Some(10),
+            },
+        )
+        .expect("explicit document search succeeds");
+
+        assert!(!response.results.is_empty());
+        assert!(response
+            .results
+            .iter()
+            .all(|result| result.document_id == "cn-contract-law-1999"));
     }
 
     #[test]
@@ -2217,6 +2487,21 @@ mod tests {
             "law:cn-labor-contract-law:cn-labor-contract-law-20130701:art:82"
         );
         assert!(article.topics.contains(&"劳动关系".to_owned()));
+    }
+
+    #[test]
+    fn infers_readable_topics_when_the_packaged_resource_has_no_topic_rows() {
+        let topics = infer_article_topics(
+            "中华人民共和国刑法",
+            None,
+            "公司、企业清算时隐匿财产，严重损害债权人利益的，对主管人员判处罚金。",
+        );
+
+        assert_eq!(topics, vec!["刑事责任", "公司治理", "清算与破产"]);
+        assert_eq!(
+            infer_article_topics("某专项规定", None, "本条自公布之日起施行。"),
+            vec!["综合法律规范"]
+        );
     }
 
     #[test]

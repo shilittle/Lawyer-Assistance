@@ -12,14 +12,18 @@ use sha2::{Digest, Sha256};
 
 pub const LEGAL_CORE_DB_FILE_NAME: &str = "legal_core.sqlite";
 pub const USER_DB_FILE_NAME: &str = "user.sqlite";
-pub const USER_SCHEMA_VERSION: i64 = 8;
+pub const USER_SCHEMA_VERSION: i64 = 10;
 const USER_CANONICAL_SCHEMA_MARKER_KEY: &str = "canonical_schema_version";
-// This marker describes the exact canonical shape within schema version 8.
+// This marker describes the exact canonical shape within schema version 10.
 // Keep it independent from USER_SCHEMA_VERSION so constraint-only repairs can
 // be applied once without pretending that an unverified v6 database is sound.
-const USER_CANONICAL_SCHEMA_MARKER_VALUE: &str = "v8-fact-issue-links-20260716";
+const USER_CANONICAL_SCHEMA_MARKER_VALUE: &str = "v10-operation-audit-20260717";
 const PENDING_EXTRACTION_REVIEW_RETENTION_SQL: &str = "+7 days";
 const CASE_MATERIAL_DIGEST_DOMAIN: &[u8] = b"lawyer-assistance-case-materials-v1\0";
+const CASE_WORKSPACE_DIGEST_DOMAIN: &[u8] = b"lawyer-assistance-case-workspace-v2-artifacts\0";
+const LEGACY_QA_CONVERSATION_ID_PREFIX: &str = "legacy-qa:";
+const LEGACY_QA_TITLE_MAX_CHARS: usize = 80;
+const COMPAT_QA_CONVERSATION_ID_PREFIX: &str = "qa:";
 const LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX: &str = "migration-unassigned-legal-answers";
 const LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE: &str = "迁移隔离：旧版未归属问答记录";
 const LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY: &str =
@@ -105,7 +109,7 @@ pub fn validate_and_migrate_user_database(
         // A file that claims the exact current schema must already contain that
         // schema. Do not silently bless a damaged or fabricated current backup
         // by creating whichever tables it omitted.
-        validate_canonical_user_table_shapes(&connection)?;
+        validate_canonical_user_database(&connection)?;
     }
     run_user_migrations(&mut connection)?;
     cleanup_expired_pending_extraction_reviews(&connection)?;
@@ -119,14 +123,46 @@ pub fn validate_and_migrate_user_database(
 pub fn validate_user_database_read_only(
     user_database_path: impl AsRef<Path>,
 ) -> Result<(), DatabaseInitError> {
+    let connection = open_user_database_read_only(user_database_path)?;
+    validate_open_user_database(&connection)
+}
+
+/// Opens an existing user database without granting SQLite write or create
+/// access. Service-layer read tools use this entry point so validation and
+/// queries run on the same read-only connection.
+pub fn open_user_database_read_only(
+    user_database_path: impl AsRef<Path>,
+) -> Result<rusqlite::Connection, DatabaseInitError> {
     let connection = rusqlite::Connection::open_with_flags(
         user_database_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    connection.busy_timeout(Duration::from_secs(5))?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.pragma_update(None, "trusted_schema", "OFF")?;
-    validate_canonical_user_database(&connection)
+    configure_user_database_connection(&connection)?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    Ok(connection)
+}
+
+/// Opens an existing user database for writes, but never creates a missing
+/// file. Initialization and migration intentionally continue to use
+/// [`open_user_database`].
+pub fn open_existing_user_database(
+    user_database_path: impl AsRef<Path>,
+) -> Result<rusqlite::Connection, DatabaseInitError> {
+    let connection = rusqlite::Connection::open_with_flags(
+        user_database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
+    configure_user_database_connection(&connection)?;
+    Ok(connection)
+}
+
+/// Validates the canonical user schema on an already-open connection. Keeping
+/// this separate from path opening lets security-sensitive callers pin and
+/// identity-check the file once, then validate that exact SQLite handle.
+pub fn validate_open_user_database(
+    connection: &rusqlite::Connection,
+) -> Result<(), DatabaseInitError> {
+    validate_canonical_user_database(connection)
 }
 
 pub fn open_user_database(
@@ -134,6 +170,14 @@ pub fn open_user_database(
 ) -> Result<rusqlite::Connection, DatabaseInitError> {
     let connection = rusqlite::Connection::open(user_database_path)?;
 
+    configure_user_database_connection(&connection)?;
+
+    Ok(connection)
+}
+
+fn configure_user_database_connection(
+    connection: &rusqlite::Connection,
+) -> Result<(), DatabaseInitError> {
     // User commands open short-lived connections and Tauri may execute more
     // than one write command at a time. SQLite otherwise fails immediately on
     // a transient writer lock. A bounded wait is sufficient for this small,
@@ -142,8 +186,7 @@ pub fn open_user_database(
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "trusted_schema", "OFF")?;
-
-    Ok(connection)
+    Ok(())
 }
 
 pub fn open_legal_core_read_only(
@@ -695,6 +738,291 @@ pub struct LegalAnswerRecordRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationRow {
+    pub conversation_id: String,
+    pub project_id: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewMessageRow {
+    pub message_id: String,
+    pub conversation_id: String,
+    pub role: String,
+    pub kind: String,
+    pub text_summary: String,
+    pub artifact_id: Option<String>,
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRow {
+    pub message_id: String,
+    pub conversation_id: String,
+    pub role: String,
+    pub kind: String,
+    pub text_summary: String,
+    pub artifact_id: Option<String>,
+    pub run_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAttachmentRow {
+    pub attachment_id: String,
+    pub project_id: Option<String>,
+    pub original_name: String,
+    pub extension: String,
+    pub detected_mime: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub content_blob: Vec<u8>,
+    pub extraction_status: String,
+    pub extracted_text: Option<String>,
+    pub segments_json: String,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentRow {
+    pub attachment_id: String,
+    pub project_id: Option<String>,
+    pub original_name: String,
+    pub extension: String,
+    pub detected_mime: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub content_blob: Vec<u8>,
+    pub extraction_status: String,
+    pub extracted_text: Option<String>,
+    pub segments_json: String,
+    pub error_code: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachmentInsertResult {
+    Inserted(AttachmentRow),
+    Existing(AttachmentRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachmentDeleteResult {
+    Deleted,
+    InUse,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageAttachmentRow {
+    pub message_id: String,
+    pub attachment_id: String,
+    pub ordinal: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSourceRow {
+    pub conversation_id: String,
+    pub source_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewArtifactRow {
+    pub artifact_id: String,
+    pub conversation_id: Option<String>,
+    pub project_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRow {
+    pub artifact_id: String,
+    pub conversation_id: Option<String>,
+    pub project_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub status: String,
+    pub current_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewArtifactVersionRow {
+    pub version_id: String,
+    pub artifact_id: String,
+    pub content_json: String,
+    pub rendered_text: String,
+    pub source_refs_json: String,
+    pub citation_report_json: String,
+    pub provider_snapshot_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactVersionRow {
+    pub version_id: String,
+    pub artifact_id: String,
+    pub version_number: i64,
+    pub content_json: String,
+    pub rendered_text: String,
+    pub source_refs_json: String,
+    pub citation_report_json: String,
+    pub provider_snapshot_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactVersionCreateResult {
+    Created(ArtifactVersionRow),
+    Conflict,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgentRunRow {
+    pub run_id: String,
+    pub conversation_id: String,
+    pub user_message_id: String,
+    pub provider_id: Option<String>,
+    pub provider_snapshot_json: String,
+    pub intent: String,
+    pub status: String,
+    pub budget_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRunRow {
+    pub run_id: String,
+    pub conversation_id: String,
+    pub user_message_id: String,
+    pub assistant_message_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub provider_snapshot_json: String,
+    pub intent: String,
+    pub status: String,
+    pub budget_json: String,
+    pub error_type: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRunStatusUpdateResult {
+    Updated(AgentRunRow),
+    Conflict(AgentRunRow),
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewToolCallRow {
+    pub tool_call_id: String,
+    pub run_id: String,
+    pub ordinal: i64,
+    pub capability_name: String,
+    pub status: String,
+    pub access_mode: String,
+    pub requires_confirmation: bool,
+    pub input_audit_json: String,
+    pub output_audit_json: String,
+    pub source_audit_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallRow {
+    pub tool_call_id: String,
+    pub run_id: String,
+    pub ordinal: i64,
+    pub capability_name: String,
+    pub status: String,
+    pub access_mode: String,
+    pub requires_confirmation: bool,
+    pub input_audit_json: String,
+    pub output_audit_json: String,
+    pub source_audit_json: String,
+    pub error_type: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallStatusUpdateResult {
+    Updated(ToolCallRow),
+    Conflict(ToolCallRow),
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCaseChangeProposalRow {
+    pub proposal_id: String,
+    pub conversation_id: String,
+    pub project_id: String,
+    pub run_id: Option<String>,
+    pub base_case_digest: String,
+    pub changes_json: String,
+    pub source_refs_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseChangeProposalRow {
+    pub proposal_id: String,
+    pub conversation_id: String,
+    pub project_id: String,
+    pub run_id: Option<String>,
+    pub base_case_digest: String,
+    pub status: String,
+    pub changes_json: String,
+    pub source_refs_json: String,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+    pub applied_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaseChangeProposalStatusUpdateResult {
+    Updated(CaseChangeProposalRow),
+    Conflict(CaseChangeProposalRow),
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOperationAuditRow {
+    pub audit_id: String,
+    pub origin: String,
+    pub operation: String,
+    pub project_id: Option<String>,
+    pub request_hash: String,
+    pub idempotency_key_hash: Option<String>,
+    pub details_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationAuditRow {
+    pub audit_id: String,
+    pub origin: String,
+    pub operation: String,
+    pub project_id: Option<String>,
+    pub request_hash: String,
+    pub idempotency_key_hash: Option<String>,
+    pub status: String,
+    pub details_json: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationAuditStatusUpdateResult {
+    Updated(OperationAuditRow),
+    Conflict(OperationAuditRow),
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentGenerationRecordRow {
     pub record_id: String,
     pub project_id: String,
@@ -756,6 +1084,1226 @@ pub fn list_document_generation_records(
     rows
 }
 
+pub fn create_conversation(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    project_id: Option<&str>,
+    title: &str,
+) -> rusqlite::Result<ConversationRow> {
+    connection.execute(
+        "INSERT INTO conversations (conversation_id, project_id, title, status)
+         VALUES (?1, ?2, ?3, 'open')",
+        params![conversation_id, project_id, title],
+    )?;
+    get_conversation(connection, conversation_id)?.ok_or_else(|| {
+        user_schema_migration_error("created conversation could not be reloaded".to_owned())
+    })
+}
+
+pub fn list_conversations(
+    connection: &rusqlite::Connection,
+    limit: u32,
+) -> rusqlite::Result<Vec<ConversationRow>> {
+    let limit = i64::from(limit.clamp(1, 500));
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, project_id, title, status, created_at, updated_at
+         FROM conversations
+         ORDER BY updated_at DESC, conversation_id DESC
+         LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([limit], conversation_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn list_conversations_for_project(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<ConversationRow>> {
+    let limit = i64::from(limit.clamp(1, 500));
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, project_id, title, status, created_at, updated_at
+         FROM conversations
+         WHERE project_id = ?1
+         ORDER BY updated_at DESC, conversation_id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![project_id, limit], conversation_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_conversation(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Option<ConversationRow>> {
+    connection
+        .query_row(
+            "SELECT conversation_id, project_id, title, status, created_at, updated_at
+             FROM conversations WHERE conversation_id = ?1",
+            [conversation_id],
+            conversation_from_row,
+        )
+        .optional()
+}
+
+pub fn bind_conversation_to_case(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    let transaction = connection.unchecked_transaction()?;
+    let changed = transaction.execute(
+        "UPDATE conversations
+         SET project_id = ?2, updated_at = CURRENT_TIMESTAMP
+         WHERE conversation_id = ?1
+           AND status = 'open'
+           AND (project_id IS NULL OR project_id = ?2)
+           AND NOT EXISTS (
+               SELECT 1 FROM artifacts
+               WHERE conversation_id = ?1
+                 AND project_id IS NOT NULL
+                 AND project_id != ?2
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM messages AS message
+               JOIN artifacts AS artifact ON artifact.artifact_id = message.artifact_id
+               WHERE message.conversation_id = ?1
+                 AND artifact.project_id IS NOT NULL
+                 AND artifact.project_id != ?2
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM message_attachments AS link
+               JOIN messages AS message ON message.message_id = link.message_id
+               JOIN attachments AS attachment ON attachment.attachment_id = link.attachment_id
+               WHERE message.conversation_id = ?1
+                 AND attachment.project_id IS NOT NULL
+                 AND attachment.project_id != ?2
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM legal_answer_records
+               WHERE conversation_id = ?1
+                 AND project_id IS NOT NULL
+                 AND project_id != ?2
+           )",
+        params![conversation_id, project_id],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    transaction.execute(
+        "UPDATE legal_answer_records
+         SET project_id = ?2
+         WHERE conversation_id = ?1 AND project_id IS NULL",
+        params![conversation_id, project_id],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+pub fn archive_conversation(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE conversations
+         SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+         WHERE conversation_id = ?1 AND status = 'open'",
+        [conversation_id],
+    )?;
+    Ok(changed == 1)
+}
+
+pub fn create_message(
+    connection: &rusqlite::Connection,
+    message: &NewMessageRow,
+) -> rusqlite::Result<MessageRow> {
+    if let Some(run_id) = message.run_id.as_deref() {
+        let run_matches: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agent_runs
+                 WHERE run_id = ?1 AND conversation_id = ?2
+             )",
+            params![run_id, message.conversation_id],
+            |row| row.get(0),
+        )?;
+        if !run_matches {
+            return Err(user_schema_migration_error(
+                "message run must belong to the same conversation".to_owned(),
+            ));
+        }
+    }
+    connection.execute(
+        "INSERT INTO messages (
+             message_id, conversation_id, role, kind, text_summary, artifact_id, run_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            message.message_id,
+            message.conversation_id,
+            message.role,
+            message.kind,
+            message.text_summary,
+            message.artifact_id,
+            message.run_id
+        ],
+    )?;
+    get_message(connection, &message.message_id)?.ok_or_else(|| {
+        user_schema_migration_error("created message could not be reloaded".to_owned())
+    })
+}
+
+pub fn get_message(
+    connection: &rusqlite::Connection,
+    message_id: &str,
+) -> rusqlite::Result<Option<MessageRow>> {
+    connection
+        .query_row(
+            "SELECT message_id, conversation_id, role, kind, text_summary,
+                    artifact_id, run_id, created_at
+             FROM messages WHERE message_id = ?1",
+            [message_id],
+            message_from_row,
+        )
+        .optional()
+}
+
+pub fn list_messages(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<MessageRow>> {
+    let mut statement = connection.prepare(
+        "SELECT message_id, conversation_id, role, kind, text_summary,
+                artifact_id, run_id, created_at
+         FROM messages
+         WHERE conversation_id = ?1
+         ORDER BY created_at ASC, message_id ASC",
+    )?;
+    let rows = statement
+        .query_map([conversation_id], message_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn insert_attachment(
+    connection: &rusqlite::Connection,
+    attachment: &NewAttachmentRow,
+) -> rusqlite::Result<AttachmentInsertResult> {
+    let changed = connection.execute(
+        "INSERT INTO attachments (
+             attachment_id, project_id, original_name, extension, detected_mime,
+             sha256, size_bytes, content_blob, extraction_status, extracted_text,
+             segments_json, error_code
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(sha256) DO NOTHING",
+        params![
+            attachment.attachment_id,
+            attachment.project_id,
+            attachment.original_name,
+            attachment.extension,
+            attachment.detected_mime,
+            attachment.sha256,
+            attachment.size_bytes,
+            attachment.content_blob,
+            attachment.extraction_status,
+            attachment.extracted_text,
+            attachment.segments_json,
+            attachment.error_code
+        ],
+    )?;
+    let persisted = get_attachment_by_sha256(connection, &attachment.sha256)?.ok_or_else(|| {
+        user_schema_migration_error("persisted attachment could not be reloaded".to_owned())
+    })?;
+    Ok(if changed == 1 {
+        AttachmentInsertResult::Inserted(persisted)
+    } else {
+        AttachmentInsertResult::Existing(persisted)
+    })
+}
+
+pub fn get_attachment(
+    connection: &rusqlite::Connection,
+    attachment_id: &str,
+) -> rusqlite::Result<Option<AttachmentRow>> {
+    connection
+        .query_row(
+            "SELECT attachment_id, project_id, original_name, extension, detected_mime,
+                    sha256, size_bytes, content_blob, extraction_status, extracted_text,
+                    segments_json, error_code, created_at
+             FROM attachments WHERE attachment_id = ?1",
+            [attachment_id],
+            attachment_from_row,
+        )
+        .optional()
+}
+
+pub fn get_attachment_by_sha256(
+    connection: &rusqlite::Connection,
+    sha256: &str,
+) -> rusqlite::Result<Option<AttachmentRow>> {
+    connection
+        .query_row(
+            "SELECT attachment_id, project_id, original_name, extension, detected_mime,
+                    sha256, size_bytes, content_blob, extraction_status, extracted_text,
+                    segments_json, error_code, created_at
+             FROM attachments WHERE sha256 = ?1",
+            [sha256],
+            attachment_from_row,
+        )
+        .optional()
+}
+
+pub fn update_attachment_extraction(
+    connection: &rusqlite::Connection,
+    attachment_id: &str,
+    expected_status: &str,
+    extraction_status: &str,
+    extracted_text: Option<&str>,
+    segments_json: &str,
+    error_code: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE attachments
+         SET extraction_status = ?3,
+             extracted_text = ?4,
+             segments_json = ?5,
+             error_code = ?6
+         WHERE attachment_id = ?1 AND extraction_status = ?2",
+        params![
+            attachment_id,
+            expected_status,
+            extraction_status,
+            extracted_text,
+            segments_json,
+            error_code
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+pub fn delete_attachment(
+    connection: &mut rusqlite::Connection,
+    attachment_id: &str,
+) -> rusqlite::Result<AttachmentDeleteResult> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let result = delete_attachment_in_transaction(&transaction, attachment_id)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// Permanently deletes an attachment only when it is currently linked to the
+/// supplied conversation and has no other message, artifact, proposal, or case
+/// reference. The conversation links are removed and the BLOB is deleted in
+/// one IMMEDIATE transaction; an in-use result rolls the link removal back.
+pub fn delete_attachment_from_conversation(
+    connection: &mut rusqlite::Connection,
+    conversation_id: &str,
+    attachment_id: &str,
+) -> rusqlite::Result<AttachmentDeleteResult> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let linked: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM message_attachments AS link
+             JOIN messages AS message ON message.message_id = link.message_id
+             JOIN conversations AS conversation
+               ON conversation.conversation_id = message.conversation_id
+             WHERE link.attachment_id = ?1
+               AND message.conversation_id = ?2
+               AND conversation.status = 'open'
+         )",
+        params![attachment_id, conversation_id],
+        |row| row.get(0),
+    )?;
+    if !linked {
+        transaction.commit()?;
+        return Ok(AttachmentDeleteResult::NotFound);
+    }
+    transaction.execute(
+        "DELETE FROM message_attachments
+         WHERE attachment_id = ?1
+           AND message_id IN (
+               SELECT message_id FROM messages WHERE conversation_id = ?2
+           )",
+        params![attachment_id, conversation_id],
+    )?;
+    let result = delete_attachment_in_transaction(&transaction, attachment_id)?;
+    if result == AttachmentDeleteResult::Deleted {
+        transaction.commit()?;
+    } else {
+        transaction.rollback()?;
+    }
+    Ok(result)
+}
+
+fn delete_attachment_in_transaction(
+    connection: &rusqlite::Connection,
+    attachment_id: &str,
+) -> rusqlite::Result<AttachmentDeleteResult> {
+    if get_attachment(connection, attachment_id)?.is_none() {
+        return Ok(AttachmentDeleteResult::NotFound);
+    }
+    let storage_reference = attachment_storage_reference(attachment_id);
+    let legacy_double_prefixed_reference = format!("attachment:{storage_reference}");
+    let in_use: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM message_attachments WHERE attachment_id = ?1
+             UNION ALL
+             SELECT 1 FROM case_files
+             WHERE storage_reference IN (?1, ?2, ?3)
+             UNION ALL
+             SELECT 1
+             FROM artifact_versions AS version, json_tree(version.source_refs_json) AS source
+             WHERE source.atom = ?1
+             UNION ALL
+             SELECT 1
+             FROM case_change_proposals AS proposal, json_tree(proposal.source_refs_json) AS source
+             WHERE source.atom = ?1
+         )",
+        params![
+            attachment_id,
+            storage_reference,
+            legacy_double_prefixed_reference
+        ],
+        |row| row.get(0),
+    )?;
+    if in_use {
+        return Ok(AttachmentDeleteResult::InUse);
+    }
+    let deleted = connection.execute(
+        "DELETE FROM attachments WHERE attachment_id = ?1",
+        [attachment_id],
+    )?;
+    Ok(if deleted == 1 {
+        AttachmentDeleteResult::Deleted
+    } else {
+        AttachmentDeleteResult::NotFound
+    })
+}
+
+/// Canonical logical reference used by `case_files` for an attachment BLOB.
+/// Stage-8 attachment identifiers already carry the `attachment:` namespace;
+/// legacy bare identifiers are normalized exactly once.
+pub fn attachment_storage_reference(attachment_id: &str) -> String {
+    if attachment_id.starts_with("attachment:") {
+        attachment_id.to_owned()
+    } else {
+        format!("attachment:{attachment_id}")
+    }
+}
+
+/// Returns whether an unclaimed attachment can be assigned to `project_id`
+/// without making any existing message link cross-project. Every conversation
+/// that currently references the attachment must already be bound to that
+/// exact case before the claim is allowed.
+pub fn attachment_can_be_claimed_for_case(
+    connection: &rusqlite::Connection,
+    attachment_id: &str,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM attachments AS attachment
+             WHERE attachment.attachment_id = ?1
+               AND attachment.project_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM message_attachments AS link
+                   JOIN messages AS message ON message.message_id = link.message_id
+                   JOIN conversations AS conversation
+                     ON conversation.conversation_id = message.conversation_id
+                   WHERE link.attachment_id = attachment.attachment_id
+                     AND conversation.project_id IS NOT ?2
+               )
+         )",
+        params![attachment_id, project_id],
+        |row| row.get(0),
+    )
+}
+
+/// Atomically claims a case-neutral attachment for one case. This is purposely
+/// not idempotent: only the `NULL -> project` transition succeeds, so two case
+/// transfer proposals cannot both claim the same attachment.
+pub fn claim_attachment_for_case(
+    connection: &rusqlite::Connection,
+    attachment_id: &str,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE attachments
+         SET project_id = ?2
+         WHERE attachment_id = ?1
+           AND project_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+               FROM message_attachments AS link
+               JOIN messages AS message ON message.message_id = link.message_id
+               JOIN conversations AS conversation
+                 ON conversation.conversation_id = message.conversation_id
+               WHERE link.attachment_id = attachments.attachment_id
+                 AND conversation.project_id IS NOT ?2
+           )",
+        params![attachment_id, project_id],
+    )?;
+    Ok(changed == 1)
+}
+
+pub fn attach_to_message(
+    connection: &rusqlite::Connection,
+    message_id: &str,
+    attachment_id: &str,
+    ordinal: i64,
+) -> rusqlite::Result<()> {
+    let changed = connection.execute(
+        "INSERT INTO message_attachments (message_id, attachment_id, ordinal)
+         SELECT message.message_id, attachment.attachment_id, ?3
+         FROM messages AS message
+         JOIN conversations AS conversation
+           ON conversation.conversation_id = message.conversation_id
+         JOIN attachments AS attachment ON attachment.attachment_id = ?2
+         WHERE message.message_id = ?1
+           AND (
+               attachment.project_id IS NULL
+               OR attachment.project_id = conversation.project_id
+           )",
+        params![message_id, attachment_id, ordinal],
+    )?;
+    if changed != 1 {
+        return Err(user_schema_migration_error(
+            "message or attachment is missing, or attachment ownership does not match the conversation"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn list_message_attachments(
+    connection: &rusqlite::Connection,
+    message_id: &str,
+) -> rusqlite::Result<Vec<MessageAttachmentRow>> {
+    let mut statement = connection.prepare(
+        "SELECT message_id, attachment_id, ordinal
+         FROM message_attachments
+         WHERE message_id = ?1
+         ORDER BY ordinal ASC, attachment_id ASC",
+    )?;
+    let rows = statement
+        .query_map([message_id], |row| {
+            Ok(MessageAttachmentRow {
+                message_id: row.get(0)?,
+                attachment_id: row.get(1)?,
+                ordinal: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn list_attachments_for_message(
+    connection: &rusqlite::Connection,
+    message_id: &str,
+) -> rusqlite::Result<Vec<AttachmentRow>> {
+    let mut statement = connection.prepare(
+        "SELECT attachment.attachment_id, attachment.project_id, attachment.original_name,
+                attachment.extension, attachment.detected_mime, attachment.sha256,
+                attachment.size_bytes, attachment.content_blob, attachment.extraction_status,
+                attachment.extracted_text, attachment.segments_json, attachment.error_code,
+                attachment.created_at
+         FROM message_attachments AS link
+         JOIN attachments AS attachment ON attachment.attachment_id = link.attachment_id
+         WHERE link.message_id = ?1
+         ORDER BY link.ordinal ASC, attachment.attachment_id ASC",
+    )?;
+    let rows = statement
+        .query_map([message_id], attachment_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn add_conversation_source(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    source_id: &str,
+) -> rusqlite::Result<ConversationSourceRow> {
+    connection.execute(
+        "INSERT INTO conversation_sources (conversation_id, source_id)
+         VALUES (?1, ?2)
+         ON CONFLICT(conversation_id, source_id) DO NOTHING",
+        params![conversation_id, source_id],
+    )?;
+    connection.query_row(
+        "SELECT conversation_id, source_id, created_at
+         FROM conversation_sources
+         WHERE conversation_id = ?1 AND source_id = ?2",
+        params![conversation_id, source_id],
+        |row| {
+            Ok(ConversationSourceRow {
+                conversation_id: row.get(0)?,
+                source_id: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        },
+    )
+}
+
+pub fn list_conversation_sources(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<ConversationSourceRow>> {
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, source_id, created_at
+         FROM conversation_sources
+         WHERE conversation_id = ?1
+         ORDER BY created_at ASC, source_id ASC",
+    )?;
+    let rows = statement
+        .query_map([conversation_id], |row| {
+            Ok(ConversationSourceRow {
+                conversation_id: row.get(0)?,
+                source_id: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn create_artifact(
+    connection: &rusqlite::Connection,
+    artifact: &NewArtifactRow,
+    initial_version: &NewArtifactVersionRow,
+) -> rusqlite::Result<ArtifactRow> {
+    if artifact.artifact_id != initial_version.artifact_id {
+        return Err(user_schema_migration_error(
+            "initial artifact version belongs to a different artifact".to_owned(),
+        ));
+    }
+
+    if !connection.is_autocommit() {
+        return insert_artifact_with_initial_version(connection, artifact, initial_version);
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    let persisted = insert_artifact_with_initial_version(&transaction, artifact, initial_version)?;
+    transaction.commit()?;
+    Ok(persisted)
+}
+
+fn insert_artifact_with_initial_version(
+    connection: &rusqlite::Connection,
+    artifact: &NewArtifactRow,
+    initial_version: &NewArtifactVersionRow,
+) -> rusqlite::Result<ArtifactRow> {
+    connection.execute(
+        "INSERT INTO artifacts (
+             artifact_id, conversation_id, project_id, kind, title, status, current_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+        params![
+            artifact.artifact_id,
+            artifact.conversation_id,
+            artifact.project_id,
+            artifact.kind,
+            artifact.title,
+            artifact.status
+        ],
+    )?;
+    insert_artifact_version(connection, initial_version, 1)?;
+    get_artifact(connection, &artifact.artifact_id)?.ok_or_else(|| {
+        user_schema_migration_error("created artifact could not be reloaded".to_owned())
+    })
+}
+
+pub fn get_artifact(
+    connection: &rusqlite::Connection,
+    artifact_id: &str,
+) -> rusqlite::Result<Option<ArtifactRow>> {
+    connection
+        .query_row(
+            "SELECT artifact_id, conversation_id, project_id, kind, title, status,
+                    current_version, created_at, updated_at
+             FROM artifacts WHERE artifact_id = ?1",
+            [artifact_id],
+            artifact_from_row,
+        )
+        .optional()
+}
+
+pub fn list_artifacts(
+    connection: &rusqlite::Connection,
+    conversation_id: Option<&str>,
+    limit: u32,
+) -> rusqlite::Result<Vec<ArtifactRow>> {
+    let limit = i64::from(limit.clamp(1, 500));
+    let mut statement = connection.prepare(
+        "SELECT artifact_id, conversation_id, project_id, kind, title, status,
+                current_version, created_at, updated_at
+         FROM artifacts
+         WHERE ?1 IS NULL OR conversation_id = ?1
+         ORDER BY updated_at DESC, artifact_id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![conversation_id, limit], artifact_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn list_artifacts_for_project(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Vec<ArtifactRow>> {
+    let mut statement = connection.prepare(
+        "SELECT artifact_id, conversation_id, project_id, kind, title, status,
+                current_version, created_at, updated_at
+         FROM artifacts
+         WHERE project_id = ?1
+         ORDER BY artifact_id ASC",
+    )?;
+    let rows = statement
+        .query_map([project_id], artifact_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn bind_artifact_to_case(
+    connection: &rusqlite::Connection,
+    artifact_id: &str,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE artifacts
+         SET project_id = ?2, updated_at = CURRENT_TIMESTAMP
+         WHERE artifact_id = ?1
+           AND status != 'archived'
+           AND project_id IS NULL
+           AND (
+               conversation_id IS NULL
+               OR EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE conversations.conversation_id = artifacts.conversation_id
+                     AND (
+                         conversations.project_id IS NULL
+                         OR conversations.project_id = ?2
+                     )
+               )
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM messages AS message
+               JOIN conversations AS conversation
+                 ON conversation.conversation_id = message.conversation_id
+               WHERE message.artifact_id = artifacts.artifact_id
+                 AND conversation.project_id IS NOT NULL
+                 AND conversation.project_id != ?2
+           )",
+        params![artifact_id, project_id],
+    )?;
+    Ok(changed == 1)
+}
+
+pub fn get_artifact_version(
+    connection: &rusqlite::Connection,
+    artifact_id: &str,
+    version_number: i64,
+) -> rusqlite::Result<Option<ArtifactVersionRow>> {
+    connection
+        .query_row(
+            "SELECT version_id, artifact_id, version_number, content_json, rendered_text,
+                    source_refs_json, citation_report_json, provider_snapshot_json, created_at
+             FROM artifact_versions
+             WHERE artifact_id = ?1 AND version_number = ?2",
+            params![artifact_id, version_number],
+            artifact_version_from_row,
+        )
+        .optional()
+}
+
+pub fn list_artifact_versions(
+    connection: &rusqlite::Connection,
+    artifact_id: &str,
+) -> rusqlite::Result<Vec<ArtifactVersionRow>> {
+    let mut statement = connection.prepare(
+        "SELECT version_id, artifact_id, version_number, content_json, rendered_text,
+                source_refs_json, citation_report_json, provider_snapshot_json, created_at
+         FROM artifact_versions
+         WHERE artifact_id = ?1
+         ORDER BY version_number DESC",
+    )?;
+    let rows = statement
+        .query_map([artifact_id], artifact_version_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn create_artifact_version(
+    connection: &rusqlite::Connection,
+    version: &NewArtifactVersionRow,
+    expected_current_version: i64,
+) -> rusqlite::Result<ArtifactVersionCreateResult> {
+    if !connection.is_autocommit() {
+        return create_artifact_version_with_cas(connection, version, expected_current_version);
+    }
+    let transaction = connection.unchecked_transaction()?;
+    let result = create_artifact_version_with_cas(&transaction, version, expected_current_version)?;
+    if matches!(result, ArtifactVersionCreateResult::Created(_)) {
+        transaction.commit()?;
+    }
+    Ok(result)
+}
+
+fn create_artifact_version_with_cas(
+    connection: &rusqlite::Connection,
+    version: &NewArtifactVersionRow,
+    expected_current_version: i64,
+) -> rusqlite::Result<ArtifactVersionCreateResult> {
+    let artifact = get_artifact(connection, &version.artifact_id)?;
+    let Some(artifact) = artifact else {
+        return Ok(ArtifactVersionCreateResult::NotFound);
+    };
+    if artifact.current_version != expected_current_version || artifact.status == "archived" {
+        return Ok(ArtifactVersionCreateResult::Conflict);
+    }
+    let next_version = expected_current_version.checked_add(1).ok_or_else(|| {
+        user_schema_migration_error("artifact version number overflowed".to_owned())
+    })?;
+    insert_artifact_version(connection, version, next_version)?;
+    let changed = connection.execute(
+        "UPDATE artifacts
+         SET current_version = ?3, updated_at = CURRENT_TIMESTAMP
+         WHERE artifact_id = ?1 AND current_version = ?2 AND status != 'archived'",
+        params![version.artifact_id, expected_current_version, next_version],
+    )?;
+    if changed != 1 {
+        return Ok(ArtifactVersionCreateResult::Conflict);
+    }
+    let persisted = get_artifact_version(connection, &version.artifact_id, next_version)?
+        .ok_or_else(|| {
+            user_schema_migration_error("created artifact version could not be reloaded".to_owned())
+        })?;
+    Ok(ArtifactVersionCreateResult::Created(persisted))
+}
+
+fn insert_artifact_version(
+    connection: &rusqlite::Connection,
+    version: &NewArtifactVersionRow,
+    version_number: i64,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO artifact_versions (
+             version_id, artifact_id, version_number, content_json, rendered_text,
+             source_refs_json, citation_report_json, provider_snapshot_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            version.version_id,
+            version.artifact_id,
+            version_number,
+            version.content_json,
+            version.rendered_text,
+            version.source_refs_json,
+            version.citation_report_json,
+            version.provider_snapshot_json
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn create_agent_run(
+    connection: &rusqlite::Connection,
+    run: &NewAgentRunRow,
+) -> rusqlite::Result<AgentRunRow> {
+    connection.execute(
+        "INSERT INTO agent_runs (
+             run_id, conversation_id, user_message_id, provider_id,
+             provider_snapshot_json, intent, status, budget_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            run.run_id,
+            run.conversation_id,
+            run.user_message_id,
+            run.provider_id,
+            run.provider_snapshot_json,
+            run.intent,
+            run.status,
+            run.budget_json
+        ],
+    )?;
+    get_agent_run(connection, &run.run_id)?.ok_or_else(|| {
+        user_schema_migration_error("created agent run could not be reloaded".to_owned())
+    })
+}
+
+pub fn get_agent_run(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<AgentRunRow>> {
+    connection
+        .query_row(
+            "SELECT run_id, conversation_id, user_message_id, assistant_message_id,
+                    provider_id, provider_snapshot_json, intent, status, budget_json,
+                    error_type, created_at, finished_at
+             FROM agent_runs WHERE run_id = ?1",
+            [run_id],
+            agent_run_from_row,
+        )
+        .optional()
+}
+
+pub fn list_agent_runs(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<AgentRunRow>> {
+    let mut statement = connection.prepare(
+        "SELECT run_id, conversation_id, user_message_id, assistant_message_id,
+                provider_id, provider_snapshot_json, intent, status, budget_json,
+                error_type, created_at, finished_at
+         FROM agent_runs
+         WHERE conversation_id = ?1
+         ORDER BY created_at ASC, run_id ASC",
+    )?;
+    let rows = statement
+        .query_map([conversation_id], agent_run_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn compare_and_set_agent_run_status(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+    expected_status: &str,
+    new_status: &str,
+    assistant_message_id: Option<&str>,
+    error_type: Option<&str>,
+) -> rusqlite::Result<AgentRunStatusUpdateResult> {
+    let changed = connection.execute(
+        "UPDATE agent_runs
+         SET status = ?3,
+             assistant_message_id = COALESCE(?4, assistant_message_id),
+             error_type = ?5,
+             finished_at = CASE
+                 WHEN ?3 IN ('succeeded', 'failed', 'cancelled') THEN CURRENT_TIMESTAMP
+                 ELSE NULL
+             END
+         WHERE run_id = ?1 AND status = ?2",
+        params![
+            run_id,
+            expected_status,
+            new_status,
+            assistant_message_id,
+            error_type
+        ],
+    )?;
+    let persisted = get_agent_run(connection, run_id)?;
+    Ok(match (changed, persisted) {
+        (1, Some(row)) => AgentRunStatusUpdateResult::Updated(row),
+        (_, Some(row)) => AgentRunStatusUpdateResult::Conflict(row),
+        (_, None) => AgentRunStatusUpdateResult::NotFound,
+    })
+}
+
+pub fn create_tool_call(
+    connection: &rusqlite::Connection,
+    tool_call: &NewToolCallRow,
+) -> rusqlite::Result<ToolCallRow> {
+    connection.execute(
+        "INSERT INTO tool_calls (
+             tool_call_id, run_id, ordinal, capability_name, status, access_mode,
+             requires_confirmation, input_audit_json, output_audit_json, source_audit_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            tool_call.tool_call_id,
+            tool_call.run_id,
+            tool_call.ordinal,
+            tool_call.capability_name,
+            tool_call.status,
+            tool_call.access_mode,
+            if tool_call.requires_confirmation {
+                1_i64
+            } else {
+                0_i64
+            },
+            tool_call.input_audit_json,
+            tool_call.output_audit_json,
+            tool_call.source_audit_json
+        ],
+    )?;
+    get_tool_call(connection, &tool_call.tool_call_id)?.ok_or_else(|| {
+        user_schema_migration_error("created tool call could not be reloaded".to_owned())
+    })
+}
+
+pub fn get_tool_call(
+    connection: &rusqlite::Connection,
+    tool_call_id: &str,
+) -> rusqlite::Result<Option<ToolCallRow>> {
+    connection
+        .query_row(
+            "SELECT tool_call_id, run_id, ordinal, capability_name, status, access_mode,
+                    requires_confirmation, input_audit_json, output_audit_json,
+                    source_audit_json, error_type, started_at, finished_at
+             FROM tool_calls WHERE tool_call_id = ?1",
+            [tool_call_id],
+            tool_call_from_row,
+        )
+        .optional()
+}
+
+pub fn list_tool_calls(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+) -> rusqlite::Result<Vec<ToolCallRow>> {
+    let mut statement = connection.prepare(
+        "SELECT tool_call_id, run_id, ordinal, capability_name, status, access_mode,
+                requires_confirmation, input_audit_json, output_audit_json,
+                source_audit_json, error_type, started_at, finished_at
+         FROM tool_calls
+         WHERE run_id = ?1
+         ORDER BY ordinal ASC",
+    )?;
+    let rows = statement
+        .query_map([run_id], tool_call_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn compare_and_set_tool_call_status(
+    connection: &rusqlite::Connection,
+    tool_call_id: &str,
+    expected_status: &str,
+    new_status: &str,
+    output_audit_json: &str,
+    source_audit_json: &str,
+    error_type: Option<&str>,
+) -> rusqlite::Result<ToolCallStatusUpdateResult> {
+    let changed = connection.execute(
+        "UPDATE tool_calls
+         SET status = ?3,
+             output_audit_json = ?4,
+             source_audit_json = ?5,
+             error_type = ?6,
+             finished_at = CASE
+                 WHEN ?3 IN ('succeeded', 'failed', 'cancelled') THEN CURRENT_TIMESTAMP
+                 ELSE NULL
+             END
+         WHERE tool_call_id = ?1 AND status = ?2",
+        params![
+            tool_call_id,
+            expected_status,
+            new_status,
+            output_audit_json,
+            source_audit_json,
+            error_type
+        ],
+    )?;
+    let persisted = get_tool_call(connection, tool_call_id)?;
+    Ok(match (changed, persisted) {
+        (1, Some(row)) => ToolCallStatusUpdateResult::Updated(row),
+        (_, Some(row)) => ToolCallStatusUpdateResult::Conflict(row),
+        (_, None) => ToolCallStatusUpdateResult::NotFound,
+    })
+}
+
+pub fn create_case_change_proposal(
+    connection: &rusqlite::Connection,
+    proposal: &NewCaseChangeProposalRow,
+) -> rusqlite::Result<CaseChangeProposalRow> {
+    connection.execute(
+        "INSERT INTO case_change_proposals (
+             proposal_id, conversation_id, project_id, run_id, base_case_digest,
+             status, changes_json, source_refs_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+        params![
+            proposal.proposal_id,
+            proposal.conversation_id,
+            proposal.project_id,
+            proposal.run_id,
+            proposal.base_case_digest,
+            proposal.changes_json,
+            proposal.source_refs_json
+        ],
+    )?;
+    get_case_change_proposal(connection, &proposal.proposal_id)?.ok_or_else(|| {
+        user_schema_migration_error("created case change proposal could not be reloaded".to_owned())
+    })
+}
+
+pub fn get_case_change_proposal(
+    connection: &rusqlite::Connection,
+    proposal_id: &str,
+) -> rusqlite::Result<Option<CaseChangeProposalRow>> {
+    connection
+        .query_row(
+            "SELECT proposal_id, conversation_id, project_id, run_id, base_case_digest,
+                    status, changes_json, source_refs_json, created_at, decided_at, applied_at
+             FROM case_change_proposals WHERE proposal_id = ?1",
+            [proposal_id],
+            case_change_proposal_from_row,
+        )
+        .optional()
+}
+
+pub fn list_case_change_proposals(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<CaseChangeProposalRow>> {
+    let mut statement = connection.prepare(
+        "SELECT proposal_id, conversation_id, project_id, run_id, base_case_digest,
+                status, changes_json, source_refs_json, created_at, decided_at, applied_at
+         FROM case_change_proposals
+         WHERE conversation_id = ?1
+         ORDER BY created_at DESC, proposal_id DESC",
+    )?;
+    let rows = statement
+        .query_map([conversation_id], case_change_proposal_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn list_case_change_proposals_for_project(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Vec<CaseChangeProposalRow>> {
+    let mut statement = connection.prepare(
+        "SELECT proposal_id, conversation_id, project_id, run_id, base_case_digest,
+                status, changes_json, source_refs_json, created_at, decided_at, applied_at
+         FROM case_change_proposals
+         WHERE project_id = ?1
+         ORDER BY created_at DESC, proposal_id DESC",
+    )?;
+    let rows = statement
+        .query_map([project_id], case_change_proposal_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Atomically claims a pending proposal for the supplied case/digest. Callers
+/// that apply typed case changes can pass a `rusqlite::Transaction` here so
+/// the CAS and the confirmed-case writes commit or roll back together.
+pub fn compare_and_set_case_change_proposal_status(
+    connection: &rusqlite::Connection,
+    proposal_id: &str,
+    project_id: &str,
+    expected_base_case_digest: &str,
+    new_status: &str,
+) -> rusqlite::Result<CaseChangeProposalStatusUpdateResult> {
+    if !matches!(new_status, "applied" | "rejected" | "stale") {
+        return Err(user_schema_migration_error(
+            "a pending proposal can only become applied, rejected, or stale".to_owned(),
+        ));
+    }
+    let changed = connection.execute(
+        "UPDATE case_change_proposals
+         SET status = ?5,
+             decided_at = CURRENT_TIMESTAMP,
+             applied_at = CASE WHEN ?5 = 'applied' THEN CURRENT_TIMESTAMP ELSE NULL END
+         WHERE proposal_id = ?1
+           AND project_id = ?2
+           AND base_case_digest = ?3
+           AND status = ?4",
+        params![
+            proposal_id,
+            project_id,
+            expected_base_case_digest,
+            "pending",
+            new_status
+        ],
+    )?;
+    let persisted = get_case_change_proposal(connection, proposal_id)?;
+    Ok(match (changed, persisted) {
+        (1, Some(row)) => CaseChangeProposalStatusUpdateResult::Updated(row),
+        (_, Some(row)) => CaseChangeProposalStatusUpdateResult::Conflict(row),
+        (_, None) => CaseChangeProposalStatusUpdateResult::NotFound,
+    })
+}
+
+pub fn create_operation_audit(
+    connection: &rusqlite::Connection,
+    audit: &NewOperationAuditRow,
+) -> rusqlite::Result<OperationAuditRow> {
+    connection.execute(
+        "INSERT INTO operation_audit (
+             audit_id, origin, operation, project_id, request_hash,
+             idempotency_key_hash, status, details_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', ?7)",
+        params![
+            audit.audit_id,
+            audit.origin,
+            audit.operation,
+            audit.project_id,
+            audit.request_hash,
+            audit.idempotency_key_hash,
+            audit.details_json,
+        ],
+    )?;
+    get_operation_audit(connection, &audit.audit_id)?.ok_or_else(|| {
+        user_schema_migration_error("created operation audit could not be reloaded".to_owned())
+    })
+}
+
+pub fn get_operation_audit(
+    connection: &rusqlite::Connection,
+    audit_id: &str,
+) -> rusqlite::Result<Option<OperationAuditRow>> {
+    connection
+        .query_row(
+            "SELECT audit_id, origin, operation, project_id, request_hash,
+                    idempotency_key_hash, status, details_json, created_at, finished_at
+             FROM operation_audit WHERE audit_id = ?1",
+            [audit_id],
+            operation_audit_from_row,
+        )
+        .optional()
+}
+
+pub fn get_operation_audit_by_idempotency_key_hash(
+    connection: &rusqlite::Connection,
+    origin: &str,
+    operation: &str,
+    idempotency_key_hash: &str,
+) -> rusqlite::Result<Option<OperationAuditRow>> {
+    connection
+        .query_row(
+            "SELECT audit_id, origin, operation, project_id, request_hash,
+                    idempotency_key_hash, status, details_json, created_at, finished_at
+             FROM operation_audit
+             WHERE origin = ?1 AND operation = ?2 AND idempotency_key_hash = ?3",
+            params![origin, operation, idempotency_key_hash],
+            operation_audit_from_row,
+        )
+        .optional()
+}
+
+pub fn compare_and_set_operation_audit_status(
+    connection: &rusqlite::Connection,
+    audit_id: &str,
+    new_status: &str,
+    details_json: &str,
+) -> rusqlite::Result<OperationAuditStatusUpdateResult> {
+    if !matches!(new_status, "succeeded" | "failed") {
+        return Err(user_schema_migration_error(
+            "a prepared operation audit can only become succeeded or failed".to_owned(),
+        ));
+    }
+    let changed = connection.execute(
+        "UPDATE operation_audit
+         SET status = ?2, details_json = ?3, finished_at = CURRENT_TIMESTAMP
+         WHERE audit_id = ?1 AND status = 'prepared'",
+        params![audit_id, new_status, details_json],
+    )?;
+    let persisted = get_operation_audit(connection, audit_id)?;
+    Ok(match (changed, persisted) {
+        (1, Some(row)) => OperationAuditStatusUpdateResult::Updated(row),
+        (_, Some(row)) => OperationAuditStatusUpdateResult::Conflict(row),
+        (_, None) => OperationAuditStatusUpdateResult::NotFound,
+    })
+}
+
 pub fn list_case_projects(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<CaseProjectRow>> {
@@ -793,7 +2341,45 @@ pub fn get_case_workspace_rows(
     // between the project SELECT and any child SELECT, producing a workspace
     // assembled from different points in time.
     let transaction = connection.unchecked_transaction()?;
-    let project = transaction
+    let workspace = load_case_workspace_rows(&transaction, project_id)?;
+    transaction.commit()?;
+    Ok(workspace)
+}
+
+/// Loads the case rows shown to the assistant and the optimistic-concurrency
+/// digest derived from that exact same SQLite snapshot. Callers preparing an
+/// assistant run should use this instead of issuing separate workspace and
+/// digest reads, which could otherwise observe different committed states.
+pub fn get_case_workspace_rows_with_digest(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<(CaseWorkspaceRows, String)>> {
+    if !connection.is_autocommit() {
+        return load_case_workspace_rows_with_digest(connection, project_id);
+    }
+    let transaction = connection.unchecked_transaction()?;
+    let snapshot = load_case_workspace_rows_with_digest(&transaction, project_id)?;
+    transaction.commit()?;
+    Ok(snapshot)
+}
+
+fn load_case_workspace_rows_with_digest(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<(CaseWorkspaceRows, String)>> {
+    let Some(workspace) = load_case_workspace_rows(connection, project_id)? else {
+        return Ok(None);
+    };
+    let artifacts = list_artifacts_for_project(connection, project_id)?;
+    let digest = case_workspace_digest_from_rows(workspace.clone(), artifacts);
+    Ok(Some((workspace, digest)))
+}
+
+fn load_case_workspace_rows(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<CaseWorkspaceRows>> {
+    let project = connection
         .query_row(
             "
             SELECT project_id, title, case_type, status, opened_on, summary, created_at, updated_at
@@ -809,20 +2395,312 @@ pub fn get_case_workspace_rows(
         .map(|project| {
             Ok::<_, rusqlite::Error>(CaseWorkspaceRows {
                 project,
-                files: list_case_files(&transaction, project_id)?,
-                parties: list_case_parties(&transaction, project_id)?,
-                facts: list_case_facts(&transaction, project_id)?,
-                evidence: list_evidence_items(&transaction, project_id)?,
-                evidence_links: list_evidence_links(&transaction, project_id)?,
-                fact_issue_links: list_fact_issue_links(&transaction, project_id)?,
-                legal_issues: list_legal_issues(&transaction, project_id)?,
-                legal_basis: list_legal_basis(&transaction, project_id)?,
-                uncertainties: list_case_uncertainties(&transaction, project_id)?,
+                files: list_case_files(connection, project_id)?,
+                parties: list_case_parties(connection, project_id)?,
+                facts: list_case_facts(connection, project_id)?,
+                evidence: list_evidence_items(connection, project_id)?,
+                evidence_links: list_evidence_links(connection, project_id)?,
+                fact_issue_links: list_fact_issue_links(connection, project_id)?,
+                legal_issues: list_legal_issues(connection, project_id)?,
+                legal_basis: list_legal_basis(connection, project_id)?,
+                uncertainties: list_case_uncertainties(connection, project_id)?,
             })
         })
         .transpose()?;
-    transaction.commit()?;
     Ok(workspace)
+}
+
+/// Returns a deterministic SHA-256 over the complete confirmed case workspace.
+/// The encoding is domain-separated, sectioned, length-prefixed, null-aware,
+/// and sorted by stable entity IDs. When called inside an existing transaction
+/// it uses that snapshot; otherwise it creates one read transaction so an
+/// assistant proposal can compare exactly the state the user reviewed.
+pub fn case_workspace_digest(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    if !connection.is_autocommit() {
+        return case_workspace_digest_in_snapshot(connection, project_id);
+    }
+    let transaction = connection.unchecked_transaction()?;
+    let digest = case_workspace_digest_in_snapshot(&transaction, project_id)?;
+    transaction.commit()?;
+    Ok(digest)
+}
+
+fn case_workspace_digest_in_snapshot(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    Ok(load_case_workspace_rows_with_digest(connection, project_id)?.map(|(_, digest)| digest))
+}
+
+fn case_workspace_digest_from_rows(
+    mut workspace: CaseWorkspaceRows,
+    mut artifacts: Vec<ArtifactRow>,
+) -> String {
+    workspace
+        .files
+        .sort_by(|left, right| left.file_id.cmp(&right.file_id));
+    workspace
+        .parties
+        .sort_by(|left, right| left.party_id.cmp(&right.party_id));
+    workspace
+        .facts
+        .sort_by(|left, right| left.fact_id.cmp(&right.fact_id));
+    workspace
+        .evidence
+        .sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
+    workspace
+        .evidence_links
+        .sort_by(|left, right| left.link_id.cmp(&right.link_id));
+    workspace
+        .fact_issue_links
+        .sort_by(|left, right| left.link_id.cmp(&right.link_id));
+    workspace
+        .legal_issues
+        .sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+    workspace
+        .legal_basis
+        .sort_by(|left, right| left.basis_id.cmp(&right.basis_id));
+    workspace
+        .uncertainties
+        .sort_by(|left, right| left.uncertainty_id.cmp(&right.uncertainty_id));
+    artifacts.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+
+    let mut hasher = Sha256::new();
+    hasher.update(CASE_WORKSPACE_DIGEST_DOMAIN);
+
+    digest_workspace_section(&mut hasher, "projects", 1);
+    let project = &workspace.project;
+    for value in [
+        project.project_id.as_str(),
+        project.title.as_str(),
+        project.case_type.as_str(),
+        project.status.as_str(),
+    ] {
+        digest_workspace_text(&mut hasher, value);
+    }
+    digest_workspace_optional_text(&mut hasher, project.opened_on.as_deref());
+    for value in [
+        project.summary.as_str(),
+        project.created_at.as_str(),
+        project.updated_at.as_str(),
+    ] {
+        digest_workspace_text(&mut hasher, value);
+    }
+
+    digest_workspace_section(&mut hasher, "case_files", workspace.files.len());
+    for row in &workspace.files {
+        for value in [
+            row.file_id.as_str(),
+            row.project_id.as_str(),
+            row.title.as_str(),
+            row.file_type.as_str(),
+            row.storage_reference.as_str(),
+            row.summary.as_str(),
+            row.created_at.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(&mut hasher, "case_parties", workspace.parties.len());
+    for row in &workspace.parties {
+        for value in [
+            row.party_id.as_str(),
+            row.project_id.as_str(),
+            row.name.as_str(),
+            row.normalized_name.as_str(),
+            row.role.as_str(),
+            row.contact.as_str(),
+            row.notes.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(&mut hasher, "case_facts", workspace.facts.len());
+    for row in &workspace.facts {
+        digest_workspace_text(&mut hasher, &row.fact_id);
+        digest_workspace_text(&mut hasher, &row.project_id);
+        digest_workspace_optional_text(&mut hasher, row.occurred_on.as_deref());
+        for value in [
+            row.title.as_str(),
+            row.description.as_str(),
+            row.source.as_str(),
+            row.confirmation_status.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(&mut hasher, "evidence_items", workspace.evidence.len());
+    for row in &workspace.evidence {
+        for value in [
+            row.evidence_id.as_str(),
+            row.project_id.as_str(),
+            row.evidence_number.as_str(),
+            row.title.as_str(),
+            row.source.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+        digest_workspace_optional_text(&mut hasher, row.formed_on.as_deref());
+        for value in [
+            row.summary.as_str(),
+            row.storage_reference.as_str(),
+            row.confirmation_status.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(
+        &mut hasher,
+        "evidence_links",
+        workspace.evidence_links.len(),
+    );
+    for row in &workspace.evidence_links {
+        for value in [
+            row.link_id.as_str(),
+            row.project_id.as_str(),
+            row.fact_id.as_str(),
+            row.evidence_id.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(
+        &mut hasher,
+        "fact_issue_links",
+        workspace.fact_issue_links.len(),
+    );
+    for row in &workspace.fact_issue_links {
+        for value in [
+            row.link_id.as_str(),
+            row.project_id.as_str(),
+            row.fact_id.as_str(),
+            row.issue_id.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(&mut hasher, "legal_issues", workspace.legal_issues.len());
+    for row in &workspace.legal_issues {
+        for value in [
+            row.issue_id.as_str(),
+            row.project_id.as_str(),
+            row.title.as_str(),
+            row.description.as_str(),
+            row.claim.as_str(),
+            row.status.as_str(),
+            row.confirmation_status.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(&mut hasher, "legal_basis", workspace.legal_basis.len());
+    for row in &workspace.legal_basis {
+        digest_workspace_text(&mut hasher, &row.basis_id);
+        digest_workspace_text(&mut hasher, &row.project_id);
+        digest_workspace_optional_text(&mut hasher, row.issue_id.as_deref());
+        digest_workspace_text(&mut hasher, &row.source_id);
+        digest_workspace_text(&mut hasher, &row.status);
+        digest_workspace_optional_text(&mut hasher, row.invalid_reason.as_deref());
+        digest_workspace_optional_text(&mut hasher, row.case_date.as_deref());
+        for value in [
+            row.article_id.as_str(),
+            row.document_id.as_str(),
+            row.version_id.as_str(),
+            row.document_title.as_str(),
+            row.version_label.as_str(),
+            row.article_number.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+        digest_workspace_optional_text(&mut hasher, row.article_title.as_deref());
+        for value in [row.canonical_label.as_str(), row.effective_from.as_str()] {
+            digest_workspace_text(&mut hasher, value);
+        }
+        digest_workspace_optional_text(&mut hasher, row.effective_to.as_deref());
+        for value in [
+            row.version_status.as_str(),
+            row.excerpt.as_str(),
+            row.note.as_str(),
+            row.created_at.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(
+        &mut hasher,
+        "case_uncertainties",
+        workspace.uncertainties.len(),
+    );
+    for row in &workspace.uncertainties {
+        for value in [
+            row.uncertainty_id.as_str(),
+            row.project_id.as_str(),
+            row.description.as_str(),
+            row.related_entity_type.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+        digest_workspace_optional_text(&mut hasher, row.related_entity_id.as_deref());
+        for value in [
+            row.source_file_ids_json.as_str(),
+            row.status.as_str(),
+            row.resolution.as_str(),
+            row.confirmation_status.as_str(),
+            row.created_at.as_str(),
+            row.updated_at.as_str(),
+        ] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    digest_workspace_section(&mut hasher, "artifacts", artifacts.len());
+    for row in &artifacts {
+        digest_workspace_text(&mut hasher, &row.artifact_id);
+        digest_workspace_optional_text(&mut hasher, row.conversation_id.as_deref());
+        digest_workspace_optional_text(&mut hasher, row.project_id.as_deref());
+        for value in [row.kind.as_str(), row.title.as_str(), row.status.as_str()] {
+            digest_workspace_text(&mut hasher, value);
+        }
+        hasher.update(row.current_version.to_be_bytes());
+        for value in [row.created_at.as_str(), row.updated_at.as_str()] {
+            digest_workspace_text(&mut hasher, value);
+        }
+    }
+
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn digest_workspace_section(hasher: &mut Sha256, name: &str, row_count: usize) {
+    digest_workspace_text(hasher, name);
+    hasher.update((row_count as u64).to_be_bytes());
+}
+
+fn digest_workspace_text(hasher: &mut Sha256, value: &str) {
+    hasher.update([1_u8]);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn digest_workspace_optional_text(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => digest_workspace_text(hasher, value),
+        None => hasher.update([0_u8]),
+    }
 }
 
 pub fn upsert_case_project(
@@ -852,6 +2730,28 @@ pub fn upsert_case_project(
     )?;
 
     Ok(())
+}
+
+/// Inserts a new case project without ever updating an existing project.
+/// Bootstrap flows use this after a read-only proposal has been reviewed.
+pub fn insert_case_project_if_absent(
+    connection: &rusqlite::Connection,
+    project: &CaseProjectRow,
+) -> rusqlite::Result<bool> {
+    let affected_rows = connection.execute(
+        "INSERT INTO projects (project_id, title, case_type, status, opened_on, summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(project_id) DO NOTHING",
+        params![
+            project.project_id,
+            project.title,
+            project.case_type,
+            project.status,
+            project.opened_on,
+            project.summary
+        ],
+    )?;
+    Ok(affected_rows == 1)
 }
 
 pub fn delete_case_project(
@@ -893,6 +2793,28 @@ pub fn upsert_case_file(
         affected_rows,
         "case file id is already assigned to another project",
     )
+}
+
+/// Inserts one additive case file and refuses to overwrite an existing ID.
+pub fn insert_case_file_if_absent(
+    connection: &rusqlite::Connection,
+    file: &CaseFileRow,
+) -> rusqlite::Result<bool> {
+    let affected_rows = connection.execute(
+        "INSERT INTO case_files
+         (file_id, project_id, title, file_type, storage_reference, summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(file_id) DO NOTHING",
+        params![
+            file.file_id,
+            file.project_id,
+            file.title,
+            file.file_type,
+            file.storage_reference,
+            file.summary
+        ],
+    )?;
+    Ok(affected_rows == 1)
 }
 
 pub fn upsert_case_party(
@@ -2007,11 +3929,56 @@ pub fn insert_legal_answer_record(
     record: &LegalAnswerRecordRow,
 ) -> rusqlite::Result<()> {
     validate_provider_audit_snapshot_json(&record.provider_snapshot_json)?;
+    let conversation_id = format!("{COMPAT_QA_CONVERSATION_ID_PREFIX}{}", record.record_id);
+    let user_message_id = format!("{conversation_id}:0-user");
+    let assistant_message_id = format!("{conversation_id}:1-assistant");
+    let title = bounded_qa_conversation_title(&record.question);
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO conversations (conversation_id, project_id, title, status)
+         VALUES (?1, ?2, ?3, 'open')",
+        params![conversation_id, record.project_id, title],
+    )?;
+    transaction.execute(
+        "INSERT INTO messages (
+             message_id, conversation_id, role, kind, text_summary, artifact_id, run_id
+         ) VALUES
+             (?1, ?3, 'user', 'text', ?4, NULL, NULL),
+             (?2, ?3, 'assistant', 'text', ?5, NULL, NULL)",
+        params![
+            user_message_id,
+            assistant_message_id,
+            conversation_id,
+            record.question,
+            record.answer_text
+        ],
+    )?;
+    insert_legal_answer_record_for_conversation_inner(&transaction, record, &conversation_id)?;
+    transaction.commit()?;
+
+    Ok(())
+}
+
+pub fn insert_legal_answer_record_for_conversation(
+    connection: &rusqlite::Connection,
+    record: &LegalAnswerRecordRow,
+    conversation_id: &str,
+) -> rusqlite::Result<()> {
+    validate_provider_audit_snapshot_json(&record.provider_snapshot_json)?;
+    insert_legal_answer_record_for_conversation_inner(connection, record, conversation_id)
+}
+
+fn insert_legal_answer_record_for_conversation_inner(
+    connection: &rusqlite::Connection,
+    record: &LegalAnswerRecordRow,
+    conversation_id: &str,
+) -> rusqlite::Result<()> {
     connection.execute(
         "
         INSERT INTO legal_answer_records (
             record_id,
             project_id,
+            conversation_id,
             provider_id,
             provider_snapshot_json,
             question,
@@ -2023,11 +3990,12 @@ pub fn insert_legal_answer_record(
             invalid_citations_json,
             unsupported_legal_conclusion
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ",
         params![
             record.record_id,
             record.project_id,
+            conversation_id,
             record.provider_id,
             record.provider_snapshot_json,
             record.question,
@@ -2046,6 +4014,22 @@ pub fn insert_legal_answer_record(
     )?;
 
     Ok(())
+}
+
+fn bounded_qa_conversation_title(question: &str) -> String {
+    let normalized = question.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let prefix = characters
+        .by_ref()
+        .take(LEGACY_QA_TITLE_MAX_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else if prefix.is_empty() {
+        "旧版法律问答".to_owned()
+    } else {
+        prefix
+    }
 }
 
 pub fn list_legal_answer_records(
@@ -2088,6 +4072,41 @@ pub fn list_legal_answer_records_for_project(
     limit: u32,
 ) -> rusqlite::Result<Vec<LegalAnswerRecordRow>> {
     list_legal_answer_records_for_project_before(connection, project_id, None, None, limit)
+}
+
+pub fn list_legal_answer_records_for_conversation(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<LegalAnswerRecordRow>> {
+    let limit = i64::from(limit.clamp(1, 100));
+    let mut statement = connection.prepare(
+        "SELECT
+             record_id,
+             project_id,
+             provider_id,
+             provider_snapshot_json,
+             question,
+             answer_text,
+             case_date,
+             query_json,
+             source_ids_json,
+             verified_citations_json,
+             invalid_citations_json,
+             unsupported_legal_conclusion,
+             created_at
+         FROM legal_answer_records
+         WHERE conversation_id = ?1
+         ORDER BY created_at DESC, record_id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(
+            params![conversation_id, limit],
+            legal_answer_record_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 pub fn list_legal_answer_records_for_project_before(
@@ -2286,6 +4305,145 @@ fn legal_answer_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Leg
         invalid_citations_json: row.get(10)?,
         unsupported_legal_conclusion: unsupported != 0,
         created_at: row.get(12)?,
+    })
+}
+
+fn conversation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRow> {
+    Ok(ConversationRow {
+        conversation_id: row.get(0)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        status: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        message_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        role: row.get(2)?,
+        kind: row.get(3)?,
+        text_summary: row.get(4)?,
+        artifact_id: row.get(5)?,
+        run_id: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentRow> {
+    Ok(AttachmentRow {
+        attachment_id: row.get(0)?,
+        project_id: row.get(1)?,
+        original_name: row.get(2)?,
+        extension: row.get(3)?,
+        detected_mime: row.get(4)?,
+        sha256: row.get(5)?,
+        size_bytes: row.get(6)?,
+        content_blob: row.get(7)?,
+        extraction_status: row.get(8)?,
+        extracted_text: row.get(9)?,
+        segments_json: row.get(10)?,
+        error_code: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
+fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRow> {
+    Ok(ArtifactRow {
+        artifact_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        project_id: row.get(2)?,
+        kind: row.get(3)?,
+        title: row.get(4)?,
+        status: row.get(5)?,
+        current_version: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn artifact_version_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactVersionRow> {
+    Ok(ArtifactVersionRow {
+        version_id: row.get(0)?,
+        artifact_id: row.get(1)?,
+        version_number: row.get(2)?,
+        content_json: row.get(3)?,
+        rendered_text: row.get(4)?,
+        source_refs_json: row.get(5)?,
+        citation_report_json: row.get(6)?,
+        provider_snapshot_json: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+fn agent_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRunRow> {
+    Ok(AgentRunRow {
+        run_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        user_message_id: row.get(2)?,
+        assistant_message_id: row.get(3)?,
+        provider_id: row.get(4)?,
+        provider_snapshot_json: row.get(5)?,
+        intent: row.get(6)?,
+        status: row.get(7)?,
+        budget_json: row.get(8)?,
+        error_type: row.get(9)?,
+        created_at: row.get(10)?,
+        finished_at: row.get(11)?,
+    })
+}
+
+fn tool_call_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallRow> {
+    let requires_confirmation: i64 = row.get(6)?;
+    Ok(ToolCallRow {
+        tool_call_id: row.get(0)?,
+        run_id: row.get(1)?,
+        ordinal: row.get(2)?,
+        capability_name: row.get(3)?,
+        status: row.get(4)?,
+        access_mode: row.get(5)?,
+        requires_confirmation: requires_confirmation != 0,
+        input_audit_json: row.get(7)?,
+        output_audit_json: row.get(8)?,
+        source_audit_json: row.get(9)?,
+        error_type: row.get(10)?,
+        started_at: row.get(11)?,
+        finished_at: row.get(12)?,
+    })
+}
+
+fn case_change_proposal_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CaseChangeProposalRow> {
+    Ok(CaseChangeProposalRow {
+        proposal_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        project_id: row.get(2)?,
+        run_id: row.get(3)?,
+        base_case_digest: row.get(4)?,
+        status: row.get(5)?,
+        changes_json: row.get(6)?,
+        source_refs_json: row.get(7)?,
+        created_at: row.get(8)?,
+        decided_at: row.get(9)?,
+        applied_at: row.get(10)?,
+    })
+}
+
+fn operation_audit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationAuditRow> {
+    Ok(OperationAuditRow {
+        audit_id: row.get(0)?,
+        origin: row.get(1)?,
+        operation: row.get(2)?,
+        project_id: row.get(3)?,
+        request_hash: row.get(4)?,
+        idempotency_key_hash: row.get(5)?,
+        status: row.get(6)?,
+        details_json: row.get(7)?,
+        created_at: row.get(8)?,
+        finished_at: row.get(9)?,
     })
 }
 
@@ -2535,10 +4693,266 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
         required_legacy_columns: &["basis_id", "project_id", "source_id", "status"],
     },
     UserTableMigrationSpec {
+        name: "conversations",
+        canonical_columns: &[
+            "conversation_id",
+            "project_id",
+            "title",
+            "status",
+            "created_at",
+            "updated_at",
+        ],
+        required_legacy_columns: &[
+            "conversation_id",
+            "project_id",
+            "title",
+            "status",
+            "created_at",
+            "updated_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "artifacts",
+        canonical_columns: &[
+            "artifact_id",
+            "conversation_id",
+            "project_id",
+            "kind",
+            "title",
+            "status",
+            "current_version",
+            "created_at",
+            "updated_at",
+        ],
+        required_legacy_columns: &[
+            "artifact_id",
+            "conversation_id",
+            "project_id",
+            "kind",
+            "title",
+            "status",
+            "current_version",
+            "created_at",
+            "updated_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "artifact_versions",
+        canonical_columns: &[
+            "version_id",
+            "artifact_id",
+            "version_number",
+            "content_json",
+            "rendered_text",
+            "source_refs_json",
+            "citation_report_json",
+            "provider_snapshot_json",
+            "created_at",
+        ],
+        required_legacy_columns: &[
+            "version_id",
+            "artifact_id",
+            "version_number",
+            "content_json",
+            "rendered_text",
+            "source_refs_json",
+            "citation_report_json",
+            "provider_snapshot_json",
+            "created_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "attachments",
+        canonical_columns: &[
+            "attachment_id",
+            "project_id",
+            "original_name",
+            "extension",
+            "detected_mime",
+            "sha256",
+            "size_bytes",
+            "content_blob",
+            "extraction_status",
+            "extracted_text",
+            "segments_json",
+            "error_code",
+            "created_at",
+        ],
+        required_legacy_columns: &[
+            "attachment_id",
+            "project_id",
+            "original_name",
+            "extension",
+            "detected_mime",
+            "sha256",
+            "size_bytes",
+            "content_blob",
+            "extraction_status",
+            "extracted_text",
+            "segments_json",
+            "error_code",
+            "created_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "messages",
+        canonical_columns: &[
+            "message_id",
+            "conversation_id",
+            "role",
+            "kind",
+            "text_summary",
+            "artifact_id",
+            "run_id",
+            "created_at",
+        ],
+        required_legacy_columns: &[
+            "message_id",
+            "conversation_id",
+            "role",
+            "kind",
+            "text_summary",
+            "artifact_id",
+            "run_id",
+            "created_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "message_attachments",
+        canonical_columns: &["message_id", "attachment_id", "ordinal"],
+        required_legacy_columns: &["message_id", "attachment_id", "ordinal"],
+    },
+    UserTableMigrationSpec {
+        name: "conversation_sources",
+        canonical_columns: &["conversation_id", "source_id", "created_at"],
+        required_legacy_columns: &["conversation_id", "source_id", "created_at"],
+    },
+    UserTableMigrationSpec {
+        name: "agent_runs",
+        canonical_columns: &[
+            "run_id",
+            "conversation_id",
+            "user_message_id",
+            "assistant_message_id",
+            "provider_id",
+            "provider_snapshot_json",
+            "intent",
+            "status",
+            "budget_json",
+            "error_type",
+            "created_at",
+            "finished_at",
+        ],
+        required_legacy_columns: &[
+            "run_id",
+            "conversation_id",
+            "user_message_id",
+            "assistant_message_id",
+            "provider_id",
+            "provider_snapshot_json",
+            "intent",
+            "status",
+            "budget_json",
+            "error_type",
+            "created_at",
+            "finished_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "tool_calls",
+        canonical_columns: &[
+            "tool_call_id",
+            "run_id",
+            "ordinal",
+            "capability_name",
+            "status",
+            "access_mode",
+            "requires_confirmation",
+            "input_audit_json",
+            "output_audit_json",
+            "source_audit_json",
+            "error_type",
+            "started_at",
+            "finished_at",
+        ],
+        required_legacy_columns: &[
+            "tool_call_id",
+            "run_id",
+            "ordinal",
+            "capability_name",
+            "status",
+            "access_mode",
+            "requires_confirmation",
+            "input_audit_json",
+            "output_audit_json",
+            "source_audit_json",
+            "error_type",
+            "started_at",
+            "finished_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "case_change_proposals",
+        canonical_columns: &[
+            "proposal_id",
+            "conversation_id",
+            "project_id",
+            "run_id",
+            "base_case_digest",
+            "status",
+            "changes_json",
+            "source_refs_json",
+            "created_at",
+            "decided_at",
+            "applied_at",
+        ],
+        required_legacy_columns: &[
+            "proposal_id",
+            "conversation_id",
+            "project_id",
+            "run_id",
+            "base_case_digest",
+            "status",
+            "changes_json",
+            "source_refs_json",
+            "created_at",
+            "decided_at",
+            "applied_at",
+        ],
+    },
+    UserTableMigrationSpec {
+        name: "operation_audit",
+        canonical_columns: &[
+            "audit_id",
+            "origin",
+            "operation",
+            "project_id",
+            "request_hash",
+            "idempotency_key_hash",
+            "status",
+            "details_json",
+            "created_at",
+            "finished_at",
+        ],
+        required_legacy_columns: &[
+            "audit_id",
+            "origin",
+            "operation",
+            "project_id",
+            "request_hash",
+            "idempotency_key_hash",
+            "status",
+            "details_json",
+            "created_at",
+            "finished_at",
+        ],
+    },
+    UserTableMigrationSpec {
         name: "legal_answer_records",
         canonical_columns: &[
             "record_id",
             "project_id",
+            "conversation_id",
             "provider_id",
             "provider_snapshot_json",
             "question",
@@ -2601,20 +5015,59 @@ const USER_SCHEMA_INDEX_NAMES: &[&str] = &[
     "idx_legal_issues_project",
     "idx_case_uncertainties_project",
     "idx_legal_basis_project",
+    "idx_conversations_updated",
+    "idx_conversations_project_updated",
+    "idx_artifacts_conversation_updated",
+    "idx_artifacts_project_updated",
+    "idx_artifact_versions_created",
+    "idx_attachments_project_created",
+    "idx_messages_conversation_created",
+    "idx_messages_run",
+    "idx_message_attachments_attachment",
+    "idx_conversation_sources_source",
+    "idx_agent_runs_conversation_created",
+    "idx_agent_runs_status",
+    "idx_tool_calls_status",
+    "idx_case_change_proposals_conversation_created",
+    "idx_case_change_proposals_project_status",
+    "idx_operation_audit_idempotency",
+    "idx_operation_audit_project_created",
     "idx_legal_answer_records_created",
     "idx_legal_answer_records_project_created",
+    "idx_legal_answer_records_conversation_created",
     "idx_document_generation_project_exported",
 ];
 
 const USER_SCHEMA_TRIGGER_NAMES: &[&str] = &[
     "trg_legal_basis_issue_project_insert",
     "trg_legal_basis_issue_project_update",
+    "trg_projects_detach_assistant_data_before_delete",
+    "trg_artifacts_scope_insert",
+    "trg_artifacts_scope_update",
+    "trg_messages_artifact_run_scope_insert",
+    "trg_messages_artifact_run_scope_update",
+    "trg_agent_runs_message_scope_insert",
+    "trg_agent_runs_message_scope_update",
+    "trg_case_change_proposals_scope_insert",
+    "trg_case_change_proposals_scope_update",
+    "trg_legal_answer_records_scope_insert",
+    "trg_legal_answer_records_scope_update",
 ];
 
 const LEGACY_USER_TABLE_DROP_ORDER: &[&str] = &[
+    "tool_calls",
+    "case_change_proposals",
+    "operation_audit",
+    "message_attachments",
+    "conversation_sources",
+    "artifact_versions",
+    "legal_answer_records",
+    "agent_runs",
+    "messages",
+    "artifacts",
+    "attachments",
     "case_extraction_confirmations",
     "pending_extraction_reviews",
-    "legal_answer_records",
     "evidence_links",
     "fact_issue_links",
     "legal_basis",
@@ -2625,6 +5078,7 @@ const LEGACY_USER_TABLE_DROP_ORDER: &[&str] = &[
     "case_facts",
     "evidence_items",
     "legal_issues",
+    "conversations",
     "projects",
     "provider_profiles",
 ];
@@ -2882,66 +5336,99 @@ fn copy_legacy_user_table(
     Ok(())
 }
 
-fn legacy_legal_answer_unowned_count(
-    transaction: &rusqlite::Transaction<'_>,
-) -> rusqlite::Result<i64> {
-    let legacy_name = legacy_user_table_name("legal_answer_records");
-    let source_columns = table_columns(transaction, &legacy_name)?;
-    if source_columns.contains("project_id") {
-        transaction.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM \"{legacy_name}\"
-                 WHERE project_id IS NULL OR length(project_id) = 0"
-            ),
-            [],
-            |row| row.get(0),
-        )
-    } else {
-        transaction.query_row(
-            &format!("SELECT COUNT(*) FROM \"{legacy_name}\""),
-            [],
-            |row| row.get(0),
-        )
-    }
-}
-
-fn create_legacy_answer_quarantine_project(
-    transaction: &rusqlite::Transaction<'_>,
-) -> rusqlite::Result<String> {
-    // Never reuse an existing project with the reserved-looking ID: it may be
-    // genuine user data. Select the first unused deterministic suffix instead.
-    for suffix in 0..10_000_u32 {
-        let project_id = if suffix == 0 {
-            LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX.to_owned()
-        } else {
-            format!("{LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX}-{suffix}")
-        };
-        if case_project_exists(transaction, &project_id)? {
-            continue;
-        }
-        transaction.execute(
-            "
-            INSERT INTO projects (project_id, title, case_type, status, summary)
-            VALUES (?1, ?2, 'migration_quarantine', 'archived', ?3)
-            ",
-            params![
-                project_id,
-                LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE,
-                LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
-            ],
-        )?;
-        return Ok(project_id);
-    }
-
-    Err(user_schema_migration_error(
-        "could not allocate a collision-safe legacy answer quarantine project".to_owned(),
-    ))
-}
-
-fn copy_legacy_legal_answers_into_quarantine(
+fn copy_legacy_messages_without_runs(
     transaction: &rusqlite::Transaction<'_>,
     spec: &UserTableMigrationSpec,
-    quarantine_project_id: &str,
+) -> rusqlite::Result<()> {
+    let legacy_name = legacy_user_table_name(spec.name);
+    let source_columns = table_columns(transaction, &legacy_name)?;
+    let canonical_columns = spec
+        .canonical_columns
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = source_columns
+        .iter()
+        .find(|column| !canonical_columns.contains(column.as_str()))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} contains unsupported column {unknown}; refusing to drop user data",
+            spec.name
+        )));
+    }
+    if let Some(missing) = spec
+        .required_legacy_columns
+        .iter()
+        .find(|column| !source_columns.contains(**column))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} is missing required column {missing}",
+            spec.name
+        )));
+    }
+
+    let copied_columns = spec
+        .canonical_columns
+        .iter()
+        .filter(|column| **column != "run_id")
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>();
+    let column_list = copied_columns.join(", ");
+    let source_count: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM \"{legacy_name}\""),
+        [],
+        |row| row.get(0),
+    )?;
+    let copied = transaction.execute(
+        &format!(
+            "INSERT INTO messages ({column_list})
+             SELECT {column_list} FROM \"{legacy_name}\""
+        ),
+        [],
+    )?;
+    if i64::try_from(copied).ok() != Some(source_count) {
+        return Err(user_schema_migration_error(
+            "legacy messages row count changed during migration".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn restore_legacy_message_runs(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let legacy_name = legacy_user_table_name("messages");
+    transaction.execute(
+        &format!(
+            "UPDATE messages
+             SET run_id = (
+                 SELECT source.run_id FROM \"{legacy_name}\" AS source
+                 WHERE source.message_id = messages.message_id
+             )"
+        ),
+        [],
+    )?;
+    let changed: bool = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM \"{legacy_name}\" AS source
+                 JOIN messages AS destination USING (message_id)
+                 WHERE destination.run_id IS NOT source.run_id
+             )"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if changed {
+        return Err(user_schema_migration_error(
+            "legacy message run ownership changed during migration".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn copy_legacy_legal_answers(
+    transaction: &rusqlite::Transaction<'_>,
+    spec: &UserTableMigrationSpec,
 ) -> rusqlite::Result<()> {
     let legacy_name = legacy_user_table_name(spec.name);
     let source_columns = table_columns(transaction, &legacy_name)?;
@@ -2974,13 +5461,10 @@ fn copy_legacy_legal_answers_into_quarantine(
     let mut select_expressions = Vec::new();
     for column in spec.canonical_columns {
         if *column == "project_id" {
-            destination_columns.push("\"project_id\"".to_owned());
-            select_expressions.push(if source_columns.contains("project_id") {
-                "CASE WHEN project_id IS NULL OR length(project_id) = 0 THEN ?1 ELSE project_id END"
-                    .to_owned()
-            } else {
-                "?1".to_owned()
-            });
+            if source_columns.contains("project_id") {
+                destination_columns.push("\"project_id\"".to_owned());
+                select_expressions.push("NULLIF(project_id, '')".to_owned());
+            }
         } else if source_columns.contains(*column) {
             destination_columns.push(format!("\"{column}\""));
             select_expressions.push(format!("\"{column}\""));
@@ -2998,13 +5482,287 @@ fn copy_legacy_legal_answers_into_quarantine(
             destination_columns.join(", "),
             select_expressions.join(", ")
         ),
-        [quarantine_project_id],
+        [],
     )?;
     if i64::try_from(copied).ok() != Some(source_count) {
         return Err(user_schema_migration_error(format!(
             "legacy table {} row count changed during migration",
             spec.name
         )));
+    }
+
+    let destination_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM legal_answer_records", [], |row| {
+            row.get(0)
+        })?;
+    if destination_count != source_count {
+        return Err(user_schema_migration_error(
+            "legacy legal answer count changed during migration".to_owned(),
+        ));
+    }
+
+    for column in spec
+        .canonical_columns
+        .iter()
+        .filter(|column| source_columns.contains(**column) && **column != "conversation_id")
+    {
+        let values_differ = if *column == "project_id" {
+            "NOT (
+                    (source.project_id IS NULL OR source.project_id = '')
+                    AND destination.project_id IS NULL
+                 ) AND destination.project_id IS NOT source.project_id"
+                .to_owned()
+        } else {
+            format!("destination.\"{column}\" IS NOT source.\"{column}\"")
+        };
+        let changed: bool = transaction.query_row(
+            &format!(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM \"{legacy_name}\" AS source
+                    LEFT JOIN legal_answer_records AS destination
+                      ON destination.record_id = source.record_id
+                    WHERE destination.record_id IS NULL OR ({values_differ})
+                )"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if changed {
+            return Err(user_schema_migration_error(format!(
+                "legacy legal answer column {column} changed during migration"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn create_legacy_qa_conversations(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let pending = {
+        let mut statement = transaction.prepare(
+            "SELECT record_id, project_id, question, answer_text, created_at
+             FROM legal_answer_records
+             WHERE conversation_id IS NULL
+             ORDER BY record_id ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for (record_id, project_id, question, answer_text, created_at) in pending {
+        let conversation_id = format!("{LEGACY_QA_CONVERSATION_ID_PREFIX}{record_id}");
+        let user_message_id = format!("{conversation_id}:0-user");
+        let assistant_message_id = format!("{conversation_id}:1-assistant");
+        let title = bounded_qa_conversation_title(&question);
+        transaction.execute(
+            "INSERT INTO conversations (
+                 conversation_id, project_id, title, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'open', ?4, ?4)",
+            params![conversation_id, project_id, title, created_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO messages (
+                 message_id, conversation_id, role, kind, text_summary,
+                 artifact_id, run_id, created_at
+             ) VALUES
+                 (?1, ?3, 'user', 'text', ?4, NULL, NULL, ?6),
+                 (?2, ?3, 'assistant', 'text', ?5, NULL, NULL, ?6)",
+            params![
+                user_message_id,
+                assistant_message_id,
+                conversation_id,
+                question,
+                answer_text,
+                created_at
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE legal_answer_records
+             SET conversation_id = ?2
+             WHERE record_id = ?1 AND conversation_id IS NULL",
+            params![record_id, conversation_id],
+        )?;
+        if changed != 1 {
+            return Err(user_schema_migration_error(format!(
+                "legacy legal answer {record_id} could not be bound to its deterministic conversation"
+            )));
+        }
+    }
+
+    let unbound_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM legal_answer_records WHERE conversation_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if unbound_count != 0 {
+        return Err(user_schema_migration_error(
+            "legacy legal answers remain without deterministic conversations".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_precise_legacy_quarantine_project_id(project_id: &str) -> bool {
+    if project_id == LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX {
+        return true;
+    }
+    let Some(suffix) = project_id
+        .strip_prefix(LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+    else {
+        return false;
+    };
+    suffix
+        .parse::<u32>()
+        .ok()
+        .filter(|number| *number > 0)
+        .is_some_and(|number| number.to_string() == suffix)
+}
+
+fn quarantine_project_has_other_business_children(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM case_files WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM pending_extraction_reviews WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM case_extraction_confirmations WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM case_parties WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM case_facts WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM evidence_items WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM evidence_links WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM legal_issues WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM fact_issue_links WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM case_uncertainties WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM legal_basis WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM document_generation_records WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM conversations WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM artifacts WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM attachments WHERE project_id = ?1
+             UNION ALL SELECT 1 FROM case_change_proposals WHERE project_id = ?1
+         )",
+        [project_id],
+        |row| row.get(0),
+    )
+}
+
+fn migrate_precise_legacy_answer_quarantines(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT project_id, title, case_type, status, opened_on, summary
+             FROM projects
+             WHERE project_id LIKE ?1
+             ORDER BY project_id ASC",
+        )?;
+        let prefix_pattern = format!("{LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX}%");
+        let rows = statement
+            .query_map([prefix_pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for (project_id, title, case_type, status, opened_on, summary) in candidates {
+        if !is_precise_legacy_quarantine_project_id(&project_id)
+            || title != LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE
+        {
+            continue;
+        }
+        if case_type != "migration_quarantine"
+            || status != "archived"
+            || opened_on.is_some()
+            || summary != LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
+        {
+            return Err(user_schema_migration_error(format!(
+                "reserved legacy answer quarantine project {project_id} has ambiguous metadata"
+            )));
+        }
+
+        let answer_conversations = {
+            let mut statement = transaction.prepare(
+                "SELECT record_id, conversation_id
+                 FROM legal_answer_records
+                 WHERE project_id = ?1
+                 ORDER BY record_id ASC",
+            )?;
+            let rows = statement
+                .query_map([&project_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (record_id, conversation_id) in &answer_conversations {
+            let expected = format!("{LEGACY_QA_CONVERSATION_ID_PREFIX}{record_id}");
+            if conversation_id != &expected {
+                return Err(user_schema_migration_error(format!(
+                    "legacy quarantine answer {record_id} has a non-deterministic conversation"
+                )));
+            }
+        }
+
+        for (_, conversation_id) in &answer_conversations {
+            let changed = transaction.execute(
+                "UPDATE conversations
+                 SET project_id = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE conversation_id = ?1 AND project_id = ?2",
+                params![conversation_id, project_id],
+            )?;
+            if changed != 1 {
+                return Err(user_schema_migration_error(format!(
+                    "legacy quarantine conversation {conversation_id} has ambiguous ownership"
+                )));
+            }
+        }
+        transaction.execute(
+            "UPDATE legal_answer_records SET project_id = NULL WHERE project_id = ?1",
+            [&project_id],
+        )?;
+
+        if !quarantine_project_has_other_business_children(transaction, &project_id)? {
+            let deleted = transaction.execute(
+                "DELETE FROM projects
+                 WHERE project_id = ?1
+                   AND title = ?2
+                   AND case_type = 'migration_quarantine'
+                   AND status = 'archived'
+                   AND opened_on IS NULL
+                   AND summary = ?3",
+                params![
+                    project_id,
+                    LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE,
+                    LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
+                ],
+            )?;
+            if deleted != 1 {
+                return Err(user_schema_migration_error(format!(
+                    "legacy quarantine project {project_id} changed during migration"
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -3016,22 +5774,24 @@ fn migrate_staged_user_tables(
 ) -> rusqlite::Result<()> {
     for spec in USER_TABLE_MIGRATION_SPECS {
         if staged.contains(spec.name) {
-            if spec.name == "legal_answer_records"
-                && legacy_legal_answer_unowned_count(transaction)? > 0
-            {
-                let quarantine_project_id = create_legacy_answer_quarantine_project(transaction)?;
-                copy_legacy_legal_answers_into_quarantine(
-                    transaction,
-                    spec,
-                    &quarantine_project_id,
-                )?;
+            if spec.name == "legal_answer_records" {
+                copy_legacy_legal_answers(transaction, spec)?;
+            } else if spec.name == "messages" {
+                copy_legacy_messages_without_runs(transaction, spec)?;
             } else {
                 copy_legacy_user_table(transaction, spec)?;
             }
         }
     }
+    if staged.contains("messages") {
+        restore_legacy_message_runs(transaction)?;
+    }
+
+    create_legacy_qa_conversations(transaction)?;
+    migrate_precise_legacy_answer_quarantines(transaction)?;
 
     validate_project_scoped_relations(transaction)?;
+    validate_assistant_scoped_relations(transaction)?;
 
     for table in LEGACY_USER_TABLE_DROP_ORDER {
         if staged.contains(table) {
@@ -3124,6 +5884,170 @@ fn validate_project_scoped_relations(connection: &rusqlite::Connection) -> rusql
     Ok(())
 }
 
+fn validate_assistant_scoped_relations(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let invalid_artifact_version: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM artifacts AS artifact
+             LEFT JOIN artifact_versions AS version
+               ON version.artifact_id = artifact.artifact_id
+              AND version.version_number = artifact.current_version
+             WHERE version.version_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM artifact_versions AS future
+                    WHERE future.artifact_id = artifact.artifact_id
+                      AND future.version_number > artifact.current_version
+                )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_artifact_version {
+        return Err(user_schema_migration_error(
+            "artifact current_version must identify its greatest persisted version".to_owned(),
+        ));
+    }
+
+    let invalid_artifact_scope: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM artifacts AS artifact
+             JOIN conversations AS conversation
+               ON conversation.conversation_id = artifact.conversation_id
+             WHERE artifact.project_id IS NOT NULL
+               AND conversation.project_id IS NOT NULL
+               AND artifact.project_id != conversation.project_id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_artifact_scope {
+        return Err(user_schema_migration_error(
+            "artifact project must match its bound conversation".to_owned(),
+        ));
+    }
+
+    let invalid_message_scope: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM messages AS message
+             JOIN conversations AS conversation
+               ON conversation.conversation_id = message.conversation_id
+             LEFT JOIN artifacts AS artifact ON artifact.artifact_id = message.artifact_id
+             LEFT JOIN agent_runs AS run ON run.run_id = message.run_id
+             WHERE (message.artifact_id IS NOT NULL AND (
+                       artifact.artifact_id IS NULL
+                       OR (
+                           artifact.conversation_id IS NOT NULL
+                           AND artifact.conversation_id != message.conversation_id
+                       )
+                       OR (
+                           conversation.project_id IS NOT NULL
+                           AND artifact.project_id IS NOT NULL
+                           AND artifact.project_id != conversation.project_id
+                       )
+                   ))
+                OR (message.run_id IS NOT NULL AND (
+                       run.run_id IS NULL OR run.conversation_id != message.conversation_id
+                   ))
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_message_scope {
+        return Err(user_schema_migration_error(
+            "message artifact and run references must remain in conversation scope".to_owned(),
+        ));
+    }
+
+    let invalid_run_scope: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM agent_runs AS run
+             LEFT JOIN messages AS user_message
+               ON user_message.message_id = run.user_message_id
+              AND user_message.conversation_id = run.conversation_id
+             LEFT JOIN messages AS assistant_message
+               ON assistant_message.message_id = run.assistant_message_id
+              AND assistant_message.conversation_id = run.conversation_id
+             WHERE user_message.message_id IS NULL
+                OR (run.assistant_message_id IS NOT NULL AND assistant_message.message_id IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_run_scope {
+        return Err(user_schema_migration_error(
+            "agent run messages must remain in conversation scope".to_owned(),
+        ));
+    }
+
+    let invalid_attachment_scope: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM message_attachments AS link
+             JOIN messages AS message ON message.message_id = link.message_id
+             JOIN conversations AS conversation
+               ON conversation.conversation_id = message.conversation_id
+             JOIN attachments AS attachment ON attachment.attachment_id = link.attachment_id
+             WHERE attachment.project_id IS NOT NULL
+               AND attachment.project_id IS NOT conversation.project_id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_attachment_scope {
+        return Err(user_schema_migration_error(
+            "message attachments must match conversation project ownership".to_owned(),
+        ));
+    }
+
+    let invalid_proposal_scope: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM case_change_proposals AS proposal
+             LEFT JOIN conversations AS conversation
+               ON conversation.conversation_id = proposal.conversation_id
+              AND conversation.project_id = proposal.project_id
+             LEFT JOIN agent_runs AS run
+               ON run.run_id = proposal.run_id
+              AND run.conversation_id = proposal.conversation_id
+             WHERE conversation.conversation_id IS NULL
+                OR (proposal.run_id IS NOT NULL AND run.run_id IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_proposal_scope {
+        return Err(user_schema_migration_error(
+            "case proposals must match conversation, project, and run ownership".to_owned(),
+        ));
+    }
+
+    let invalid_answer_scope: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM legal_answer_records AS answer
+             LEFT JOIN conversations AS conversation
+               ON conversation.conversation_id = answer.conversation_id
+             WHERE answer.conversation_id IS NOT NULL
+               AND (
+                   conversation.conversation_id IS NULL
+                   OR conversation.project_id IS NOT answer.project_id
+               )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_answer_scope {
+        return Err(user_schema_migration_error(
+            "legal answer project must match its conversation".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_canonical_user_database(
     connection: &rusqlite::Connection,
 ) -> Result<(), DatabaseInitError> {
@@ -3138,6 +6062,7 @@ fn validate_canonical_user_database(
     }
     validate_exact_canonical_user_schema(connection)?;
     validate_project_scoped_relations(connection)?;
+    validate_assistant_scoped_relations(connection)?;
     let mut foreign_keys = connection.prepare("PRAGMA foreign_key_check")?;
     if foreign_keys.query([])?.next()?.is_some() {
         return Err(user_schema_migration_error(
@@ -3306,6 +6231,10 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let staged_tables = if needs_canonical_rebuild {
+        // v9 contains a deliberate message/run cycle. Deferring foreign keys
+        // keeps the staged copy deterministic while the final transaction is
+        // still proven by foreign_key_check before commit.
+        transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
         stage_legacy_user_tables(&transaction)?
     } else {
         HashSet::new()
@@ -3563,9 +6492,415 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
         CREATE INDEX IF NOT EXISTS idx_legal_basis_project
             ON legal_basis(project_id, issue_id);
 
+        CREATE TABLE IF NOT EXISTS conversations (
+            conversation_id TEXT PRIMARY KEY CHECK (length(conversation_id) > 0),
+            project_id TEXT,
+            title TEXT NOT NULL CHECK (length(title) > 0),
+            status TEXT NOT NULL CHECK (status IN ('open', 'archived')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE SET NULL,
+            CHECK (project_id IS NULL OR length(project_id) > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS artifacts (
+            artifact_id TEXT PRIMARY KEY CHECK (length(artifact_id) > 0),
+            conversation_id TEXT,
+            project_id TEXT,
+            kind TEXT NOT NULL CHECK (kind IN ('research', 'document', 'map')),
+            title TEXT NOT NULL CHECK (length(title) > 0),
+            status TEXT NOT NULL CHECK (status IN ('draft', 'final', 'archived')),
+            current_version INTEGER NOT NULL CHECK (current_version >= 1),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(conversation_id)
+                REFERENCES conversations(conversation_id) ON DELETE SET NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE SET NULL,
+            CHECK (conversation_id IS NULL OR length(conversation_id) > 0),
+            CHECK (project_id IS NULL OR length(project_id) > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS artifact_versions (
+            version_id TEXT PRIMARY KEY CHECK (length(version_id) > 0),
+            artifact_id TEXT NOT NULL,
+            version_number INTEGER NOT NULL CHECK (version_number >= 1),
+            content_json TEXT NOT NULL CHECK (json_valid(content_json)),
+            rendered_text TEXT NOT NULL DEFAULT '',
+            source_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (
+                json_valid(source_refs_json) AND json_type(source_refs_json) = 'array'
+            ),
+            citation_report_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(citation_report_json)
+            ),
+            provider_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(provider_snapshot_json) AND length(provider_snapshot_json) <= 65536
+            ),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(artifact_id) REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+            UNIQUE(artifact_id, version_number)
+        );
+
+        CREATE TABLE IF NOT EXISTS attachments (
+            attachment_id TEXT PRIMARY KEY CHECK (length(attachment_id) > 0),
+            project_id TEXT,
+            original_name TEXT NOT NULL CHECK (length(original_name) > 0),
+            extension TEXT NOT NULL DEFAULT '',
+            detected_mime TEXT NOT NULL CHECK (length(detected_mime) > 0),
+            sha256 TEXT NOT NULL UNIQUE CHECK (length(sha256) = 64),
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            content_blob BLOB NOT NULL,
+            extraction_status TEXT NOT NULL CHECK (
+                extraction_status IN ('pending', 'succeeded', 'failed', 'unsupported')
+            ),
+            extracted_text TEXT,
+            segments_json TEXT NOT NULL DEFAULT '[]' CHECK (
+                json_valid(segments_json) AND json_type(segments_json) = 'array'
+            ),
+            error_code TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE SET NULL,
+            CHECK (project_id IS NULL OR length(project_id) > 0),
+            CHECK (size_bytes = length(content_blob)),
+            CHECK (error_code IS NULL OR length(error_code) > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id TEXT PRIMARY KEY CHECK (length(message_id) > 0),
+            conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+            kind TEXT NOT NULL CHECK (kind IN ('text', 'artifact_ref', 'proposal_ref')),
+            text_summary TEXT NOT NULL DEFAULT '',
+            artifact_id TEXT,
+            run_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(conversation_id)
+                REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+            FOREIGN KEY(artifact_id) REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+            FOREIGN KEY(run_id) REFERENCES agent_runs(run_id) ON DELETE SET NULL
+                DEFERRABLE INITIALLY DEFERRED,
+            CHECK (artifact_id IS NULL OR length(artifact_id) > 0),
+            CHECK (run_id IS NULL OR length(run_id) > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS message_attachments (
+            message_id TEXT NOT NULL,
+            attachment_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            PRIMARY KEY(message_id, attachment_id),
+            FOREIGN KEY(message_id) REFERENCES messages(message_id) ON DELETE CASCADE,
+            FOREIGN KEY(attachment_id) REFERENCES attachments(attachment_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS conversation_sources (
+            conversation_id TEXT NOT NULL,
+            source_id TEXT NOT NULL CHECK (length(source_id) > 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(conversation_id, source_id),
+            FOREIGN KEY(conversation_id)
+                REFERENCES conversations(conversation_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            run_id TEXT PRIMARY KEY CHECK (length(run_id) > 0),
+            conversation_id TEXT NOT NULL,
+            user_message_id TEXT NOT NULL,
+            assistant_message_id TEXT,
+            provider_id TEXT,
+            provider_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(provider_snapshot_json) AND length(provider_snapshot_json) <= 65536
+            ),
+            intent TEXT NOT NULL CHECK (length(intent) > 0),
+            status TEXT NOT NULL CHECK (
+                status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+            ),
+            budget_json TEXT NOT NULL CHECK (json_valid(budget_json)),
+            error_type TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT,
+            FOREIGN KEY(conversation_id)
+                REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+            FOREIGN KEY(user_message_id) REFERENCES messages(message_id) ON DELETE CASCADE
+                DEFERRABLE INITIALLY DEFERRED,
+            FOREIGN KEY(assistant_message_id) REFERENCES messages(message_id) ON DELETE SET NULL
+                DEFERRABLE INITIALLY DEFERRED,
+            FOREIGN KEY(provider_id) REFERENCES provider_profiles(id) ON DELETE SET NULL,
+            CHECK (assistant_message_id IS NULL OR length(assistant_message_id) > 0),
+            CHECK (provider_id IS NULL OR length(provider_id) > 0),
+            CHECK (error_type IS NULL OR length(error_type) > 0),
+            CHECK (
+                (status IN ('queued', 'running') AND finished_at IS NULL)
+                OR (status IN ('succeeded', 'failed', 'cancelled') AND finished_at IS NOT NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            tool_call_id TEXT PRIMARY KEY CHECK (length(tool_call_id) > 0),
+            run_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            capability_name TEXT NOT NULL CHECK (length(capability_name) > 0),
+            status TEXT NOT NULL CHECK (
+                status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+            ),
+            access_mode TEXT NOT NULL CHECK (access_mode IN ('read', 'write')),
+            requires_confirmation INTEGER NOT NULL CHECK (requires_confirmation IN (0, 1)),
+            input_audit_json TEXT NOT NULL CHECK (json_valid(input_audit_json)),
+            output_audit_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(output_audit_json)),
+            source_audit_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(source_audit_json)),
+            error_type TEXT,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT,
+            FOREIGN KEY(run_id) REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+            UNIQUE(run_id, ordinal),
+            CHECK (error_type IS NULL OR length(error_type) > 0),
+            CHECK (
+                (status IN ('queued', 'running') AND finished_at IS NULL)
+                OR (status IN ('succeeded', 'failed', 'cancelled') AND finished_at IS NOT NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS case_change_proposals (
+            proposal_id TEXT PRIMARY KEY CHECK (length(proposal_id) > 0),
+            conversation_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            run_id TEXT,
+            base_case_digest TEXT NOT NULL CHECK (length(base_case_digest) = 64),
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'applied', 'rejected', 'stale')
+            ),
+            changes_json TEXT NOT NULL CHECK (json_valid(changes_json)),
+            source_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (
+                json_valid(source_refs_json) AND json_type(source_refs_json) = 'array'
+            ),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            decided_at TEXT,
+            applied_at TEXT,
+            FOREIGN KEY(conversation_id)
+                REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
+            FOREIGN KEY(run_id) REFERENCES agent_runs(run_id) ON DELETE SET NULL,
+            CHECK (run_id IS NULL OR length(run_id) > 0),
+            CHECK (
+                (status = 'pending' AND decided_at IS NULL AND applied_at IS NULL)
+                OR (status IN ('rejected', 'stale') AND decided_at IS NOT NULL AND applied_at IS NULL)
+                OR (status = 'applied' AND decided_at IS NOT NULL AND applied_at IS NOT NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_audit (
+            audit_id TEXT PRIMARY KEY CHECK (length(audit_id) > 0),
+            origin TEXT NOT NULL CHECK (origin IN ('desktop', 'mcp')),
+            operation TEXT NOT NULL CHECK (length(operation) > 0),
+            project_id TEXT,
+            request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+            idempotency_key_hash TEXT CHECK (
+                idempotency_key_hash IS NULL OR length(idempotency_key_hash) = 64
+            ),
+            status TEXT NOT NULL CHECK (
+                status IN ('prepared', 'succeeded', 'failed')
+            ),
+            details_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(details_json)
+                AND json_type(details_json) = 'object'
+                AND length(details_json) <= 65536
+            ),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE SET NULL,
+            CHECK (project_id IS NULL OR length(project_id) > 0),
+            CHECK (
+                (status = 'prepared' AND finished_at IS NULL)
+                OR (status IN ('succeeded', 'failed') AND finished_at IS NOT NULL)
+            )
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_artifacts_scope_insert
+        BEFORE INSERT ON artifacts
+        WHEN NEW.conversation_id IS NOT NULL
+          AND NEW.project_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM conversations
+              WHERE conversation_id = NEW.conversation_id
+                AND (project_id IS NULL OR project_id = NEW.project_id)
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'artifact project must match its bound conversation');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_artifacts_scope_update
+        BEFORE UPDATE OF conversation_id, project_id ON artifacts
+        WHEN NEW.conversation_id IS NOT NULL
+          AND NEW.project_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM conversations
+              WHERE conversation_id = NEW.conversation_id
+                AND (project_id IS NULL OR project_id = NEW.project_id)
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'artifact project must match its bound conversation');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_messages_artifact_run_scope_insert
+        BEFORE INSERT ON messages
+        WHEN (
+            NEW.artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1
+                FROM artifacts AS artifact
+                JOIN conversations AS conversation
+                  ON conversation.conversation_id = NEW.conversation_id
+                WHERE artifact.artifact_id = NEW.artifact_id
+                  AND (
+                      artifact.conversation_id IS NULL
+                      OR artifact.conversation_id = NEW.conversation_id
+                  )
+                  AND (
+                      conversation.project_id IS NULL
+                      OR artifact.project_id IS NULL
+                      OR artifact.project_id = conversation.project_id
+                  )
+            )
+        ) OR (
+            NEW.run_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM agent_runs
+                WHERE run_id = NEW.run_id AND conversation_id = NEW.conversation_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'message artifact and run must remain in conversation scope');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_messages_artifact_run_scope_update
+        BEFORE UPDATE OF conversation_id, artifact_id, run_id ON messages
+        WHEN (
+            NEW.artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1
+                FROM artifacts AS artifact
+                JOIN conversations AS conversation
+                  ON conversation.conversation_id = NEW.conversation_id
+                WHERE artifact.artifact_id = NEW.artifact_id
+                  AND (
+                      artifact.conversation_id IS NULL
+                      OR artifact.conversation_id = NEW.conversation_id
+                  )
+                  AND (
+                      conversation.project_id IS NULL
+                      OR artifact.project_id IS NULL
+                      OR artifact.project_id = conversation.project_id
+                  )
+            )
+        ) OR (
+            NEW.run_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM agent_runs
+                WHERE run_id = NEW.run_id AND conversation_id = NEW.conversation_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'message artifact and run must remain in conversation scope');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_agent_runs_message_scope_insert
+        BEFORE INSERT ON agent_runs
+        WHEN NOT EXISTS (
+            SELECT 1 FROM messages
+            WHERE message_id = NEW.user_message_id
+              AND conversation_id = NEW.conversation_id
+        ) OR (
+            NEW.assistant_message_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM messages
+                WHERE message_id = NEW.assistant_message_id
+                  AND conversation_id = NEW.conversation_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'agent run messages must belong to the same conversation');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_agent_runs_message_scope_update
+        BEFORE UPDATE OF conversation_id, user_message_id, assistant_message_id ON agent_runs
+        WHEN NOT EXISTS (
+            SELECT 1 FROM messages
+            WHERE message_id = NEW.user_message_id
+              AND conversation_id = NEW.conversation_id
+        ) OR (
+            NEW.assistant_message_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM messages
+                WHERE message_id = NEW.assistant_message_id
+                  AND conversation_id = NEW.conversation_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'agent run messages must belong to the same conversation');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_change_proposals_scope_insert
+        BEFORE INSERT ON case_change_proposals
+        WHEN NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE conversation_id = NEW.conversation_id AND project_id = NEW.project_id
+        ) OR (
+            NEW.run_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM agent_runs
+                WHERE run_id = NEW.run_id AND conversation_id = NEW.conversation_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'case proposal must match its conversation, project, and run');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_change_proposals_scope_update
+        BEFORE UPDATE OF conversation_id, project_id, run_id ON case_change_proposals
+        WHEN NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE conversation_id = NEW.conversation_id AND project_id = NEW.project_id
+        ) OR (
+            NEW.run_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM agent_runs
+                WHERE run_id = NEW.run_id AND conversation_id = NEW.conversation_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'case proposal must match its conversation, project, and run');
+        END;
+
+        CREATE INDEX IF NOT EXISTS idx_conversations_updated
+            ON conversations(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_conversations_project_updated
+            ON conversations(project_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_conversation_updated
+            ON artifacts(conversation_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_project_updated
+            ON artifacts(project_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_artifact_versions_created
+            ON artifact_versions(artifact_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_attachments_project_created
+            ON attachments(project_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
+            ON messages(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_run
+            ON messages(run_id);
+        CREATE INDEX IF NOT EXISTS idx_message_attachments_attachment
+            ON message_attachments(attachment_id);
+        CREATE INDEX IF NOT EXISTS idx_conversation_sources_source
+            ON conversation_sources(source_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_conversation_created
+            ON agent_runs(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_status
+            ON agent_runs(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_status
+            ON tool_calls(status, started_at);
+        CREATE INDEX IF NOT EXISTS idx_case_change_proposals_conversation_created
+            ON case_change_proposals(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_case_change_proposals_project_status
+            ON case_change_proposals(project_id, status, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_audit_idempotency
+            ON operation_audit(origin, operation, idempotency_key_hash)
+            WHERE idempotency_key_hash IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_operation_audit_project_created
+            ON operation_audit(project_id, created_at);
+
         CREATE TABLE IF NOT EXISTS legal_answer_records (
             record_id TEXT PRIMARY KEY CHECK (length(record_id) > 0),
-            project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+            project_id TEXT,
+            conversation_id TEXT,
             provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
             provider_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
                 json_valid(provider_snapshot_json)
@@ -3582,13 +6917,48 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
                 unsupported_legal_conclusion IN (0, 1)
             ),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE SET NULL,
+            FOREIGN KEY(conversation_id)
+                REFERENCES conversations(conversation_id) ON DELETE SET NULL,
+            CHECK (project_id IS NULL OR length(project_id) > 0),
+            CHECK (conversation_id IS NULL OR length(conversation_id) > 0)
         );
+
+        CREATE TRIGGER IF NOT EXISTS trg_legal_answer_records_scope_insert
+        BEFORE INSERT ON legal_answer_records
+        WHEN NEW.conversation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE conversation_id = NEW.conversation_id AND project_id IS NEW.project_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legal answer project must match its conversation');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_legal_answer_records_scope_update
+        BEFORE UPDATE OF project_id, conversation_id ON legal_answer_records
+        WHEN NEW.conversation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM conversations
+            WHERE conversation_id = NEW.conversation_id AND project_id IS NEW.project_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legal answer project must match its conversation');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_projects_detach_assistant_data_before_delete
+        BEFORE DELETE ON projects
+        BEGIN
+            UPDATE conversations
+            SET project_id = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE project_id = OLD.project_id;
+            UPDATE legal_answer_records SET project_id = NULL WHERE project_id = OLD.project_id;
+        END;
 
         CREATE INDEX IF NOT EXISTS idx_legal_answer_records_created
             ON legal_answer_records(created_at);
         CREATE INDEX IF NOT EXISTS idx_legal_answer_records_project_created
             ON legal_answer_records(project_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_answer_records_conversation_created
+            ON legal_answer_records(conversation_id, created_at);
 
         CREATE TABLE IF NOT EXISTS document_generation_records (
             record_id TEXT PRIMARY KEY CHECK (length(record_id) > 0),
@@ -3675,6 +7045,32 @@ mod tests {
 
         assert_eq!(database_path, directory.path().join(USER_DB_FILE_NAME));
         assert!(database_path.is_file());
+    }
+
+    #[test]
+    fn existing_only_and_read_only_user_database_open_modes_are_enforced() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database is created");
+        let read_only =
+            open_user_database_read_only(&database_path).expect("read-only database opens");
+        assert_eq!(
+            read_only
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .expect("query-only pragma reads"),
+            1
+        );
+        assert!(read_only
+            .execute(
+                "INSERT INTO projects (project_id, title, status) VALUES ('forbidden', 'Forbidden', 'active')",
+                [],
+            )
+            .is_err());
+        drop(read_only);
+
+        let missing = directory.path().join("must-not-be-created.sqlite");
+        assert!(open_existing_user_database(&missing).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -4480,7 +7876,7 @@ mod tests {
     }
 
     #[test]
-    fn user_database_migrates_v6_answers_into_collision_safe_deletable_quarantine() {
+    fn user_database_migrates_v6_unowned_answers_into_case_free_conversations() {
         let directory = tempfile::tempdir().expect("tempdir exists");
         let database_path = directory.path().join(USER_DB_FILE_NAME);
         {
@@ -4550,63 +7946,45 @@ mod tests {
         let connection = open_user_database(&database_path).expect("migrated database opens");
         let migrated = connection
             .query_row(
-                "SELECT project_id, provider_id, question, answer_text, case_date,
+                "SELECT project_id, conversation_id, provider_id, question, answer_text, case_date,
                         query_json, source_ids_json, verified_citations_json,
                         invalid_citations_json, unsupported_legal_conclusion, created_at
                  FROM legal_answer_records WHERE record_id = 'legacy-answer'",
                 [],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, String>(11)?,
                     ))
                 },
             )
             .expect("legacy answer survives");
-        let quarantine_project_id = format!("{LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX}-1");
+        assert_eq!(migrated.0, None);
+        assert_eq!(migrated.1, "legacy-qa:legacy-answer");
+        assert_eq!(migrated.2, "legacy-provider");
+        assert_eq!(migrated.3, "Preserve question");
+        assert_eq!(migrated.4, "Preserve answer");
+        assert_eq!(migrated.5.as_deref(), Some("2024-01-02"));
+        assert_eq!(migrated.6, r#"{"keywords":["breach"]}"#);
+        assert_eq!(migrated.7, r#"["source-1"]"#);
         assert_eq!(
-            migrated.0, quarantine_project_id,
-            "the pre-existing base ID must never receive unowned records"
-        );
-        assert_eq!(migrated.1, "legacy-provider");
-        assert_eq!(migrated.2, "Preserve question");
-        assert_eq!(migrated.3, "Preserve answer");
-        assert_eq!(migrated.4.as_deref(), Some("2024-01-02"));
-        assert_eq!(migrated.5, r#"{"keywords":["breach"]}"#);
-        assert_eq!(migrated.6, r#"["source-1"]"#);
-        assert_eq!(
-            migrated.7,
+            migrated.8,
             r#"[{"rawMarker":"[SRC:source-1]","sourceId":"source-1","status":"valid","reason":null,"source":null}]"#
         );
-        assert_eq!(migrated.8, "[]");
-        assert_eq!(migrated.9, 0);
-        assert_eq!(migrated.10, "2026-07-13 10:00:00");
+        assert_eq!(migrated.9, "[]");
+        assert_eq!(migrated.10, 0);
+        assert_eq!(migrated.11, "2026-07-13 10:00:00");
 
-        let quarantine = connection
-            .query_row(
-                "SELECT title, status, summary FROM projects WHERE project_id = ?1",
-                [&quarantine_project_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .expect("quarantine project is visible and recoverable");
-        assert_eq!(quarantine.0, LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE);
-        assert_eq!(quarantine.1, "archived");
-        assert_eq!(quarantine.2, LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY);
         let project_id_not_null: i64 = connection
             .query_row(
                 "SELECT \"notnull\" FROM pragma_table_info('legal_answer_records')
@@ -4615,27 +7993,31 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("canonical project ownership constraint reads");
-        assert_eq!(project_id_not_null, 1);
+        assert_eq!(project_id_not_null, 0);
+        let conversation = get_conversation(&connection, "legacy-qa:legacy-answer")
+            .expect("conversation reads")
+            .expect("conversation exists");
+        assert_eq!(conversation.project_id, None);
+        assert_eq!(conversation.title, "Preserve question");
+        let messages =
+            list_messages(&connection, "legacy-qa:legacy-answer").expect("legacy messages read");
+        assert_eq!(messages.len(), 2);
         assert_eq!(
-            list_legal_answer_records_for_project(&connection, &quarantine_project_id, 10)
-                .expect("quarantined history is readable")
-                .len(),
-            1
+            (messages[0].role.as_str(), messages[0].text_summary.as_str()),
+            ("user", "Preserve question")
+        );
+        assert_eq!(
+            (messages[1].role.as_str(), messages[1].text_summary.as_str()),
+            ("assistant", "Preserve answer")
         );
         assert!(
             case_project_exists(&connection, LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX)
                 .expect("colliding user project remains")
         );
-        assert!(delete_case_project(&connection, &quarantine_project_id)
-            .expect("quarantine project deletes"));
         assert_eq!(
             table_row_count(&connection, "legal_answer_records"),
-            0,
-            "deleting the quarantine project removes every legacy sensitive answer"
-        );
-        assert!(
-            case_project_exists(&connection, LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX)
-                .expect("colliding user project still remains after quarantine deletion")
+            1,
+            "case-free history survives without manufacturing a project"
         );
     }
 
@@ -6716,7 +10098,17 @@ mod tests {
         );
         assert_eq!(
             list_legal_answer_records(&connection, 10)
-                .expect("other project's answer remains")
+                .expect("conversation history survives project deletion")
+                .len(),
+            2
+        );
+        let detached = get_conversation(&connection, "qa:answer-1")
+            .expect("conversation reads")
+            .expect("conversation survives");
+        assert_eq!(detached.project_id, None);
+        assert_eq!(
+            list_legal_answer_records_for_conversation(&connection, "qa:answer-1", 10)
+                .expect("detached answer remains in its conversation")
                 .len(),
             1
         );
@@ -6964,6 +10356,1777 @@ mod tests {
                 [],
             )
             .expect_err("canonical project CHECK is present after rebuild");
+    }
+
+    #[test]
+    fn v10_schema_exposes_exact_assistant_and_operation_audit_objects() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let connection = open_user_database(&database_path).expect("database opens");
+        for table in [
+            "conversations",
+            "artifacts",
+            "artifact_versions",
+            "messages",
+            "attachments",
+            "message_attachments",
+            "conversation_sources",
+            "agent_runs",
+            "tool_calls",
+            "case_change_proposals",
+            "operation_audit",
+        ] {
+            assert_eq!(
+                sqlite_master_count(&connection, table),
+                1,
+                "v10 table {table} must exist exactly once"
+            );
+        }
+        for index in [
+            "idx_conversations_updated",
+            "idx_conversations_project_updated",
+            "idx_artifacts_conversation_updated",
+            "idx_artifacts_project_updated",
+            "idx_artifact_versions_created",
+            "idx_attachments_project_created",
+            "idx_messages_conversation_created",
+            "idx_messages_run",
+            "idx_message_attachments_attachment",
+            "idx_conversation_sources_source",
+            "idx_agent_runs_conversation_created",
+            "idx_agent_runs_status",
+            "idx_tool_calls_status",
+            "idx_case_change_proposals_conversation_created",
+            "idx_case_change_proposals_project_status",
+            "idx_operation_audit_idempotency",
+            "idx_operation_audit_project_created",
+            "idx_legal_answer_records_conversation_created",
+        ] {
+            assert_eq!(
+                sqlite_master_count(&connection, index),
+                1,
+                "v10 index {index} must exist exactly once"
+            );
+        }
+        for trigger in [
+            "trg_projects_detach_assistant_data_before_delete",
+            "trg_artifacts_scope_insert",
+            "trg_artifacts_scope_update",
+            "trg_messages_artifact_run_scope_insert",
+            "trg_messages_artifact_run_scope_update",
+            "trg_agent_runs_message_scope_insert",
+            "trg_agent_runs_message_scope_update",
+            "trg_case_change_proposals_scope_insert",
+            "trg_case_change_proposals_scope_update",
+            "trg_legal_answer_records_scope_insert",
+            "trg_legal_answer_records_scope_update",
+        ] {
+            assert_eq!(
+                sqlite_master_count(&connection, trigger),
+                1,
+                "v10 trigger {trigger} must exist exactly once"
+            );
+        }
+
+        let nullable_answer_columns = connection
+            .prepare(
+                "SELECT name, \"notnull\" FROM pragma_table_info('legal_answer_records')
+                 WHERE name IN ('project_id', 'conversation_id') ORDER BY name",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("legal answer nullability reads");
+        assert_eq!(
+            nullable_answer_columns,
+            vec![
+                ("conversation_id".to_owned(), 0),
+                ("project_id".to_owned(), 0)
+            ]
+        );
+
+        let conversation_fks = table_foreign_key_contracts(&connection, "conversations")
+            .expect("conversation foreign keys read");
+        assert!(conversation_fks.iter().any(|contract| {
+            contract.target_table == "projects"
+                && contract.on_delete == "SET NULL"
+                && contract.columns == vec![(0, "project_id".to_owned(), "project_id".to_owned())]
+        }));
+        let proposal_fks = table_foreign_key_contracts(&connection, "case_change_proposals")
+            .expect("proposal foreign keys read");
+        assert!(proposal_fks.iter().any(|contract| {
+            contract.target_table == "projects" && contract.on_delete == "CASCADE"
+        }));
+        assert!(proposal_fks.iter().any(|contract| {
+            contract.target_table == "conversations" && contract.on_delete == "CASCADE"
+        }));
+        let audit_fks = table_foreign_key_contracts(&connection, "operation_audit")
+            .expect("operation audit foreign keys read");
+        assert!(audit_fks.iter().any(|contract| {
+            contract.target_table == "projects" && contract.on_delete == "SET NULL"
+        }));
+        validate_user_database_read_only(&database_path).expect("v10 schema is canonical");
+    }
+
+    #[test]
+    fn operation_audit_is_idempotent_cas_bounded_and_project_scoped() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let connection = open_user_database(&database_path).expect("database opens");
+        connection
+            .execute(
+                "INSERT INTO projects (project_id, title, status)
+                 VALUES ('audit-project', 'Audit project', 'active')",
+                [],
+            )
+            .expect("project is seeded");
+
+        let prepared = create_operation_audit(
+            &connection,
+            &NewOperationAuditRow {
+                audit_id: "audit-1".to_owned(),
+                origin: "mcp".to_owned(),
+                operation: "case_apply_patch".to_owned(),
+                project_id: Some("audit-project".to_owned()),
+                request_hash: "a".repeat(64),
+                idempotency_key_hash: Some("b".repeat(64)),
+                details_json: r#"{"proposalHash":"redacted-hash-only"}"#.to_owned(),
+            },
+        )
+        .expect("prepared audit is created");
+        assert_eq!(prepared.status, "prepared");
+        assert!(prepared.finished_at.is_none());
+
+        let by_key = get_operation_audit_by_idempotency_key_hash(
+            &connection,
+            "mcp",
+            "case_apply_patch",
+            &"b".repeat(64),
+        )
+        .expect("idempotency lookup succeeds")
+        .expect("audit exists");
+        assert_eq!(by_key.audit_id, prepared.audit_id);
+
+        let finished = compare_and_set_operation_audit_status(
+            &connection,
+            "audit-1",
+            "succeeded",
+            r#"{"newRevision":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}"#,
+        )
+        .expect("audit status update succeeds");
+        assert!(matches!(
+            finished,
+            OperationAuditStatusUpdateResult::Updated(OperationAuditRow {
+                ref status,
+                finished_at: Some(_),
+                ..
+            }) if status == "succeeded"
+        ));
+
+        assert!(matches!(
+            compare_and_set_operation_audit_status(
+                &connection,
+                "audit-1",
+                "failed",
+                r#"{"code":"late"}"#,
+            )
+            .expect("second status update returns conflict"),
+            OperationAuditStatusUpdateResult::Conflict(_)
+        ));
+
+        let duplicate = create_operation_audit(
+            &connection,
+            &NewOperationAuditRow {
+                audit_id: "audit-2".to_owned(),
+                origin: "mcp".to_owned(),
+                operation: "case_apply_patch".to_owned(),
+                project_id: Some("audit-project".to_owned()),
+                request_hash: "d".repeat(64),
+                idempotency_key_hash: Some("b".repeat(64)),
+                details_json: "{}".to_owned(),
+            },
+        );
+        assert!(
+            duplicate.is_err(),
+            "idempotency key must be unique per operation"
+        );
+
+        connection
+            .execute(
+                "DELETE FROM projects WHERE project_id = 'audit-project'",
+                [],
+            )
+            .expect("project deletion succeeds");
+        let detached = get_operation_audit(&connection, "audit-1")
+            .expect("audit reload succeeds")
+            .expect("audit remains after project deletion");
+        assert!(detached.project_id.is_none());
+    }
+
+    #[test]
+    fn v8_answers_migrate_with_exact_fields_real_binding_and_precise_quarantine_cleanup() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("current database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            seed_project(&connection, "real-v8-project");
+            seed_project(&connection, LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX);
+            connection
+                .execute(
+                    "UPDATE projects SET title = 'User-owned reserved-looking project'
+                     WHERE project_id = ?1",
+                    [LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX],
+                )
+                .expect("collision fixture updates");
+            for project_id in [
+                "migration-unassigned-legal-answers-1",
+                "migration-unassigned-legal-answers-2",
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO projects (
+                             project_id, title, case_type, status, opened_on, summary
+                         ) VALUES (?1, ?2, 'migration_quarantine', 'archived', NULL, ?3)",
+                        params![
+                            project_id,
+                            LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE,
+                            LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
+                        ],
+                    )
+                    .expect("precise quarantine fixture inserts");
+            }
+            connection
+                .execute(
+                    "INSERT INTO case_files (
+                         file_id, project_id, title, file_type, storage_reference, summary
+                     ) VALUES ('quarantine-child', ?1, 'Preserved child', '', '', '')",
+                    ["migration-unassigned-legal-answers-2"],
+                )
+                .expect("other business child inserts");
+
+            for (record_id, project_id, question, answer, query_json) in [
+                (
+                    "v8-real-answer",
+                    "real-v8-project",
+                    "Real project question",
+                    "Real project answer",
+                    r#"{"keywords":["real"]}"#,
+                ),
+                (
+                    "v8-quarantine-delete",
+                    "migration-unassigned-legal-answers-1",
+                    "Detached question one",
+                    "",
+                    r#"{"keywords":["one"]}"#,
+                ),
+                (
+                    "v8-quarantine-keep",
+                    "migration-unassigned-legal-answers-2",
+                    "Detached question two",
+                    "Detached answer two",
+                    r#"{"keywords":["two"]}"#,
+                ),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO legal_answer_records (
+                             record_id, project_id, conversation_id, provider_id,
+                             provider_snapshot_json, question, answer_text, case_date,
+                             query_json, source_ids_json, verified_citations_json,
+                             invalid_citations_json, unsupported_legal_conclusion, created_at
+                         ) VALUES (
+                             ?1, ?2, NULL, 'legacy-provider', '{}', ?3, ?4, '2024-02-03',
+                             ?5, '[\"source-a\"]', '[{\"sourceId\":\"source-a\"}]',
+                             '[]', 0, '2026-07-15 12:34:56'
+                         )",
+                        params![record_id, project_id, question, answer, query_json],
+                    )
+                    .expect("legacy answer fixture inserts");
+            }
+            connection
+                .execute_batch(
+                    "UPDATE user_database_metadata SET value = '8'
+                       WHERE key = 'schema_version';
+                     UPDATE user_database_metadata
+                       SET value = 'v8-fact-issue-links-20260716'
+                       WHERE key = 'canonical_schema_version';",
+                )
+                .expect("fixture is marked v8");
+        }
+
+        ensure_user_database(directory.path()).expect("v8 database migrates to v9");
+        let connection = open_user_database(&database_path).expect("migrated database opens");
+        assert_eq!(table_row_count(&connection, "legal_answer_records"), 3);
+
+        let real = connection
+            .query_row(
+                "SELECT project_id, conversation_id, provider_id, question, answer_text,
+                        case_date, query_json, source_ids_json, verified_citations_json,
+                        invalid_citations_json, unsupported_legal_conclusion, created_at
+                 FROM legal_answer_records WHERE record_id = 'v8-real-answer'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, String>(11)?,
+                    ))
+                },
+            )
+            .expect("real answer reads");
+        assert_eq!(real.0.as_deref(), Some("real-v8-project"));
+        assert_eq!(real.1, "legacy-qa:v8-real-answer");
+        assert_eq!(real.2, "legacy-provider");
+        assert_eq!(real.3, "Real project question");
+        assert_eq!(real.4, "Real project answer");
+        assert_eq!(real.5.as_deref(), Some("2024-02-03"));
+        assert_eq!(real.6, r#"{"keywords":["real"]}"#);
+        assert_eq!(real.7, r#"["source-a"]"#);
+        assert_eq!(real.8, r#"[{"sourceId":"source-a"}]"#);
+        assert_eq!(real.9, "[]");
+        assert_eq!(real.10, 0);
+        assert_eq!(real.11, "2026-07-15 12:34:56");
+        assert_eq!(
+            get_conversation(&connection, "legacy-qa:v8-real-answer")
+                .expect("real conversation reads")
+                .expect("real conversation exists")
+                .project_id
+                .as_deref(),
+            Some("real-v8-project")
+        );
+
+        for record_id in ["v8-quarantine-delete", "v8-quarantine-keep"] {
+            let (project_id, conversation_id): (Option<String>, String) = connection
+                .query_row(
+                    "SELECT project_id, conversation_id FROM legal_answer_records
+                     WHERE record_id = ?1",
+                    [record_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("detached answer reads");
+            assert_eq!(project_id, None);
+            assert_eq!(conversation_id, format!("legacy-qa:{record_id}"));
+            assert_eq!(
+                get_conversation(&connection, &conversation_id)
+                    .expect("detached conversation reads")
+                    .expect("detached conversation exists")
+                    .project_id,
+                None
+            );
+            assert_eq!(
+                list_messages(&connection, &conversation_id)
+                    .expect("deterministic messages read")
+                    .len(),
+                2
+            );
+        }
+        assert!(
+            !case_project_exists(&connection, "migration-unassigned-legal-answers-1")
+                .expect("empty precise quarantine is removed")
+        );
+        assert!(
+            case_project_exists(&connection, "migration-unassigned-legal-answers-2")
+                .expect("quarantine with another child is retained")
+        );
+        assert!(
+            case_project_exists(&connection, LEGACY_ANSWER_QUARANTINE_PROJECT_ID_PREFIX)
+                .expect("user-owned reserved-looking project remains")
+        );
+        validate_user_database_read_only(&database_path).expect("migrated v9 is canonical");
+    }
+
+    #[test]
+    fn ambiguous_quarantine_metadata_aborts_v8_rebuild_atomically() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("current database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            connection
+                .execute(
+                    "INSERT INTO projects (
+                         project_id, title, case_type, status, opened_on, summary
+                     ) VALUES (?1, ?2, 'migration_quarantine', 'archived', NULL, 'modified')",
+                    params![
+                        "migration-unassigned-legal-answers-3",
+                        LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE
+                    ],
+                )
+                .expect("ambiguous project inserts");
+            connection
+                .execute_batch(
+                    "UPDATE user_database_metadata SET value = '8'
+                       WHERE key = 'schema_version';
+                     UPDATE user_database_metadata
+                       SET value = 'v8-fact-issue-links-20260716'
+                       WHERE key = 'canonical_schema_version';",
+                )
+                .expect("fixture is marked v8");
+        }
+
+        let error = validate_and_migrate_user_database(&database_path)
+            .expect_err("ambiguous quarantine must fail closed");
+        assert!(error.to_string().contains("ambiguous metadata"));
+        let connection = open_user_database(&database_path).expect("rolled-back database opens");
+        let (version, marker): (String, String) = connection
+            .query_row(
+                "SELECT
+                     (SELECT value FROM user_database_metadata WHERE key = 'schema_version'),
+                     (SELECT value FROM user_database_metadata
+                      WHERE key = 'canonical_schema_version')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("metadata reads");
+        assert_eq!(version, "8");
+        assert_eq!(marker, "v8-fact-issue-links-20260716");
+        let summary: String = connection
+            .query_row(
+                "SELECT summary FROM projects
+                 WHERE project_id = 'migration-unassigned-legal-answers-3'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("ambiguous project survives rollback");
+        assert_eq!(summary, "modified");
+        assert_eq!(
+            sqlite_master_count(&connection, "__lawyer_assistance_v6_legacy_conversations"),
+            0
+        );
+    }
+
+    #[test]
+    fn case_free_conversation_message_attachment_and_set_null_lifecycle_work() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        let conversation = create_conversation(
+            &connection,
+            "conversation-free",
+            None,
+            "Independent research",
+        )
+        .expect("case-free conversation creates");
+        assert_eq!(conversation.project_id, None);
+        let message = create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "message-free".to_owned(),
+                conversation_id: conversation.conversation_id.clone(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "Please inspect the attachment".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("message creates");
+        let attachment = NewAttachmentRow {
+            attachment_id: "attachment-one".to_owned(),
+            project_id: None,
+            original_name: "note.txt".to_owned(),
+            extension: "txt".to_owned(),
+            detected_mime: "text/plain".to_owned(),
+            sha256: "1".repeat(64),
+            size_bytes: 3,
+            content_blob: b"abc".to_vec(),
+            extraction_status: "pending".to_owned(),
+            extracted_text: None,
+            segments_json: "[]".to_owned(),
+            error_code: None,
+        };
+        assert!(matches!(
+            insert_attachment(&connection, &attachment).expect("attachment inserts"),
+            AttachmentInsertResult::Inserted(_)
+        ));
+        let mut duplicate = attachment.clone();
+        duplicate.attachment_id = "attachment-duplicate".to_owned();
+        assert!(matches!(
+            insert_attachment(&connection, &duplicate).expect("duplicate resolves"),
+            AttachmentInsertResult::Existing(AttachmentRow { attachment_id, .. })
+                if attachment_id == "attachment-one"
+        ));
+        assert!(update_attachment_extraction(
+            &connection,
+            "attachment-one",
+            "pending",
+            "succeeded",
+            Some("abc"),
+            r#"[{"locator":"line:1","text":"abc"}]"#,
+            None,
+        )
+        .expect("extraction CAS updates"));
+        attach_to_message(&connection, &message.message_id, "attachment-one", 0)
+            .expect("attachment links");
+        assert_eq!(
+            list_attachments_for_message(&connection, &message.message_id)
+                .expect("linked attachments read")
+                .len(),
+            1
+        );
+        assert_eq!(
+            delete_attachment(&mut connection, "attachment-one").expect("delete checks references"),
+            AttachmentDeleteResult::InUse
+        );
+
+        seed_project(&connection, "conversation-project");
+        assert!(bind_conversation_to_case(
+            &connection,
+            "conversation-free",
+            "conversation-project"
+        )
+        .expect("conversation binds"));
+        assert!(delete_case_project(&connection, "conversation-project")
+            .expect("bound project deletes"));
+        assert_eq!(
+            get_conversation(&connection, "conversation-free")
+                .expect("conversation reads")
+                .expect("conversation survives project deletion")
+                .project_id,
+            None
+        );
+        assert!(
+            archive_conversation(&connection, "conversation-free").expect("conversation archives")
+        );
+        assert!(
+            !bind_conversation_to_case(&connection, "conversation-free", "missing-project")
+                .expect("archived conversation cannot bind")
+        );
+        validate_user_database_read_only(&database_path).expect("database remains canonical");
+    }
+
+    #[test]
+    fn artifact_creation_joins_an_outer_transaction_and_rolls_back_with_it() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        create_conversation(
+            &connection,
+            "artifact-transaction-conversation",
+            None,
+            "Atomic artifact",
+        )
+        .expect("conversation creates");
+
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("outer transaction starts");
+        let artifact = create_artifact(
+            &transaction,
+            &NewArtifactRow {
+                artifact_id: "artifact-transactional".to_owned(),
+                conversation_id: Some("artifact-transaction-conversation".to_owned()),
+                project_id: None,
+                kind: "research".to_owned(),
+                title: "Transactional artifact".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &NewArtifactVersionRow {
+                version_id: "artifact-transactional-v1".to_owned(),
+                artifact_id: "artifact-transactional".to_owned(),
+                content_json: r#"{"schemaVersion":1}"#.to_owned(),
+                rendered_text: "transactional".to_owned(),
+                source_refs_json: "[]".to_owned(),
+                citation_report_json: "{}".to_owned(),
+                provider_snapshot_json: "{}".to_owned(),
+            },
+        )
+        .expect("artifact joins the caller transaction");
+        assert_eq!(artifact.current_version, 1);
+        assert!(get_artifact(&transaction, "artifact-transactional")
+            .expect("artifact reads inside transaction")
+            .is_some());
+        transaction
+            .rollback()
+            .expect("outer transaction rolls back");
+
+        assert!(get_artifact(&connection, "artifact-transactional")
+            .expect("artifact reads after rollback")
+            .is_none());
+        assert!(
+            list_artifact_versions(&connection, "artifact-transactional")
+                .expect("artifact versions read after rollback")
+                .is_empty()
+        );
+
+        create_artifact(
+            &connection,
+            &NewArtifactRow {
+                artifact_id: "artifact-version-transactional".to_owned(),
+                conversation_id: Some("artifact-transaction-conversation".to_owned()),
+                project_id: None,
+                kind: "research".to_owned(),
+                title: "Transactional version".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &NewArtifactVersionRow {
+                version_id: "artifact-version-transactional-v1".to_owned(),
+                artifact_id: "artifact-version-transactional".to_owned(),
+                content_json: r#"{"schemaVersion":1}"#.to_owned(),
+                rendered_text: "v1".to_owned(),
+                source_refs_json: "[]".to_owned(),
+                citation_report_json: "{}".to_owned(),
+                provider_snapshot_json: "{}".to_owned(),
+            },
+        )
+        .expect("base artifact creates");
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("outer version transaction starts");
+        assert!(matches!(
+            create_artifact_version(
+                &transaction,
+                &NewArtifactVersionRow {
+                    version_id: "artifact-version-transactional-v2".to_owned(),
+                    artifact_id: "artifact-version-transactional".to_owned(),
+                    content_json: r#"{"schemaVersion":1}"#.to_owned(),
+                    rendered_text: "v2".to_owned(),
+                    source_refs_json: "[]".to_owned(),
+                    citation_report_json: "{}".to_owned(),
+                    provider_snapshot_json: "{}".to_owned(),
+                },
+                1,
+            )
+            .expect("version joins outer transaction"),
+            ArtifactVersionCreateResult::Created(_)
+        ));
+        transaction
+            .rollback()
+            .expect("outer version transaction rolls back");
+        assert_eq!(
+            get_artifact(&connection, "artifact-version-transactional")
+                .expect("artifact reads")
+                .expect("artifact remains")
+                .current_version,
+            1
+        );
+        assert_eq!(
+            list_artifact_versions(&connection, "artifact-version-transactional")
+                .expect("versions read")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn artifact_versions_are_append_only_cas_and_survive_canonical_rebuild() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            create_conversation(&connection, "artifact-conversation", None, "Artifact work")
+                .expect("conversation creates");
+            let artifact = create_artifact(
+                &connection,
+                &NewArtifactRow {
+                    artifact_id: "artifact-one".to_owned(),
+                    conversation_id: Some("artifact-conversation".to_owned()),
+                    project_id: None,
+                    kind: "document".to_owned(),
+                    title: "Draft document".to_owned(),
+                    status: "draft".to_owned(),
+                },
+                &NewArtifactVersionRow {
+                    version_id: "artifact-version-one".to_owned(),
+                    artifact_id: "artifact-one".to_owned(),
+                    content_json: r#"{"schemaVersion":1,"body":"one"}"#.to_owned(),
+                    rendered_text: "version one".to_owned(),
+                    source_refs_json: "[]".to_owned(),
+                    citation_report_json: "{}".to_owned(),
+                    provider_snapshot_json: "{}".to_owned(),
+                },
+            )
+            .expect("artifact and version one create atomically");
+            assert_eq!(artifact.current_version, 1);
+            let second = NewArtifactVersionRow {
+                version_id: "artifact-version-two".to_owned(),
+                artifact_id: "artifact-one".to_owned(),
+                content_json: r#"{"schemaVersion":1,"body":"two"}"#.to_owned(),
+                rendered_text: "version two".to_owned(),
+                source_refs_json: "[]".to_owned(),
+                citation_report_json: "{}".to_owned(),
+                provider_snapshot_json: "{}".to_owned(),
+            };
+            assert!(matches!(
+                create_artifact_version(&connection, &second, 1).expect("second version appends"),
+                ArtifactVersionCreateResult::Created(ArtifactVersionRow {
+                    version_number: 2,
+                    ..
+                })
+            ));
+            let stale = NewArtifactVersionRow {
+                version_id: "artifact-version-stale".to_owned(),
+                ..second.clone()
+            };
+            assert_eq!(
+                create_artifact_version(&connection, &stale, 1).expect("stale CAS is reported"),
+                ArtifactVersionCreateResult::Conflict
+            );
+            assert_eq!(
+                list_artifact_versions(&connection, "artifact-one")
+                    .unwrap()
+                    .len(),
+                2
+            );
+            connection
+                .execute(
+                    "UPDATE user_database_metadata SET value = 'precanonical-v9'
+                     WHERE key = 'canonical_schema_version'",
+                    [],
+                )
+                .expect("marker is made stale");
+        }
+
+        ensure_user_database(directory.path()).expect("canonical v9 rebuild succeeds");
+        let connection = open_user_database(&database_path).expect("rebuilt database opens");
+        assert_eq!(
+            get_artifact(&connection, "artifact-one")
+                .expect("artifact reads")
+                .expect("artifact survives")
+                .current_version,
+            2
+        );
+        assert_eq!(
+            list_artifact_versions(&connection, "artifact-one")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            sqlite_master_count(&connection, "__lawyer_assistance_v6_legacy_artifacts"),
+            0
+        );
+        validate_user_database_read_only(&database_path).expect("rebuilt database is canonical");
+    }
+
+    #[test]
+    fn run_tool_and_proposal_statuses_use_cas_and_support_transaction_rollback() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "proposal-project");
+        seed_project(&connection, "other-project");
+        create_conversation(
+            &connection,
+            "proposal-conversation",
+            Some("proposal-project"),
+            "Case analysis",
+        )
+        .expect("conversation creates");
+        create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "proposal-user-message".to_owned(),
+                conversation_id: "proposal-conversation".to_owned(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "Analyze this case".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("user message creates");
+        create_agent_run(
+            &connection,
+            &NewAgentRunRow {
+                run_id: "agent-run-one".to_owned(),
+                conversation_id: "proposal-conversation".to_owned(),
+                user_message_id: "proposal-user-message".to_owned(),
+                provider_id: None,
+                provider_snapshot_json: "{}".to_owned(),
+                intent: "case_analysis".to_owned(),
+                status: "queued".to_owned(),
+                budget_json: r#"{"maxToolCalls":8}"#.to_owned(),
+            },
+        )
+        .expect("agent run creates");
+        create_tool_call(
+            &connection,
+            &NewToolCallRow {
+                tool_call_id: "tool-call-one".to_owned(),
+                run_id: "agent-run-one".to_owned(),
+                ordinal: 0,
+                capability_name: "case.read".to_owned(),
+                status: "queued".to_owned(),
+                access_mode: "read".to_owned(),
+                requires_confirmation: false,
+                input_audit_json: r#"{"projectId":"proposal-project"}"#.to_owned(),
+                output_audit_json: "{}".to_owned(),
+                source_audit_json: "[]".to_owned(),
+            },
+        )
+        .expect("tool call creates");
+        assert!(matches!(
+            compare_and_set_agent_run_status(
+                &connection,
+                "agent-run-one",
+                "queued",
+                "running",
+                None,
+                None,
+            )
+            .expect("run starts"),
+            AgentRunStatusUpdateResult::Updated(AgentRunRow { status, .. }) if status == "running"
+        ));
+        assert!(matches!(
+            compare_and_set_tool_call_status(
+                &connection,
+                "tool-call-one",
+                "queued",
+                "running",
+                "{}",
+                "[]",
+                None,
+            )
+            .expect("tool starts"),
+            ToolCallStatusUpdateResult::Updated(ToolCallRow { status, .. }) if status == "running"
+        ));
+        assert!(matches!(
+            compare_and_set_tool_call_status(
+                &connection,
+                "tool-call-one",
+                "running",
+                "succeeded",
+                r#"{"entityCount":1}"#,
+                "[]",
+                None,
+            )
+            .expect("tool succeeds"),
+            ToolCallStatusUpdateResult::Updated(ToolCallRow {
+                finished_at: Some(_),
+                ..
+            })
+        ));
+        create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "proposal-assistant-message".to_owned(),
+                conversation_id: "proposal-conversation".to_owned(),
+                role: "assistant".to_owned(),
+                kind: "proposal_ref".to_owned(),
+                text_summary: "A pending proposal is ready".to_owned(),
+                artifact_id: None,
+                run_id: Some("agent-run-one".to_owned()),
+            },
+        )
+        .expect("assistant message creates");
+        assert!(matches!(
+            compare_and_set_agent_run_status(
+                &connection,
+                "agent-run-one",
+                "running",
+                "succeeded",
+                Some("proposal-assistant-message"),
+                None,
+            )
+            .expect("run succeeds"),
+            AgentRunStatusUpdateResult::Updated(AgentRunRow {
+                finished_at: Some(_),
+                ..
+            })
+        ));
+
+        let digest = "a".repeat(64);
+        create_case_change_proposal(
+            &connection,
+            &NewCaseChangeProposalRow {
+                proposal_id: "proposal-one".to_owned(),
+                conversation_id: "proposal-conversation".to_owned(),
+                project_id: "proposal-project".to_owned(),
+                run_id: Some("agent-run-one".to_owned()),
+                base_case_digest: digest.clone(),
+                changes_json: r#"{"facts":[]}"#.to_owned(),
+                source_refs_json: "[]".to_owned(),
+            },
+        )
+        .expect("pending proposal creates");
+        assert_eq!(table_row_count(&connection, "case_facts"), 0);
+        let cross_project = create_case_change_proposal(
+            &connection,
+            &NewCaseChangeProposalRow {
+                proposal_id: "proposal-cross-project".to_owned(),
+                conversation_id: "proposal-conversation".to_owned(),
+                project_id: "other-project".to_owned(),
+                run_id: None,
+                base_case_digest: digest.clone(),
+                changes_json: "{}".to_owned(),
+                source_refs_json: "[]".to_owned(),
+            },
+        )
+        .expect_err("cross-project proposal is rejected");
+        assert!(cross_project
+            .to_string()
+            .contains("case proposal must match"));
+
+        {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("apply transaction starts");
+            assert!(matches!(
+                compare_and_set_case_change_proposal_status(
+                    &transaction,
+                    "proposal-one",
+                    "proposal-project",
+                    &digest,
+                    "applied",
+                )
+                .expect("proposal is claimed inside transaction"),
+                CaseChangeProposalStatusUpdateResult::Updated(_)
+            ));
+            transaction
+                .rollback()
+                .expect("simulated apply failure rolls back");
+        }
+        assert_eq!(
+            get_case_change_proposal(&connection, "proposal-one")
+                .expect("proposal reads")
+                .expect("proposal remains")
+                .status,
+            "pending"
+        );
+        assert!(matches!(
+            compare_and_set_case_change_proposal_status(
+                &connection,
+                "proposal-one",
+                "proposal-project",
+                &digest,
+                "applied",
+            )
+            .expect("proposal applies"),
+            CaseChangeProposalStatusUpdateResult::Updated(CaseChangeProposalRow {
+                status,
+                applied_at: Some(_),
+                ..
+            }) if status == "applied"
+        ));
+        assert!(matches!(
+            compare_and_set_case_change_proposal_status(
+                &connection,
+                "proposal-one",
+                "proposal-project",
+                &digest,
+                "rejected",
+            )
+            .expect("repeat decision conflicts"),
+            CaseChangeProposalStatusUpdateResult::Conflict(_)
+        ));
+        assert_eq!(table_row_count(&connection, "case_facts"), 0);
+        validate_user_database_read_only(&database_path).expect("lifecycle database is canonical");
+    }
+
+    #[test]
+    fn answer_and_message_scope_triggers_reject_cross_conversation_ownership() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "scope-project-a");
+        seed_project(&connection, "scope-project-b");
+        create_conversation(
+            &connection,
+            "scope-conversation-a",
+            Some("scope-project-a"),
+            "Scope A",
+        )
+        .expect("bound conversation creates");
+        create_conversation(
+            &connection,
+            "scope-conversation-b",
+            Some("scope-project-b"),
+            "Scope B",
+        )
+        .expect("other bound conversation creates");
+        create_conversation(&connection, "scope-conversation-free", None, "Scope free")
+            .expect("unbound conversation creates");
+
+        let legal_record = |record_id: &str, project_id: Option<&str>| LegalAnswerRecordRow {
+            record_id: record_id.to_owned(),
+            project_id: project_id.map(str::to_owned),
+            provider_id: "scope-provider".to_owned(),
+            provider_snapshot_json: provider_snapshot_json(),
+            question: "Scope question".to_owned(),
+            answer_text: "Scope answer".to_owned(),
+            case_date: None,
+            query_json: "{}".to_owned(),
+            source_ids_json: "[]".to_owned(),
+            verified_citations_json: "[]".to_owned(),
+            invalid_citations_json: "[]".to_owned(),
+            unsupported_legal_conclusion: false,
+            created_at: String::new(),
+        };
+        insert_legal_answer_record_for_conversation(
+            &connection,
+            &legal_record("answer-free-valid", None),
+            "scope-conversation-free",
+        )
+        .expect("unbound answer matches unbound conversation");
+        insert_legal_answer_record_for_conversation(
+            &connection,
+            &legal_record("answer-bound-valid", Some("scope-project-a")),
+            "scope-conversation-a",
+        )
+        .expect("bound answer matches bound conversation");
+        for (record_id, project_id, conversation_id) in [
+            ("answer-bound-null", None, "scope-conversation-a"),
+            (
+                "answer-free-project",
+                Some("scope-project-a"),
+                "scope-conversation-free",
+            ),
+            (
+                "answer-cross-project",
+                Some("scope-project-b"),
+                "scope-conversation-a",
+            ),
+        ] {
+            let error = insert_legal_answer_record_for_conversation(
+                &connection,
+                &legal_record(record_id, project_id),
+                conversation_id,
+            )
+            .expect_err("answer ownership mismatch is rejected");
+            assert!(error
+                .to_string()
+                .contains("legal answer project must match"));
+        }
+
+        for (conversation_id, message_id, run_id) in [
+            ("scope-conversation-a", "scope-user-a", "scope-run-a"),
+            ("scope-conversation-b", "scope-user-b", "scope-run-b"),
+        ] {
+            create_message(
+                &connection,
+                &NewMessageRow {
+                    message_id: message_id.to_owned(),
+                    conversation_id: conversation_id.to_owned(),
+                    role: "user".to_owned(),
+                    kind: "text".to_owned(),
+                    text_summary: "User message".to_owned(),
+                    artifact_id: None,
+                    run_id: None,
+                },
+            )
+            .expect("user message creates");
+            create_agent_run(
+                &connection,
+                &NewAgentRunRow {
+                    run_id: run_id.to_owned(),
+                    conversation_id: conversation_id.to_owned(),
+                    user_message_id: message_id.to_owned(),
+                    provider_id: None,
+                    provider_snapshot_json: "{}".to_owned(),
+                    intent: "file_analysis".to_owned(),
+                    status: "queued".to_owned(),
+                    budget_json: "{}".to_owned(),
+                },
+            )
+            .expect("run creates");
+        }
+        let insert_error = connection
+            .execute(
+                "INSERT INTO messages (
+                     message_id, conversation_id, role, kind, text_summary, run_id
+                 ) VALUES (
+                     'scope-cross-run-message', 'scope-conversation-a',
+                     'assistant', 'text', '', 'scope-run-b'
+                 )",
+                [],
+            )
+            .expect_err("cross-conversation run insert is rejected");
+        assert!(insert_error
+            .to_string()
+            .contains("message artifact and run must remain"));
+        let update_error = connection
+            .execute(
+                "UPDATE messages SET run_id = 'scope-run-b'
+                 WHERE message_id = 'scope-user-a'",
+                [],
+            )
+            .expect_err("cross-conversation run update is rejected");
+        assert!(update_error
+            .to_string()
+            .contains("message artifact and run must remain"));
+
+        assert!(delete_case_project(&connection, "scope-project-a")
+            .expect("project deletion succeeds with strict scope triggers"));
+        assert_eq!(
+            get_conversation(&connection, "scope-conversation-a")
+                .unwrap()
+                .unwrap()
+                .project_id,
+            None
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT project_id FROM legal_answer_records
+                     WHERE record_id = 'answer-bound-valid'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("detached answer reads"),
+            None
+        );
+        validate_user_database_read_only(&database_path).expect("scope database is canonical");
+    }
+
+    #[test]
+    fn artifact_project_scope_blocks_cross_case_bind_and_message_reference() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "artifact-project-a");
+        seed_project(&connection, "artifact-project-b");
+        create_conversation(
+            &connection,
+            "artifact-bound-a",
+            Some("artifact-project-a"),
+            "Bound A",
+        )
+        .expect("bound conversation creates");
+        create_conversation(&connection, "artifact-free-transfer", None, "Free transfer")
+            .expect("free conversation creates");
+
+        let initial_version = |version_id: &str, artifact_id: &str| NewArtifactVersionRow {
+            version_id: version_id.to_owned(),
+            artifact_id: artifact_id.to_owned(),
+            content_json: "{}".to_owned(),
+            rendered_text: String::new(),
+            source_refs_json: "[]".to_owned(),
+            citation_report_json: "{}".to_owned(),
+            provider_snapshot_json: "{}".to_owned(),
+        };
+        create_artifact(
+            &connection,
+            &NewArtifactRow {
+                artifact_id: "artifact-cross-create".to_owned(),
+                conversation_id: Some("artifact-bound-a".to_owned()),
+                project_id: Some("artifact-project-b".to_owned()),
+                kind: "research".to_owned(),
+                title: "Cross create".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &initial_version("artifact-cross-create-v1", "artifact-cross-create"),
+        )
+        .expect_err("cross-project artifact create is rejected");
+
+        create_artifact(
+            &connection,
+            &NewArtifactRow {
+                artifact_id: "artifact-transferred-b".to_owned(),
+                conversation_id: Some("artifact-free-transfer".to_owned()),
+                project_id: Some("artifact-project-b".to_owned()),
+                kind: "research".to_owned(),
+                title: "Transferred B".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &initial_version("artifact-transferred-b-v1", "artifact-transferred-b"),
+        )
+        .expect("unbound conversation may retain transferred artifact");
+        assert!(!bind_conversation_to_case(
+            &connection,
+            "artifact-free-transfer",
+            "artifact-project-a"
+        )
+        .expect("cross-case conversation bind is refused"));
+        assert!(bind_conversation_to_case(
+            &connection,
+            "artifact-free-transfer",
+            "artifact-project-b"
+        )
+        .expect("matching conversation bind succeeds"));
+
+        create_artifact(
+            &connection,
+            &NewArtifactRow {
+                artifact_id: "artifact-bound-unowned".to_owned(),
+                conversation_id: Some("artifact-bound-a".to_owned()),
+                project_id: None,
+                kind: "map".to_owned(),
+                title: "Bound unowned".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &initial_version("artifact-bound-unowned-v1", "artifact-bound-unowned"),
+        )
+        .expect("case-neutral artifact creates in bound conversation");
+        assert!(!bind_artifact_to_case(
+            &connection,
+            "artifact-bound-unowned",
+            "artifact-project-b"
+        )
+        .expect("cross-case artifact bind is refused"));
+        assert!(
+            bind_artifact_to_case(&connection, "artifact-bound-unowned", "artifact-project-a")
+                .expect("matching artifact bind succeeds")
+        );
+
+        create_artifact(
+            &connection,
+            &NewArtifactRow {
+                artifact_id: "artifact-independent-b".to_owned(),
+                conversation_id: None,
+                project_id: Some("artifact-project-b".to_owned()),
+                kind: "document".to_owned(),
+                title: "Independent B".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &initial_version("artifact-independent-b-v1", "artifact-independent-b"),
+        )
+        .expect("independent transferred artifact creates");
+        let reference_error = create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "artifact-cross-reference".to_owned(),
+                conversation_id: "artifact-bound-a".to_owned(),
+                role: "assistant".to_owned(),
+                kind: "artifact_ref".to_owned(),
+                text_summary: "Cross reference".to_owned(),
+                artifact_id: Some("artifact-independent-b".to_owned()),
+                run_id: None,
+            },
+        )
+        .expect_err("bound case cannot reference another case artifact");
+        assert!(reference_error
+            .to_string()
+            .contains("message artifact and run must remain"));
+        validate_user_database_read_only(&database_path).expect("artifact scope remains canonical");
+    }
+
+    #[test]
+    fn case_workspace_digest_is_stable_complete_and_transaction_aware() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "digest-project");
+        let party = |party_id: &str, name: &str, notes: &str| CasePartyRow {
+            party_id: party_id.to_owned(),
+            project_id: "digest-project".to_owned(),
+            name: name.to_owned(),
+            normalized_name: name.to_lowercase(),
+            role: "other".to_owned(),
+            contact: String::new(),
+            notes: notes.to_owned(),
+        };
+        upsert_case_party(&connection, &party("party-b", "Beta", ""))
+            .expect("party B inserts first");
+        upsert_case_party(&connection, &party("party-a", "Alpha", ""))
+            .expect("party A inserts second");
+        let first = case_workspace_digest(&connection, "digest-project")
+            .expect("digest computes")
+            .expect("project exists");
+        assert_eq!(first.len(), 64);
+
+        connection
+            .execute(
+                "DELETE FROM case_parties WHERE project_id = 'digest-project'",
+                [],
+            )
+            .expect("parties clear");
+        upsert_case_party(&connection, &party("party-a", "Alpha", ""))
+            .expect("party A reinserts first");
+        upsert_case_party(&connection, &party("party-b", "Beta", ""))
+            .expect("party B reinserts second");
+        let reordered = case_workspace_digest(&connection, "digest-project")
+            .expect("reordered digest computes")
+            .expect("project exists");
+        assert_eq!(
+            first, reordered,
+            "row insertion order must not affect digest"
+        );
+
+        upsert_case_party(&connection, &party("party-a", "Alpha", "changed"))
+            .expect("business field changes");
+        let changed = case_workspace_digest(&connection, "digest-project")
+            .expect("changed digest computes")
+            .expect("project exists");
+        assert_ne!(
+            first, changed,
+            "any covered business field must change digest"
+        );
+        assert_eq!(
+            case_workspace_digest(&connection, "missing-project").expect("missing lookup succeeds"),
+            None
+        );
+        assert_eq!(
+            get_case_workspace_rows_with_digest(&connection, "missing-project")
+                .expect("missing combined lookup succeeds"),
+            None
+        );
+
+        let before_artifact = case_workspace_digest(&connection, "digest-project")
+            .expect("pre-artifact digest computes")
+            .expect("project exists");
+        create_artifact(
+            &connection,
+            &NewArtifactRow {
+                artifact_id: "digest-artifact".to_owned(),
+                conversation_id: None,
+                project_id: Some("digest-project".to_owned()),
+                kind: "research".to_owned(),
+                title: "Digest artifact".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &NewArtifactVersionRow {
+                version_id: "digest-artifact-v1".to_owned(),
+                artifact_id: "digest-artifact".to_owned(),
+                content_json: "{}".to_owned(),
+                rendered_text: String::new(),
+                source_refs_json: "[]".to_owned(),
+                citation_report_json: "{}".to_owned(),
+                provider_snapshot_json: "{}".to_owned(),
+            },
+        )
+        .expect("project artifact creates");
+        let after_artifact = case_workspace_digest(&connection, "digest-project")
+            .expect("artifact digest computes")
+            .expect("project exists");
+        assert_ne!(before_artifact, after_artifact);
+        connection
+            .execute(
+                "UPDATE artifacts SET title = 'Changed artifact title'
+                 WHERE artifact_id = 'digest-artifact'",
+                [],
+            )
+            .expect("artifact title changes");
+        let after_artifact_title = case_workspace_digest(&connection, "digest-project")
+            .expect("artifact title digest computes")
+            .expect("project exists");
+        assert_ne!(after_artifact, after_artifact_title);
+
+        let (combined_workspace, combined_digest) =
+            get_case_workspace_rows_with_digest(&connection, "digest-project")
+                .expect("combined snapshot reads")
+                .expect("project exists");
+        assert_eq!(combined_workspace.project.project_id, "digest-project");
+        assert_eq!(
+            combined_digest,
+            case_workspace_digest(&connection, "digest-project")
+                .expect("standalone digest reads")
+                .expect("project exists")
+        );
+
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("outer proposal transaction starts");
+        let before = case_workspace_digest(&transaction, "digest-project")
+            .expect("digest works inside transaction")
+            .expect("project exists");
+        let (_, combined_before) =
+            get_case_workspace_rows_with_digest(&transaction, "digest-project")
+                .expect("combined snapshot works inside transaction")
+                .expect("project exists");
+        assert_eq!(before, combined_before);
+        upsert_case_fact(
+            &transaction,
+            &CaseFactRow {
+                fact_id: "digest-fact".to_owned(),
+                project_id: "digest-project".to_owned(),
+                occurred_on: None,
+                title: "Digest fact".to_owned(),
+                description: "Changed in transaction".to_owned(),
+                source: "test".to_owned(),
+                confirmation_status: "confirmed".to_owned(),
+            },
+        )
+        .expect("transactional fact inserts");
+        let after = case_workspace_digest(&transaction, "digest-project")
+            .expect("updated digest works inside transaction")
+            .expect("project exists");
+        assert_ne!(before, after);
+        let (combined_after_workspace, combined_after) =
+            get_case_workspace_rows_with_digest(&transaction, "digest-project")
+                .expect("updated combined snapshot works inside transaction")
+                .expect("project exists");
+        assert_eq!(after, combined_after);
+        assert!(combined_after_workspace
+            .facts
+            .iter()
+            .any(|fact| fact.fact_id == "digest-fact"));
+        transaction
+            .rollback()
+            .expect("fixture transaction rolls back");
+    }
+
+    #[test]
+    fn attachment_references_delete_guards_and_atomic_case_claims_are_canonical() {
+        assert_eq!(
+            attachment_storage_reference("bare-id"),
+            "attachment:bare-id"
+        );
+        assert_eq!(
+            attachment_storage_reference("attachment:canonical-id"),
+            "attachment:canonical-id"
+        );
+
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "claim-project-a");
+        seed_project(&connection, "claim-project-b");
+        create_conversation(
+            &connection,
+            "claim-conversation-a",
+            Some("claim-project-a"),
+            "Claim A",
+        )
+        .expect("conversation A creates");
+        create_conversation(
+            &connection,
+            "claim-conversation-b",
+            Some("claim-project-b"),
+            "Claim B",
+        )
+        .expect("conversation B creates");
+        create_conversation(&connection, "claim-conversation-free", None, "Claim free")
+            .expect("free conversation creates");
+
+        let insert_message =
+            |connection: &rusqlite::Connection, message_id: &str, conversation_id: &str| {
+                create_message(
+                    connection,
+                    &NewMessageRow {
+                        message_id: message_id.to_owned(),
+                        conversation_id: conversation_id.to_owned(),
+                        role: "user".to_owned(),
+                        kind: "text".to_owned(),
+                        text_summary: "claim fixture".to_owned(),
+                        artifact_id: None,
+                        run_id: None,
+                    },
+                )
+                .expect("message creates");
+            };
+        insert_message(&connection, "claim-message-a", "claim-conversation-a");
+        insert_message(&connection, "claim-message-b", "claim-conversation-b");
+        insert_message(&connection, "claim-message-free", "claim-conversation-free");
+
+        let insert_claim_attachment =
+            |connection: &rusqlite::Connection, attachment_id: &str, sha256: &str| {
+                insert_attachment(
+                    connection,
+                    &NewAttachmentRow {
+                        attachment_id: attachment_id.to_owned(),
+                        project_id: None,
+                        original_name: format!("{attachment_id}.txt"),
+                        extension: "txt".to_owned(),
+                        detected_mime: "text/plain".to_owned(),
+                        sha256: format!("{sha256:0<64}"),
+                        size_bytes: 1,
+                        content_blob: vec![1],
+                        extraction_status: "succeeded".to_owned(),
+                        extracted_text: Some("x".to_owned()),
+                        segments_json: "[]".to_owned(),
+                        error_code: None,
+                    },
+                )
+                .expect("attachment inserts");
+            };
+        insert_claim_attachment(&connection, "attachment:claim-a", "claim-sha-a");
+        attach_to_message(&connection, "claim-message-a", "attachment:claim-a", 0)
+            .expect("attachment links to A");
+        assert!(attachment_can_be_claimed_for_case(
+            &connection,
+            "attachment:claim-a",
+            "claim-project-a"
+        )
+        .expect("claim eligibility reads"));
+        assert!(
+            claim_attachment_for_case(&connection, "attachment:claim-a", "claim-project-a")
+                .expect("claim succeeds")
+        );
+        assert!(
+            !claim_attachment_for_case(&connection, "attachment:claim-a", "claim-project-a")
+                .expect("second NULL-to-project claim is refused")
+        );
+
+        insert_claim_attachment(&connection, "attachment:claim-cross", "claim-sha-cross");
+        attach_to_message(&connection, "claim-message-a", "attachment:claim-cross", 0)
+            .expect("cross attachment links to A");
+        attach_to_message(&connection, "claim-message-b", "attachment:claim-cross", 0)
+            .expect("cross attachment links to B");
+        assert!(!attachment_can_be_claimed_for_case(
+            &connection,
+            "attachment:claim-cross",
+            "claim-project-a"
+        )
+        .expect("cross-project eligibility reads"));
+        assert!(!claim_attachment_for_case(
+            &connection,
+            "attachment:claim-cross",
+            "claim-project-a"
+        )
+        .expect("cross-project claim is refused"));
+
+        insert_claim_attachment(&connection, "attachment:claim-free", "claim-sha-free");
+        attach_to_message(
+            &connection,
+            "claim-message-free",
+            "attachment:claim-free",
+            0,
+        )
+        .expect("free attachment links");
+        assert!(!attachment_can_be_claimed_for_case(
+            &connection,
+            "attachment:claim-free",
+            "claim-project-a"
+        )
+        .expect("unbound conversation eligibility reads"));
+
+        for (index, storage_reference) in [
+            "delete-reference-raw".to_owned(),
+            "attachment:delete-reference-canonical".to_owned(),
+            "attachment:attachment:delete-reference-double".to_owned(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let attachment_id = match index {
+                0 => "delete-reference-raw",
+                1 => "delete-reference-canonical",
+                _ => "delete-reference-double",
+            };
+            insert_claim_attachment(&connection, attachment_id, &format!("delete-sha-{index}"));
+            upsert_case_file(
+                &connection,
+                &CaseFileRow {
+                    file_id: format!("delete-file-{index}"),
+                    project_id: "claim-project-a".to_owned(),
+                    title: "Delete guard".to_owned(),
+                    file_type: "txt".to_owned(),
+                    storage_reference,
+                    summary: String::new(),
+                    created_at: String::new(),
+                },
+            )
+            .expect("case file inserts");
+            assert_eq!(
+                delete_attachment(&mut connection, attachment_id).expect("delete guard checks"),
+                AttachmentDeleteResult::InUse
+            );
+        }
+
+        insert_claim_attachment(
+            &connection,
+            "delete-artifact-reference",
+            "delete-sha-artifact",
+        );
+        create_artifact(
+            &connection,
+            &NewArtifactRow {
+                artifact_id: "delete-reference-artifact".to_owned(),
+                conversation_id: Some("claim-conversation-a".to_owned()),
+                project_id: Some("claim-project-a".to_owned()),
+                kind: "research".to_owned(),
+                title: "Delete reference artifact".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &NewArtifactVersionRow {
+                version_id: "delete-reference-artifact-v1".to_owned(),
+                artifact_id: "delete-reference-artifact".to_owned(),
+                content_json: "{}".to_owned(),
+                rendered_text: String::new(),
+                source_refs_json: r#"["delete-artifact-reference"]"#.to_owned(),
+                citation_report_json: "{}".to_owned(),
+                provider_snapshot_json: "{}".to_owned(),
+            },
+        )
+        .expect("artifact reference inserts");
+        assert_eq!(
+            delete_attachment(&mut connection, "delete-artifact-reference")
+                .expect("artifact delete guard checks"),
+            AttachmentDeleteResult::InUse
+        );
+
+        for (index, status) in ["pending", "rejected", "applied"].into_iter().enumerate() {
+            let attachment_id = format!("delete-proposal-{status}");
+            insert_claim_attachment(
+                &connection,
+                &attachment_id,
+                &format!("delete-sha-proposal-{index}"),
+            );
+            let proposal_id = format!("delete-reference-proposal-{status}");
+            let digest = format!("{index:0<64}");
+            create_case_change_proposal(
+                &connection,
+                &NewCaseChangeProposalRow {
+                    proposal_id: proposal_id.clone(),
+                    conversation_id: "claim-conversation-a".to_owned(),
+                    project_id: "claim-project-a".to_owned(),
+                    run_id: None,
+                    base_case_digest: digest.clone(),
+                    changes_json: "{}".to_owned(),
+                    source_refs_json: serde_json::to_string(&[&attachment_id])
+                        .expect("source reference serializes"),
+                },
+            )
+            .expect("proposal reference inserts");
+            if status != "pending" {
+                assert!(matches!(
+                    compare_and_set_case_change_proposal_status(
+                        &connection,
+                        &proposal_id,
+                        "claim-project-a",
+                        &digest,
+                        status,
+                    )
+                    .expect("proposal status changes"),
+                    CaseChangeProposalStatusUpdateResult::Updated(_)
+                ));
+            }
+            assert_eq!(
+                delete_attachment(&mut connection, &attachment_id)
+                    .expect("proposal delete guard checks"),
+                AttachmentDeleteResult::InUse,
+                "{status} proposals retain their source audit references"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_attachment_delete_serializes_a_concurrent_reference_writer() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        let mut writer = open_user_database(&database_path).expect("writer opens");
+        create_conversation(&writer, "delete-race-conversation", None, "Delete race")
+            .expect("conversation creates");
+        create_message(
+            &writer,
+            &NewMessageRow {
+                message_id: "delete-race-message".to_owned(),
+                conversation_id: "delete-race-conversation".to_owned(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "race fixture".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("message creates");
+        insert_attachment(
+            &writer,
+            &NewAttachmentRow {
+                attachment_id: "delete-race-attachment".to_owned(),
+                project_id: None,
+                original_name: "race.txt".to_owned(),
+                extension: "txt".to_owned(),
+                detected_mime: "text/plain".to_owned(),
+                sha256: "9".repeat(64),
+                size_bytes: 4,
+                content_blob: b"race".to_vec(),
+                extraction_status: "succeeded".to_owned(),
+                extracted_text: Some("race".to_owned()),
+                segments_json: "[]".to_owned(),
+                error_code: None,
+            },
+        )
+        .expect("attachment inserts");
+        attach_to_message(&writer, "delete-race-message", "delete-race-attachment", 0)
+            .expect("attachment links");
+
+        let write_transaction = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("reference writer takes the write lock");
+        let delete_path = database_path.clone();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let delete_thread = std::thread::spawn(move || {
+            let mut connection = open_user_database(&delete_path).expect("deleter opens");
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .expect("busy timeout configures");
+            attempt_tx.send(()).expect("attempt signal sends");
+            let result = delete_attachment_from_conversation(
+                &mut connection,
+                "delete-race-conversation",
+                "delete-race-attachment",
+            );
+            result_tx.send(result).expect("delete result sends");
+        });
+        attempt_rx.recv().expect("deleter begins");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        create_artifact(
+            &write_transaction,
+            &NewArtifactRow {
+                artifact_id: "delete-race-artifact".to_owned(),
+                conversation_id: Some("delete-race-conversation".to_owned()),
+                project_id: None,
+                kind: "research".to_owned(),
+                title: "Concurrent reference".to_owned(),
+                status: "draft".to_owned(),
+            },
+            &NewArtifactVersionRow {
+                version_id: "delete-race-artifact-v1".to_owned(),
+                artifact_id: "delete-race-artifact".to_owned(),
+                content_json: "{}".to_owned(),
+                rendered_text: String::new(),
+                source_refs_json: r#"["delete-race-attachment"]"#.to_owned(),
+                citation_report_json: "{}".to_owned(),
+                provider_snapshot_json: "{}".to_owned(),
+            },
+        )
+        .expect("concurrent reference inserts before the lock is released");
+        write_transaction.commit().expect("reference commits");
+
+        assert_eq!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("delete returns")
+                .expect("delete query succeeds"),
+            AttachmentDeleteResult::InUse
+        );
+        delete_thread.join().expect("deleter joins");
+        let connection = open_user_database(&database_path).expect("database reopens");
+        assert!(get_attachment(&connection, "delete-race-attachment")
+            .expect("attachment reads")
+            .is_some());
+        assert_eq!(
+            list_attachments_for_message(&connection, "delete-race-message")
+                .expect("message attachments read")
+                .len(),
+            1,
+            "the in-use result rolls the conversation unlink back"
+        );
+    }
+
+    #[test]
+    fn claimed_v9_with_missing_index_is_rejected_without_silent_repair() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = ensure_user_database(directory.path()).expect("database is created");
+        {
+            let connection = open_user_database(&database_path).expect("database opens");
+            connection
+                .execute("DROP INDEX idx_messages_conversation_created", [])
+                .expect("canonical index is removed");
+        }
+        let error = validate_and_migrate_user_database(&database_path)
+            .expect_err("claimed-current schema damage is rejected");
+        assert!(error
+            .to_string()
+            .contains("sqlite_master does not match the exact canonical schema"));
+        let connection = open_user_database(&database_path).expect("damaged database opens raw");
+        assert_eq!(
+            sqlite_master_count(&connection, "idx_messages_conversation_created"),
+            0,
+            "validation must not silently recreate a claimed-current missing index"
+        );
     }
 
     #[test]

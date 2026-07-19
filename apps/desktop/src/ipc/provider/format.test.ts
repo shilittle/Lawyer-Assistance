@@ -32,8 +32,8 @@ describe("provider IPC format helpers", () => {
   it("formats missing latency and HTTP status", () => {
     expect(formatLatency(null)).toBe("未返回");
     expect(formatLatency(12)).toBe("12 ms");
-    expect(formatHttpStatus(null)).toBe("无 HTTP 状态");
-    expect(formatHttpStatus(200)).toBe("HTTP 200");
+    expect(formatHttpStatus(null)).toBe("未返回状态码");
+    expect(formatHttpStatus(200)).toBe("状态码 200");
   });
 
   it("formats connection success and failure", () => {
@@ -49,7 +49,7 @@ describe("provider IPC format helpers", () => {
         errorType: null,
         message: "connection_ok",
       }),
-    ).toBe("成功 · HTTP 200 · qwen-plus");
+    ).toBe("连接成功");
 
     expect(
       formatConnectionResult({
@@ -63,6 +63,6 @@ describe("provider IPC format helpers", () => {
         errorType: "http",
         message: "auth_error",
       }),
-    ).toBe("失败 · http · auth_error");
+    ).toBe("连接失败，请检查配置和网络后重试。");
   });
 });

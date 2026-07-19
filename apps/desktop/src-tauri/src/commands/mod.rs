@@ -1,7 +1,13 @@
+pub mod assistant;
+pub mod assistant_run;
 pub mod case;
 pub mod document;
 pub mod graph;
 pub mod legal;
+pub mod mcp;
+pub mod privacy;
+pub mod privacy_workflow;
 pub mod provider;
 pub mod release;
+mod research_output;
 pub mod updater;

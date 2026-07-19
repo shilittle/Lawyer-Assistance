@@ -267,6 +267,39 @@ fn formal_chinese_keyword_expansion_recalls_substantive_civil_code_article() {
 
 #[test]
 #[ignore = "requires the audited Stage 1C legal database"]
+fn formal_explicit_law_alias_scopes_contract_performance_search() {
+    let connection = formal_connection();
+    let response = retrieval::search_articles(
+        &connection,
+        SearchArticlesRequest {
+            query: "民法典 合同履行 逾期交付".to_owned(),
+            document_id: None,
+            case_date: Some("2025-11-10".to_owned()),
+            limit: Some(10),
+        },
+    )
+    .expect("explicit Civil Code search succeeds");
+
+    assert!(!response.results.is_empty());
+    assert!(response
+        .results
+        .iter()
+        .all(|result| result.document_title == "中华人民共和国民法典"));
+    for expected_article in ["第五百一十三条", "第五百八十四条", "第八百零一条"]
+    {
+        assert!(
+            response
+                .results
+                .iter()
+                .any(|result| result.article_number == expected_article),
+            "missing {expected_article}: {:?}",
+            response.results
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the audited Stage 1C legal database"]
 fn formal_structured_article_subarticle_and_natural_question_searches_are_exact() {
     let connection = formal_connection();
     for query in ["民法典第577条", "民法典 第577条"] {

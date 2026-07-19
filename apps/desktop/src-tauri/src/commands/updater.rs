@@ -9,13 +9,21 @@ use std::{
     io::Write,
     os::windows::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOW};
+
+use crate::{
+    drain_mcp_and_finalize, mcp_manager::McpManager, ExitDrainCoordinator, FinalExitAction,
+    InstallerLaunchCompletion,
+};
 
 const UPDATE_ENDPOINT: &str =
     "https://github.com/shilittle/Lawyer-Assistance/releases/latest/download/latest.json";
@@ -144,6 +152,8 @@ pub async fn check_for_application_update() -> Result<Option<ApplicationUpdateIn
 #[tauri::command]
 pub async fn download_install_application_update(
     app: AppHandle,
+    mcp_manager: tauri::State<'_, McpManager>,
+    exit_drain: tauri::State<'_, Arc<ExitDrainCoordinator>>,
     request: InstallApplicationUpdateRequest,
 ) -> Result<(), IpcError> {
     let _install_guard = UpdateInstallGuard::acquire()?;
@@ -192,17 +202,75 @@ pub async fn download_install_application_update(
         return Err(error);
     }
 
+    let exit_drain = Arc::clone(exit_drain.inner());
+    if !exit_drain.reserve_installer_launch() {
+        remove_download_target(&target);
+        return Err(IpcError::new(
+            "application_exiting",
+            "Another application exit, restart, or installer hand-off is already in progress",
+        ));
+    }
     if let Err(error) = launch_nsis_installer(&target.installer) {
         remove_download_target(&target);
+        match exit_drain.complete_installer_launch(false) {
+            InstallerLaunchCompletion::ReturnToApp => {}
+            InstallerLaunchCompletion::BeginPendingExit(exit_code) => {
+                tauri::async_runtime::spawn(drain_mcp_and_finalize(
+                    app.clone(),
+                    Some(mcp_manager.inner().clone()),
+                    Arc::clone(&exit_drain),
+                    FinalExitAction::Exit(exit_code),
+                ));
+            }
+            InstallerLaunchCompletion::BeginInstallerExit
+            | InstallerLaunchCompletion::InvalidState => {
+                return Err(IpcError::new(
+                    "updater_state",
+                    "The application exit coordinator entered an invalid installer state",
+                ));
+            }
+        }
         return Err(error);
     }
-    app.cleanup_before_exit();
-    std::process::exit(0)
+    if exit_drain.complete_installer_launch(true) != InstallerLaunchCompletion::BeginInstallerExit {
+        return Err(IpcError::new(
+            "updater_state",
+            "The application exit coordinator could not finalize installer hand-off",
+        ));
+    }
+    drain_mcp_and_finalize(
+        app,
+        Some(mcp_manager.inner().clone()),
+        exit_drain,
+        FinalExitAction::Exit(0),
+    )
+    .await;
+    Ok(())
 }
 
 #[tauri::command]
-pub fn relaunch_application(app: AppHandle) {
-    app.request_restart();
+pub async fn relaunch_application(
+    app: AppHandle,
+    mcp_manager: tauri::State<'_, McpManager>,
+    exit_drain: tauri::State<'_, Arc<ExitDrainCoordinator>>,
+) -> Result<(), IpcError> {
+    // Tauri deliberately ignores `prevent_exit` for restart exit codes, so the
+    // drain must complete before requesting the restart event.
+    let exit_drain = Arc::clone(exit_drain.inner());
+    if !exit_drain.begin_programmatic_exit() {
+        return Err(IpcError::new(
+            "application_exiting",
+            "Another application exit, restart, or installer hand-off is already in progress",
+        ));
+    }
+    drain_mcp_and_finalize(
+        app,
+        Some(mcp_manager.inner().clone()),
+        exit_drain,
+        FinalExitAction::Restart,
+    )
+    .await;
+    Ok(())
 }
 
 /// Removes verified installers left by an updater process that successfully

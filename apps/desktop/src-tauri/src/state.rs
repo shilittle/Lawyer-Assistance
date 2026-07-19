@@ -71,6 +71,7 @@ struct AppStateInner {
     user_database_path: PathBuf,
     crash_log_path: PathBuf,
     legal_answer_cancellations: Mutex<HashMap<String, LegalAnswerCancellationEntry>>,
+    assistant_run_cancellations: Mutex<HashMap<String, AssistantRunCancellationEntry>>,
     pending_extraction_reviews: Mutex<HashMap<String, ActiveExtractionReview>>,
     // A document export spans SQLite persistence, a crash-recovery marker and
     // an atomic destination-file swap. Serialize the protocol so concurrent
@@ -90,6 +91,19 @@ struct LegalAnswerCancellationEntry {
     phase: LegalAnswerPhase,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantRunPhase {
+    Running,
+    Finalizing,
+}
+
+#[derive(Debug)]
+struct AssistantRunCancellationEntry {
+    token: CancellationToken,
+    provider_cancellation: providers::RequestCancellation,
+    phase: AssistantRunPhase,
+}
+
 impl AppState {
     pub fn new(legal_core_path: PathBuf, user_database_path: PathBuf) -> Self {
         let crash_log_path = user_database_path
@@ -102,6 +116,7 @@ impl AppState {
                 user_database_path,
                 crash_log_path,
                 legal_answer_cancellations: Mutex::new(HashMap::new()),
+                assistant_run_cancellations: Mutex::new(HashMap::new()),
                 pending_extraction_reviews: Mutex::new(HashMap::new()),
                 document_export_lock: Mutex::new(()),
             }),
@@ -119,6 +134,31 @@ impl AppState {
 
     pub fn crash_log_path(&self) -> &Path {
         &self.inner.crash_log_path
+    }
+
+    /// Build the transport-neutral application service used by both the
+    /// desktop IPC adapters and the standalone MCP server. The desktop keeps
+    /// its file boundary at LocalAppData; user-selected export destinations
+    /// continue to pass through the existing reviewed desktop export flow.
+    pub fn legal_services(
+        &self,
+    ) -> Result<legal_services::LegalServices, legal_services::ServiceError> {
+        let local_root = self.user_database_path().parent().ok_or_else(|| {
+            legal_services::ServiceError::new(
+                "invalid_configuration",
+                "user database path has no parent directory",
+                false,
+            )
+        })?;
+        legal_services::LegalServices::new_with_origin(
+            legal_services::ServiceConfig {
+                legal_core_path: self.legal_core_path().to_path_buf(),
+                user_database_path: self.user_database_path().to_path_buf(),
+                allowed_file_roots: vec![local_root.to_path_buf()],
+                allowed_output_root: local_root.to_path_buf(),
+            },
+            legal_services::ServiceOrigin::Desktop,
+        )
     }
 
     pub fn begin_document_export(&self) -> MutexGuard<'_, ()> {
@@ -197,6 +237,74 @@ impl AppState {
             // if another thread unwinds while holding the mutex.
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    pub fn begin_assistant_run(
+        &self,
+        run_id: &str,
+    ) -> Result<AssistantRunCancellationGuard, &'static str> {
+        let mut cancellations = self.assistant_run_cancellations();
+        if cancellations.contains_key(run_id) {
+            return Err("an assistant run with this id is already active");
+        }
+
+        let token = CancellationToken::new();
+        let provider_cancellation = providers::RequestCancellation::default();
+        cancellations.insert(
+            run_id.to_owned(),
+            AssistantRunCancellationEntry {
+                token: token.clone(),
+                provider_cancellation: provider_cancellation.clone(),
+                phase: AssistantRunPhase::Running,
+            },
+        );
+
+        Ok(AssistantRunCancellationGuard {
+            state: self.clone(),
+            run_id: run_id.to_owned(),
+            token,
+            provider_cancellation,
+        })
+    }
+
+    pub fn cancel_assistant_run(&self, run_id: &str) -> bool {
+        let mut cancellations = self.assistant_run_cancellations();
+        match cancellations.get_mut(run_id) {
+            Some(entry) if entry.phase == AssistantRunPhase::Running => {
+                entry.token.cancel();
+                entry.provider_cancellation.cancel();
+                true
+            }
+            Some(_) | None => false,
+        }
+    }
+
+    fn begin_assistant_run_finalization(&self, run_id: &str) -> bool {
+        let mut cancellations = self.assistant_run_cancellations();
+        let Some(entry) = cancellations.get_mut(run_id) else {
+            return false;
+        };
+        if entry.phase != AssistantRunPhase::Running || entry.token.is_cancelled() {
+            return false;
+        }
+
+        entry.phase = AssistantRunPhase::Finalizing;
+        true
+    }
+
+    fn finish_assistant_run(&self, run_id: &str) {
+        self.assistant_run_cancellations().remove(run_id);
+    }
+
+    fn assistant_run_cancellations(
+        &self,
+    ) -> MutexGuard<'_, HashMap<String, AssistantRunCancellationEntry>> {
+        self.inner
+            .assistant_run_cancellations
+            .lock()
+            // The registry contains independent cancellation tokens and an
+            // enum phase, so recovering after an unwind is safe.
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Debug)]
@@ -222,14 +330,54 @@ impl Drop for LegalAnswerCancellationGuard {
     }
 }
 
+#[derive(Debug)]
+pub struct AssistantRunCancellationGuard {
+    state: AppState,
+    run_id: String,
+    token: CancellationToken,
+    provider_cancellation: providers::RequestCancellation,
+}
+
+impl AssistantRunCancellationGuard {
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    /// Cancellation handle consumed by the synchronous provider transport.
+    /// Keeping it in the same registry entry as the Tokio token makes the
+    /// public cancel command interrupt both local orchestration and HTTP I/O.
+    pub fn provider_cancellation(&self) -> providers::RequestCancellation {
+        self.provider_cancellation.clone()
+    }
+
+    pub fn begin_finalization(&self) -> bool {
+        self.state.begin_assistant_run_finalization(&self.run_id)
+    }
+}
+
+impl Drop for AssistantRunCancellationGuard {
+    fn drop(&mut self) {
+        self.state.finish_assistant_run(&self.run_id);
+    }
+}
+
 impl AppState {
     pub fn register_extraction_review(
         &self,
         review_id: String,
         review: PendingExtractionReview,
     ) -> Result<(), PendingReviewRegistryError> {
+        self.register_extraction_review_at(review_id, review, Instant::now())
+    }
+
+    fn register_extraction_review_at(
+        &self,
+        review_id: String,
+        review: PendingExtractionReview,
+        now: Instant,
+    ) -> Result<(), PendingReviewRegistryError> {
         let mut reviews = self.pending_extraction_reviews()?;
-        prune_expired_reviews(&mut reviews);
+        prune_expired_reviews_at(&mut reviews, now);
         match reviews.entry(review_id.clone()) {
             Entry::Occupied(_) => return Err(PendingReviewRegistryError::IdentifierCollision),
             Entry::Vacant(_) => {}
@@ -248,7 +396,7 @@ impl AppState {
             review_id,
             ActiveExtractionReview {
                 review,
-                created_at: Instant::now(),
+                created_at: now,
                 phase: PendingExtractionReviewPhase::Ready,
             },
         );
@@ -370,9 +518,13 @@ impl AppState {
 }
 
 fn prune_expired_reviews(reviews: &mut HashMap<String, ActiveExtractionReview>) {
+    prune_expired_reviews_at(reviews, Instant::now());
+}
+
+fn prune_expired_reviews_at(reviews: &mut HashMap<String, ActiveExtractionReview>, now: Instant) {
     reviews.retain(|_, active| {
         active.phase == PendingExtractionReviewPhase::Claimed
-            || active.created_at.elapsed() <= PENDING_EXTRACTION_REVIEW_TTL
+            || now.saturating_duration_since(active.created_at) <= PENDING_EXTRACTION_REVIEW_TTL
     });
 }
 
@@ -449,6 +601,57 @@ mod tests {
         assert!(state.cancel_legal_answer("cancels-first"));
         assert!(!cancelled_guard.begin_finalization());
         assert!(cancelled_guard.token().is_cancelled());
+    }
+
+    #[test]
+    fn assistant_run_ids_are_unique_until_the_guard_is_released() {
+        let state = state();
+        let guard = state
+            .begin_assistant_run("run-1")
+            .expect("assistant run registers");
+        assert!(state.begin_assistant_run("run-1").is_err());
+        assert!(state.cancel_assistant_run("run-1"));
+        assert!(guard.token().is_cancelled());
+        assert!(guard.provider_cancellation().is_cancelled());
+
+        drop(guard);
+        assert!(!state.cancel_assistant_run("run-1"));
+        assert!(state.begin_assistant_run("run-1").is_ok());
+    }
+
+    #[test]
+    fn assistant_finalization_and_cancellation_have_a_single_winner() {
+        let state = state();
+        let guard = state
+            .begin_assistant_run("finalizes-first")
+            .expect("assistant run registers");
+        assert!(guard.begin_finalization());
+        assert!(!state.cancel_assistant_run("finalizes-first"));
+        assert!(!guard.token().is_cancelled());
+        assert!(!guard.provider_cancellation().is_cancelled());
+
+        let cancelled_guard = state
+            .begin_assistant_run("cancels-first")
+            .expect("assistant run registers");
+        assert!(state.cancel_assistant_run("cancels-first"));
+        assert!(!cancelled_guard.begin_finalization());
+        assert!(cancelled_guard.token().is_cancelled());
+        assert!(cancelled_guard.provider_cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn legal_answer_and_assistant_run_namespaces_do_not_collide() {
+        let state = state();
+        let legal = state
+            .begin_legal_answer("shared-id")
+            .expect("legal answer registers");
+        let assistant = state
+            .begin_assistant_run("shared-id")
+            .expect("assistant run registers independently");
+
+        assert!(state.cancel_assistant_run("shared-id"));
+        assert!(assistant.token().is_cancelled());
+        assert!(!legal.token().is_cancelled());
     }
 
     #[test]
@@ -580,6 +783,7 @@ mod tests {
     #[test]
     fn expired_reviews_are_pruned_before_registration() {
         let state = state();
+        let created_at = Instant::now();
         state
             .inner
             .pending_extraction_reviews
@@ -589,14 +793,18 @@ mod tests {
                 "expired".to_owned(),
                 ActiveExtractionReview {
                     review: review(),
-                    created_at: Instant::now()
-                        .checked_sub(PENDING_EXTRACTION_REVIEW_TTL + Duration::from_secs(1))
-                        .expect("test instant can move backwards"),
+                    created_at,
                     phase: PendingExtractionReviewPhase::Ready,
                 },
             );
         state
-            .register_extraction_review("fresh".to_owned(), review())
+            .register_extraction_review_at(
+                "fresh".to_owned(),
+                review(),
+                created_at
+                    .checked_add(PENDING_EXTRACTION_REVIEW_TTL + Duration::from_secs(1))
+                    .expect("test instant can move forwards"),
+            )
             .expect("fresh review registers");
 
         assert!(state

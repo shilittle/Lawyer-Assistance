@@ -1,26 +1,76 @@
-use crate::{
-    commands::case::{workspace_from_rows, IpcError},
-    state::AppState,
-};
+use crate::{commands::case::IpcError, state::AppState};
 use domain::document::{
-    generate_document, template_catalog, DocumentTable, DocumentTemplateId,
-    DocumentTemplateMetadata, GeneratedDocument,
+    generate_standalone_document, template_catalog, DocumentTemplateId, DocumentTemplateMetadata,
+    GeneratedDocument, StandaloneDocumentInput,
 };
+use font_subset::{Font, FontReader, TableTag};
+use lopdf::{Object as PdfObject, ObjectId as PdfObjectId, StringFormat as PdfStringFormat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeSet, HashMap},
     fs::{self, File},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    os::windows::ffi::OsStrExt,
+    path::{Component, Path, PathBuf},
 };
 use tauri::State;
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    },
+};
 
 const MAX_PROJECT_ID_BYTES: usize = 256;
 const MAX_MODEL_DRAFT_BYTES: usize = 1024 * 1024;
 const MAX_EXPORT_PATH_BYTES: usize = 32 * 1024;
+const MAX_RECOVERABLE_PDF_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PDF_ASCII_TOKEN_CHARS: usize = 12;
+const PDF_TABLE_BODY_FONT_SIZE: u8 = 11;
+const PDF_TABLE_SEQUENCE_HEADER_FONT_SIZE: u8 = 10;
+const PDF_TABLE_CELL_VERTICAL_PADDING_MM: f32 = 1.0;
+const PDF_TABLE_CELL_HORIZONTAL_PADDING_MM: f32 = 1.0;
+const PDF_TABLE_FIT_GUARD_MM: f32 = 0.5;
 const EXPORT_MARKER_PREFIX: &str = "pending-document-export-";
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfTablePageTrace {
+    headers: Vec<String>,
+    row_start: usize,
+    row_end: usize,
+    oversized_continuation: bool,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PDF_TABLE_PAGE_TRACE: std::cell::RefCell<Option<Vec<PdfTablePageTrace>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn begin_pdf_table_page_trace() {
+    PDF_TABLE_PAGE_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+fn record_pdf_table_page_trace(trace_entry: PdfTablePageTrace) {
+    PDF_TABLE_PAGE_TRACE.with(|trace| {
+        if let Some(entries) = trace.borrow_mut().as_mut() {
+            entries.push(trace_entry);
+        }
+    });
+}
+
+#[cfg(test)]
+fn take_pdf_table_page_trace() -> Vec<PdfTablePageTrace> {
+    PDF_TABLE_PAGE_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +85,8 @@ enum ExportMarkerPhase {
 struct ExportMarker {
     format_version: u8,
     phase: ExportMarkerPhase,
+    #[serde(default)]
+    audit_id: Option<String>,
     record_id: String,
     export_path: PathBuf,
     staged_path: PathBuf,
@@ -47,7 +99,8 @@ struct ExportMarker {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewDocumentRequest {
-    pub project_id: String,
+    pub project_id: Option<String>,
+    pub standalone_input: Option<StandaloneDocumentInput>,
     pub template_id: DocumentTemplateId,
     pub model_draft: Option<String>,
 }
@@ -60,21 +113,58 @@ pub struct TemplateCatalogResponse {
 #[serde(rename_all = "camelCase")]
 pub struct PreviewDocumentResponse {
     pub document: GeneratedDocument,
+    pub case_revision: Option<String>,
+    pub generation_hash: String,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExportDocumentRequest {
-    pub project_id: String,
+pub struct ExportDocumentPdfRequest {
+    pub project_id: Option<String>,
+    pub standalone_input: Option<StandaloneDocumentInput>,
     pub template_id: DocumentTemplateId,
     pub model_draft: Option<String>,
-    pub export_path: String,
+    pub expected_revision: Option<String>,
+    pub generation_hash: String,
+    pub confirmed: bool,
+    pub idempotency_key: String,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExportDocumentResponse {
-    pub record_id: String,
-    pub export_path: String,
+pub struct ExportDocumentPdfResponse {
+    pub cancelled: bool,
+    pub replayed: bool,
+    pub record_id: Option<String>,
+    pub file_name: Option<String>,
     pub citation_count: usize,
+}
+
+#[derive(Debug)]
+struct GeneratedPreview {
+    document: GeneratedDocument,
+    case_revision: Option<String>,
+    generation_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PdfExportAuditDetails {
+    schema_version: u16,
+    record_id: String,
+    export_path: PathBuf,
+    file_sha256: String,
+    citation_count: usize,
+    case_revision: Option<String>,
+    generation_hash: String,
+}
+
+struct LockedDirectory(HANDLE);
+
+impl Drop for LockedDirectory {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 #[tauri::command]
@@ -89,45 +179,103 @@ pub fn preview_document(
     state: State<'_, AppState>,
     request: PreviewDocumentRequest,
 ) -> Result<PreviewDocumentResponse, IpcError> {
-    let document = load_and_generate(
+    let generated = load_and_generate(
         &state,
-        &request.project_id,
+        request.project_id.as_deref(),
+        request.standalone_input.as_ref(),
         request.template_id,
         request.model_draft.as_deref(),
     )?;
-    Ok(PreviewDocumentResponse { document })
+    Ok(PreviewDocumentResponse {
+        document: generated.document,
+        case_revision: generated.case_revision,
+        generation_hash: generated.generation_hash,
+    })
 }
 
+fn require_privacy_safe_document_export() -> Result<(), IpcError> {
+    Err(IpcError::new(
+        "privacy_required",
+        "Legacy document PDF export is disabled; use export_approved_review_pdf with an active exact redaction receipt.",
+    ))
+}
 #[tauri::command]
-pub fn export_document(
+pub async fn export_document_pdf(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
-    request: ExportDocumentRequest,
-) -> Result<ExportDocumentResponse, IpcError> {
-    if request.export_path.trim().is_empty()
-        || request.export_path.len() > MAX_EXPORT_PATH_BYTES
-        || !request.export_path.to_ascii_lowercase().ends_with(".docx")
-    {
-        return Err(IpcError::new(
-            "validation",
-            "exportPath must end with .docx",
-        ));
-    }
+    request: ExportDocumentPdfRequest,
+) -> Result<ExportDocumentPdfResponse, IpcError> {
+    require_privacy_safe_document_export()?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        export_document_pdf_blocking(&app, &state, request)
+    })
+    .await
+    .map_err(|_| IpcError::new("runtime", "PDF export worker failed"))?
+}
+
+fn export_document_pdf_blocking(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    request: ExportDocumentPdfRequest,
+) -> Result<ExportDocumentPdfResponse, IpcError> {
+    validate_pdf_export_request(&request)?;
     let _export_guard = state.begin_document_export();
-    let document = load_and_generate(
-        &state,
-        &request.project_id,
+    let request_hash = sha256_serialized(&request)?;
+    let idempotency_key_hash = sha256_bytes(request.idempotency_key.as_bytes());
+    let connection = database::open_user_database(state.user_database_path())?;
+    if let Some(existing) = database::get_operation_audit_by_idempotency_key_hash(
+        &connection,
+        "desktop",
+        "document_export_pdf",
+        &idempotency_key_hash,
+    )? {
+        return replay_pdf_export(&existing, &request_hash);
+    }
+    drop(connection);
+
+    let generated = load_and_generate(
+        state,
+        request.project_id.as_deref(),
+        request.standalone_input.as_ref(),
         request.template_id,
         request.model_draft.as_deref(),
     )?;
-    let export_path = absolute_file_path(Path::new(&request.export_path))?;
-    if export_path.exists() && !export_path.is_file() {
-        return Err(IpcError::new(
-            "validation",
-            "exportPath must name a regular file",
-        ));
+    verify_generation_seal(&request, &generated)?;
+    let case_revision = generated.case_revision.clone();
+    let generation_hash = generated.generation_hash.clone();
+    let document = generated.document;
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("导出已复核 PDF")
+        .set_file_name(format!("{}.pdf", request.template_id.as_str()))
+        .add_filter("PDF 文档", &["pdf"])
+        .blocking_save_file();
+    let Some(selected) = selected else {
+        return Ok(ExportDocumentPdfResponse {
+            cancelled: true,
+            replayed: false,
+            record_id: None,
+            file_name: None,
+            citation_count: 0,
+        });
+    };
+    let mut export_path = selected
+        .into_path()
+        .map_err(|_| IpcError::new("validation", "selected destination is not a local file"))?;
+    if !export_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
+    {
+        export_path.set_extension("pdf");
     }
+    let (validated_path, _parent_lock) = validate_selected_pdf_destination(state, &export_path)?;
+    export_path = validated_path;
     let staged_path = sibling_path(&export_path, "export-incoming")?;
     let rollback_path = sibling_path(&export_path, "export-previous")?;
+    let audit_id = format!("audit:{}", Uuid::new_v4());
     let record_id = Uuid::new_v4().to_string();
     let source_ids = document
         .sections
@@ -147,11 +295,12 @@ pub fn export_document(
     citation_ids.dedup();
     let source_ids_json = serde_json::to_string(&source_ids)?;
     let citation_ids_json = serde_json::to_string(&citation_ids)?;
-    let destination_existed = export_path.exists();
-    let destination_sha256 = destination_existed
-        .then(|| file_sha256(&export_path))
-        .transpose()?;
-    write_docx(&staged_path, &document)?;
+    // A native save-dialog selection is required and existing destinations
+    // are rejected. This avoids treating a renderer-originated boolean as
+    // proof that the user approved an overwrite.
+    let destination_existed = false;
+    let destination_sha256 = None;
+    write_pdf(&staged_path, &document)?;
     let staged_sha256 = file_sha256(&staged_path).inspect_err(|_| {
         let _ = fs::remove_file(&staged_path);
     })?;
@@ -159,6 +308,7 @@ pub fn export_document(
     let mut marker = ExportMarker {
         format_version: 1,
         phase: ExportMarkerPhase::Prepared,
+        audit_id: Some(audit_id.clone()),
         record_id: record_id.clone(),
         export_path: export_path.clone(),
         staged_path: staged_path.clone(),
@@ -183,34 +333,64 @@ pub fn export_document(
             ));
         }
     };
-    let transaction = match connection.transaction() {
-        Ok(transaction) => transaction,
-        Err(error) => {
+    let transaction =
+        match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let primary = error.into();
+                return Err(combine_cleanup_error(
+                    primary,
+                    cleanup_prepared_export(&marker_path, &marker, None),
+                ));
+            }
+        };
+    if let Err(error) = database::create_operation_audit(
+        &transaction,
+        &database::NewOperationAuditRow {
+            audit_id: audit_id.clone(),
+            origin: "desktop".to_owned(),
+            operation: "document_export_pdf".to_owned(),
+            project_id: request.project_id.clone(),
+            request_hash: request_hash.clone(),
+            idempotency_key_hash: Some(idempotency_key_hash),
+            details_json: serde_json::json!({
+                "schemaVersion": legal_services::SERVICE_SCHEMA_VERSION,
+                "generationHash": generation_hash,
+                "caseRevision": case_revision,
+                "state": "prepared"
+            })
+            .to_string(),
+        },
+    ) {
+        let primary = IpcError::from(error);
+        return Err(combine_cleanup_error(
+            primary,
+            cleanup_prepared_export(&marker_path, &marker, None),
+        ));
+    }
+    if let Some(project_id) = request
+        .project_id
+        .filter(|project_id| !project_id.trim().is_empty())
+    {
+        if let Err(error) = database::insert_document_generation_record(
+            &transaction,
+            &database::DocumentGenerationRecordRow {
+                record_id: record_id.clone(),
+                project_id,
+                template_id: request.template_id.as_str().to_owned(),
+                template_version: document.template.version.clone(),
+                source_ids_json,
+                citation_ids_json,
+                export_path: export_path.to_string_lossy().into_owned(),
+                exported_at: current_timestamp(),
+            },
+        ) {
             let primary = error.into();
             return Err(combine_cleanup_error(
                 primary,
                 cleanup_prepared_export(&marker_path, &marker, None),
             ));
         }
-    };
-    if let Err(error) = database::insert_document_generation_record(
-        &transaction,
-        &database::DocumentGenerationRecordRow {
-            record_id: record_id.clone(),
-            project_id: request.project_id,
-            template_id: request.template_id.as_str().to_owned(),
-            template_version: document.template.version.clone(),
-            source_ids_json,
-            citation_ids_json,
-            export_path: export_path.to_string_lossy().into_owned(),
-            exported_at: current_timestamp(),
-        },
-    ) {
-        let primary = error.into();
-        return Err(combine_cleanup_error(
-            primary,
-            cleanup_prepared_export(&marker_path, &marker, None),
-        ));
     }
     if let Err(error) = transaction.commit() {
         let primary = error.into();
@@ -229,49 +409,492 @@ pub fn export_document(
             cleanup_prepared_export(&marker_path, &marker, Some(&connection)),
         ));
     }
-    marker.phase = ExportMarkerPhase::Committed;
-    if let Err(error) = write_export_marker(&marker_path, &marker) {
-        return Err(combine_cleanup_error(
-            error,
-            cleanup_prepared_export(&marker_path, &marker, Some(&connection)),
-        ));
+    let completed = PdfExportAuditDetails {
+        schema_version: legal_services::SERVICE_SCHEMA_VERSION,
+        record_id: record_id.clone(),
+        export_path: export_path.clone(),
+        file_sha256: marker.staged_sha256.clone(),
+        citation_count: document.citations.len(),
+        case_revision,
+        generation_hash,
+    };
+    match database::compare_and_set_operation_audit_status(
+        &connection,
+        &audit_id,
+        "succeeded",
+        &serde_json::to_string(&completed)?,
+    ) {
+        Ok(database::OperationAuditStatusUpdateResult::Updated(_)) => {}
+        Ok(database::OperationAuditStatusUpdateResult::Conflict(_))
+        | Ok(database::OperationAuditStatusUpdateResult::NotFound) => {
+            return Err(combine_cleanup_error(
+                IpcError::new("audit_conflict", "PDF export audit could not be finalized"),
+                cleanup_prepared_export(&marker_path, &marker, Some(&connection)),
+            ));
+        }
+        Err(error) => {
+            return Err(combine_cleanup_error(
+                IpcError::from(error),
+                cleanup_prepared_export(&marker_path, &marker, Some(&connection)),
+            ));
+        }
     }
+    marker.phase = ExportMarkerPhase::Committed;
+    // Once the audit is durably succeeded, a stale prepared marker is safe:
+    // startup recovery verifies the file hash and completes cleanup.
+    let _ = write_export_marker(&marker_path, &marker);
     if rollback_path.exists() {
         fs::remove_file(&rollback_path).map_err(|error| IpcError::new("io", error.to_string()))?;
     }
-    fs::remove_file(&marker_path).map_err(|error| IpcError::new("io", error.to_string()))?;
-    Ok(ExportDocumentResponse {
-        record_id,
-        export_path: export_path.to_string_lossy().into_owned(),
+    let _ = remove_file_if_exists(&marker_path);
+    let file_name = export_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| IpcError::new("validation", "selected file name is not valid UTF-8"))?
+        .to_owned();
+    Ok(ExportDocumentPdfResponse {
+        cancelled: false,
+        replayed: false,
+        record_id: Some(record_id),
+        file_name: Some(file_name),
         citation_count: document.citations.len(),
     })
 }
 
 fn load_and_generate(
     state: &AppState,
-    project_id: &str,
+    project_id: Option<&str>,
+    standalone_input: Option<&StandaloneDocumentInput>,
     template_id: DocumentTemplateId,
     model_draft: Option<&str>,
-) -> Result<GeneratedDocument, IpcError> {
-    if project_id.trim().is_empty() || project_id.len() > MAX_PROJECT_ID_BYTES {
-        return Err(IpcError::new("validation", "projectId is required"));
-    }
+) -> Result<GeneratedPreview, IpcError> {
     if model_draft.is_some_and(|draft| draft.len() > MAX_MODEL_DRAFT_BYTES) {
         return Err(IpcError::new(
             "validation",
             "modelDraft exceeds the 1 MiB safety limit",
         ));
     }
-    let connection = database::open_user_database(state.user_database_path())?;
-    let rows = database::get_case_workspace_rows(&connection, project_id)?
-        .ok_or_else(|| IpcError::new("not_found", "case project not found"))?;
-    let workspace = workspace_from_rows(rows)?;
-    generate_document(&workspace, template_id, model_draft).map_err(|error| {
+    if standalone_input.is_some_and(|input| {
+        serde_json::to_vec(input).is_ok_and(|value| value.len() > MAX_MODEL_DRAFT_BYTES)
+    }) {
+        return Err(IpcError::new(
+            "validation",
+            "standaloneInput exceeds the 1 MiB safety limit",
+        ));
+    }
+
+    let project_id = project_id.filter(|value| !value.trim().is_empty());
+    let generated = match (project_id, standalone_input) {
+        (Some(_), Some(_)) => {
+            return Err(IpcError::new(
+                "validation",
+                "choose either a case project or standalone input",
+            ));
+        }
+        (Some(project_id), None) => {
+            if project_id.len() > MAX_PROJECT_ID_BYTES {
+                return Err(IpcError::new("validation", "projectId is too long"));
+            }
+            let generated = state
+                .legal_services()?
+                .document_generate(legal_services::DocumentGenerateRequest {
+                    schema_version: legal_services::SERVICE_SCHEMA_VERSION,
+                    project_id: project_id.to_owned(),
+                    template_id,
+                    model_draft: model_draft.map(str::to_owned),
+                })
+                .map_err(document_service_error)?;
+            return Ok(GeneratedPreview {
+                document: generated.document,
+                case_revision: Some(generated.case_revision),
+                generation_hash: generated.generation_hash,
+            });
+        }
+        (None, Some(input)) => generate_standalone_document(input, template_id, model_draft),
+        (None, None) => {
+            return Err(IpcError::new(
+                "validation",
+                "case project or standalone input is required",
+            ));
+        }
+    };
+    let document = generated.map_err(|error| {
         IpcError::new(
             "document_validation",
             serde_json::to_string(&error).unwrap_or_else(|_| "document validation failed".into()),
         )
+    })?;
+    let generation_hash = sha256_serialized(&document)?;
+    Ok(GeneratedPreview {
+        document,
+        case_revision: None,
+        generation_hash,
     })
+}
+
+fn document_service_error(error: legal_services::ServiceError) -> IpcError {
+    if error.code != "document_validation_failed" {
+        return error.into();
+    }
+
+    const PUBLIC_DOCUMENT_FIELDS: &[&str] = &[
+        "plaintiff",
+        "defendant",
+        "sender",
+        "recipient",
+        "claims",
+        "facts",
+        "dated_facts",
+        "evidence",
+        "issues",
+        "valid_citations",
+        "case_date",
+        "model_draft",
+        "standalone_content",
+    ];
+    let missing_fields = error
+        .details
+        .get("missingFields")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|field| PUBLIC_DOCUMENT_FIELDS.contains(field))
+        .collect::<Vec<_>>();
+    let invalid_citation_count = error
+        .details
+        .get("invalidCitationIds")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let code = error
+        .details
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| *code == "missing_required_fields")
+        .unwrap_or("citation_validation_failed");
+    let public_payload = serde_json::json!({
+        "code": code,
+        "missingFields": missing_fields,
+        // The UI needs only a count. Never forward source identifiers across
+        // the renderer boundary as part of a user-visible validation error.
+        "invalidCitationIds": vec!["待重新核验"; invalid_citation_count],
+    });
+    IpcError::new("document_validation", public_payload.to_string())
+}
+
+fn validate_pdf_export_request(request: &ExportDocumentPdfRequest) -> Result<(), IpcError> {
+    if !request.confirmed {
+        return Err(IpcError::new(
+            "confirmation_required",
+            "explicit confirmation is required before PDF export",
+        ));
+    }
+    if request.idempotency_key.len() < 16
+        || request.idempotency_key.len() > 128
+        || !request
+            .idempotency_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'.'))
+    {
+        return Err(IpcError::new(
+            "validation",
+            "idempotencyKey must contain 16-128 safe ASCII characters",
+        ));
+    }
+    validate_sha256_text("generationHash", &request.generation_hash)?;
+    let project_id = request
+        .project_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    match (project_id, request.standalone_input.as_ref()) {
+        (Some(_), None) => {
+            let revision = request.expected_revision.as_deref().ok_or_else(|| {
+                IpcError::new(
+                    "validation",
+                    "expectedRevision is required for a case-backed PDF",
+                )
+            })?;
+            validate_sha256_text("expectedRevision", revision)?;
+        }
+        (None, Some(_)) if request.expected_revision.is_none() => {}
+        (Some(_), Some(_)) => {
+            return Err(IpcError::new(
+                "validation",
+                "choose either a case project or standalone input",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(IpcError::new(
+                "validation",
+                "standalone PDF export must not carry a case revision",
+            ));
+        }
+        (None, None) => {
+            return Err(IpcError::new(
+                "validation",
+                "case project or standalone input is required",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_generation_seal(
+    request: &ExportDocumentPdfRequest,
+    generated: &GeneratedPreview,
+) -> Result<(), IpcError> {
+    if request.expected_revision != generated.case_revision {
+        return Err(IpcError::new(
+            "revision_conflict",
+            "case changed after PDF preview; regenerate and review the preview",
+        ));
+    }
+    if request.generation_hash != generated.generation_hash {
+        return Err(IpcError::new(
+            "generation_hash_mismatch",
+            "regenerated PDF content does not match the reviewed preview",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256_text(field: &str, value: &str) -> Result<(), IpcError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(IpcError::new(
+            "validation",
+            format!("{field} must be a lowercase SHA-256 digest"),
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_serialized<T: Serialize>(value: &T) -> Result<String, IpcError> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(sha256_bytes(&bytes))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn replay_pdf_export(
+    existing: &database::OperationAuditRow,
+    request_hash: &str,
+) -> Result<ExportDocumentPdfResponse, IpcError> {
+    if existing.request_hash != request_hash {
+        return Err(IpcError::new(
+            "idempotency_conflict",
+            "idempotencyKey was already used for a different PDF export request",
+        ));
+    }
+    if existing.status == "prepared" {
+        return Err(IpcError::new(
+            "operation_in_progress",
+            "the original PDF export is still being finalized; retry with the same key",
+        ));
+    }
+    if existing.status != "succeeded" {
+        return Err(IpcError::new(
+            "idempotency_conflict",
+            "the original PDF export failed; review the state and use a new key",
+        ));
+    }
+    let details: PdfExportAuditDetails = serde_json::from_str(&existing.details_json)
+        .map_err(|_| IpcError::new("audit_corrupt", "PDF export audit details are invalid"))?;
+    if details.schema_version != legal_services::SERVICE_SCHEMA_VERSION
+        || !path_is_normal_absolute(&details.export_path)
+    {
+        return Err(IpcError::new(
+            "audit_corrupt",
+            "PDF export audit details are incompatible",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&details.export_path)
+        .map_err(|_| IpcError::new("export_missing", "the previously exported PDF is missing"))?;
+    if !metadata.is_file()
+        || is_reparse_point(&metadata)
+        || metadata.len() > MAX_RECOVERABLE_PDF_BYTES
+    {
+        return Err(IpcError::new(
+            "export_changed",
+            "the previously exported PDF is no longer a bounded regular file",
+        ));
+    }
+    if file_sha256(&details.export_path)? != details.file_sha256 {
+        return Err(IpcError::new(
+            "export_changed",
+            "the previously exported PDF no longer matches its audit digest",
+        ));
+    }
+    let file_name = details
+        .export_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| IpcError::new("audit_corrupt", "audited PDF file name is invalid"))?
+        .to_owned();
+    Ok(ExportDocumentPdfResponse {
+        cancelled: false,
+        replayed: true,
+        record_id: Some(details.record_id),
+        file_name: Some(file_name),
+        citation_count: details.citation_count,
+    })
+}
+
+fn validate_selected_pdf_destination(
+    state: &AppState,
+    destination: &Path,
+) -> Result<(PathBuf, LockedDirectory), IpcError> {
+    if !path_is_normal_absolute(destination)
+        || destination.as_os_str().to_string_lossy().len() > MAX_EXPORT_PATH_BYTES
+        || !destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
+    {
+        return Err(IpcError::new(
+            "validation",
+            "the selected destination must be an absolute normal .pdf path",
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| IpcError::new("validation", "selected destination has no parent"))?;
+    reject_reparse_chain(parent)?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|_| IpcError::new("validation", "selected parent directory is unavailable"))?;
+    let parent_metadata = fs::symlink_metadata(&canonical_parent)
+        .map_err(|_| IpcError::new("validation", "selected parent metadata is unavailable"))?;
+    if !parent_metadata.is_dir() || is_reparse_point(&parent_metadata) {
+        return Err(IpcError::new(
+            "validation",
+            "selected parent must be a non-reparse directory",
+        ));
+    }
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| IpcError::new("validation", "selected destination has no file name"))?;
+    let normalized = canonical_parent.join(file_name);
+    let app_data = state
+        .user_database_path()
+        .parent()
+        .ok_or_else(|| IpcError::new("validation", "application data directory is unavailable"))?;
+    if path_is_within_directory(&canonical_parent, app_data)
+        || [
+            state.user_database_path(),
+            state.legal_core_path(),
+            state.crash_log_path(),
+        ]
+        .iter()
+        .any(|protected| crate::commands::release::paths_refer_to_same_file(protected, &normalized))
+    {
+        return Err(IpcError::new(
+            "protected_path",
+            "PDF files cannot be exported into application-managed storage",
+        ));
+    }
+    let parent_lock = lock_directory(&canonical_parent)?;
+    match fs::symlink_metadata(&normalized) {
+        Ok(_) => {
+            return Err(IpcError::new(
+                "output_exists",
+                "PDF export never overwrites an existing destination; choose a new file name",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(IpcError::new(
+                "validation",
+                "selected destination metadata is unavailable",
+            ));
+        }
+    }
+    Ok((normalized, parent_lock))
+}
+
+fn path_is_normal_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
+}
+
+fn path_is_within_directory(path: &Path, directory: &Path) -> bool {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let directory = fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+    let path = path.to_string_lossy().to_lowercase();
+    let mut directory = directory.to_string_lossy().to_lowercase();
+    if !directory.ends_with(std::path::MAIN_SEPARATOR) {
+        directory.push(std::path::MAIN_SEPARATOR);
+    }
+    path == directory.trim_end_matches(std::path::MAIN_SEPARATOR) || path.starts_with(&directory)
+}
+
+fn reject_reparse_chain(path: &Path) -> Result<(), IpcError> {
+    let mut cursor = PathBuf::new();
+    for component in path.components() {
+        cursor.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&cursor)
+            .map_err(|_| IpcError::new("validation", "selected path metadata is unavailable"))?;
+        if !metadata.is_dir() || is_reparse_point(&metadata) {
+            return Err(IpcError::new(
+                "path_escape",
+                "selected path contains a symlink or reparse point",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn lock_directory(path: &Path) -> Result<LockedDirectory, IpcError> {
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(IpcError::new(
+            "path_lock_failed",
+            "selected parent directory could not be locked for export",
+        ));
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err(IpcError::new(
+            "path_lock_failed",
+            "selected parent directory identity could not be verified",
+        ));
+    }
+    Ok(LockedDirectory(handle))
 }
 
 fn current_timestamp() -> String {
@@ -436,9 +1059,42 @@ fn cleanup_prepared_export(
     connection: Option<&rusqlite::Connection>,
 ) -> Result<(), IpcError> {
     if let Some(connection) = connection {
+        if let Some(audit_id) = marker.audit_id.as_deref() {
+            if database::get_operation_audit(connection, audit_id)?
+                .is_some_and(|audit| audit.status == "succeeded")
+            {
+                return Err(IpcError::new(
+                    "document_cleanup",
+                    "a succeeded PDF audit cannot be rolled back automatically",
+                ));
+            }
+        }
         delete_generation_record(connection, &marker.record_id)?;
     }
     rollback_export_files(marker)?;
+    if let (Some(connection), Some(audit_id)) = (connection, marker.audit_id.as_deref()) {
+        match database::compare_and_set_operation_audit_status(
+            connection,
+            audit_id,
+            "failed",
+            &serde_json::json!({
+                "schemaVersion": legal_services::SERVICE_SCHEMA_VERSION,
+                "reason": "pdf_export_rolled_back"
+            })
+            .to_string(),
+        )? {
+            database::OperationAuditStatusUpdateResult::Updated(_)
+            | database::OperationAuditStatusUpdateResult::NotFound => {}
+            database::OperationAuditStatusUpdateResult::Conflict(audit)
+                if audit.status == "failed" => {}
+            database::OperationAuditStatusUpdateResult::Conflict(_) => {
+                return Err(IpcError::new(
+                    "audit_conflict",
+                    "PDF export audit changed during rollback",
+                ));
+            }
+        }
+    }
     let mut completed = marker.clone();
     completed.phase = ExportMarkerPhase::RolledBack;
     write_export_marker(marker_path, &completed)?;
@@ -458,7 +1114,7 @@ fn combine_cleanup_error(primary: IpcError, cleanup: Result<(), IpcError>) -> Ip
     }
 }
 
-/// Repairs the small two-phase journal used to keep exported DOCX files and
+/// Repairs the small two-phase journal used to keep exported PDF files and
 /// their database audit records consistent across a process or power loss.
 pub fn recover_pending_document_exports(
     app_local_data_dir: &Path,
@@ -494,16 +1150,57 @@ pub fn recover_pending_document_exports(
                 |row| row.get(0),
             )
             .map_err(IpcError::from)?;
-        if marker.phase == ExportMarkerPhase::Committed
-            && record_exists
+        let audit = marker
+            .audit_id
+            .as_deref()
+            .map(|audit_id| database::get_operation_audit(&connection, audit_id))
+            .transpose()?
+            .flatten();
+        let durable_success = audit.as_ref().is_some_and(|audit| {
+            audit.status == "succeeded" && (audit.project_id.is_none() || record_exists)
+        }) || (audit.is_none()
+            && marker.phase == ExportMarkerPhase::Committed
+            && record_exists);
+        if durable_success
             && marker.export_path.is_file()
             && file_sha256(&marker.export_path)? == marker.staged_sha256
         {
             remove_file_if_exists(&marker.staged_path)?;
             remove_file_if_exists(&marker.rollback_path)?;
         } else {
+            if audit
+                .as_ref()
+                .is_some_and(|audit| audit.status == "succeeded")
+            {
+                return Err(IpcError::new(
+                    "document_recovery",
+                    "a succeeded PDF audit no longer matches its file or generation record",
+                ));
+            }
             delete_generation_record(&connection, &marker.record_id)?;
             rollback_export_files(&marker)?;
+            if let (Some(audit), Some(audit_id)) = (audit.as_ref(), marker.audit_id.as_deref()) {
+                if audit.status == "prepared" {
+                    match database::compare_and_set_operation_audit_status(
+                        &connection,
+                        audit_id,
+                        "failed",
+                        &serde_json::json!({
+                            "schemaVersion": legal_services::SERVICE_SCHEMA_VERSION,
+                            "reason": "recovered_incomplete_pdf_export"
+                        })
+                        .to_string(),
+                    )? {
+                        database::OperationAuditStatusUpdateResult::Updated(_) => {}
+                        _ => {
+                            return Err(IpcError::new(
+                                "audit_conflict",
+                                "PDF export audit changed during recovery",
+                            ));
+                        }
+                    }
+                }
+            }
             if marker.phase != ExportMarkerPhase::RolledBack {
                 let mut completed = marker.clone();
                 completed.phase = ExportMarkerPhase::RolledBack;
@@ -518,6 +1215,11 @@ pub fn recover_pending_document_exports(
 fn validate_export_marker(marker: &ExportMarker, marker_path: &Path) -> Result<(), IpcError> {
     if marker.format_version != 1
         || Uuid::parse_str(&marker.record_id).is_err()
+        || marker.audit_id.as_deref().is_some_and(|audit_id| {
+            audit_id
+                .strip_prefix("audit:")
+                .is_none_or(|value| Uuid::parse_str(value).is_err())
+        })
         || marker.staged_sha256.len() != 64
         || marker
             .destination_sha256
@@ -572,135 +1274,982 @@ fn validate_export_marker(marker: &ExportMarker, marker_path: &Path) -> Result<(
     Ok(())
 }
 
-fn write_docx(path: &Path, document: &GeneratedDocument) -> Result<(), IpcError> {
+fn write_pdf(path: &Path, document: &GeneratedDocument) -> Result<(), IpcError> {
     let path = absolute_file_path(path)?;
     let path = path.as_path();
-    validate_docx_structure(document)?;
+    validate_pdf_structure(document)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|e| IpcError::new("io", e.to_string()))?;
     }
-    let staged_path = sibling_path(path, "docx-incoming")?;
-    let rollback_path = sibling_path(path, "docx-previous")?;
-    if let Err(error) = write_docx_payload(&staged_path, document) {
-        let _ = fs::remove_file(staged_path);
+    if let Err(error) = write_pdf_payload(path, document) {
+        let _ = fs::remove_file(path);
         return Err(error);
     }
-    let destination_existed = path.exists();
-    if let Err(error) = crate::atomic_file::install(
-        &staged_path,
-        path,
-        destination_existed.then_some(rollback_path.as_path()),
-    ) {
-        let _ = fs::remove_file(staged_path);
-        return Err(IpcError::new("io", error.to_string()));
-    }
-    if rollback_path.exists() {
-        let _ = fs::remove_file(rollback_path);
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        let _ = fs::remove_file(path);
+        IpcError::new("io", error.to_string())
+    })?;
+    if !metadata.is_file()
+        || is_reparse_point(&metadata)
+        || metadata.len() == 0
+        || metadata.len() > MAX_RECOVERABLE_PDF_BYTES
+    {
+        let _ = fs::remove_file(path);
+        return Err(IpcError::new(
+            "pdf_size",
+            "generated PDF is empty or exceeds the recoverable export limit",
+        ));
     }
     Ok(())
 }
 
-fn write_docx_payload(path: &Path, document: &GeneratedDocument) -> Result<(), IpcError> {
-    let file = File::create(path).map_err(|e| IpcError::new("io", e.to_string()))?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let types = content_types_xml();
-    let rels = package_relationships_xml();
-    let document_rels = document_relationships_xml();
-    let mut body = styled_paragraph(&document.title, "Title");
-    body.push_str(&styled_paragraph(
-        &format!(
-            "{} · 模板版本 {} · 内容来源可追溯",
-            document.template.scenario, document.template.version
-        ),
-        "Subtitle",
-    ));
-    for section in &document.sections {
-        let heading_style = match section.level {
-            0 | 1 => "Heading1",
-            2 => "Heading2",
-            _ => "Heading3",
-        };
-        body.push_str(&styled_paragraph(&section.heading, heading_style));
-        for paragraph in &section.paragraphs {
-            if is_numbered_section(&section.heading) {
-                body.push_str(&numbered_paragraph(paragraph));
-            } else if section.heading == "模型草稿（待律师复核）" {
-                body.push_str(&styled_paragraph(paragraph, "ModelDraft"));
-            } else {
-                body.push_str(&styled_paragraph(paragraph, "Normal"));
-            }
+fn write_pdf_payload(path: &Path, document: &GeneratedDocument) -> Result<(), IpcError> {
+    use genpdf::{elements, style, Alignment, Element as _, PaperSize};
+
+    let all_characters = collect_pdf_characters(document);
+    let title_characters = document
+        .title
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<BTreeSet<_>>();
+    let emphasis_characters = collect_pdf_emphasis_characters(document);
+    let fang = load_required_legal_font(
+        "仿宋正文",
+        &["simfang.ttf", "STFANGSO.TTF"],
+        &all_characters,
+    )?;
+    let song = load_required_legal_font(
+        "宋体标题",
+        &["STSONG.TTF", "STZHONGS.TTF", "simfang.ttf"],
+        &title_characters,
+    )?;
+    let bold = load_optional_legal_font(&["simhei.ttf", "STXIHEI.TTF"], &emphasis_characters)?
+        .unwrap_or_else(|| fang.clone());
+    // SimSun-ExtB (`simsunb.ttf`) is an extension-plane font, not the bold
+    // SimSun face its filename suggests. Using it for ordinary Chinese titles
+    // renders BMP glyphs as tofu boxes on a stock Windows installation. Keep
+    // the Song face for every title style so the embedded font always covers
+    // the same legal-document character set.
+    let title_bold = song.clone();
+
+    validate_pdf_font_coverage("宋体标题", &song, std::iter::once(document.title.as_str()))?;
+    validate_pdf_font_coverage(
+        "黑体强调",
+        &bold,
+        document
+            .sections
+            .iter()
+            .map(|section| section.heading.as_str())
+            .chain(
+                document
+                    .tables
+                    .iter()
+                    .flat_map(|table| table.headers.iter().map(String::as_str)),
+            ),
+    )?;
+    validate_pdf_font_coverage(
+        "仿宋正文",
+        &fang,
+        document
+            .sections
+            .iter()
+            .flat_map(|section| section.paragraphs.iter().map(String::as_str))
+            .chain(document.tables.iter().flat_map(|table| {
+                table
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter().map(String::as_str))
+            })),
+    )?;
+
+    let body_family = genpdf::fonts::FontFamily {
+        regular: fang.clone(),
+        bold: bold.clone(),
+        italic: fang,
+        bold_italic: bold,
+    };
+    let title_family = genpdf::fonts::FontFamily {
+        regular: song.clone(),
+        bold: title_bold.clone(),
+        italic: song,
+        bold_italic: title_bold,
+    };
+
+    let mut pdf = genpdf::Document::new(body_family);
+    let title_family = pdf.add_font_family(title_family);
+    pdf.set_title(&document.title);
+    pdf.set_paper_size(PaperSize::A4);
+    pdf.set_font_size(16);
+    pdf.set_line_spacing(1.5);
+    pdf.set_minimal_conformance();
+    let mut decorator = genpdf::SimplePageDecorator::new();
+    decorator.set_margins((25, 25, 25, 28));
+    pdf.set_page_decorator(decorator);
+
+    let title_style = style::Style::new()
+        .with_font_family(title_family)
+        .with_font_size(18)
+        .with_line_spacing(1.25)
+        .bold();
+    pdf.push(
+        breakable_paragraph(&document.title)
+            .aligned(Alignment::Center)
+            .styled(title_style),
+    );
+    pdf.push(elements::Break::new(1.5));
+
+    for (section_index, section) in document.sections.iter().enumerate() {
+        // The public citation appendix must stay visually independent from the
+        // preceding pleading.  Starting it on a fresh page also gives its
+        // widest rows enough room to remain intact.
+        if section_index > 0 && section.heading == "法律依据与案例引用表" {
+            pdf.push(elements::PageBreak::new());
         }
-        for table in document
+        let heading_size = match section.level {
+            0 | 1 => 17,
+            2 => 16,
+            _ => 15,
+        };
+        pdf.push(
+            breakable_paragraph(&section.heading)
+                .styled(style::Style::new().with_font_size(heading_size).bold()),
+        );
+        pdf.push(elements::Break::new(0.5));
+
+        for paragraph in &section.paragraphs {
+            for line in paragraph.lines() {
+                pdf.push(indented_legal_paragraph(line));
+            }
+            pdf.push(elements::Break::new(0.65));
+        }
+
+        for source_table in document
             .tables
             .iter()
             .filter(|table| table.section_heading == section.heading)
         {
-            body.push_str(&table_xml(table));
+            let weights = source_table
+                .column_widths_dxa
+                .iter()
+                .map(|width| usize::try_from(*width).unwrap_or(1).max(1))
+                .collect();
+            pdf.push(PaginatedPdfTable::new(
+                weights,
+                source_table.headers.clone(),
+                source_table
+                    .rows
+                    .iter()
+                    .map(|row| row.cells.clone())
+                    .collect(),
+            ));
+            pdf.push(elements::Break::new(0.8));
         }
-        if !section.source_ids.is_empty() {
-            body.push_str(&styled_paragraph(
-                &source_note(&section.heading, &section.source_ids),
-                "SourceNote",
+    }
+
+    pdf.render_to_file(path)
+        .map_err(|error| IpcError::new("pdf", format!("PDF rendering failed: {error}")))?;
+    optimize_pdf_file(path, &document.title)?;
+    File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| IpcError::new("io", error.to_string()))
+}
+
+/// A table renderer with row-level pagination.
+///
+/// `genpdf`'s stock `TableLayout` resumes a partially rendered row on the next
+/// page without repeating the header.  That is unsuitable for legal citation
+/// appendices: a reader must always be able to identify every continued
+/// column, and an ordinary row must not be cut merely because it began in the
+/// last few lines of a page.  This element measures the wrapped cell content,
+/// emits only complete rows that fit, and reconstructs the header on every
+/// continuation page.  A single row taller than a full page is the sole case
+/// in which the row itself is continued; even then, each continuation receives
+/// a fresh header.
+struct PaginatedPdfTable {
+    column_weights: Vec<usize>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    next_row: usize,
+    next_render_is_fresh_page: bool,
+    oversized_row: Option<genpdf::elements::TableLayout>,
+}
+
+impl PaginatedPdfTable {
+    fn new(column_weights: Vec<usize>, headers: Vec<String>, rows: Vec<Vec<String>>) -> Self {
+        Self {
+            column_weights,
+            headers,
+            rows,
+            next_row: 0,
+            next_render_is_fresh_page: false,
+            oversized_row: None,
+        }
+    }
+
+    fn render_oversized_row(
+        &mut self,
+        context: &genpdf::Context,
+        mut area: genpdf::render::Area<'_>,
+        style: genpdf::style::Style,
+    ) -> Result<genpdf::RenderResult, genpdf::error::Error> {
+        let mut header = build_pdf_table_layout(&self.column_weights, &self.headers, &[], true)?;
+        let header_result = genpdf::Element::render(&mut header, context, area.clone(), style)?;
+        if header_result.has_more {
+            return Err(genpdf::error::Error::new(
+                "PDF table header exceeds the writable page area",
+                genpdf::error::ErrorKind::PageSizeExceeded,
             ));
         }
+
+        area.add_offset(genpdf::Position::new(0, header_result.size.height));
+        let row_result = genpdf::Element::render(
+            self.oversized_row
+                .as_mut()
+                .expect("oversized table row must exist while rendering"),
+            context,
+            area,
+            style,
+        )?;
+        #[cfg(test)]
+        record_pdf_table_page_trace(PdfTablePageTrace {
+            headers: self.headers.clone(),
+            row_start: self.next_row,
+            row_end: self.next_row + 1,
+            oversized_continuation: true,
+        });
+        let mut result = genpdf::RenderResult {
+            size: header_result.size.stack_vertical(row_result.size),
+            has_more: row_result.has_more,
+        };
+
+        if row_result.has_more {
+            self.next_render_is_fresh_page = true;
+        } else {
+            self.oversized_row = None;
+            self.next_row += 1;
+            result.has_more = self.next_row < self.rows.len();
+            self.next_render_is_fresh_page = result.has_more;
+        }
+        Ok(result)
     }
-    body.push_str(&styled_paragraph(
-        &format!(
-            "生成说明：本文件由 Lawyer Assistance 使用 {} v{} 生成；法律依据仅包含状态为 valid 的本地已校验引用。",
-            document.template.name, document.template.version
-        ),
-        "SourceNote",
-    ));
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{body}<w:sectPr><w:headerReference w:type="default" r:id="rId5"/><w:footerReference w:type="default" r:id="rId6"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:cols w:space="720"/><w:docGrid w:linePitch="312"/></w:sectPr></w:body></w:document>"#
-    );
-    let header = header_xml(&document.template.name);
-    let footer = footer_xml();
-    let core = core_properties_xml(&document.title);
-    let styles = styles_xml();
-    for (name, content) in [
-        ("[Content_Types].xml", types.as_str()),
-        ("_rels/.rels", rels.as_str()),
-        ("docProps/core.xml", core.as_str()),
-        ("docProps/app.xml", APP_PROPERTIES_XML),
-        ("word/document.xml", xml.as_str()),
-        ("word/_rels/document.xml.rels", document_rels.as_str()),
-        ("word/styles.xml", styles.as_str()),
-        ("word/numbering.xml", NUMBERING_XML),
-        ("word/settings.xml", SETTINGS_XML),
-        ("word/fontTable.xml", FONT_TABLE_XML),
-        ("word/header1.xml", header.as_str()),
-        ("word/footer1.xml", footer.as_str()),
-    ] {
-        zip.start_file(name, options)
-            .map_err(|e| IpcError::new("docx", e.to_string()))?;
-        zip.write_all(content.as_bytes())
-            .map_err(|e| IpcError::new("docx", e.to_string()))?;
+}
+
+impl genpdf::Element for PaginatedPdfTable {
+    fn render(
+        &mut self,
+        context: &genpdf::Context,
+        area: genpdf::render::Area<'_>,
+        style: genpdf::style::Style,
+    ) -> Result<genpdf::RenderResult, genpdf::error::Error> {
+        let is_fresh_page = self.next_render_is_fresh_page;
+        self.next_render_is_fresh_page = false;
+
+        if self.oversized_row.is_some() {
+            return self.render_oversized_row(context, area, style);
+        }
+
+        if self.rows.is_empty() {
+            let mut header =
+                build_pdf_table_layout(&self.column_weights, &self.headers, &[], true)?;
+            return genpdf::Element::render(&mut header, context, area, style);
+        }
+
+        let header_height = measure_pdf_table_row_height(
+            context,
+            &area,
+            style,
+            &self.column_weights,
+            &self.headers,
+            true,
+        );
+        let available_height = area.size().height;
+        let fit_guard = genpdf::Mm::from(PDF_TABLE_FIT_GUARD_MM);
+        let mut planned_height = header_height + fit_guard;
+        let mut end_row = self.next_row;
+        while end_row < self.rows.len() {
+            let row_height = measure_pdf_table_row_height(
+                context,
+                &area,
+                style,
+                &self.column_weights,
+                &self.rows[end_row],
+                false,
+            );
+            if planned_height + row_height + fit_guard > available_height {
+                break;
+            }
+            planned_height += row_height + fit_guard;
+            end_row += 1;
+        }
+
+        if end_row == self.next_row {
+            if !is_fresh_page {
+                // Consume no vertical space but return a non-zero width, like
+                // genpdf's PageBreak, so the root renderer safely advances to
+                // a clean page and retries this same row.
+                self.next_render_is_fresh_page = true;
+                return Ok(genpdf::RenderResult {
+                    size: genpdf::Size::new(1, 0),
+                    has_more: true,
+                });
+            }
+
+            self.oversized_row = Some(build_pdf_table_layout(
+                &self.column_weights,
+                &self.headers,
+                &self.rows[self.next_row..=self.next_row],
+                false,
+            )?);
+            return self.render_oversized_row(context, area, style);
+        }
+
+        let mut table = build_pdf_table_layout(
+            &self.column_weights,
+            &self.headers,
+            &self.rows[self.next_row..end_row],
+            true,
+        )?;
+        let mut result = genpdf::Element::render(&mut table, context, area, style)?;
+        if result.has_more {
+            return Err(genpdf::error::Error::new(
+                "PDF table row fit calculation did not preserve a complete row",
+                genpdf::error::ErrorKind::PageSizeExceeded,
+            ));
+        }
+
+        #[cfg(test)]
+        record_pdf_table_page_trace(PdfTablePageTrace {
+            headers: self.headers.clone(),
+            row_start: self.next_row,
+            row_end: end_row,
+            oversized_continuation: false,
+        });
+
+        self.next_row = end_row;
+        result.has_more = self.next_row < self.rows.len();
+        self.next_render_is_fresh_page = result.has_more;
+        Ok(result)
     }
-    let file = zip
-        .finish()
-        .map_err(|e| IpcError::new("docx", e.to_string()))?;
+}
+
+fn build_pdf_table_layout(
+    column_weights: &[usize],
+    headers: &[String],
+    rows: &[Vec<String>],
+    include_header: bool,
+) -> Result<genpdf::elements::TableLayout, genpdf::error::Error> {
+    use genpdf::{elements, style, Element as _};
+
+    let mut table = elements::TableLayout::new(column_weights.to_vec());
+    table.set_cell_decorator(elements::FrameCellDecorator::new(true, true, false));
+
+    if include_header {
+        let mut header = table.row();
+        for value in headers {
+            let font_size = if value == "序号" {
+                PDF_TABLE_SEQUENCE_HEADER_FONT_SIZE
+            } else {
+                PDF_TABLE_BODY_FONT_SIZE
+            };
+            header.push_element(
+                breakable_table_header(value)
+                    .styled(style::Style::new().with_font_size(font_size).bold())
+                    .padded((
+                        PDF_TABLE_CELL_VERTICAL_PADDING_MM,
+                        PDF_TABLE_CELL_HORIZONTAL_PADDING_MM,
+                    )),
+            );
+        }
+        header.push()?;
+    }
+
+    for values in rows {
+        let mut row = table.row();
+        for value in values {
+            row.push_element(
+                breakable_table_cell(value)
+                    .styled(style::Style::new().with_font_size(PDF_TABLE_BODY_FONT_SIZE))
+                    .padded((
+                        PDF_TABLE_CELL_VERTICAL_PADDING_MM,
+                        PDF_TABLE_CELL_HORIZONTAL_PADDING_MM,
+                    )),
+            );
+        }
+        row.push()?;
+    }
+    Ok(table)
+}
+
+fn measure_pdf_table_row_height(
+    context: &genpdf::Context,
+    area: &genpdf::render::Area<'_>,
+    parent_style: genpdf::style::Style,
+    column_weights: &[usize],
+    values: &[String],
+    is_header: bool,
+) -> genpdf::Mm {
+    let column_areas = area.split_horizontally(column_weights);
+    column_areas
+        .iter()
+        .zip(values)
+        .map(|(column_area, value)| {
+            let font_size = if is_header && value == "序号" {
+                PDF_TABLE_SEQUENCE_HEADER_FONT_SIZE
+            } else {
+                PDF_TABLE_BODY_FONT_SIZE
+            };
+            let cell_style = parent_style.and({
+                let style = genpdf::style::Style::new().with_font_size(font_size);
+                if is_header {
+                    style.bold()
+                } else {
+                    style
+                }
+            });
+            let content_width = (column_area.size().width
+                - genpdf::Mm::from(2.0 * PDF_TABLE_CELL_HORIZONTAL_PADDING_MM))
+            .max(genpdf::Mm::from(0.1_f32));
+            let line_count = pdf_table_lines(value)
+                .iter()
+                .map(|tokens| {
+                    if tokens.is_empty() {
+                        1
+                    } else {
+                        measure_pdf_wrapped_lines(context, tokens, content_width, cell_style)
+                    }
+                })
+                .sum::<usize>();
+            let content_height = cell_style.line_height(&context.font_cache) * line_count as f64;
+            content_height + genpdf::Mm::from(2.0 * PDF_TABLE_CELL_VERTICAL_PADDING_MM)
+        })
+        .fold(genpdf::Mm::from(0), |height, cell_height| {
+            height.max(cell_height)
+        })
+}
+
+fn measure_pdf_wrapped_lines(
+    context: &genpdf::Context,
+    tokens: &[String],
+    max_width: genpdf::Mm,
+    style: genpdf::style::Style,
+) -> usize {
+    let mut lines = 0_usize;
+    let mut occupied = genpdf::Mm::from(0);
+    let mut has_word = false;
+
+    for token in tokens {
+        let mut remaining = token.as_str();
+        while !remaining.is_empty() {
+            let split_at = remaining
+                .find(' ')
+                .map(|index| index + 1)
+                .unwrap_or(remaining.len());
+            let word = &remaining[..split_at];
+            remaining = &remaining[split_at..];
+            let word_width = style.str_width(&context.font_cache, word);
+            if has_word && occupied + word_width > max_width {
+                lines += 1;
+                occupied = word_width;
+            } else {
+                occupied += word_width;
+            }
+            has_word = true;
+        }
+    }
+
+    lines + usize::from(has_word)
+}
+
+/// genpdf 0.2 only wraps at `StyledString` boundaries without a hyphenator.
+/// These tokens keep Chinese closing punctuation, ISO dates and file extensions
+/// attached to their neighbours while still bounding long opaque identifiers.
+fn breakable_paragraph(value: &str) -> genpdf::elements::Paragraph {
+    pdf_break_tokens(value).into_iter().collect()
+}
+
+fn indented_legal_paragraph(value: &str) -> genpdf::elements::Paragraph {
+    if value.trim().is_empty() || value.starts_with("　　") {
+        breakable_paragraph(value)
+    } else {
+        breakable_paragraph(&format!("　　{value}"))
+    }
+}
+
+fn breakable_table_cell(value: &str) -> genpdf::elements::LinearLayout {
+    let mut layout = genpdf::elements::LinearLayout::vertical();
+    for line in pdf_table_lines(value) {
+        if line.is_empty() {
+            layout.push(genpdf::elements::Break::new(1));
+        } else {
+            layout.push(line.into_iter().collect::<genpdf::elements::Paragraph>());
+        }
+    }
+    layout
+}
+
+fn breakable_table_header(value: &str) -> genpdf::elements::LinearLayout {
+    if value == "序号" {
+        let mut layout = genpdf::elements::LinearLayout::vertical();
+        layout.push(genpdf::elements::Paragraph::new(value));
+        layout
+    } else {
+        breakable_table_cell(value)
+    }
+}
+
+fn pdf_table_lines(value: &str) -> Vec<Vec<String>> {
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(pdf_break_tokens)
+        .collect()
+}
+
+fn pdf_break_tokens(value: &str) -> Vec<String> {
+    const CLOSING_PUNCTUATION: &str = "，。！？；：、）》】」』”’〉〕］｝…";
+    const OPENING_PUNCTUATION: &str = "（《【「『“‘〈〔［｛";
+
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::<String>::new();
+    let mut opening = String::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if character.is_ascii() && !character.is_ascii_whitespace() {
+            let start = index;
+            index += 1;
+            while index < characters.len()
+                && characters[index].is_ascii()
+                && !characters[index].is_ascii_whitespace()
+            {
+                index += 1;
+            }
+            let ascii = characters[start..index].iter().collect::<String>();
+            for (piece_index, piece) in split_pdf_ascii_token(&ascii).into_iter().enumerate() {
+                if piece_index == 0 && piece.starts_with('.') && piece.len() <= 5 {
+                    if let Some(previous) = tokens.last_mut() {
+                        previous.push_str(&opening);
+                        opening.clear();
+                        previous.push_str(&piece);
+                        continue;
+                    }
+                }
+                let mut token = String::new();
+                token.push_str(&opening);
+                opening.clear();
+                token.push_str(&piece);
+                tokens.push(token);
+            }
+            continue;
+        }
+        index += 1;
+
+        if character.is_whitespace() {
+            let mut whitespace = String::new();
+            whitespace.push_str(&opening);
+            opening.clear();
+            whitespace.push(character);
+            while index < characters.len() && characters[index].is_whitespace() {
+                whitespace.push(characters[index]);
+                index += 1;
+            }
+            tokens.push(whitespace);
+        } else if OPENING_PUNCTUATION.contains(character) {
+            opening.push(character);
+        } else if CLOSING_PUNCTUATION.contains(character) {
+            if let Some(previous) = tokens.last_mut() {
+                previous.push_str(&opening);
+                opening.clear();
+                previous.push(character);
+            } else {
+                opening.push(character);
+            }
+        } else {
+            let mut token = String::new();
+            token.push_str(&opening);
+            opening.clear();
+            token.push(character);
+            tokens.push(token);
+        }
+    }
+    if !opening.is_empty() {
+        if let Some(previous) = tokens.last_mut() {
+            previous.push_str(&opening);
+        } else {
+            tokens.push(opening);
+        }
+    }
+    tokens
+}
+
+fn split_pdf_ascii_token(value: &str) -> Vec<String> {
+    if value.chars().count() <= MAX_PDF_ASCII_TOKEN_CHARS {
+        return vec![value.to_owned()];
+    }
+    let mut remaining = value;
+    let mut pieces = Vec::new();
+    while remaining.len() > MAX_PDF_ASCII_TOKEN_CHARS {
+        let window = &remaining[..MAX_PDF_ASCII_TOKEN_CHARS];
+        let cut = window
+            .char_indices()
+            .rev()
+            .find_map(|(index, character)| {
+                matches!(character, ':' | '/' | '\\' | '-' | '_' | '.')
+                    .then_some(index + character.len_utf8())
+            })
+            .filter(|cut| *cut >= 4)
+            .unwrap_or(MAX_PDF_ASCII_TOKEN_CHARS);
+        pieces.push(remaining[..cut].to_owned());
+        remaining = &remaining[cut..];
+    }
+    if !remaining.is_empty() {
+        pieces.push(remaining.to_owned());
+    }
+    pieces
+}
+
+fn collect_pdf_characters(document: &GeneratedDocument) -> BTreeSet<char> {
+    // U+3000 is inserted by `indented_legal_paragraph` even when it is not
+    // present in the generated document model.
+    let mut characters = BTreeSet::from([' ', '-', '\u{3000}']);
+    extend_pdf_characters(&mut characters, &document.title);
+    for section in &document.sections {
+        extend_pdf_characters(&mut characters, &section.heading);
+        for paragraph in &section.paragraphs {
+            extend_pdf_characters(&mut characters, paragraph);
+        }
+    }
+    for table in &document.tables {
+        for header in &table.headers {
+            extend_pdf_characters(&mut characters, header);
+        }
+        for row in &table.rows {
+            for cell in &row.cells {
+                extend_pdf_characters(&mut characters, cell);
+            }
+        }
+    }
+    characters
+}
+
+fn collect_pdf_emphasis_characters(document: &GeneratedDocument) -> BTreeSet<char> {
+    let mut characters = BTreeSet::from([' ', '-']);
+    for section in &document.sections {
+        extend_pdf_characters(&mut characters, &section.heading);
+    }
+    for table in &document.tables {
+        for header in &table.headers {
+            extend_pdf_characters(&mut characters, header);
+        }
+    }
+    characters
+}
+
+fn extend_pdf_characters(characters: &mut BTreeSet<char>, value: &str) {
+    characters.extend(value.chars().filter(|character| !character.is_control()));
+}
+
+fn windows_font_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(windows) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) {
+        directories.push(PathBuf::from(windows).join("Fonts"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        directories.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
+    }
+    directories
+}
+
+fn find_legal_font(file_names: &[&str]) -> Option<PathBuf> {
+    windows_font_directories()
+        .into_iter()
+        .flat_map(|directory| {
+            file_names
+                .iter()
+                .map(move |file_name| directory.join(file_name))
+        })
+        .find(|path| path.is_file())
+}
+
+fn load_required_legal_font(
+    role: &str,
+    file_names: &[&str],
+    retained_characters: &BTreeSet<char>,
+) -> Result<genpdf::fonts::FontData, IpcError> {
+    let path = find_legal_font(file_names).ok_or_else(|| {
+        IpcError::new(
+            "pdf_font",
+            format!(
+                "未找到{role}字体（{}）。请在 Windows 字体中安装后重试。",
+                file_names.join(" / ")
+            ),
+        )
+    })?;
+    load_subset_legal_font(role, &path, retained_characters)
+}
+
+fn load_optional_legal_font(
+    file_names: &[&str],
+    retained_characters: &BTreeSet<char>,
+) -> Result<Option<genpdf::fonts::FontData>, IpcError> {
+    find_legal_font(file_names)
+        .map(|path| load_subset_legal_font("黑体强调", &path, retained_characters))
+        .transpose()
+}
+
+fn load_subset_legal_font(
+    role: &str,
+    path: &Path,
+    retained_characters: &BTreeSet<char>,
+) -> Result<genpdf::fonts::FontData, IpcError> {
+    let bytes = fs::read(path).map_err(|error| {
+        IpcError::new(
+            "pdf_font",
+            format!("无法读取{role}字体 {}：{error}", path.display()),
+        )
+    })?;
+    let reader = FontReader::new(&bytes).map_err(|error| {
+        IpcError::new(
+            "pdf_font",
+            format!("无法解析{role}字体 {}：{error}", path.display()),
+        )
+    })?;
+
+    let os2 = reader
+        .raw_tables()
+        .find_map(|(tag, bytes)| (tag == TableTag::OS2).then_some(bytes))
+        .ok_or_else(|| IpcError::new("pdf_font", format!("{role}字体缺少 OS/2 许可表。")))?;
+    if os2.len() < 10 {
+        return Err(IpcError::new(
+            "pdf_font",
+            format!("{role}字体的 OS/2 许可表不完整。"),
+        ));
+    }
+    let os2_version = u16::from_be_bytes([os2[0], os2[1]]);
+    let fs_type = u16::from_be_bytes([os2[8], os2[9]]);
+    let embedding = fs_type & 0x000f;
+    if !matches!(embedding, 0 | 8) || fs_type & 0x0200 != 0 {
+        return Err(IpcError::new(
+            "pdf_font_license",
+            format!("{role}字体的许可证不允许可编辑的轮廓嵌入，已拒绝生成 PDF。"),
+        ));
+    }
+
+    // font-subset 0.1 supports OS/2 versions 2..=5. Windows' licensed
+    // STSong/STFangsong faces use the older, valid 86-byte version-1 table.
+    // Preserve those fonts in full and rely on the PDF post-processor to
+    // deduplicate the repeated family slots. This is a compatibility fallback,
+    // not a license bypass: fsType was checked directly above.
+    if os2_version == 1 {
+        return genpdf::fonts::FontData::new(bytes, None).map_err(|error| {
+            IpcError::new(
+                "pdf_font",
+                format!("无法加载兼容的{role}字体 {}：{error}", path.display()),
+            )
+        });
+    }
+
+    let font: Font<'_> = reader.read().map_err(|error| {
+        IpcError::new(
+            "pdf_font",
+            format!("无法解析{role}字体 {}：{error}", path.display()),
+        )
+    })?;
+    let permissions = font.permissions();
+    if !permissions.embedding.is_lenient()
+        || !permissions.allow_subsetting
+        || permissions.embed_only_bitmaps
+    {
+        return Err(IpcError::new(
+            "pdf_font_license",
+            format!("{role}字体的许可证不允许嵌入并子集化，已拒绝生成 PDF。"),
+        ));
+    }
+    let supported_characters = retained_characters
+        .iter()
+        .copied()
+        .filter(|character| font.contains_char(*character))
+        .collect::<BTreeSet<_>>();
+    if supported_characters.is_empty() {
+        return Err(IpcError::new(
+            "pdf_font",
+            format!("{role}字体不包含文书所需的任何字形。"),
+        ));
+    }
+    let subset = font.subset(&supported_characters).map_err(|error| {
+        IpcError::new(
+            "pdf_font",
+            format!("无法子集化{role}字体 {}：{error}", path.display()),
+        )
+    })?;
+    genpdf::fonts::FontData::new(subset.to_opentype(), None).map_err(|error| {
+        IpcError::new(
+            "pdf_font",
+            format!("无法加载子集化的{role}字体 {}：{error}", path.display()),
+        )
+    })
+}
+
+fn optimize_pdf_file(path: &Path, title: &str) -> Result<(), IpcError> {
+    let mut document = lopdf::Document::load(path)
+        .map_err(|error| IpcError::new("pdf", format!("PDF post-processing failed: {error}")))?;
+    deduplicate_pdf_font_streams(&mut document);
+    set_pdf_title_metadata(&mut document, title)?;
+    document.prune_objects();
+    document.compress();
+    let file = document
+        .save(path)
+        .map_err(|error| IpcError::new("pdf", format!("PDF optimization failed: {error}")))?;
     file.sync_all()
-        .map_err(|error| IpcError::new("io", error.to_string()))?;
+        .map_err(|error| IpcError::new("io", error.to_string()))
+}
+
+fn deduplicate_pdf_font_streams(document: &mut lopdf::Document) {
+    let mut canonical = HashMap::<(i64, [u8; 32]), PdfObjectId>::new();
+    let mut replacements = HashMap::<PdfObjectId, PdfObjectId>::new();
+    for (object_id, object) in &document.objects {
+        let PdfObject::Stream(stream) = object else {
+            continue;
+        };
+        let Ok(length) = stream.dict.get(b"Length1").and_then(PdfObject::as_i64) else {
+            continue;
+        };
+        if length < 0 || usize::try_from(length).ok() != Some(stream.content.len()) {
+            continue;
+        }
+        let digest: [u8; 32] = Sha256::digest(&stream.content).into();
+        if let Some(canonical_id) = canonical.get(&(length, digest)) {
+            replacements.insert(*object_id, *canonical_id);
+        } else {
+            canonical.insert((length, digest), *object_id);
+        }
+    }
+    if replacements.is_empty() {
+        return;
+    }
+    for object in document.objects.values_mut() {
+        replace_pdf_references(object, &replacements);
+    }
+    for (_, object) in document.trailer.iter_mut() {
+        replace_pdf_references(object, &replacements);
+    }
+}
+
+fn replace_pdf_references(
+    object: &mut PdfObject,
+    replacements: &HashMap<PdfObjectId, PdfObjectId>,
+) {
+    match object {
+        PdfObject::Reference(object_id) => {
+            if let Some(replacement) = replacements.get(object_id) {
+                *object_id = *replacement;
+            }
+        }
+        PdfObject::Array(objects) => {
+            for object in objects {
+                replace_pdf_references(object, replacements);
+            }
+        }
+        PdfObject::Dictionary(dictionary) => {
+            for (_, object) in dictionary.iter_mut() {
+                replace_pdf_references(object, replacements);
+            }
+        }
+        PdfObject::Stream(stream) => {
+            for (_, object) in stream.dict.iter_mut() {
+                replace_pdf_references(object, replacements);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn set_pdf_title_metadata(document: &mut lopdf::Document, title: &str) -> Result<(), IpcError> {
+    let info_id = match document
+        .trailer
+        .get(b"Info")
+        .and_then(PdfObject::as_reference)
+    {
+        Ok(info_id) => info_id,
+        Err(_) => {
+            let info_id = document.add_object(lopdf::Dictionary::new());
+            document.trailer.set("Info", PdfObject::Reference(info_id));
+            info_id
+        }
+    };
+    let info = document
+        .objects
+        .get_mut(&info_id)
+        .and_then(|object| object.as_dict_mut().ok())
+        .ok_or_else(|| IpcError::new("pdf", "PDF metadata dictionary is invalid"))?;
+    info.set(
+        "Title",
+        PdfObject::String(pdf_utf16be(title), PdfStringFormat::Hexadecimal),
+    );
     Ok(())
 }
 
-fn validate_docx_structure(document: &GeneratedDocument) -> Result<(), IpcError> {
+fn pdf_utf16be(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(value.len().saturating_mul(2).saturating_add(2));
+    bytes.extend_from_slice(&[0xFE, 0xFF]);
+    for unit in value.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    bytes
+}
+
+fn validate_pdf_font_coverage<'a>(
+    role: &str,
+    font: &genpdf::fonts::FontData,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), IpcError> {
+    let family = genpdf::fonts::FontFamily {
+        regular: font.clone(),
+        bold: font.clone(),
+        italic: font.clone(),
+        bold_italic: font.clone(),
+    };
+    let cache = genpdf::fonts::FontCache::new(family);
+    let cached_font = cache.default_font_family().regular;
+
+    for value in values {
+        let glyph_ids = cached_font.glyph_ids(&cache, value.chars());
+        if let Some(character) = value
+            .chars()
+            .zip(glyph_ids)
+            .find_map(|(character, glyph_id)| {
+                (!character.is_whitespace() && glyph_id == 0).then_some(character)
+            })
+        {
+            return Err(IpcError::new(
+                "pdf_font",
+                format!(
+                    "{role}字体缺少 U+{:04X} 字形，已拒绝生成包含方框缺字的 PDF。",
+                    u32::from(character)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pdf_structure(document: &GeneratedDocument) -> Result<(), IpcError> {
     for table in &document.tables {
-        let width = table.column_widths_dxa.iter().copied().sum::<u32>();
         if table.headers.is_empty()
             || table.headers.len() != table.column_widths_dxa.len()
-            || width != 9_360
+            || table.column_widths_dxa.contains(&0)
             || table
                 .rows
                 .iter()
                 .any(|row| row.cells.len() != table.headers.len())
         {
             return Err(IpcError::new(
-                "docx_structure",
+                "pdf_structure",
                 format!(
-                    "table '{}' must have matching headers/cells and exactly 9360 DXA width",
+                    "table '{}' must have matching non-empty headers, widths and cells",
                     table.section_heading
                 ),
             ));
@@ -709,196 +2258,10 @@ fn validate_docx_structure(document: &GeneratedDocument) -> Result<(), IpcError>
     Ok(())
 }
 
-fn content_types_xml() -> String {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#.to_owned()
-}
-
-fn package_relationships_xml() -> String {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#.to_owned()
-}
-
-fn document_relationships_xml() -> String {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/><Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/></Relationships>"#.to_owned()
-}
-
-fn core_properties_xml(title: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>{}</dc:title><dc:creator>Lawyer Assistance</dc:creator><cp:lastModifiedBy>Lawyer Assistance</cp:lastModifiedBy><dc:subject>可追溯法律文书</dc:subject><dc:description>由本地案件工作区和已校验法律引用生成</dc:description></cp:coreProperties>"#,
-        escape_xml(title)
-    )
-}
-
-fn header_xml(template_name: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="0"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="微软雅黑"/><w:color w:val="6B7280"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr><w:t xml:space="preserve">Lawyer Assistance · {}</w:t></w:r></w:p></w:hdr>"#,
-        escape_xml(template_name)
-    )
-}
-
-fn footer_xml() -> String {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:pStyle w:val="SourceNote"/><w:jc w:val="right"/><w:spacing w:before="0" w:after="0"/></w:pPr><w:r><w:t>第 </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t> 页</w:t></w:r></w:p></w:ftr>"#.to_owned()
-}
-
-fn styles_xml() -> String {
-    // A 22-point CJK title leaves a single orphan character for ordinary
-    // matter names such as the acceptance case. Keep the same centered title
-    // hierarchy at 18 points so the complete title fits the printable width.
-    STYLES_XML
-        .replacen(
-            "w:after=\"240\" w:line=\"528\" w:lineRule=\"auto\"",
-            "w:after=\"240\" w:line=\"432\" w:lineRule=\"auto\"",
-            1,
-        )
-        .replacen(
-            "<w:sz w:val=\"44\"/><w:szCs w:val=\"44\"/>",
-            "<w:sz w:val=\"36\"/><w:szCs w:val=\"36\"/>",
-            1,
-        )
-}
-
-fn styled_paragraph(text: &str, style: &str) -> String {
-    format!(
-        "<w:p><w:pPr><w:pStyle w:val=\"{}\"/></w:pPr>{}</w:p>",
-        style,
-        runs_xml(text)
-    )
-}
-
-fn numbered_paragraph(text: &str) -> String {
-    format!(
-        "<w:p><w:pPr><w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>{}</w:p>",
-        runs_xml(text)
-    )
-}
-
-fn runs_xml(text: &str) -> String {
-    let mut output = String::new();
-    for (index, line) in text.split('\n').enumerate() {
-        if index > 0 {
-            output.push_str("<w:r><w:br/></w:r>");
-        }
-        output.push_str(&format!(
-            "<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>",
-            escape_xml(line)
-        ));
-    }
-    output
-}
-
-fn table_xml(table: &DocumentTable) -> String {
-    let mut output = String::from(
-        "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"9360\" w:type=\"dxa\"/><w:tblInd w:w=\"120\" w:type=\"dxa\"/><w:tblLayout w:type=\"fixed\"/><w:tblCellMar><w:top w:w=\"80\" w:type=\"dxa\"/><w:left w:w=\"120\" w:type=\"dxa\"/><w:bottom w:w=\"80\" w:type=\"dxa\"/><w:right w:w=\"120\" w:type=\"dxa\"/></w:tblCellMar><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:color=\"AEB8C4\"/><w:left w:val=\"single\" w:sz=\"4\" w:color=\"AEB8C4\"/><w:bottom w:val=\"single\" w:sz=\"4\" w:color=\"AEB8C4\"/><w:right w:val=\"single\" w:sz=\"4\" w:color=\"AEB8C4\"/><w:insideH w:val=\"single\" w:sz=\"4\" w:color=\"D5DAE1\"/><w:insideV w:val=\"single\" w:sz=\"4\" w:color=\"D5DAE1\"/></w:tblBorders></w:tblPr><w:tblGrid>",
-    );
-    for width in &table.column_widths_dxa {
-        output.push_str(&format!("<w:gridCol w:w=\"{width}\"/>"));
-    }
-    output.push_str("</w:tblGrid><w:tr><w:trPr><w:tblHeader/><w:cantSplit/></w:trPr>");
-    for (column, (header, width)) in table
-        .headers
-        .iter()
-        .zip(&table.column_widths_dxa)
-        .enumerate()
-    {
-        output.push_str(&table_cell_xml(header, *width, true, column, header));
-    }
-    output.push_str("</w:tr>");
-    for row in &table.rows {
-        output.push_str("<w:tr><w:trPr><w:cantSplit/></w:trPr>");
-        for (column, ((cell, width), header)) in row
-            .cells
-            .iter()
-            .zip(&table.column_widths_dxa)
-            .zip(&table.headers)
-            .enumerate()
-        {
-            output.push_str(&table_cell_xml(cell, *width, false, column, header));
-        }
-        output.push_str("</w:tr>");
-    }
-    output.push_str("</w:tbl>");
-    output
-}
-
-fn table_cell_xml(text: &str, width: u32, header_row: bool, column: usize, header: &str) -> String {
-    let fill = if header_row {
-        "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F2F4F7\"/>"
-    } else {
-        ""
-    };
-    let alignment = if header_row || should_center_column(column, header) {
-        "center"
-    } else {
-        "left"
-    };
-    let style = if header_row {
-        "TableHeader"
-    } else {
-        "TableText"
-    };
-    format!(
-        "<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/><w:vAlign w:val=\"center\"/>{fill}</w:tcPr><w:p><w:pPr><w:pStyle w:val=\"{style}\"/><w:jc w:val=\"{alignment}\"/></w:pPr>{}</w:p></w:tc>",
-        runs_xml(text)
-    )
-}
-
-fn should_center_column(column: usize, header: &str) -> bool {
-    column == 0 && matches!(header, "序号" | "日期" | "诉讼地位")
-}
-
-fn is_numbered_section(heading: &str) -> bool {
-    matches!(
-        heading,
-        "诉讼请求" | "答辩意见" | "争点清单" | "正式要求" | "待核对事项"
-    )
-}
-
-fn source_note(heading: &str, source_ids: &[String]) -> String {
-    let kind = if heading == "模型草稿（待律师复核）" {
-        "模型草稿（须律师复核）"
-    } else if matches!(
-        heading,
-        "法律依据" | "法律依据与检索结果" | "引用来源映射" | "检索结论使用说明"
-    ) {
-        "本地已校验法律引用"
-    } else {
-        "案件工作区已确认数据"
-    };
-    format!("来源：{kind}｜{}", source_ids.join("、"))
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| {
-            matches!(*character, '\u{0009}' | '\u{000A}' | '\u{000D}')
-                || (*character >= '\u{0020}' && *character <= '\u{D7FF}')
-                || (*character >= '\u{E000}' && *character <= '\u{FFFD}')
-                || (*character >= '\u{10000}' && *character <= '\u{10FFFF}')
-        })
-        .flat_map(|character| match character {
-            '&' => "&amp;".chars().collect::<Vec<_>>(),
-            '<' => "&lt;".chars().collect(),
-            '>' => "&gt;".chars().collect(),
-            '"' => "&quot;".chars().collect(),
-            '\'' => "&apos;".chars().collect(),
-            other => vec![other],
-        })
-        .collect()
-}
-
-const APP_PROPERTIES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Lawyer Assistance</Application><AppVersion>2.0</AppVersion><Company></Company><DocSecurity>0</DocSecurity><ScaleCrop>false</ScaleCrop><LinksUpToDate>false</LinksUpToDate><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged></Properties>"#;
-
-const SETTINGS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:zoom w:percent="100"/><w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="doNotCompress"/><w:updateFields w:val="true"/><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>"#;
-
-const FONT_TABLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:font w:name="Calibri"><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font><w:font w:name="宋体"><w:family w:val="roman"/><w:charset w:val="86"/><w:pitch w:val="variable"/></w:font><w:font w:name="微软雅黑"><w:family w:val="swiss"/><w:charset w:val="86"/><w:pitch w:val="variable"/></w:font></w:fonts>"#;
-
-const NUMBERING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="singleLevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/><w:pPr><w:tabs><w:tab w:val="num" w:pos="720"/></w:tabs><w:ind w:left="720" w:hanging="360"/><w:spacing w:after="160" w:line="280" w:lineRule="auto"/></w:pPr></w:lvl></w:abstractNum><w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="singleLevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:tabs><w:tab w:val="num" w:pos="720"/></w:tabs><w:ind w:left="720" w:hanging="360"/><w:spacing w:after="160" w:line="280" w:lineRule="auto"/></w:pPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#;
-
-const STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="宋体" w:cs="Times New Roman"/><w:sz w:val="22"/><w:szCs w:val="22"/><w:lang w:val="en-US" w:eastAsia="zh-CN"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:before="0" w:after="120" w:line="264" w:lineRule="auto"/><w:widowControl/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/><w:pPr><w:spacing w:before="0" w:after="120" w:line="264" w:lineRule="auto"/><w:jc w:val="left"/><w:widowControl/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="宋体"/><w:sz w:val="22"/><w:szCs w:val="22"/><w:color w:val="1F2937"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Subtitle"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="0" w:after="240" w:line="528" w:lineRule="auto"/><w:jc w:val="center"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="微软雅黑"/><w:b/><w:color w:val="111827"/><w:sz w:val="44"/><w:szCs w:val="44"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="0" w:after="240" w:line="240" w:lineRule="auto"/><w:jc w:val="center"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="微软雅黑"/><w:color w:val="6B7280"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="320" w:after="160" w:line="384" w:lineRule="auto"/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="微软雅黑"/><w:b/><w:color w:val="2E74B5"/><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="240" w:after="120" w:line="312" w:lineRule="auto"/><w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="微软雅黑"/><w:b/><w:color w:val="2E74B5"/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="160" w:after="80" w:line="288" w:lineRule="auto"/><w:outlineLvl w:val="2"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="微软雅黑"/><w:b/><w:color w:val="1F4D78"/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="0" w:after="160" w:line="280" w:lineRule="auto"/><w:contextualSpacing/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="SourceNote"><w:name w:val="Source Note"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="80" w:after="80" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="宋体"/><w:i/><w:color w:val="6B7280"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="ModelDraft"><w:name w:val="Model Draft"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="80" w:after="120" w:line="280" w:lineRule="auto"/><w:ind w:left="120" w:right="120"/><w:shd w:val="clear" w:fill="FFF8E8"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="宋体"/><w:color w:val="7A5A00"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="TableText"><w:name w:val="Table Text"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:widowControl/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="宋体"/><w:sz w:val="20"/><w:szCs w:val="20"/><w:color w:val="1F2937"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="TableHeader"><w:name w:val="Table Header"/><w:basedOn w:val="TableText"/><w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:keepNext/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="微软雅黑"/><w:b/><w:color w:val="1F3A5F"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style><w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:uiPriority w:val="59"/><w:tblPr><w:tblInd w:w="120" w:type="dxa"/><w:tblCellMar><w:top w:w="80" w:type="dxa"/><w:left w:w="120" w:type="dxa"/><w:bottom w:w="80" w:type="dxa"/><w:right w:w="120" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style></w:styles>"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::document::generate_document;
     use domain::{
         case::{
             CaseFact, CaseParty, CaseProject, CaseProjectStatus, CaseWorkspace, ConfirmationStatus,
@@ -906,7 +2269,34 @@ mod tests {
         },
         qa::CitationStatus,
     };
-    use std::io::Read;
+
+    #[test]
+    fn case_document_validation_error_preserves_only_safe_missing_field_details() {
+        let error = legal_services::ServiceError::new(
+            "document_validation_failed",
+            "case is incomplete for the requested document template",
+            false,
+        )
+        .with_details(serde_json::json!({
+            "code": "missing_required_fields",
+            "missingFields": ["claims", "facts", "private_internal_field"],
+            "invalidCitationIds": ["law:secret-source"],
+        }));
+
+        let ipc = document_service_error(error);
+        assert_eq!(ipc.error_type, "document_validation");
+        let payload: serde_json::Value = serde_json::from_str(&ipc.message).unwrap();
+        assert_eq!(
+            payload["missingFields"],
+            serde_json::json!(["claims", "facts"])
+        );
+        assert_eq!(
+            payload["invalidCitationIds"],
+            serde_json::json!(["待重新核验"])
+        );
+        assert!(!ipc.message.contains("private_internal_field"));
+        assert!(!ipc.message.contains("law:secret-source"));
+    }
 
     fn acceptance_workspace() -> CaseWorkspace {
         CaseWorkspace {
@@ -1086,9 +2476,9 @@ mod tests {
                     version_id: "flk-version-ff808081729d1efe01729d50b5c500bf".into(),
                     document_title: "中华人民共和国民法典".into(),
                     version_label: "2020-05-28公布版本".into(),
-                    article_number: "第五百七十七条".into(),
+                    article_number: "第五百七十七条第一款".into(),
                     article_title: None,
-                    canonical_label: "《中华人民共和国民法典》第五百七十七条".into(),
+                    canonical_label: "《中华人民共和国民法典》第五百七十七条第一款".into(),
                     effective_from: "2021-01-01".into(),
                     effective_to: None,
                     version_status: "in_force".into(),
@@ -1109,9 +2499,9 @@ mod tests {
                     version_id: "flk-version-ff808081729d1efe01729d50b5c500bf".into(),
                     document_title: "中华人民共和国民法典".into(),
                     version_label: "2020-05-28公布版本".into(),
-                    article_number: "第五百二十六条".into(),
+                    article_number: "第五百二十六条第一款".into(),
                     article_title: None,
-                    canonical_label: "《中华人民共和国民法典》第五百二十六条".into(),
+                    canonical_label: "《中华人民共和国民法典》第五百二十六条第一款".into(),
                     effective_from: "2021-01-01".into(),
                     effective_to: None,
                     version_status: "in_force".into(),
@@ -1125,19 +2515,96 @@ mod tests {
         }
     }
 
-    fn read_part(path: &Path, part: &str) -> String {
-        let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
-        let mut content = String::new();
-        archive
-            .by_name(part)
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        content
+    #[test]
+    fn legacy_document_pdf_export_is_disabled_without_exact_privacy_receipt() {
+        let error = require_privacy_safe_document_export().unwrap_err();
+        assert_eq!(error.error_type, "privacy_required");
+        assert!(error.message.contains("export_approved_review_pdf"));
+        assert!(!error.message.contains("case"));
+    }
+    #[test]
+    fn case_pdf_export_requires_confirmation_and_the_exact_preview_seal() {
+        let document =
+            generate_document(&acceptance_workspace(), DocumentTemplateId::Complaint, None)
+                .unwrap();
+        let request = ExportDocumentPdfRequest {
+            project_id: Some("qa-case-2026-001".into()),
+            standalone_input: None,
+            template_id: DocumentTemplateId::Complaint,
+            model_draft: None,
+            expected_revision: Some("a".repeat(64)),
+            generation_hash: "b".repeat(64),
+            confirmed: true,
+            idempotency_key: "pdf-export-seal-test".into(),
+        };
+        let generated = GeneratedPreview {
+            document,
+            case_revision: Some("a".repeat(64)),
+            generation_hash: "b".repeat(64),
+        };
+        validate_pdf_export_request(&request).unwrap();
+        verify_generation_seal(&request, &generated).unwrap();
+
+        let mut stale = request.clone();
+        stale.expected_revision = Some("c".repeat(64));
+        assert_eq!(
+            verify_generation_seal(&stale, &generated)
+                .unwrap_err()
+                .error_type,
+            "revision_conflict"
+        );
+        let mut unconfirmed = request;
+        unconfirmed.confirmed = false;
+        assert_eq!(
+            validate_pdf_export_request(&unconfirmed)
+                .unwrap_err()
+                .error_type,
+            "confirmation_required"
+        );
     }
 
     #[test]
-    fn docx_is_a_complete_parseable_office_zip_without_external_runtime() {
+    fn succeeded_pdf_export_replays_only_when_the_audited_file_still_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        let export = directory.path().join("reviewed.pdf");
+        fs::write(&export, b"reviewed-pdf").unwrap();
+        let details = PdfExportAuditDetails {
+            schema_version: legal_services::SERVICE_SCHEMA_VERSION,
+            record_id: "record-1".into(),
+            export_path: export.clone(),
+            file_sha256: file_sha256(&export).unwrap(),
+            citation_count: 3,
+            case_revision: Some("a".repeat(64)),
+            generation_hash: "b".repeat(64),
+        };
+        let audit = database::OperationAuditRow {
+            audit_id: format!("audit:{}", Uuid::new_v4()),
+            origin: "desktop".into(),
+            operation: "document_export_pdf".into(),
+            project_id: Some("qa-case-2026-001".into()),
+            request_hash: "c".repeat(64),
+            idempotency_key_hash: Some("d".repeat(64)),
+            status: "succeeded".into(),
+            details_json: serde_json::to_string(&details).unwrap(),
+            created_at: "1".into(),
+            finished_at: Some("2".into()),
+        };
+
+        let response = replay_pdf_export(&audit, &audit.request_hash).unwrap();
+        assert!(response.replayed);
+        assert_eq!(response.file_name.as_deref(), Some("reviewed.pdf"));
+
+        fs::write(&export, b"changed").unwrap();
+        assert_eq!(
+            replay_pdf_export(&audit, &audit.request_hash)
+                .unwrap_err()
+                .error_type,
+            "export_changed"
+        );
+    }
+
+    #[test]
+    fn pdf_export_has_a_valid_header_trailer_and_embedded_content() {
         let temp = tempfile::tempdir().unwrap();
         let doc = generate_document(
             &acceptance_workspace(),
@@ -1145,49 +2612,171 @@ mod tests {
             Some("律师复核意见：应核对每项证据原件及送达凭证。"),
         )
         .unwrap();
-        let path = temp.path().join("test.docx");
-        write_docx(&path, &doc).unwrap();
-        let mut archive = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
-        for part in [
-            "word/document.xml",
-            "word/styles.xml",
-            "word/numbering.xml",
-            "word/settings.xml",
-            "word/fontTable.xml",
-            "word/header1.xml",
-            "word/footer1.xml",
-            "docProps/core.xml",
-        ] {
-            assert!(archive.by_name(part).is_ok(), "missing DOCX part {part}");
-        }
-        drop(archive);
+        let citation_table = doc
+            .tables
+            .iter()
+            .find(|table| table.section_heading == "法律依据与案例引用表")
+            .expect("PDF input includes the final public citation table");
+        assert!(citation_table
+            .rows
+            .iter()
+            .any(|row| row.cells.get(3).is_some_and(|cell| cell == "2021年起施行")));
+        assert!(citation_table
+            .rows
+            .iter()
+            .all(|row| row.cells.get(3).is_none_or(|cell| cell != "2021年")));
+        let path = temp.path().join("test.pdf");
+        write_pdf(&path, &doc).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(bytes.windows(5).any(|window| window == b"%%EOF"));
+        assert!(bytes.len() > 100_000, "embedded Chinese fonts are expected");
+        assert!(
+            bytes.len() < 20 * 1024 * 1024,
+            "the visual fixture must use subsetted or deduplicated fonts"
+        );
 
-        let document_xml = read_part(&path, "word/document.xml");
-        assert!(document_xml.contains("<w:pgSz w:w=\"12240\" w:h=\"15840\"/>"));
-        assert!(document_xml.contains("w:top=\"1440\""));
-        assert!(document_xml.contains("<w:tblW w:w=\"9360\" w:type=\"dxa\"/>"));
-        assert!(document_xml.contains("<w:tblHeader/>"));
-        assert!(document_xml.contains("软件采购合同及签章页"));
-        assert!(document_xml.contains("律师复核意见：应核对每项证据原件及送达凭证。"));
-        let styles = read_part(&path, "word/styles.xml");
-        assert!(styles.contains("w:eastAsia=\"宋体\""));
-        assert!(styles.contains("w:eastAsia=\"微软雅黑\""));
-        assert!(styles.contains("w:styleId=\"Heading2\""));
-        assert!(styles.contains("w:styleId=\"TableHeader\""));
-        let title_style = styles
-            .split("w:styleId=\"Title\"")
-            .nth(1)
-            .and_then(|suffix| suffix.split("</w:style>").next())
-            .expect("Title style exists");
-        assert!(title_style.contains("w:line=\"432\""));
-        assert!(title_style.contains("w:sz w:val=\"36\""));
-        assert!(title_style.contains("w:szCs w:val=\"36\""));
-        assert!(read_part(&path, "word/footer1.xml").contains("PAGE"));
+        let parsed = lopdf::Document::load(&path).unwrap();
+        let embedded_fonts = parsed
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                PdfObject::Stream(stream) if stream.dict.has(b"Length1") => Some(stream),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!embedded_fonts.is_empty());
+        assert!(embedded_fonts.len() <= 3);
+        assert!(embedded_fonts
+            .iter()
+            .all(|stream| stream.content.len() < 16 * 1024 * 1024));
+
+        let info_id = parsed
+            .trailer
+            .get(b"Info")
+            .and_then(PdfObject::as_reference)
+            .unwrap();
+        let title = parsed
+            .objects
+            .get(&info_id)
+            .and_then(|object| object.as_dict().ok())
+            .and_then(|dictionary| dictionary.get(b"Title").ok())
+            .unwrap();
+        let PdfObject::String(raw_title, PdfStringFormat::Hexadecimal) = title else {
+            panic!("PDF title must be an explicit UTF-16BE hexadecimal string");
+        };
+        assert_eq!(raw_title, &pdf_utf16be(&doc.title));
+        assert!(raw_title.starts_with(&[0xFE, 0xFF]));
+        let decoded_units = raw_title[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(String::from_utf16(&decoded_units).unwrap(), doc.title);
     }
 
     #[test]
-    fn all_six_templates_export_with_fixed_table_geometry_and_traceability() {
+    fn multi_page_pdf_table_keeps_rows_intact_and_repeats_its_header() {
         let temp = tempfile::tempdir().unwrap();
+        let mut document = generate_document(
+            &acceptance_workspace(),
+            DocumentTemplateId::EvidenceSchedule,
+            Some("律师复核意见：应核对每项证据原件及送达凭证。"),
+        )
+        .unwrap();
+        let citation_table = document
+            .tables
+            .iter_mut()
+            .find(|table| table.section_heading == "法律依据与案例引用表")
+            .unwrap();
+        let seed = citation_table.rows.last().unwrap().clone();
+        citation_table.rows.clear();
+        let labels = ["第一", "第二", "第三", "第四", "第五", "第六"];
+        for label in labels {
+            let mut row = seed.clone();
+            row.cells[2] = format!("第五百二十六条第一款（{label}项）");
+            row.cells[4] = format!(
+                "{label}项引用开始。\n{}{}\n{label}项引用完毕。",
+                seed.cells[4], seed.cells[4]
+            );
+            row.source_ids.clear();
+            citation_table.rows.push(row);
+        }
+        let citation_headers = citation_table.headers.clone();
+
+        let path = temp.path().join("multi-page-table.pdf");
+        begin_pdf_table_page_trace();
+        write_pdf(&path, &document).unwrap();
+        let parsed = lopdf::Document::load(&path).unwrap();
+        assert!(
+            parsed.get_pages().len() >= 4,
+            "the fixture must exercise more than one citation continuation page"
+        );
+
+        let citation_pages = take_pdf_table_page_trace()
+            .into_iter()
+            .filter(|page| page.headers == citation_headers)
+            .collect::<Vec<_>>();
+        assert!(citation_pages.len() >= 2);
+        assert!(citation_pages
+            .iter()
+            .all(|page| !page.oversized_continuation && page.row_start < page.row_end));
+        assert_eq!(
+            citation_pages
+                .iter()
+                .flat_map(|page| page.row_start..page.row_end)
+                .collect::<Vec<_>>(),
+            (0..labels.len()).collect::<Vec<_>>(),
+            "each ordinary row must be emitted exactly once and only as a complete row"
+        );
+    }
+
+    #[test]
+    fn pdf_line_break_tokens_preserve_legal_text_atoms_and_explicit_lines() {
+        let dated = "截至2025-11-03送达";
+        let dated_tokens = pdf_break_tokens(dated);
+        assert_eq!(dated_tokens.concat(), dated);
+        assert!(dated_tokens.iter().any(|token| token == "2025-11-03"));
+
+        assert_eq!(pdf_break_tokens("材料.pdf"), vec!["材", "料.pdf"]);
+        assert_eq!(pdf_break_tokens("材料.PDF"), vec!["材", "料.PDF"]);
+        assert_eq!(pdf_break_tokens("甲，乙。丙"), vec!["甲，", "乙。", "丙"]);
+
+        let identifier = format!("law:document-version:{}:art:577", "a".repeat(128));
+        let identifier_tokens = pdf_break_tokens(&identifier);
+        assert_eq!(identifier_tokens.concat(), identifier);
+        assert!(identifier_tokens.len() > 8);
+        assert!(identifier_tokens
+            .iter()
+            .all(|token| token.chars().count() <= MAX_PDF_ASCII_TOKEN_CHARS));
+
+        let lines = pdf_table_lines("银行电子回单\r\n2025-11-03");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].concat(), "银行电子回单");
+        assert_eq!(lines[1], vec!["2025-11-03"]);
+        assert_eq!(pdf_table_lines("a\n\nb").len(), 3);
+    }
+
+    #[test]
+    fn pdf_export_rejects_missing_glyphs_instead_of_rendering_tofu_boxes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut document = generate_document(
+            &acceptance_workspace(),
+            DocumentTemplateId::EvidenceSchedule,
+            Some("律师复核意见：应核对每项证据原件及送达凭证。"),
+        )
+        .unwrap();
+        document.title.push('😀');
+        let path = temp.path().join("missing-glyph.pdf");
+
+        let error = write_pdf(&path, &document).unwrap_err();
+
+        assert_eq!(error.error_type, "pdf_font");
+        assert!(error.message.contains("U+1F600"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn all_six_templates_have_pdf_compatible_table_geometry() {
         let workspace = acceptance_workspace();
         for template in template_catalog() {
             let document = generate_document(
@@ -1196,22 +2785,14 @@ mod tests {
                 Some("模型草稿仅用于辅助表达，正式文本由承办律师复核。"),
             )
             .unwrap();
-            assert_eq!(document.template.version, "2.0.0");
+            assert_eq!(document.template.version, "2.1.0");
             assert!(document.tables.iter().all(|table| table
                 .column_widths_dxa
                 .iter()
                 .sum::<u32>()
                 == 9_360));
-            assert!(document.markdown.contains("来源标识："));
-            let path = temp.path().join(format!("{:?}.docx", template.template_id));
-            write_docx(&path, &document).unwrap();
-            assert!(path.metadata().unwrap().len() > 4_000);
-            let document_xml = read_part(&path, "word/document.xml");
-            assert!(document_xml.contains(&document.title));
-            assert!(document_xml.contains("来源："));
-            assert!(document_xml.contains(
-                "law:flk-ff808081729d1efe01729d50b5c500bf:flk-version-ff808081729d1efe01729d50b5c500bf:art:577"
-            ));
+            assert!(!document.markdown.contains("来源标识："));
+            validate_pdf_structure(&document).unwrap();
         }
     }
 
@@ -1263,8 +2844,16 @@ mod tests {
             assert_eq!(resolved.2, basis.version_id);
             assert_eq!(resolved.3, basis.document_title);
             assert_eq!(resolved.4, basis.version_label);
-            assert_eq!(resolved.5, basis.article_number);
-            assert_eq!(resolved.6, basis.canonical_label);
+            let public_article_number = basis
+                .article_number
+                .strip_suffix("第一款")
+                .expect("the acceptance fixture records its verified paragraph explicitly");
+            let public_canonical_label = basis
+                .canonical_label
+                .strip_suffix("第一款")
+                .expect("the acceptance fixture records its verified paragraph explicitly");
+            assert_eq!(resolved.5, public_article_number);
+            assert_eq!(resolved.6, public_canonical_label);
             assert_eq!(resolved.7, basis.effective_from);
             assert_eq!(resolved.8, basis.effective_to);
             assert_eq!(resolved.9, basis.version_status);
@@ -1281,17 +2870,11 @@ mod tests {
             None,
         )
         .unwrap();
-        document.tables[0].column_widths_dxa[0] += 1;
-        let path = temp.path().join("invalid.docx");
-        let error = write_docx(&path, &document).unwrap_err();
-        assert_eq!(error.error_type, "docx_structure");
+        document.tables[0].column_widths_dxa[0] = 0;
+        let path = temp.path().join("invalid.pdf");
+        let error = write_pdf(&path, &document).unwrap_err();
+        assert_eq!(error.error_type, "pdf_structure");
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn xml_control_characters_are_removed_and_special_characters_are_escaped() {
-        let escaped = escape_xml("中文 & <安全> \"引号\"\u{0001}");
-        assert_eq!(escaped, "中文 &amp; &lt;安全&gt; &quot;引号&quot;");
     }
 
     fn insert_export_record(connection: &rusqlite::Connection, record_id: &str, export: &Path) {
@@ -1329,7 +2912,7 @@ mod tests {
     fn prepared_export_is_rolled_back_with_its_audit_record_after_a_crash() {
         let directory = tempfile::tempdir().unwrap();
         let user_database = database::ensure_user_database(directory.path()).unwrap();
-        let export = directory.path().join("filing.docx");
+        let export = directory.path().join("filing.pdf");
         fs::write(&export, b"previous").unwrap();
         let staged = sibling_path(&export, "export-incoming").unwrap();
         let rollback = sibling_path(&export, "export-previous").unwrap();
@@ -1337,12 +2920,27 @@ mod tests {
         let destination_sha256 = file_sha256(&export).unwrap();
         let staged_sha256 = file_sha256(&staged).unwrap();
         let record_id = Uuid::new_v4().to_string();
+        let audit_id = format!("audit:{}", Uuid::new_v4());
         let connection = database::open_user_database(&user_database).unwrap();
         insert_export_record(&connection, &record_id, &export);
+        database::create_operation_audit(
+            &connection,
+            &database::NewOperationAuditRow {
+                audit_id: audit_id.clone(),
+                origin: "desktop".into(),
+                operation: "document_export_pdf".into(),
+                project_id: Some("recovery-project".into()),
+                request_hash: "a".repeat(64),
+                idempotency_key_hash: Some("b".repeat(64)),
+                details_json: "{}".into(),
+            },
+        )
+        .unwrap();
         drop(connection);
         let marker = ExportMarker {
             format_version: 1,
             phase: ExportMarkerPhase::Prepared,
+            audit_id: Some(audit_id.clone()),
             record_id: record_id.clone(),
             export_path: export.clone(),
             staged_path: staged.clone(),
@@ -1364,6 +2962,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(
+            database::get_operation_audit(&connection, &audit_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
         assert!(!marker_path.exists());
     }
 
@@ -1371,7 +2976,7 @@ mod tests {
     fn committed_export_is_kept_and_only_its_rollback_journal_is_cleaned() {
         let directory = tempfile::tempdir().unwrap();
         let user_database = database::ensure_user_database(directory.path()).unwrap();
-        let export = directory.path().join("filing.docx");
+        let export = directory.path().join("filing.pdf");
         fs::write(&export, b"previous").unwrap();
         let staged = sibling_path(&export, "export-incoming").unwrap();
         let rollback = sibling_path(&export, "export-previous").unwrap();
@@ -1386,6 +2991,7 @@ mod tests {
         let marker = ExportMarker {
             format_version: 1,
             phase: ExportMarkerPhase::Committed,
+            audit_id: None,
             record_id: record_id.clone(),
             export_path: export.clone(),
             staged_path: staged,
@@ -1415,12 +3021,13 @@ mod tests {
     fn rolled_back_marker_is_idempotent_after_marker_deletion_was_interrupted() {
         let directory = tempfile::tempdir().unwrap();
         let user_database = database::ensure_user_database(directory.path()).unwrap();
-        let export = directory.path().join("filing.docx");
+        let export = directory.path().join("filing.pdf");
         fs::write(&export, b"previous").unwrap();
         let record_id = Uuid::new_v4().to_string();
         let marker = ExportMarker {
             format_version: 1,
             phase: ExportMarkerPhase::RolledBack,
+            audit_id: None,
             record_id: record_id.clone(),
             export_path: export.clone(),
             staged_path: sibling_path(&export, "export-incoming").unwrap(),
@@ -1441,7 +3048,7 @@ mod tests {
     #[test]
     fn failed_audit_record_deletion_retains_the_complete_rollback_journal() {
         let directory = tempfile::tempdir().unwrap();
-        let export = directory.path().join("filing.docx");
+        let export = directory.path().join("filing.pdf");
         let staged = sibling_path(&export, "export-incoming").unwrap();
         fs::write(&export, b"previous").unwrap();
         fs::write(&staged, b"replacement").unwrap();
@@ -1457,6 +3064,7 @@ mod tests {
         let marker = ExportMarker {
             format_version: 1,
             phase: ExportMarkerPhase::Prepared,
+            audit_id: None,
             record_id,
             export_path: export.clone(),
             staged_path: staged.clone(),
@@ -1478,37 +3086,22 @@ mod tests {
 
     /// Opt-in artifact generator for the mandatory render-and-inspect gate.
     ///
-    /// The six files always use the same complete case workspace. Set
-    /// `LAWYER_ASSISTANCE_DOCX_QA_DIR` to keep the artifacts outside `target`.
+    /// Set `LAWYER_ASSISTANCE_PDF_QA_DIR` to keep the artifact outside `target`.
     #[test]
-    #[ignore = "writes six persistent DOCX artifacts for visual QA"]
-    fn generate_stage5_visual_qa_bundle() {
-        let output_dir = std::env::var_os("LAWYER_ASSISTANCE_DOCX_QA_DIR")
+    #[ignore = "writes one persistent PDF artifact for visual QA"]
+    fn generate_pdf_visual_qa_artifact() {
+        let output_dir = std::env::var_os("LAWYER_ASSISTANCE_PDF_QA_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("target/stage5-docx-qa"));
+            .unwrap_or_else(|| std::path::PathBuf::from("target/document-pdf-qa"));
         std::fs::create_dir_all(&output_dir).unwrap();
-        let workspace = acceptance_workspace();
-        let names = [
-            (DocumentTemplateId::Complaint, "01-民事起诉状.docx"),
-            (DocumentTemplateId::Defence, "02-民事答辩状.docx"),
-            (DocumentTemplateId::EvidenceSchedule, "03-证据目录.docx"),
-            (DocumentTemplateId::FactTimeline, "04-案件事实时间线.docx"),
-            (
-                DocumentTemplateId::LegalResearchReport,
-                "05-法律检索报告.docx",
-            ),
-            (DocumentTemplateId::LawyerLetter, "06-律师函.docx"),
-        ];
-        for (template_id, name) in names {
-            let document = generate_document(
-                &workspace,
-                template_id,
-                Some("律师复核意见：引用已经过本地效力校验；提交或发送前，须结合完整案卷核对事实、主体信息、期限、管辖及签章。"),
-            )
-            .unwrap();
-            let path = output_dir.join(name);
-            write_docx(&path, &document).unwrap();
-            println!("{}", path.display());
-        }
+        let document = generate_document(
+            &acceptance_workspace(),
+            DocumentTemplateId::EvidenceSchedule,
+            Some("律师复核意见：提交或发送前，应结合完整案卷核对事实、主体信息、期限、管辖、签章及所引法律依据的适用性。"),
+        )
+        .unwrap();
+        let path = output_dir.join("法律文书-PDF视觉验收.pdf");
+        write_pdf(&path, &document).unwrap();
+        println!("{}", path.display());
     }
 }

@@ -13,6 +13,11 @@ import {
   type GraphNode,
   type GraphSelection,
 } from "./ipc/graph/types";
+import {
+  publicErrorMessage,
+  publicTitle,
+  sanitizePublicGeneratedText,
+} from "./publicOutput";
 
 const EMPTY_GRAPH: GraphData = { nodes: [], edges: [] };
 type GraphLayout = "cose" | "breadthfirst" | "circle" | "grid";
@@ -26,10 +31,35 @@ interface GraphWorkspaceProps {
 }
 
 function errorMessage(error: unknown): string {
-  if (error && typeof error === "object" && "message" in error) {
-    return String((error as { message: unknown }).message);
-  }
-  return String(error);
+  return publicErrorMessage(error, "关系图读取失败，请重试。 ");
+}
+
+function graphTypeLabel(value: string): string {
+  const labels: Readonly<Record<string, string>> = {
+    case: "案件",
+    project: "案件",
+    party: "当事人",
+    case_file: "案件材料",
+    file: "案件材料",
+    fact: "案件事实",
+    evidence: "证据",
+    legal_issue: "法律争点",
+    legal_basis: "法律依据",
+    legal_citation: "法律条文",
+    uncertainty: "待核事项",
+    document: "法律文件",
+    article: "法律条文",
+    proves: "证明",
+    relates_to: "关联",
+    supports: "支持",
+    cites: "引用",
+  };
+  return labels[value] ?? "相关内容";
+}
+
+function graphNodeLabel(value: string | null | undefined): string {
+  const publicValue = sanitizePublicGeneratedText(value ?? "", "").trim();
+  return publicTitle(publicValue, "相关记录");
 }
 
 interface GraphTextAlternativeProps {
@@ -43,7 +73,9 @@ export function GraphTextAlternative({
   selection,
   onSelect,
 }: GraphTextAlternativeProps) {
-  const nodeLabels = new Map(graph.nodes.map((node) => [node.id, node.label]));
+  const nodeLabels = new Map(
+    graph.nodes.map((node) => [node.id, graphNodeLabel(node.label)]),
+  );
   const nodeTitleId = useId();
   const edgeTitleId = useId();
 
@@ -66,7 +98,7 @@ export function GraphTextAlternative({
                     type="button"
                     onClick={() => onSelect({ kind: "node", node })}
                   >
-                    {node.label}（{node.category}）
+                    {graphNodeLabel(node.label)}（{graphTypeLabel(node.category)}）
                   </button>
                 </li>
               ))}
@@ -88,8 +120,9 @@ export function GraphTextAlternative({
                     type="button"
                     onClick={() => onSelect({ kind: "edge", edge })}
                   >
-                    {nodeLabels.get(edge.from) ?? edge.from} → {edge.label} →{" "}
-                    {nodeLabels.get(edge.to) ?? edge.to}
+                    {nodeLabels.get(edge.from) ?? "相关记录"} →{" "}
+                    {publicTitle(edge.label, "关联")} →{" "}
+                    {nodeLabels.get(edge.to) ?? "相关记录"}
                   </button>
                 </li>
               ))}
@@ -167,7 +200,7 @@ export function GraphWorkspace({
         setResult({
           sourceKey,
           graph: EMPTY_GRAPH,
-          status: `关系图读取失败：${errorMessage(error)}`,
+          status: errorMessage(error),
         });
         setSelection({ sourceKey, value: null });
       });
@@ -201,7 +234,7 @@ export function GraphWorkspace({
           data: {
             id: `node:${node.id}`,
             rawId: node.id,
-            label: node.label,
+            label: graphNodeLabel(node.label),
             category: node.category,
           },
         })),
@@ -211,7 +244,7 @@ export function GraphWorkspace({
             rawId: edge.id,
             source: `node:${edge.from}`,
             target: `node:${edge.to}`,
-            label: edge.label,
+            label: publicTitle(edge.label, "关联"),
             category: edge.category,
           },
         })),
@@ -306,10 +339,10 @@ export function GraphWorkspace({
       ? {
           from:
             graph.nodes.find((node) => node.id === visibleSelection.edge.from)
-              ?.label ?? visibleSelection.edge.from,
+              ?.label ?? "相关记录",
           to:
             graph.nodes.find((node) => node.id === visibleSelection.edge.to)
-              ?.label ?? visibleSelection.edge.to,
+              ?.label ?? "相关记录",
         }
       : null;
 
@@ -348,7 +381,7 @@ export function GraphWorkspace({
           <input
             type="search"
             value={searchQuery}
-            placeholder="名称、来源 ID 或类型"
+            placeholder="名称或类型"
             onChange={(event) => setSearchQuery(event.target.value)}
           />
         </label>
@@ -427,11 +460,10 @@ export function GraphWorkspace({
           <h3>{visibleSelection?.kind === "edge" ? "关系来源" : "节点详情"}</h3>
           {visibleSelection?.kind === "node" ? (
             <>
-              <strong>{visibleSelection.node.label}</strong>
+              <strong>{graphNodeLabel(visibleSelection.node.label)}</strong>
               <dl>
-                <dt>类型</dt><dd>{visibleSelection.node.category}</dd>
-                <dt>来源类型</dt><dd>{visibleSelection.node.sourceKind}</dd>
-                <dt>来源 ID</dt><dd>{visibleSelection.node.sourceId}</dd>
+                <dt>内容类型</dt><dd>{graphTypeLabel(visibleSelection.node.category)}</dd>
+                <dt>资料范围</dt><dd>{graphTypeLabel(visibleSelection.node.sourceKind)}</dd>
               </dl>
               <button type="button" onClick={() => onOpenNode(visibleSelection.node)}>
                 打开原始本地记录
@@ -439,14 +471,21 @@ export function GraphWorkspace({
             </>
           ) : visibleSelection?.kind === "edge" && selectedEdgeLabels ? (
             <>
-              <strong>{visibleSelection.edge.label}</strong>
+              <strong>{publicTitle(visibleSelection.edge.label, "关联关系")}</strong>
               <p>{selectedEdgeLabels.from} → {selectedEdgeLabels.to}</p>
               <dl>
-                <dt>关系类型</dt><dd>{visibleSelection.edge.category}</dd>
-                <dt>来源类型</dt><dd>{visibleSelection.edge.provenance.sourceKind}</dd>
-                <dt>来源 ID</dt><dd>{visibleSelection.edge.provenance.sourceId}</dd>
-                <dt>来源说明</dt><dd>{visibleSelection.edge.provenance.description}</dd>
-                {visibleSelection.edge.provenance.sourceReference && <><dt>官方来源</dt><dd>{visibleSelection.edge.provenance.sourceReference}</dd></>}
+                <dt>关系类型</dt><dd>{graphTypeLabel(visibleSelection.edge.category)}</dd>
+                <dt>资料范围</dt><dd>{graphTypeLabel(visibleSelection.edge.provenance.sourceKind)}</dd>
+                <dt>来源说明</dt>
+                <dd>
+                  {sanitizePublicGeneratedText(
+                    visibleSelection.edge.provenance.description,
+                    "来源说明暂不可用。",
+                  )}
+                </dd>
+                {visibleSelection.edge.provenance.sourceReference ? (
+                  <><dt>来源核验</dt><dd>官方来源记录已保留</dd></>
+                ) : null}
               </dl>
             </>
           ) : (

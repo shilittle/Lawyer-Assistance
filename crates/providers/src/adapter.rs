@@ -2,8 +2,8 @@ use crate::{
     credentials::ApiSecret,
     redaction::truncate_for_log,
     types::{
-        ChatMessageRole, ChatRequest, ChatUsage, ConnectionTest, ProviderError, ProviderErrorKind,
-        ProviderKind, ProviderOptions, ProviderProfile,
+        ChatCompletion, ChatMessageRole, ChatRequest, ChatUsage, ConnectionTest, ProviderError,
+        ProviderErrorKind, ProviderKind, ProviderOptions, ProviderProfile,
     },
 };
 use serde_json::{json, Map, Value};
@@ -21,6 +21,9 @@ use std::{
 use crate::stream::{StreamEvent, StreamParser};
 
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Hard ceiling for visible text returned by the public non-stream parser.
+/// Callers must provide a positive limit no greater than this value.
+pub const MAX_CHAT_COMPLETION_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_ABSOLUTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const PRIVATE_DNS_REJECTION: &str = "provider-dns-rejected-special-address";
 static SYNCHRONOUS_TRANSPORT_RUNTIME: OnceLock<
@@ -963,6 +966,15 @@ fn build_chat_body(
     profile: &ProviderProfile,
     request: &ChatRequest,
 ) -> Result<Value, ProviderError> {
+    if !matches!(
+        request.data_classification,
+        privacy::DataClassification::LegalPublic | privacy::DataClassification::ProductPublic
+    ) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider request requires an exact active redaction receipt",
+        ));
+    }
     if request.messages.is_empty() {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
@@ -1002,6 +1014,7 @@ fn build_chat_body(
     let mut body = Map::new();
     body.insert("model".to_owned(), json!(model_id));
     body.insert("stream".to_owned(), json!(request.stream));
+    let mut content_redactor = privacy::Redactor::default();
     body.insert(
         "messages".to_owned(),
         Value::Array(
@@ -1009,9 +1022,11 @@ fn build_chat_body(
                 .messages
                 .iter()
                 .map(|message| {
+                    let redacted_content =
+                        redact_message_content(&mut content_redactor, &message.content);
                     json!({
                         "role": role_name(message.role),
-                        "content": message.content,
+                        "content": redacted_content,
                     })
                 })
                 .collect(),
@@ -1045,7 +1060,26 @@ fn build_chat_body(
     let normalized_options = profile.kind.options_with_defaults(profile.options.clone());
     apply_provider_options(profile.kind, &normalized_options, &mut body);
 
-    Ok(Value::Object(body))
+    let body = Value::Object(body);
+    let serialized = serde_json::to_vec(&body).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider request privacy validation failed",
+        )
+    })?;
+    let residual = privacy::scan_residual(&serialized).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider request privacy validation failed",
+        )
+    })?;
+    if !residual.passed {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider request rejected by privacy policy",
+        ));
+    }
+    Ok(body)
 }
 
 fn apply_provider_options(
@@ -1117,6 +1151,15 @@ fn role_name(role: ChatMessageRole) -> &'static str {
     }
 }
 
+fn redact_message_content(redactor: &mut privacy::Redactor, content: &str) -> String {
+    if let Ok(mut structured) = serde_json::from_str::<Value>(content) {
+        redactor.redact_json(&mut structured);
+        serde_json::to_string(&structured).unwrap_or_else(|_| redactor.redact(content))
+    } else {
+        redactor.redact(content)
+    }
+}
+
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -1128,6 +1171,99 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     })
 }
 
+/// Parses exactly one complete, non-stream OpenAI-compatible Chat Completions
+/// JSON response and returns only user-visible message content.
+///
+/// Unknown provider fields are ignored. SSE, concatenated JSON values,
+/// reasoning-only responses, and non-string `message.content` fail closed.
+/// `max_content_bytes` is measured in UTF-8 bytes and must be within the
+/// public hard ceiling. The caller must separately require a successful HTTP
+/// status before passing the response body to this parser.
+pub fn parse_chat_completion(
+    body: &str,
+    max_content_bytes: usize,
+) -> Result<ChatCompletion, ProviderError> {
+    if max_content_bytes == 0 || max_content_bytes > MAX_CHAT_COMPLETION_CONTENT_BYTES {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "chat completion content limit is outside the supported range",
+        ));
+    }
+    if body.len() > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(response_too_large_error(MAX_PROVIDER_RESPONSE_BYTES, None));
+    }
+
+    let value = serde_json::from_str::<Value>(body).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Parse,
+            "provider response was not one complete JSON value",
+        )
+    })?;
+    if value.get("error").is_some() {
+        return Err(completion_shape_error(
+            "provider JSON response was an error envelope",
+        ));
+    }
+    let parsed = parse_chat_completion_value(&value)?;
+    if parsed.content.len() > max_content_bytes {
+        return Err(response_too_large_error(max_content_bytes, None));
+    }
+
+    Ok(ChatCompletion {
+        content: parsed.content.to_owned(),
+        model: parsed.model.map(str::to_owned),
+        usage: parsed.usage,
+    })
+}
+
+struct ParsedChatCompletion<'a> {
+    content: &'a str,
+    model: Option<&'a str>,
+    usage: Option<ChatUsage>,
+}
+
+fn parse_chat_completion_value(value: &Value) -> Result<ParsedChatCompletion<'_>, ProviderError> {
+    let choices = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            completion_shape_error("provider JSON response did not include a choices array")
+        })?;
+    let choice = choices.first().and_then(Value::as_object).ok_or_else(|| {
+        completion_shape_error("provider JSON response did not include choices[0] as an object")
+    })?;
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            completion_shape_error("provider JSON response did not include a message object")
+        })?;
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            completion_shape_error("provider JSON response did not include string message content")
+        })?;
+    if content.trim().is_empty() {
+        return Err(completion_shape_error(
+            "provider JSON response did not include visible message content",
+        ));
+    }
+
+    Ok(ParsedChatCompletion {
+        content,
+        model: value.get("model").and_then(Value::as_str),
+        usage: value
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .map(parse_usage),
+    })
+}
+
+fn completion_shape_error(message: &'static str) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::Parse, message)
+}
+
 fn parse_chat_completion_metadata(
     body: &str,
     secret: &ApiSecret,
@@ -1137,31 +1273,13 @@ fn parse_chat_completion_metadata(
             return Err(map_http_error(200, body, secret));
         }
 
-        let has_content = value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .is_some_and(|content| !content.is_empty());
-        if !has_content {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Parse,
-                "provider response did not include response content",
-            ));
-        }
+        let parsed = parse_chat_completion_value(&value)?;
 
-        let model = value
-            .get("model")
-            .and_then(Value::as_str)
+        let model = parsed
+            .model
             .map(|model| redact_known_secret_text(model, secret));
-        let usage = value
-            .get("usage")
-            .filter(|usage| usage.is_object())
-            .map(parse_usage);
 
-        return Ok((model, usage));
+        return Ok((model, parsed.usage));
     }
 
     parse_streaming_completion_metadata(body, secret)
@@ -1391,6 +1509,7 @@ mod tests {
             stream: true,
             temperature: Some(0.2),
             max_tokens: Some(16),
+            data_classification: privacy::DataClassification::ProductPublic,
         }
     }
 
@@ -1432,6 +1551,159 @@ mod tests {
         assert!(!request.allow_private_network);
         assert!(!format!("{request:?}").contains("contract-secret-1234"));
         assert!(!format!("{request:?}").contains("ping"));
+    }
+
+    #[test]
+    fn every_provider_rejects_case_and_secret_classifications_before_serialization() {
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage {
+                    role: ChatMessageRole::System,
+                    content: "仅处理用户提供的案件材料。".to_owned(),
+                },
+                ChatMessage {
+                    role: ChatMessageRole::User,
+                    content: "原告：张三，身份证号11010519491231002X，手机号13800138000，邮箱zhang.san@example.com，银行卡4532015112830366。张三请求判令被告还款。".to_owned(),
+                },
+                ChatMessage {
+                    role: ChatMessageRole::User,
+                    content: r#"{"当事人":"李四","案号":"（2024）京0105民初1234号","护照号":"E12345678","车牌号":"京A12345"}"#.to_owned(),
+                },
+            ],
+            stream: false,
+            temperature: Some(0.0),
+            max_tokens: None,
+            data_classification: privacy::DataClassification::CaseRaw,
+        };
+        for classification in [
+            privacy::DataClassification::CaseRaw,
+            privacy::DataClassification::CaseRedactedPending,
+            privacy::DataClassification::CaseRedactedApproved,
+            privacy::DataClassification::Secret,
+        ] {
+            let mut classified_request = request.clone();
+            classified_request.data_classification = classification;
+            for kind in [
+                ProviderKind::DeepSeek,
+                ProviderKind::Qwen,
+                ProviderKind::SiliconFlow,
+                ProviderKind::VolcengineArk,
+                ProviderKind::Custom,
+            ] {
+                let mut profile = profile(kind);
+                if kind == ProviderKind::Custom {
+                    profile.base_url = "https://provider.example/v1".to_owned();
+                    profile.model_id = "custom-model".to_owned();
+                }
+                let error = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
+                    &profile,
+                    &ApiSecret::new("contract-secret-1234"),
+                    &classified_request,
+                )
+                .expect_err("non-public classifications must fail before transport serialization");
+                assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+                assert!(error.to_string().contains("exact active redaction receipt"));
+                assert!(!error.to_string().contains("case material"));
+            }
+        }
+    }
+    #[test]
+    fn every_provider_blocks_non_public_send_paths_before_transport_without_canary_leakage() {
+        const CANARIES: [&str; 7] = [
+            "PII_NAME_ZHANG_SAN_7F9C",
+            "PII_ID_11010519491231002X",
+            "PII_PHONE_13800138000",
+            "PII_EMAIL_zhang.san@example.com",
+            "PII_BANK_4532015112830366",
+            "PII_CASE_2024-JING-0105-1234",
+            "PROVIDER_SECRET_CANARY_A91E",
+        ];
+
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage {
+                    role: ChatMessageRole::System,
+                    content: format!("Handle case material containing {}", CANARIES[0]),
+                },
+                ChatMessage {
+                    role: ChatMessageRole::User,
+                    content: CANARIES[1..6].join(" | "),
+                },
+            ],
+            stream: false,
+            temperature: Some(0.0),
+            max_tokens: None,
+            data_classification: privacy::DataClassification::CaseRaw,
+        };
+        let secret = ApiSecret::new(CANARIES[6]);
+
+        for classification in [
+            privacy::DataClassification::CaseRaw,
+            privacy::DataClassification::CaseRedactedPending,
+            privacy::DataClassification::CaseRedactedApproved,
+            privacy::DataClassification::Secret,
+        ] {
+            let mut classified_request = request.clone();
+            classified_request.data_classification = classification;
+
+            for kind in [
+                ProviderKind::DeepSeek,
+                ProviderKind::Qwen,
+                ProviderKind::SiliconFlow,
+                ProviderKind::VolcengineArk,
+                ProviderKind::Custom,
+            ] {
+                let mut provider_profile = profile(kind);
+                if kind == ProviderKind::Custom {
+                    provider_profile.base_url = "https://provider.example/v1".to_owned();
+                    provider_profile.model_id = "custom-model".to_owned();
+                }
+
+                for send_with_cancellation in [false, true] {
+                    let transport = MockTransport::new(TransportResponse {
+                        status: 200,
+                        body: "transport must not run".to_owned(),
+                        first_content_token_latency_ms: None,
+                        total_latency_ms: 0,
+                    });
+                    let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+                    let cancellation = RequestCancellation::default();
+
+                    let result = if send_with_cancellation {
+                        adapter.send_chat_with_cancellation(
+                            &provider_profile,
+                            &secret,
+                            &classified_request,
+                            &cancellation,
+                        )
+                    } else {
+                        adapter.send_chat(&provider_profile, &secret, &classified_request)
+                    };
+                    let error = result.expect_err(
+                        "non-public classifications must fail before transport serialization",
+                    );
+
+                    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+                    assert!(error.to_string().contains("exact active redaction receipt"));
+                    assert!(
+                        transport.requests.lock().expect("requests lock").is_empty(),
+                        "transport ran for {kind:?}, {classification:?}, cancellation={send_with_cancellation}",
+                    );
+                    let display = error.to_string();
+                    let debug = format!("{error:?}");
+                    for canary in CANARIES {
+                        assert!(
+                            !display.contains(canary),
+                            "Display leaked canary for {kind:?}, {classification:?}, cancellation={send_with_cancellation}",
+                        );
+                        assert!(
+                            !debug.contains(canary),
+                            "Debug leaked canary for {kind:?}, {classification:?}, cancellation={send_with_cancellation}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1855,6 +2127,184 @@ mod tests {
         assert_eq!(result.status, crate::types::ConnectionTestStatus::Failed);
         assert_eq!(result.error_type.as_deref(), Some("parse"));
         assert_eq!(result.first_token_latency_ms, None);
+    }
+
+    #[test]
+    fn bounded_non_stream_parser_returns_visible_content_model_and_usage() {
+        let body = r#"{
+            "id":"chatcmpl-1",
+            "model":"mock-model",
+            "provider_extension":{"region":"test"},
+            "choices":[{
+                "index":0,
+                "finish_reason":"stop",
+                "message":{"role":"assistant","content":"visible"}
+            }],
+            "usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"cached_tokens":1}
+        }"#;
+
+        let completion = parse_chat_completion(body, "visible".len()).unwrap();
+        assert_eq!(completion.content, "visible");
+        assert_eq!(completion.model.as_deref(), Some("mock-model"));
+        assert_eq!(
+            completion.usage,
+            Some(ChatUsage {
+                prompt_tokens: Some(2),
+                completion_tokens: Some(3),
+                total_tokens: Some(5),
+            })
+        );
+    }
+
+    #[test]
+    fn bounded_non_stream_parser_accepts_missing_and_partial_usage() {
+        let missing =
+            parse_chat_completion(r#"{"choices":[{"message":{"content":"one"}}]}"#, 16).unwrap();
+        assert_eq!(missing.usage, None);
+        assert_eq!(missing.model, None);
+
+        let partial = parse_chat_completion(
+            r#"{"choices":[{"message":{"content":"two"}}],"usage":{"prompt_tokens":4,"completion_tokens":"unknown"}}"#,
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            partial.usage,
+            Some(ChatUsage {
+                prompt_tokens: Some(4),
+                completion_tokens: None,
+                total_tokens: None,
+            })
+        );
+
+        let non_object_usage = parse_chat_completion(
+            r#"{"choices":[{"message":{"content":"three"}}],"usage":"not-supported"}"#,
+            16,
+        )
+        .unwrap();
+        assert_eq!(non_object_usage.usage, None);
+    }
+
+    #[test]
+    fn bounded_non_stream_parser_ignores_reasoning_and_debug_redacts_visible_fields() {
+        let body = r#"{
+            "model":"model-secret-1234",
+            "choices":[{"message":{
+                "reasoning_content":"hidden-chain-secret-5678",
+                "content":"visible-content-secret-9999"
+            }}]
+        }"#;
+        let completion = parse_chat_completion(body, 128).unwrap();
+        assert_eq!(completion.content, "visible-content-secret-9999");
+        assert_eq!(completion.model.as_deref(), Some("model-secret-1234"));
+        let serialized = serde_json::to_value(&completion).unwrap();
+        assert!(serialized.get("reasoningContent").is_none());
+        assert!(!serialized.to_string().contains("hidden-chain-secret-5678"));
+
+        let debug = format!("{completion:?}");
+        assert!(!debug.contains("visible-content-secret-9999"));
+        assert!(!debug.contains("model-secret-1234"));
+        assert!(!debug.contains("hidden-chain-secret-5678"));
+    }
+
+    #[test]
+    fn bounded_non_stream_parser_rejects_reasoning_only_and_bad_shapes() {
+        for body in [
+            r#"{"choices":[{"message":{"reasoning_content":"hidden"}}]}"#,
+            r#"{"choices":[{"message":{"content":"   "}}]}"#,
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"no"}]}}]}"#,
+            r#"{"choices":[{}]}"#,
+            r#"{"choices":[]}"#,
+            r#"{"choices":"wrong"}"#,
+            r#"{"error":{"message":"secret upstream detail"}}"#,
+            r#"[]"#,
+        ] {
+            let error = parse_chat_completion(body, 128).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::Parse);
+            assert!(!error.to_string().contains("hidden"));
+            assert!(!error.to_string().contains("secret upstream detail"));
+        }
+    }
+
+    #[test]
+    fn bounded_non_stream_parser_enforces_utf8_byte_and_hard_limits() {
+        let unicode = r#"{"choices":[{"message":{"content":"你好"}}]}"#;
+        assert_eq!(
+            parse_chat_completion(unicode, 5).unwrap_err().kind,
+            ProviderErrorKind::ResponseTooLarge
+        );
+        assert_eq!(parse_chat_completion(unicode, 6).unwrap().content, "你好");
+
+        for invalid_limit in [0, MAX_CHAT_COMPLETION_CONTENT_BYTES + 1] {
+            assert_eq!(
+                parse_chat_completion(unicode, invalid_limit)
+                    .unwrap_err()
+                    .kind,
+                ProviderErrorKind::InvalidRequest
+            );
+        }
+
+        let oversized_body = "x".repeat(MAX_PROVIDER_RESPONSE_BYTES + 1);
+        assert_eq!(
+            parse_chat_completion(&oversized_body, 16).unwrap_err().kind,
+            ProviderErrorKind::ResponseTooLarge
+        );
+    }
+
+    #[test]
+    fn bounded_non_stream_parser_rejects_non_json_sse_and_concatenated_json_without_leaks() {
+        let secret = "parser-secret-1234";
+        for body in [
+            format!("not-json {secret}"),
+            format!("data: {{\"choices\":[{{\"message\":{{\"content\":\"{secret}\"}}}}]}}\n\n"),
+            format!(
+                "{{\"choices\":[{{\"message\":{{\"content\":\"ok\"}}}}]}}{{\"debug\":\"{secret}\"}}"
+            ),
+        ] {
+            let error = parse_chat_completion(&body, 128).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::Parse);
+            assert!(!format!("{error:?}").contains(secret));
+            assert!(!error.to_string().contains(secret));
+            assert!(!serde_json::to_string(&error).unwrap().contains(secret));
+        }
+    }
+
+    #[test]
+    fn bounded_non_stream_parser_works_for_every_profile_without_native_tools() {
+        for kind in [
+            ProviderKind::DeepSeek,
+            ProviderKind::Qwen,
+            ProviderKind::SiliconFlow,
+            ProviderKind::VolcengineArk,
+            ProviderKind::Custom,
+        ] {
+            let transport = MockTransport::new(TransportResponse {
+                status: 200,
+                body: r#"{"model":"compatible-model","choices":[{"message":{"content":"structured-json-text"}}]}"#.to_owned(),
+                first_content_token_latency_ms: None,
+                total_latency_ms: 1,
+            });
+            let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+            let mut profile = profile(kind);
+            if kind == ProviderKind::Custom {
+                profile.base_url = "https://provider.example/v1".to_owned();
+                profile.model_id = "custom-model".to_owned();
+            }
+            let mut request = request_for_contract();
+            request.stream = false;
+            let response = adapter
+                .send_chat(&profile, &ApiSecret::new("contract-secret-1234"), &request)
+                .unwrap();
+            let completion = parse_chat_completion(&response.body, 256).unwrap();
+            assert_eq!(completion.content, "structured-json-text");
+
+            let requests = transport.requests.lock().unwrap();
+            let request_json: Value = serde_json::from_str(&requests[0].body).unwrap();
+            assert_eq!(request_json["stream"], false);
+            assert!(request_json.get("tools").is_none());
+            assert!(request_json.get("tool_choice").is_none());
+            assert_eq!(requests[0].header_value("Accept"), Some("application/json"));
+        }
     }
 
     #[test]

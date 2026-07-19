@@ -285,10 +285,7 @@ pub fn analyze_case_gaps(
                 kind: CaseGapKind::EvidenceMissingSource,
                 severity: CaseGapSeverity::Blocking,
                 entity_id: evidence_item.evidence_id.clone(),
-                message: format!(
-                    "Evidence {} is missing a source.",
-                    evidence_item.evidence_number
-                ),
+                message: "该项证据尚未注明来源。".to_owned(),
             });
         }
 
@@ -308,10 +305,7 @@ pub fn analyze_case_gaps(
                 kind: CaseGapKind::EvidenceMissingFormedOn,
                 severity: CaseGapSeverity::Warning,
                 entity_id: evidence_item.evidence_id.clone(),
-                message: format!(
-                    "Evidence {} is missing a formation date.",
-                    evidence_item.evidence_number
-                ),
+                message: "该项证据尚未注明形成时间。".to_owned(),
             });
         }
     }
@@ -324,7 +318,7 @@ pub fn analyze_case_gaps(
                 kind: CaseGapKind::FactMissingEvidence,
                 severity: CaseGapSeverity::Blocking,
                 entity_id: fact.fact_id.clone(),
-                message: format!("Fact \"{}\" has no linked evidence.", fact.title),
+                message: "该项事实尚未关联证据。".to_owned(),
             });
         }
     }
@@ -339,10 +333,7 @@ pub fn analyze_case_gaps(
                 kind: CaseGapKind::InvalidEvidenceId,
                 severity: CaseGapSeverity::Blocking,
                 entity_id: link.link_id.clone(),
-                message: format!(
-                    "Evidence link {} references a missing fact or evidence item.",
-                    link.link_id
-                ),
+                message: "证据与事实的关联记录无效，请重新关联。".to_owned(),
             });
         }
     }
@@ -388,7 +379,7 @@ fn timeline_conflicts(project_id: &str, facts: &[CaseFact]) -> Vec<CaseGap> {
             kind: CaseGapKind::TimelineConflict,
             severity: CaseGapSeverity::Warning,
             entity_id: fact.fact_id.clone(),
-            message: format!("Fact \"{}\" appears on conflicting dates.", fact.title),
+            message: "同一事实存在相互冲突的发生日期，请核对。".to_owned(),
         })
         .collect()
 }
@@ -426,7 +417,7 @@ fn party_name_inconsistencies(project_id: &str, parties: &[CaseParty]) -> Vec<Ca
             kind: CaseGapKind::PartyNameInconsistent,
             severity: CaseGapSeverity::Warning,
             entity_id: party.party_id.clone(),
-            message: format!("Party \"{}\" has inconsistent display names.", party.name),
+            message: "当事人名称存在不一致，请核对后统一。".to_owned(),
         })
         .collect()
 }
@@ -452,10 +443,7 @@ fn legal_issue_basis_gaps(
             kind: CaseGapKind::LegalIssueMissingBasis,
             severity: CaseGapSeverity::Warning,
             entity_id: issue.issue_id.clone(),
-            message: format!(
-                "Legal issue \"{}\" has no validated legal basis.",
-                issue.title
-            ),
+            message: "该项法律争点尚无经核验的法律依据。".to_owned(),
         })
         .collect()
 }
@@ -677,6 +665,7 @@ pub fn validate_structured_case_extraction(
 ) -> Result<(), StructuredExtractionParseError> {
     validate_extraction_bounds(extraction)?;
     validate_extraction_dates(extraction)?;
+    validate_extraction_public_business_text(extraction)?;
 
     if extraction
         .parties
@@ -969,6 +958,48 @@ pub fn validate_structured_case_extraction_draft(
         }
     }
 
+    validate_extraction_public_business_text(extraction)?;
+
+    Ok(())
+}
+
+fn validate_extraction_public_business_text(
+    extraction: &StructuredCaseExtraction,
+) -> Result<(), StructuredExtractionParseError> {
+    use crate::validation;
+
+    let validate = |field: &str, value: &str| {
+        validation::public_business_text(field, value)
+            .map_err(|error| extraction_validation_error(error.to_string()))
+    };
+
+    for party in &extraction.parties {
+        validate("party.name", &party.name)?;
+    }
+    for fact in &extraction.facts {
+        validate("fact.title", &fact.title)?;
+        validate("fact.description", &fact.description)?;
+        for evidence_number in &fact.evidence_numbers {
+            validate("fact.evidenceNumbers", evidence_number)?;
+        }
+    }
+    for evidence in &extraction.evidence {
+        validate("evidence.evidenceNumber", &evidence.evidence_number)?;
+        validate("evidence.title", &evidence.title)?;
+        validate("evidence.source", &evidence.source)?;
+        validate("evidence.summary", &evidence.summary)?;
+    }
+    for issue in &extraction.legal_issues {
+        validate("legalIssue.title", &issue.title)?;
+        validate("legalIssue.description", &issue.description)?;
+        validate("legalIssue.claim", &issue.claim)?;
+    }
+    for uncertainty in &extraction.uncertainties {
+        validate("uncertainty.description", &uncertainty.description)?;
+        if let Some(reference) = uncertainty.related_reference.as_deref() {
+            validate("uncertainty.relatedReference", reference)?;
+        }
+    }
     Ok(())
 }
 
@@ -1222,6 +1253,36 @@ fn failed_extraction(
 mod tests {
     use super::*;
 
+    fn assert_public_gap_messages(gaps: &[CaseGap]) {
+        assert!(!gaps.is_empty());
+        for gap in gaps {
+            assert!(
+                gap.message
+                    .chars()
+                    .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)),
+                "gap message must be Chinese: {}",
+                gap.message
+            );
+            for forbidden in [
+                "fact-",
+                "ev-",
+                "link-",
+                "party-",
+                "issue-",
+                "Evidence",
+                "Fact",
+                "Party",
+                "Legal issue",
+            ] {
+                assert!(
+                    !gap.message.contains(forbidden),
+                    "gap message exposed {forbidden}: {}",
+                    gap.message
+                );
+            }
+        }
+    }
+
     fn valid_extraction_json() -> &'static str {
         r#"{
             "parties":[{"name":"Acme Ltd.","role":"plaintiff"}],
@@ -1263,6 +1324,8 @@ mod tests {
         }];
         let gaps = analyze_case_gaps("project-1", &parties, &facts, &evidence, &links, &[], &[]);
 
+        assert_public_gap_messages(&gaps);
+
         assert!(gaps
             .iter()
             .any(|gap| gap.kind == CaseGapKind::EvidenceMissingSource));
@@ -1290,6 +1353,7 @@ mod tests {
         };
         let gaps = analyze_case_gaps("project-1", &[], &[fact], &[], &[], &[], &[]);
 
+        assert_public_gap_messages(&gaps);
         assert_eq!(gaps[0].kind, CaseGapKind::FactMissingEvidence);
     }
 
@@ -1337,6 +1401,7 @@ mod tests {
         ];
         let gaps = analyze_case_gaps("project-1", &parties, &facts, &[], &[], &[], &[]);
 
+        assert_public_gap_messages(&gaps);
         assert!(gaps
             .iter()
             .any(|gap| gap.kind == CaseGapKind::TimelineConflict));
@@ -1394,6 +1459,7 @@ mod tests {
             std::slice::from_ref(&issue),
             std::slice::from_ref(&invalid_basis),
         );
+        assert_public_gap_messages(&gaps);
         assert_eq!(gaps[0].kind, CaseGapKind::LegalIssueMissingBasis);
 
         let gaps = analyze_case_gaps("project-1", &[], &[], &[], &[], &[issue], &[valid_basis]);
@@ -1434,6 +1500,44 @@ mod tests {
         let error = validate_structured_case_extraction(&extraction)
             .expect_err("oversized extracted text is rejected");
         assert!(!error.message.contains("sensitive-description"));
+    }
+
+    #[test]
+    fn rejects_internal_details_from_every_extracted_business_text_family() {
+        let baseline = parse_structured_case_extraction(valid_extraction_json())
+            .expect("baseline extraction parses");
+        let assert_rejected = |extraction: &StructuredCaseExtraction| {
+            let draft_error = validate_structured_case_extraction_draft(extraction)
+                .expect_err("unsafe review draft is rejected before persistence");
+            assert!(draft_error.message.contains("business field"));
+            assert!(!draft_error.message.contains("file-secret-1"));
+            assert!(validate_structured_case_extraction(extraction).is_err());
+        };
+
+        let mut extraction = baseline.clone();
+        extraction.parties[0].name = "fileId=file-secret-1".to_owned();
+        assert_rejected(&extraction);
+
+        let mut extraction = baseline.clone();
+        extraction.facts[0].description = r#"{"sourceRefs":["file-secret-1"]}"#.to_owned();
+        assert_rejected(&extraction);
+
+        let mut extraction = baseline.clone();
+        extraction.evidence[0].source = "C:\\Users\\operator\\private\\material.pdf".to_owned();
+        assert_rejected(&extraction);
+
+        let mut extraction = baseline.clone();
+        extraction.evidence[0].summary = "proposalHash=deadbeef0123456789abcdef01234567".to_owned();
+        assert_rejected(&extraction);
+
+        let mut extraction = baseline.clone();
+        extraction.legal_issues[0].claim =
+            "service-deadbeef01234567-7 generated this claim".to_owned();
+        assert_rejected(&extraction);
+
+        let mut extraction = baseline;
+        extraction.uncertainties[0].description = "模型输出中的内部字段需要核对".to_owned();
+        assert_rejected(&extraction);
     }
 
     #[test]

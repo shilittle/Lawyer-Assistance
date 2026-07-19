@@ -1,21 +1,35 @@
 # Lawyer Assistance
 
-Windows-first Tauri 2 desktop application for legal assistance workflows.
+Rust-first legal-assistance platform with a cross-platform-targeted MCP server and an optional Windows Tauri 2 professional review station. WorkBuddy, Codex, and OpenCode share the same public-law MCP contract.
+
+Production MCP and all checked-in host integrations use `public_law_only`:
+
+```text
+lawyer-assistance-mcp --privacy-profile public_law_only stdio
+lawyer-assistance-mcp --privacy-profile public_law_only serve --bind 127.0.0.1:8787
+```
+
+Its exact surface is five read-only tools: `system_status`, `legal_search`, `legal_get_article`, `legal_get_versions`, and `legal_get_relations`. stdio and HTTP must expose the same names and order.
+
+The experimental `redacted_case` profile adds only receipt-gated `citation_validate` (six tools total). The App cannot yet issue a receipt bound to that MCP purpose, destination, and exact request bytes, so production remains on the public five. Case reads/writes, material import, gap analysis, document generation, and export are hidden in both profiles. Shared case/document implementations in `crates/legal-services` are not an external MCP capability.
+
+Provider transport also lacks an App-to-Provider case receipt path. It accepts only explicitly public legal/product classifications before serialization; legacy case-bearing requests are `CASE_RAW` and fail closed. Local App review and approval do not automatically authorize MCP or Provider egress.
+
+MCP and repository prompts cannot prevent or retract a first message or attachment that a host sent before loading its Skill/Agent rules. Do not put client or case material into WorkBuddy, Codex, OpenCode, or another external model task.
+
+For local material preparation, PDF/DOCX/TXT/Markdown can enter the App's local extraction, automated redaction, human review, exact receipt and safe text-PDF workflow. The reconstructed PDF embeds a hash-pinned common CJK font; unsupported glyphs fail closed instead of rendering tofu. A confirmed lifecycle action deletes the App's protected review payload and every associated receipt while preserving hash-only audit; it never deletes the user-selected source or separately saved PDF.
+
+
+HTTP remains loopback-only by default. A non-loopback cleartext bind is rejected even with Bearer authentication; production remote access terminates TLS at a trusted reverse proxy connected to the loopback listener.
 
 ## Current Scope
 
-As of 2026-07-16, the engineering scope of Stages 0–7 is implemented: offline
-legal retrieval, provider configuration, citation-grounded answers, local
-case/evidence work, six legal-document workflows, case/law graphs, and the
-Windows release/update/backup lifecycle. Automated gates use the formal legal
-resource where product identity matters. Authenticode certification and
-clean-machine Windows 10/11 qualification are external release-operations
-gates, not unfinished application development:
+As of 2026-07-19, the historical engineering scope of Stages 0–7 remains implemented for local desktop use: offline legal retrieval, provider configuration, citation-grounded public-law answers, local case/evidence work, six local legal-document workflows, case/law graphs, and the Windows release/update/backup lifecycle. Stage 8 adds an assistant-first product layer and a local privacy/redaction workflow. The 2026-07-19 privacy hardening is a current constraint over those historical outcomes: case-bearing Provider requests fail closed, external MCP hosts receive only the public-law five-tool profile, and scanned/visual PDF processing remains blocked until local OCR is authenticated end to end. Authenticode certification and clean-machine Windows 10/11 qualification remain external release-operations gates:
 
 - Tauri 2 desktop shell for Windows x86_64
 - React, TypeScript, and Vite frontend
 - pnpm workspace and Rust Cargo workspace
-- Rust crates split into `domain`, `database`, `retrieval`, `providers`, and `citations`
+- Rust crates split into `domain`, `database`, `retrieval`, `providers`, `citations`, `assistant`, `file-ingest`, `legal-services`, and `legal-mcp`
 - Versioned `legal_core.sqlite` schema in `data/schema/legal_core.sql`
 - Bundled read-only `legal_core.sqlite` official-source legal metadata index
 - Writable `user.sqlite` created under the app's LocalAppData directory with transaction-based migrations, one-time canonical schema repair, and project-ownership constraints
@@ -27,6 +41,10 @@ gates, not unfinished application development:
   - `get_law_versions`
   - `get_law_relations`
 - React offline search workspace with law results, article results, article details, versions, and relations
+- Conversation-first Assistant workspace with unbound or case-bound local conversations, bounded history, typed run events and cancellation; Provider transport is public-only and rejects case-bearing runs before serialization
+- Rust-side PDF, DOCX, UTF-8 TXT and Markdown privacy import with format checks and hard limits; reliable text-layer PDFs can be reviewed and exported as a font-embedded safe text PDF, protected review state can be explicitly revoked/deleted, while the MinerU runner is not connected by the App and scanned/visual PDFs fail closed
+- Versioned Research, Document and Map Artifacts with source/provider/citation audit, safe Markdown, Rust-generated DOCX/JSON, fixed Cytoscape mapping, append-only edits and regeneration
+- Pending case-change proposals with case digest/CAS checks, explicit apply or reject, and no model-direct writes to confirmed case records
 - Provider profile CRUD with DeepSeek as the only default/top-level preset;
   Qwen / Alibaba Cloud Model Studio, SiliconFlow, and Volcengine Ark remain
   available in a collapsed secondary menu, and existing profiles for all four
@@ -39,16 +57,17 @@ gates, not unfinished application development:
 - Provider settings page with a single DeepSeek quick-create action, collapsed optional/custom provider creation, model ID, Base URL, extension options, masked key status, and connection test results
 - Source-bounded legal answer context assembly from the local legal database
 - Citation parser and Rust-side validator for `[SRC:...]` source ids
-- Citation-grounded legal answer command using BYOK provider profiles and in-process mock-provider tests
+- Citation-grounded public-law answer command using BYOK provider profiles and in-process mock-provider tests; no case-bearing Provider egress path is enabled
 - Legal answer records persisted with verified citation reports, not trusted raw model citations
 - React citation Q&A workspace with candidate sources, clickable verified inline citations, explicit invalid/duplicate marker styling, citation validation status, and local source text
 - Case project CRUD persisted in `user.sqlite`
+- MCP privacy profiles with a production `public_law_only` five-tool surface; experimental `redacted_case` adds one receipt-gated citation tool but has no App signing path, and all case/material/document tools remain hidden
 - Case workspace data model for files, parties, facts, evidence, legal issues, validated legal basis records, and explicit project-scoped fact-evidence/fact-issue links; composite database constraints reject cross-case relationships
 - Rust-side case gap analysis for timeline conflicts, party name inconsistencies, missing evidence support, missing source/date metadata, invalid evidence references, and open legal issues without validated legal basis
 - Case legal basis binding through local `[SRC:...]` source ids with Rust-side citation/effectiveness validation and read-only lookups against `legal_core.sqlite`
 - Structured case extraction JSON parser with strict Rust deserialization and one repair-attempt path
 - React case workspace with project list, editable persisted case files/parties/facts/evidence/issues, fact timeline, evidence catalog, legal basis panel, explicit fact-evidence and fact-issue link editors, gap panel, and extraction review panel
-- Six reviewed legal-document templates with structured validation, confirmed-data-only assembly, local citation traceability, Markdown preview, pure-Rust DOCX generation, crash-safe export and persisted generation audit records
+- Six reviewed legal-document templates for local desktop workflows, with structured validation, local citation traceability, rendered Markdown/source preview, and pure-Rust PDF export; local approval/export does not grant MCP or Provider egress
 - Case and formal-law graph workspaces with namespaced identities, confirmed nodes, persisted fact-evidence/fact-issue/issue-citation edges, formal `law_relations`, provenance, filtering, search, layout controls, details and exact source jumps
 - Version information, atomic backup, validated restart-time restore, payload-free crash/maintenance events and redacted diagnostic export
 - A signed-update protocol with strict GitHub URL policy, semantic-version checks, streaming download, Minisign verification, trusted-filename binding, NSIS handoff and stale-installer cleanup
@@ -75,13 +94,15 @@ fetch/audit payloads and the case/template corpora that the current UI does not
 query. The archival database and its strict-audit reports remain the coverage
 and rebuild authority.
 
-Stage 3 implements Tauri Channel streaming, cancellation, local citation
+Stage 3 implements the compatibility legal-answer Tauri Channel streaming, cancellation, local citation
 validation and verified persistence. Stage 4 implements local case/evidence
 persistence, legal-basis binding, provider-driven structured extraction, one
 automatic repair, bounded review state, user confirmation and atomic
-persistence. The current extraction scope intentionally sends selected material
-summaries rather than reading original files. Embeddings and local-model
-workflows remain explicitly outside the product architecture.
+persistence. Its legacy case-extraction flow still sends selected case-material
+summaries. Stage 8 separately imports the actual bytes of up to two selected
+PDF/DOCX/TXT/Markdown files through Rust and can expose their bounded extracted
+text to an Assistant run after the UI shows the exact scope. Embeddings and
+local-model workflows remain explicitly outside the product architecture.
 
 The 2026-07-13 hardening pass adds bounded IPC text/array/response inputs,
 strict Gregorian `YYYY-MM-DD` validation, UUID v4 answer record ids, correct
@@ -92,8 +113,11 @@ atomic canonical rebuild, serializes read-then-write transactions with
 `BEGIN IMMEDIATE`, rejects stale case-workspace responses, preserves finalized
 Q&A context across page changes, locks extraction navigation correctly, and
 supports editing persisted case child records. The declared engineering scope
-is complete; optional hands-on GUI observations remain release-qualification
-evidence and do not reopen completed development.
+is complete. The native MCP control page has a local Windows release-app
+start/auth/stop/auto-start acceptance record; broader hands-on GUI,
+clean-machine, signing, SmartScreen, AV/EDR, and Windows 10/11 qualification
+remain required release-operations evidence and do not reopen completed
+application development.
 
 ## Repository Data Policy
 
@@ -122,8 +146,15 @@ Every formal Tauri build runs the read-only resource gate before compilation.
 
 ## Architecture Constraints
 
-- Windows x86_64 is the only supported target in the current phase.
-- The app must not create an HTTP server, FastAPI service, Express service, localhost service, or sidecar process.
+- The Tauri review station is Windows x86_64. The standalone MCP binary has
+  local Windows build/test and WorkBuddy evidence; repository workflow
+  definitions target Linux x86_64 and macOS Apple silicon as well, but their
+  first successful remote matrix run is still required before publication.
+- The Windows desktop exposes an opt-in MCP control page under Settings. It can
+  start the same Streamable HTTP implementation in-process on IPv4 loopback;
+  startup is manual unless the user explicitly saves `autoStart`. The desktop
+  never launches an MCP sidecar or enables a Tauri shell capability.
+- The MCP server is pure Rust and does not add a Node or Python runtime.
 - The packaged app must not introduce a local LLM, embedding model, Python runtime, or Node runtime.
 - The frontend is UI-only and calls Rust through typed Tauri commands.
 - SQLite queries, model API requests, and credential access must run in Rust.
@@ -131,14 +162,36 @@ Every formal Tauri build runs the read-only resource gate before compilation.
 - `legal_core.sqlite` is bundled as an app resource and treated as read-only.
 - `user.sqlite` is created as the writable user database under LocalAppData.
 - Case and evidence business data is stored through Rust-managed `user.sqlite` tables, not frontend storage.
-- API keys must not be written to ordinary config files, frontend storage, logs, or SQLite. The `providers` crate stores API keys through Windows Credential Manager and returns only configured/masked status to the frontend.
+- API keys and the desktop MCP Bearer must not be written to ordinary config
+  files, frontend storage, logs, or SQLite. The `providers` crate stores them
+  through Windows Credential Manager and returns only configured/masked status
+  to the frontend.
 - Every IPC request and response must have explicit Rust and TypeScript types.
 
 ## Project Documents
 
+- [MCP architecture, tools, installation and host integrations](docs/mcp/README.md)
+- [MCP security and privacy](docs/mcp/security-and-privacy.md)
+- [v0.3.0 privacy-hardening release notes and MCP compatibility](RELEASE_NOTES.md)
+- [WorkBuddy integration package](integrations/workbuddy/README.md)
+- [Codex integration package](integrations/codex/README.md)
+- [OpenCode integration package](integrations/opencode/README.md)
 - [引用 ID 规则](docs/citation-ids.md)
 
 ## Development Commands
+
+Build the standalone portable MCP binary on the current platform:
+
+```powershell
+cargo build --locked -p legal-mcp --bin lawyer-assistance-mcp
+cargo test --locked -p legal-services -p legal-mcp
+python integrations\validate_examples.py
+```
+
+The databases remain external files. Set their paths and the filesystem
+boundaries with CLI flags, a config file, or the documented
+`LAWYER_ASSISTANCE_*` environment variables; never package a real `user.sqlite`
+or the multi-gigabyte legal database into a Skill or source archive.
 
 Install dependencies:
 
@@ -150,7 +203,7 @@ Run all required checks:
 
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets --offline -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings
 cargo test --locked --workspace --offline
 pnpm lint
 pnpm test
@@ -160,6 +213,7 @@ python data/build/audit_provider_security.py
 python apps/desktop/scripts/verify_legal_resource.py
 python -m unittest scripts.test_generate_third_party_notices
 python scripts/generate_third_party_notices.py --check
+python -m unittest scripts.test_package_mcp_release
 ```
 
 Run the repeatable Provider secret/logging audit:
@@ -175,7 +229,7 @@ python -m unittest data.build.test_audit_provider_security
 ```
 
 Run the formal-database integration gates explicitly. The current suite contains
-six citation tests, five retrieval/relationship-graph tests, and one Stage 5
+six citation tests, six retrieval/relationship-graph tests, and one Stage 5
 document-citation test. They are ignored by ordinary CI so a fixture cannot
 masquerade as the product corpus:
 

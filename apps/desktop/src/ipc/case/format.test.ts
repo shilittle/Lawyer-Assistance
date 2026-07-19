@@ -15,7 +15,7 @@ describe("case IPC format helpers", () => {
     expect(formatPartyRole("plaintiff")).toBe("原告");
     expect(formatPartyRole("third_party")).toBe("第三人");
     expect(formatConfirmationStatus("confirmed")).toBe("已确认事实");
-    expect(formatConfirmationStatus("model_suggested")).toBe("模型建议");
+    expect(formatConfirmationStatus("model_suggested")).toBe("待审阅内容");
   });
 
   it("formats issue status and gap labels", () => {

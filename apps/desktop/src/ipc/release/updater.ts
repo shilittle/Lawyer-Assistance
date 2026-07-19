@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import { publicErrorMessage } from "../../publicOutput";
+
 const UPDATE_PROGRESS_EVENT = "lawyer-assistance://updater-progress";
 
 export interface ApplicationUpdate {
@@ -70,61 +72,6 @@ export async function relaunchApplication(
   await dependencies.invoke<void>("relaunch_application");
 }
 
-function parseMessage(value: string): { message: string; code?: string } | null {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-
-  try {
-    const parsed: unknown = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object") {
-      const record = parsed as Record<string, unknown>;
-      const message = [record.message, record.error, record.details].find(
-        (candidate): candidate is string =>
-          typeof candidate === "string" && candidate.trim().length > 0,
-      );
-      if (message) {
-        const code = [record.errorType, record.code].find(
-          (candidate): candidate is string =>
-            typeof candidate === "string" && candidate.trim().length > 0,
-        );
-        return {
-          message: message.trim(),
-          code: code?.trim(),
-        };
-      }
-    }
-  } catch {
-    // Plain Rust/Tauri command errors are commonly returned as strings.
-  }
-
-  return { message: trimmed };
-}
-
 export function formatIpcError(error: unknown): string {
-  if (error instanceof Error) {
-    const parsed = parseMessage(error.message);
-    if (parsed) return parsed.code ? `${parsed.message}（${parsed.code}）` : parsed.message;
-  }
-
-  if (typeof error === "string") {
-    const parsed = parseMessage(error);
-    if (parsed) return parsed.code ? `${parsed.message}（${parsed.code}）` : parsed.message;
-  }
-
-  if (error && typeof error === "object") {
-    const record = error as Record<string, unknown>;
-    const message = [record.message, record.error, record.details].find(
-      (candidate): candidate is string =>
-        typeof candidate === "string" && candidate.trim().length > 0,
-    );
-    if (message) {
-      const code = [record.errorType, record.code].find(
-        (candidate): candidate is string =>
-          typeof candidate === "string" && candidate.trim().length > 0,
-      );
-      return code ? `${message.trim()}（${code.trim()}）` : message.trim();
-    }
-  }
-
-  return "操作失败，请稍后重试或导出诊断报告。";
+  return publicErrorMessage(error);
 }

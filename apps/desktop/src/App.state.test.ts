@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   advanceCaseWorkspaceEpoch,
   advanceRequestEpoch,
+  assistantWritesBlockClose,
   articleMatchesDocumentCitation,
   blockingDirtyCaseDrafts,
   caseGraphNodeDomId,
@@ -18,6 +19,7 @@ import {
   copyCaseEntityForEditing,
   currentLawSearchCriteria,
   detectDirtyCaseDrafts,
+  decideMcpWorkspaceNavigation,
   decideWorkspaceClose,
   extractionReviewDiscardConfirmation,
   exactLawDocumentMatchesRequest,
@@ -37,6 +39,8 @@ import {
   providerApiKeyDeletionConfirmation,
   providerApiKeyOverwriteConfirmation,
   providerDeletionConfirmation,
+  publicCaseBusinessText,
+  publicEvidenceNumber,
   qaFormDraftFromLegalAnswerRecord,
   releaseCaseMutation,
   resolveLegalAnswerQuestion,
@@ -284,6 +288,22 @@ describe("App case workspace state helpers", () => {
     expect(draft).toEqual(file);
     expect(draft.fileId).toBe("file-1");
     expect(draft.projectId).toBe("case-saved");
+  });
+
+  it("keeps legacy service provenance out of editable case labels", () => {
+    expect(publicEvidenceNumber("service-aabbccddeeff0011-3")).toBe("待编号");
+    expect(
+      publicCaseBusinessText(
+        '{"proposalHash":"secret","sourceRefs":["attachment-secret"]}',
+        "经确认的案件信息",
+      ),
+    ).toBe("经确认的案件信息");
+    expect(
+      publicCaseBusinessText(
+        "材料存放在 C:\\Users\\someone\\private.pdf",
+        "案件材料",
+      ),
+    ).not.toContain("C:\\Users");
   });
 
   it("serializes case mutations and advances the workspace epoch per owner", () => {
@@ -551,6 +571,8 @@ describe("App case workspace state helpers", () => {
       "caseMutationInFlight",
       "providerMutationInFlight",
       "extractionMutationInFlight",
+      "assistantMutationInFlight",
+      "mcpMutationInFlight",
     ] as const) {
       const decision = decideWorkspaceClose({
         dirtyCaseDrafts: ["project"],
@@ -571,6 +593,114 @@ describe("App case workspace state helpers", () => {
         providerMutationInFlight: false,
         extractionMutationInFlight: false,
       }),
+    ).toEqual({ kind: "proceed" });
+  });
+
+  it("treats legal-library bridge writes as assistant mutations for close protection", () => {
+    expect(assistantWritesBlockClose(false, false)).toBe(false);
+    expect(assistantWritesBlockClose(true, false)).toBe(true);
+    expect(assistantWritesBlockClose(false, true)).toBe(true);
+    expect(assistantWritesBlockClose(true, true)).toBe(true);
+
+    const bridgeWrite = decideWorkspaceClose({
+      dirtyCaseDrafts: [],
+      providerDraftDirty: false,
+      caseMutationInFlight: false,
+      providerMutationInFlight: false,
+      extractionMutationInFlight: false,
+      assistantMutationInFlight: assistantWritesBlockClose(false, true),
+    });
+    expect(bridgeWrite.kind).toBe("block");
+    expect("message" in bridgeWrite ? bridgeWrite.message : "").toContain(
+      "法律库桥接",
+    );
+  });
+
+  it("protects active assistant runs and unsent assistant drafts", () => {
+    const activeRun = decideWorkspaceClose({
+      dirtyCaseDrafts: [],
+      providerDraftDirty: false,
+      caseMutationInFlight: false,
+      providerMutationInFlight: false,
+      extractionMutationInFlight: false,
+      assistantRunActive: true,
+    });
+    expect(activeRun.kind).toBe("block");
+    expect("message" in activeRun ? activeRun.message : "").toContain(
+      "助理任务仍在运行",
+    );
+
+    const unsentDraft = decideWorkspaceClose({
+      dirtyCaseDrafts: [],
+      providerDraftDirty: false,
+      caseMutationInFlight: false,
+      providerMutationInFlight: false,
+      extractionMutationInFlight: false,
+      assistantDraftDirty: true,
+    });
+    expect(unsentDraft.kind).toBe("confirm_discard");
+    expect("message" in unsentDraft ? unsentDraft.message : "").toContain(
+      "助理中未发送的任务草稿",
+    );
+  });
+
+  it("protects MCP configuration writes and unsaved settings", () => {
+    const activeMutation = decideWorkspaceClose({
+      dirtyCaseDrafts: [],
+      providerDraftDirty: false,
+      caseMutationInFlight: false,
+      providerMutationInFlight: false,
+      extractionMutationInFlight: false,
+      mcpMutationInFlight: true,
+    });
+    expect(activeMutation.kind).toBe("block");
+    expect("message" in activeMutation ? activeMutation.message : "").toContain(
+      "MCP 服务配置",
+    );
+
+    const dirtyConfig = decideWorkspaceClose({
+      dirtyCaseDrafts: [],
+      providerDraftDirty: false,
+      caseMutationInFlight: false,
+      providerMutationInFlight: false,
+      extractionMutationInFlight: false,
+      mcpDraftDirty: true,
+    });
+    expect(dirtyConfig.kind).toBe("confirm_discard");
+    expect("message" in dirtyConfig ? dirtyConfig.message : "").toContain(
+      "Bearer Token",
+    );
+  });
+
+  it("guards every shell navigation while MCP state is unresolved", () => {
+    expect(
+      decideMcpWorkspaceNavigation("mcp", "mcp", true, true),
+    ).toEqual({ kind: "proceed" });
+
+    const activeMutation = decideMcpWorkspaceNavigation(
+      "mcp",
+      "providers",
+      true,
+      true,
+    );
+    expect(activeMutation.kind).toBe("block");
+    expect(
+      "message" in activeMutation ? activeMutation.message : "",
+    ).toContain("阻止切换");
+
+    const pendingBearer = decideMcpWorkspaceNavigation(
+      "mcp",
+      "release",
+      false,
+      true,
+    );
+    expect(pendingBearer.kind).toBe("confirm_discard");
+    expect(
+      "message" in pendingBearer ? pendingBearer.message : "",
+    ).toContain("Bearer Token");
+
+    expect(
+      decideMcpWorkspaceNavigation("mcp", "assistant", false, false),
     ).toEqual({ kind: "proceed" });
   });
 
@@ -762,7 +892,7 @@ describe("App case workspace state helpers", () => {
         unsupportedLegalConclusion: true,
         semanticSupportVerified: false,
       }),
-    ).toBe("无可校验来源标记");
+    ).toBe("未列出法条依据");
     expect(
       formatCitationValidationSummary({
         citations: [
@@ -778,7 +908,7 @@ describe("App case workspace state helpers", () => {
         unsupportedLegalConclusion: true,
         semanticSupportVerified: false,
       }),
-    ).toBe("1 个无效");
+    ).toBe("1 条依据需要核对");
   });
 
   it("rejects stale search and detail responses by monotonically advancing epochs", () => {
@@ -826,14 +956,14 @@ describe("App case workspace state helpers", () => {
       caseEntityDeletionConfirmation("fact_issue_link", "交付 ↔ 违约责任"),
     ).toContain("事实—争点关联");
     expect(providerDeletionConfirmation("DeepSeek", "default")).toContain(
-      "Windows 凭据库",
+      "已保存的访问凭据",
     );
     expect(
       providerApiKeyDeletionConfirmation("DeepSeek", "default"),
     ).toContain("重新录入");
     expect(
       providerApiKeyOverwriteConfirmation("DeepSeek", "default"),
-    ).toContain("覆盖旧 Key");
+    ).toContain("覆盖旧凭据");
     expect(extractionReviewDiscardConfirmation()).toContain("不可撤销");
     expect(unrestorableExtractionDiscardConfirmation()).toContain("不可撤销");
   });

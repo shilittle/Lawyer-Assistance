@@ -1,0 +1,134 @@
+name: MCP server CI
+
+on:
+  push:
+    paths:
+      - "crates/legal-mcp/**"
+      - "crates/legal-services/**"
+      - "crates/assistant/**"
+      - "crates/citations/**"
+      - "crates/database/**"
+      - "crates/domain/**"
+      - "crates/file-ingest/**"
+      - "crates/retrieval/**"
+      - "integrations/**"
+      - "docs/mcp/**"
+      - "scripts/generate_third_party_notices.py"
+      - "scripts/test_generate_third_party_notices.py"
+      - "scripts/package_mcp_release.py"
+      - "scripts/test_package_mcp_release.py"
+      - "apps/desktop/package.json"
+      - "apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+      - "LICENSE"
+      - "README.md"
+      - "RELEASE_NOTES.md"
+      - ".github/workflows/mcp-ci.yml"
+  pull_request:
+    paths:
+      - "crates/legal-mcp/**"
+      - "crates/legal-services/**"
+      - "crates/assistant/**"
+      - "crates/citations/**"
+      - "crates/database/**"
+      - "crates/domain/**"
+      - "crates/file-ingest/**"
+      - "crates/retrieval/**"
+      - "integrations/**"
+      - "docs/mcp/**"
+      - "scripts/generate_third_party_notices.py"
+      - "scripts/test_generate_third_party_notices.py"
+      - "scripts/package_mcp_release.py"
+      - "scripts/test_package_mcp_release.py"
+      - "apps/desktop/package.json"
+      - "apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+      - "LICENSE"
+      - "README.md"
+      - "RELEASE_NOTES.md"
+      - ".github/workflows/mcp-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    name: legal-mcp (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: legal-mcp-${{ matrix.target }}
+
+      - name: Validate checked-in host configs and self-contained Skill packages
+        run: |
+          python -m unittest integrations.test_validate_examples
+          python integrations/validate_examples.py
+
+      - name: Check server crates
+        run: cargo check --locked -p file-ingest -p legal-services -p legal-mcp --all-targets --all-features
+
+      - name: Lint server crates
+        run: cargo clippy --locked -p file-ingest -p legal-services -p legal-mcp --all-targets --all-features -- -D warnings
+
+      - name: Test server crates
+        run: cargo test --locked -p file-ingest -p legal-services -p legal-mcp --all-features
+
+      - name: Build release server
+        run: cargo build --release --locked -p legal-mcp --bin lawyer-assistance-mcp
+
+      - name: Verify complete desktop and MCP notices
+        run: |
+          python -m unittest scripts.test_generate_third_party_notices
+          python scripts/generate_third_party_notices.py --check
+
+      - name: Test and assemble verified MCP release archive
+        shell: pwsh
+        run: |
+          python -m unittest scripts.test_package_mcp_release
+          $suffix = if ('${{ runner.os }}' -eq 'Windows') { '.exe' } else { '' }
+          $binary = "target/${{ matrix.target }}/release/lawyer-assistance-mcp$suffix"
+          python scripts/package_mcp_release.py --target '${{ matrix.target }}' --binary $binary --output-dir dist/mcp
+
+      - name: Upload verified MCP release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: lawyer-assistance-mcp-${{ matrix.target }}
+          path: dist/mcp/*
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,48 @@
+[package]
+name = "legal-mcp"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "lawyer-assistance-mcp"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+database = { path = "../database" }
+hmac = "0.12"
+legal-services = { path = "../legal-services" }
+privacy.workspace = true
+providers.workspace = true
+rmcp = { version = "=2.2.0", default-features = false, features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server"] }
+rusqlite.workspace = true
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["io-std", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.19", features = ["v4"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+tempfile = "3.23"
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

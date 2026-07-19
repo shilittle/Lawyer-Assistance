@@ -42,7 +42,9 @@ function localReference(currentFile, rawReference) {
   }
   const absolute = withoutSuffix.startsWith("/")
     ? resolve(distRoot, `.${withoutSuffix}`)
-    : resolve(distRoot, dirname(currentFile), withoutSuffix);
+    : withoutSuffix.startsWith("assets/")
+      ? resolve(distRoot, withoutSuffix)
+      : resolve(distRoot, dirname(currentFile), withoutSuffix);
   const normalized = normalizeRelative(relative(distRoot, absolute));
   if (normalized === ".." || normalized.startsWith("../")) {
     throw new Error(`frontend asset escapes dist root: ${rawReference}`);
@@ -62,8 +64,14 @@ const queue = [entry];
 const textExtensions = /\.(?:html|css|js|mjs|json|svg)$/i;
 const referencePatterns = [
   /\b(?:src|href)\s*=\s*["']([^"']+)["']/gi,
-  /\burl\(\s*["']?([^"')]+)["']?\s*\)/gi,
+  // Keep CSS `url(...)` case-sensitive here. Minified JavaScript commonly
+  // contains the unrelated `URL(value)` constructor, which must not be
+  // treated as a path to a bundled asset.
+  /\burl\(\s*["']?([^"')]+)["']?\s*\)/g,
   /\b(?:import|from)\s*\(?\s*[`"']([^`"']+)[`"']/gi,
+  // Lazy chunks can carry their extracted CSS in Vite's generated
+  // `__vite__mapDeps` string table rather than an import statement.
+  /[`"']((?:\.\.\/|\.\/|\/)?assets\/[A-Za-z0-9_.~-]+-[A-Za-z0-9_-]{8,}\.(?:css|js|mjs|map|svg|png|webp|woff2?))[`"']/gi,
   /\bsourceMappingURL\s*=\s*([^\s*]+)/gi,
 ];
 

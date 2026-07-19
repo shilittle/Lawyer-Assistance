@@ -1,0 +1,25 @@
+[package]
+name = "material-processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lopdf = { version = "=0.44.0", default-features = false }
+printpdf = { version = "=0.11.1", default-features = false }
+privacy = { path = "../privacy" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints.rust]
+# One reviewed Win32 drive-type query is isolated in mineru_config; all other
+# unsafe code remains denied by default.
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"

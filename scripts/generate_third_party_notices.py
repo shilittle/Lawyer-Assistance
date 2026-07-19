@@ -12,6 +12,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "apps" / "desktop" / "src-tauri" / "resources" / "THIRD_PARTY_NOTICES.txt"
+FONT_ASSET_DIR = ROOT / "crates" / "material-processing" / "assets" / "fonts"
+SAFE_EXPORT_FONT_SHA256 = "7db3c634bbd0301b3082a80ffcac2f422e8ef9ce0730f8b279c3e8f756598f68"
 NOTICE_NAMES = re.compile(r"^(licen[cs]e|copying|copyright|notice)([._-].*)?$", re.IGNORECASE)
 
 ALLOC_STDLIB_BSD = """Copyright (c) 2016 Dropbox, Inc.
@@ -75,6 +77,127 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
+CC0_1_0 = """Creative Commons Legal Code
+
+CC0 1.0 Universal
+
+    CREATIVE COMMONS CORPORATION IS NOT A LAW FIRM AND DOES NOT PROVIDE
+    LEGAL SERVICES. DISTRIBUTION OF THIS DOCUMENT DOES NOT CREATE AN
+    ATTORNEY-CLIENT RELATIONSHIP. CREATIVE COMMONS PROVIDES THIS
+    INFORMATION ON AN "AS-IS" BASIS. CREATIVE COMMONS MAKES NO WARRANTIES
+    REGARDING THE USE OF THIS DOCUMENT OR THE INFORMATION OR WORKS
+    PROVIDED HEREUNDER, AND DISCLAIMS LIABILITY FOR DAMAGES RESULTING FROM
+    THE USE OF THIS DOCUMENT OR THE INFORMATION OR WORKS PROVIDED
+    HEREUNDER.
+
+Statement of Purpose
+
+The laws of most jurisdictions throughout the world automatically confer
+exclusive Copyright and Related Rights (defined below) upon the creator
+and subsequent owner(s) (each and all, an "owner") of an original work of
+authorship and/or a database (each, a "Work").
+
+Certain owners wish to permanently relinquish those rights to a Work for
+the purpose of contributing to a commons of creative, cultural and
+scientific works ("Commons") that the public can reliably and without fear
+of later claims of infringement build upon, modify, incorporate in other
+works, reuse and redistribute as freely as possible in any form whatsoever
+and for any purposes, including without limitation commercial purposes.
+These owners may contribute to the Commons to promote the ideal of a free
+culture and the further production of creative, cultural and scientific
+works, or to gain reputation or greater distribution for their Work in
+part through the use and efforts of others.
+
+For these and/or other purposes and motivations, and without any
+expectation of additional consideration or compensation, the person
+associating CC0 with a Work (the "Affirmer"), to the extent that he or she
+is an owner of Copyright and Related Rights in the Work, voluntarily
+elects to apply CC0 to the Work and publicly distribute the Work under its
+terms, with knowledge of his or her Copyright and Related Rights in the
+Work and the meaning and intended legal effect of CC0 on those rights.
+
+1. Copyright and Related Rights. A Work made available under CC0 may be
+protected by copyright and related or neighboring rights ("Copyright and
+Related Rights"). Copyright and Related Rights include, but are not
+limited to, the following:
+
+  i. the right to reproduce, adapt, distribute, perform, display,
+     communicate, and translate a Work;
+ ii. moral rights retained by the original author(s) and/or performer(s);
+iii. publicity and privacy rights pertaining to a person's image or
+     likeness depicted in a Work;
+ iv. rights protecting against unfair competition in regards to a Work,
+     subject to the limitations in paragraph 4(a), below;
+  v. rights protecting the extraction, dissemination, use and reuse of data
+     in a Work;
+ vi. database rights (such as those arising under Directive 96/9/EC of
+     the European Parliament and of the Council of 11 March 1996 on the
+     legal protection of databases, and under any national implementation
+     thereof, including any amended or successor version of such
+     directive); and
+vii. other similar, equivalent or corresponding rights throughout the
+     world based on applicable law or treaty, and any national
+     implementations thereof.
+
+2. Waiver. To the greatest extent permitted by, but not in contravention
+of, applicable law, Affirmer hereby overtly, fully, permanently,
+irrevocably and unconditionally waives, abandons, and surrenders all of
+Affirmer's Copyright and Related Rights and associated claims and causes
+of action, whether now known or unknown (including existing as well as
+future claims and causes of action), in the Work (i) in all territories
+worldwide, (ii) for the maximum duration provided by applicable law or
+treaty (including future time extensions), (iii) in any current or future
+medium and for any number of copies, and (iv) for any purpose whatsoever,
+including without limitation commercial, advertising or promotional
+purposes (the "Waiver"). Affirmer makes the Waiver for the benefit of each
+member of the public at large and to the detriment of Affirmer's heirs and
+successors, fully intending that such Waiver shall not be subject to
+revocation, rescission, cancellation, termination, or any other legal or
+equitable action to disrupt the quiet enjoyment of the Work by the public
+as contemplated by Affirmer's express Statement of Purpose.
+
+3. Public License Fallback. Should any part of the Waiver for any reason be
+judged legally invalid or ineffective under applicable law, then the
+Waiver shall be preserved to the maximum extent permitted taking into
+account Affirmer's express Statement of Purpose. In addition, to the
+extent the Waiver is so judged Affirmer hereby grants to each affected
+person a royalty-free, non transferable, non sublicensable, non exclusive,
+irrevocable and unconditional license to exercise Affirmer's Copyright and
+Related Rights in the Work (i) in all territories worldwide, (ii) for the
+maximum duration provided by applicable law or treaty (including future
+time extensions), (iii) in any current or future medium and for any number
+of copies, and (iv) for any purpose whatsoever, including without
+limitation commercial, advertising or promotional purposes (the
+"License"). The License shall be deemed effective as of the date CC0 was
+applied by Affirmer to the Work. Should any part of the License for any
+reason be judged legally invalid or ineffective under applicable law, such
+partial invalidity or ineffectiveness shall not invalidate the remainder
+of the License, and in such case Affirmer hereby affirms that he or she
+will not (i) exercise any of his or her remaining Copyright and Related
+Rights in the Work or (ii) assert any associated claims and causes of
+action with respect to the Work, in either case contrary to Affirmer's
+express Statement of Purpose.
+
+4. Limitations and Disclaimers.
+
+ a. No trademark or patent rights held by Affirmer are waived, abandoned,
+    surrendered, licensed or otherwise affected by this document.
+ b. Affirmer offers the Work as-is and makes no representations or
+    warranties of any kind concerning the Work, express, implied,
+    statutory or otherwise, including without limitation warranties of
+    title, merchantability, fitness for a particular purpose, non
+    infringement, or the absence of latent or other defects, accuracy, or
+    the present or absence of errors, whether or not discoverable, all to
+    the greatest extent permissible under applicable law.
+ c. Affirmer disclaims responsibility for clearing rights of other persons
+    that may apply to the Work or any use thereof, including without
+    limitation any person's Copyright and Related Rights in the Work.
+    Further, Affirmer disclaims responsibility for obtaining any necessary
+    consents, permissions or other rights required for any use of the Work.
+ d. Affirmer understands and acknowledges that Creative Commons is not a
+    party to this document and has no duty or obligation with respect to
+    this CC0 or use of the Work."""
+
 
 @dataclass(frozen=True)
 class Component:
@@ -113,6 +236,29 @@ def readable_notices(directory: Path) -> tuple[tuple[str, str], ...]:
     return tuple(notices)
 
 
+def bundled_asset_components() -> list[Component]:
+    font_path = FONT_ASSET_DIR / "NotoSansHans-Regular.otf"
+    if not font_path.is_file():
+        raise RuntimeError("bundled safe-export font is missing")
+    digest = hashlib.sha256(font_path.read_bytes()).hexdigest()
+    if digest != SAFE_EXPORT_FONT_SHA256:
+        raise RuntimeError("bundled safe-export font SHA-256 does not match the reviewed binary")
+    texts = readable_notices(FONT_ASSET_DIR)
+    text_names = {name for name, _ in texts}
+    required = {"LICENSE-APACHE-2.0.txt", "NOTICE-NOTO-SANS-S-CHINESE.txt"}
+    if not required.issubset(text_names):
+        raise RuntimeError("bundled safe-export font license or notice is missing")
+    return [
+        Component(
+            "Bundled Font",
+            "Noto Sans S Chinese Regular",
+            "1.000",
+            "Apache-2.0",
+            "https://github.com/adobe-fonts/source-han-sans",
+            texts,
+        )
+    ]
+
 def cargo_components() -> list[Component]:
     command = [
         "cargo",
@@ -136,13 +282,15 @@ def cargo_components() -> list[Component]:
     )
     packages_by_id = {package["id"]: package for package in metadata["packages"]}
     nodes_by_id = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+    product_names = {"lawyer-assistance-desktop", "legal-mcp"}
     roots = [
         package["id"]
         for package in metadata["packages"]
-        if package["name"] == "lawyer-assistance-desktop"
+        if package["name"] in product_names
     ]
-    if len(roots) != 1:
-        raise RuntimeError("cannot identify the Lawyer Assistance desktop Cargo package")
+    resolved_names = {packages_by_id[package_id]["name"] for package_id in roots}
+    if resolved_names != product_names:
+        raise RuntimeError("cannot identify the desktop and MCP Cargo product packages")
     reachable: set[str] = set()
     pending = roots
     while pending:
@@ -203,12 +351,19 @@ def npm_package_directories() -> list[Path]:
     while pending:
         owner, name, optional = pending.pop()
         parts = name.split("/")
-        search_paths = [
-            owner.joinpath(*parts),
-            owner.joinpath("node_modules", *parts),
-            owner.parent.joinpath(*parts),
-            desktop_modules.joinpath(*parts),
-        ]
+        # A resolved pnpm package lives below
+        # `.pnpm/<package>/node_modules/<package>`.  Its scoped transitive
+        # dependencies are siblings below the *outer* node_modules directory,
+        # not children of the resolved package directory.  Walk the bounded
+        # ancestor chain so both ordinary npm layouts and pnpm's isolated
+        # layout are resolved without assuming a particular store hash.
+        search_paths = [owner.joinpath(*parts)]
+        for ancestor in (owner, *owner.parents):
+            search_paths.append(ancestor.joinpath("node_modules", *parts))
+            search_paths.append(ancestor.joinpath(*parts))
+            if ancestor == ROOT:
+                break
+        search_paths.append(desktop_modules.joinpath(*parts))
         dependency = next((candidate for candidate in search_paths if candidate.is_dir()), None)
         if dependency is None:
             if optional:
@@ -302,6 +457,14 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
         "unic-ucd-ident",
         "unic-ucd-version",
     }
+    encoding_index_packages = {
+        "encoding-index-japanese",
+        "encoding-index-korean",
+        "encoding-index-simpchinese",
+        "encoding-index-singlebyte",
+        "encoding-index-tradchinese",
+        "encoding_index_tests",
+    }
     completed: list[Component] = []
     for component in components:
         texts = component.texts
@@ -311,6 +474,34 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
             texts = (("SPDX-MPL-2.0", mpl),)
         elif not texts and component.name in unic_packages and component.version == "0.9.0":
             texts = (("UPSTREAM-LICENSE-MIT", UNIC_MIT), ("SPDX-Apache-2.0", apache))
+        elif (
+            not texts
+            and component.name in encoding_index_packages
+            and component.license_expression == "CC0-1.0"
+        ):
+            texts = (("SPDX-CC0-1.0", CC0_1_0),)
+        elif not texts and component.name == "genpdf" and component.version == "0.2.0":
+            # genpdf offers Apache-2.0 OR MIT.  The package omits both license
+            # files from its published crate, so distribute it under the
+            # Apache-2.0 option using the canonical text already present in
+            # another locked dependency.
+            texts = (("SPDX-Apache-2.0", apache),)
+        elif not texts and component.name == "tauri-plugin" and component.version == "2.6.3":
+            # tauri-plugin offers Apache-2.0 OR MIT.  The published crate omits
+            # both license files, so use the canonical Apache-2.0 text already
+            # present in this exact locked dependency closure.
+            texts = (("SPDX-Apache-2.0", apache),)
+        elif not texts and component.license_expression in {
+            "Apache-2.0",
+            "Apache-2.0 OR MIT",
+            "MIT OR Apache-2.0",
+            "MIT/Apache-2.0",
+        }:
+            # Some crates (including rmcp-macros and sse-stream) declare an
+            # Apache-2.0 option in their published manifest but omit the
+            # duplicate license file. Reuse the canonical Apache text from
+            # this exact locked closure and distribute under that option.
+            texts = (("SPDX-Apache-2.0", apache),)
         elif not texts and component.name in {
             "webview2-com",
             "webview2-com-macros",
@@ -338,7 +529,7 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
 def render() -> str:
     cargo_lock = ROOT / "Cargo.lock"
     pnpm_lock = ROOT / "pnpm-lock.yaml"
-    components = cargo_components() + npm_components()
+    components = cargo_components() + npm_components() + bundled_asset_components()
     vendor = ROOT / "vendor" / "minisign-verify"
     components.append(
         Component(
@@ -378,7 +569,7 @@ def render() -> str:
     lines = [
         "LAWYER ASSISTANCE THIRD-PARTY SOFTWARE NOTICES",
         "",
-        "This file is generated from the exact Rust and JavaScript dependency installations.",
+        "This file is generated from the exact Rust/JavaScript installations and reviewed bundled assets.",
         f"Cargo.lock SHA-256: {canonical_text_sha256(cargo_lock)}",
         f"pnpm-lock.yaml SHA-256: {canonical_text_sha256(pnpm_lock)}",
         f"Components: {len(components)}; unique bundled notice texts: {len(text_bodies)}",

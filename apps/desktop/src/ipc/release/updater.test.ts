@@ -101,10 +101,12 @@ describe("release updater", () => {
       formatIpcError(
         '{"errorType":"backup_invalid","message":"备份文件无效"}',
       ),
-    ).toBe("备份文件无效（backup_invalid）");
+    ).toBe("操作未完成，请重试；如仍失败，请导出诊断报告。");
     expect(formatIpcError({ error: "网络不可用", code: "updater_offline" })).toBe(
-      "网络不可用（updater_offline）",
+      "操作未完成，请重试；如仍失败，请导出诊断报告。",
     );
-    expect(formatIpcError(null)).toBe("操作失败，请稍后重试或导出诊断报告。");
+    expect(formatIpcError(null)).toBe(
+      "操作未完成，请重试；如仍失败，请导出诊断报告。",
+    );
   });
 });

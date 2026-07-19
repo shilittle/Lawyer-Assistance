@@ -1,0 +1,11 @@
+interface:
+  display_name: "Lawyer Assistance"
+  short_description: "Research Chinese public law safely"
+  default_prompt: "Use $lawyer-assistance to research a public Chinese law question with no client or case data."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "lawyer_assistance"
+      description: "Lawyer Assistance public-law-only MCP server"
+      transport: "streamable_http"
+      url: "http://127.0.0.1:8787/mcp"

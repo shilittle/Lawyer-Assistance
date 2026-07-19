@@ -34,14 +34,14 @@ describe("legal answer stream state", () => {
 
     expect(state.answer).toBe("第一段第二段");
     expect(state.usage?.totalTokens).toBe(12);
-    expect(formatLegalAnswerStreamStatus(state)).toContain("引用未校验");
+    expect(formatLegalAnswerStreamStatus(state)).toBe("正在整理回答");
 
     state = reduceLegalAnswerStreamEvent(state, {
       requestId: "answer-1",
       eventType: "done",
     });
     expect(state.status).toBe("finalizing");
-    expect(formatLegalAnswerStreamStatus(state)).toContain("正在载入结果");
+    expect(formatLegalAnswerStreamStatus(state)).toContain("正在载入法条依据");
     expect(isLegalAnswerStreamActive(state)).toBe(true);
     expect(isLegalAnswerStreamCancellable(state)).toBe(false);
     expect(markLegalAnswerCancelling(state)).toBe(state);

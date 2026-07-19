@@ -1,9 +1,15 @@
 [workspace]
 members = [
   "apps/desktop/src-tauri",
+  "crates/assistant",
   "crates/citations",
   "crates/database",
   "crates/domain",
+  "crates/file-ingest",
+  "crates/legal-mcp",
+  "crates/material-processing",
+  "crates/privacy",
+  "crates/legal-services",
   "crates/providers",
   "crates/retrieval",
   "vendor/minisign-verify",
@@ -13,12 +19,18 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace.dependencies]
+assistant = { path = "crates/assistant" }
 citations = { path = "crates/citations" }
 database = { path = "crates/database" }
 domain = { path = "crates/domain" }
+file-ingest = { path = "crates/file-ingest" }
+legal-mcp = { path = "crates/legal-mcp" }
+material-processing = { path = "crates/material-processing" }
+privacy = { path = "crates/privacy" }
+legal-services = { path = "crates/legal-services" }
 providers = { path = "crates/providers" }
 retrieval = { path = "crates/retrieval" }
 
@@ -32,7 +44,14 @@ serde_json = "1.0.145"
 sha2 = "0.10.9"
 tauri = "2.11.5"
 tauri-build = "2.6.3"
+tauri-plugin-dialog = "=2.7.1"
 tauri-plugin-single-instance = "2.4.3"
 tempfile = "3.23.0"
 uuid = { version = "1.19.0", features = ["v4"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release.package.legal-mcp]
+# The server is I/O-bound; O2 with bounded codegen parallelism also avoids an
+# LLVM 22/O3 access violation observed in Windows MSVC release builds.
+opt-level = 2
+codegen-units = 4

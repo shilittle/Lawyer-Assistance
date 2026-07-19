@@ -1,0 +1,133 @@
+.mcp-workspace {
+  display: grid;
+  gap: 18px;
+}
+
+.mcp-workspace__status-grid,
+.mcp-workspace__form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+}
+
+.mcp-workspace__status-grid {
+  margin: 0;
+}
+
+.mcp-workspace__status-grid > div {
+  min-width: 0;
+  border: 1px solid #dde5e2;
+  border-radius: 7px;
+  padding: 10px 12px;
+  background: #f8fbfa;
+}
+
+.mcp-workspace__status-grid dt {
+  color: #5e6c66;
+  font-size: 0.78rem;
+  font-weight: 750;
+}
+
+.mcp-workspace__status-grid dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.mcp-workspace__form-grid label,
+.mcp-workspace__credential label {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: #52635b;
+  font-size: 0.86rem;
+  font-weight: 750;
+}
+
+.mcp-workspace__form-grid .mcp-workspace__wide {
+  grid-column: 1 / -1;
+}
+
+.mcp-workspace__checkbox {
+  display: flex !important;
+  align-items: center;
+  gap: 8px !important;
+}
+
+.mcp-workspace__checkbox input {
+  width: 18px;
+  height: 18px;
+}
+
+.mcp-workspace__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.mcp-workspace__actions button.is-stop,
+.mcp-workspace__credential button.is-delete {
+  border-color: #9d2418;
+  background: #b42318;
+}
+
+.mcp-workspace__advanced {
+  border: 1px solid #d7e0dd;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.mcp-workspace__advanced summary {
+  cursor: pointer;
+  color: #334840;
+  font-weight: 750;
+}
+
+.mcp-workspace__advanced .mcp-workspace__form-grid {
+  margin-top: 14px;
+}
+
+.mcp-workspace__credential {
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid #dde5e2;
+  padding-top: 14px;
+}
+
+.mcp-workspace__credential-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.mcp-workspace__credential-row label {
+  min-width: 0;
+}
+
+.mcp-workspace__error {
+  border: 1px solid #e3aba4;
+  border-radius: 7px;
+  padding: 10px 12px;
+  background: #fff3f1;
+  color: #8f2016;
+}
+
+.mcp-workspace__notice {
+  border: 1px solid #a8c8bf;
+  border-radius: 7px;
+  padding: 10px 12px;
+  background: #f0f8f5;
+  color: #24594e;
+}
+
+@media (max-width: 760px) {
+  .mcp-workspace__status-grid,
+  .mcp-workspace__form-grid,
+  .mcp-workspace__credential-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .mcp-workspace__form-grid .mcp-workspace__wide {
+    grid-column: auto;
+  }
+}

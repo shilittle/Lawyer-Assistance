@@ -7,14 +7,173 @@
 compile_error!("Lawyer Assistance currently supports only Windows x86_64.");
 
 use domain::health::HealthCheckResponse;
-use std::path::PathBuf;
-use tauri::{path::BaseDirectory, Manager};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tauri::{path::BaseDirectory, AppHandle, Manager};
 
 mod atomic_file;
 mod commands;
 mod crash_log;
+mod mcp_manager;
+mod privacy_manager;
+mod privacy_workflow;
 mod single_instance;
 mod state;
+
+const MCP_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitDrainDecision {
+    BeginDrain,
+    WaitForDrain,
+    AllowExit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitDrainPhase {
+    Idle,
+    LaunchingInstaller { pending_exit: Option<i32> },
+    Draining,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallerLaunchCompletion {
+    BeginInstallerExit,
+    BeginPendingExit(i32),
+    ReturnToApp,
+    InvalidState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalExitAction {
+    Exit(i32),
+    Restart,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExitDrainCoordinator {
+    phase: Mutex<ExitDrainPhase>,
+}
+
+impl Default for ExitDrainCoordinator {
+    fn default() -> Self {
+        Self {
+            phase: Mutex::new(ExitDrainPhase::Idle),
+        }
+    }
+}
+
+impl ExitDrainCoordinator {
+    fn request(&self, exit_code: i32) -> ExitDrainDecision {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *phase {
+            ExitDrainPhase::Idle => {
+                *phase = ExitDrainPhase::Draining;
+                ExitDrainDecision::BeginDrain
+            }
+            ExitDrainPhase::LaunchingInstaller { pending_exit } => {
+                if pending_exit.is_none() {
+                    *pending_exit = Some(exit_code);
+                }
+                ExitDrainDecision::WaitForDrain
+            }
+            ExitDrainPhase::Draining => ExitDrainDecision::WaitForDrain,
+            ExitDrainPhase::Finalizing => ExitDrainDecision::AllowExit,
+        }
+    }
+
+    pub(crate) fn begin_programmatic_exit(&self) -> bool {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *phase != ExitDrainPhase::Idle {
+            return false;
+        }
+        *phase = ExitDrainPhase::Draining;
+        true
+    }
+
+    pub(crate) fn reserve_installer_launch(&self) -> bool {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *phase != ExitDrainPhase::Idle {
+            return false;
+        }
+        *phase = ExitDrainPhase::LaunchingInstaller { pending_exit: None };
+        true
+    }
+
+    pub(crate) fn complete_installer_launch(&self, succeeded: bool) -> InstallerLaunchCompletion {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ExitDrainPhase::LaunchingInstaller { pending_exit } = *phase else {
+            return InstallerLaunchCompletion::InvalidState;
+        };
+        if succeeded {
+            *phase = ExitDrainPhase::Draining;
+            InstallerLaunchCompletion::BeginInstallerExit
+        } else if let Some(exit_code) = pending_exit {
+            *phase = ExitDrainPhase::Draining;
+            InstallerLaunchCompletion::BeginPendingExit(exit_code)
+        } else {
+            *phase = ExitDrainPhase::Idle;
+            InstallerLaunchCompletion::ReturnToApp
+        }
+    }
+
+    pub(crate) fn is_finalizing(&self) -> bool {
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == ExitDrainPhase::Finalizing
+    }
+
+    fn mark_finalizing(&self) {
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ExitDrainPhase::Finalizing;
+    }
+}
+
+pub(crate) async fn drain_mcp_and_finalize(
+    app: AppHandle,
+    manager: Option<mcp_manager::McpManager>,
+    coordinator: Arc<ExitDrainCoordinator>,
+    action: FinalExitAction,
+) {
+    if let Some(manager) = manager {
+        if !manager
+            .shutdown_for_exit_with_timeout(MCP_EXIT_DRAIN_TIMEOUT)
+            .await
+        {
+            if let Ok(directory) = app.path().app_local_data_dir() {
+                crash_log::record_maintenance_failure(
+                    &directory.join("crash-events.log"),
+                    "mcp_exit_drain_timeout",
+                );
+            }
+        }
+    }
+    coordinator.mark_finalizing();
+    match action {
+        FinalExitAction::Exit(code) => app.exit(code),
+        FinalExitAction::Restart => app.request_restart(),
+    }
+}
 
 pub fn health_check_response() -> HealthCheckResponse {
     HealthCheckResponse::ok("Lawyer Assistance")
@@ -55,10 +214,13 @@ pub fn run() {
         .expect("failed to acquire the single-instance lifetime guard");
     let is_primary = lifetime_guard.is_some();
     let pending_main_window_reveal = single_instance::new_pending_reveal_flag();
+    let exit_drain = Arc::new(ExitDrainCoordinator::default());
+    let managed_exit_drain = Arc::clone(&exit_drain);
 
     let app = tauri::Builder::default()
         // Tauri requires this plugin to be registered before every other plugin.
         .plugin(single_instance::plugin(pending_main_window_reveal.clone()))
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // The upstream plugin normally terminates a secondary during build,
             // but its Windows message target may be transiently unavailable.
@@ -85,6 +247,20 @@ pub fn run() {
                 },
             )?;
             let user_database_path = database::ensure_user_database(&app_local_data_dir)?;
+            commands::assistant_run::recover_interrupted_assistant_runs(&user_database_path)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to recover interrupted assistant runs: {}",
+                        error.message
+                    ))
+                })?;
+            commands::assistant::recover_pending_assistant_artifact_exports(&app_local_data_dir)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to recover pending assistant artifact export: {}",
+                        error.message
+                    ))
+                })?;
             commands::document::recover_pending_document_exports(
                 &app_local_data_dir,
                 &user_database_path,
@@ -96,7 +272,34 @@ pub fn run() {
                 ))
             })?;
             let legal_core_path = resolve_legal_core_resource(app)?;
+            let privacy_manager = privacy_manager::PrivacyManager::new(app_local_data_dir.clone())
+                .map_err(|error| {
+                    std::io::Error::other(format!("failed to initialize privacy settings: {error}"))
+                })?;
+            let privacy_workflow = privacy_workflow::PrivacyWorkflowManager::new(
+                app_local_data_dir.clone(),
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("failed to initialize privacy workflow: {error}"))
+            })?;
+            let mcp_manager = mcp_manager::McpManager::new(
+                app_local_data_dir,
+                legal_core_path.clone(),
+                user_database_path.clone(),
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("failed to initialize MCP settings: {error}"))
+            })?;
             app.manage(state::AppState::new(legal_core_path, user_database_path));
+            app.manage(mcp_manager.clone());
+            app.manage(privacy_manager);
+            app.manage(Arc::clone(&managed_exit_drain));
+            app.manage(privacy_workflow);
+            if mcp_manager.auto_start_enabled() {
+                tauri::async_runtime::spawn(async move {
+                    let _ = mcp_manager.auto_start_if_enabled().await;
+                });
+            }
             single_instance::flush_pending_main_window_reveal(
                 app.handle(),
                 &pending_main_window_reveal,
@@ -105,6 +308,26 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             health_check,
+            commands::assistant::get_assistant_capabilities,
+            commands::assistant::list_assistant_conversations,
+            commands::assistant::create_assistant_conversation,
+            commands::assistant::get_assistant_conversation,
+            commands::assistant::bind_assistant_conversation,
+            commands::assistant::archive_assistant_conversation,
+            commands::assistant::add_assistant_legal_source,
+            commands::assistant::propose_assistant_legal_basis,
+            commands::assistant::list_assistant_artifacts,
+            commands::assistant::get_assistant_artifact,
+            commands::assistant::bind_assistant_artifact,
+            commands::assistant::save_assistant_artifact,
+            commands::assistant::export_assistant_artifact,
+            commands::assistant::import_assistant_files,
+            commands::assistant::delete_assistant_attachment,
+            commands::assistant::create_assistant_case_change_proposal,
+            commands::assistant::reject_assistant_case_change_proposal,
+            commands::assistant::apply_assistant_case_change_proposal,
+            commands::assistant_run::start_assistant_run,
+            commands::assistant::cancel_assistant_run,
             commands::case::list_case_projects,
             commands::case::get_case_workspace,
             commands::case::get_pending_structured_case_extraction,
@@ -126,7 +349,7 @@ pub fn run() {
             commands::case::discard_structured_case_extraction,
             commands::document::list_document_templates,
             commands::document::preview_document,
-            commands::document::export_document,
+            commands::document::export_document_pdf,
             commands::graph::get_case_graph,
             commands::graph::get_law_graph,
             commands::legal::search_laws,
@@ -139,7 +362,23 @@ pub fn run() {
             commands::legal::list_legal_answer_records,
             commands::legal::answer_legal_question,
             commands::legal::cancel_legal_answer,
+            commands::mcp::get_mcp_server_config,
+            commands::mcp::save_mcp_server_config,
+            commands::mcp::get_mcp_server_status,
+            commands::mcp::start_mcp_server,
+            commands::mcp::stop_mcp_server,
+            commands::mcp::write_mcp_bearer_token,
+            commands::mcp::delete_mcp_bearer_token,
+            commands::privacy::get_privacy_config,
+            commands::privacy::save_privacy_config,
+            commands::privacy::get_local_ocr_status,
+            commands::privacy_workflow::delete_privacy_review,
             commands::provider::list_provider_profiles,
+            commands::privacy_workflow::prepare_privacy_material,
+            commands::privacy_workflow::load_privacy_review,
+            commands::privacy_workflow::load_latest_privacy_review,
+            commands::privacy_workflow::approve_privacy_review,
+            commands::privacy_workflow::export_approved_review_pdf,
             commands::provider::upsert_provider_profile,
             commands::provider::delete_provider_profile,
             commands::provider::get_provider_api_key_status,
@@ -167,7 +406,49 @@ pub fn run() {
     let Some(_lifetime_guard) = lifetime_guard else {
         return;
     };
-    app.run(|_, _| {});
+    app.run(move |handle, event| match event {
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
+            // Tauri ignores `prevent_exit` for its reserved restart code. Every
+            // in-app restart path drains MCP before requesting that event.
+            if code == Some(tauri::RESTART_EXIT_CODE) {
+                if !exit_drain.is_finalizing() {
+                    if let Some(manager) = handle.try_state::<mcp_manager::McpManager>() {
+                        manager.cancel_for_exit();
+                    }
+                    if let Ok(directory) = handle.path().app_local_data_dir() {
+                        crash_log::record_maintenance_failure(
+                            &directory.join("crash-events.log"),
+                            "mcp_uncoordinated_restart",
+                        );
+                    }
+                }
+                return;
+            }
+            let exit_code = code.unwrap_or(0);
+            match exit_drain.request(exit_code) {
+                ExitDrainDecision::BeginDrain => {
+                    api.prevent_exit();
+                    let manager = handle
+                        .try_state::<mcp_manager::McpManager>()
+                        .map(|state| state.inner().clone());
+                    tauri::async_runtime::spawn(drain_mcp_and_finalize(
+                        handle.clone(),
+                        manager,
+                        Arc::clone(&exit_drain),
+                        FinalExitAction::Exit(exit_code),
+                    ));
+                }
+                ExitDrainDecision::WaitForDrain => api.prevent_exit(),
+                ExitDrainDecision::AllowExit => {}
+            }
+        }
+        tauri::RunEvent::Exit => {
+            if let Some(manager) = handle.try_state::<mcp_manager::McpManager>() {
+                manager.cancel_for_exit();
+            }
+        }
+        _ => {}
+    });
 }
 
 #[cfg(test)]
@@ -202,5 +483,71 @@ mod tests {
                 Some("updater:default" | "process:allow-restart")
             )
         }));
+    }
+
+    #[test]
+    fn exit_drain_coordinator_prevents_reentrant_exit_until_finalization() {
+        let coordinator = ExitDrainCoordinator::default();
+        assert_eq!(coordinator.request(7), ExitDrainDecision::BeginDrain);
+        assert_eq!(coordinator.request(9), ExitDrainDecision::WaitForDrain);
+        coordinator.mark_finalizing();
+        assert_eq!(coordinator.request(11), ExitDrainDecision::AllowExit);
+    }
+
+    #[test]
+    fn concurrent_exit_requests_start_exactly_one_drain() {
+        let coordinator = Arc::new(ExitDrainCoordinator::default());
+        let decisions = (0..8)
+            .map(|_| {
+                let coordinator = Arc::clone(&coordinator);
+                std::thread::spawn(move || coordinator.request(0))
+            })
+            .map(|thread| thread.join().expect("exit request thread joins"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|decision| **decision == ExitDrainDecision::BeginDrain)
+                .count(),
+            1
+        );
+        assert!(decisions.iter().all(|decision| matches!(
+            decision,
+            ExitDrainDecision::BeginDrain | ExitDrainDecision::WaitForDrain
+        )));
+    }
+
+    #[test]
+    fn failed_installer_launch_restores_idle_or_honors_a_pending_window_exit() {
+        let coordinator = ExitDrainCoordinator::default();
+        assert!(coordinator.reserve_installer_launch());
+        assert_eq!(
+            coordinator.complete_installer_launch(false),
+            InstallerLaunchCompletion::ReturnToApp
+        );
+        assert!(coordinator.begin_programmatic_exit());
+
+        let coordinator = ExitDrainCoordinator::default();
+        assert!(coordinator.reserve_installer_launch());
+        assert_eq!(coordinator.request(23), ExitDrainDecision::WaitForDrain);
+        assert_eq!(
+            coordinator.complete_installer_launch(false),
+            InstallerLaunchCompletion::BeginPendingExit(23)
+        );
+        assert!(!coordinator.begin_programmatic_exit());
+    }
+
+    #[test]
+    fn successful_installer_launch_claims_the_single_exit_sequence() {
+        let coordinator = ExitDrainCoordinator::default();
+        assert!(coordinator.reserve_installer_launch());
+        assert_eq!(
+            coordinator.complete_installer_launch(true),
+            InstallerLaunchCompletion::BeginInstallerExit
+        );
+        assert!(!coordinator.reserve_installer_launch());
+        assert_eq!(coordinator.request(0), ExitDrainDecision::WaitForDrain);
+        coordinator.mark_finalizing();
+        assert_eq!(coordinator.request(0), ExitDrainDecision::AllowExit);
     }
 }

@@ -1,0 +1,15 @@
+[mcp_servers.lawyer_assistance]
+url = "http://127.0.0.1:8787/mcp"
+bearer_token_env_var = "LAWYER_ASSISTANCE_MCP_TOKEN"
+enabled = true
+required = true
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+enabled_tools = [
+  "system_status",
+  "legal_search",
+  "legal_get_article",
+  "legal_get_versions",
+  "legal_get_relations",
+]
+default_tools_approval_mode = "writes"

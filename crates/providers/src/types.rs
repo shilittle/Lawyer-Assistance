@@ -187,6 +187,8 @@ pub struct ChatRequest {
     pub stream: bool,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    #[serde(skip, default)]
+    pub data_classification: privacy::DataClassification,
 }
 
 impl ChatRequest {
@@ -205,6 +207,7 @@ impl ChatRequest {
             stream: true,
             temperature: Some(0.0),
             max_tokens: Some(64),
+            data_classification: privacy::DataClassification::ProductPublic,
         }
     }
 }
@@ -215,6 +218,28 @@ pub struct ChatUsage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+}
+
+/// Visible result of one bounded, non-stream OpenAI-compatible chat
+/// completion. Reasoning fields are intentionally absent from this type.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChatCompletion {
+    pub content: String,
+    pub model: Option<String>,
+    pub usage: Option<ChatUsage>,
+}
+
+impl fmt::Debug for ChatCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatCompletion")
+            .field("content", &"<redacted>")
+            .field("content_bytes", &self.content.len())
+            .field("model", &self.model.as_ref().map(|_| "<redacted-present>"))
+            .field("usage", &self.usage)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

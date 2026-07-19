@@ -10,6 +10,6 @@ describe("formatHealthCheck", () => {
         appName: "Lawyer Assistance",
         architecture: "x86_64",
       }),
-    ).toBe("ok · Lawyer Assistance · x86_64");
+    ).toBe("本地服务正常");
   });
 });

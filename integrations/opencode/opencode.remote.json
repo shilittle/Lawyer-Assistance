@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "mcp": {
+    "lawyer_assistance": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8787/mcp",
+      "enabled": true,
+      "timeout": 30000,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {env:LAWYER_ASSISTANCE_MCP_TOKEN}"
+      }
+    }
+  },
+  "permission": {
+    "lawyer_assistance_*": "deny",
+    "lawyer_assistance_system_status": "allow",
+    "lawyer_assistance_legal_search": "allow",
+    "lawyer_assistance_legal_get_article": "allow",
+    "lawyer_assistance_legal_get_versions": "allow",
+    "lawyer_assistance_legal_get_relations": "allow"
+  }
+}

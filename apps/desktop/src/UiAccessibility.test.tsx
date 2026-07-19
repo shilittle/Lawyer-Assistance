@@ -48,22 +48,25 @@ const GRAPH: GraphData = {
 describe("workspace accessibility and Chinese rendering", () => {
   it("marks exactly one main navigation destination as the current page", () => {
     const markup = renderToStaticMarkup(<App />);
+    const mainNavigation = markup.match(
+      /<nav class="view-tabs"[\s\S]*?<\/nav>/,
+    )?.[0];
 
-    expect(markup.match(/aria-current="page"/g)).toHaveLength(1);
-    expect(markup).toMatch(
-      /<button aria-current="page"[^>]*>法律检索<\/button>/,
+    expect(mainNavigation).toBeDefined();
+    expect(mainNavigation?.match(/aria-current="page"/g)).toHaveLength(1);
+    expect(mainNavigation).toMatch(
+      /<button aria-current="page"[^>]*>助理<\/button>/,
     );
     for (const label of [
-      "法律检索",
-      "引用问答",
-      "案件工作台",
-      "Provider 设置",
-      "文书生成",
-      "关系图",
-      "版本与备份",
+      "助理",
+      "案件工作台 β",
+      "法律库",
+      "设置与维护",
     ]) {
-      expect(markup).toContain(label);
+      expect(mainNavigation).toContain(label);
     }
+    expect(mainNavigation).not.toContain("引用问答");
+    expect(mainNavigation).not.toContain("文书生成");
   });
 
   it("provides a keyboard-operable text alternative for graph nodes and edges", () => {
@@ -76,9 +79,27 @@ describe("workspace accessibility and Chinese rendering", () => {
     );
 
     expect(markup).toContain("关系图文字列表（2 个节点，1 条关系）");
-    expect(markup).toContain("合同已经签订（fact）");
+    expect(markup).toContain("合同已经签订（案件事实）");
     expect(markup).toContain("合同已经签订 → 由证据支持 → 书面合同");
     expect(markup).toContain('aria-pressed="true"');
+  });
+
+  it("removes legacy service identifiers from graph labels", () => {
+    const graph: GraphData = {
+      nodes: [
+        {
+          ...GRAPH.nodes[1],
+          label: "service-aabbccddeeff0011-3 书面合同",
+        },
+      ],
+      edges: [],
+    };
+    const markup = renderToStaticMarkup(
+      <GraphTextAlternative graph={graph} selection={null} onSelect={vi.fn()} />,
+    );
+
+    expect(markup).toContain("书面合同（证据）");
+    expect(markup).not.toContain("service-aabbccddeeff0011-3");
   });
 
   it("uses normal pressed buttons for graph source switching and hides the canvas duplicate", () => {
@@ -146,5 +167,24 @@ describe("workspace accessibility and Chinese rendering", () => {
     expect(markup).toContain('class="workspace-card release-workspace"');
     expect(markup).not.toContain("\uFFFD");
     expect(markup).not.toMatch(/\?{3,}/);
+  });
+
+  it("keeps document settings and preview in separate compact workspace panels", () => {
+    const markup = renderToStaticMarkup(
+      <DocumentWorkspace projectId={null} onOpenCitation={vi.fn()} />,
+    );
+
+    expect(markup).toContain('class="document-layout"');
+    expect(markup).toContain('aria-labelledby="document-controls-title"');
+    expect(markup).toContain('aria-labelledby="document-output-title"');
+    expect(markup).toContain("生成设置");
+    expect(markup).toContain("校验与预览");
+    expect(markup).toContain("尚未生成预览");
+    expect(markup).toContain("直接填写要求，无需创建案件");
+    expect(markup).toContain("系统“另存为”对话框");
+    expect(markup).toContain("导出 PDF");
+    expect(markup).not.toContain("DOCX");
+    expect(markup).toContain('aria-pressed="true"');
+    expect(markup).not.toContain("请先到案件工作台选择需要生成文书的案件");
   });
 });

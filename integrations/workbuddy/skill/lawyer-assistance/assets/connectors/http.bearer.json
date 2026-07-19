@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "lawyer_assistance": {
+      "type": "http",
+      "description": "Lawyer Assistance public-law-only Streamable HTTP endpoint; reject unless tools/list is exactly the five public-law tools",
+      "url": "http://127.0.0.1:8787/mcp",
+      "headers": {
+        "Authorization": "Bearer ${LAWYER_ASSISTANCE_MCP_TOKEN}"
+      }
+    }
+  }
+}

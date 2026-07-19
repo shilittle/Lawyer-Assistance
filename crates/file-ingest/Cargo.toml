@@ -1,0 +1,12 @@
+[package]
+name = "file-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+infer = { version = "=0.19.0", default-features = false }
+lopdf = { version = "=0.44.0", default-features = false }
+quick-xml = { version = "=0.39.4", default-features = false }
+sha2 = "=0.10.9"
+zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }

@@ -8,8 +8,10 @@ import {
   extractionReviewNeedsCloseFlush,
   extractionLocksSources,
   extractionReducer,
+  extractionBusinessTextIsPublic,
   guardExtractionClose,
   pendingExtractionUpdateAtRevision,
+  structuredCaseExtractionIsPublic,
   type ExtractionState,
 } from "./extractionReview";
 import type { StructuredCaseExtraction } from "./types";
@@ -31,6 +33,78 @@ const draft: StructuredCaseExtraction = {
 };
 
 describe("case extraction review state", () => {
+  it("rejects machine details before a draft can enter review or autosave", () => {
+    const unsafeValues = [
+      'fileId=file-secret-1 sourceRefs=["file-secret-1"]',
+      '{"proposalHash":"deadbeef0123456789abcdef01234567"}',
+      "C:\\Users\\operator\\private\\material.pdf",
+      "https://internal.invalid/material/1",
+      "service-deadbeef01234567-7",
+      "550e8400-e29b-41d4-a716-446655440000",
+      "模型输出中的内部字段",
+    ];
+    unsafeValues.forEach((value) => {
+      expect(extractionBusinessTextIsPublic(value)).toBe(false);
+    });
+
+    const polluted: StructuredCaseExtraction = {
+      ...draft,
+      facts: [
+        {
+          ...draft.facts[0],
+          description: unsafeValues[0],
+        },
+      ],
+    };
+    expect(structuredCaseExtractionIsPublic(polluted)).toBe(false);
+
+    const context = createExtractionContext(
+      "request-safe-boundary",
+      "project-1",
+      "provider-1",
+      ["file-a"],
+    );
+    const generating: ExtractionState = { kind: "generating", context };
+    const rejected = extractionReducer(generating, {
+      type: "generated",
+      requestId: "request-safe-boundary",
+      reviewId: "review-1",
+      draft: polluted,
+      revision: 0,
+      repaired: false,
+    });
+    expect(rejected.kind).toBe("failed");
+    expect(buildConfirmationRequest(rejected)).toBeNull();
+
+    const rejectedRestore = extractionReducer(
+      { kind: "idle" },
+      {
+        type: "restore",
+        context,
+        reviewId: "review-restored",
+        draft: polluted,
+        revision: 2,
+        createdAt: "2026-07-18T10:00:00Z",
+        expiresAt: "2026-07-19T10:00:00Z",
+      },
+    );
+    expect(rejectedRestore.kind).toBe("failed");
+
+    const reviewing = extractionReducer(generating, {
+      type: "generated",
+      requestId: "request-safe-boundary",
+      reviewId: "review-1",
+      draft,
+      revision: 0,
+      repaired: false,
+    });
+    const afterUnsafeEdit = extractionReducer(reviewing, {
+      type: "edit",
+      draft: polluted,
+    });
+    expect(afterUnsafeEdit).toBe(reviewing);
+  });
+
   it("freezes generation provenance and confirms the reviewed edit", () => {
     const providerSnapshot: ProviderAuditSnapshot = {
       kind: "deep_seek",

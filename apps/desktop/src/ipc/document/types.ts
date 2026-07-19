@@ -17,6 +17,10 @@ export interface DocumentTemplateMetadata {
 }
 
 export interface DocumentCitation {
+  kind: "law" | "judicialCase";
+  title: string;
+  locator: string;
+  effectiveOrDecidedOn: string;
   sourceId: string;
   canonicalLabel: string;
   excerpt: string;
@@ -71,12 +75,40 @@ export interface DocumentIpcError {
   message: string;
 }
 
+export interface StandaloneDocumentInput {
+  title: string;
+  partyA: string;
+  partyB: string;
+  facts: string;
+  requests: string;
+  evidence: string;
+  requirements: string;
+}
+
 export interface PreviewDocumentRequest {
-  projectId: string;
+  projectId?: string | null;
+  standaloneInput?: StandaloneDocumentInput | null;
   templateId: DocumentTemplateId;
   modelDraft?: string | null;
 }
 
-export interface ExportDocumentRequest extends PreviewDocumentRequest {
-  exportPath: string;
+export interface PreviewDocumentResponse {
+  document: GeneratedDocument;
+  caseRevision: string | null;
+  generationHash: string;
+}
+
+export interface ExportDocumentPdfRequest extends PreviewDocumentRequest {
+  expectedRevision?: string | null;
+  generationHash: string;
+  confirmed: boolean;
+  idempotencyKey: string;
+}
+
+export interface ExportDocumentPdfResponse {
+  cancelled: boolean;
+  replayed: boolean;
+  recordId: string | null;
+  fileName: string | null;
+  citationCount: number;
 }

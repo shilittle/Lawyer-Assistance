@@ -49,6 +49,7 @@ import {
   extractionReducer,
   guardExtractionClose,
   pendingExtractionUpdateAtRevision,
+  structuredCaseExtractionIsPublic,
 } from "./ipc/case/extractionReview";
 import type { PendingExtractionDraftSaveRequest } from "./ipc/case/extractionReview";
 import type {
@@ -85,6 +86,7 @@ import {
   formatArticleLabel,
   formatCitationInvalidReason,
   formatEffectiveWindow,
+  formatLegalContextWarning,
   formatLegalSourceLabel,
   formatStatus,
   segmentLegalAnswer,
@@ -120,6 +122,11 @@ import type {
 } from "./ipc/legal/types";
 import type { GraphMode, GraphNode } from "./ipc/graph/types";
 import type { DocumentCitation } from "./ipc/document/types";
+import {
+  addAssistantLegalSource,
+  proposeAssistantLegalBasis,
+} from "./ipc/assistant/client";
+import type { AssistantConversation } from "./ipc/assistant/types";
 import {
   deleteProviderApiKey,
   deleteProviderProfile,
@@ -159,10 +166,23 @@ import type {
   ProviderProfile,
   ReasoningEffort,
 } from "./ipc/provider/types";
+import { AppShell } from "./app/AppShell";
+import { VIEW_METADATA, type ViewMode } from "./app/views";
+import { AssistantWorkspace } from "./features/assistant/AssistantWorkspace";
+import { CasesWorkspace } from "./features/cases/CasesWorkspace";
+import { LegalLibraryWorkspace } from "./features/legal-library/LegalLibraryWorkspace";
+import { SettingsWorkspace } from "./features/settings/SettingsWorkspace";
+import {
+  publicContentSummary,
+  publicErrorMessage,
+  publicTitle,
+  sanitizePublicGeneratedText,
+} from "./publicOutput";
 
-type ViewMode = "search" | "qa" | "cases" | "documents" | "graph" | "providers" | "release";
 const DocumentWorkspace = lazy(() => import("./DocumentWorkspace").then((module) => ({ default: module.DocumentWorkspace })));
 const GraphWorkspace = lazy(() => import("./GraphWorkspace").then((module) => ({ default: module.GraphWorkspace })));
+const McpWorkspace = lazy(() => import("./features/mcp/McpWorkspace").then((module) => ({ default: module.McpWorkspace })));
+const PrivacyWorkspace = lazy(() => import("./features/privacy/PrivacyWorkspace").then((module) => ({ default: module.PrivacyWorkspace })));
 const ReleaseWorkspace = lazy(() => import("./ReleaseWorkspace").then((module) => ({ default: module.ReleaseWorkspace })));
 
 type HealthState =
@@ -582,10 +602,10 @@ export function legalAnswerContextFromRecord(
     sources: record.sources.map((source) => ({ ...source })),
     prompt: "",
     warnings: [
-      "这是已保存的历史回答；已恢复保存时的完整结构化查询、候选来源和来源标记校验结果。",
+      "这是已保存的历史回答；已恢复当时的检索条件、候选来源和法条依据。",
       ...(record.missingSourceIds.length > 0
         ? [
-            `当前本地法库无法恢复 ${record.missingSourceIds.length} 个历史候选来源；其来源 ID 已保留供审计。`,
+            `当前本地法律库有 ${record.missingSourceIds.length} 项历史来源暂不可用；回答已保留，引用需重新核对。`,
           ]
         : []),
     ],
@@ -750,11 +770,11 @@ export function formatCitationValidationSummary(
   report: CitationValidationReport,
 ): string {
   if (report.citations.length === 0 || report.validCount + report.invalidCount === 0) {
-    return "无可校验来源标记";
+    return "未列出法条依据";
   }
   return report.invalidCount > 0
-    ? `${report.invalidCount} 个无效`
-    : `${report.validCount} 个来源标记已映射`;
+    ? `${report.invalidCount} 条依据需要核对`
+    : `${report.validCount} 条法条依据`;
 }
 
 const CASE_DRAFT_LABELS: Record<CaseDraftKind, string> = {
@@ -775,6 +795,13 @@ export interface WorkspaceCloseProtectionState {
   caseMutationInFlight: boolean;
   providerMutationInFlight: boolean;
   extractionMutationInFlight: boolean;
+  assistantRunActive?: boolean;
+  assistantMutationInFlight?: boolean;
+  assistantDraftDirty?: boolean;
+  mcpMutationInFlight?: boolean;
+  mcpDraftDirty?: boolean;
+  privacyMutationInFlight?: boolean;
+  privacyDraftDirty?: boolean;
 }
 
 export type WorkspaceCloseDecision =
@@ -786,10 +813,23 @@ export type WorkspaceCloseDecision =
 export function decideWorkspaceClose(
   state: WorkspaceCloseProtectionState,
 ): WorkspaceCloseDecision {
+  if (state.assistantRunActive) {
+    return {
+      kind: "block",
+      message:
+        "助理任务仍在运行。请先等待完成或在助理工作区取消，再关闭窗口。",
+    };
+  }
+
   const activeWrites = [
     state.caseMutationInFlight ? "案件数据写入" : null,
     state.providerMutationInFlight ? "Provider 或 API Key 写入" : null,
-    state.extractionMutationInFlight ? "抽取审阅事务" : null,
+    state.extractionMutationInFlight ? "材料审阅保存" : null,
+    state.assistantMutationInFlight
+      ? "助理保存、导入、导出、法律库桥接或已确认建议写入"
+      : null,
+    state.mcpMutationInFlight ? "MCP 服务配置或生命周期变更" : null,
+    state.privacyMutationInFlight ? "隐私与本地处理配置写入" : null,
   ].filter((item): item is string => item !== null);
   if (activeWrites.length > 0) {
     return {
@@ -804,6 +844,15 @@ export function decideWorkspaceClose(
   if (state.providerDraftDirty) {
     unsaved.push("Provider Profile 或 API Key 输入");
   }
+  if (state.assistantDraftDirty) {
+    unsaved.push("助理中未发送的任务草稿");
+  }
+  if (state.mcpDraftDirty) {
+    unsaved.push("MCP 服务配置或待写入 Bearer Token");
+  }
+  if (state.privacyDraftDirty) {
+    unsaved.push("隐私与本地 OCR 配置");
+  }
   if (unsaved.length > 0) {
     return {
       kind: "confirm_discard",
@@ -812,6 +861,71 @@ export function decideWorkspaceClose(
   }
 
   return { kind: "proceed" };
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function decideMcpWorkspaceNavigation(
+  currentView: ViewMode,
+  nextView: ViewMode,
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
+  if (currentView === nextView) {
+    return { kind: "proceed" };
+  }
+  if (mutationInFlight) {
+    return {
+      kind: "block",
+      message:
+        "MCP 服务配置或生命周期变更尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
+    };
+  }
+  if (draftDirty) {
+    return {
+      kind: "confirm_discard",
+      message:
+        "切换工作区将永久丢弃未保存的 MCP 服务配置或待写入 Bearer Token。确定继续吗？",
+    };
+  }
+  return { kind: "proceed" };
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function decidePrivacyWorkspaceNavigation(
+  currentView: ViewMode,
+  nextView: ViewMode,
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
+  if (currentView === nextView) {
+    return { kind: "proceed" };
+  }
+  if (currentView !== "privacy") {
+    return { kind: "proceed" };
+  }
+  if (mutationInFlight) {
+    return {
+      kind: "block",
+      message:
+        "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
+    };
+  }
+  if (draftDirty) {
+    return {
+      kind: "confirm_discard",
+      message:
+        "切换工作区将永久丢弃未保存的隐私与本地 OCR 配置。确定继续吗？",
+    };
+  }
+  return { kind: "proceed" };
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function assistantWritesBlockClose(
+  workspaceMutationActive: boolean,
+  legalSourceBridgeMutationActive: boolean,
+): boolean {
+  return workspaceMutationActive || legalSourceBridgeMutationActive;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -896,6 +1010,30 @@ export function copyCaseEntityForEditing<T extends EditableCaseEntity>(
   entity: T,
 ): T {
   return { ...entity };
+}
+
+const LEGACY_GENERATED_EVIDENCE_NUMBER = /^service-[0-9a-f]{8,64}-\d+$/iu;
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function publicCaseBusinessText(
+  value: string | null | undefined,
+  fallback = "",
+): string {
+  if (!value?.trim()) return fallback;
+  return sanitizePublicGeneratedText(value, fallback);
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function publicEvidenceNumber(
+  value: string | null | undefined,
+  fallback = "待编号",
+): string {
+  const normalized = value?.trim() ?? "";
+  if (!normalized || LEGACY_GENERATED_EVIDENCE_NUMBER.test(normalized)) {
+    return fallback;
+  }
+  const publicValue = sanitizePublicGeneratedText(normalized, "").trim();
+  return publicTitle(publicValue, fallback);
 }
 
 const INITIAL_QUERY = "合同";
@@ -987,12 +1125,13 @@ function createIssue(projectId: string): LegalIssue {
 
 function formatLegalBasisTitle(basis: LegalBasis): string {
   if (!basis.documentTitle || !basis.articleNumber) {
-    return basis.sourceId;
+    return publicTitle(basis.canonicalLabel, "法律条文");
   }
-
-  const suffix = basis.articleTitle ? `：${basis.articleTitle}` : "";
-
-  return `《${basis.documentTitle}》${basis.articleNumber}${suffix}`;
+  const year = /^(\d{4})/u.exec(basis.effectiveFrom)?.[1];
+  return `《${publicTitle(basis.documentTitle, "法律文件")}》${publicTitle(
+    basis.articleNumber,
+    "相关条文",
+  )}${year ? `（${year}年起施行）` : ""}`;
 }
 
 function formatLegalBasisWindow(basis: LegalBasis): string {
@@ -1033,7 +1172,8 @@ export function providerDeletionConfirmation(
   displayName: string,
   accountId: string,
 ): string {
-  return `确定永久删除 Provider“${displayName}”吗？配置以及 Windows 凭据库中账号“${accountId}”对应的 API Key 会一并删除；既有结果中的无密钥审计快照会保留。`;
+  void accountId;
+  return `确定永久删除 Provider“${displayName}”吗？对应配置和已保存的访问凭据会一并删除；既有结果不受影响。`;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -1041,7 +1181,8 @@ export function providerApiKeyDeletionConfirmation(
   displayName: string,
   accountId: string,
 ): string {
-  return `确定删除 Provider“${displayName}”账号“${accountId}”的 API Key 吗？删除后需重新录入才能调用该 Provider。`;
+  void accountId;
+  return `确定删除 Provider“${displayName}”的访问凭据吗？删除后需重新录入才能调用该服务。`;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -1049,17 +1190,18 @@ export function providerApiKeyOverwriteConfirmation(
   displayName: string,
   accountId: string,
 ): string {
-  return `Provider“${displayName}”账号“${accountId}”已经保存 API Key。确定用当前输入永久覆盖旧 Key 吗？旧 Key 无法恢复。`;
+  void accountId;
+  return `Provider“${displayName}”已经保存访问凭据。确定用当前输入覆盖旧凭据吗？旧凭据无法恢复。`;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function extractionReviewDiscardConfirmation(): string {
-  return "确定永久放弃当前结构化抽取审阅草稿吗？已自动保存的修改和模型建议都会删除，且不会写入案件；此操作不可撤销。";
+  return "确定永久放弃当前材料信息审阅草稿吗？已保存的修改和待确认内容都会删除，且不会写入案件；此操作不可撤销。";
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function unrestorableExtractionDiscardConfirmation(): string {
-  return "该待审草稿已无法安全载入。确定永久删除服务端保存的草稿并解锁案件吗？此操作不可撤销。";
+  return "该待审草稿已无法安全载入。确定永久删除该草稿并解锁案件吗？此操作不可撤销。";
 }
 
 export type ConfirmedDestructiveActionResult<T> =
@@ -1085,66 +1227,70 @@ function caseEntityDeletionDisplayName(
 ): string {
   switch (entityType) {
     case "file":
-      return workspace.files.find((item) => item.fileId === id)?.title || id;
+      return publicTitle(
+        workspace.files.find((item) => item.fileId === id)?.title,
+        "案件材料",
+      );
     case "party":
-      return workspace.parties.find((item) => item.partyId === id)?.name || id;
+      return publicTitle(
+        workspace.parties.find((item) => item.partyId === id)?.name,
+        "当事人",
+      );
     case "fact":
-      return workspace.facts.find((item) => item.factId === id)?.title || id;
+      return publicTitle(
+        workspace.facts.find((item) => item.factId === id)?.title,
+        "案件事实",
+      );
     case "evidence": {
       const item = workspace.evidence.find((entry) => entry.evidenceId === id);
-      return item ? `${item.evidenceNumber} ${item.title}`.trim() : id;
+      return item
+        ? `${publicEvidenceNumber(item.evidenceNumber)} ${publicTitle(item.title, "案件证据")}`.trim()
+        : "案件证据";
     }
     case "evidence_link": {
       const link = workspace.evidenceLinks.find((item) => item.linkId === id);
       if (!link) {
-        return id;
+        return "事实与证据关联";
       }
       const fact = workspace.facts.find((item) => item.factId === link.factId);
       const evidence = workspace.evidence.find(
         (item) => item.evidenceId === link.evidenceId,
       );
-      return `${fact?.title || link.factId} ↔ ${evidence?.evidenceNumber || link.evidenceId}`;
+      return `${publicTitle(fact?.title, "相关事实")} ↔ ${publicEvidenceNumber(evidence?.evidenceNumber, "相关证据")}`;
     }
     case "fact_issue_link": {
       const link = workspace.factIssueLinks.find((item) => item.linkId === id);
       if (!link) {
-        return id;
+        return "事实与争点关联";
       }
       const fact = workspace.facts.find((item) => item.factId === link.factId);
       const issue = workspace.legalIssues.find(
         (item) => item.issueId === link.issueId,
       );
-      return `${fact?.title || link.factId} ↔ ${issue?.title || link.issueId}`;
+      return `${publicTitle(fact?.title, "相关事实")} ↔ ${publicTitle(issue?.title, "相关法律争点")}`;
     }
     case "legal_issue":
-      return workspace.legalIssues.find((item) => item.issueId === id)?.title || id;
+      return publicTitle(
+        workspace.legalIssues.find((item) => item.issueId === id)?.title,
+        "法律争点",
+      );
     case "legal_basis": {
       const basis = workspace.legalBasis.find((item) => item.basisId === id);
-      return basis ? formatLegalBasisTitle(basis) : id;
+      return basis ? formatLegalBasisTitle(basis) : "法律依据";
     }
     case "uncertainty":
       return (
-        workspace.uncertainties.find((item) => item.uncertaintyId === id)
-          ?.description || id
+        publicCaseBusinessText(
+          workspace.uncertainties.find((item) => item.uncertaintyId === id)
+            ?.description,
+          "待核实事项",
+        )
       );
   }
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "message" in error &&
-    typeof (error as { message: unknown }).message === "string"
-  ) {
-    return (error as { message: string }).message;
-  }
-
-  return String(error);
+  return publicErrorMessage(error);
 }
 
 function createLegalAnswerRequestId(): string {
@@ -1156,11 +1302,57 @@ function createLegalAnswerRequestId(): string {
 }
 
 export function App() {
-  const [viewMode, setViewMode] = useState<ViewMode>("search");
+  const [viewMode, setViewMode] = useState<ViewMode>("assistant");
   const [health, setHealth] = useState<HealthState>({ kind: "loading" });
   const [closeProtectionMessage, setCloseProtectionMessage] = useState<
     string | null
   >(null);
+  const [assistantConversation, setAssistantConversation] =
+    useState<AssistantConversation | null>(null);
+  const [assistantRefreshKey, setAssistantRefreshKey] = useState(0);
+  const [assistantCaseHandoff, setAssistantCaseHandoff] = useState<
+    { projectId: string; title: string; requestId: number } | null
+  >(null);
+  const assistantCaseHandoffSequence = useRef(0);
+  const assistantDraftDirty = useRef(false);
+  const assistantMutationActive = useRef(false);
+  const assistantRunActive = useRef(false);
+  const mcpDraftDirty = useRef(false);
+  const mcpMutationActive = useRef(false);
+  const privacyDraftDirty = useRef(false);
+  const privacyMutationActive = useRef(false);
+  const legalSourceBridgeMutationActive = useRef(false);
+  const [legalSourceBridgeState, setLegalSourceBridgeState] = useState<
+    | { kind: "idle" | "loading" }
+    | { kind: "success" | "error"; message: string }
+  >({ kind: "idle" });
+  const handleAssistantConversationChange = useCallback(
+    (conversation: AssistantConversation | null) => {
+      setAssistantConversation(conversation);
+    },
+    [],
+  );
+  const handleAssistantRunActivityChange = useCallback((active: boolean) => {
+    assistantRunActive.current = active;
+  }, []);
+  const handleAssistantDraftDirtyChange = useCallback((dirty: boolean) => {
+    assistantDraftDirty.current = dirty;
+  }, []);
+  const handleAssistantMutationActivityChange = useCallback((active: boolean) => {
+    assistantMutationActive.current = active;
+  }, []);
+  const handleMcpDraftDirtyChange = useCallback((dirty: boolean) => {
+    mcpDraftDirty.current = dirty;
+  }, []);
+  const handleMcpMutationActivityChange = useCallback((active: boolean) => {
+    mcpMutationActive.current = active;
+  }, []);
+  const handlePrivacyDraftDirtyChange = useCallback((dirty: boolean) => {
+    privacyDraftDirty.current = dirty;
+  }, []);
+  const handlePrivacyMutationActivityChange = useCallback((active: boolean) => {
+    privacyMutationActive.current = active;
+  }, []);
   const [query, setQuery] = useState(INITIAL_QUERY);
   const [caseDate, setCaseDate] = useState("");
   const queryRef = useRef(query);
@@ -1188,6 +1380,9 @@ export function App() {
   );
   const [selectedArticle, setSelectedArticle] =
     useState<LawArticleDetail | null>(null);
+  useEffect(() => {
+    setLegalSourceBridgeState({ kind: "idle" });
+  }, [selectedArticleId]);
   const [graphMode, setGraphMode] = useState<GraphMode>("case");
   const [graphDocumentId, setGraphDocumentId] = useState<string | null>(null);
   const [graphCaseTarget, setGraphCaseTarget] = useState<{
@@ -1508,7 +1703,7 @@ export function App() {
     pendingExtractionDraftSave.current = null;
     setExtractionDraftSaveState({
       kind: "conflict",
-      message: `${message} 已锁定本窗口的编辑、确认和取消操作；请重新加载服务端草稿后核对。`,
+      message: `${message} 已锁定本窗口的编辑、确认和取消操作；请重新加载最新草稿后核对。`,
     });
   }
 
@@ -1525,7 +1720,7 @@ export function App() {
     const expectedRevision = extractionServerRevision.current;
     if (expectedRevision === null) {
       if (extractionDraftSaveSession.current === session) {
-        lockExtractionReviewForServerReload("待审阅草稿缺少服务端版本号。");
+        lockExtractionReviewForServerReload("待审阅草稿缺少可核对的版本信息。");
       }
       return false;
     }
@@ -1538,7 +1733,7 @@ export function App() {
         !Number.isSafeInteger(response.revision) ||
         response.revision !== expectedRevision + 1
       ) {
-        throw new Error("服务端返回了不连续的审阅草稿版本");
+        throw new Error("审阅草稿的保存结果不连续");
       }
       if (extractionDraftSaveSession.current === session) {
         extractionDraftSavedSequence.current = Math.max(
@@ -1869,8 +2064,8 @@ export function App() {
         extractionDraftSaveSequence.current,
         pendingExtractionDraftSave.current !== null,
       );
-    const currentCloseDecision = () =>
-      decideWorkspaceClose({
+    const currentCloseDecision = () => {
+      return decideWorkspaceClose({
         dirtyCaseDrafts: dirtyCaseDraftsForClose.current,
         providerDraftDirty: providerNavigationHasUnsavedChanges(
           providerDraftBaseline.current,
@@ -1883,7 +2078,18 @@ export function App() {
           extractionConfirmInFlight.current,
           extractionDiscardInFlight.current,
         ),
+        assistantRunActive: assistantRunActive.current,
+        assistantMutationInFlight: assistantWritesBlockClose(
+          assistantMutationActive.current,
+          legalSourceBridgeMutationActive.current,
+        ),
+        assistantDraftDirty: assistantDraftDirty.current,
+        mcpMutationInFlight: mcpMutationActive.current,
+        mcpDraftDirty: mcpDraftDirty.current,
+        privacyMutationInFlight: privacyMutationActive.current,
+        privacyDraftDirty: privacyDraftDirty.current,
       });
+    };
     const blockBrowserUnload = (event: BeforeUnloadEvent) => {
       if (controlledCloseApproved.current) {
         return;
@@ -2169,7 +2375,7 @@ export function App() {
         return "待恢复抽取审阅的案件归属不匹配，已拒绝载入。";
       }
       if (!Number.isSafeInteger(pending.revision) || pending.revision < 0) {
-        return "待恢复抽取审阅缺少有效的服务端版本号，已拒绝载入。";
+        return "待恢复草稿缺少有效的版本信息，已拒绝载入。";
       }
       if (!pending.providerSnapshot) {
         setPendingReviewRecoveryBlock({
@@ -2180,6 +2386,15 @@ export function App() {
             "待恢复抽取审阅缺少可信的生成配置快照，只能永久放弃，不能确认写入。",
         });
         return "待恢复抽取审阅缺少可信的生成配置快照，已拒绝载入。";
+      }
+      if (!structuredCaseExtractionIsPublic(pending.extraction)) {
+        setPendingReviewRecoveryBlock({
+          reviewId: pending.reviewId,
+          projectId: pending.projectId,
+          revision: pending.revision,
+          message: "待恢复内容未通过安全检查，只能放弃后重新整理。",
+        });
+        return "待恢复内容未通过安全检查，已拒绝载入。";
       }
 
       const workspaceFileIds = workspace.files.map((file) => file.fileId);
@@ -2219,7 +2434,7 @@ export function App() {
       });
       return null;
     } catch (error: unknown) {
-      return `未能恢复待审阅的结构化抽取：${errorMessage(error)}`;
+      return `未能恢复待审阅的材料整理结果：${errorMessage(error)}`;
     }
   }
 
@@ -2617,7 +2832,7 @@ export function App() {
       if (!target) {
         setSearchState({
           kind: "error",
-          message: `无法按精确文书 ID“${documentId}”在当前本地法律库中找到记录。`,
+          message: "当前本地法律库中没有找到对应法律文件。",
         });
         setDocumentState({ kind: "idle" });
         return;
@@ -2625,7 +2840,7 @@ export function App() {
       if (!exactLawDocumentMatchesRequest(target, documentId)) {
         setSearchState({
           kind: "error",
-          message: "本地法律库返回的文书 ID 与请求不一致，已拒绝跳转。",
+          message: "法律文件校验未通过，已停止跳转，请重新检索。",
         });
         setDocumentState({ kind: "idle" });
         return;
@@ -2697,9 +2912,10 @@ export function App() {
   }
 
   function setStatusForUnsupportedGraphNode(node: GraphNode) {
+    void node;
     setCaseState({
       kind: "error",
-      message: `暂不支持打开来源类型 ${node.sourceKind}（${node.sourceId}）。`,
+      message: "暂不支持打开该项内容。",
     });
   }
 
@@ -2848,7 +3064,7 @@ export function App() {
         ...current,
         status: "done",
         answer: response.answer,
-        message: "来源标记已由 Rust 校验，回答已保存",
+        message: "引用已完成校验，回答已保存",
       }));
       setQaState({ kind: "idle" });
       void refreshLegalAnswerHistory(projectId);
@@ -2998,41 +3214,74 @@ export function App() {
 
     resetAllCaseEntityDrafts(target.entity.projectId);
     switch (target.entityType) {
-      case "file":
-        setFileDraft(copyCaseEntityForEditing(target.entity));
+      case "file": {
+        const draft = copyCaseEntityForEditing(target.entity);
+        setFileDraft({
+          ...draft,
+          summary: publicCaseBusinessText(draft.summary),
+        });
         setActiveCaseEntityEditor({
           entityType: "file",
           entityId: target.entity.fileId,
         });
         break;
-      case "party":
-        setPartyDraft(copyCaseEntityForEditing(target.entity));
+      }
+      case "party": {
+        const draft = copyCaseEntityForEditing(target.entity);
+        setPartyDraft({
+          ...draft,
+          name: publicTitle(draft.name, ""),
+          normalizedName: publicCaseBusinessText(draft.normalizedName),
+          contact: publicCaseBusinessText(draft.contact),
+          notes: publicCaseBusinessText(draft.notes),
+        });
         setActiveCaseEntityEditor({
           entityType: "party",
           entityId: target.entity.partyId,
         });
         break;
-      case "fact":
-        setFactDraft(copyCaseEntityForEditing(target.entity));
+      }
+      case "fact": {
+        const draft = copyCaseEntityForEditing(target.entity);
+        setFactDraft({
+          ...draft,
+          description: publicCaseBusinessText(draft.description),
+          source: publicCaseBusinessText(draft.source),
+        });
         setActiveCaseEntityEditor({
           entityType: "fact",
           entityId: target.entity.factId,
         });
         break;
-      case "evidence":
-        setEvidenceDraft(copyCaseEntityForEditing(target.entity));
+      }
+      case "evidence": {
+        const draft = copyCaseEntityForEditing(target.entity);
+        setEvidenceDraft({
+          ...draft,
+          evidenceNumber: publicEvidenceNumber(draft.evidenceNumber, ""),
+          source: publicCaseBusinessText(draft.source),
+          summary: publicCaseBusinessText(draft.summary),
+        });
         setActiveCaseEntityEditor({
           entityType: "evidence",
           entityId: target.entity.evidenceId,
         });
         break;
-      case "legal_issue":
-        setIssueDraft(copyCaseEntityForEditing(target.entity));
+      }
+      case "legal_issue": {
+        const draft = copyCaseEntityForEditing(target.entity);
+        setIssueDraft({
+          ...draft,
+          title: publicTitle(draft.title, ""),
+          description: publicCaseBusinessText(draft.description),
+          claim: publicCaseBusinessText(draft.claim),
+        });
         setActiveCaseEntityEditor({
           entityType: "legal_issue",
           entityId: target.entity.issueId,
         });
         break;
+      }
     }
     setCaseState({ kind: "idle" });
   }
@@ -3205,7 +3454,7 @@ export function App() {
     const projectTitle =
       caseProjects.find((project) => project.projectId === projectId)?.title ||
       caseProjectDraft.title ||
-      projectId;
+      "当前案件";
     await runConfirmedDestructiveAction(
       caseProjectDeletionConfirmation(projectTitle),
       (message) => window.confirm(message),
@@ -3280,7 +3529,7 @@ export function App() {
     if (caseNavigationLocked || extractionLifecycleLock.current) {
       setCaseState({
         kind: "error",
-        message: "结构化抽取进行中，请先完成或丢弃当前抽取任务。",
+        message: "材料信息整理进行中，请先完成或放弃当前任务。",
       });
       return false;
     }
@@ -3507,7 +3756,7 @@ export function App() {
       return;
     }
     if (!basisSourceId.trim()) {
-      showCaseValidationError("请输入本地来源 ID。", "case-basis-source-id");
+      showCaseValidationError("请选择本地法律来源。", "case-basis-source-id");
       return;
     }
     clearCaseValidationError();
@@ -3687,7 +3936,7 @@ export function App() {
   async function runStructuredExtraction() {
     if (!caseChildrenReady || !caseWorkspace) {
       showCaseValidationError(
-        "请先保存并成功加载案件，再开始结构化抽取。",
+        "请先保存并成功加载案件，再开始整理材料信息。",
         "case-project-title",
       );
       return;
@@ -3695,13 +3944,13 @@ export function App() {
     if (activeCaseEntityEditor !== null) {
       setCaseState({
         kind: "error",
-        message: "请先保存或取消当前案件子项编辑，再开始结构化抽取。",
+        message: "请先保存或取消当前案件子项编辑，再开始整理材料信息。",
       });
       return;
     }
     if (!extractionProviderId) {
       showCaseValidationError(
-        "请选择用于结构化抽取的 Provider。",
+        "请选择用于整理材料信息的模型服务。",
         "extraction-provider",
       );
       return;
@@ -3716,7 +3965,7 @@ export function App() {
     if (extractionSourcesLocked || caseInteractionIsLocked()) {
       return;
     }
-    if (blockWorkspaceReloadForDirtyDrafts([], "开始结构化抽取")) {
+    if (blockWorkspaceReloadForDirtyDrafts([], "开始整理材料信息")) {
       return;
     }
 
@@ -3744,6 +3993,7 @@ export function App() {
       if (
         response.result.status === "review_required" &&
         response.result.extraction &&
+        structuredCaseExtractionIsPublic(response.result.extraction) &&
         response.result.reviewId &&
         response.providerSnapshot &&
         Number.isSafeInteger(response.reviewRevision) &&
@@ -3772,8 +4022,8 @@ export function App() {
           message:
             response.result.error?.message ??
             (response.result.status === "review_required"
-              ? "结构化抽取返回的待审阅草稿缺少有效服务端版本号或生成配置快照，请重新加载案件恢复。"
-              : "结构化抽取失败"),
+              ? "待审阅结果无法安全载入，请重新加载案件后重试。"
+              : "材料信息整理失败"),
           repairAttempted: response.result.repairAttempted,
           rawOutput: response.result.rawOutput,
           repairOutput: response.result.repairOutput,
@@ -3802,6 +4052,13 @@ export function App() {
       !extractionDiscardInFlight.current
     ) {
       const draft = update(extractionState.draft);
+      if (!structuredCaseExtractionIsPublic(draft)) {
+        setCaseState({
+          kind: "error",
+          message: "该内容不适合写入案件业务字段，请删除其中的系统信息后重试。",
+        });
+        return;
+      }
       dispatchExtraction({
         type: "edit",
         draft,
@@ -3860,7 +4117,7 @@ export function App() {
       const expectedRevision = extractionServerRevision.current;
       if (expectedRevision === null) {
         lockExtractionReviewForServerReload(
-          "取消前无法确定服务端审阅草稿的当前版本。",
+          "取消前无法确认待审草稿的最新状态。",
         );
         return;
       }
@@ -3871,7 +4128,7 @@ export function App() {
       });
       if (!response.discarded) {
         lockExtractionReviewForServerReload(
-          "服务端草稿已被其他窗口更新或处理，取消结果未生效。",
+          "草稿已被其他窗口更新或处理，取消结果未生效。",
         );
         return;
       }
@@ -3929,7 +4186,7 @@ export function App() {
           ...blocked,
           reloadRequired: true,
           message:
-            "服务端草稿已被其他窗口更新或处理，本窗口不能按旧版本放弃。",
+            "草稿已被其他窗口更新或处理，本窗口不能按旧内容放弃。",
         });
         return;
       }
@@ -4003,7 +4260,7 @@ export function App() {
     ) {
       return;
     }
-    if (blockWorkspaceReloadForDirtyDrafts([], "确认结构化抽取")) {
+    if (blockWorkspaceReloadForDirtyDrafts([], "确认材料整理结果")) {
       return;
     }
     extractionConfirmInFlight.current = true;
@@ -4025,7 +4282,7 @@ export function App() {
       const expectedRevision = extractionServerRevision.current;
       if (expectedRevision === null) {
         lockExtractionReviewForServerReload(
-          "确认前无法确定服务端审阅草稿的当前版本。",
+          "确认前无法确认待审草稿的最新状态。",
         );
         return;
       }
@@ -4052,7 +4309,7 @@ export function App() {
         return;
       }
       if (!response.applied) {
-        const message = "服务端未确认写入结果。";
+        const message = "当前无法确认写入结果。";
         dispatchExtraction({ type: "commit_failed", message });
         lockExtractionReviewForServerReload(message);
         return;
@@ -4068,8 +4325,8 @@ export function App() {
       dispatchExtraction({
         type: "committed",
         message: workspaceReloaded
-          ? `已原子写入 ${response.counts.facts} 项事实、${response.counts.evidence} 项证据和 ${response.counts.uncertainties} 项待核实事项。`
-          : `审阅结果已经原子写入，但案件刷新失败，写操作已锁定。请重新加载当前案件；不要重复确认。`,
+          ? `已保存 ${response.counts.facts} 项事实、${response.counts.evidence} 项证据和 ${response.counts.uncertainties} 项待核实事项。`
+          : "审阅结果已保存，但案件内容暂未刷新。为避免重复保存，确认按钮已停用，请重新加载当前案件。",
       });
       requestAnimationFrame(() => extractionReviewReturnFocusRef.current?.focus());
     } finally {
@@ -4405,7 +4662,7 @@ export function App() {
       ? formatHealthCheck(health.response)
       : health.kind === "error"
         ? health.message
-        : "正在调用 Rust command...";
+        : "正在检查本地服务…";
   const normalizedProviderDraft = normalizeProviderProfile(providerDraft);
   const savedProviderProfile = providerProfiles.find(
     (profile) => profile.id === normalizedProviderDraft.id,
@@ -4489,114 +4746,162 @@ export function App() {
     caseProjects,
     caseProjectPage,
   );
+  const assistantActiveProject = selectedCaseProjectId
+    ? caseProjects.find(
+        (project) => project.projectId === selectedCaseProjectId,
+      ) ?? null
+    : null;
+  const assistantProposalApplyBlockedReason =
+    dirtyCaseDraftsForClose.current.length > 0
+      ? "案件工作台仍有未保存草稿。请先保存或清空草稿，再确认写入助理建议。"
+      : caseNavigationLocked || caseWorkspaceWriteBlocked
+        ? "案件工作台正在处理其他操作或处于只读保护状态，请恢复后再确认写入。"
+        : caseWorkspace?.project.projectId !== selectedCaseProjectId
+          ? "当前案件工作区尚未完整加载，不能确认写入助理建议。"
+          : null;
+  const activeProductArea = VIEW_METADATA[viewMode].futureArea;
+
+  function refreshCaseAfterAssistantProposal(projectId: string) {
+    if (selectedCaseProjectIdRef.current !== projectId) return;
+    const requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
+    void loadCaseWorkspace(projectId, requestEpoch, true);
+  }
+
+  function continueSelectedCaseInAssistant() {
+    if (!assistantActiveProject) return;
+    assistantCaseHandoffSequence.current += 1;
+    setAssistantCaseHandoff({
+      projectId: assistantActiveProject.projectId,
+      title: assistantActiveProject.title,
+      requestId: assistantCaseHandoffSequence.current,
+    });
+    setViewMode("assistant");
+  }
+
+  async function addSelectedArticleToAssistant() {
+    if (
+      !selectedArticle ||
+      !assistantConversation ||
+      legalSourceBridgeMutationActive.current
+    ) {
+      return;
+    }
+    legalSourceBridgeMutationActive.current = true;
+    setLegalSourceBridgeState({ kind: "loading" });
+    try {
+      await addAssistantLegalSource({
+        conversationId: assistantConversation.conversationId,
+        sourceId: selectedArticle.citationId,
+      });
+      setAssistantRefreshKey((current) => current + 1);
+      setLegalSourceBridgeState({
+        kind: "success",
+        message: `已加入助理会话“${publicTitle(assistantConversation.title, "助理会话")}”。`,
+      });
+    } catch (error: unknown) {
+      setLegalSourceBridgeState({
+        kind: "error",
+        message: `加入助理会话失败：${errorMessage(error)}`,
+      });
+    } finally {
+      legalSourceBridgeMutationActive.current = false;
+    }
+  }
+
+  async function proposeSelectedArticleForCase() {
+    if (
+      !selectedArticle ||
+      !assistantConversation ||
+      !selectedCaseProjectId ||
+      assistantConversation.projectId !== selectedCaseProjectId ||
+      legalSourceBridgeMutationActive.current
+    ) {
+      return;
+    }
+    legalSourceBridgeMutationActive.current = true;
+    setLegalSourceBridgeState({ kind: "loading" });
+    try {
+      await proposeAssistantLegalBasis({
+        conversationId: assistantConversation.conversationId,
+        projectId: selectedCaseProjectId,
+        sourceId: selectedArticle.citationId,
+      });
+      setAssistantRefreshKey((current) => current + 1);
+      setLegalSourceBridgeState({
+        kind: "success",
+        message: `已为案件“${assistantActiveProject?.title ?? "当前案件"}”生成待确认法律依据；请到助理右侧审阅，尚未写入案件。`,
+      });
+    } catch (error: unknown) {
+      setLegalSourceBridgeState({
+        kind: "error",
+        message: `生成待确认法律依据失败：${errorMessage(error)}`,
+      });
+    } finally {
+      legalSourceBridgeMutationActive.current = false;
+    }
+  }
+
+  function navigateFromShell(nextView: ViewMode) {
+    const mcpNavigation = decideMcpWorkspaceNavigation(
+      viewMode,
+      nextView,
+      mcpMutationActive.current,
+      mcpDraftDirty.current,
+    );
+    if (mcpNavigation.kind === "block") {
+      setCloseProtectionMessage(mcpNavigation.message);
+      return;
+    }
+    if (mcpNavigation.kind === "confirm_discard") {
+      if (!window.confirm(mcpNavigation.message)) {
+        setCloseProtectionMessage(
+          "已取消切换；未保存的 MCP 设置仍保留在当前工作区。",
+        );
+        return;
+      }
+      // The MCP workspace is conditionally mounted. Once the user explicitly
+      // approves discarding it there is no remaining draft for the global
+      // close guard to protect after navigation unmounts the workspace.
+      mcpDraftDirty.current = false;
+    }
+    const privacyNavigation = decidePrivacyWorkspaceNavigation(
+      viewMode,
+      nextView,
+      privacyMutationActive.current,
+      privacyDraftDirty.current,
+    );
+    if (privacyNavigation.kind === "block") {
+      setCloseProtectionMessage(privacyNavigation.message);
+      return;
+    }
+    if (privacyNavigation.kind === "confirm_discard") {
+      if (!window.confirm(privacyNavigation.message)) {
+        setCloseProtectionMessage(
+          "已取消切换；未保存的隐私与本地 OCR 配置仍保留在当前工作区。",
+        );
+        return;
+      }
+      // PrivacyWorkspace is conditionally mounted. Once the user approves
+      // discarding it, no stale dirty flag should remain in the close guard.
+      privacyDraftDirty.current = false;
+    }
+    setCloseProtectionMessage(null);
+    if (nextView === "graph") {
+      if (selectedCaseProjectId) setGraphMode("case");
+      else if (selectedDocument) {
+        setGraphDocumentId(selectedDocument.documentId);
+        setGraphMode("law");
+      }
+    }
+    setViewMode(nextView);
+  }
 
   return (
-    <main className="app-shell">
-      <header className="top-bar">
-        <div>
-          <p className="eyebrow">
-            {viewMode === "search"
-              ? "离线法律库"
-              : viewMode === "qa"
-                ? "来源受限回答"
-              : viewMode === "cases"
-                ? "案件与证据"
-                : viewMode === "documents"
-                  ? "结构化文书"
-                  : viewMode === "graph"
-                    ? "可追溯关系"
-                    : viewMode === "release"
-                      ? "Windows 发布与维护"
-                      : "BYOK Provider"}
-          </p>
-          <h1>
-            {viewMode === "search"
-              ? "法律检索"
-              : viewMode === "qa"
-                ? "引用问答"
-              : viewMode === "cases"
-                ? "案件工作台"
-                : viewMode === "documents"
-                  ? "文书生成"
-                  : viewMode === "graph"
-                    ? "关系图"
-                    : viewMode === "release"
-                      ? "版本与数据维护"
-                      : "模型供应商设置"}
-          </h1>
-        </div>
-        <div className="top-actions">
-          <nav className="view-tabs" aria-label="主视图">
-            <button
-              aria-current={viewMode === "search" ? "page" : undefined}
-              className={viewMode === "search" ? "is-active" : ""}
-              type="button"
-              onClick={() => setViewMode("search")}
-            >
-              法律检索
-            </button>
-            <button
-              aria-current={viewMode === "qa" ? "page" : undefined}
-              className={viewMode === "qa" ? "is-active" : ""}
-              type="button"
-              onClick={() => setViewMode("qa")}
-            >
-              引用问答
-            </button>
-            <button
-              aria-current={viewMode === "cases" ? "page" : undefined}
-              className={viewMode === "cases" ? "is-active" : ""}
-              type="button"
-              onClick={() => setViewMode("cases")}
-            >
-              案件工作台
-            </button>
-            <button
-              aria-current={viewMode === "providers" ? "page" : undefined}
-              className={viewMode === "providers" ? "is-active" : ""}
-              type="button"
-              onClick={() => setViewMode("providers")}
-            >
-              Provider 设置
-            </button>
-            <button
-              aria-current={viewMode === "documents" ? "page" : undefined}
-              className={viewMode === "documents" ? "is-active" : ""}
-              type="button"
-              onClick={() => setViewMode("documents")}
-            >
-              文书生成
-            </button>
-            <button
-              aria-current={viewMode === "graph" ? "page" : undefined}
-              className={viewMode === "graph" ? "is-active" : ""}
-              type="button"
-              onClick={() => {
-                if (selectedCaseProjectId) setGraphMode("case");
-                else if (selectedDocument) {
-                  setGraphDocumentId(selectedDocument.documentId);
-                  setGraphMode("law");
-                }
-                setViewMode("graph");
-              }}
-            >
-              关系图
-            </button>
-            <button
-              aria-current={viewMode === "release" ? "page" : undefined}
-              className={viewMode === "release" ? "is-active" : ""}
-              type="button"
-              onClick={() => setViewMode("release")}
-            >
-              版本与备份
-            </button>
-          </nav>
-          <div className="health-chip" role="status" aria-live="polite">
-            <span className={`status-dot status-dot--${health.kind}`} />
-            <span>{healthText}</span>
-          </div>
-        </div>
-      </header>
+    <AppShell
+      activeView={viewMode}
+      status={{ kind: health.kind, text: healthText }}
+      onNavigate={navigateFromShell}
+    >
 
       {closeProtectionMessage ? (
         <p className="error-text" role="alert" aria-live="assertive">
@@ -4604,8 +4909,102 @@ export function App() {
         </p>
       ) : null}
 
-      {viewMode === "search" ? (
-        <>
+      {activeProductArea !== "legal-library" ? (
+        <nav className="workspace-subnav" aria-label="当前产品区功能">
+          {activeProductArea === "assistant" ? (
+            <>
+              <button
+                aria-current={viewMode === "assistant" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("assistant")}
+              >
+                助理工作区
+              </button>
+              <button
+                aria-current={viewMode === "qa" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("qa")}
+              >
+                兼容引用问答
+              </button>
+            </>
+          ) : activeProductArea === "cases" ? (
+            <>
+              <button
+                aria-current={viewMode === "cases" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("cases")}
+              >
+                案件工作台 β
+              </button>
+              <button
+                aria-current={viewMode === "documents" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("documents")}
+              >
+                既有文书模板
+              </button>
+              <button
+                aria-current={viewMode === "graph" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("graph")}
+              >
+                确定性图谱
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                aria-current={viewMode === "providers" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("providers")}
+              >
+                Provider 与凭据
+              </button>
+              <button
+                aria-current={viewMode === "privacy" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("privacy")}
+              >
+                隐私与本地处理
+              </button>
+              <button
+                aria-current={viewMode === "mcp" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("mcp")}
+              >
+                MCP 服务
+              </button>
+              <button
+                aria-current={viewMode === "release" ? "page" : undefined}
+                type="button"
+                onClick={() => navigateFromShell("release")}
+              >
+                版本、备份与诊断
+              </button>
+            </>
+          )}
+        </nav>
+      ) : null}
+
+      <div className="assistant-workspace-host" hidden={viewMode !== "assistant"}>
+        <AssistantWorkspace
+          activeProject={assistantActiveProject}
+          caseHandoff={assistantCaseHandoff}
+          externalRefreshKey={assistantRefreshKey}
+          providerProfiles={providerProfiles}
+          proposalApplyBlockedReason={assistantProposalApplyBlockedReason}
+          onCaseProposalApplied={refreshCaseAfterAssistantProposal}
+          onConversationChange={handleAssistantConversationChange}
+          onDraftDirtyChange={handleAssistantDraftDirtyChange}
+          onMutationActivityChange={handleAssistantMutationActivityChange}
+          onOpenProviderSettings={() => navigateFromShell("providers")}
+          onRunActivityChange={handleAssistantRunActivityChange}
+        />
+      </div>
+
+      {viewMode === "assistant" ? null : viewMode === "search" ? (
+        <LegalLibraryWorkspace>
           <section className="query-band" aria-label="检索条件">
             <form className="search-form" onSubmit={submitSearch}>
               <label>
@@ -4676,11 +5075,18 @@ export function App() {
                     type="button"
                     onClick={() => void loadDocumentContext(law)}
                   >
-                    <span className="item-title">{law.title}</span>
+                    <span className="item-title">
+                      {publicTitle(
+                        law.title,
+                        `${publicTitle(law.authorityName, "发布机关")}发布的${publicTitle(law.documentType, "法律文件")}`,
+                      )}
+                    </span>
                     <span className="item-meta">
                       {formatStatus(law.status)} · {law.authorityName}
                     </span>
-                    <span className="item-summary">{law.summary}</span>
+                    <span className="item-summary">
+                      内容摘要：{publicContentSummary(law.summary)}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -4718,7 +5124,9 @@ export function App() {
                         article.effectiveTo,
                       )}
                     </span>
-                    <span className="item-summary">{article.snippet}</span>
+                    <span className="item-summary">
+                      内容摘要：{publicContentSummary(article.snippet)}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -4744,11 +5152,66 @@ export function App() {
                   </p>
                   <h3>{formatArticleLabel(selectedArticle)}</h3>
                   <p className="article-content">{selectedArticle.content}</p>
+                  <div className="command-row">
+                    <button
+                      disabled={
+                        !assistantConversation ||
+                        legalSourceBridgeState.kind === "loading"
+                      }
+                      type="button"
+                      onClick={() => void addSelectedArticleToAssistant()}
+                    >
+                      {legalSourceBridgeState.kind === "loading"
+                        ? "正在加入…"
+                        : "加入当前助理会话"}
+                    </button>
+                    <button
+                      disabled={
+                        !assistantConversation ||
+                        !selectedCaseProjectId ||
+                        assistantConversation.projectId !== selectedCaseProjectId ||
+                        legalSourceBridgeState.kind === "loading"
+                      }
+                      type="button"
+                      onClick={() => void proposeSelectedArticleForCase()}
+                    >
+                      加入当前案件（待确认）
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        assistantActiveProject
+                          ? continueSelectedCaseInAssistant()
+                          : navigateFromShell("assistant")
+                      }
+                    >
+                      {assistantActiveProject ? "在案件助理中继续" : "打开助理"}
+                    </button>
+                  </div>
+                  <p
+                    className={
+                      legalSourceBridgeState.kind === "error"
+                        ? "error-text"
+                        : "privacy-note"
+                    }
+                    role={
+                      legalSourceBridgeState.kind === "error"
+                        ? "alert"
+                        : "status"
+                    }
+                  >
+                    {legalSourceBridgeState.kind === "success" ||
+                    legalSourceBridgeState.kind === "error"
+                      ? legalSourceBridgeState.message
+                      : assistantConversation
+                        ? assistantActiveProject &&
+                          assistantConversation.projectId !==
+                            assistantActiveProject.projectId
+                          ? `当前助理会话“${publicTitle(assistantConversation.title, "助理会话")}”未绑定所选案件；请先点“在案件助理中继续”，再返回生成待确认法律依据。`
+                          : `目标会话：${publicTitle(assistantConversation.title, "助理会话")}`
+                        : "请先在助理中创建或选择一个会话。"}
+                  </p>
                   <dl className="meta-grid">
-                    <div>
-                      <dt>引用 ID</dt>
-                      <dd>{selectedArticle.citationId}</dd>
-                    </div>
                     <div>
                       <dt>效力期间</dt>
                       <dd>
@@ -4815,15 +5278,20 @@ export function App() {
                         {formatStatus(relation.relationType)} ·{" "}
                         {relation.toTitle}
                       </strong>
-                      <span>{relation.description}</span>
-                      <span>{relation.sourceReference}</span>
+                      <span>
+                        {sanitizePublicGeneratedText(
+                          relation.description,
+                          "关系说明暂不可用。",
+                        )}
+                      </span>
+                      {relation.sourceReference ? <span>官方来源记录已保留</span> : null}
                     </div>
                   ))}
                 </div>
               </section>
             </aside>
           </section>
-        </>
+        </LegalLibraryWorkspace>
       ) : viewMode === "qa" ? (
         <section className="qa-layout">
           <aside className="panel qa-control-panel" aria-labelledby="qa-control-title">
@@ -4835,7 +5303,7 @@ export function App() {
               <p className="privacy-note">
                 回答归属：
                 {caseWorkspace && selectedCaseProjectId
-                  ? caseWorkspace.project.title
+                  ? publicTitle(caseWorkspace.project.title, "当前案件")
                   : "未选择已保存案件；可检索来源，但不能生成或保存回答"}
               </p>
               <fieldset
@@ -4971,7 +5439,9 @@ export function App() {
                 aria-label="法律检索风险提示"
               >
                 {activeQaContext.warnings.map((warning, index) => (
-                  <p key={`${index}-${warning}`}>{warning}</p>
+                  <p key={`${index}-${warning}`}>
+                    {formatLegalContextWarning(warning)}
+                  </p>
                 ))}
               </div>
             ) : null}
@@ -5004,14 +5474,13 @@ export function App() {
                   >
                     <strong>{record.question}</strong>
                     <span>
-                      {record.createdAt.replace("T", " ").replace("Z", "")} ·{" "}
-                      {record.providerSnapshot
-                        ? `${record.providerId} · ${record.providerSnapshot.modelId} · ${record.providerSnapshot.baseUrl}`
-                        : `${record.providerId} · 旧记录无 Provider 快照`}
+                      保存于 {record.createdAt.replace("T", " ").replace("Z", "")}
                     </span>
                     <span>
-                      {record.citationReport.validCount} 个来源标记已映射 ·{" "}
-                      {record.citationReport.invalidCount} 个无效
+                      {record.citationReport.validCount} 条法条依据
+                      {record.citationReport.invalidCount > 0
+                        ? ` · ${record.citationReport.invalidCount} 条需要核对`
+                        : ""}
                     </span>
                   </button>
                 ))}
@@ -5071,7 +5540,9 @@ export function App() {
                         source.effectiveTo,
                       )}
                     </span>
-                    <span className="item-summary">{source.snippet}</span>
+                    <span className="item-summary">
+                      内容摘要：{publicContentSummary(source.snippet)}
+                    </span>
                   </button>
                 ))}
                 {activeQaContext && activeQaContext.sources.length === 0 ? (
@@ -5086,7 +5557,7 @@ export function App() {
               <h2 id="qa-answer-title">回答</h2>
               <span>
                 {qaAnswer
-                  ? `${qaAnswer.citationReport.validCount} 个来源标记已映射`
+                  ? `${qaAnswer.citationReport.validCount} 条法条依据`
                   : formatLegalAnswerStreamStatus(qaStream)}
               </span>
             </div>
@@ -5101,18 +5572,23 @@ export function App() {
             ) : null}
             {qaStream.status === "error" || qaStream.status === "cancelled" ? (
               <p className="error-text">
-                {qaStream.message ?? formatLegalAnswerStreamStatus(qaStream)}
+                {qaStream.status === "cancelled"
+                  ? "回答生成已取消。"
+                  : publicErrorMessage(
+                      qaStream.message,
+                      "回答生成未完成，请重试。",
+                    )}
               </p>
             ) : null}
             {qaAnswer ? (
               <>
                 {qaAnswer.citationReport.unsupportedLegalConclusion ? (
                   <p className="risk-banner">
-                    存在未由可映射来源标记邻近覆盖的法律子句；不得据此认定结论有法源支持。
+                    部分法律结论缺少可核对的法条依据，请补充依据后再使用。
                   </p>
                 ) : !qaAnswer.citationReport.semanticSupportVerified ? (
                   <p className="risk-banner">
-                    系统未检测到缺少邻近标记的法律子句；自由文本分段属于启发式结构校验，不能保证穷尽所有结论，也尚未核验法条在语义上支持该结论。必须逐条对照本地原文并由律师判断。
+                    本回答依据本地法律资料生成，请结合案件事实逐条核对并由律师审定。
                   </p>
                 ) : null}
                 <article className="answer-box">
@@ -5122,7 +5598,9 @@ export function App() {
                       qaAnswer.citationReport.citations,
                     ).map((segment) =>
                       segment.kind === "text" ? (
-                        <span key={segment.key}>{segment.text}</span>
+                        <span key={segment.key}>
+                          {sanitizePublicGeneratedText(segment.text, "")}
+                        </span>
                       ) : citationHasTrustedSource(segment.citation) ? (
                         <button
                           className="answer-citation answer-citation--valid"
@@ -5152,31 +5630,29 @@ export function App() {
                   </p>
                 </article>
                 <div className="answer-meta-row">
-                  <span>记录：{qaAnswer.recordId ?? "未保存"}</span>
-                  <span>Provider：{qaAnswer.providerId}</span>
-                  <span>
-                    {qaStream.usage?.totalTokens
-                      ? `${qaStream.usage.totalTokens} tokens`
-                      : "用量未返回"}
-                  </span>
+                  <span>{qaAnswer.recordId ? "回答已保存" : "本次回答尚未保存"}</span>
                 </div>
                 <section className="detail-section" aria-labelledby="qa-citation-title">
                   <div className="section-heading">
-                    <h3 id="qa-citation-title">引用校验</h3>
+                    <h3 id="qa-citation-title">法律依据与案例引用表</h3>
                     <span>{formatCitationValidationSummary(qaAnswer.citationReport)}</span>
                   </div>
                   <p className="validation-scope-note">
-                    此处只校验来源标记能否映射到本地原文，不代表法律结论正确，也不代表语义支持已经人工核实。
+                    以下列明本回答采用的法律依据；适用结论仍应结合案件事实由律师审定。
                   </p>
                   <div className="citation-list">
                     {qaAnswer.citationReport.citations.map((citation, index) => {
                       const key = `${citation.rawMarker}-${citation.sourceId}-${index}`;
                       const content = (
                         <>
-                          <strong>{citation.rawMarker}</strong>
+                          <strong>
+                            {citation.source
+                              ? formatLegalSourceLabel(citation.source)
+                              : `第 ${index + 1} 条依据`}
+                          </strong>
                           <span>
                             {citation.status === "valid"
-                              ? "已映射到本地原文"
+                              ? "查看法条原文"
                               : formatCitationInvalidReason(citation.reason)}
                           </span>
                         </>
@@ -5203,7 +5679,7 @@ export function App() {
                       );
                     })}
                     {qaAnswer.citationReport.citations.length === 0 ? (
-                      <p className="empty-state">回答中没有可校验引用</p>
+                      <p className="empty-state">本回答未列出法条或案例依据</p>
                     ) : null}
                   </div>
                 </section>
@@ -5212,16 +5688,13 @@ export function App() {
               <>
                 <p className="risk-banner">
                   {qaStream.status === "finalizing"
-                    ? "回答已保存，来源标记已由 Rust 校验，正在载入明细。"
-                    : "以下为生成中的原始增量，来源标记尚未由 Rust 校验，不能作为可信来源。"}
+                    ? "回答已保存，正在载入法条依据。"
+                    : "回答正在生成，完成后将在此显示。"}
                 </p>
-                <article className="answer-box" aria-live="polite">
-                  <p>{qaStream.answer}</p>
-                </article>
               </>
             ) : (
               <p className="empty-state">
-                先检索本地来源；配置 Provider 和 API Key 后再生成回答。
+                先检索本地法律资料；完成模型服务和访问凭据设置后再生成回答。
               </p>
             )}
           </section>
@@ -5233,9 +5706,7 @@ export function App() {
             </div>
             {selectedQaSource ? (
               <article className="article-detail">
-                <p className="detail-kicker">{selectedQaSource.sourceId}</p>
                 <h3>{formatLegalSourceLabel(selectedQaSource)}</h3>
-                <p className="item-meta">{selectedQaSource.canonicalLabel}</p>
                 <p className="article-content">{selectedQaSource.content}</p>
                 <dl className="meta-grid">
                   <div>
@@ -5285,10 +5756,32 @@ export function App() {
             onOpenNode={openGraphNode}
           />
         </Suspense>
+      ) : viewMode === "privacy" ? (
+        <SettingsWorkspace mode="privacy">
+          <Suspense fallback={<p className="empty-state">正在加载隐私设置…</p>}>
+            <PrivacyWorkspace
+              onDraftDirtyChange={handlePrivacyDraftDirtyChange}
+              onMutationActivityChange={handlePrivacyMutationActivityChange}
+            />
+          </Suspense>
+        </SettingsWorkspace>
       ) : viewMode === "release" ? (
-        <Suspense fallback={<p className="empty-state">正在加载版本信息…</p>}><ReleaseWorkspace /></Suspense>
+        <SettingsWorkspace mode="maintenance">
+          <Suspense fallback={<p className="empty-state">正在加载版本信息…</p>}>
+            <ReleaseWorkspace />
+          </Suspense>
+        </SettingsWorkspace>
+      ) : viewMode === "mcp" ? (
+        <SettingsWorkspace mode="mcp">
+          <Suspense fallback={<p className="empty-state">正在加载 MCP 服务设置…</p>}>
+            <McpWorkspace
+              onDraftDirtyChange={handleMcpDraftDirtyChange}
+              onMutationActivityChange={handleMcpMutationActivityChange}
+            />
+          </Suspense>
+        </SettingsWorkspace>
       ) : viewMode === "cases" ? (
-        <section className="case-layout" aria-busy={caseState.kind === "loading"}>
+        <CasesWorkspace busy={caseState.kind === "loading"}>
           <aside className="panel case-list-panel" aria-labelledby="case-list-title">
             <div className="panel-heading">
               <h2 id="case-list-title">案件项目</h2>
@@ -5316,12 +5809,16 @@ export function App() {
                   type="button"
                   onClick={() => selectCaseProject(project)}
                 >
-                  <span className="item-title">{project.title}</span>
+                  <span className="item-title">
+                    {publicTitle(project.title, "未命名案件")}
+                  </span>
                   <span className="item-meta">
                     {project.caseType || "未分类"} ·{" "}
                     {project.openedOn ?? "未登记日期"}
                   </span>
-                  <span className="item-summary">{project.summary}</span>
+                  <span className="item-summary">
+                    {publicCaseBusinessText(project.summary, "暂无案件摘要")}
+                  </span>
                 </button>
               ))}
               {caseProjects.length === 0 ? (
@@ -5366,8 +5863,17 @@ export function App() {
 
           <section className="panel case-workbench-panel" aria-labelledby="case-workbench-title">
             <div className="panel-heading">
-              <h2 id="case-workbench-title">案件工作台</h2>
+              <h2 id="case-workbench-title">案件工作台 β</h2>
               <span>{caseState.kind === "loading" ? "处理中" : "本地"}</span>
+            </div>
+            <div className="provider-create-row">
+              <button
+                disabled={!assistantActiveProject || caseNavigationLocked}
+                type="button"
+                onClick={continueSelectedCaseInAssistant}
+              >
+                在助理中继续
+              </button>
             </div>
             <div className="case-scroll">
               {caseState.kind === "error" ? (
@@ -5528,21 +6034,9 @@ export function App() {
                         }
                       />
                     </label>
-                    <label>
-                      <span>存储引用</span>
-                      <input
-                        value={fileDraft.storageReference}
-                        onChange={(event) =>
-                          setFileDraft((current) => ({
-                            ...current,
-                            storageReference: event.target.value,
-                          }))
-                        }
-                      />
-                    </label>
                   </div>
                   <label>
-                    <span>材料文本或摘要（仅由用户维护）</span>
+                    <span>材料摘要</span>
                     <textarea
                       value={fileDraft.summary}
                       onChange={(event) =>
@@ -5590,13 +6084,12 @@ export function App() {
                             )
                           }
                         />
-                        <strong>{file.title}</strong>
+                        <strong>{publicTitle(file.title, "案件材料")}</strong>
                       </label>
+                      <span>{publicTitle(file.fileType, "未分类")}</span>
                       <span>
-                        {file.fileType || "未分类"} ·{" "}
-                        {file.storageReference || "未登记位置"}
+                        {publicContentSummary(file.summary, "未填写材料摘要")}
                       </span>
-                      <span>{file.summary || "未填写材料文本或摘要"}</span>
                       <div className="compact-row-actions">
                         <button
                           className="edit-action"
@@ -5740,7 +6233,7 @@ export function App() {
                 <div className="compact-list">
                   {caseWorkspace?.parties.map((party) => (
                     <div className="compact-row" key={party.partyId}>
-                      <strong>{party.name}</strong>
+                      <strong>{publicTitle(party.name, "案件当事人")}</strong>
                       <span>{formatPartyRole(party.role)}</span>
                       <div className="compact-row-actions">
                         <button
@@ -5848,7 +6341,7 @@ export function App() {
                         }
                       >
                         <option value="confirmed">已确认事实</option>
-                        <option value="model_suggested">模型建议</option>
+                        <option value="model_suggested">待审阅建议</option>
                       </select>
                     </label>
                     <label>
@@ -5908,12 +6401,17 @@ export function App() {
                       key={fact.factId}
                       tabIndex={-1}
                     >
-                      <strong>{fact.title}</strong>
+                      <strong>{publicTitle(fact.title, "案件事实")}</strong>
                       <span>
                         {fact.occurredOn ?? "未登记日期"} ·{" "}
                         {formatConfirmationStatus(fact.confirmationStatus)}
                       </span>
-                      <span>{fact.description}</span>
+                      <span>
+                        {publicCaseBusinessText(
+                          fact.description,
+                          "未填写事实描述",
+                        )}
+                      </span>
                       <div className="compact-row-actions">
                         <button
                           className="edit-action"
@@ -6081,10 +6579,11 @@ export function App() {
                       tabIndex={-1}
                     >
                       <strong>
-                        {item.evidenceNumber} · {item.title}
+                        {publicEvidenceNumber(item.evidenceNumber)} ·{" "}
+                        {publicTitle(item.title, "案件证据")}
                       </strong>
                       <span>
-                        {item.source || "缺少来源"} ·{" "}
+                        {publicCaseBusinessText(item.source, "缺少来源")} ·{" "}
                         {item.formedOn ?? "缺少形成时间"}
                       </span>
                       <div className="compact-row-actions">
@@ -6150,7 +6649,7 @@ export function App() {
                     <option value="">选择事实</option>
                     {caseWorkspace?.facts.map((fact) => (
                       <option key={fact.factId} value={fact.factId}>
-                        {fact.title}
+                        {publicTitle(fact.title, "相关事实")}
                       </option>
                     ))}
                   </select>
@@ -6168,7 +6667,8 @@ export function App() {
                     <option value="">选择证据</option>
                     {caseWorkspace?.evidence.map((item) => (
                       <option key={item.evidenceId} value={item.evidenceId}>
-                        {item.evidenceNumber} · {item.title}
+                        {publicEvidenceNumber(item.evidenceNumber)} ·{" "}
+                        {publicTitle(item.title, "案件证据")}
                       </option>
                     ))}
                   </select>
@@ -6195,8 +6695,13 @@ export function App() {
 
                     return (
                       <div className="compact-row" key={link.linkId}>
-                        <strong>{fact?.title ?? link.factId}</strong>
-                        <span>{evidence?.evidenceNumber ?? link.evidenceId}</span>
+                        <strong>{publicTitle(fact?.title, "相关事实")}</strong>
+                        <span>
+                          {publicEvidenceNumber(
+                            evidence?.evidenceNumber,
+                            "相关证据",
+                          )}
+                        </span>
                         <button
                           disabled={
                             caseNavigationLocked ||
@@ -6316,9 +6821,9 @@ export function App() {
                       key={issue.issueId}
                       tabIndex={-1}
                     >
-                      <strong>{issue.title}</strong>
+                      <strong>{publicTitle(issue.title, "相关法律争点")}</strong>
                       <span>{formatLegalIssueStatus(issue.status)}</span>
-                      <span>{issue.claim}</span>
+                      <span>{publicCaseBusinessText(issue.claim, "尚未填写主张")}</span>
                       <div className="compact-row-actions">
                         <button
                           className="edit-action"
@@ -6369,7 +6874,7 @@ export function App() {
                   <div>
                     <h3>事实—争点关联</h3>
                     <p className="muted">
-                      仅保存你手动建立的关联，不会根据文本或模型输出自动推断。
+                      仅保存你手动建立的关联，不会自动推断。
                     </p>
                   </div>
                   <span>{caseWorkspace?.factIssueLinks.length ?? 0}</span>
@@ -6391,7 +6896,7 @@ export function App() {
                     <option value="">选择事实</option>
                     {caseWorkspace?.facts.map((fact) => (
                       <option key={fact.factId} value={fact.factId}>
-                        {fact.title}
+                        {publicTitle(fact.title, "相关事实")}
                       </option>
                     ))}
                   </select>
@@ -6411,7 +6916,7 @@ export function App() {
                     <option value="">选择争点</option>
                     {caseWorkspace?.legalIssues.map((issue) => (
                       <option key={issue.issueId} value={issue.issueId}>
-                        {issue.title}
+                        {publicTitle(issue.title, "相关法律争点")}
                       </option>
                     ))}
                   </select>
@@ -6438,8 +6943,10 @@ export function App() {
 
                     return (
                       <div className="compact-row" key={link.linkId}>
-                        <strong>{fact?.title ?? link.factId}</strong>
-                        <span>争点：{issue?.title ?? link.issueId}</span>
+                        <strong>{publicTitle(fact?.title, "相关事实")}</strong>
+                        <span>
+                          争点：{publicTitle(issue?.title, "相关法律争点")}
+                        </span>
                         <button
                           disabled={
                             caseNavigationLocked ||
@@ -6479,8 +6986,8 @@ export function App() {
                   >
                   <div className="form-grid">
                     <label>
-                      <span>引用 ID</span>
-                      <input
+                      <span>本地法律来源</span>
+                      <select
                         id="case-basis-source-id"
                         aria-describedby="case-workbench-error"
                         aria-invalid={
@@ -6488,8 +6995,14 @@ export function App() {
                         }
                         value={basisSourceId}
                         onChange={(event) => setBasisSourceId(event.target.value)}
-                        placeholder="[SRC:law:...]"
-                      />
+                      >
+                        <option value="">请选择已检索的法律来源</option>
+                        {(activeQaContext?.sources ?? []).map((source) => (
+                          <option key={source.sourceId} value={source.sourceId}>
+                            {formatLegalSourceLabel(source)}
+                          </option>
+                        ))}
+                      </select>
                     </label>
                     <label>
                       <span>关联争点</span>
@@ -6500,7 +7013,7 @@ export function App() {
                         <option value="">不关联争点</option>
                         {caseWorkspace?.legalIssues.map((issue) => (
                           <option key={issue.issueId} value={issue.issueId}>
-                            {issue.title}
+                            {publicTitle(issue.title, "相关法律争点")}
                           </option>
                         ))}
                       </select>
@@ -6589,11 +7102,22 @@ export function App() {
                           · {formatLegalBasisWindow(basis)}
                         </span>
                         <span>
-                          {linkedIssue ? `争点：${linkedIssue.title}` : "未关联争点"}{" "}
+                          {linkedIssue
+                            ? `争点：${publicTitle(linkedIssue.title, "相关法律争点")}`
+                            : "未关联争点"}{" "}
                           · {basis.caseDate ?? "未指定案件日期"}
                         </span>
-                        {basis.excerpt ? <span>{basis.excerpt}</span> : null}
-                        {basis.note ? <span>{basis.note}</span> : null}
+                        {basis.excerpt ? (
+                          <span>内容摘要：{publicContentSummary(basis.excerpt)}</span>
+                        ) : null}
+                        {basis.note ? (
+                          <span>
+                            {sanitizePublicGeneratedText(
+                              basis.note,
+                              "补充说明暂不可用。",
+                            )}
+                          </span>
+                        ) : null}
                         <button
                           disabled={
                             caseNavigationLocked ||
@@ -6641,7 +7165,12 @@ export function App() {
               <div className="compact-list extraction-uncertainty-list">
                 {caseWorkspace?.uncertainties.map((uncertainty) => (
                   <div className="compact-row" key={uncertainty.uncertaintyId}>
-                    <strong>{uncertainty.description}</strong>
+                    <strong>
+                      {publicCaseBusinessText(
+                        uncertainty.description,
+                        "相关事项需要核实",
+                      )}
+                    </strong>
                     <span>
                       {uncertainty.status === "open" ? "待核实" : "已解决"} ·{" "}
                       {formatConfirmationStatus(uncertainty.confirmationStatus)}
@@ -6670,9 +7199,9 @@ export function App() {
             </section>
 
             <section className="provider-subsection extraction-panel">
-              <h3>模型结构化抽取</h3>
+              <h3>材料信息整理</h3>
               <p className="privacy-note">
-                仅发送已勾选材料记录中的“摘要”字段，不读取存储引用指向的原文件。模型建议先在本机审阅，确认事务不会修改案件材料记录。
+                仅处理已勾选材料的摘要，不会读取原始文件。整理结果须经你逐项审阅，确认前不会改动案件内容。
               </p>
               {pendingReviewRecoveryBlock?.projectId ===
               selectedCaseProjectId ? (
@@ -6692,7 +7221,7 @@ export function App() {
                     {pendingReviewRecoveryBlock.reloadRequired
                       ? caseMutationInFlight
                         ? "正在重新加载…"
-                        : "重新加载服务端草稿"
+                        : "重新加载最新草稿"
                       : extractionDiscarding
                         ? "正在放弃…"
                         : "放弃该待审阅草稿并解锁案件"}
@@ -6733,7 +7262,7 @@ export function App() {
               >
                 {extractionState.kind === "generating"
                   ? "正在请求并严格校验…"
-                  : `生成模型建议（已选 ${extractionFileIds.length} 份材料）`}
+                  : `生成待审阅内容（已选 ${extractionFileIds.length} 份材料）`}
               </button>
 
               {extractionState.kind === "reviewing" ||
@@ -6760,25 +7289,19 @@ export function App() {
                 >
                   <div className="review-banner" aria-live="polite">
                     <strong id="extraction-review-title">
-                      模型建议，尚未写入
+                      待审阅整理结果，尚未保存
                     </strong>
                     <span>
                       <span id="extraction-review-description" className="sr-only">
-                        请逐项审阅模型建议。按 Escape 可取消且不写入。
+                        请逐项审阅整理结果。按 Escape 可取消且不会保存。
                       </span>
                       {extractionState.restored
                         ? `已从本地恢复待审阅草稿（创建于 ${extractionState.restoredCreatedAt ?? "未知时间"}，到期于 ${extractionState.restoredExpiresAt ?? "未知时间"}）。`
                         : extractionState.repaired
-                          ? "首次输出失败，Rust 已自动修复 1 次并重新严格校验。"
-                          : "首次输出已通过 Rust 严格校验。"}
+                          ? "初次结果未通过校验，系统已修正并重新校验。"
+                          : "整理结果已通过系统校验。"}
                     </span>
                   </div>
-                  <p className="validation-scope-note">
-                    生成配置：
-                    {extractionState.context.providerSnapshot
-                      ? `${extractionState.context.providerSnapshot.modelId} · ${extractionState.context.providerSnapshot.baseUrl}`
-                      : `${extractionState.context.providerId}（旧草稿未提供可展示的配置快照）`}
-                  </p>
                   <p
                     className={
                       extractionDraftSaveState.kind === "conflict"
@@ -6808,7 +7331,7 @@ export function App() {
                   {extractionDraftSaveState.kind === "conflict" ? (
                     <div className="risk-banner" role="alert">
                       <p>
-                        为避免覆盖其他窗口或重复提交，必须放弃本窗口尚未确认的视图并重新读取服务端版本。
+                        为避免覆盖其他窗口或重复提交，必须放弃本窗口尚未确认的内容并重新读取最新草稿。
                       </p>
                       <button
                         disabled={caseMutationInFlight || extractionDiscarding}
@@ -6821,7 +7344,7 @@ export function App() {
                       >
                         {caseMutationInFlight
                           ? "正在重新加载…"
-                          : "重新加载服务端草稿"}
+                          : "重新加载最新草稿"}
                       </button>
                     </div>
                   ) : null}
@@ -6836,7 +7359,7 @@ export function App() {
                       extractionDraftSaveState.kind === "conflict"
                     }
                   >
-                  <legend className="sr-only">模型结构化抽取审阅字段</legend>
+                  <legend className="sr-only">材料信息审阅字段</legend>
                   <h4 id="extraction-parties-title">当事人</h4>
                   {extractionState.draft.parties.map((party, index) => (
                     <div
@@ -7302,10 +7825,10 @@ export function App() {
                       {extractionClosePreparing
                         ? "正在保存并关闭窗口…"
                         : extractionState.kind === "committing"
-                        ? "事务写入中…"
+                        ? "正在保存审阅结果…"
                         : extractionConfirmPreparing
                           ? "正在保存并准备确认…"
-                        : "确认审阅结果并原子写入"}
+                        : "确认并保存审阅结果"}
                     </button>
                   </div>
                 </div>
@@ -7313,28 +7836,18 @@ export function App() {
 
               {extractionState.kind === "failed" ? (
                 <div className="extraction-failure">
-                  <strong>抽取失败：{extractionState.message}</strong>
+                  <strong>
+                    材料信息整理未完成：
+                    {publicErrorMessage(
+                      extractionState.message,
+                      "请检查模型服务和网络后重试。",
+                    )}
+                  </strong>
                   <span>
                     {extractionState.repairAttempted
-                      ? "Rust 已自动修复且仅修复 1 次，第二次严格校验仍失败。"
-                      : "未进入结构修复流程（例如 provider、网络或响应信封错误）。"}
+                      ? "系统已尝试修正，但结果仍未通过校验。"
+                      : "模型服务或网络异常，未生成可审阅内容。"}
                   </span>
-                  {extractionState.rawOutput ? (
-                    <details>
-                      <summary>
-                        查看首次模型输出（API 凭据已脱敏，案件内容仍可能敏感）
-                      </summary>
-                      <pre>{extractionState.rawOutput}</pre>
-                    </details>
-                  ) : null}
-                  {extractionState.repairOutput ? (
-                    <details>
-                      <summary>
-                        查看一次修复输出（API 凭据已脱敏，案件内容仍可能敏感）
-                      </summary>
-                      <pre>{extractionState.repairOutput}</pre>
-                    </details>
-                  ) : null}
                   <button type="button" onClick={resetExtractionResult}>
                     关闭
                   </button>
@@ -7344,14 +7857,14 @@ export function App() {
               {extractionState.kind === "committed" ? (
                 <div className="connection-summary">
                   <span className="status-dot status-dot--succeeded" />
-                  <strong>{extractionState.message}</strong>
+                  <strong>审阅结果已写入案件。</strong>
                 </div>
               ) : null}
             </section>
           </aside>
-        </section>
+        </CasesWorkspace>
       ) : (
-        <section className="provider-layout" aria-busy={providerBusy}>
+        <SettingsWorkspace mode="providers" busy={providerBusy}>
           <aside className="panel provider-list-panel" aria-labelledby="provider-list-title">
             <div className="panel-heading">
               <h2 id="provider-list-title">Profiles</h2>
@@ -7749,8 +8262,8 @@ export function App() {
               </button>
             </section>
           </aside>
-        </section>
+        </SettingsWorkspace>
       )}
-    </main>
+    </AppShell>
   );
 }
