@@ -2,6 +2,7 @@
 
 pub const LOCAL_PROTECTION_SCHEME: &str = "windows_dpapi_current_user_v1";
 pub const MAX_PROTECTED_PLAINTEXT_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(windows)]
 const OPTIONAL_ENTROPY: &[u8] = b"LawyerAssistance/privacy/local-protected-blob/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

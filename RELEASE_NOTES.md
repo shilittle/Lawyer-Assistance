@@ -1,4 +1,6 @@
-# Lawyer Assistance MCP 0.3.0
+# Lawyer Assistance MCP 0.3.1
+
+> **Supersedes v0.3.0.** The v0.3.0 Windows assets passed local and remote byte verification, but its Linux/macOS MCP Clippy jobs exposed a Windows-only DPAPI constant without a platform guard. v0.3.1 adds the guard and is the first candidate eligible for the complete remote matrix.
 
 > **Windows privacy-hardening prerelease.** This build is published for controlled testing. The NSIS installer is protected by the repository's Tauri/Minisign updater signature but is not Authenticode-signed because no trusted Windows code-signing certificate is available on the release machine. Windows can therefore display an unknown-publisher or SmartScreen warning. Do not treat this prerelease as production qualification for real client material.
 
@@ -26,7 +28,7 @@ This is the first separately packaged MCP server release for Lawyer Assistance. 
 
 | Item | Current value |
 |---|---|
-| Binary release | `0.3.0` |
+| Binary release | `0.3.1` |
 | MCP protocol metadata | `2025-11-25` |
 | Public service schema | `1` |
 | Legal archive schema | `4` |
