@@ -15,6 +15,11 @@ OUTPUT = ROOT / "apps" / "desktop" / "src-tauri" / "resources" / "THIRD_PARTY_NO
 FONT_ASSET_DIR = ROOT / "crates" / "material-processing" / "assets" / "fonts"
 SAFE_EXPORT_FONT_SHA256 = "7db3c634bbd0301b3082a80ffcac2f422e8ef9ce0730f8b279c3e8f756598f68"
 NOTICE_NAMES = re.compile(r"^(licen[cs]e|copying|copyright|notice)([._-].*)?$", re.IGNORECASE)
+CARGO_RELEASE_TARGET_PRODUCTS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("x86_64-pc-windows-msvc", frozenset({"lawyer-assistance-desktop", "legal-mcp"})),
+    ("x86_64-unknown-linux-gnu", frozenset({"legal-mcp"})),
+    ("aarch64-apple-darwin", frozenset({"legal-mcp"})),
+)
 
 ALLOC_STDLIB_BSD = """Copyright (c) 2016 Dropbox, Inc.
 All rights reserved.
@@ -259,18 +264,18 @@ def bundled_asset_components() -> list[Component]:
         )
     ]
 
-def cargo_components() -> list[Component]:
+def cargo_metadata_for_target(target: str) -> dict:
     command = [
         "cargo",
         "metadata",
         "--locked",
         "--offline",
         "--filter-platform",
-        "x86_64-pc-windows-msvc",
+        target,
         "--format-version",
         "1",
     ]
-    metadata = json.loads(
+    return json.loads(
         subprocess.run(
             command,
             cwd=ROOT,
@@ -280,30 +285,38 @@ def cargo_components() -> list[Component]:
             encoding="utf-8",
         ).stdout
     )
-    packages_by_id = {package["id"]: package for package in metadata["packages"]}
-    nodes_by_id = {node["id"]: node for node in metadata["resolve"]["nodes"]}
-    product_names = {"lawyer-assistance-desktop", "legal-mcp"}
-    roots = [
-        package["id"]
-        for package in metadata["packages"]
-        if package["name"] in product_names
-    ]
-    resolved_names = {packages_by_id[package_id]["name"] for package_id in roots}
-    if resolved_names != product_names:
-        raise RuntimeError("cannot identify the desktop and MCP Cargo product packages")
+
+
+def cargo_components() -> list[Component]:
+    packages_by_id: dict[str, dict] = {}
     reachable: set[str] = set()
-    pending = roots
-    while pending:
-        package_id = pending.pop()
-        if package_id in reachable:
-            continue
-        reachable.add(package_id)
-        node = nodes_by_id[package_id]
-        for dependency in node.get("deps", []):
-            kinds = dependency.get("dep_kinds", [])
-            if kinds and all(kind.get("kind") == "dev" for kind in kinds):
+    for target, product_names in CARGO_RELEASE_TARGET_PRODUCTS:
+        metadata = cargo_metadata_for_target(target)
+        target_packages_by_id = {package["id"]: package for package in metadata["packages"]}
+        nodes_by_id = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+        roots = [
+            package["id"]
+            for package in metadata["packages"]
+            if package["name"] in product_names
+        ]
+        resolved_names = {target_packages_by_id[package_id]["name"] for package_id in roots}
+        if resolved_names != product_names:
+            raise RuntimeError(f"cannot identify Cargo product packages for {target}")
+        target_reachable: set[str] = set()
+        pending = list(roots)
+        while pending:
+            package_id = pending.pop()
+            if package_id in target_reachable:
                 continue
-            pending.append(dependency["pkg"])
+            target_reachable.add(package_id)
+            node = nodes_by_id[package_id]
+            for dependency in node.get("deps", []):
+                kinds = dependency.get("dep_kinds", [])
+                if kinds and all(kind.get("kind") == "dev" for kind in kinds):
+                    continue
+                pending.append(dependency["pkg"])
+        packages_by_id.update(target_packages_by_id)
+        reachable.update(target_reachable)
 
     components: list[Component] = []
     for package_id in sorted(reachable):

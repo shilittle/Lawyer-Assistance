@@ -5,6 +5,7 @@ from pathlib import Path
 
 if __package__:
     from scripts.generate_third_party_notices import (
+        CARGO_RELEASE_TARGET_PRODUCTS,
         SAFE_EXPORT_FONT_SHA256,
         bundled_asset_components,
         canonical_text_sha256,
@@ -14,6 +15,7 @@ else:
     # Keep the regression test runnable both as a module (the CI entry point)
     # and as a standalone file from the repository root.
     from generate_third_party_notices import (
+        CARGO_RELEASE_TARGET_PRODUCTS,
         SAFE_EXPORT_FONT_SHA256,
         bundled_asset_components,
         canonical_text_sha256,
@@ -46,9 +48,18 @@ class CanonicalTextSha256Tests(unittest.TestCase):
         self.assertIn("NOTICE-NOTO-SANS-S-CHINESE.txt", text_names)
 
     def test_mcp_runtime_dependencies_are_in_the_release_notice_closure(self) -> None:
+        self.assertEqual(
+            CARGO_RELEASE_TARGET_PRODUCTS,
+            (
+                ("x86_64-pc-windows-msvc", frozenset({"lawyer-assistance-desktop", "legal-mcp"})),
+                ("x86_64-unknown-linux-gnu", frozenset({"legal-mcp"})),
+                ("aarch64-apple-darwin", frozenset({"legal-mcp"})),
+            ),
+        )
         components = {(component.name, component.version) for component in cargo_components()}
         self.assertIn(("rmcp", "2.2.0"), components)
         self.assertIn(("rmcp-macros", "2.2.0"), components)
+        self.assertIn(("signal-hook-registry", "1.4.8"), components)
 
 
 if __name__ == "__main__":

@@ -46,8 +46,8 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Fetch locked Rust dependencies
-        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+      - name: Fetch locked release dependency closure
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-gnu --target aarch64-apple-darwin
 
       - name: Test all data build and audit tools
         run: python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
