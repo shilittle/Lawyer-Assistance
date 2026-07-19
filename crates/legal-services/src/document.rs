@@ -1014,7 +1014,7 @@ fn open_export_lock_file(path: &Path) -> std::io::Result<File> {
     };
 
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true).write(true).create(true).truncate(false);
     options
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
@@ -1027,6 +1027,7 @@ fn open_export_lock_file(path: &Path) -> std::io::Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
 }
 
@@ -1424,6 +1425,7 @@ fn cleanup_committed_export(prepared: &PreparedExport) -> Result<(), ServiceErro
     Ok(())
 }
 
+#[cfg(any(not(unix), test))]
 fn bounded_file_hash(
     path: &Path,
     maximum_len: usize,
