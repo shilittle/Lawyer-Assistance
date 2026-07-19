@@ -1307,34 +1307,22 @@ fn write_pdf_payload(path: &Path, document: &GeneratedDocument) -> Result<(), Ip
     use genpdf::{elements, style, Alignment, Element as _, PaperSize};
 
     let all_characters = collect_pdf_characters(document);
-    let title_characters = document
-        .title
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<BTreeSet<_>>();
-    let emphasis_characters = collect_pdf_emphasis_characters(document);
-    let fang = load_required_legal_font(
-        "仿宋正文",
-        &["simfang.ttf", "STFANGSO.TTF"],
-        &all_characters,
-    )?;
-    let song = load_required_legal_font(
-        "宋体标题",
-        &["STSONG.TTF", "STZHONGS.TTF", "simfang.ttf"],
-        &title_characters,
-    )?;
-    let bold = load_optional_legal_font(&["simhei.ttf", "STXIHEI.TTF"], &emphasis_characters)?
-        .unwrap_or_else(|| fang.clone());
-    // SimSun-ExtB (`simsunb.ttf`) is an extension-plane font, not the bold
-    // SimSun face its filename suggests. Using it for ordinary Chinese titles
-    // renders BMP glyphs as tofu boxes on a stock Windows installation. Keep
-    // the Song face for every title style so the embedded font always covers
-    // the same legal-document character set.
-    let title_bold = song.clone();
+    // Use one reviewed, hash-pinned TrueType face for every family slot. The
+    // generated PDF embeds only the glyph subset it needs, so output no longer
+    // depends on optional Windows FangSong/Song/Hei font installations.
+    let bundled = load_bundled_legal_font(&all_characters)?;
+    let fang = bundled.clone();
+    let song = bundled.clone();
+    let bold = bundled.clone();
+    let title_bold = bundled;
 
-    validate_pdf_font_coverage("宋体标题", &song, std::iter::once(document.title.as_str()))?;
     validate_pdf_font_coverage(
-        "黑体强调",
+        "内置标题字体",
+        &song,
+        std::iter::once(document.title.as_str()),
+    )?;
+    validate_pdf_font_coverage(
+        "内置强调字体",
         &bold,
         document
             .sections
@@ -1348,7 +1336,7 @@ fn write_pdf_payload(path: &Path, document: &GeneratedDocument) -> Result<(), Ip
             ),
     )?;
     validate_pdf_font_coverage(
-        "仿宋正文",
+        "内置正文字体",
         &fang,
         document
             .sections
@@ -1935,127 +1923,57 @@ fn collect_pdf_characters(document: &GeneratedDocument) -> BTreeSet<char> {
     characters
 }
 
-fn collect_pdf_emphasis_characters(document: &GeneratedDocument) -> BTreeSet<char> {
-    let mut characters = BTreeSet::from([' ', '-']);
-    for section in &document.sections {
-        extend_pdf_characters(&mut characters, &section.heading);
-    }
-    for table in &document.tables {
-        for header in &table.headers {
-            extend_pdf_characters(&mut characters, header);
-        }
-    }
-    characters
-}
-
 fn extend_pdf_characters(characters: &mut BTreeSet<char>, value: &str) {
-    characters.extend(value.chars().filter(|character| !character.is_control()));
+    characters.extend(
+        value
+            .chars()
+            .filter(|character| pdf_character_requires_glyph(*character)),
+    );
 }
 
-fn windows_font_directories() -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    if let Some(windows) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) {
-        directories.push(PathBuf::from(windows).join("Fonts"));
-    }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        directories.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
-    }
-    directories
+fn pdf_character_requires_glyph(character: char) -> bool {
+    // Paragraph and table renderers consume CR/LF as line boundaries. Other
+    // whitespace, including tabs and narrow no-break spaces, is handed to the
+    // font renderer and must therefore have a real glyph or fail closed.
+    !matches!(character, '\r' | '\n')
 }
 
-fn find_legal_font(file_names: &[&str]) -> Option<PathBuf> {
-    windows_font_directories()
-        .into_iter()
-        .flat_map(|directory| {
-            file_names
-                .iter()
-                .map(move |file_name| directory.join(file_name))
-        })
-        .find(|path| path.is_file())
-}
-
-fn load_required_legal_font(
-    role: &str,
-    file_names: &[&str],
+fn load_bundled_legal_font(
     retained_characters: &BTreeSet<char>,
 ) -> Result<genpdf::fonts::FontData, IpcError> {
-    let path = find_legal_font(file_names).ok_or_else(|| {
+    const ROLE: &str = "内置 Noto Sans SC";
+    const SOURCE_LABEL: &str = "NotoSansSC-Regular.ttf";
+    let bytes = material_processing::bundled_pdf_font_bytes();
+    let reader = FontReader::new(bytes).map_err(|error| {
         IpcError::new(
             "pdf_font",
-            format!(
-                "未找到{role}字体（{}）。请在 Windows 字体中安装后重试。",
-                file_names.join(" / ")
-            ),
-        )
-    })?;
-    load_subset_legal_font(role, &path, retained_characters)
-}
-
-fn load_optional_legal_font(
-    file_names: &[&str],
-    retained_characters: &BTreeSet<char>,
-) -> Result<Option<genpdf::fonts::FontData>, IpcError> {
-    find_legal_font(file_names)
-        .map(|path| load_subset_legal_font("黑体强调", &path, retained_characters))
-        .transpose()
-}
-
-fn load_subset_legal_font(
-    role: &str,
-    path: &Path,
-    retained_characters: &BTreeSet<char>,
-) -> Result<genpdf::fonts::FontData, IpcError> {
-    let bytes = fs::read(path).map_err(|error| {
-        IpcError::new(
-            "pdf_font",
-            format!("无法读取{role}字体 {}：{error}", path.display()),
-        )
-    })?;
-    let reader = FontReader::new(&bytes).map_err(|error| {
-        IpcError::new(
-            "pdf_font",
-            format!("无法解析{role}字体 {}：{error}", path.display()),
+            format!("无法解析{ROLE}字体 {SOURCE_LABEL}：{error}"),
         )
     })?;
 
     let os2 = reader
         .raw_tables()
         .find_map(|(tag, bytes)| (tag == TableTag::OS2).then_some(bytes))
-        .ok_or_else(|| IpcError::new("pdf_font", format!("{role}字体缺少 OS/2 许可表。")))?;
+        .ok_or_else(|| IpcError::new("pdf_font", format!("{ROLE}字体缺少 OS/2 许可表。")))?;
     if os2.len() < 10 {
         return Err(IpcError::new(
             "pdf_font",
-            format!("{role}字体的 OS/2 许可表不完整。"),
+            format!("{ROLE}字体的 OS/2 许可表不完整。"),
         ));
     }
-    let os2_version = u16::from_be_bytes([os2[0], os2[1]]);
     let fs_type = u16::from_be_bytes([os2[8], os2[9]]);
     let embedding = fs_type & 0x000f;
     if !matches!(embedding, 0 | 8) || fs_type & 0x0200 != 0 {
         return Err(IpcError::new(
             "pdf_font_license",
-            format!("{role}字体的许可证不允许可编辑的轮廓嵌入，已拒绝生成 PDF。"),
+            format!("{ROLE}字体的许可证不允许可编辑的轮廓嵌入，已拒绝生成 PDF。"),
         ));
-    }
-
-    // font-subset 0.1 supports OS/2 versions 2..=5. Windows' licensed
-    // STSong/STFangsong faces use the older, valid 86-byte version-1 table.
-    // Preserve those fonts in full and rely on the PDF post-processor to
-    // deduplicate the repeated family slots. This is a compatibility fallback,
-    // not a license bypass: fsType was checked directly above.
-    if os2_version == 1 {
-        return genpdf::fonts::FontData::new(bytes, None).map_err(|error| {
-            IpcError::new(
-                "pdf_font",
-                format!("无法加载兼容的{role}字体 {}：{error}", path.display()),
-            )
-        });
     }
 
     let font: Font<'_> = reader.read().map_err(|error| {
         IpcError::new(
             "pdf_font",
-            format!("无法解析{role}字体 {}：{error}", path.display()),
+            format!("无法解析{ROLE}字体 {SOURCE_LABEL}：{error}"),
         )
     })?;
     let permissions = font.permissions();
@@ -2065,7 +1983,18 @@ fn load_subset_legal_font(
     {
         return Err(IpcError::new(
             "pdf_font_license",
-            format!("{role}字体的许可证不允许嵌入并子集化，已拒绝生成 PDF。"),
+            format!("{ROLE}字体的许可证不允许嵌入并子集化，已拒绝生成 PDF。"),
+        ));
+    }
+    if let Some(character) = retained_characters.iter().copied().find(|character| {
+        pdf_character_requires_glyph(*character) && !font.contains_char(*character)
+    }) {
+        return Err(IpcError::new(
+            "pdf_font",
+            format!(
+                "{ROLE}字体缺少 U+{:04X} 字形，已拒绝生成包含方框缺字的 PDF。",
+                u32::from(character)
+            ),
         ));
     }
     let supported_characters = retained_characters
@@ -2076,19 +2005,19 @@ fn load_subset_legal_font(
     if supported_characters.is_empty() {
         return Err(IpcError::new(
             "pdf_font",
-            format!("{role}字体不包含文书所需的任何字形。"),
+            format!("{ROLE}字体不包含文书所需的任何字形。"),
         ));
     }
     let subset = font.subset(&supported_characters).map_err(|error| {
         IpcError::new(
             "pdf_font",
-            format!("无法子集化{role}字体 {}：{error}", path.display()),
+            format!("无法子集化{ROLE}字体 {SOURCE_LABEL}：{error}"),
         )
     })?;
     genpdf::fonts::FontData::new(subset.to_opentype(), None).map_err(|error| {
         IpcError::new(
             "pdf_font",
-            format!("无法加载子集化的{role}字体 {}：{error}", path.display()),
+            format!("无法加载子集化的{ROLE}字体 {SOURCE_LABEL}：{error}"),
         )
     })
 }
@@ -2221,7 +2150,7 @@ fn validate_pdf_font_coverage<'a>(
             .chars()
             .zip(glyph_ids)
             .find_map(|(character, glyph_id)| {
-                (!character.is_whitespace() && glyph_id == 0).then_some(character)
+                (pdf_character_requires_glyph(character) && glyph_id == 0).then_some(character)
             })
         {
             return Err(IpcError::new(
@@ -2604,6 +2533,39 @@ mod tests {
     }
 
     #[test]
+    fn bundled_pdf_font_is_hash_pinned_licensed_and_subsettable() {
+        let bytes = material_processing::bundled_pdf_font_bytes();
+        assert!(bytes.starts_with(b"\0\x01\0\0"));
+        assert_eq!(
+            sha256_bytes(bytes),
+            material_processing::BUNDLED_PDF_FONT_SHA256
+        );
+        assert_eq!(
+            material_processing::BUNDLED_PDF_FONT_SHA256,
+            "c7763f454946833081cc90e73186615f8e1189de9c5e5a5a8752871fd79fddbc"
+        );
+
+        let supported = "法律　文书".chars().collect::<BTreeSet<_>>();
+        let font = load_bundled_legal_font(&supported).expect("reviewed font subset");
+        validate_pdf_font_coverage("内置字体", &font, ["法律　文书"])
+            .expect("reviewed glyph coverage");
+
+        for (character, codepoint) in [('😀', "U+1F600"), ('\u{202F}', "U+202F"), ('\t', "U+0009")]
+        {
+            let unsupported = BTreeSet::from([character]);
+            let error = load_bundled_legal_font(&unsupported)
+                .expect_err("unsupported rendered character must fail closed");
+            assert_eq!(error.error_type, "pdf_font");
+            assert!(error.message.contains(codepoint));
+        }
+
+        assert!(!pdf_character_requires_glyph('\r'));
+        assert!(!pdf_character_requires_glyph('\n'));
+        assert!(pdf_character_requires_glyph('\t'));
+        assert!(pdf_character_requires_glyph('\u{202F}'));
+    }
+
+    #[test]
     fn pdf_export_has_a_valid_header_trailer_and_embedded_content() {
         let temp = tempfile::tempdir().unwrap();
         let doc = generate_document(
@@ -2630,7 +2592,10 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"%PDF-"));
         assert!(bytes.windows(5).any(|window| window == b"%%EOF"));
-        assert!(bytes.len() > 100_000, "embedded Chinese fonts are expected");
+        assert!(
+            bytes.len() > 10_000,
+            "a nontrivial embedded-font document is expected"
+        );
         assert!(
             bytes.len() < 20 * 1024 * 1024,
             "the visual fixture must use subsetted or deduplicated fonts"
@@ -2759,20 +2724,24 @@ mod tests {
     #[test]
     fn pdf_export_rejects_missing_glyphs_instead_of_rendering_tofu_boxes() {
         let temp = tempfile::tempdir().unwrap();
-        let mut document = generate_document(
+        let document = generate_document(
             &acceptance_workspace(),
             DocumentTemplateId::EvidenceSchedule,
             Some("律师复核意见：应核对每项证据原件及送达凭证。"),
         )
         .unwrap();
-        document.title.push('😀');
-        let path = temp.path().join("missing-glyph.pdf");
+        for (character, codepoint) in [('😀', "U+1F600"), ('\u{202F}', "U+202F"), ('\t', "U+0009")]
+        {
+            let mut unsupported_document = document.clone();
+            unsupported_document.title.push(character);
+            let path = temp.path().join(format!("missing-glyph-{codepoint}.pdf"));
 
-        let error = write_pdf(&path, &document).unwrap_err();
+            let error = write_pdf(&path, &unsupported_document).unwrap_err();
 
-        assert_eq!(error.error_type, "pdf_font");
-        assert!(error.message.contains("U+1F600"));
-        assert!(!path.exists());
+            assert_eq!(error.error_type, "pdf_font");
+            assert!(error.message.contains(codepoint));
+            assert!(!path.exists());
+        }
     }
 
     #[test]

@@ -39,13 +39,13 @@ class CanonicalTextSha256Tests(unittest.TestCase):
         components = bundled_asset_components()
         self.assertEqual(len(components), 1)
         component = components[0]
-        self.assertEqual(component.name, "Noto Sans S Chinese Regular")
-        self.assertEqual(component.version, "1.000")
-        self.assertEqual(component.license_expression, "Apache-2.0")
-        self.assertIn("7db3c634", SAFE_EXPORT_FONT_SHA256)
+        self.assertEqual(component.name, "Noto Sans SC Regular")
+        self.assertEqual(component.version, "2.004")
+        self.assertEqual(component.license_expression, "OFL-1.1")
+        self.assertIn("c7763f45", SAFE_EXPORT_FONT_SHA256)
         text_names = {name for name, _ in component.texts}
-        self.assertIn("LICENSE-APACHE-2.0.txt", text_names)
-        self.assertIn("NOTICE-NOTO-SANS-S-CHINESE.txt", text_names)
+        self.assertIn("LICENSE-OFL-1.1.txt", text_names)
+        self.assertIn("NOTICE-NOTO-SANS-SC.txt", text_names)
 
     def test_mcp_runtime_dependencies_are_in_the_release_notice_closure(self) -> None:
         self.assertEqual(

@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "apps" / "desktop" / "src-tauri" / "resources" / "THIRD_PARTY_NOTICES.txt"
 FONT_ASSET_DIR = ROOT / "crates" / "material-processing" / "assets" / "fonts"
-SAFE_EXPORT_FONT_SHA256 = "7db3c634bbd0301b3082a80ffcac2f422e8ef9ce0730f8b279c3e8f756598f68"
+SAFE_EXPORT_FONT_SHA256 = "c7763f454946833081cc90e73186615f8e1189de9c5e5a5a8752871fd79fddbc"
 NOTICE_NAMES = re.compile(r"^(licen[cs]e|copying|copyright|notice)([._-].*)?$", re.IGNORECASE)
 CARGO_RELEASE_TARGET_PRODUCTS: tuple[tuple[str, frozenset[str]], ...] = (
     ("x86_64-pc-windows-msvc", frozenset({"lawyer-assistance-desktop", "legal-mcp"})),
@@ -242,7 +242,7 @@ def readable_notices(directory: Path) -> tuple[tuple[str, str], ...]:
 
 
 def bundled_asset_components() -> list[Component]:
-    font_path = FONT_ASSET_DIR / "NotoSansHans-Regular.otf"
+    font_path = FONT_ASSET_DIR / "NotoSansSC-Regular.ttf"
     if not font_path.is_file():
         raise RuntimeError("bundled safe-export font is missing")
     digest = hashlib.sha256(font_path.read_bytes()).hexdigest()
@@ -250,16 +250,16 @@ def bundled_asset_components() -> list[Component]:
         raise RuntimeError("bundled safe-export font SHA-256 does not match the reviewed binary")
     texts = readable_notices(FONT_ASSET_DIR)
     text_names = {name for name, _ in texts}
-    required = {"LICENSE-APACHE-2.0.txt", "NOTICE-NOTO-SANS-S-CHINESE.txt"}
+    required = {"LICENSE-OFL-1.1.txt", "NOTICE-NOTO-SANS-SC.txt"}
     if not required.issubset(text_names):
         raise RuntimeError("bundled safe-export font license or notice is missing")
     return [
         Component(
             "Bundled Font",
-            "Noto Sans S Chinese Regular",
-            "1.000",
-            "Apache-2.0",
-            "https://github.com/adobe-fonts/source-han-sans",
+            "Noto Sans SC Regular",
+            "2.004",
+            "OFL-1.1",
+            "https://github.com/notofonts/noto-cjk/tree/Sans2.004",
             texts,
         )
     ]

@@ -12,6 +12,7 @@ on:
       - "crates/domain/**"
       - "crates/file-ingest/**"
       - "crates/retrieval/**"
+      - "crates/material-processing/assets/fonts/**"
       - "integrations/**"
       - "docs/mcp/**"
       - "scripts/generate_third_party_notices.py"
@@ -23,6 +24,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "pnpm-lock.yaml"
+      - "package.json"
+      - "pnpm-workspace.yaml"
       - "LICENSE"
       - "README.md"
       - "RELEASE_NOTES.md"
@@ -37,6 +40,7 @@ on:
       - "crates/domain/**"
       - "crates/file-ingest/**"
       - "crates/retrieval/**"
+      - "crates/material-processing/assets/fonts/**"
       - "integrations/**"
       - "docs/mcp/**"
       - "scripts/generate_third_party_notices.py"
@@ -48,6 +52,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "pnpm-lock.yaml"
+      - "package.json"
+      - "pnpm-workspace.yaml"
       - "LICENSE"
       - "README.md"
       - "RELEASE_NOTES.md"
@@ -84,6 +90,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Install locked frontend notice dependencies
+        run: pnpm --filter "@lawyer-assistance/desktop..." --fail-if-no-match install --prod --frozen-lockfile --ignore-scripts
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

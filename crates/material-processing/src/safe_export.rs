@@ -23,7 +23,19 @@ const FONT_SIZE_POINTS: usize = 9;
 const MAX_CHAR_UNITS_PER_LINE: usize =
     (PAGE_WIDTH_POINTS - 2 * HORIZONTAL_MARGIN_POINTS) / FONT_SIZE_POINTS;
 const MAX_LINES_PER_PHYSICAL_PAGE: usize = 62;
-const SAFE_EXPORT_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansHans-Regular.otf");
+const SAFE_EXPORT_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansSC-Regular.ttf");
+
+/// Reviewed SHA-256 of the bundled, static 400-weight PDF font.
+pub const BUNDLED_PDF_FONT_SHA256: &str =
+    "c7763f454946833081cc90e73186615f8e1189de9c5e5a5a8752871fd79fddbc";
+
+/// Returns the reviewed font bytes shared by safe redaction exports and
+/// ordinary local document exports. Keeping one embedded asset prevents the
+/// two PDF paths from silently drifting to different glyph coverage.
+#[must_use]
+pub fn bundled_pdf_font_bytes() -> &'static [u8] {
+    SAFE_EXPORT_FONT_BYTES
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -494,6 +506,17 @@ fn reflow_text(text: &str) -> Vec<String> {
     output
 }
 
+fn canonicalize_reextracted_text(text: &str) -> String {
+    // PDF text extractors do not preserve empty ShowText operations. Empty rows are
+    // layout-only, so compare every non-empty reflowed line byte-for-byte while
+    // allowing those rows to disappear from the extracted representation.
+    text.trim_end_matches(char::is_whitespace)
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn verify_reextracted_pages(
     document: &Document,
     request: &SafePdfExportRequest,
@@ -514,9 +537,7 @@ fn verify_reextracted_pages(
             extracted.push_str(&chunk);
         }
         let expected = reflow_text(&source.text).join("\n");
-        if extracted.trim_end_matches(char::is_whitespace)
-            != expected.trim_end_matches(char::is_whitespace)
-        {
+        if canonicalize_reextracted_text(&extracted) != canonicalize_reextracted_text(&expected) {
             return Err(SafePdfExportError::ReextractedTextMismatch {
                 page_number: source.page_number,
             });
@@ -743,9 +764,10 @@ mod tests {
 
     #[test]
     fn embeds_verified_cjk_font_program_without_stsong_fallback() {
+        assert_eq!(sha256_hex(SAFE_EXPORT_FONT_BYTES), BUNDLED_PDF_FONT_SHA256);
         assert_eq!(
-            sha256_hex(SAFE_EXPORT_FONT_BYTES),
-            "7db3c634bbd0301b3082a80ffcac2f422e8ef9ce0730f8b279c3e8f756598f68"
+            BUNDLED_PDF_FONT_SHA256,
+            "c7763f454946833081cc90e73186615f8e1189de9c5e5a5a8752871fd79fddbc"
         );
         let request = request(vec![ApprovedTextPage {
             page_number: 1,
@@ -782,6 +804,27 @@ mod tests {
             .extract_text(&[1])
             .expect("extract embedded CJK text");
         assert!(extracted.contains("普通中文与脱敏占位符"));
+        assert!(extracted.contains("[姓名1]"));
+    }
+
+    #[test]
+    fn blank_layout_lines_preserve_all_nonempty_approved_text() {
+        let approved = "脱敏审阅副本\n\n原告：[姓名1]\n\n发送前逐页复核。";
+        let request = request(vec![ApprovedTextPage {
+            page_number: 1,
+            text: approved.to_owned(),
+        }]);
+        let artifact = reconstruct_approved_text_pdf(&request, SafePdfExportLimits::default())
+            .expect("blank layout rows must not defeat safe reconstruction");
+        let reopened = Document::load_mem(&artifact.bytes).expect("open blank-line PDF");
+        let extracted = reopened
+            .extract_text(&[1])
+            .expect("extract approved non-empty lines");
+
+        assert_eq!(
+            canonicalize_reextracted_text(&extracted),
+            canonicalize_reextracted_text(approved)
+        );
         assert!(extracted.contains("[姓名1]"));
     }
 

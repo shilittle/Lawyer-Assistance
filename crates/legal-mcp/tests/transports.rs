@@ -30,7 +30,7 @@ use rmcp::{transport::async_rw::AsyncRwTransport, RoleServer, ServiceExt};
 use serde_json::{json, Map, Value};
 
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
@@ -50,6 +50,8 @@ const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const SENSITIVE_RESULT_CANARY: &str = "alice.case@example.com";
 const INPUT_CANARY_PHONE: &str = "13800138000";
 const INPUT_CANARY_NAME: &str = "原告：张三";
+const MAX_TEST_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_TEST_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct FixturePaths {
@@ -606,7 +608,7 @@ impl RawHttpResponse {
 }
 
 async fn spawn_http(paths: &FixturePaths) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    spawn_http_with_timeout(paths, Duration::from_millis(200)).await
+    spawn_http_with_timeout(paths, Duration::from_secs(2)).await
 }
 
 async fn spawn_http_with_timeout(
@@ -720,7 +722,7 @@ fn raw_http(
     protocol: Option<&str>,
 ) -> RawHttpResponse {
     let mut request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\n",
         body.len()
     );
     if let Some(token) = token {
@@ -733,88 +735,339 @@ fn raw_http(
         request.push_str(&format!("MCP-Protocol-Version: {protocol}\r\n"));
     }
     request.push_str("\r\n");
+    let mut request = request.into_bytes();
+    request.extend_from_slice(&body);
     let mut stream = TcpStream::connect(address).expect("connect HTTP fixture");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
-    stream.write_all(request.as_bytes()).expect("HTTP headers");
-    stream.write_all(&body).expect("HTTP body");
+    stream.write_all(&request).expect("HTTP request");
     stream.flush().expect("flush HTTP request");
     read_http_response(stream)
 }
 
-fn read_http_response(mut stream: TcpStream) -> RawHttpResponse {
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("HTTP response");
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("HTTP response headers");
-    let header_text = String::from_utf8_lossy(&response[..split + 4]);
-    let mut header_lines = header_text.lines();
-    let status = header_lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
+fn read_http_response(stream: impl Read) -> RawHttpResponse {
+    try_read_http_response(stream).expect("HTTP response")
+}
+
+fn try_read_http_response(stream: impl Read) -> io::Result<RawHttpResponse> {
+    let mut reader = BufReader::new(stream);
+    let mut header_bytes = 0;
+    let status_line = read_crlf_line(
+        &mut reader,
+        &mut header_bytes,
+        MAX_TEST_HTTP_HEADER_BYTES,
+        "HTTP response status line",
+    )?;
+    let status_line = std::str::from_utf8(&status_line)
+        .map_err(|_| invalid_http_response("HTTP response status line is not UTF-8"))?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
         .and_then(|value| value.parse::<u16>().ok())
-        .expect("HTTP status");
-    let headers = header_lines
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let (name, value) = line.split_once(':').expect("valid HTTP response header");
-            (name.trim().to_owned(), value.trim().to_owned())
-        })
-        .collect::<Vec<_>>();
-    let mut body = response[split + 4..].to_vec();
-    if headers.iter().any(|(name, value)| {
+        .ok_or_else(|| invalid_http_response("HTTP response status is invalid"))?;
+
+    let mut headers = Vec::new();
+    loop {
+        let line = read_crlf_line(
+            &mut reader,
+            &mut header_bytes,
+            MAX_TEST_HTTP_HEADER_BYTES,
+            "HTTP response headers",
+        )?;
+        if line.is_empty() {
+            break;
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| invalid_http_response("HTTP response header is not UTF-8"))?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| invalid_http_response("HTTP response header is invalid"))?;
+        headers.push((name.trim().to_owned(), value.trim().to_owned()));
+    }
+
+    let is_chunked = headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("transfer-encoding")
             && value
                 .split(',')
                 .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
-    }) {
-        body = decode_chunked(&body);
+    });
+    let mut content_length = None;
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| invalid_http_response("HTTP Content-Length is invalid"))?;
+        if content_length.is_some_and(|existing| existing != parsed) {
+            return Err(invalid_http_response(
+                "HTTP response has conflicting Content-Length headers",
+            ));
+        }
+        content_length = Some(parsed);
     }
-    RawHttpResponse {
+    if is_chunked && content_length.is_some() {
+        return Err(invalid_http_response(
+            "HTTP response has both chunked encoding and Content-Length",
+        ));
+    }
+
+    let body = if is_chunked {
+        read_chunked_body(&mut reader)?
+    } else if let Some(length) = content_length {
+        if length > MAX_TEST_HTTP_RESPONSE_BYTES {
+            return Err(invalid_http_response(
+                "HTTP response body exceeds test limit",
+            ));
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body)?;
+        body
+    } else {
+        let mut body = Vec::new();
+        reader
+            .take(
+                u64::try_from(MAX_TEST_HTTP_RESPONSE_BYTES + 1)
+                    .expect("test HTTP response limit fits u64"),
+            )
+            .read_to_end(&mut body)?;
+        if body.len() > MAX_TEST_HTTP_RESPONSE_BYTES {
+            return Err(invalid_http_response(
+                "HTTP response body exceeds test limit",
+            ));
+        }
+        body
+    };
+
+    Ok(RawHttpResponse {
         status,
         headers,
         body,
-    }
+    })
 }
 
-fn decode_chunked(mut input: &[u8]) -> Vec<u8> {
-    let mut output = Vec::new();
-    while !input.is_empty() {
-        let Some(line_end) = input.windows(2).position(|window| window == b"\r\n") else {
-            break;
-        };
-        let size = usize::from_str_radix(
-            std::str::from_utf8(&input[..line_end])
-                .unwrap_or("0")
-                .trim(),
-            16,
-        )
-        .unwrap_or(0);
-        input = &input[line_end + 2..];
-        if size == 0 || input.len() < size {
+fn read_crlf_line<R: BufRead>(
+    reader: &mut R,
+    consumed: &mut usize,
+    limit: usize,
+    context: &'static str,
+) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let remaining = limit
+            .checked_sub(*consumed)
+            .ok_or_else(|| invalid_http_response("HTTP response metadata exceeds test limit"))?;
+        if remaining == 0 {
+            return Err(invalid_http_response(
+                "HTTP response metadata exceeds test limit",
+            ));
+        }
+
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{context} ended before CRLF"),
+            ));
+        }
+        let examined = available.len().min(remaining);
+        let newline = available[..examined].iter().position(|byte| *byte == b'\n');
+        let copied = newline.map_or(examined, |position| position + 1);
+        line.extend_from_slice(&available[..copied]);
+        reader.consume(copied);
+        *consumed = consumed
+            .checked_add(copied)
+            .ok_or_else(|| invalid_http_response("HTTP response line budget overflow"))?;
+
+        if newline.is_some() {
             break;
         }
-        output.extend_from_slice(&input[..size]);
-        input = input.get(size + 2..).unwrap_or_default();
+        if copied == remaining {
+            return Err(invalid_http_response(
+                "HTTP response metadata exceeds test limit",
+            ));
+        }
     }
-    output
+    if !line.ends_with(b"\r\n") {
+        return Err(invalid_http_response(
+            "HTTP response line is not CRLF terminated",
+        ));
+    }
+    line.truncate(line.len() - 2);
+    Ok(line)
 }
 
-async fn slow_body_request(address: SocketAddr) -> RawHttpResponse {
+fn read_chunked_body<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut metadata_bytes = 0;
+    loop {
+        let size_line = read_crlf_line(
+            reader,
+            &mut metadata_bytes,
+            MAX_TEST_HTTP_HEADER_BYTES,
+            "HTTP chunk size",
+        )?;
+        let size_token = size_line
+            .split(|byte| *byte == b';')
+            .next()
+            .ok_or_else(|| invalid_http_response("HTTP chunk size is missing"))?;
+        let size_token = std::str::from_utf8(size_token)
+            .map_err(|_| invalid_http_response("HTTP chunk size is not ASCII"))?
+            .trim();
+        let size = usize::from_str_radix(size_token, 16)
+            .map_err(|_| invalid_http_response("HTTP chunk size is invalid"))?;
+        if size == 0 {
+            loop {
+                let trailer = read_crlf_line(
+                    reader,
+                    &mut metadata_bytes,
+                    MAX_TEST_HTTP_HEADER_BYTES,
+                    "HTTP chunk trailers",
+                )?;
+                if trailer.is_empty() {
+                    return Ok(body);
+                }
+                if !trailer.contains(&b':') {
+                    return Err(invalid_http_response("HTTP chunk trailer is invalid"));
+                }
+            }
+        }
+        let new_length = body
+            .len()
+            .checked_add(size)
+            .ok_or_else(|| invalid_http_response("HTTP chunked body length overflow"))?;
+        if new_length > MAX_TEST_HTTP_RESPONSE_BYTES {
+            return Err(invalid_http_response(
+                "HTTP response body exceeds test limit",
+            ));
+        }
+        let start = body.len();
+        body.resize(new_length, 0);
+        reader.read_exact(&mut body[start..])?;
+        let mut terminator = [0; 2];
+        reader.read_exact(&mut terminator)?;
+        if terminator != *b"\r\n" {
+            return Err(invalid_http_response("HTTP chunk is not CRLF terminated"));
+        }
+    }
+}
+
+fn invalid_http_response(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[derive(Debug)]
+struct CompleteThenAbort {
+    bytes: &'static [u8],
+    offset: usize,
+    max_chunk_size: usize,
+}
+
+impl CompleteThenAbort {
+    fn new(bytes: &'static [u8], max_chunk_size: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            max_chunk_size,
+        }
+    }
+}
+
+impl Read for CompleteThenAbort {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.offset == self.bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "synthetic peer aborted after the complete framed response",
+            ));
+        }
+        let count = output
+            .len()
+            .min(self.max_chunk_size)
+            .min(self.bytes.len() - self.offset);
+        output[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+#[test]
+fn framed_http_response_reader_stops_before_an_aborted_eof() {
+    let content_length = CompleteThenAbort::new(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong",
+        3,
+    );
+    let response = try_read_http_response(content_length).expect("Content-Length response");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"pong");
+
+    let chunked = CompleteThenAbort::new(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\npong\r\n0\r\nX-Test: done\r\n\r\n",
+        3,
+    );
+    let response = try_read_http_response(chunked).expect("chunked response");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"pong");
+}
+
+#[test]
+fn framed_http_response_reader_rejects_truncated_content_length() {
+    let truncated = &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\npong"[..];
+    let error = try_read_http_response(truncated).expect_err("truncated response must fail");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn http_metadata_reader_enforces_budget_before_allocation() {
+    const LIMIT: usize = 32;
+
+    let mut exact = vec![b'a'; LIMIT - 2];
+    exact.extend_from_slice(b"\r\n");
+    let mut exact_reader = BufReader::with_capacity(7, exact.as_slice());
+    let mut exact_consumed = 0;
+    let exact_line = read_crlf_line(
+        &mut exact_reader,
+        &mut exact_consumed,
+        LIMIT,
+        "bounded metadata",
+    )
+    .expect("exact-limit CRLF line");
+    assert_eq!(exact_line, vec![b'a'; LIMIT - 2]);
+    assert_eq!(exact_consumed, LIMIT);
+
+    let oversized = vec![b'a'; LIMIT + 1];
+    let mut oversized_reader = BufReader::with_capacity(7, oversized.as_slice());
+    let mut oversized_consumed = 0;
+    let error = read_crlf_line(
+        &mut oversized_reader,
+        &mut oversized_consumed,
+        LIMIT,
+        "bounded metadata",
+    )
+    .expect_err("unterminated metadata must respect its budget");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(oversized_consumed, LIMIT);
+}
+
+async fn slow_body_request(
+    address: SocketAddr,
+    sent: tokio::sync::oneshot::Sender<()>,
+) -> RawHttpResponse {
     tokio::task::spawn_blocking(move || {
         let mut stream = TcpStream::connect(address).expect("slow connection");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("slow read timeout");
         let headers = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nAuthorization: Bearer {TEST_TOKEN}\r\nOrigin: https://client.example\r\nMCP-Protocol-Version: {STABLE_VERSION}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nAuthorization: Bearer {TEST_TOKEN}\r\nOrigin: https://client.example\r\nMCP-Protocol-Version: {STABLE_VERSION}\r\nContent-Length: 100\r\n\r\n{{"
         );
         stream.write_all(headers.as_bytes()).expect("slow headers");
         stream.flush().expect("slow flush");
-        thread::sleep(Duration::from_millis(350));
+        sent.send(()).expect("report flushed slow request");
         read_http_response(stream)
     })
     .await
@@ -956,17 +1209,37 @@ async fn stdio_and_http_are_protocol_consistent_and_secure() {
     );
     assert_text_fallback_matches_structured(&invalid_call["result"]);
 
-    let slow = tokio::spawn(slow_body_request(address));
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let concurrent = post_json(
-        address,
-        json!({"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}),
-        Some(TEST_TOKEN),
-        Some("https://client.example"),
-        Some(STABLE_VERSION),
-    )
-    .await;
-    assert_eq!(concurrent.status, 429);
+    // Wait until the partial request is on the wire, then use complete,
+    // side-effect-free requests to observe the occupied permit. A complete
+    // probe can win the permit before the slow handler is polled, so retry it
+    // under a strict deadline; observing 429 proves the slow request acquired
+    // the permit before we wait for its 408 response.
+    let (slow_sent, slow_flushed) = tokio::sync::oneshot::channel();
+    let slow = tokio::spawn(slow_body_request(address, slow_sent));
+    slow_flushed.await.expect("slow request flushed");
+    let concurrency_deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    loop {
+        let concurrent = tokio::time::timeout_at(
+            concurrency_deadline,
+            post_json(
+                address,
+                json!({"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}),
+                Some(TEST_TOKEN),
+                Some("https://client.example"),
+                Some(STABLE_VERSION),
+            ),
+        )
+        .await
+        .expect("observe concurrency rejection before slow request timeout");
+        if concurrent.status == 429 {
+            break;
+        }
+        assert_eq!(
+            concurrent.status, 200,
+            "probe may complete before the slow request acquires the permit"
+        );
+        tokio::task::yield_now().await;
+    }
     assert_eq!(slow.await.expect("slow join").status, 408);
 
     http_task.abort();

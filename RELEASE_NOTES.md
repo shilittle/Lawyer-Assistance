@@ -1,13 +1,13 @@
 # Lawyer Assistance MCP 0.3.1
 
-> **Supersedes v0.3.0.** The v0.3.0 Windows assets passed local and remote byte verification, but its Linux/macOS MCP Clippy jobs exposed a Windows-only DPAPI constant without a platform guard. v0.3.1 adds the guard and is the first candidate eligible for the complete remote matrix.
+> **Supersedes v0.3.0.** The v0.3.0 Windows assets passed local and remote byte verification, but its first Linux/macOS MCP jobs exposed a Windows-only DPAPI constant without a platform guard. Subsequent three-platform runs also exposed cross-platform lock and notice reproducibility, Windows HTTP early-response test framing and optional system-font portability defects. v0.3.1 fixes those release blockers and must pass the complete remote matrix before publication.
 
 > **Windows privacy-hardening prerelease.** This build is published for controlled testing. The NSIS installer is protected by the repository's Tauri/Minisign updater signature but is not Authenticode-signed because no trusted Windows code-signing certificate is available on the release machine. Windows can therefore display an unknown-publisher or SmartScreen warning. Do not treat this prerelease as production qualification for real client material.
 
 ## Desktop privacy and redaction
 
 - PDF, DOCX, TXT and Markdown materials can be ingested locally for automatic detection, manual review, exact receipt issuance and reconstructed text-PDF export.
-- Safe PDFs embed a hash-pinned Chinese font, reject unsupported glyphs and are reopened for text, object-graph, hash and canary verification before installation.
+- Safe PDFs and ordinary generated legal-document PDFs share a hash-pinned Noto Sans SC 2.004 static TrueType font, no longer depend on optional Windows system fonts, reject unsupported glyphs and are reopened for structural verification where applicable.
 - Review payloads and receipts can be revoked and deleted through an exact source/extraction-hash-bound lifecycle command while hash-only audit remains.
 - Reliable text-layer PDFs are supported. Scanned, handwritten, stamped or otherwise visual PDFs fail closed because the qualified App-to-MinerU production chain is not enabled.
 - Case-bearing Provider requests remain blocked before transport. Production MCP and bundled host integrations expose exactly five public-law read-only tools.
@@ -22,7 +22,7 @@
 
 > **Privacy hardening breaking change — 2026-07-19.** The current production contract replaces the earlier fixed 12-tool surface with `public_law_only`, exactly five public-law read-only tools. Earlier new-case, material-import, apply/get-state, document-generation and export instructions are legacy and unavailable. Do not use historical release or acceptance text to re-enable them.
 
-This is the first separately packaged MCP server release for Lawyer Assistance. Archives are platform-specific and contain the binary, license/third-party notices, `docs/mcp/`, public-only host integration assets and `MANIFEST.sha256`. They contain no legal database, user database, client material, exported document, token, Provider credential or machine-local configuration.
+v0.3.1 continues the separately packaged MCP delivery introduced by v0.3.0. Archives are platform-specific and contain the binary, license/third-party notices, `docs/mcp/`, public-only host integration assets and `MANIFEST.sha256`. They contain no legal database, user database, client material, exported document, token, Provider credential or machine-local configuration.
 
 ## Compatibility contract
 
@@ -68,7 +68,7 @@ The former step that created a case with a 64-zero revision, bootstrap/import pr
 
 ## PDF and OCR limit
 
-Reliable text-layer PDFs can be extracted, reviewed and redacted locally. The safe text-PDF path now embeds a hash-pinned Noto Sans Hans font, rejects unsupported glyphs before approval/export, reopens and re-extracts output, and never copies the original image/object graph. Users can explicitly revoke every receipt and delete the App's protected review payload; source files, separately saved PDFs and hash-only audit remain.
+Reliable text-layer PDFs can be extracted, reviewed and redacted locally. The safe text-PDF path embeds the same hash-pinned Noto Sans SC 2.004 static TrueType asset used by ordinary local document export, rejects unsupported glyphs before approval/export, reopens and re-extracts output, and never copies the original image/object graph. Users can explicitly revoke every receipt and delete the App's protected review payload; source files, separately saved PDFs and hash-only audit remain.
 
 A fixed synthetic page passed MinerU 3.4.3 GPU OCR on the local RTX 5090, but evidence explicitly records no OS network isolation and no trusted model manifest. The App therefore continues to pass no runner (`None`). Scanned, handwritten and image-text PDFs fail closed; there is no remote MinerU, SSH or cloud OCR fallback.
 
