@@ -1,3 +1,4 @@
+use crate::diagram_mcp;
 use clap::ValueEnum;
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde::Deserialize;
@@ -22,6 +23,20 @@ pub const REDACTED_CASE_TOOL_NAMES: [&str; 6] = [
     "citation_validate",
 ];
 
+pub const DIAGRAM_AUTHORING_TOOL_NAMES: [&str; 11] = [
+    "system_status",
+    "legal_search",
+    "legal_get_article",
+    "legal_get_versions",
+    "legal_get_relations",
+    "diagram.list_templates",
+    "diagram.get_schema",
+    "diagram.validate",
+    "diagram.render",
+    "diagram.update",
+    "diagram.export",
+];
+
 pub const DISABLED_SENSITIVE_TOOL_NAMES: [&str; 7] = [
     "citation_validate",
     "case_get_state",
@@ -42,12 +57,16 @@ pub enum PrivacyProfile {
     /// Public-law tools plus exact-receipt-gated citation validation.
     #[value(name = "redacted_case", alias = "redacted-case")]
     RedactedCase,
+    /// Public law plus local diagram authoring for separately approved inputs.
+    #[value(name = "diagram_authoring", alias = "diagram-authoring")]
+    DiagramAuthoring,
 }
 
 impl PrivacyProfile {
     pub(crate) fn allows_tool(self, name: &str) -> bool {
         match self {
             Self::PublicLawOnly => TOOL_NAMES.contains(&name),
+            Self::DiagramAuthoring => DIAGRAM_AUTHORING_TOOL_NAMES.contains(&name),
             Self::RedactedCase => REDACTED_CASE_TOOL_NAMES.contains(&name),
         }
     }
@@ -60,6 +79,7 @@ impl FromStr for PrivacyProfile {
         match value.trim().to_ascii_lowercase().as_str() {
             "public_law_only" | "public-law-only" => Ok(Self::PublicLawOnly),
             "redacted_case" | "redacted-case" => Ok(Self::RedactedCase),
+            "diagram_authoring" | "diagram-authoring" => Ok(Self::DiagramAuthoring),
             _ => Err("unsupported privacy profile"),
         }
     }
@@ -111,7 +131,7 @@ impl ToolRegistry {
 }
 
 fn build_tools(profile: PrivacyProfile) -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         make_tool(
             "system_status",
             "System status",
@@ -418,7 +438,9 @@ fn build_tools(profile: PrivacyProfile) -> Vec<Tool> {
             }),
             Hints::mutating(true),
         ),
-    ]
+    ];
+    tools.extend(diagram_mcp::tools());
+    tools
 }
 
 #[derive(Clone, Copy)]
@@ -469,7 +491,7 @@ fn make_tool(
 
 fn citation_validate_input(profile: PrivacyProfile) -> Value {
     match profile {
-        PrivacyProfile::PublicLawOnly => json!({
+        PrivacyProfile::PublicLawOnly | PrivacyProfile::DiagramAuthoring => json!({
             "type":"object",
             "properties":{
                 "schema_version":schema_version(),

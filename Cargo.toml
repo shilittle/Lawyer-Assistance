@@ -5,6 +5,7 @@ members = [
   "crates/citations",
   "crates/database",
   "crates/domain",
+  "crates/diagrams",
   "crates/file-ingest",
   "crates/legal-mcp",
   "crates/material-processing",
@@ -26,6 +27,7 @@ assistant = { path = "crates/assistant" }
 citations = { path = "crates/citations" }
 database = { path = "crates/database" }
 domain = { path = "crates/domain" }
+diagrams = { path = "crates/diagrams" }
 file-ingest = { path = "crates/file-ingest" }
 legal-mcp = { path = "crates/legal-mcp" }
 material-processing = { path = "crates/material-processing" }
@@ -36,6 +38,7 @@ retrieval = { path = "crates/retrieval" }
 
 rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 base64 = "0.22.1"
+jsonschema = { version = "=0.48.2", default-features = false }
 minisign-verify = { path = "vendor/minisign-verify" }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 semver = { version = "1.0.28", features = ["serde"] }

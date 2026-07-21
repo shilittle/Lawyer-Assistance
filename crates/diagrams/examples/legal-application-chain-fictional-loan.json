@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "diagram_type": "legal_application_chain",
+  "template_id": "legal_application_chain_v1",
+  "title": "虚构民间借贷要件适用链",
+  "summary": "演示借款交付、还款期限与责任后果的分析链；人物、金额与规则均为虚构。",
+  "nodes": [
+    {"id":"issue_repayment","type":"issue","label":"是否应当返还借款","details":"围绕款项性质、交付与到期展开。","status":"disputed","importance":"critical","source_refs":["src_scenario"],"tags":["民间借贷","虚构"],"metadata":{}},
+    {"id":"rule_repayment","type":"rule","label":"虚构借款返还规则","details":"仅为测试设置：借款成立、款项交付且期限届满时产生返还责任。","status":"effective","importance":"high","source_refs":["src_scenario"],"tags":["虚构规则"],"metadata":{"full_name":"示例借款返还规则（虚构）","version":"2026-test-v1","validity_status":"fictional_only","official_source":"lawyer-assistance://fixtures/loan-rule"}},
+    {"id":"element_agreement","type":"element","label":"存在借款合意","details":"需要证据支持双方存在借款合意。","status":"supported","importance":"high","source_refs":["src_chat"],"tags":["要件"],"metadata":{}},
+    {"id":"element_delivery","type":"element","label":"款项已经交付","details":"转账凭证初步支持交付。","status":"supported","importance":"high","source_refs":["src_transfer"],"tags":["要件"],"metadata":{}},
+    {"id":"element_due","type":"element","label":"还款期限届满","details":"虚构约定日期已经届满。","status":"supported","importance":"normal","source_refs":["src_chat"],"tags":["要件"],"metadata":{}},
+    {"id":"consequence_repay","type":"legal_consequence","label":"承担返还责任","details":"只有全部必要要件经确认后才可形成结论。","status":"uncertain","importance":"critical","source_refs":["src_scenario"],"tags":["后果"],"metadata":{}}
+  ],
+  "edges": [
+    {"id":"edge_rule_issue","source":"rule_repayment","target":"issue_repayment","relation":"applies_to","label":"适用于争点","strength":"strong","source_refs":["src_scenario"],"metadata":{}},
+    {"id":"edge_rule_agreement","source":"rule_repayment","target":"element_agreement","relation":"requires","label":"要求","strength":"conclusive","source_refs":["src_scenario"],"metadata":{}},
+    {"id":"edge_rule_delivery","source":"rule_repayment","target":"element_delivery","relation":"requires","label":"要求","strength":"conclusive","source_refs":["src_scenario"],"metadata":{}},
+    {"id":"edge_rule_due","source":"rule_repayment","target":"element_due","relation":"requires","label":"要求","strength":"conclusive","source_refs":["src_scenario"],"metadata":{}},
+    {"id":"edge_agreement_result","source":"element_agreement","target":"consequence_repay","relation":"leads_to","label":"满足后参与导出","strength":"moderate","source_refs":["src_chat"],"metadata":{}},
+    {"id":"edge_delivery_result","source":"element_delivery","target":"consequence_repay","relation":"leads_to","label":"满足后参与导出","strength":"moderate","source_refs":["src_transfer"],"metadata":{}},
+    {"id":"edge_due_result","source":"element_due","target":"consequence_repay","relation":"leads_to","label":"满足后参与导出","strength":"moderate","source_refs":["src_chat"],"metadata":{}}
+  ],
+  "groups": [
+    {"id":"group_elements","label":"构成要件","node_ids":["element_agreement","element_delivery","element_due"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["src_scenario"]}
+  ],
+  "sources": [
+    {"id":"src_scenario","kind":"human_input","title":"虚构借款分析设定","locator":"仓库内测试样例，无现实对应案件","verification_status":"human_confirmed"},
+    {"id":"src_chat","kind":"attachment","title":"虚构聊天记录","locator":"虚构附件 A，第 2 段","artifact_id":"fixture_chat_a","attachment":"A","verification_status":"original_material"},
+    {"id":"src_transfer","kind":"table","title":"虚构转账清单","locator":"虚构附件 B，第 1 行","artifact_id":"fixture_transfer_b","table":"第1行","verification_status":"original_material"}
+  ],
+  "layout_hints": {"direction":"left_right","preferred_root_ids":["issue_repayment"],"group_by":"node_type","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options": {"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance": {"generated_by":"human","generated_at":"2026-07-21T10:05:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["src_scenario","src_chat","src_transfer"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"第一阶段纯虚构民间借贷样例","model_content_scope":"仅整理虚构要件与测试证据，不形成法律结论。","deterministic_content_scope":"模板、关系校验、布局和 HTML 渲染由固定代码完成。"}
+}

@@ -47,6 +47,9 @@ impl ServerHandler for LegalMcpServer {
             crate::registry::PrivacyProfile::RedactedCase => {
                 "Redacted-case profile. Only citation_validate is added, and every call requires an App-issued rct_v1 receipt bound to the exact approved CitationValidateRequest bytes, ExternalMcpHost destination, fixed purpose, and TTL. Page-material receipts cannot be reused. If the Windows receipt key or persisted receipt state is unavailable, the tool remains listed but every call fails closed. Raw OCR, paths, case state, writes, generation, and export remain unavailable. Both result channels are privacy-scanned."
             }
+            crate::registry::PrivacyProfile::DiagramAuthoring => {
+                "Diagram-authoring profile. This explicit opt-in adds deterministic local validation, rendering, update, and export for synthetic/public DiagramSpec data or data separately approved for trusted local processing. Never place raw customer case material in these MCP calls until an App-issued exact-payload approval path exists. Tools never fetch source URIs; model-visible results contain only fixed metadata, validation codes/paths, statistics, hashes, and content-addressed artifact references, and both result channels are privacy-scanned."
+            }
         };
 
         ServerInfo::new(capabilities)

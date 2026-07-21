@@ -1,0 +1,22 @@
+{
+  "schema_version":"1.0","diagram_type":"legal_application_chain","template_id":"legal_application_chain_v1","title":"虚构借款要件适用链（注册样例）","summary":"虚构民间借贷的规则、要件与后果测试图。",
+  "nodes":[
+    {"id":"la_issue","type":"issue","label":"是否产生返还责任","details":"款项性质与到期状态存在待核验内容。","status":"disputed","importance":"critical","source_refs":["la_src"],"tags":["虚构","民间借贷"],"metadata":{}},
+    {"id":"la_rule","type":"rule","label":"虚构借款返还规则","details":"借款合意、交付和期限届满均需确认。","status":"effective","importance":"high","source_refs":["la_src"],"tags":["虚构规则"],"metadata":{"full_name":"示例借款返还规则（虚构）","version":"2026-test-v1","validity_status":"fictional_only","official_source":"lawyer-assistance://fixtures/loan-rule"}},
+    {"id":"la_element_agreement","type":"element","label":"借款合意","details":"需要证据支持。","status":"supported","importance":"high","source_refs":["la_src"],"tags":["要件"],"metadata":{}},
+    {"id":"la_element_delivery","type":"element","label":"款项交付","details":"虚构流水初步支持。","status":"supported","importance":"high","source_refs":["la_src"],"tags":["要件"],"metadata":{}},
+    {"id":"la_result","type":"legal_consequence","label":"可能承担返还责任","details":"仅在必要要件均确认时形成。","status":"uncertain","importance":"critical","source_refs":["la_src"],"tags":["后果"],"metadata":{}}
+  ],
+  "edges":[
+    {"id":"la_edge_apply","source":"la_rule","target":"la_issue","relation":"applies_to","label":"适用于争点","strength":"strong","source_refs":["la_src"],"metadata":{}},
+    {"id":"la_edge_req_1","source":"la_rule","target":"la_element_agreement","relation":"requires","label":"要求","strength":"conclusive","source_refs":["la_src"],"metadata":{}},
+    {"id":"la_edge_req_2","source":"la_rule","target":"la_element_delivery","relation":"requires","label":"要求","strength":"conclusive","source_refs":["la_src"],"metadata":{}},
+    {"id":"la_edge_result_1","source":"la_element_agreement","target":"la_result","relation":"leads_to","label":"参与导出后果","strength":"moderate","source_refs":["la_src"],"metadata":{}},
+    {"id":"la_edge_result_2","source":"la_element_delivery","target":"la_result","relation":"leads_to","label":"参与导出后果","strength":"moderate","source_refs":["la_src"],"metadata":{}}
+  ],
+  "groups":[{"id":"la_group","label":"必要要件","node_ids":["la_element_agreement","la_element_delivery"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["la_src"]}],
+  "sources":[{"id":"la_src","kind":"human_input","title":"虚构借款适用链设定","locator":"仓库测试样例，无现实对应案件","verification_status":"human_confirmed"}],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["la_issue"],"group_by":"node_type","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T11:05:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["la_src"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"注册表虚构样例","model_content_scope":"只整理虚构规则、要件与状态，不形成真实法律结论。","deterministic_content_scope":"校验、布局和 HTML 渲染由固定模板完成。"}
+}

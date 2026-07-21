@@ -1,0 +1,40 @@
+{
+  "schema_version":"1.0","diagram_type":"case_issue_evidence_law","template_id":"case_issue_evidence_law_v1",
+  "title":"虚构民间借贷争点—证据—法律图","summary":"围绕一笔虚构转账的借贷或投资性质，区分双方主张、事实、证据、规则与待补材料，不代表真实法律结论。",
+  "nodes":[
+    {"id":"party_lender","type":"party","label":"出借主张方甲某","details":"纯虚构主体，不对应真实自然人。","status":"active","importance":"high","source_refs":["src_scenario"],"tags":["虚构","主张方"],"metadata":{"role":"claimant"}},
+    {"id":"party_borrower","type":"party","label":"投资抗辩方乙某","details":"纯虚构主体，不对应真实自然人。","status":"active","importance":"high","source_refs":["src_scenario"],"tags":["虚构","相对方"],"metadata":{"role":"respondent"}},
+    {"id":"issue_payment_nature","type":"issue","label":"20 万元款项属于借款还是投资","details":"转账客观发生，但双方对款项性质、返还条件与风险承担存在相反陈述。","status":"disputed","importance":"critical","source_refs":["src_bank","src_chat","src_scenario"],"tags":["核心争点","款项性质"],"metadata":{}},
+    {"id":"claim_loan","type":"claim","label":"主张款项为借款并应返还","details":"主张方称双方口头约定三个月后返还本金。","status":"alleged","importance":"critical","source_refs":["src_scenario","src_chat"],"tags":["借款主张"],"metadata":{"requested_remedy":"return_principal"}},
+    {"id":"defense_investment","type":"defense","label":"抗辩款项为共同投资","details":"相对方称款项用于共同项目并由双方承担经营风险。","status":"disputed","importance":"critical","source_refs":["src_scenario","src_chat"],"tags":["投资抗辩"],"metadata":{"defense_basis":"shared_business_risk"}},
+    {"id":"fact_transfer","type":"fact","label":"甲方向乙方转账 20 万元","details":"虚构银行流水显示单笔转账，附言为空。","status":"supported","importance":"high","source_refs":["src_bank"],"tags":["转账事实"],"metadata":{"amount":"200000.00","currency":"CNY","date":"2026-02-10","date_precision":"day"}},
+    {"id":"evidence_bank","type":"evidence","label":"虚构银行转账回单","details":"能够支持转账发生，但不能单独证明款项法律性质。","status":"supported","importance":"high","source_refs":["src_bank"],"tags":["书证","证明范围有限"],"metadata":{"evidence_name":"虚构银行转账回单","evidence_type":"bank_receipt","submitted_by":"claimant","formed_at":"2026-02-10","authenticity":"fixture_original","legality":"not_disputed_in_fixture","relevance":"transfer_only","is_original":true,"examined":false,"opponent_view":"仅认可转账发生","probative_value":"strong_for_transfer_weak_for_nature","defects":["附言为空"]}},
+    {"id":"evidence_chat","type":"evidence","label":"虚构聊天记录节选","details":"出现“项目回款后处理”等表述，同时缺少明确的借款本金、期限和利息约定。","status":"disputed","importance":"high","source_refs":["src_chat"],"tags":["电子数据","解释有争议"],"metadata":{"evidence_name":"虚构聊天记录节选","evidence_type":"chat_export","submitted_by":"both_sides","formed_at":"2026-02","authenticity":"unverified_fixture_copy","legality":"pending_review","relevance":"payment_nature","is_original":false,"examined":false,"opponent_view":"双方作相反解释","probative_value":"uncertain","defects":["上下文不完整","缺少原始载体核验"]}},
+    {"id":"rule_payment_nature","type":"rule","label":"虚构款项性质审查规则","details":"仅作工程测试：应结合交付款项、合意内容、返还安排和风险承担综合判断，不得只凭转账推定借贷。","status":"effective","importance":"high","source_refs":["src_rule"],"tags":["虚构规则","人工复核"],"metadata":{"full_name":"示例款项性质审查规则（虚构）","short_name":"虚构审查规则","issuer":"测试规则委员会","document_number":"TEST-2026-LOAN-01","authority_level":"fictional_only","publication_date":"2026-01-01","effective_date":"2026-01-01","validity_status":"fictional_only","territory":"test_only","applicable_subjects":"fixture_parties","article_locator":"测试第 1 条","version":"2026-test-v1","official_source":"lawyer-assistance://fixtures/loan-nature-rule","verified_by":"human_fixture_review"}},
+    {"id":"missing_context","type":"missing_information","label":"缺少完整聊天上下文与项目资料","details":"需要核验完整聊天载体、资金用途、收益分配、亏损承担和既往还款行为。","status":"unknown","importance":"critical","source_refs":["src_scenario","src_chat"],"tags":["待补证"],"metadata":{"requested_item":"complete_chat_and_project_records"}}
+  ],
+  "edges":[
+    {"id":"edge_claim_raises","source":"claim_loan","target":"issue_payment_nature","relation":"raises","label":"提出借款性质主张","strength":"strong","source_refs":["src_scenario","src_chat"],"metadata":{}},
+    {"id":"edge_defense_disputes","source":"defense_investment","target":"issue_payment_nature","relation":"disputes","label":"提出共同投资抗辩","strength":"strong","source_refs":["src_scenario","src_chat"],"metadata":{}},
+    {"id":"edge_bank_proves_transfer","source":"evidence_bank","target":"fact_transfer","relation":"proves","label":"证明转账客观发生","strength":"strong","source_refs":["src_bank"],"metadata":{}},
+    {"id":"edge_transfer_supports_issue","source":"fact_transfer","target":"issue_payment_nature","relation":"supports","label":"支持存在款项交付但不决定性质","strength":"moderate","source_refs":["src_bank"],"metadata":{}},
+    {"id":"edge_chat_supports_issue","source":"evidence_chat","target":"issue_payment_nature","relation":"supports","label":"为双方解释提供有限上下文","strength":"weak","source_refs":["src_chat"],"metadata":{}},
+    {"id":"edge_rule_applies","source":"rule_payment_nature","target":"issue_payment_nature","relation":"applies_to","label":"提供综合审查框架","strength":"strong","source_refs":["src_rule"],"metadata":{}},
+    {"id":"edge_issue_involves_lender","source":"issue_payment_nature","target":"party_lender","relation":"involves","label":"涉及主张方","strength":"moderate","source_refs":["src_scenario"],"metadata":{}},
+    {"id":"edge_issue_involves_borrower","source":"issue_payment_nature","target":"party_borrower","relation":"involves","label":"涉及相对方","strength":"moderate","source_refs":["src_scenario"],"metadata":{}},
+    {"id":"edge_rule_requires_context","source":"rule_payment_nature","target":"evidence_chat","relation":"requires","label":"要求核验完整证据上下文","strength":"moderate","source_refs":["src_rule","src_chat"],"metadata":{}}
+  ],
+  "groups":[
+    {"id":"group_positions","label":"双方主张","node_ids":["party_lender","party_borrower","claim_loan","defense_investment"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["src_scenario","src_chat"]},
+    {"id":"group_evidence","label":"事实、证据与缺口","node_ids":["fact_transfer","evidence_bank","evidence_chat","missing_context"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["src_bank","src_chat"]}
+  ],
+  "sources":[
+    {"id":"src_scenario","kind":"human_input","title":"虚构民间借贷争议设定","locator":"仓库内测试样例，无现实对应案件","verification_status":"human_confirmed"},
+    {"id":"src_bank","kind":"attachment","title":"虚构银行转账回单","locator":"测试附件 B1，第 1 页","artifact_id":"fixture_loan_bank_receipt","file_name":"fictional-loan-bank-receipt.pdf","page":1,"attachment":"B1","content_hash":"sha256:1111111111111111111111111111111111111111111111111111111111111111","verification_status":"original_material"},
+    {"id":"src_chat","kind":"file_page","title":"虚构聊天记录节选","locator":"测试材料 C1，第 2 页","artifact_id":"fixture_loan_chat_excerpt","file_name":"fictional-loan-chat-excerpt.pdf","page":2,"quote":"项目回款后再处理；该节选上下文不完整。","content_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","verification_status":"model_extracted"},
+    {"id":"src_rule","kind":"law","title":"示例款项性质审查规则（虚构）","locator":"测试第 1 条","artifact_id":"fixture_loan_nature_rule","uri":"lawyer-assistance://fixtures/loan-nature-rule","law_document":"示例款项性质审查规则（虚构）","law_version":"2026-test-v1","article":"测试第 1 条","quote":"结合合意、返还安排与风险承担综合判断。","verification_status":"human_confirmed"}
+  ],
+  "layout_hints":{"direction":"top_down","preferred_root_ids":["issue_payment_nature"],"group_by":"issue","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T16:20:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["src_scenario","src_bank","src_chat","src_rule"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"第一阶段纯虚构民间借贷争点专用样例","model_content_scope":"仅组织虚构双方主张、证据范围和待补事项，不认定款项性质。","deterministic_content_scope":"Schema、语义验证、模板、布局和 HTML 渲染均由固定本地代码执行。"}
+}

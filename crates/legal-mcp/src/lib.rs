@@ -1,4 +1,5 @@
 pub mod config;
+mod diagram_mcp;
 pub mod handler;
 pub mod http;
 mod privacy_gate;
