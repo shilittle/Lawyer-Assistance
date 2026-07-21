@@ -21,7 +21,8 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::{
-    privacy_gate, public_output, receipt_gate::RedactedReceiptGate, registry::PrivacyProfile,
+    approved_workspace, privacy_gate, public_output, receipt_gate::RedactedReceiptGate,
+    registry::PrivacyProfile,
 };
 
 const MAX_TOOL_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
@@ -169,6 +170,7 @@ impl ServiceAdapter {
     pub fn for_profile(services: LegalServices, profile: PrivacyProfile) -> Self {
         let receipt_gate = match profile {
             PrivacyProfile::PublicLawOnly => None,
+            PrivacyProfile::ApprovedCaseWorkspace => None,
             PrivacyProfile::RedactedCase => RedactedReceiptGate::load_from_windows_credentials(
                 &services.config().user_database_path,
             )
@@ -215,6 +217,15 @@ impl ServiceAdapter {
             ));
         }
         let arguments = arguments.unwrap_or_default();
+        if approved_workspace::is_approved_workspace_tool(tool_name) {
+            if !approved_workspace::request_is_valid(tool_name, &arguments) {
+                return Err(ErrorData::invalid_params(
+                    "Tool arguments do not match the declared input schema.",
+                    None,
+                ));
+            }
+            return Ok(approved_workspace_not_qualified());
+        }
         match tool_name {
             "system_status" => self.system_status(arguments).await,
             "legal_search" => {
@@ -589,6 +600,19 @@ fn tool_error(tool_name: &str, error: ServiceError) -> CallToolResult {
     debug_assert!(envelope_size <= MAX_TOOL_ENVELOPE_BYTES);
     let mut result = CallToolResult::structured_error(envelope);
     result.content = vec![ContentBlock::text(public_message)];
+    result
+}
+
+fn approved_workspace_not_qualified() -> CallToolResult {
+    let envelope = json!({
+        "schema_version": 1,
+        "status": "unavailable",
+        "reason_code": "PROFILE_NOT_QUALIFIED"
+    });
+    let mut result = CallToolResult::structured_error(envelope);
+    result.content = vec![ContentBlock::text(
+        "Approved case workspace execution is unavailable because local qualification has not been established.",
+    )];
     result
 }
 

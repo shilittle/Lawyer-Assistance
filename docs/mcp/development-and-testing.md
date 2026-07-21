@@ -6,7 +6,7 @@
 - `crates/legal-mcp`：profile registry、adapter 二次拒绝、receipt gate、stdio/HTTP 和结果隐私扫描。
 - `crates/privacy`：分类、脱敏、DPAPI、票据与本地审计。
 - `crates/material-processing`：原生 PDF、实验本地 MinerU runner 和安全 PDF 重建。
-- `integrations`：三类宿主的 public-only 五工具配置、Skill/Agent 和验证器。
+- `integrations`：三类宿主的 public-only 默认资产及独立、默认禁用的 approved-case-workspace 配置、Skill/Agent 和 validator。
 
 共享服务里存在案件函数不构成 MCP API；测试必须证明它们从 registry 和 adapter 两层均不可达。
 
@@ -18,7 +18,9 @@ cargo clippy -p legal-mcp --all-targets -- -D warnings
 cargo test -p legal-mcp
 cargo test -p privacy -p material-processing -p providers -p file-ingest -p legal-services
 python integrations/validate_examples.py
+python integrations/validate_approved_workspace_examples.py
 python -m unittest integrations.test_validate_examples
+python -m unittest integrations.test_validate_approved_workspace_examples
 ```
 
 桌面端变更还运行其 Rust、TypeScript、Vitest 与 ESLint 门禁。
@@ -35,6 +37,9 @@ python -m unittest integrations.test_validate_examples
 8. 带可靠文本层的 PDF 可原生处理；当 App 未提供本地 OCR runner 时，扫描/视觉 PDF 必须拒绝，不能回退 SSH、云 OCR 或网络。
 9. 本地 MinerU runner 测试覆盖参数白名单、清空环境、禁远程、超时、取消和输出边界；这些单测不等于 App/GPU 端到端认证。
 10. WorkBuddy/Codex/OpenCode 的第一操作性规则覆盖 `CASE_RAW`、待复核与仅标签 approved，并保留“pre-Skill 披露无法阻止或撤回”的说明。
+11. `approved_case_workspace` 精确列出 15 项；未资格化案件调用返回 `PROFILE_NOT_QUALIFIED` 且不回显参数。
+12. 三类 approved 宿主副本只信当前 approved read 直接响应，搜索/列表只导航 ID，成果只经 write/update 写回，并显式禁止附件/粘贴/宿主文件/浏览器/远程 OCR/其他 MCP 或 Skill/memory/subagent/未批准 Provider。
+13. public-only 与 approved validator 独立运行；新增 profile 不改变默认五项及其宿主白名单。
 
 ## 人工宿主验收
 

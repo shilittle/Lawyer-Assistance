@@ -29,6 +29,8 @@ const config: PrivacyConfig = {
     maxPages: 200,
     strictOffline: true,
     forbidCloudFallback: true,
+    forbidRemoteUpload: true,
+    forbidTelemetry: true,
   },
 };
 
@@ -55,8 +57,12 @@ describe("privacy IPC client", () => {
     const payload = JSON.stringify(invoke.mock.calls[0]);
     expect(payload).toContain('"forbidCloudFallback":true');
     expect(payload).toContain('"strictOffline":true');
+    expect(payload).toContain('"forbidRemoteUpload":true');
+    expect(payload).toContain('"forbidTelemetry":true');
     expect(payload).not.toContain("allowRawCloud");
     expect(payload).not.toContain("cloudFallbackUrl");
+    expect(payload).not.toContain("telemetryEndpoint");
+    expect(payload).not.toContain("remoteUploadUrl");
   });
   it("uses native-picker workflow commands without accepting a frontend path", async () => {
     await preparePrivacyMaterial({ customTerms: ["内部代号"] });

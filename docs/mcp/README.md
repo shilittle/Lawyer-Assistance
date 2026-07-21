@@ -8,16 +8,19 @@
 - `legal_get_versions`
 - `legal_get_relations`
 
-stdio 与 Streamable HTTP 必须列出相同的五项；宿主看到多一项或少一项都应拒绝连接。仓库中的 WorkBuddy、Codex 和 OpenCode 示例均按此契约配置。
+默认 stdio 与 Streamable HTTP 必须列出相同的五项；宿主看到多一项或少一项都应拒绝连接。仓库中的 WorkBuddy、Codex 和 OpenCode 默认示例均按此契约配置。
 
 `redacted_case` 是实验 profile，只在五项基础上增加需要精确活动票据的 `citation_validate`。当前 App 尚不能签发绑定该用途、目标和请求字节的正向票据，因此生产集成仍固定使用公开五项。没有票据、密钥、持久化状态或 Windows 保护能力时，第六项调用 fail-closed。
 
-案件读取、案件写入、材料导入、缺口分析、文书生成和文书导出工具在两个 profile 中都隐藏且不可调用。Provider 路径同样没有案件批准票据正向集成；案件数据在请求序列化前被拒绝。
+`approved_case_workspace` 是新增的资格门禁 profile，列出公开五项和十个 opaque-ID-only 案件/成果工具。当前资格证据未建立，案件工具统一返回 `PROFILE_NOT_QUALIFIED`；仓库中的三类宿主资产默认禁用。工具可发现不等于已获准生产使用。
+
+旧的 `case_get_state`、patch、任意材料导入、缺口分析、文书生成和路径导出能力在所有 profile 中仍隐藏且不可调用。Provider transport 同样没有案件批准正向链；不得把新 MCP schema 的存在表述成当前 Provider 案件发送已启用。
 
 ## 文档
 
 - [架构与信任边界](architecture.md)
 - [工具与 profile 契约](tools.md)
+- [批准案件工作区 profile](approved-case-workspace.md)
 - [安装与运行](installation.md)
 - [安全与隐私](security-and-privacy.md)
 - [数据库与版本](database-and-versioning.md)

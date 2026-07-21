@@ -12,6 +12,8 @@
 
 ## 当前请求路径
 
+默认生产路径仍为：
+
 1. 宿主启动或连接 MCP，并声明/核验 `public_law_only`。
 2. stdio 或 HTTP 传输完成帧、认证、Host/Origin、大小、超时和并发检查。
 3. profile registry 只列出精确五个公开法律工具；adapter 对隐藏工具再次拒绝，不能只依赖 `tools/list` 隐藏。
@@ -20,7 +22,9 @@
 
 `redacted_case` 只在第 3 步多列出 `citation_validate`，并在调用服务前验证精确活动票据。票据绑定完整请求字节、固定目的地 `lawyer-assistance-mcp:redacted_case`、固定用途、内容/策略/探测器 provenance、密钥版本和短 TTL，并核对持久化撤销状态。当前 App 没有该签发用途，所以这条路径没有生产正向调用。
 
-案件状态、案件变更、材料导入、缺口分析、文书生成和导出在两个 profile 中均不进入 registry，也必须被 adapter 拒绝。不能用内部共享服务仍存在这些 DTO 或实现来推断对外可用。
+`approved_case_workspace` 在第 3 步列出十个额外 ID-only schema，但 adapter 当前在执行前稳定返回 `PROFILE_NOT_QUALIFIED`。完成资格后，读取路径必须先验证 immutable manifest、签名、内容哈希、scope/purpose、撤销和残留扫描；写入只允许 immutable work-product generation。宿主不能传路径，也不能直接访问工作区目录。
+
+旧案件状态、案件变更、任意材料导入、缺口分析、文书生成和路径导出在所有 profile 中均不进入 registry，也必须被 adapter 拒绝。不能用内部共享服务仍存在这些 DTO 或实现来推断对外可用。
 
 ## 信任边界
 

@@ -16,8 +16,11 @@ WorkBuddy、Codex、OpenCode 或其他宿主可能在 Skill/Agent/prompt 规则�
 
 - `public_law_only` 默认只公开五个法律只读工具，不读取案件材料。
 - `redacted_case` 仅增加 receipt-gated `citation_validate`。其票据必须精确绑定请求字节、目标、用途、来源/抽取/脱敏/批准哈希、策略与探测器版本、密钥版本和短 TTL，并通过持久化活动/撤销状态核验。
+- `approved_case_workspace` 列出十个最小 ID-only 案件工具；当前资格未建立，案件执行返回 `PROFILE_NOT_QUALIFIED`。只有当前 `case_read_approved_material` 直接响应且响应本身为 `CASE_REDACTED_APPROVED` 才可能成为宿主正文来源。
 - 当前 App 不能签发上述 MCP 引证用途票据。因此生产宿主固定使用 `public_law_only`；不得把本地材料页或导出票据改名后复用。
-- 案件读写、材料导入、缺口分析、文书生成和导出工具在所有当前 profile 中隐藏。
+- 三类批准宿主资产默认禁用。Skill、用户同意或客户端白名单不能替代后端 manifest、撤销、哈希、残留扫描、隔离和 Provider 资格。
+- 旧案件状态/patch、任意材料导入、缺口分析、文书生成和路径导出工具在所有 profile 中隐藏；新 work-product 只能通过精确的 write/update 业务工具写入。
+- 原件已进入任务时必须停止并新建干净任务；Skill 不能撤回加载前披露。
 
 ## Provider 边界
 

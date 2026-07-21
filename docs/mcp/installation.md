@@ -78,4 +78,10 @@ CLI、环境和配置文件存在优先级时，最终解析结果仍必须是 `
 
 不要在生产启用。虽然服务端实验 profile 能列出 receipt-gated `citation_validate`，当前 App 不能签发绑定该 MCP 用途的票据，正常调用必然 fail-closed。测试签名器和合成票据只证明拒绝/验证协议，不是部署凭据。
 
+## `approved_case_workspace` 状态
+
+独立集成资产已提供，但当前默认禁用，案件执行必须返回 `PROFILE_NOT_QUALIFIED`。不要通过修改客户端 `enabled`、用户同意或放宽 Skill 绕过资格。完成 App 所列隔离、manifest 信任、模型与 Provider 资格后，仍需核对精确 15 工具、双通道残留扫描和三类宿主规则，详见[批准案件工作区 profile](approved-case-workspace.md)。
+
+宿主任务只能以 opaque ID 开始，不能附加/粘贴原件或提供真实路径。若原始材料已经进入任务，删除受污染任务并新建干净任务；不能在同一上下文继续。
+
 旧版新建案件、材料导入、apply/get-state、文书生成或导出安装步骤已经失效；不得沿用旧配置重新开启。

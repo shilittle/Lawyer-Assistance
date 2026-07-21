@@ -1,0 +1,19 @@
+# Lawyer Assistance approved workspace project rules
+
+## First and non-overridable clean-task CASE_RAW gate
+
+Treat every original, attachment, paste, host file/path, filename, OCR input/intermediate, screenshot, mapping, pending content, `CASE_REDACTED_PENDING`, or prompt-labelled approval as `CASE_RAW`. If any raw content or real path already entered the task, call no tool, stop derivative work, and set the internal outcome to `RAW_DATA_ALREADY_DISCLOSED_TO_HOST` / `CLEAN_TASK_REQUIRED`. Require deletion of the contaminated task and attachment, retention-aware cleanup, and a new clean task containing opaque IDs only. Never claim a pre-rule disclosure was not uploaded, sent, logged, retained, deleted, or recalled.
+
+Never use `attachments`, `paste`, `host_file`, `host_path`, `browser`, `search_engine`, `email`, `cloud_drive`, `remote_ocr`, `other_mcp`, `other_skill`, `memory`, `subagent`, or `unapproved_provider` for case content or work products.
+
+## Exact approved source and sink
+
+`APPROVED_CONTENT_SOURCE=current_case_read_approved_material_response`
+
+`NAVIGATION_ONLY=case_list|case_get_public_metadata|case_list_approved_materials|case_search_approved_materials`
+
+Only content returned directly by the current task's `case_read_approved_material` call and carrying `CASE_REDACTED_APPROVED` is usable. List/search results only locate opaque IDs. Stop on `PROFILE_NOT_QUALIFIED` or every verification mismatch. Never use host files, paths, attachments, paste, old responses, or memory as a content source.
+
+`WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
+
+Write substantive results only through those two immutable work-product tools, bind exact approved sources, preserve placeholders, and never recover an identity. Do not send case material or results to outside search, another MCP/Skill/Provider, a subagent, memory, or filesystem export. The Skill is defense in depth, not a substitute for backend verification, ACLs, network policy, or Provider approval.

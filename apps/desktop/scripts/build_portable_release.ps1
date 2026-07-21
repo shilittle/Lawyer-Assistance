@@ -182,7 +182,8 @@ if ($expectedExecutableHash -and $exeHash -ne $expectedExecutableHash) {
 }
 
 $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion
-if ($productVersion -notmatch '^(\d+\.\d+\.\d+)(?:\.0)?(?:[-+].*)?$' -or $Matches[1] -ne $version) {
+$normalizedProductVersion = if ($productVersion -match '^(\d+\.\d+\.\d+)\.0$') { $Matches[1] } else { $productVersion }
+if ($normalizedProductVersion -ne $version) {
   throw "Executable ProductVersion '$productVersion' does not match $version"
 }
 if ($RequireAuthenticode) {

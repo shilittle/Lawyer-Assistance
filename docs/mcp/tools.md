@@ -1,6 +1,6 @@
 # 工具与隐私 profile 契约
 
-机器权威位于 `crates/legal-mcp/src/registry.rs`。所有发布配置和宿主白名单必须与 `integrations/tool-catalog.json` 的 `public_law_only` 五项完全一致。
+机器权威位于 `crates/legal-mcp/src/registry.rs`。默认发布配置和宿主白名单必须与 `integrations/tool-catalog.json` 的 `public_law_only` 五项完全一致；资格门禁资产必须与 `integrations/tool-catalog.approved-case-workspace.json` 的 15 项完全一致，二者不能混用。
 
 ## Profile
 
@@ -8,10 +8,13 @@
 |---|---|---|
 | `public_law_only` | 五个公开法律只读工具 | 默认且唯一获准的生产 profile |
 | `redacted_case` | 公开五项 + receipt-gated `citation_validate` | 实验；App 无法签发该用途票据，生产不可用 |
+| `approved_case_workspace` | 公开五项 + 十个 ID-only 批准材料/成果工具 | 资格门禁；当前案件执行 `PROFILE_NOT_QUALIFIED`，宿主资产默认禁用 |
 
 `redacted_case` 的第六项要求活动、未撤销、未过期的精确票据。票据必须绑定完整请求字节、固定 MCP 目标、固定用途、策略/探测器/内容哈希、密钥版本和短 TTL；材料页或本地导出票据不能复用。当前 App 没有这条签发路径，所以没有生产正向调用。
 
-以下案件能力在两个 profile 中都隐藏并拒绝调用：`case_get_state`、`case_propose_patch`、`case_apply_patch`、`case_analyze_gaps`、`document_generate`、`document_export`。材料导入也不可用；不得用文件、命令、浏览器、Provider 或其他 MCP 工具重建这些流程。
+`approved_case_workspace` 的十个新工具仅处理签名批准 generation 与匿名 work-product。正文只可由当前 `case_read_approved_material` 直接响应提供；输出只可通过 `case_write_work_product` 或 `case_update_work_product` 写回。完整契约见[批准案件工作区 profile](approved-case-workspace.md)。
+
+以下旧宽泛能力在所有 profile 中都隐藏并拒绝调用：`case_get_state`、`case_propose_patch`、`case_apply_patch`、`case_analyze_gaps`、`document_generate`、`document_export`。任意路径材料导入也不可用；不得用文件、命令、浏览器、Provider 或其他 MCP 工具重建这些流程。
 
 ## 通用规则
 

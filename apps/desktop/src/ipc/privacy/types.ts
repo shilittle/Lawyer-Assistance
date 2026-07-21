@@ -13,6 +13,8 @@ export interface LocalOcrConfig {
   maxPages: number;
   strictOffline: true;
   forbidCloudFallback: true;
+  forbidRemoteUpload: true;
+  forbidTelemetry: true;
 }
 
 export interface PrivacyConfig {
@@ -40,6 +42,24 @@ export interface LocalOcrStatus {
   networkIsolationVerified: boolean;
 }
 
+export interface PrivacyVNextQualificationStatus {
+  networkIsolationEnforced: boolean;
+  modelManifestTrustEstablished: boolean;
+  appAutoEnableAuthorized: boolean;
+  productionCaseOcrAuthorized: boolean;
+}
+
+export interface PrivacyVNextCapabilityMatrix {
+  localGpuPreferenceConfigurable: boolean;
+  scannedCaseOcrEnabled: boolean;
+  automaticApprovalEnabled: boolean;
+  approvedCaseMcpEnabled: boolean;
+  remoteOcrFallbackAllowed: boolean;
+  telemetryAllowed: boolean;
+  rawMaterialUploadAllowed: boolean;
+  blockingReasonCodes: string[];
+}
+
 export interface PrivacyConfigResponse {
   config: PrivacyConfig;
   configValid: boolean;
@@ -48,6 +68,8 @@ export interface PrivacyConfigResponse {
     | "configuration_only"
     | "local_review_safe_pdf_ready_case_provider_production_mcp_fail_closed_public_legal_tools_only";
   ocrStatus: LocalOcrStatus;
+  qualification: PrivacyVNextQualificationStatus;
+  capabilities: PrivacyVNextCapabilityMatrix;
 }
 
 export interface SavePrivacyConfigRequest {

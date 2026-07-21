@@ -25,6 +25,8 @@ const config: PrivacyConfig = {
     maxPages: 200,
     strictOffline: true,
     forbidCloudFallback: true,
+    forbidRemoteUpload: true,
+    forbidTelemetry: true,
   },
 };
 
@@ -45,6 +47,28 @@ const response: PrivacyConfigResponse = {
     integrityVerified: false,
     networkIsolationVerified: false,
   },
+  qualification: {
+    networkIsolationEnforced: false,
+    modelManifestTrustEstablished: false,
+    appAutoEnableAuthorized: false,
+    productionCaseOcrAuthorized: false,
+  },
+  capabilities: {
+    localGpuPreferenceConfigurable: true,
+    scannedCaseOcrEnabled: false,
+    automaticApprovalEnabled: false,
+    approvedCaseMcpEnabled: false,
+    remoteOcrFallbackAllowed: false,
+    telemetryAllowed: false,
+    rawMaterialUploadAllowed: false,
+    blockingReasonCodes: [
+      "network_isolation_not_enforced",
+      "model_manifest_trust_not_established",
+      "app_auto_enable_not_authorized",
+      "production_case_ocr_not_authorized",
+      "approved_case_workspace_profile_not_qualified",
+    ],
+  },
 };
 
 describe("PrivacyWorkspace configuration", () => {
@@ -56,6 +80,8 @@ describe("PrivacyWorkspace configuration", () => {
     expect(normalized).toEqual(config);
     expect(normalized.ocr.strictOffline).toBe(true);
     expect(normalized.ocr.forbidCloudFallback).toBe(true);
+    expect(normalized.ocr.forbidRemoteUpload).toBe(true);
+    expect(normalized.ocr.forbidTelemetry).toBe(true);
     expect(privacyConfigDraftIsDirty(config, draft)).toBe(false);
     expect(JSON.stringify(normalized)).not.toContain("allowRawCloud");
   });
@@ -115,6 +141,20 @@ describe("PrivacyWorkspaceView", () => {
     expect(markup).toContain("后端默认拒绝（fail closed）");
     expect(markup).toContain("只有不携带案件材料的公开法律工具可以外发请求");
     expect(markup).toContain("获批脱敏案件材料均不得据此发送");
+    expect(markup).toContain("networkIsolationEnforced=false");
+    expect(markup).toContain("modelManifestTrustEstablished=false");
+    expect(markup).toContain("appAutoEnableAuthorized=false");
+    expect(markup).toContain("productionCaseOcrAuthorized=false");
+    expect(markup).toContain("扫描件 OCR");
+    expect(markup).toContain("自动批准");
+    expect(markup).toContain("approved MCP");
+    expect(markup.match(/后端不可启用/gu)).toHaveLength(3);
+    expect(markup).toContain("禁止远端上传原件、OCR 正文与中间产物");
+    expect(markup).toContain("禁止 OCR 遥测与隐式模型下载");
+    expect(markup).toContain("这不构成来源认证、OS");
+    expect(markup).toContain(
+      "不得据此处理真实扫描案件、自动批准或启动案件材料 MCP",
+    );
     expect(markup).not.toContain("第一阶段边界");
     expect(markup).not.toContain("允许原件上云");
     expect(markup).not.toContain("allowRawCloud");

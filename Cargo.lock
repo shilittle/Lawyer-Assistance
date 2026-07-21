@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "assistant"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "quick-xml",
  "serde",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "citations"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "database",
  "domain",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "database"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "file-ingest"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "infer",
  "lopdf 0.44.0",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "lawyer-assistance-desktop"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "assistant",
  "base64 0.22.1",
@@ -2496,7 +2496,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "legal-mcp"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "legal-services"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "assistant",
  "citations",
@@ -2734,7 +2734,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "material-processing"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "lopdf 0.44.0",
  "printpdf 0.11.1",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "privacy"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "base64 0.22.1",
  "rusqlite",
@@ -3538,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "providers"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "privacy",
  "reqwest 0.12.28",
@@ -3818,7 +3818,7 @@ dependencies = [
 
 [[package]]
 name = "retrieval"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 dependencies = [
  "database",
  "domain",

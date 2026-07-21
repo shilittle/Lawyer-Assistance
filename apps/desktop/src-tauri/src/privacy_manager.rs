@@ -71,6 +71,10 @@ pub struct LocalOcrConfig {
     pub strict_offline: bool,
     #[serde(default = "enabled")]
     pub forbid_cloud_fallback: bool,
+    #[serde(default = "enabled")]
+    pub forbid_remote_upload: bool,
+    #[serde(default = "enabled")]
+    pub forbid_telemetry: bool,
 }
 
 impl Default for LocalOcrConfig {
@@ -85,6 +89,8 @@ impl Default for LocalOcrConfig {
             max_pages: default_max_pages(),
             strict_offline: true,
             forbid_cloud_fallback: true,
+            forbid_remote_upload: true,
+            forbid_telemetry: true,
         }
     }
 }
@@ -134,6 +140,85 @@ pub struct LocalOcrStatus {
     pub network_isolation_verified: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivacyVNextQualificationStatus {
+    pub network_isolation_enforced: bool,
+    pub model_manifest_trust_established: bool,
+    pub app_auto_enable_authorized: bool,
+    pub production_case_ocr_authorized: bool,
+}
+
+impl PrivacyVNextQualificationStatus {
+    pub(crate) const fn current() -> Self {
+        Self {
+            network_isolation_enforced: false,
+            model_manifest_trust_established: false,
+            app_auto_enable_authorized: false,
+            production_case_ocr_authorized: false,
+        }
+    }
+
+    pub(crate) const fn production_ocr_chain_authorized(self) -> bool {
+        self.network_isolation_enforced
+            && self.model_manifest_trust_established
+            && self.production_case_ocr_authorized
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivacyVNextCapabilityMatrix {
+    pub local_gpu_preference_configurable: bool,
+    pub scanned_case_ocr_enabled: bool,
+    pub automatic_approval_enabled: bool,
+    pub approved_case_mcp_enabled: bool,
+    pub remote_ocr_fallback_allowed: bool,
+    pub telemetry_allowed: bool,
+    pub raw_material_upload_allowed: bool,
+    pub blocking_reason_codes: Vec<&'static str>,
+}
+
+impl PrivacyVNextCapabilityMatrix {
+    pub(crate) fn current(
+        config_valid: bool,
+        qualification: PrivacyVNextQualificationStatus,
+    ) -> Self {
+        let scanned_case_ocr_enabled =
+            config_valid && qualification.production_ocr_chain_authorized();
+        let mut blocking_reason_codes = Vec::new();
+        if !config_valid {
+            blocking_reason_codes.push("privacy_configuration_invalid");
+        }
+        if !qualification.network_isolation_enforced {
+            blocking_reason_codes.push("network_isolation_not_enforced");
+        }
+        if !qualification.model_manifest_trust_established {
+            blocking_reason_codes.push("model_manifest_trust_not_established");
+        }
+        if !qualification.app_auto_enable_authorized {
+            blocking_reason_codes.push("app_auto_enable_not_authorized");
+        }
+        if !qualification.production_case_ocr_authorized {
+            blocking_reason_codes.push("production_case_ocr_not_authorized");
+        }
+        blocking_reason_codes.push("approved_case_workspace_profile_not_qualified");
+        Self {
+            local_gpu_preference_configurable: config_valid,
+            scanned_case_ocr_enabled,
+            automatic_approval_enabled: scanned_case_ocr_enabled
+                && qualification.app_auto_enable_authorized,
+            // The approved-case MCP profile has no production qualification in
+            // this release even when a schema implementation is present.
+            approved_case_mcp_enabled: false,
+            remote_ocr_fallback_allowed: false,
+            telemetry_allowed: false,
+            raw_material_upload_allowed: false,
+            blocking_reason_codes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrivacyConfigurationSnapshot {
@@ -142,6 +227,8 @@ pub struct PrivacyConfigurationSnapshot {
     pub load_error: Option<String>,
     pub enforcement_state: &'static str,
     pub ocr_status: LocalOcrStatus,
+    pub qualification: PrivacyVNextQualificationStatus,
+    pub capabilities: PrivacyVNextCapabilityMatrix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +326,8 @@ impl PrivacyManager {
             )
         };
         let ocr_status = inspect_local_ocr(&config.ocr);
+        let qualification = self.current_qualification();
+        let capabilities = PrivacyVNextCapabilityMatrix::current(config_valid, qualification);
         Ok(PrivacyConfigurationSnapshot {
             config,
             config_valid,
@@ -248,6 +337,8 @@ impl PrivacyManager {
             // public legal-tool egress is open.
             enforcement_state: "local_review_safe_pdf_ready_case_provider_production_mcp_fail_closed_public_legal_tools_only",
             ocr_status,
+            qualification,
+            capabilities,
         })
     }
 
@@ -258,6 +349,10 @@ impl PrivacyManager {
 
     pub fn current_config(&self) -> PrivacyConfig {
         self.state().config.clone()
+    }
+
+    pub(crate) const fn current_qualification(&self) -> PrivacyVNextQualificationStatus {
+        PrivacyVNextQualificationStatus::current()
     }
 
     pub fn save_config(
@@ -324,6 +419,18 @@ fn validate_config(config: &PrivacyConfig) -> Result<(), PrivacyManagerError> {
         return Err(PrivacyManagerError::new(
             "invalid_configuration",
             "真实案件不得启用云端 OCR 回退。",
+        ));
+    }
+    if !config.ocr.forbid_remote_upload {
+        return Err(PrivacyManagerError::new(
+            "invalid_configuration",
+            "真实案件材料和 OCR 产物不得上传到远端服务。",
+        ));
+    }
+    if !config.ocr.forbid_telemetry {
+        return Err(PrivacyManagerError::new(
+            "invalid_configuration",
+            "本地 OCR 不得发送材料、正文或运行遥测。",
         ));
     }
     validate_optional_absolute_path("worker", config.ocr.worker_path.as_deref())?;
@@ -814,6 +921,26 @@ mod tests {
         assert_eq!(config.ocr.mode, OcrMode::Off);
         assert!(config.ocr.strict_offline);
         assert!(config.ocr.forbid_cloud_fallback);
+        assert!(config.ocr.forbid_remote_upload);
+        assert!(config.ocr.forbid_telemetry);
+    }
+
+    #[test]
+    fn invalid_configuration_blocks_hypothetically_qualified_production_capabilities() {
+        let hypothetical_qualification = PrivacyVNextQualificationStatus {
+            network_isolation_enforced: true,
+            model_manifest_trust_established: true,
+            app_auto_enable_authorized: true,
+            production_case_ocr_authorized: true,
+        };
+        let capabilities = PrivacyVNextCapabilityMatrix::current(false, hypothetical_qualification);
+        assert!(!capabilities.local_gpu_preference_configurable);
+        assert!(!capabilities.scanned_case_ocr_enabled);
+        assert!(!capabilities.automatic_approval_enabled);
+        assert!(!capabilities.approved_case_mcp_enabled);
+        assert!(capabilities
+            .blocking_reason_codes
+            .contains(&"privacy_configuration_invalid"));
     }
 
     #[test]
@@ -829,12 +956,26 @@ mod tests {
         assert_eq!(config.ocr.languages, ["zh", "en"]);
         assert!(config.ocr.strict_offline);
         assert!(config.ocr.forbid_cloud_fallback);
+        assert!(config.ocr.forbid_remote_upload);
+        assert!(config.ocr.forbid_telemetry);
         validate_config(&config).expect("safe migrated defaults validate");
     }
 
     #[test]
-    fn cloud_fallback_offline_and_path_invariants_fail_closed() {
+    fn offline_upload_telemetry_and_path_invariants_fail_closed() {
         let mut config = PrivacyConfig::default();
+        config.ocr.forbid_remote_upload = false;
+        assert_eq!(
+            validate_config(&config).unwrap_err().code(),
+            "invalid_configuration"
+        );
+        config.ocr.forbid_remote_upload = true;
+        config.ocr.forbid_telemetry = false;
+        assert_eq!(
+            validate_config(&config).unwrap_err().code(),
+            "invalid_configuration"
+        );
+        config.ocr.forbid_telemetry = true;
         config.ocr.forbid_cloud_fallback = false;
         assert_eq!(
             validate_config(&config).unwrap_err().code(),
@@ -901,6 +1042,21 @@ mod tests {
         );
         assert!(!saved.ocr_status.integrity_verified);
         assert!(!saved.ocr_status.network_isolation_verified);
+        assert_eq!(
+            saved.qualification,
+            PrivacyVNextQualificationStatus::current()
+        );
+        assert!(!saved.qualification.network_isolation_enforced);
+        assert!(!saved.qualification.model_manifest_trust_established);
+        assert!(!saved.qualification.app_auto_enable_authorized);
+        assert!(!saved.qualification.production_case_ocr_authorized);
+        assert!(saved.capabilities.local_gpu_preference_configurable);
+        assert!(!saved.capabilities.scanned_case_ocr_enabled);
+        assert!(!saved.capabilities.automatic_approval_enabled);
+        assert!(!saved.capabilities.approved_case_mcp_enabled);
+        assert!(!saved.capabilities.remote_ocr_fallback_allowed);
+        assert!(!saved.capabilities.telemetry_allowed);
+        assert!(!saved.capabilities.raw_material_upload_allowed);
 
         let reopened = PrivacyManager::new(directory.path().to_path_buf()).expect("reopens");
         assert_eq!(

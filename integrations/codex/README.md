@@ -2,6 +2,8 @@
 
 The checked-in Codex examples expose only the `public_law_only` profile and exactly five read-only tools: `system_status`, `legal_search`, `legal_get_article`, `legal_get_versions`, and `legal_get_relations`.
 
+A separate, disabled `approved_case_workspace` package is documented in [APPROVED_WORKSPACE.md](APPROVED_WORKSPACE.md). It does not relax these defaults and must return `PROFILE_NOT_QUALIFIED` until the App reports the exact qualification complete.
+
 - `config.stdio.toml` starts the local binary with `--privacy-profile public_law_only` and also applies an exact five-tool client allowlist.
 - `config.http.toml` applies the same client allowlist. Start the loopback HTTP server with `public_law_only`, then reject the connection unless `tools/list` is an exact five-item match.
 - Merge `config.privacy-hardening.toml` so task history is not persisted and external-context memories are disabled. This reduces local retention; it does not make a selected Provider safe for case material.

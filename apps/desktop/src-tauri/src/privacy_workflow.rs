@@ -1561,10 +1561,14 @@ fn extract_pdf_material(
     config: &PrivacyConfig,
     ocr_status: &LocalOcrStatus,
 ) -> Result<LocalExtractedDocument, PrivacyWorkflowError> {
-    if !config.ocr.strict_offline || !config.ocr.forbid_cloud_fallback {
+    if !config.ocr.strict_offline
+        || !config.ocr.forbid_cloud_fallback
+        || !config.ocr.forbid_remote_upload
+        || !config.ocr.forbid_telemetry
+    {
         return Err(PrivacyWorkflowError::new(
             "unsafe_ocr_configuration",
-            "真实案件必须保持严格离线且禁止云端 OCR 回退。",
+            "真实案件必须保持严格离线，并禁止云端回退、远端上传和遥测。",
         ));
     }
     if config.ocr.mode == ConfigOcrMode::ForceLocal

@@ -2,6 +2,8 @@
 
 本目录提供三个连接器示例和一个可上传的 `lawyer-assistance` Skill。当前安全默认仅为 `public_law_only`，只公开 `system_status`、`legal_search`、`legal_get_article`、`legal_get_versions`、`legal_get_relations` 五个只读工具。
 
+另有默认不启用、受资格门禁的 `approved_case_workspace` 资产；它不放宽本页 public-only 契约。只有完成 App 报告的精确资格后，才可按 [批准案件工作区说明](APPROVED_WORKSPACE.md) 单独安装，当前未资格化执行必须返回 `PROFILE_NOT_QUALIFIED`。
+
 ## 安装
 
 1. 选择 stdio 或 loopback HTTP 示例，替换二进制和数据库绝对路径。stdio 示例已显式传入 `--privacy-profile public_law_only`。

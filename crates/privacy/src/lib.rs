@@ -5,9 +5,16 @@
 //! preview and human review.
 
 pub mod egress;
+pub mod finding_engine;
 pub mod protected_blob;
 pub mod receipt;
+pub mod risk_engine;
 pub mod store;
+pub mod vault_crypto;
+pub mod vault_store;
+pub mod vnext;
+pub mod work_products;
+pub mod workspace;
 
 pub use egress::{
     scan_residual, ApprovedOutboundPayload, DataClassification, EgressCandidate, EgressError,

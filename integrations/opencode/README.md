@@ -2,6 +2,8 @@
 
 Both examples disable sharing and deny the `lawyer_assistance_*` wildcard before allowing exactly five read-only public-law tools: `system_status`, `legal_search`, `legal_get_article`, `legal_get_versions`, and `legal_get_relations`.
 
+The separate examples in [APPROVED_WORKSPACE.md](APPROVED_WORKSPACE.md) remain disabled and qualification-gated. They do not relax this default; unqualified `approved_case_workspace` execution must return `PROFILE_NOT_QUALIFIED`.
+
 - `opencode.local.json` explicitly starts the binary with `--privacy-profile public_law_only`.
 - `opencode.remote.json` must connect only to a loopback server started with that profile. Reject the connection unless `tools/list` is an exact five-item match.
 - Keep the wildcard permission set to `deny`; changing it to `ask` or `allow` would reopen tools outside this reviewed surface.

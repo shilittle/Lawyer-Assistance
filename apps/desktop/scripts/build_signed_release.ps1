@@ -126,7 +126,8 @@ foreach ($artifact in @($appExe, $installer, $signature)) {
   }
 }
 $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($appExe.FullName).ProductVersion
-if ($productVersion -notmatch '^(\d+\.\d+\.\d+)(?:\.0)?(?:[-+].*)?$' -or $Matches[1] -ne $version) {
+$normalizedProductVersion = if ($productVersion -match '^(\d+\.\d+\.\d+)\.0$') { $Matches[1] } else { $productVersion }
+if ($normalizedProductVersion -ne $version) {
   throw "Executable ProductVersion '$productVersion' does not match $version"
 }
 $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction Stop |

@@ -9,11 +9,15 @@ mod mineru_config;
 mod native;
 mod safe_export;
 mod types;
+mod worker_protocol;
+mod worker_protocol_validation;
 
 pub use mineru_config::validate_local_mineru_config;
 pub use native::assess_pdf_text_layer;
 pub use safe_export::*;
 pub use types::*;
+pub use worker_protocol::*;
+pub use worker_protocol_validation::*;
 
 use mineru::run_local_mineru;
 use native::extract_native_pdf;

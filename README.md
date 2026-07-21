@@ -172,7 +172,7 @@ Every formal Tauri build runs the read-only resource gate before compilation.
 
 - [MCP architecture, tools, installation and host integrations](docs/mcp/README.md)
 - [MCP security and privacy](docs/mcp/security-and-privacy.md)
-- [v0.3.1 privacy-hardening release notes and MCP compatibility](RELEASE_NOTES.md)
+- [v0.4.0-beta.1 Privacy vNext prerelease notes and MCP compatibility](RELEASE_NOTES.md)
 - [WorkBuddy integration package](integrations/workbuddy/README.md)
 - [Codex integration package](integrations/codex/README.md)
 - [OpenCode integration package](integrations/opencode/README.md)

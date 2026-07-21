@@ -1,3 +1,4 @@
+pub mod approved_workspace;
 pub mod config;
 pub mod handler;
 pub mod http;

@@ -1,0 +1,26 @@
+[mcp_servers.lawyer_assistance]
+command = "/absolute/path/to/lawyer-assistance-mcp"
+args = ["--privacy-profile", "approved_case_workspace", "stdio"]
+env = { LAWYER_ASSISTANCE_LEGAL_DB = "/absolute/path/to/legal_core.sqlite", LAWYER_ASSISTANCE_USER_DB = "/absolute/path/to/user.sqlite", LAWYER_ASSISTANCE_ALLOWED_ROOTS = "/absolute/path/to/empty-input", LAWYER_ASSISTANCE_OUTPUT_ROOT = "/absolute/path/to/work-products" }
+enabled = false
+required = true
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+enabled_tools = [
+  "system_status",
+  "legal_search",
+  "legal_get_article",
+  "legal_get_versions",
+  "legal_get_relations",
+  "case_list",
+  "case_get_public_metadata",
+  "case_list_approved_materials",
+  "case_read_approved_material",
+  "case_search_approved_materials",
+  "case_list_work_products",
+  "case_read_work_product",
+  "case_write_work_product",
+  "case_update_work_product",
+  "case_export_work_product_manifest",
+]
+default_tools_approval_mode = "writes"

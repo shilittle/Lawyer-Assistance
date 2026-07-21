@@ -1,3 +1,4 @@
+use crate::approved_workspace;
 use clap::ValueEnum;
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde::Deserialize;
@@ -22,6 +23,24 @@ pub const REDACTED_CASE_TOOL_NAMES: [&str; 6] = [
     "citation_validate",
 ];
 
+pub const APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES: [&str; 15] = [
+    "system_status",
+    "legal_search",
+    "legal_get_article",
+    "legal_get_versions",
+    "legal_get_relations",
+    "case_list",
+    "case_get_public_metadata",
+    "case_list_approved_materials",
+    "case_read_approved_material",
+    "case_search_approved_materials",
+    "case_list_work_products",
+    "case_read_work_product",
+    "case_write_work_product",
+    "case_update_work_product",
+    "case_export_work_product_manifest",
+];
+
 pub const DISABLED_SENSITIVE_TOOL_NAMES: [&str; 7] = [
     "citation_validate",
     "case_get_state",
@@ -42,6 +61,9 @@ pub enum PrivacyProfile {
     /// Public-law tools plus exact-receipt-gated citation validation.
     #[value(name = "redacted_case", alias = "redacted-case")]
     RedactedCase,
+    /// Public law plus opaque-ID-only approved generations and work products.
+    #[value(name = "approved_case_workspace", alias = "approved-case-workspace")]
+    ApprovedCaseWorkspace,
 }
 
 impl PrivacyProfile {
@@ -49,6 +71,9 @@ impl PrivacyProfile {
         match self {
             Self::PublicLawOnly => TOOL_NAMES.contains(&name),
             Self::RedactedCase => REDACTED_CASE_TOOL_NAMES.contains(&name),
+            Self::ApprovedCaseWorkspace => {
+                APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES.contains(&name)
+            }
         }
     }
 }
@@ -60,6 +85,9 @@ impl FromStr for PrivacyProfile {
         match value.trim().to_ascii_lowercase().as_str() {
             "public_law_only" | "public-law-only" => Ok(Self::PublicLawOnly),
             "redacted_case" | "redacted-case" => Ok(Self::RedactedCase),
+            "approved_case_workspace" | "approved-case-workspace" => {
+                Ok(Self::ApprovedCaseWorkspace)
+            }
             _ => Err("unsupported privacy profile"),
         }
     }
@@ -83,7 +111,11 @@ impl ToolRegistry {
     }
 
     pub fn for_profile(profile: PrivacyProfile) -> Self {
-        let tools = build_tools(profile)
+        let mut candidates = build_tools(profile);
+        if profile == PrivacyProfile::ApprovedCaseWorkspace {
+            candidates.extend(approved_workspace::build_tools());
+        }
+        let tools = candidates
             .into_iter()
             .filter(|tool| profile.allows_tool(tool.name.as_ref()))
             .collect();
@@ -469,7 +501,7 @@ fn make_tool(
 
 fn citation_validate_input(profile: PrivacyProfile) -> Value {
     match profile {
-        PrivacyProfile::PublicLawOnly => json!({
+        PrivacyProfile::PublicLawOnly | PrivacyProfile::ApprovedCaseWorkspace => json!({
             "type":"object",
             "properties":{
                 "schema_version":schema_version(),

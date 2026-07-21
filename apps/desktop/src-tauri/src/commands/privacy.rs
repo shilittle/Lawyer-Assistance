@@ -72,6 +72,7 @@ pub async fn get_local_ocr_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privacy_manager::{PrivacyVNextCapabilityMatrix, PrivacyVNextQualificationStatus};
 
     #[test]
     fn save_request_rejects_unknown_fields_and_cloud_fallback_is_explicit() {
@@ -88,13 +89,17 @@ mod tests {
                     "timeoutSeconds": 300,
                     "maxPages": 200,
                     "strictOffline": true,
-                    "forbidCloudFallback": true
+                    "forbidCloudFallback": true,
+                    "forbidRemoteUpload": true,
+                    "forbidTelemetry": true
                 }
             }
         });
         let request: SavePrivacyConfigRequest =
             serde_json::from_value(valid.clone()).expect("valid request parses");
         assert!(request.config.ocr.forbid_cloud_fallback);
+        assert!(request.config.ocr.forbid_remote_upload);
+        assert!(request.config.ocr.forbid_telemetry);
 
         let mut unknown = valid;
         unknown
@@ -106,6 +111,8 @@ mod tests {
 
     #[test]
     fn snapshot_serializes_honest_enforcement_and_verification_fields() {
+        let qualification = PrivacyVNextQualificationStatus::current();
+        let capabilities = PrivacyVNextCapabilityMatrix::current(true, qualification);
         let snapshot = PrivacyConfigurationSnapshot {
             config: PrivacyConfig::default(),
             config_valid: true,
@@ -123,11 +130,25 @@ mod tests {
                 integrity_verified: false,
                 network_isolation_verified: false,
             },
+            qualification,
+            capabilities,
         };
         let value = serde_json::to_value(snapshot).expect("snapshot serializes");
         assert_eq!(value["enforcementState"], "configuration_only");
         assert_eq!(value["ocrStatus"]["networkIsolationVerified"], false);
+        assert_eq!(value["qualification"]["networkIsolationEnforced"], false);
+        assert_eq!(
+            value["qualification"]["modelManifestTrustEstablished"],
+            false
+        );
+        assert_eq!(value["qualification"]["appAutoEnableAuthorized"], false);
+        assert_eq!(value["qualification"]["productionCaseOcrAuthorized"], false);
+        assert_eq!(value["capabilities"]["scannedCaseOcrEnabled"], false);
+        assert_eq!(value["capabilities"]["automaticApprovalEnabled"], false);
+        assert_eq!(value["capabilities"]["approvedCaseMcpEnabled"], false);
         assert_eq!(value["config"]["ocr"]["forbidCloudFallback"], true);
+        assert_eq!(value["config"]["ocr"]["forbidRemoteUpload"], true);
+        assert_eq!(value["config"]["ocr"]["forbidTelemetry"], true);
         assert!(value.get("allowRawCloudUpload").is_none());
     }
 }

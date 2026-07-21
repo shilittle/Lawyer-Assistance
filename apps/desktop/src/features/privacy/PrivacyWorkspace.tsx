@@ -127,6 +127,8 @@ export function privacyDraftToConfig(draft: PrivacyConfigDraft): PrivacyConfig {
       // fields. The backend independently rejects either value if false.
       strictOffline: true,
       forbidCloudFallback: true,
+      forbidRemoteUpload: true,
+      forbidTelemetry: true,
     },
   };
 }
@@ -191,6 +193,29 @@ export function PrivacyWorkspaceView({
   const busy = operation !== "idle";
   const ocrEnabled = draft.ocrMode !== "off";
   const status = configResponse.ocrStatus;
+  const qualificationChecks = [
+    [
+      "networkIsolationEnforced",
+      configResponse.qualification.networkIsolationEnforced,
+    ],
+    [
+      "modelManifestTrustEstablished",
+      configResponse.qualification.modelManifestTrustEstablished,
+    ],
+    [
+      "appAutoEnableAuthorized",
+      configResponse.qualification.appAutoEnableAuthorized,
+    ],
+    [
+      "productionCaseOcrAuthorized",
+      configResponse.qualification.productionCaseOcrAuthorized,
+    ],
+  ] as const;
+  const productionCapabilities = [
+    ["扫描件 OCR", configResponse.capabilities.scannedCaseOcrEnabled],
+    ["自动批准", configResponse.capabilities.automaticApprovalEnabled],
+    ["approved MCP", configResponse.capabilities.approvedCaseMcpEnabled],
+  ] as const;
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     onSave();
@@ -216,6 +241,39 @@ export function PrivacyWorkspaceView({
           真实案件原件与获批脱敏案件材料均不得据此发送。
         </p>
       </div>
+
+      <section
+        className="privacy-vnext-gates"
+        aria-labelledby="privacy-vnext-gates-title"
+      >
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">风险优先 · 后端资格快照</p>
+            <h3 id="privacy-vnext-gates-title">生产能力门全部保持阻断</h3>
+          </div>
+          <span className="privacy-gate-badge">fail closed</span>
+        </div>
+        <dl className="privacy-qualification-list">
+          {qualificationChecks.map(([name, value]) => (
+            <div className={value ? "is-qualified" : "is-blocked"} key={name}>
+              <dt><code>{name}={String(value)}</code></dt>
+              <dd>{value ? "已取得当前证据" : "未取得当前证据"}</dd>
+            </div>
+          ))}
+        </dl>
+        <ul className="privacy-capability-list">
+          {productionCapabilities.map(([label, enabled]) => (
+            <li className={enabled ? "is-qualified" : "is-blocked"} key={label}>
+              <strong>{label}</strong>
+              <span>{enabled ? "后端已授权" : "后端不可启用"}</span>
+            </li>
+          ))}
+        </ul>
+        <p className="privacy-qualification-note">
+          可以保存本地 worker、模型和 GPU 偏好，但这不构成来源认证、OS
+          网络隔离证据或生产授权；不得据此处理真实扫描案件、自动批准或启动案件材料 MCP。
+        </p>
+      </section>
 
       {!configResponse.configValid && configResponse.loadError ? (
         <p className="error-text" role="alert">
@@ -273,8 +331,12 @@ export function PrivacyWorkspaceView({
                 }
               >
                 <option value="off">关闭</option>
-                <option value="auto_local">自动判断并调用本地 OCR</option>
-                <option value="force_local">强制调用本地 OCR</option>
+                <option value="auto_local">
+                  保存本地自动路由偏好（生产 OCR 仍受资格门阻断）
+                </option>
+                <option value="force_local">
+                  保存强制本地 OCR 偏好（生产 OCR 仍受资格门阻断）
+                </option>
               </select>
             </label>
             <label>
@@ -354,6 +416,8 @@ export function PrivacyWorkspaceView({
           <div className="privacy-fixed-invariants" aria-label="不可关闭的案件安全约束">
             <span>✓ 严格离线模式（固定开启）</span>
             <span>✓ 禁止云端 OCR 回退（真实案件不可关闭）</span>
+            <span>✓ 禁止远端上传原件、OCR 正文与中间产物（固定开启）</span>
+            <span>✓ 禁止 OCR 遥测与隐式模型下载（固定开启）</span>
             <span>✓ 页面不提供原件外发许可开关</span>
           </div>
         </fieldset>

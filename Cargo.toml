@@ -19,7 +19,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.3.1"
+version = "0.4.0-beta.1"
 
 [workspace.dependencies]
 assistant = { path = "crates/assistant" }
@@ -53,5 +53,24 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 [profile.release.package.legal-mcp]
 # The server is I/O-bound; O2 with bounded codegen parallelism also avoids an
 # LLVM 22/O3 access violation observed in Windows MSVC release builds.
+opt-level = 2
+codegen-units = 4
+
+[profile.release.package.privacy]
+# The privacy vNext crate hits the same Windows MSVC LLVM/O3 access-violation class.
+opt-level = 2
+codegen-units = 4
+
+[profile.release.package.database]
+# The database crate also trips Windows MSVC LLVM/O3 during desktop release packaging.
+opt-level = 2
+codegen-units = 4
+
+[profile.release.package.urlpattern]
+# The transitive urlpattern crate trips Windows MSVC LLVM/O3 during desktop release packaging.
+opt-level = 2
+codegen-units = 4
+[profile.release]
+# Windows MSVC release/O3 is unstable for this workspace on the release machine.
 opt-level = 2
 codegen-units = 4
