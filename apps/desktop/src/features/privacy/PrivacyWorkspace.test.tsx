@@ -48,6 +48,10 @@ const response: PrivacyConfigResponse = {
     networkIsolationVerified: false,
   },
   qualification: {
+    qualificationReportId: null,
+    qualificationReportSha256: null,
+    processingChainQualified: false,
+    exactWorkerModelMatch: false,
     networkIsolationEnforced: false,
     modelManifestTrustEstablished: false,
     appAutoEnableAuthorized: false,

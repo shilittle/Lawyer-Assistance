@@ -7,6 +7,7 @@
 pub mod egress;
 pub mod finding_engine;
 pub mod protected_blob;
+pub mod qualification;
 pub mod receipt;
 pub mod risk_engine;
 pub mod store;
@@ -23,6 +24,10 @@ pub use egress::{
 pub use protected_blob::{
     protect_local, unprotect_local, ProtectedBlobError, LOCAL_PROTECTION_SCHEME,
     MAX_PROTECTED_PLAINTEXT_BYTES,
+};
+pub use qualification::{
+    parse_local_mineru_qualification_report, LocalMineruQualificationReportV1,
+    QualificationReportError,
 };
 pub use receipt::{
     sha256_hex, DestinationKind, DestinationScope, ReceiptError, ReceiptSigner,

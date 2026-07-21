@@ -43,6 +43,10 @@ export interface LocalOcrStatus {
 }
 
 export interface PrivacyVNextQualificationStatus {
+  qualificationReportId: string | null;
+  qualificationReportSha256: string | null;
+  processingChainQualified: boolean;
+  exactWorkerModelMatch: boolean;
   networkIsolationEnforced: boolean;
   modelManifestTrustEstablished: boolean;
   appAutoEnableAuthorized: boolean;
@@ -74,6 +78,10 @@ export interface PrivacyConfigResponse {
 
 export interface SavePrivacyConfigRequest {
   config: PrivacyConfig;
+}
+
+export interface InspectLocalMineruQualificationReportRequest {
+  reportJson: string;
 }
 
 export interface PrivacyConfigDraft {

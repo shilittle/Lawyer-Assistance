@@ -372,6 +372,7 @@ pub fn run() {
             commands::privacy::get_privacy_config,
             commands::privacy::save_privacy_config,
             commands::privacy::get_local_ocr_status,
+            commands::privacy::inspect_local_mineru_qualification_report,
             commands::privacy_workflow::delete_privacy_review,
             commands::provider::list_provider_profiles,
             commands::privacy_workflow::prepare_privacy_material,

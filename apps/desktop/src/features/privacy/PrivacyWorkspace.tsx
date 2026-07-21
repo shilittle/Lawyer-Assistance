@@ -195,6 +195,14 @@ export function PrivacyWorkspaceView({
   const status = configResponse.ocrStatus;
   const qualificationChecks = [
     [
+      "processingChainQualified",
+      configResponse.qualification.processingChainQualified,
+    ],
+    [
+      "exactWorkerModelMatch",
+      configResponse.qualification.exactWorkerModelMatch,
+    ],
+    [
       "networkIsolationEnforced",
       configResponse.qualification.networkIsolationEnforced,
     ],
@@ -261,6 +269,11 @@ export function PrivacyWorkspaceView({
             </div>
           ))}
         </dl>
+        <p className="privacy-qualification-note">
+          qualificationReportId: <code>{configResponse.qualification.qualificationReportId ?? "none"}</code>
+          {" · "}
+          qualificationReportSha256: <code>{configResponse.qualification.qualificationReportSha256 ?? "none"}</code>
+        </p>
         <ul className="privacy-capability-list">
           {productionCapabilities.map(([label, enabled]) => (
             <li className={enabled ? "is-qualified" : "is-blocked"} key={label}>

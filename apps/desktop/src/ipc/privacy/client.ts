@@ -7,6 +7,7 @@ import type {
   DeletePrivacyReviewResponse,
   ExportApprovedReviewPdfRequest,
   ExportApprovedReviewPdfResponse,
+  InspectLocalMineruQualificationReportRequest,
   LoadPrivacyReviewRequest,
   PreparePrivacyMaterialRequest,
   PreparePrivacyMaterialResponse,
@@ -28,6 +29,14 @@ export function savePrivacyConfig(
 
 export function getLocalOcrStatus(): Promise<LocalOcrStatus> {
   return invoke<LocalOcrStatus>("get_local_ocr_status");
+}
+export function inspectLocalMineruQualificationReport(
+  request: InspectLocalMineruQualificationReportRequest,
+): Promise<PrivacyConfigResponse> {
+  return invoke<PrivacyConfigResponse>(
+    "inspect_local_mineru_qualification_report",
+    { request },
+  );
 }
 export function preparePrivacyMaterial(
   request: PreparePrivacyMaterialRequest,

@@ -1,6 +1,6 @@
 use crate::privacy_manager::{
     LocalOcrStatus, PrivacyConfig, PrivacyConfigurationSnapshot, PrivacyManager,
-    PrivacyManagerError,
+    PrivacyManagerError, PrivacyVNextCapabilityMatrix,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -27,6 +27,11 @@ pub struct SavePrivacyConfigRequest {
     pub config: PrivacyConfig,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InspectLocalMineruQualificationReportRequest {
+    pub report_json: String,
+}
 #[tauri::command]
 pub async fn get_privacy_config(
     manager: State<'_, PrivacyManager>,
@@ -56,6 +61,30 @@ pub async fn save_privacy_config(
         .map_err(Into::into)
 }
 
+#[tauri::command]
+pub async fn inspect_local_mineru_qualification_report(
+    manager: State<'_, PrivacyManager>,
+    request: InspectLocalMineruQualificationReportRequest,
+) -> Result<PrivacyConfigurationSnapshot, IpcError> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let qualification =
+            manager.inspect_local_mineru_qualification_report(&request.report_json)?;
+        let mut snapshot = manager.configuration_snapshot()?;
+        snapshot.qualification = qualification;
+        snapshot.capabilities = PrivacyVNextCapabilityMatrix::current(
+            snapshot.config_valid,
+            snapshot.qualification.clone(),
+        );
+        Ok::<PrivacyConfigurationSnapshot, PrivacyManagerError>(snapshot)
+    })
+    .await
+    .map_err(|_| IpcError {
+        error_type: "runtime_failure".to_owned(),
+        message: "local MinerU qualification report inspection did not complete".to_owned(),
+    })?
+    .map_err(Into::into)
+}
 #[tauri::command]
 pub async fn get_local_ocr_status(
     manager: State<'_, PrivacyManager>,
@@ -112,7 +141,7 @@ mod tests {
     #[test]
     fn snapshot_serializes_honest_enforcement_and_verification_fields() {
         let qualification = PrivacyVNextQualificationStatus::current();
-        let capabilities = PrivacyVNextCapabilityMatrix::current(true, qualification);
+        let capabilities = PrivacyVNextCapabilityMatrix::current(true, qualification.clone());
         let snapshot = PrivacyConfigurationSnapshot {
             config: PrivacyConfig::default(),
             config_valid: true,

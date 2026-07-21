@@ -1,3 +1,4 @@
+use privacy::{parse_local_mineru_qualification_report, vnext::Sha256Hex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -116,7 +117,7 @@ impl Default for PrivacyConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalOcrStatusCode {
     Disabled,
@@ -140,9 +141,13 @@ pub struct LocalOcrStatus {
     pub network_isolation_verified: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrivacyVNextQualificationStatus {
+    pub qualification_report_id: Option<String>,
+    pub qualification_report_sha256: Option<String>,
+    pub processing_chain_qualified: bool,
+    pub exact_worker_model_match: bool,
     pub network_isolation_enforced: bool,
     pub model_manifest_trust_established: bool,
     pub app_auto_enable_authorized: bool,
@@ -152,6 +157,10 @@ pub struct PrivacyVNextQualificationStatus {
 impl PrivacyVNextQualificationStatus {
     pub(crate) const fn current() -> Self {
         Self {
+            qualification_report_id: None,
+            qualification_report_sha256: None,
+            processing_chain_qualified: false,
+            exact_worker_model_match: false,
             network_isolation_enforced: false,
             model_manifest_trust_established: false,
             app_auto_enable_authorized: false,
@@ -159,8 +168,10 @@ impl PrivacyVNextQualificationStatus {
         }
     }
 
-    pub(crate) const fn production_ocr_chain_authorized(self) -> bool {
-        self.network_isolation_enforced
+    pub(crate) fn production_ocr_chain_authorized(&self) -> bool {
+        self.processing_chain_qualified
+            && self.exact_worker_model_match
+            && self.network_isolation_enforced
             && self.model_manifest_trust_established
             && self.production_case_ocr_authorized
     }
@@ -327,7 +338,8 @@ impl PrivacyManager {
         };
         let ocr_status = inspect_local_ocr(&config.ocr);
         let qualification = self.current_qualification();
-        let capabilities = PrivacyVNextCapabilityMatrix::current(config_valid, qualification);
+        let capabilities =
+            PrivacyVNextCapabilityMatrix::current(config_valid, qualification.clone());
         Ok(PrivacyConfigurationSnapshot {
             config,
             config_valid,
@@ -353,6 +365,60 @@ impl PrivacyManager {
 
     pub(crate) const fn current_qualification(&self) -> PrivacyVNextQualificationStatus {
         PrivacyVNextQualificationStatus::current()
+    }
+
+    pub(crate) fn inspect_local_mineru_qualification_report(
+        &self,
+        report_json: &str,
+    ) -> Result<PrivacyVNextQualificationStatus, PrivacyManagerError> {
+        let config = self.state().config.clone();
+        let ocr_status = inspect_local_ocr(&config.ocr);
+        let expected_worker = ocr_status
+            .worker_sha256
+            .as_deref()
+            .map(Sha256Hex::parse)
+            .transpose()
+            .map_err(|_| {
+                PrivacyManagerError::new(
+                    "qualification_report_rejected",
+                    "local OCR worker hash is invalid; qualification remains blocked",
+                )
+            })?;
+        let expected_model = ocr_status
+            .model_manifest_sha256
+            .as_deref()
+            .map(Sha256Hex::parse)
+            .transpose()
+            .map_err(|_| {
+                PrivacyManagerError::new(
+                    "qualification_report_rejected",
+                    "local OCR model manifest hash is invalid; qualification remains blocked",
+                )
+            })?;
+        let snapshot = parse_local_mineru_qualification_report(
+            report_json.as_bytes(),
+            expected_worker.as_ref(),
+            expected_model.as_ref(),
+            None,
+        )
+        .map_err(|error| {
+            PrivacyManagerError::new(
+                "qualification_report_rejected",
+                format!("local MinerU qualification report rejected: {error}"),
+            )
+        })?;
+        Ok(PrivacyVNextQualificationStatus {
+            qualification_report_id: snapshot.qualification_report_id,
+            qualification_report_sha256: snapshot
+                .qualification_report_sha256
+                .map(|value| value.as_str().to_owned()),
+            processing_chain_qualified: snapshot.processing_chain_qualified,
+            exact_worker_model_match: snapshot.exact_worker_model_match,
+            network_isolation_enforced: snapshot.network_isolation_enforced,
+            model_manifest_trust_established: snapshot.model_manifest_trust_established,
+            app_auto_enable_authorized: false,
+            production_case_ocr_authorized: snapshot.production_case_ocr_authorized,
+        })
     }
 
     pub fn save_config(
@@ -928,6 +994,10 @@ mod tests {
     #[test]
     fn invalid_configuration_blocks_hypothetically_qualified_production_capabilities() {
         let hypothetical_qualification = PrivacyVNextQualificationStatus {
+            qualification_report_id: Some("qualification-v1".to_owned()),
+            qualification_report_sha256: Some("a".repeat(64)),
+            processing_chain_qualified: true,
+            exact_worker_model_match: true,
             network_isolation_enforced: true,
             model_manifest_trust_established: true,
             app_auto_enable_authorized: true,

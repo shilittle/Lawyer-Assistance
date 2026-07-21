@@ -10,6 +10,7 @@ import {
   loadLatestPrivacyReview,
   loadPrivacyReview,
   preparePrivacyMaterial,
+  inspectLocalMineruQualificationReport,
   getLocalOcrStatus,
   getPrivacyConfig,
   savePrivacyConfig,
@@ -130,4 +131,21 @@ describe("privacy IPC client", () => {
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("originalText");
   });
 
+  it("inspects a local MinerU qualification report without passing case paths", async () => {
+    await inspectLocalMineruQualificationReport({
+      reportJson: "{\"schemaVersion\":1,\"scope\":\"fixed_synthetic_canary_only\"}",
+    });
+
+    expect(invoke).toHaveBeenCalledWith(
+      "inspect_local_mineru_qualification_report",
+      {
+        request: {
+          reportJson: "{\"schemaVersion\":1,\"scope\":\"fixed_synthetic_canary_only\"}",
+        },
+      },
+    );
+    expect(JSON.stringify(invoke.mock.calls)).not.toContain("case/raw.pdf");
+    expect(JSON.stringify(invoke.mock.calls)).not.toContain("workerPath");
+    expect(JSON.stringify(invoke.mock.calls)).not.toContain("modelDirectory");
+  });
 });
