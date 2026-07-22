@@ -9,4 +9,4 @@
 
 必须停止：工具列表不是精确五项、profile 不是 `public_law_only`、法律库 degraded、日期或法域不足、问题含真实案件事实，或任何输入属于 `CASE_RAW`、`CASE_REDACTED_PENDING`、待复核/仅标签批准内容。
 
-当前没有安全的 App→MCP citation receipt 正向链，因而没有案件导入、案件分析、个案引证核验、文书生成、写入或导出工作流。
+本 public-only Skill 刻意没有 approved session，因而没有案件导入、案件分析、个案引证、写入或导出工作流。独立 approved Skill 的工作流只能从当前 MCP 直接响应取得批准正文，并通过 write/update/reread 保存；不能在本 Skill 中模拟或复制。

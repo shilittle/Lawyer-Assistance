@@ -7,22 +7,35 @@ import {
 } from "react";
 
 import {
+  discoverLocalMineru,
   getLocalOcrStatus,
   getPrivacyConfig,
   savePrivacyConfig,
 } from "../../ipc/privacy/client";
 import {
   PRIVACY_CONFIG_SCHEMA_VERSION,
+  type ApprovedProviderTask,
+  type LocalMineruDiscoveryResult,
   type PrivacyConfig,
   type PrivacyConfigDraft,
   type PrivacyConfigResponse,
 } from "../../ipc/privacy/types";
 import "./privacy.css";
+import { ApprovedMcpPanel } from "./ApprovedMcpPanel";
+import { MineruComponentManagerPanel } from "./MineruComponentManagerPanel";
+import { ProviderApprovalPanel } from "./ProviderApprovalPanel";
+import { PrivacyLifecyclePanel } from "./PrivacyLifecyclePanel";
+import { PrivacyQualificationControls } from "./PrivacyQualificationControls";
 import { PrivacyReviewWorkbench } from "./PrivacyReviewWorkbench";
 
-type PrivacyOperation = "loading" | "idle" | "saving" | "refreshing";
+type PrivacyOperation = "loading" | "idle" | "discovering" | "saving" | "refreshing";
 
 export interface PrivacyWorkspaceProps {
+  providerTaskRequest?: {
+    task: ApprovedProviderTask;
+    notice: string;
+    requestId: number;
+  } | null;
   onDraftDirtyChange?: (dirty: boolean) => void;
   onMutationActivityChange?: (active: boolean) => void;
 }
@@ -35,6 +48,7 @@ export interface PrivacyWorkspaceViewProps {
   notice: string;
   error: string;
   onDraftChange: (draft: PrivacyConfigDraft) => void;
+  onDiscover: () => void;
   onSave: () => void;
   onReset: () => void;
   onRefreshStatus: () => void;
@@ -51,6 +65,8 @@ export function privacyConfigToDraft(config: PrivacyConfig): PrivacyConfigDraft 
     ocrMode: config.ocr.mode,
     workerPath: config.ocr.workerPath ?? "",
     modelDirectory: config.ocr.modelDirectory ?? "",
+    toolsConfigPath: config.ocr.toolsConfigPath ?? "",
+    runtimeExecutablePaths: config.ocr.runtimeExecutablePaths.join("\n"),
     device: config.ocr.device,
     languages: config.ocr.languages.join(", "),
     timeoutSeconds: String(config.ocr.timeoutSeconds),
@@ -83,6 +99,21 @@ function optionalAbsolutePath(label: string, value: string): string | null {
   return normalized;
 }
 
+function normalizedRuntimePaths(value: string): string[] {
+  const paths = value
+    .split(/[\r\n;；]+/u)
+    .map((path) => optionalAbsolutePath("运行时可执行文件", path))
+    .filter((path): path is string => path !== null);
+  const unique = new Map(paths.map((path) => [path.toLocaleLowerCase(), path]));
+  if (unique.size !== paths.length) {
+    throw new Error("运行时可执行文件路径不得重复。");
+  }
+  if (paths.length > 64) {
+    throw new Error("运行时可执行文件不得超过 64 个。");
+  }
+  return paths;
+}
+
 function normalizedLanguages(value: string): string[] {
   const languages = value
     .split(/[\s,，;；]+/u)
@@ -102,6 +133,17 @@ function normalizedLanguages(value: string): string[] {
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
+export function applyLocalMineruDiscoveryToDraft(
+  current: PrivacyConfigDraft,
+  discovery: LocalMineruDiscoveryResult,
+): PrivacyConfigDraft {
+  return privacyConfigToDraft({
+    schemaVersion: PRIVACY_CONFIG_SCHEMA_VERSION,
+    privacyMode: current.privacyMode,
+    ocr: discovery.ocrConfig,
+  });
+}
+// eslint-disable-next-line react-refresh/only-export-components
 export function privacyDraftToConfig(draft: PrivacyConfigDraft): PrivacyConfig {
   const device = draft.device.trim().toLowerCase();
   if (!DEVICE.test(device)) {
@@ -114,6 +156,8 @@ export function privacyDraftToConfig(draft: PrivacyConfigDraft): PrivacyConfig {
       mode: draft.ocrMode,
       workerPath: optionalAbsolutePath("MinerU worker 路径", draft.workerPath),
       modelDirectory: optionalAbsolutePath("模型目录", draft.modelDirectory),
+      toolsConfigPath: optionalAbsolutePath("MinerU tools JSON", draft.toolsConfigPath),
+      runtimeExecutablePaths: normalizedRuntimePaths(draft.runtimeExecutablePaths),
       device,
       languages: normalizedLanguages(draft.languages),
       timeoutSeconds: parseBoundedInteger(
@@ -163,6 +207,8 @@ function statusLabel(code: PrivacyConfigResponse["ocrStatus"]["code"]): string {
       return "本地组件不可用";
     case "configured_unverified":
       return "已配置，尚未实机验证";
+    case "ready":
+      return "当前环境已验证并获授权";
   }
 }
 
@@ -186,6 +232,7 @@ export function PrivacyWorkspaceView({
   notice,
   error,
   onDraftChange,
+  onDiscover,
   onSave,
   onReset,
   onRefreshStatus,
@@ -194,6 +241,10 @@ export function PrivacyWorkspaceView({
   const ocrEnabled = draft.ocrMode !== "off";
   const status = configResponse.ocrStatus;
   const qualificationChecks = [
+    [
+      "syntheticCanaryQualified",
+      configResponse.qualification.syntheticCanaryQualified,
+    ],
     [
       "processingChainQualified",
       configResponse.qualification.processingChainQualified,
@@ -222,7 +273,7 @@ export function PrivacyWorkspaceView({
   const productionCapabilities = [
     ["扫描件 OCR", configResponse.capabilities.scannedCaseOcrEnabled],
     ["自动批准", configResponse.capabilities.automaticApprovalEnabled],
-    ["approved MCP", configResponse.capabilities.approvedCaseMcpEnabled],
+    ["App 自动本地 OCR", configResponse.capabilities.appAutoOcrEnabled],
   ] as const;
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -244,9 +295,9 @@ export function PrivacyWorkspaceView({
       <div className="privacy-boundary-warning" role="note">
         <strong>当前强制边界</strong>
         <p>
-          本地脱敏审阅、精确回执和安全 PDF 重建已经可用。案件 Provider 与生产 MCP
-          正向链尚未开放，后端默认拒绝（fail closed）；目前只有不携带案件材料的公开法律工具可以外发请求。
-          真实案件原件与获批脱敏案件材料均不得据此发送。
+          原件、OCR 中间产物和未获批准的案件内容始终禁止外发。只有经本地脱敏、人工复核、
+          精确回执与一次性票据绑定，并且对应后端能力显示“已授权”的副本，才能进入 approved MCP
+          或 Provider；任一资格、哈希、目标、用途、时效或消费状态不匹配都会 fail closed。
         </p>
       </div>
 
@@ -257,9 +308,11 @@ export function PrivacyWorkspaceView({
         <div className="panel-heading">
           <div>
             <p className="eyebrow">风险优先 · 后端资格快照</p>
-            <h3 id="privacy-vnext-gates-title">生产能力门全部保持阻断</h3>
+            <h3 id="privacy-vnext-gates-title">生产能力资格门（逐项后端授权）</h3>
           </div>
-          <span className="privacy-gate-badge">fail closed</span>
+                    <span className="privacy-gate-badge">
+            {configResponse.capabilities.scannedCaseOcrEnabled ? "qualified" : "fail closed"}
+          </span>
         </div>
         <dl className="privacy-qualification-list">
           {qualificationChecks.map(([name, value]) => (
@@ -284,7 +337,8 @@ export function PrivacyWorkspaceView({
         </ul>
         <p className="privacy-qualification-note">
           可以保存本地 worker、模型和 GPU 偏好，但这不构成来源认证、OS
-          网络隔离证据或生产授权；不得据此处理真实扫描案件、自动批准或启动案件材料 MCP。
+          网络隔离证据或生产授权；不得据此处理真实扫描案件或自动批准。approved MCP
+          与案件 Provider 使用各自独立、持久化且可撤销的资格面板，本 OCR 快照不会替它们授权或代报状态。
         </p>
       </section>
 
@@ -331,6 +385,15 @@ export function PrivacyWorkspaceView({
 
         <fieldset disabled={busy}>
           <legend>本地 MinerU OCR</legend>
+          <div className="privacy-discovery-actions">
+            <button type="button" onClick={onDiscover}>
+              {operation === "discovering" ? "正在发现…" : "自动发现本机 MinerU"}
+            </button>
+            <small>
+              只检查本机 uv/common 安装和固定本地模型缓存，不执行 MinerU、Python、shell
+              或任何网络命令；应用仅生成包含 pipeline/vlm 路径的最小离线配置。
+            </small>
+          </div>
           <div className="privacy-grid">
             <label>
               <span>OCR 模式</span>
@@ -344,12 +407,8 @@ export function PrivacyWorkspaceView({
                 }
               >
                 <option value="off">关闭</option>
-                <option value="auto_local">
-                  保存本地自动路由偏好（生产 OCR 仍受资格门阻断）
-                </option>
-                <option value="force_local">
-                  保存强制本地 OCR 偏好（生产 OCR 仍受资格门阻断）
-                </option>
+                <option value="auto_local">低质量页自动路由到已获资格的本地 OCR</option>
+                <option value="force_local">所有 PDF 页强制使用已获资格的本地 OCR</option>
               </select>
             </label>
             <label>
@@ -384,6 +443,32 @@ export function PrivacyWorkspaceView({
                   onDraftChange({
                     ...draft,
                     modelDirectory: event.target.value,
+                  })
+                }
+              />
+            </label>
+            <label className="privacy-wide-field">
+              <span>MinerU tools JSON 绝对路径</span>
+              <input
+                disabled={!ocrEnabled}
+                value={draft.toolsConfigPath}
+                placeholder="C:\\ProgramData\\Lawyer Assistance\\MinerU\\mineru.json"
+                onChange={(event) =>
+                  onDraftChange({ ...draft, toolsConfigPath: event.target.value })
+                }
+              />
+            </label>
+            <label className="privacy-wide-field">
+              <span>运行时可执行文件（每行一个绝对路径）</span>
+              <textarea
+                disabled={!ocrEnabled}
+                rows={4}
+                value={draft.runtimeExecutablePaths}
+                placeholder={"C:\\...\\mineru.exe\nC:\\...\\python.exe"}
+                onChange={(event) =>
+                  onDraftChange({
+                    ...draft,
+                    runtimeExecutablePaths: event.target.value,
                   })
                 }
               />
@@ -493,6 +578,7 @@ export function PrivacyWorkspaceView({
 }
 
 export function PrivacyWorkspace({
+  providerTaskRequest = null,
   onDraftDirtyChange,
   onMutationActivityChange,
 }: PrivacyWorkspaceProps) {
@@ -503,6 +589,11 @@ export function PrivacyWorkspace({
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [workflowActive, setWorkflowActive] = useState(false);
+  const [lifecycleActive, setLifecycleActive] = useState(false);
+  const [providerActive, setProviderActive] = useState(false);
+  const [approvedMcpActive, setApprovedMcpActive] = useState(false);
+  const [componentActive, setComponentActive] = useState(false);
+  const [qualificationActive, setQualificationActive] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -536,7 +627,15 @@ export function PrivacyWorkspace({
     return () => onDraftDirtyChange?.(false);
   }, [dirty, onDraftDirtyChange]);
 
-  const mutationActive = operation === "saving" || workflowActive;
+  const mutationActive =
+    operation === "discovering" ||
+    operation === "saving" ||
+    workflowActive ||
+    lifecycleActive ||
+    providerActive ||
+    approvedMcpActive ||
+    componentActive ||
+    qualificationActive;
   useEffect(() => {
     onMutationActivityChange?.(mutationActive);
     return () => onMutationActivityChange?.(false);
@@ -591,6 +690,25 @@ export function PrivacyWorkspace({
     }
   }, [configResponse, dirty, operation]);
 
+  const discover = useCallback(async () => {
+    if (!configResponse || !draft || operation !== "idle") return;
+    setOperation("discovering");
+    setError("");
+    setNotice("");
+    try {
+      const result = await discoverLocalMineru();
+      setDraft((current) =>
+        current ? applyLocalMineruDiscoveryToDraft(current, result) : current,
+      );
+      setNotice(
+        "已发现本机 MinerU 并生成最小离线配置，但尚未保存；请依次执行：保存配置 → 安装信任 → 安装防火墙隔离 → 运行资格检查。",
+      );
+    } catch (reason: unknown) {
+      setError(displayError(reason));
+    } finally {
+      setOperation("idle");
+    }
+  }, [configResponse, draft, operation]);
   if (!configResponse || !draft) {
     return (
       <section className="privacy-workspace" aria-busy={operation === "loading"}>
@@ -614,13 +732,50 @@ export function PrivacyWorkspace({
         notice={notice}
         error={error}
         onDraftChange={setDraft}
+        onDiscover={() => void discover()}
         onSave={() => void save()}
         onReset={reset}
         onRefreshStatus={() => void refreshStatus()}
       />
+      <MineruComponentManagerPanel
+        snapshot={configResponse}
+        disabled={
+          dirty ||
+          operation !== "idle" ||
+          workflowActive ||
+          lifecycleActive ||
+          providerActive ||
+          approvedMcpActive ||
+          qualificationActive
+        }
+        onSnapshot={(next) => {
+          setConfigResponse(next);
+          setDraft(privacyConfigToDraft(next.config));
+        }}
+        onActivityChange={setComponentActive}
+      />
+      <PrivacyQualificationControls
+        snapshot={configResponse}
+        disabled={dirty || operation !== "idle" || approvedMcpActive || componentActive}
+        onSnapshot={setConfigResponse}
+        onActivityChange={setQualificationActive}
+      />
+      <PrivacyLifecyclePanel
+        disabled={dirty || operation !== "idle" || providerActive || approvedMcpActive || componentActive || qualificationActive}
+        onActivityChange={setLifecycleActive}
+      />
       <PrivacyReviewWorkbench
-        disabled={!configResponse.configValid || dirty || operation !== "idle"}
+        disabled={!configResponse.configValid || dirty || operation !== "idle" || providerActive || approvedMcpActive || componentActive || qualificationActive}
         onActivityChange={setWorkflowActive}
+      />
+      <ProviderApprovalPanel
+        taskRequest={providerTaskRequest}
+        disabled={!configResponse.configValid || dirty || operation !== "idle" || workflowActive || lifecycleActive || approvedMcpActive || componentActive || qualificationActive}
+        onActivityChange={setProviderActive}
+      />
+      <ApprovedMcpPanel
+        disabled={!configResponse.configValid || dirty || operation !== "idle" || workflowActive || lifecycleActive || providerActive || componentActive || qualificationActive}
+        onActivityChange={setApprovedMcpActive}
       />
     </>
   );

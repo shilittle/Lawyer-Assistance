@@ -1,10 +1,17 @@
+use crate::approved_mcp::{
+    ApprovedMcpServerSession, ApprovedMcpWorkspace, StandaloneMcpHostBinding,
+};
 use legal_mcp::{
-    config::{BearerSecret, EmbeddedHttpConfig},
+    config::{normalize_allowed_origins, BearerSecret, EmbeddedHttpConfig},
     handler::LegalMcpServer,
-    registry::ToolRegistry,
+    registry::{PrivacyProfile, ToolRegistry},
     service_adapter::ServiceAdapter,
+    standalone_approved::{
+        ApprovedMcpGrantGroupV1, ProvisionedStandaloneSessionV1, StandaloneSessionMetadataV1,
+    },
 };
 use legal_services::{LegalServices, ServiceConfig};
+use privacy::mcp_ticket::McpTransportBindingV1;
 use providers::{ApiSecret, CredentialStore, ProviderCredentialKey, ProviderStoreLock};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -144,6 +151,7 @@ struct ServerRuntime {
     generation: u64,
     cancellation: CancellationToken,
     task: JoinHandle<()>,
+    approved_session: Option<ApprovedMcpServerSession>,
 }
 
 #[derive(Debug)]
@@ -171,6 +179,7 @@ struct McpManagerShared {
     credential_store: WindowsCredentialStore,
     credential_key: ProviderCredentialKey,
     lifecycle_notify: Notify,
+    approved_workspace: Option<ApprovedMcpWorkspace>,
     state: Mutex<ManagerState>,
 }
 
@@ -184,6 +193,9 @@ impl Drop for McpManagerShared {
             token.cancel();
         }
         if let Some(runtime) = state.runtime.as_ref() {
+            if let Some(session) = runtime.approved_session.as_ref() {
+                let _ = session.revoke_all();
+            }
             runtime.cancellation.cancel();
             runtime.task.abort();
         }
@@ -196,24 +208,58 @@ pub struct McpManager {
 }
 
 impl McpManager {
+    #[cfg(test)]
     pub fn new(
         app_local_data_directory: PathBuf,
         legal_database_path: PathBuf,
         user_database_path: PathBuf,
     ) -> Result<Self, McpManagerError> {
-        Self::new_with_credential_prefix(
+        Self::new_internal(
             app_local_data_directory,
             legal_database_path,
             user_database_path,
             CREDENTIAL_SERVICE_PREFIX.to_owned(),
+            None,
         )
     }
 
+    pub(crate) fn new_with_approved_workspace(
+        app_local_data_directory: PathBuf,
+        legal_database_path: PathBuf,
+        user_database_path: PathBuf,
+        approved_workspace: ApprovedMcpWorkspace,
+    ) -> Result<Self, McpManagerError> {
+        Self::new_internal(
+            app_local_data_directory,
+            legal_database_path,
+            user_database_path,
+            CREDENTIAL_SERVICE_PREFIX.to_owned(),
+            Some(approved_workspace),
+        )
+    }
+
+    #[cfg(test)]
     fn new_with_credential_prefix(
         app_local_data_directory: PathBuf,
         legal_database_path: PathBuf,
         user_database_path: PathBuf,
         credential_service_prefix: String,
+    ) -> Result<Self, McpManagerError> {
+        Self::new_internal(
+            app_local_data_directory,
+            legal_database_path,
+            user_database_path,
+            credential_service_prefix,
+            None,
+        )
+    }
+
+    fn new_internal(
+        app_local_data_directory: PathBuf,
+        legal_database_path: PathBuf,
+        user_database_path: PathBuf,
+        credential_service_prefix: String,
+        approved_workspace: Option<ApprovedMcpWorkspace>,
     ) -> Result<Self, McpManagerError> {
         let app_local_data_directory = ensure_directory(&app_local_data_directory, true)?;
         let legal_database_path = validate_managed_database_path(&legal_database_path)?;
@@ -288,6 +334,7 @@ impl McpManager {
                     CREDENTIAL_PROVIDER_ID,
                     CREDENTIAL_ACCOUNT_ID,
                 ),
+                approved_workspace,
                 lifecycle_notify: Notify::new(),
                 state: Mutex::new(ManagerState {
                     config,
@@ -468,7 +515,12 @@ impl McpManager {
         let startup = self
             .prepare_server(config, startup_cancellation.clone())
             .await;
-        let (server, resolved, listener) = match startup {
+        let PreparedServer {
+            server,
+            resolved,
+            listener,
+            approved_session,
+        } = match startup {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_start_failure(generation, error.message());
@@ -476,6 +528,9 @@ impl McpManager {
             }
         };
         if startup_cancellation.is_cancelled() {
+            if let Some(session) = approved_session.as_ref() {
+                let _ = session.revoke_all();
+            }
             let error = McpManagerError::new(
                 "server_cancelled",
                 "MCP server startup was cancelled because the application is exiting",
@@ -528,18 +583,23 @@ impl McpManager {
                 generation,
                 cancellation,
                 task,
+                approved_session,
             });
         }
         if begin_tx.send(()).is_err() {
             let mut state = self.state();
             let mut state_changed = false;
+            let mut failed_session = None;
             if state
                 .runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.generation == generation)
             {
                 let was_stopping = state.phase == ServerPhase::Stopping;
-                state.runtime = None;
+                failed_session = state
+                    .runtime
+                    .take()
+                    .and_then(|runtime| runtime.approved_session);
                 state.phase = if was_stopping {
                     ServerPhase::Stopped
                 } else {
@@ -555,6 +615,9 @@ impl McpManager {
                 state_changed = true;
             }
             drop(state);
+            if let Some(session) = failed_session.as_ref() {
+                let _ = session.revoke_all();
+            }
             if state_changed {
                 self.shared.lifecycle_notify.notify_waiters();
             }
@@ -567,7 +630,7 @@ impl McpManager {
     }
 
     pub async fn stop(&self) -> Result<McpServerStatus, McpManagerError> {
-        {
+        let approved_session = {
             let mut state = self.state();
             match state.phase {
                 ServerPhase::Stopped => return Ok(status_from_state(&state)),
@@ -595,6 +658,13 @@ impl McpManager {
                     state.last_error = None;
                 }
             }
+            state
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.approved_session.clone())
+        };
+        if let Some(session) = approved_session.as_ref() {
+            session.revoke_all().map_err(map_approved_mcp_error)?;
         }
 
         let deadline = tokio::time::Instant::now() + STOP_WAIT_TIMEOUT;
@@ -624,6 +694,10 @@ impl McpManager {
     pub fn cancel_for_exit(&self) {
         let mut state = self.state();
         state.exiting = true;
+        let approved_session = state
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.approved_session.clone());
         if let Some(cancellation) = state.startup_cancellation.as_ref() {
             cancellation.cancel();
         }
@@ -634,6 +708,9 @@ impl McpManager {
             state.phase = ServerPhase::Stopping;
         }
         drop(state);
+        if let Some(session) = approved_session.as_ref() {
+            let _ = session.revoke_all();
+        }
         self.shared.lifecycle_notify.notify_waiters();
     }
 
@@ -672,6 +749,111 @@ impl McpManager {
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn provision_standalone_approved_session(
+        &self,
+        connector_id: String,
+        transport: McpTransportBindingV1,
+        grant_groups: Vec<ApprovedMcpGrantGroupV1>,
+        ttl_seconds: u64,
+        http_port: Option<u16>,
+        allowed_origins: Vec<String>,
+    ) -> Result<ProvisionedStandaloneSessionV1, McpManagerError> {
+        let (config, workspace) = {
+            let state = self.state();
+            if !state.config_valid {
+                return Err(McpManagerError::new(
+                    "configuration_invalid",
+                    "The saved MCP configuration is invalid",
+                ));
+            }
+            let workspace = self.shared.approved_workspace.clone().ok_or_else(|| {
+                McpManagerError::new(
+                    "approved_mcp_session_unavailable",
+                    "The approved MCP workspace is unavailable",
+                )
+            })?;
+            (state.config.clone(), workspace)
+        };
+        let allowed_origins = normalize_allowed_origins(allowed_origins).map_err(|_| {
+            McpManagerError::new(
+                "approved_mcp_standalone_origin_invalid",
+                "The standalone approved MCP allowed-origin list is invalid",
+            )
+        })?;
+        let http_bind = match (transport, http_port) {
+            (McpTransportBindingV1::Stdio, None) if allowed_origins.is_empty() => None,
+            (McpTransportBindingV1::StreamableHttp, Some(port)) if port >= MIN_PORT => Some(
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            ),
+            _ => {
+                return Err(McpManagerError::new(
+                    "approved_mcp_standalone_binding_invalid",
+                    "The standalone approved MCP transport binding is invalid",
+                ))
+            }
+        };
+        workspace
+            .provision_standalone_session(
+                connector_id,
+                transport,
+                grant_groups,
+                ttl_seconds,
+                StandaloneMcpHostBinding {
+                    legal_database_path: self.shared.legal_database_path.clone(),
+                    user_database_path: self.shared.user_database_path.clone(),
+                    allowed_roots: config.allowed_roots,
+                    output_root: config.output_root,
+                    http_bind,
+                    allowed_origins,
+                },
+            )
+            .map_err(map_approved_mcp_error)
+    }
+
+    pub(crate) fn list_standalone_approved_sessions(
+        &self,
+    ) -> Result<Vec<StandaloneSessionMetadataV1>, McpManagerError> {
+        self.shared
+            .approved_workspace
+            .as_ref()
+            .ok_or_else(|| {
+                McpManagerError::new(
+                    "approved_mcp_session_unavailable",
+                    "The approved MCP workspace is unavailable",
+                )
+            })?
+            .list_standalone_sessions()
+            .map_err(map_approved_mcp_error)
+    }
+
+    pub(crate) fn revoke_standalone_approved_session(
+        &self,
+        server_instance_id: &str,
+    ) -> Result<(), McpManagerError> {
+        self.shared
+            .approved_workspace
+            .as_ref()
+            .ok_or_else(|| {
+                McpManagerError::new(
+                    "approved_mcp_session_unavailable",
+                    "The approved MCP workspace is unavailable",
+                )
+            })?
+            .revoke_standalone_session(server_instance_id)
+            .map_err(map_approved_mcp_error)
+    }
+
+    pub(crate) fn revoke_active_approved_tickets(&self) -> Result<(), McpManagerError> {
+        let session = self
+            .state()
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.approved_session.clone());
+        session.map_or(Ok(()), |value| {
+            value.revoke_all().map_err(map_approved_mcp_error)
+        })
     }
 
     pub async fn shutdown_for_exit_with_timeout(&self, timeout: Duration) -> bool {
@@ -725,7 +907,7 @@ impl McpManager {
             request_timeout_ms: config.request_timeout_ms,
             max_concurrency: config.max_concurrency,
         };
-        let resolved = embedded.resolve().map_err(|_| {
+        let mut resolved = embedded.resolve().map_err(|_| {
             McpManagerError::new(
                 "invalid_configuration",
                 "The saved MCP server configuration is invalid",
@@ -765,14 +947,57 @@ impl McpManager {
                 "MCP server startup was cancelled",
             ));
         }
-        let server = LegalMcpServer::new(ToolRegistry::new(), ServiceAdapter::new(services));
-        let listener = TcpListener::bind(resolved.bind).await.map_err(|_| {
-            McpManagerError::new(
-                "port_unavailable",
-                "The configured local MCP port is unavailable",
+        let approved_session = if let Some(workspace) = self.shared.approved_workspace.clone() {
+            tokio::task::spawn_blocking(move || {
+                workspace.prepare_session(McpTransportBindingV1::StreamableHttp)
+            })
+            .await
+            .map_err(|_| {
+                McpManagerError::new(
+                    "runtime_failure",
+                    "Approved MCP session preparation did not complete",
+                )
+            })?
+            .map_err(map_approved_mcp_error)?
+        } else {
+            None
+        };
+        if cancellation.is_cancelled() {
+            if let Some(session) = approved_session.as_ref() {
+                let _ = session.revoke_all();
+            }
+            return Err(McpManagerError::new(
+                "server_cancelled",
+                "MCP server startup was cancelled",
+            ));
+        }
+        let server = if let Some(session) = approved_session.as_ref() {
+            resolved.privacy_profile = PrivacyProfile::ApprovedCaseWorkspace;
+            LegalMcpServer::new(
+                ToolRegistry::for_profile(PrivacyProfile::ApprovedCaseWorkspace),
+                ServiceAdapter::for_approved_workspace(services, session.backend().clone()),
             )
-        })?;
-        Ok((server, resolved, listener))
+        } else {
+            LegalMcpServer::new(ToolRegistry::new(), ServiceAdapter::new(services))
+        };
+        let listener = match TcpListener::bind(resolved.bind).await {
+            Ok(listener) => listener,
+            Err(_) => {
+                if let Some(session) = approved_session.as_ref() {
+                    let _ = session.revoke_all();
+                }
+                return Err(McpManagerError::new(
+                    "port_unavailable",
+                    "The configured local MCP port is unavailable",
+                ));
+            }
+        };
+        Ok(PreparedServer {
+            server,
+            resolved,
+            listener,
+            approved_session,
+        })
     }
 
     fn record_start_failure(&self, generation: u64, message: &str) {
@@ -851,11 +1076,12 @@ impl McpManager {
     }
 }
 
-type PreparedServer = (
-    LegalMcpServer,
-    legal_mcp::config::ResolvedConfig,
-    TcpListener,
-);
+struct PreparedServer {
+    server: LegalMcpServer,
+    resolved: legal_mcp::config::ResolvedConfig,
+    listener: TcpListener,
+    approved_session: Option<ApprovedMcpServerSession>,
+}
 
 #[derive(Debug)]
 struct ControlOperationGuard {
@@ -907,7 +1133,10 @@ fn record_server_exit(
             .runtime
             .as_ref()
             .is_some_and(|runtime| runtime.cancellation.is_cancelled());
-    state.runtime = None;
+    let approved_session = state
+        .runtime
+        .take()
+        .and_then(|runtime| runtime.approved_session);
     state.endpoint = None;
     state.started_at = None;
     if expected_shutdown {
@@ -922,6 +1151,9 @@ fn record_server_exit(
         });
     }
     drop(state);
+    if let Some(session) = approved_session.as_ref() {
+        let _ = session.revoke_all();
+    }
     shared.lifecycle_notify.notify_waiters();
 }
 
@@ -1337,6 +1569,10 @@ fn read_bearer_secret(
         .transpose()
 }
 
+fn map_approved_mcp_error(error: crate::approved_mcp::ApprovedMcpError) -> McpManagerError {
+    McpManagerError::new(error.code(), error.message())
+}
+
 fn credential_error(_error: providers::ProviderError) -> McpManagerError {
     McpManagerError::new(
         "credential_unavailable",
@@ -1603,6 +1839,7 @@ mod tests {
                 generation,
                 cancellation,
                 task,
+                approved_session: None,
             });
         }
 
@@ -1720,6 +1957,7 @@ mod tests {
                 generation,
                 cancellation: cancellation.clone(),
                 task,
+                approved_session: None,
             });
         }
 

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lawyer-assistance.local/schemas/privacy-evaluation-report-v1.schema.json",
+  "title": "Lawyer Assistance Offline Privacy Evaluation Report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "corpusId", "detectorVersion", "policyVersion", "syntheticOnly", "overall", "byEntity", "byOcrStratum", "documentCount", "documentEscapeCount", "documentEscapeRatePpm", "expectedCalibrationErrorPpm", "reliabilityBins", "autoApprovalCandidateCount", "autoCandidateHumanModifiedCount", "autoCandidateHumanModifiedRatePpm", "missedP0Count", "missedP1Count", "productionQualificationAllowed", "qualificationReasonCode", "evidenceHash"],
+  "properties": {
+    "schemaVersion": { "const": "privacy-evaluation-report-v1" },
+    "corpusId": { "$ref": "#/$defs/token" },
+    "detectorVersion": { "$ref": "#/$defs/token" },
+    "policyVersion": { "$ref": "#/$defs/token" },
+    "syntheticOnly": { "type": "boolean" },
+    "overall": { "$ref": "#/$defs/metrics" },
+    "byEntity": { "type": "object", "additionalProperties": { "$ref": "#/$defs/metrics" } },
+    "byOcrStratum": { "type": "object", "additionalProperties": { "$ref": "#/$defs/metrics" } },
+    "documentCount": { "$ref": "#/$defs/count" },
+    "documentEscapeCount": { "$ref": "#/$defs/count" },
+    "documentEscapeRatePpm": { "$ref": "#/$defs/ppm" },
+    "expectedCalibrationErrorPpm": { "$ref": "#/$defs/ppm" },
+    "reliabilityBins": { "type": "array", "minItems": 10, "maxItems": 10, "items": { "$ref": "#/$defs/bin" } },
+    "autoApprovalCandidateCount": { "$ref": "#/$defs/count" },
+    "autoCandidateHumanModifiedCount": { "$ref": "#/$defs/count" },
+    "autoCandidateHumanModifiedRatePpm": { "$ref": "#/$defs/ppm" },
+    "missedP0Count": { "$ref": "#/$defs/count" },
+    "missedP1Count": { "$ref": "#/$defs/count" },
+    "productionQualificationAllowed": { "const": false },
+    "qualificationReasonCode": { "const": "offline_report_cannot_self_qualify_production" },
+    "evidenceHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "$defs": {
+    "token": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "count": { "type": "integer", "minimum": 0 },
+    "ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truePositive", "falsePositive", "falseNegative", "trueNegative", "precisionPpm", "recallPpm", "falseNegativeRatePpm", "falsePositiveRatePpm"],
+      "properties": {
+        "truePositive": { "$ref": "#/$defs/count" },
+        "falsePositive": { "$ref": "#/$defs/count" },
+        "falseNegative": { "$ref": "#/$defs/count" },
+        "trueNegative": { "$ref": "#/$defs/count" },
+        "precisionPpm": { "$ref": "#/$defs/ppm" },
+        "recallPpm": { "$ref": "#/$defs/ppm" },
+        "falseNegativeRatePpm": { "$ref": "#/$defs/ppm" },
+        "falsePositiveRatePpm": { "$ref": "#/$defs/ppm" }
+      }
+    },
+    "bin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lowerBoundPpm", "upperBoundPpm", "sampleCount", "meanConfidencePpm", "empiricalAccuracyPpm"],
+      "properties": {
+        "lowerBoundPpm": { "$ref": "#/$defs/ppm" },
+        "upperBoundPpm": { "$ref": "#/$defs/ppm" },
+        "sampleCount": { "$ref": "#/$defs/count" },
+        "meanConfidencePpm": { "$ref": "#/$defs/ppm" },
+        "empiricalAccuracyPpm": { "$ref": "#/$defs/ppm" }
+      }
+    }
+  }
+}

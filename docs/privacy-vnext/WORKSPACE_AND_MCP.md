@@ -2,9 +2,9 @@
 
 ## 1. 两个物理数据域
 
-`vault` 保存原件、OCR 私有结果、真实实体、mapping、review state 和密钥材料；`workspace` 只保存已批准脱敏材料、最小公开元数据和脱敏 work products。两者使用不同根目录、不同 Broker 能力和不同服务接口。
+`vault` 保存原件、OCR 私有结果、真实实体、mapping、review state 和密钥材料；`workspace` 只保存已批准脱敏材料、最小公开元数据和加密落盘的脱敏 work products。两者使用不同根目录、不同 Broker 能力和不同服务接口。
 
-MCP 进程或嵌入服务只能得到 `ApprovedWorkspaceService` 与 `WorkProductService`，不得得到 vault root、privacy database、user.sqlite、任意文件读取能力或解密能力。
+MCP handler 只能得到 `ApprovedWorkspaceService` 与 scoped `WorkProductService`，不得得到 vault root、workspace root、privacy database、user.sqlite、mapping、任意文件读取能力或通用解密能力。只有 `WorkProductService` 可以在一次受限 read 操作中，对调用指定且已通过全部绑定校验的单个 work product 进行鉴权解密；它没有 Vault、mapping、root 浏览或任意路径能力。
 
 当前若仍在同一 Windows 用户边界内运行，隔离级别必须标记为 `user-boundary-only`。只有独立服务身份、受验证的 DACL 与进程访问测试通过后，才能标记 `strong-service-boundary`。
 
@@ -53,7 +53,17 @@ work product 只能写入：
 
 ```text
 workspace/<case-id>/work-products/<work-product-id>/<version>/
+  content.envelope.json
+  manifest.json
+  commit.json
 ```
+
+每个 immutable version 的文件集合必须精确等于上述三项：
+
+- `content.envelope.json` 是 canonical JSON 加密 envelope，不是明文正文。每个 generation 都生成新的随机 AES-256-GCM data key 与 nonce，data key 由 Windows DPAPI CurrentUser 包装。
+- AES-GCM AAD 绑定 `workspace_instance_id`、case ID、work-product ID、version、signed-manifest SHA-256、content SHA-256、content bytes 与 media type；跨 workspace/case/object/version/manifest/content 调换均无法通过认证。
+- `manifest.json` 是 canonical、签名的 work-product manifest；`commit.json` 再绑定 case/work-product/version、manifest hash、content hash 与长度。
+- 旧格式明文 `content.bin`、任何额外/缺失文件、非普通文件、symlink/reparse/hardlink、非 canonical/未知字段、签名或 hash 不一致都 fail closed。正文不会以明文文件落盘。
 
 服务端生成 ID 与版本；更新要求 `expected_parent_version` 和 idempotency key。写入必须：
 
@@ -63,7 +73,7 @@ workspace/<case-id>/work-products/<work-product-id>/<version>/
 - 使用 immutable generation + 原子 current pointer。
 - 不得覆盖 approved、vault 或另一个 case。
 
-撤销源材料后，相关 work product 标记 stale；是否允许只读由组织策略决定，但不得继续作为有效源生成新成果。
+读取时，scoped `WorkProductService` 先验证 exact file set、固定本地普通文件身份、canonical manifest/commit/envelope、manifest 签名、全部 AAD/ID/version/hash/length/media bindings、当前 approved source refs 与 revocation，再鉴权解密并复算 content hash、执行 residual scan；任一步失败均不返回正文。撤销源材料后，相关 work product 立即失效；当前实现阻断 list/read/update/export，不允许用组织策略把已撤销源降级成“仍可读”。合法保留只影响受控保留/清理，不重新授予 MCP 内容访问能力。
 
 ## 5. MCP profiles
 
@@ -89,6 +99,8 @@ workspace/<case-id>/work-products/<work-product-id>/<version>/
 所有参数 `deny_unknown_fields`，只接受严格 opaque ID、受限枚举、页码/limit/cursor、受限搜索串、受限正文和并发版本。禁止 path、filename、URI、URL、directory、glob、command、shell、任意 metadata object 和任意环境选择。
 
 profile 启用门包括：workspace 完整性、manifest verifier、撤销检查、双通道 egress scan、隔离级别政策、资格 tuple 和本地显式设置。默认关闭，不从旧 `redacted_case` 自动迁移。
+
+formal Windows App 与 MCP sibling 是成对发布物：构建流程先生成并测量 exact `lawyer-assistance-mcp.exe`，再把其 SHA-256 编译进 App。approved-MCP qualification 同时核对该 trust anchor、canonical sibling path/file identity、版本、canary 行为、App/workspace/server key/transport 与撤销 epoch。普通未绑定 development App、缺失/畸形 hash、同名替换或只模仿版本/canary 的二进制一律 fail closed。
 
 ## 6. MCP 输出与错误
 
@@ -125,5 +137,4 @@ profile 启用门包括：workspace 完整性、manifest verifier、撤销检查
 
 ## 9. 当前交付状态
 
-该架构在代码落地并完成资格矩阵前均为 `designed`。v0.3.1 默认 MCP 仍是 `public_law_only`；当前没有任何生产案件材料可通过 MCP 读取，且 Provider 案件路径继续 fail closed。
 

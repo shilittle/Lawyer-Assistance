@@ -222,6 +222,28 @@ fn unavailable_or_inconsistent_confidence_fails_closed() {
         validate_ocr_document_structure_v1(&document),
         Err(OcrIntegrityError::ConfidenceSummaryMismatch)
     );
+
+    let mut false_warning = fixture_document();
+    false_warning.pages[0]
+        .warnings
+        .push(OcrWarningV1::LowConfidence);
+    assert_eq!(
+        validate_ocr_document_structure_v1(&false_warning),
+        Err(OcrIntegrityError::ConfidenceSummaryMismatch)
+    );
+
+    let mut missing_warning = fixture_document();
+    missing_warning.pages[0].blocks[0].ocr_confidence_ppm = ppm(600_000);
+    missing_warning.pages[0].minimum_ocr_confidence_ppm = ppm(600_000);
+    missing_warning.pages[0].mean_ocr_confidence_ppm = ppm(600_000);
+    assert_eq!(
+        validate_ocr_document_structure_v1(&missing_warning),
+        Err(OcrIntegrityError::ConfidenceSummaryMismatch)
+    );
+    missing_warning.pages[0]
+        .warnings
+        .push(OcrWarningV1::LowConfidence);
+    assert_eq!(validate_ocr_document_structure_v1(&missing_warning), Ok(()));
 }
 
 #[test]

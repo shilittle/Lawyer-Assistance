@@ -8,11 +8,11 @@
 |---|---|---|
 | `public_law_only` | 五个公开法律只读工具 | 默认且唯一获准的生产 profile |
 | `redacted_case` | 公开五项 + receipt-gated `citation_validate` | 实验；App 无法签发该用途票据，生产不可用 |
-| `approved_case_workspace` | 公开五项 + 十个 ID-only 批准材料/成果工具 | 资格门禁；当前案件执行 `PROFILE_NOT_QUALIFIED`，宿主资产默认禁用 |
+| `approved_case_workspace` | 公开五项 + 十个 ID-only 批准材料/成果工具 | 真实 handler；仅当前 App 资格 + standalone session + 精确一次性 ticket 有效时执行，静态宿主资产默认禁用 |
 
 `redacted_case` 的第六项要求活动、未撤销、未过期的精确票据。票据必须绑定完整请求字节、固定 MCP 目标、固定用途、策略/探测器/内容哈希、密钥版本和短 TTL；材料页或本地导出票据不能复用。当前 App 没有这条签发路径，所以没有生产正向调用。
 
-`approved_case_workspace` 的十个新工具仅处理签名批准 generation 与匿名 work-product。正文只可由当前 `case_read_approved_material` 直接响应提供；输出只可通过 `case_write_work_product` 或 `case_update_work_product` 写回。完整契约见[批准案件工作区 profile](approved-case-workspace.md)。
+`approved_case_workspace` 的十个新工具仅处理签名批准 generation 与匿名 work-product。正文只可由当前 `case_read_approved_material` 直接响应提供；输出只可通过 `case_write_work_product` 或 `case_update_work_product` 写回。formal App 在构建时内置 exact paired MCP sibling SHA-256；运行时还复测 sibling path/file identity/version/behavior。无该 compile-time anchor 的 development App、同名替换 binary、静态 host allowlist 或用户同意均不能取得 qualification。完整契约见[批准案件工作区 profile](approved-case-workspace.md)。
 
 以下旧宽泛能力在所有 profile 中都隐藏并拒绝调用：`case_get_state`、`case_propose_patch`、`case_apply_patch`、`case_analyze_gaps`、`document_generate`、`document_export`。任意路径材料导入也不可用；不得用文件、命令、浏览器、Provider 或其他 MCP 工具重建这些流程。
 
@@ -26,6 +26,8 @@
 - `openWorldHint: false`
 
 成功响应使用版本化 envelope；错误和日志不得回显令牌、客户文本、数据库路径或本地文件路径。MCP 的 `content` 与 `structuredContent` 两个结果通道都执行隐私残留检查。
+
+`public_law_only` 与 `approved_case_workspace` 是不同的数据面，不是同一 profile 的“开关强弱”：public 五项不能读取 approved material/work product/Vault；approved 十项也不能接受任意路径、附件、粘贴原文或 raw OCR。实际 sibling binary 的 stdio/HTTP 合成 E2E 已通过，只证明 handler/transport/auth chain 存在。当前机器 OCR 四项资格仍为 `false`，该 E2E 不等于真实扫描案件获准处理。
 
 ## 五个生产工具
 

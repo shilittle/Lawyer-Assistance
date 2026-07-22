@@ -73,7 +73,19 @@ pub struct LocalMineruBinaryEvidenceV1 {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LocalMineruGpuEvidenceV1 {
     pub nvidia_smi_sha256: Sha256Hex,
-    pub devices: Vec<Value>,
+    pub selected_cuda_device: u32,
+    pub devices: Vec<LocalMineruGpuDeviceEvidenceV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LocalMineruGpuDeviceEvidenceV1 {
+    pub index: u32,
+    pub name: String,
+    pub driver_version: String,
+    #[serde(rename = "memoryMiB")]
+    pub memory_mib: u32,
+    pub descriptor_sha256: Sha256Hex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +105,7 @@ pub struct LocalMineruVerificationEvidenceV1 {
     pub page_count: u32,
     pub page_indices: Vec<u32>,
     pub page_size: Vec<u32>,
-    pub exact_text_items: u32,
+    pub exact_verified_text_entries: u32,
     pub output_file_count: u32,
     pub output_bytes: u64,
     pub isolated_job_file_count: u32,
@@ -199,19 +211,52 @@ impl LocalMineruQualificationReportV1 {
         {
             return Err(QualificationReportError::UnsafeSyntheticCanary);
         }
-        if self.verification.page_count != 1
-            || self.verification.page_indices != [0]
-            || self.verification.page_size.len() != 2
-            || self.verification.exact_text_items == 0
+        if self.gpu.devices.is_empty() || self.gpu.devices.len() > 16 {
+            return Err(QualificationReportError::UnsafeSyntheticCanary);
+        }
+        let mut indices = std::collections::BTreeSet::new();
+        for device in &self.gpu.devices {
+            let descriptor = crate::sha256_hex(
+                format!(
+                    "{}|{}|{}|{}",
+                    device.index, device.name, device.driver_version, device.memory_mib
+                )
+                .as_bytes(),
+            );
+            if !indices.insert(device.index)
+                || !valid_gpu_name(&device.name)
+                || device.memory_mib < 1024
+                || !valid_nvidia_driver_version(&device.driver_version)
+                || device.descriptor_sha256.as_str() != descriptor
+            {
+                return Err(QualificationReportError::UnsafeSyntheticCanary);
+            }
+        }
+        let selected = self
+            .gpu
+            .devices
+            .iter()
+            .filter(|device| device.index == self.gpu.selected_cuda_device)
+            .collect::<Vec<_>>();
+        if self.gpu.selected_cuda_device != 0
+            || selected.len() != 1
+            || selected[0].memory_mib < 6144
+        {
+            return Err(QualificationReportError::UnsafeSyntheticCanary);
+        }
+        if self.verification.page_count != 3
+            || self.verification.page_indices != [0, 1, 2]
+            || self.verification.page_size != [595, 841]
+            || self.verification.exact_verified_text_entries != 24
             || !self.verification.output_resolved_within_isolated_root
             || self.verification.output_file_count == 0
-            || self.verification.output_file_count > 32
+            || self.verification.output_file_count > 128
             || self.verification.output_bytes == 0
-            || self.verification.output_bytes > 32 * 1024 * 1024
+            || self.verification.output_bytes > 512 * 1024 * 1024
             || self.verification.isolated_job_file_count == 0
-            || self.verification.isolated_job_file_count > 64
+            || self.verification.isolated_job_file_count > 512
             || self.verification.isolated_job_bytes == 0
-            || self.verification.isolated_job_bytes > 64 * 1024 * 1024
+            || self.verification.isolated_job_bytes > 1024 * 1024 * 1024
         {
             return Err(QualificationReportError::UnboundedOrUnexpectedOutput);
         }
@@ -270,6 +315,25 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_nvidia_driver_version(value: &str) -> bool {
+    let segments = value.split('.').collect::<Vec<_>>();
+    (2..=4).contains(&segments.len())
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment.len() <= 5
+                && segment.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn valid_gpu_name(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == value
+        && (3..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +348,7 @@ mod tests {
     }
 
     fn report() -> Value {
+        let descriptor = crate::sha256_hex(b"0|NVIDIA GeForce RTX 5090|572.70|32607");
         json!({
             "schemaVersion": 1,
             "runId": "0123456789abcdef0123456789abcdef",
@@ -322,7 +387,14 @@ mod tests {
             },
             "gpu": {
                 "nvidiaSmiSha256": hash(5),
-                "devices": [{"index": 0, "name": "NVIDIA GeForce RTX 5090"}]
+                "selectedCudaDevice": 0,
+                "devices": [{
+                    "index": 0,
+                    "name": "NVIDIA GeForce RTX 5090",
+                    "driverVersion": "572.70",
+                    "memoryMiB": 32607,
+                    "descriptorSha256": descriptor
+                }]
             },
             "hashes": {
                 "scriptSha256": hash(6),
@@ -333,10 +405,10 @@ mod tests {
             },
             "verification": {
                 "outputResolvedWithinIsolatedRoot": true,
-                "pageCount": 1,
-                "pageIndices": [0],
-                "pageSize": [794, 1123],
-                "exactTextItems": 6,
+                "pageCount": 3,
+                "pageIndices": [0, 1, 2],
+                "pageSize": [595, 841],
+                "exactVerifiedTextEntries": 24,
                 "outputFileCount": 3,
                 "outputBytes": 4096,
                 "isolatedJobFileCount": 5,
@@ -407,7 +479,7 @@ mod tests {
     #[test]
     fn unbounded_output_and_unknown_fields_fail_closed() {
         let mut unbounded = report();
-        unbounded["verification"]["outputFileCount"] = json!(33);
+        unbounded["verification"]["outputFileCount"] = json!(129);
         let bytes = serde_json::to_vec(&unbounded).expect("json");
         assert_eq!(
             parse_local_mineru_qualification_report(&bytes, None, None, Some(42)),
@@ -420,6 +492,47 @@ mod tests {
         assert_eq!(
             parse_local_mineru_qualification_report(&bytes, None, None, Some(42)),
             Err(QualificationReportError::InvalidSchema)
+        );
+    }
+
+    #[test]
+    fn single_page_or_inexact_canary_text_count_fails_closed() {
+        let mut single_page = report();
+        single_page["verification"]["pageCount"] = json!(1);
+        single_page["verification"]["pageIndices"] = json!([0]);
+        let bytes = serde_json::to_vec(&single_page).expect("json");
+        assert_eq!(
+            parse_local_mineru_qualification_report(&bytes, None, None, Some(42)),
+            Err(QualificationReportError::UnboundedOrUnexpectedOutput)
+        );
+
+        let mut inexact_text = report();
+        inexact_text["verification"]["exactVerifiedTextEntries"] = json!(23);
+        let bytes = serde_json::to_vec(&inexact_text).expect("json");
+        assert_eq!(
+            parse_local_mineru_qualification_report(&bytes, None, None, Some(42)),
+            Err(QualificationReportError::UnboundedOrUnexpectedOutput)
+        );
+    }
+
+    #[test]
+    fn invalid_or_unbound_gpu_descriptor_fails_closed() {
+        let mut unsupported_gpu = report();
+        unsupported_gpu["gpu"]["devices"][0]["memoryMiB"] = json!(4096);
+        unsupported_gpu["gpu"]["devices"][0]["descriptorSha256"] =
+            json!(crate::sha256_hex(b"0|NVIDIA GeForce RTX 5090|572.70|4096"));
+        let bytes = serde_json::to_vec(&unsupported_gpu).expect("json");
+        assert_eq!(
+            parse_local_mineru_qualification_report(&bytes, None, None, Some(42)),
+            Err(QualificationReportError::UnsafeSyntheticCanary)
+        );
+
+        let mut wrong_descriptor = report();
+        wrong_descriptor["gpu"]["devices"][0]["descriptorSha256"] = json!(hash(15));
+        let bytes = serde_json::to_vec(&wrong_descriptor).expect("json");
+        assert_eq!(
+            parse_local_mineru_qualification_report(&bytes, None, None, Some(42)),
+            Err(QualificationReportError::UnsafeSyntheticCanary)
         );
     }
 }

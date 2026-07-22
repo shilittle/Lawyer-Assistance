@@ -1,0 +1,87 @@
+{
+  "schemaVersion": "privacy-evaluation-corpus-v1",
+  "corpusId": "repository-synthetic-golden-v1",
+  "detectorVersion": "privacy-deterministic-cn-v2",
+  "policyVersion": "synthetic-shadow-policy-v1",
+  "syntheticOnly": true,
+  "items": [
+    {
+      "itemId": "syn-identity-001",
+      "documentId": "syn-native-a",
+      "entityType": "identity_number",
+      "expectedSensitive": true,
+      "predictedSensitive": true,
+      "matchedGroundTruth": true,
+      "confidencePpm": 1000000,
+      "autoApprovalCandidate": true,
+      "humanModified": false,
+      "expectedSeverity": "p0_blocking",
+      "ocrStratum": "native_text"
+    },
+    {
+      "itemId": "syn-email-001",
+      "documentId": "syn-native-a",
+      "entityType": "email_address",
+      "expectedSensitive": true,
+      "predictedSensitive": true,
+      "matchedGroundTruth": true,
+      "confidencePpm": 990000,
+      "autoApprovalCandidate": true,
+      "humanModified": false,
+      "expectedSeverity": "p1_high",
+      "ocrStratum": "native_text"
+    },
+    {
+      "itemId": "syn-address-001",
+      "documentId": "syn-ocr-low-b",
+      "entityType": "address",
+      "expectedSensitive": true,
+      "predictedSensitive": false,
+      "matchedGroundTruth": false,
+      "confidencePpm": 300000,
+      "autoApprovalCandidate": false,
+      "humanModified": true,
+      "expectedSeverity": "p1_high",
+      "ocrStratum": "ocr_low"
+    },
+    {
+      "itemId": "syn-person-fp-001",
+      "documentId": "syn-ocr-low-b",
+      "entityType": "person_name",
+      "expectedSensitive": false,
+      "predictedSensitive": true,
+      "matchedGroundTruth": true,
+      "confidencePpm": 700000,
+      "autoApprovalCandidate": false,
+      "humanModified": true,
+      "expectedSeverity": "informational",
+      "ocrStratum": "ocr_low"
+    },
+    {
+      "itemId": "syn-org-001",
+      "documentId": "syn-ocr-high-c",
+      "entityType": "organization_name",
+      "expectedSensitive": true,
+      "predictedSensitive": true,
+      "matchedGroundTruth": true,
+      "confidencePpm": 920000,
+      "autoApprovalCandidate": true,
+      "humanModified": true,
+      "expectedSeverity": "p2_medium",
+      "ocrStratum": "ocr_high"
+    },
+    {
+      "itemId": "syn-negative-001",
+      "documentId": "syn-ocr-high-c",
+      "entityType": "custom",
+      "expectedSensitive": false,
+      "predictedSensitive": false,
+      "matchedGroundTruth": false,
+      "confidencePpm": 100000,
+      "autoApprovalCandidate": false,
+      "humanModified": false,
+      "expectedSeverity": "informational",
+      "ocrStratum": "ocr_high"
+    }
+  ]
+}

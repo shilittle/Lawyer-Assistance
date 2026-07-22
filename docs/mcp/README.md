@@ -12,9 +12,9 @@
 
 `redacted_case` 是实验 profile，只在五项基础上增加需要精确活动票据的 `citation_validate`。当前 App 尚不能签发绑定该用途、目标和请求字节的正向票据，因此生产集成仍固定使用公开五项。没有票据、密钥、持久化状态或 Windows 保护能力时，第六项调用 fail-closed。
 
-`approved_case_workspace` 是新增的资格门禁 profile，列出公开五项和十个 opaque-ID-only 案件/成果工具。当前资格证据未建立，案件工具统一返回 `PROFILE_NOT_QUALIFIED`；仓库中的三类宿主资产默认禁用。工具可发现不等于已获准生产使用。
+`approved_case_workspace` 是独立资格门禁 profile，列出公开五项和十个 opaque-ID-only 案件/成果工具。其生产 handler、App 签票和 standalone session 已实现；仓库静态资产仍默认禁用。只有当前 App 已资格化、已发布精确批准 generation、并签发匹配 session/ticket 时才执行。缺失、过期、撤销、漂移或不匹配返回 `PROFILE_NOT_QUALIFIED` 或更具体的匿名错误；工具可发现不等于已授权。
 
-旧的 `case_get_state`、patch、任意材料导入、缺口分析、文书生成和路径导出能力在所有 profile 中仍隐藏且不可调用。Provider transport 同样没有案件批准正向链；不得把新 MCP schema 的存在表述成当前 Provider 案件发送已启用。
+旧的 `case_get_state`、patch、任意材料导入、缺口分析、文书生成和路径导出能力在所有 profile 中仍隐藏且不可调用。Provider transport 的独立批准正向链也已实现，但只接受 Rust 后端恢复并验证的精确批准 payload；旧入口和裸案件请求仍在网络前 fail closed。
 
 ## 文档
 

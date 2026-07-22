@@ -20,6 +20,8 @@ const SCHEMA_VERSION: u8 = 1;
 const MAX_QUERY_BYTES: usize = 512;
 const MAX_WORK_PRODUCT_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_REFS: usize = 128;
+const MAX_ACCESS_TICKET_BYTES: usize = 16 * 1024;
+const MAX_CURSOR_BYTES: usize = 512;
 
 const APPROVED_OUTPUT_INSTRUCTION: &str =
     "Only a currently verified CASE_REDACTED_APPROVED generation may reach either content or structuredContent. Raw material, private OCR, review drafts, mappings, paths, filenames, URIs, URLs, secrets, and vault diagnostics are forbidden. This contract is discoverable but execution remains fail closed until the approved workspace backend is qualified.";
@@ -29,6 +31,13 @@ pub(crate) fn is_approved_workspace_tool(name: &str) -> bool {
 }
 
 pub(crate) fn build_tools() -> Vec<Tool> {
+    build_host_tools()
+        .into_iter()
+        .map(with_access_ticket)
+        .collect()
+}
+
+pub(crate) fn build_host_tools() -> Vec<Tool> {
     vec![
         make_tool(
             "case_list",
@@ -170,6 +179,20 @@ pub(crate) fn request_is_valid(tool_name: &str, arguments: &JsonObject) -> bool 
         }
         _ => false,
     }
+}
+
+pub(crate) fn split_access_ticket(mut arguments: JsonObject) -> Result<(String, JsonObject), ()> {
+    let ticket = arguments.remove("access_ticket").ok_or(())?;
+    let ticket = ticket.as_str().ok_or(())?;
+    if ticket.is_empty() || ticket.len() > MAX_ACCESS_TICKET_BYTES {
+        return Err(());
+    }
+    Ok((ticket.to_owned(), arguments))
+}
+
+pub(crate) fn remove_optional_access_ticket(mut arguments: JsonObject) -> JsonObject {
+    arguments.remove("access_ticket");
+    arguments
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> Option<T> {
@@ -377,7 +400,7 @@ fn valid_cursor(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix("cur_") else {
         return false;
     };
-    (32..=256).contains(&suffix.len())
+    (32..=MAX_CURSOR_BYTES - 4).contains(&suffix.len())
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
@@ -442,7 +465,7 @@ fn make_tool(
     let description = format!("{description} {APPROVED_OUTPUT_INSTRUCTION}");
     Tool::new(name, description, json_object(input))
         .with_title(title)
-        .with_raw_output_schema(json_object(unavailable_output_schema()))
+        .with_raw_output_schema(json_object(approved_output_schema()))
         .with_annotations(
             ToolAnnotations::with_title(title)
                 .read_only(hints.read_only)
@@ -452,16 +475,46 @@ fn make_tool(
         )
 }
 
-fn unavailable_output_schema() -> Value {
+fn with_access_ticket(mut tool: Tool) -> Tool {
+    let input = Value::Object(tool.input_schema.as_ref().clone());
+    tool.input_schema = json_object(input_with_access_ticket(input));
+    tool
+}
+
+fn input_with_access_ticket(mut input: Value) -> Value {
+    if let Value::Object(root) = &mut input {
+        if let Some(Value::Object(properties)) = root.get_mut("properties") {
+            properties.insert(
+                "access_ticket".to_owned(),
+                json!({
+                    "type":"string",
+                    "minLength":1,
+                    "maxLength":MAX_ACCESS_TICKET_BYTES
+                }),
+            );
+        }
+        if let Some(Value::Array(required)) = root.get_mut("required") {
+            required.push(json!("access_ticket"));
+        }
+    }
+    input
+}
+
+fn approved_output_schema() -> Value {
     json!({
         "$schema":"https://json-schema.org/draft/2020-12/schema",
         "type":"object",
         "properties":{
             "schema_version":schema_version(),
-            "status":{"type":"string","const":"unavailable"},
-            "reason_code":{"type":"string","const":"PROFILE_NOT_QUALIFIED"}
+            "status":{"type":"string","enum":["success","error","unavailable"]},
+            "tool":{
+                "type":"string",
+                "enum":APPROVED_CASE_WORKSPACE_TOOL_NAMES
+            },
+            "data":{"type":"object"},
+            "reason_code":{"type":"string","minLength":1,"maxLength":96,"pattern":"^[A-Z0-9_]+$"}
         },
-        "required":["schema_version","status","reason_code"],
+        "required":["schema_version","status"],
         "additionalProperties":false
     })
 }
@@ -499,8 +552,8 @@ fn cursor() -> Value {
     json!({
         "type":["string","null"],
         "minLength":36,
-        "maxLength":260,
-        "pattern":"^cur_[A-Za-z0-9_-]{32,256}$"
+        "maxLength":MAX_CURSOR_BYTES,
+        "pattern":"^cur_[A-Za-z0-9_-]{32,508}$"
     })
 }
 
@@ -703,6 +756,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn standalone_host_contract_hides_internal_access_tickets() {
+        let tools = build_host_tools();
+        assert_eq!(tools.len(), APPROVED_CASE_WORKSPACE_TOOL_NAMES.len());
+        for tool in tools {
+            let schema = serde_json::to_string(&tool.input_schema).expect("serialize host schema");
+            assert!(!schema.contains("access_ticket"), "{}", tool.name);
+            assert_eq!(tool.input_schema["additionalProperties"], false);
+        }
+    }
     #[test]
     fn write_contract_requires_exact_approved_refs_and_concurrency_fields() {
         let write = object(json!({

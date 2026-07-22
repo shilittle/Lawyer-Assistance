@@ -195,6 +195,12 @@ def scan_repository(repository: Path) -> tuple[tuple[str, ...], list[TextIssue]]
         path = repository / Path(relative_path)
         try:
             payload = path.read_bytes()
+        except FileNotFoundError:
+            # A tracked file may be intentionally deleted in the working tree
+            # before the deletion is staged or committed. There are no bytes
+            # to validate in that state; Git's own status/diff gates remain
+            # responsible for reviewing the deletion itself.
+            continue
         except OSError as error:
             issues.append(
                 TextIssue(relative_path, "unreadable", None, None, str(error))

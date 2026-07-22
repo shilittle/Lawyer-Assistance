@@ -6,8 +6,6 @@ dependencies:
   tools:
     - type: "mcp"
       value: "lawyer_assistance"
-      description: "Qualification-gated Lawyer Assistance approved-case-workspace MCP server"
-      transport: "streamable_http"
-      url: "http://127.0.0.1:8787/mcp"
+      description: "Qualification-gated Lawyer Assistance approved-case-workspace MCP server using an App-issued opaque stdio session"
 policy:
   allow_implicit_invocation: false

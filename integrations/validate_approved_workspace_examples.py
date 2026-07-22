@@ -13,7 +13,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATIONS = ROOT / "integrations"
 PROFILE = "approved_case_workspace"
-PROFILE_STDIO_ARGS = ["--privacy-profile", PROFILE, "stdio"]
+SESSION_PLACEHOLDER = "<APP_ISSUED_SERVER_ID>"
+PROFILE_STDIO_ARGS = [
+    "--privacy-profile", PROFILE, "--approved-session-id", SESSION_PLACEHOLDER, "stdio"
+]
 PUBLIC_TOOLS = (
     "system_status",
     "legal_search",
@@ -47,16 +50,8 @@ EXPECTED_WRITE_ANNOTATIONS = {
     "idempotentHint": True,
     "openWorldHint": False,
 }
-REQUIRED_STDIO_ENV = {
-    "LAWYER_ASSISTANCE_LEGAL_DB",
-    "LAWYER_ASSISTANCE_USER_DB",
-    "LAWYER_ASSISTANCE_ALLOWED_ROOTS",
-    "LAWYER_ASSISTANCE_OUTPUT_ROOT",
-}
-ALLOWED_AUTH_VALUES = {
-    "Bearer ${LAWYER_ASSISTANCE_MCP_TOKEN}",
-    "Bearer {env:LAWYER_ASSISTANCE_MCP_TOKEN}",
-}
+ALLOWED_AUTH_VALUES: set[str] = set()
+SESSION_ID_PATTERN = re.compile(r"^srv_[0-9a-f]{32}$")
 DANGEROUS_NON_LOOPBACK_OPT_INS = (
     "--dangerously-allow-insecure-non-loopback-http",
     "dangerously_allow_insecure_non_loopback_http",
@@ -65,6 +60,7 @@ DANGEROUS_NON_LOOPBACK_OPT_INS = (
 MAX_FILE_BYTES = 1024 * 1024
 SOURCE_INVARIANT = "APPROVED_CONTENT_SOURCE=current_case_read_approved_material_response"
 SINK_INVARIANT = "WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product"
+VERIFY_INVARIANT = "WORK_PRODUCT_VERIFY=current_case_read_work_product_response"
 NAVIGATION_INVARIANT = (
     "NAVIGATION_ONLY=case_list|case_get_public_metadata|"
     "case_list_approved_materials|case_search_approved_materials"
@@ -82,6 +78,7 @@ MANDATORY_MARKERS = (
     SOURCE_INVARIANT,
     SINK_INVARIANT,
     NAVIGATION_INVARIANT,
+    VERIFY_INVARIANT,
 )
 FORBIDDEN_CAPABILITY_MARKERS = (
     "attachments",
@@ -121,8 +118,6 @@ REQUIRED_SKILL_FILES = {
         "references/tool-catalog.md",
         "references/end-to-end-synthetic.md",
         "assets/connectors/stdio.windows.json",
-        "assets/connectors/stdio.unix.json",
-        "assets/connectors/http.bearer.json",
     },
     "codex": {
         "SKILL.md",
@@ -131,7 +126,6 @@ REQUIRED_SKILL_FILES = {
         "references/install-and-preflight.md",
         "references/tool-routing.md",
         "assets/config.approved-workspace.stdio.toml",
-        "assets/config.approved-workspace.http.toml",
         "assets/config.privacy-hardening.toml",
     },
 }
@@ -143,9 +137,7 @@ dependencies:
   tools:
     - type: "mcp"
       value: "lawyer_assistance"
-      description: "Qualification-gated Lawyer Assistance approved-case-workspace MCP server"
-      transport: "streamable_http"
-      url: "http://127.0.0.1:8787/mcp"
+      description: "Qualification-gated Lawyer Assistance approved-case-workspace MCP server using an App-issued opaque stdio session"
 policy:
   allow_implicit_invocation: false
 """
@@ -303,38 +295,22 @@ def _approved_toml_documents(integrations_root: Path) -> dict[Path, Any]:
 def validate_workbuddy(documents: dict[Path, Any], integrations_root: Path = INTEGRATIONS) -> None:
     base = integrations_root / "workbuddy" / "connectors" / "approved-case-workspace"
     assets = integrations_root / "workbuddy" / "skill" / "lawyer-assistance-approved-workspace" / "assets" / "connectors"
-    for filename in ("stdio.windows.json", "stdio.unix.json", "http.bearer.json"):
-        root_path = base / filename
-        asset_path = assets / filename
-        check(root_path.is_file() and asset_path.is_file(), f"WorkBuddy approved connector missing: {filename}")
-        if root_path.is_file() and asset_path.is_file():
-            check(root_path.read_bytes() == asset_path.read_bytes(), f"WorkBuddy approved asset differs: {filename}")
-        data = documents.get(root_path)
-        if not isinstance(data, dict):
-            continue
-        check(set(data.get("mcpServers", {})) == {"lawyer_assistance"}, f"{display_path(root_path)}: server drift")
-        server = data.get("mcpServers", {}).get("lawyer_assistance", {})
-        description = str(server.get("description", "")).lower()
-        check("qualification-gated" in description, f"{display_path(root_path)}: qualification warning missing")
-        if filename.startswith("stdio"):
-            check(server.get("type") == "stdio", f"{display_path(root_path)}: expected stdio")
-            check(server.get("args") == PROFILE_STDIO_ARGS, f"{display_path(root_path)}: approved profile args drift")
-            environment = server.get("env", {})
-            check(set(environment) == REQUIRED_STDIO_ENV, f"{display_path(root_path)}: environment fields drift")
-            windows = "windows" in filename
-            validate_approved_roots(
-                root_path,
-                environment,
-                "C:/LawyerAssistance/empty-input" if windows else "/srv/lawyer-assistance/empty-input",
-                "C:/LawyerAssistance/work-products" if windows else "/srv/lawyer-assistance/work-products",
-            )
-        else:
-            check(server.get("type") == "http", f"{display_path(root_path)}: expected HTTP")
-            check(server.get("url") == "http://127.0.0.1:8787/mcp", f"{display_path(root_path)}: loopback URL drift")
-            check(
-                server.get("headers", {}).get("Authorization") == "Bearer ${LAWYER_ASSISTANCE_MCP_TOKEN}",
-                f"{display_path(root_path)}: bearer placeholder drift",
-            )
+    filename = "stdio.windows.json"
+    root_path = base / filename
+    asset_path = assets / filename
+    check(root_path.is_file() and asset_path.is_file(), f"WorkBuddy approved connector missing: {filename}")
+    if root_path.is_file() and asset_path.is_file():
+        check(root_path.read_bytes() == asset_path.read_bytes(), f"WorkBuddy approved asset differs: {filename}")
+    data = documents.get(root_path)
+    if not isinstance(data, dict):
+        return
+    check(set(data.get("mcpServers", {})) == {"lawyer_assistance"}, f"{display_path(root_path)}: server drift")
+    server = data.get("mcpServers", {}).get("lawyer_assistance", {})
+    description = str(server.get("description", "")).lower()
+    check(set(server) == {"type", "description", "command", "args"}, f"{display_path(root_path)}: only stdio session fields are allowed")
+    check(server.get("type") == "stdio", f"{display_path(root_path)}: expected stdio")
+    check(server.get("args") == PROFILE_STDIO_ARGS, f"{display_path(root_path)}: approved session args drift")
+    check("qualification-gated" in description and "opaque session" in description, f"{display_path(root_path)}: session warnings missing")
 
 
 def validate_codex(documents: dict[Path, Any], integrations_root: Path = INTEGRATIONS) -> None:
@@ -342,43 +318,24 @@ def validate_codex(documents: dict[Path, Any], integrations_root: Path = INTEGRA
     assets = base / "skill" / "lawyer-assistance-approved-workspace" / "assets"
     pairs = (
         (base / "config.approved-workspace.stdio.toml", assets / "config.approved-workspace.stdio.toml"),
-        (base / "config.approved-workspace.http.toml", assets / "config.approved-workspace.http.toml"),
         (base / "config.privacy-hardening.toml", assets / "config.privacy-hardening.toml"),
     )
     for root_path, asset_path in pairs:
         check(root_path.is_file() and asset_path.is_file(), f"Codex approved config copy missing: {root_path.name}")
         if root_path.is_file() and asset_path.is_file():
             check(root_path.read_bytes() == asset_path.read_bytes(), f"Codex approved asset differs: {root_path.name}")
-    for filename, transport in (
-        ("config.approved-workspace.stdio.toml", "stdio"),
-        ("config.approved-workspace.http.toml", "http"),
-    ):
-        path = base / filename
-        data = documents.get(path)
-        if not isinstance(data, dict):
-            continue
+    path = base / "config.approved-workspace.stdio.toml"
+    data = documents.get(path)
+    if isinstance(data, dict):
         server = data.get("mcp_servers", {}).get("lawyer_assistance", {})
         check(tuple(server.get("enabled_tools", ())) == EXPECTED_TOOLS, f"{display_path(path)}: exact 15 tools required")
         check(server.get("enabled") is False, f"{display_path(path)}: unqualified example must be disabled")
         check(server.get("required") is True, f"{display_path(path)}: server must fail closed when enabled")
         check(server.get("default_tools_approval_mode") == "writes", f"{display_path(path)}: write approval mode drift")
         check(not server.get("tools"), f"{display_path(path)}: ad hoc per-tool override is forbidden")
-        if transport == "stdio":
-            check(server.get("args") == PROFILE_STDIO_ARGS, f"{display_path(path)}: approved profile args drift")
-            environment = server.get("env", {})
-            check(set(environment) == REQUIRED_STDIO_ENV, f"{display_path(path)}: environment fields drift")
-            validate_approved_roots(
-                path,
-                environment,
-                "/absolute/path/to/empty-input",
-                "/absolute/path/to/work-products",
-            )
-        else:
-            check(server.get("url") == "http://127.0.0.1:8787/mcp", f"{display_path(path)}: loopback URL drift")
-            check(
-                server.get("bearer_token_env_var") == "LAWYER_ASSISTANCE_MCP_TOKEN",
-                f"{display_path(path)}: bearer env drift",
-            )
+        check(server.get("args") == PROFILE_STDIO_ARGS, f"{display_path(path)}: approved session args drift")
+        check("env" not in server, f"{display_path(path)}: approved session forbids environment injection")
+        check("url" not in server and "bearer_token_env_var" not in server, f"{display_path(path)}: static approved HTTP/bearer config is forbidden")
     metadata = base / "skill" / "lawyer-assistance-approved-workspace" / "agents" / "openai.yaml"
     check(metadata.is_file(), "Codex approved Skill metadata missing")
     if metadata.is_file():
@@ -391,40 +348,21 @@ def validate_opencode(documents: dict[Path, Any], integrations_root: Path = INTE
     expected_permissions = {"lawyer_assistance_*"} | {
         f"lawyer_assistance_{name}" for name in EXPECTED_TOOLS
     }
-    for filename, transport in (
-        ("opencode.approved-workspace.local.json", "local"),
-        ("opencode.approved-workspace.remote.json", "remote"),
-    ):
-        path = base / filename
-        data = documents.get(path)
-        if not isinstance(data, dict):
-            continue
+    path = base / "opencode.approved-workspace.local.json"
+    data = documents.get(path)
+    if isinstance(data, dict):
         check(data.get("share") == "disabled", f"{display_path(path)}: sharing must be disabled")
         server = data.get("mcp", {}).get("lawyer_assistance", {})
-        check(server.get("type") == transport, f"{display_path(path)}: transport drift")
+        check(server.get("type") == "local", f"{display_path(path)}: transport drift")
         check(server.get("enabled") is False, f"{display_path(path)}: unqualified example must be disabled")
         permissions = data.get("permission", {})
         check(set(permissions) == expected_permissions, f"{display_path(path)}: exact wildcard plus 15 permissions required")
         check(permissions.get("lawyer_assistance_*") == "deny", f"{display_path(path)}: wildcard must deny")
         for name in EXPECTED_TOOLS:
             check(permissions.get(f"lawyer_assistance_{name}") == "allow", f"{display_path(path)}: {name} must be allowed")
-        if transport == "local":
-            command = server.get("command", [])
-            check(isinstance(command, list) and command[1:] == PROFILE_STDIO_ARGS, f"{display_path(path)}: profile args drift")
-            environment = server.get("environment", {})
-            check(set(environment) == REQUIRED_STDIO_ENV, f"{display_path(path)}: environment fields drift")
-            validate_approved_roots(
-                path,
-                environment,
-                "/absolute/path/to/empty-input",
-                "/absolute/path/to/work-products",
-            )
-        else:
-            check(server.get("url") == "http://127.0.0.1:8787/mcp", f"{display_path(path)}: loopback URL drift")
-            check(
-                server.get("headers", {}).get("Authorization") == "Bearer {env:LAWYER_ASSISTANCE_MCP_TOKEN}",
-                f"{display_path(path)}: bearer placeholder drift",
-            )
+        command = server.get("command", [])
+        check(isinstance(command, list) and command[1:] == PROFILE_STDIO_ARGS, f"{display_path(path)}: approved session args drift")
+        check(set(server) == {"type", "command", "enabled", "timeout"}, f"{display_path(path)}: approved session forbids environment, URL and secret fields")
 
     agent = base / "agents" / "lawyer-assistance-approved-workspace.md"
     check(agent.is_file(), f"{display_path(agent)}: OpenCode approved agent missing")
@@ -650,6 +588,20 @@ def validate_integrations_root(integrations_root: Path = INTEGRATIONS, *, includ
     validate_codex(toml_documents, integrations_root)
     validate_opencode(json_documents, integrations_root)
     validate_skill_packages(integrations_root)
+    forbidden_static_assets = (
+        integrations_root / "workbuddy" / "connectors" / "approved-case-workspace" / "http.bearer.json",
+        integrations_root / "workbuddy" / "connectors" / "approved-case-workspace" / "stdio.unix.json",
+        integrations_root / "workbuddy" / "skill" / "lawyer-assistance-approved-workspace" / "assets" / "connectors" / "http.bearer.json",
+        integrations_root / "workbuddy" / "skill" / "lawyer-assistance-approved-workspace" / "assets" / "connectors" / "stdio.unix.json",
+        integrations_root / "codex" / "config.approved-workspace.http.toml",
+        integrations_root / "codex" / "skill" / "lawyer-assistance-approved-workspace" / "assets" / "config.approved-workspace.http.toml",
+        integrations_root / "opencode" / "opencode.approved-workspace.remote.json",
+    )
+    for path in forbidden_static_assets:
+        check(
+            not path.exists(),
+            f"{display_path(path)}: approved static HTTP/Unix asset is forbidden",
+        )
     validate_documentation(integrations_root)
     validate_text_hygiene(integrations_root)
     if include_rust:

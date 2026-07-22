@@ -142,6 +142,20 @@
   color: var(--muted-text, #606773);
 }
 
+.privacy-discovery-actions {
+  align-items: center;
+  background: #f5f8ff;
+  border: 1px solid #cbd8f5;
+  border-radius: 8px;
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+
+.privacy-discovery-actions small {
+  color: var(--muted-text, #606773);
+  line-height: 1.45;
+}
 .privacy-grid {
   display: grid;
   gap: 0.8rem;
@@ -151,6 +165,26 @@
 .privacy-grid label {
   display: grid;
   gap: 0.35rem;
+}
+
+.privacy-approval-form input,
+.privacy-approval-form select {
+  background: #fff;
+  border: 1px solid #bac8c4;
+  border-radius: 6px;
+  box-sizing: border-box;
+  color: #1f2d35;
+  height: 38px;
+  min-width: 0;
+  outline: none;
+  padding: 0 10px;
+  width: 100%;
+}
+
+.privacy-approval-form input:focus,
+.privacy-approval-form select:focus {
+  border-color: #2d6cdf;
+  box-shadow: 0 0 0 3px rgb(45 108 223 / 14%);
 }
 
 .privacy-wide-field {
@@ -363,6 +397,11 @@
 }
 
 .privacy-export-fidelity-warning {
+  background: #fff7e8;
+  border-left: 4px solid #c9862a;
+  padding: 0.75rem;
+}
+
 .privacy-review-delete {
   background: #fff7f6;
   border-color: #b42318;
@@ -387,10 +426,6 @@
 
 .privacy-review-delete button.danger:hover:not(:disabled) {
   background: #8f1d16;
-}
-  background: #fff7e8;
-  border-left: 4px solid #c9862a;
-  padding: 0.75rem;
 }
 
 .privacy-approved-result > button {

@@ -4,7 +4,7 @@
 
 - Domain schema：lawyer-assistance-privacy-domain-v2
 - OCR protocol：la-mineru-worker-v1
-- Approved manifest：approved-material-manifest-v1
+- Approved manifest：approved-material-manifest-v2（签名绑定 Vault 原件版本、源文件名哈希、案件词典与映射修订）
 - Work product manifest：work-product-manifest-v1
 - Canonical encoding：canonical-json-v1
 

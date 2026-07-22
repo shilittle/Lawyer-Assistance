@@ -1,0 +1,189 @@
+.privacy-lifecycle-panel {
+  display: grid;
+  gap: 1rem;
+  margin: 1rem auto 2rem;
+  max-width: 1120px;
+  padding: 1rem;
+  width: 100%;
+}
+
+.privacy-erasure-warning {
+  background: #fff7e8;
+  border: 1px solid #e8b968;
+  border-left: 4px solid #b56b00;
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+}
+
+.privacy-erasure-warning p {
+  margin: 0.45rem 0;
+}
+
+.privacy-erasure-warning code,
+.privacy-lifecycle-panel code {
+  overflow-wrap: anywhere;
+}
+
+.privacy-lifecycle-card,
+.privacy-lifecycle-facts {
+  background: var(--panel-background, #fff);
+  border: 1px solid var(--border-color, #d7dbe0);
+  border-radius: 12px;
+  padding: 1rem;
+}
+
+.privacy-lifecycle-card {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.privacy-lifecycle-card h3,
+.privacy-lifecycle-card p {
+  margin: 0;
+}
+
+.privacy-lifecycle-card label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.privacy-lifecycle-card input {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+}
+
+.privacy-lifecycle-grid,
+.privacy-lifecycle-facts {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.privacy-lifecycle-grid {
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.privacy-lifecycle-facts {
+  margin: 0;
+}
+
+.privacy-lifecycle-facts div {
+  min-width: 0;
+}
+
+.privacy-lifecycle-facts dt {
+  color: var(--muted-text, #606773);
+  font-size: 0.85rem;
+}
+
+.privacy-lifecycle-facts dd {
+  margin: 0.2rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.privacy-lifecycle-inline {
+  align-items: end;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.privacy-lifecycle-inline .privacy-check {
+  align-items: center;
+  display: flex;
+  padding-bottom: 0.45rem;
+}
+
+.privacy-lifecycle-inline .privacy-check input {
+  width: auto;
+}
+
+.privacy-lifecycle-list {
+  display: grid;
+  gap: 0.55rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.privacy-lifecycle-list li {
+  align-items: center;
+  background: #f5f7fa;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  display: grid;
+  gap: 0.4rem;
+  grid-template-columns: minmax(11rem, 1fr) minmax(12rem, 2fr) auto;
+  padding: 0.7rem;
+}
+
+.privacy-lifecycle-list li.is-selected {
+  border-color: #2f6feb;
+}
+
+.privacy-lifecycle-list button {
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.privacy-sensitive-action {
+  background: #fff7f6;
+  border: 1px solid #e2a39d;
+  border-radius: 10px;
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.9rem;
+}
+
+.privacy-lifecycle-panel button.danger {
+  background: #b42318;
+  border-color: #b42318;
+  color: #fff;
+}
+
+.privacy-lifecycle-panel button.danger:hover:not(:disabled) {
+  background: #8f1d16;
+}
+
+.privacy-revealed-mapping {
+  background: #fff;
+  border: 2px solid #b42318;
+  border-radius: 8px;
+  padding: 0.8rem;
+}
+
+.privacy-revealed-mapping dl {
+  display: grid;
+  gap: 0.45rem;
+  margin-bottom: 0;
+}
+
+.privacy-revealed-mapping dl div {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: minmax(8rem, 1fr) minmax(0, 2fr);
+}
+
+.privacy-revealed-mapping dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.privacy-restart-required {
+  background: #fff1cc;
+  border-left: 4px solid #b56b00;
+  padding: 0.75rem;
+}
+
+@media (max-width: 760px) {
+  .privacy-lifecycle-grid,
+  .privacy-lifecycle-facts,
+  .privacy-lifecycle-inline,
+  .privacy-lifecycle-list li,
+  .privacy-revealed-mapping dl div {
+    grid-template-columns: 1fr;
+  }
+}

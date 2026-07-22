@@ -7,16 +7,37 @@
 mod mineru;
 mod mineru_config;
 mod native;
+mod network_isolation;
+mod process_tree;
+mod raster;
+mod safe_derived_export;
 mod safe_export;
 mod types;
 mod worker_protocol;
+mod worker_protocol_client;
 mod worker_protocol_validation;
 
-pub use mineru_config::validate_local_mineru_config;
+pub use mineru_config::{
+    bind_local_mineru_runtime_executable, build_local_mineru_runtime_manifest,
+    validate_local_mineru_config, verify_local_mineru_support_manifest_full,
+    LocalMineruSupportEvidence, LOCAL_MINERU_RUNTIME_MANIFEST_SCHEMA_VERSION,
+};
 pub use native::assess_pdf_text_layer;
+#[cfg(windows)]
+pub use network_isolation::trusted_windows_powershell_command;
+pub use network_isolation::{
+    measure_windows_firewall_isolation, verify_network_isolation, NetworkIsolationMeasurement,
+    RuntimeNetworkIsolationMeasurement,
+};
+pub use raster::{process_raster_image, process_raster_image_with_cancel};
+pub use safe_derived_export::*;
 pub use safe_export::*;
 pub use types::*;
 pub use worker_protocol::*;
+pub use worker_protocol_client::{
+    probe_local_mineru_worker_v1, worker_health_evidence_sha256_v1, worker_identity_sha256_v1,
+    WorkerProtocolProbeEvidenceV1,
+};
 pub use worker_protocol_validation::*;
 
 use mineru::run_local_mineru;
@@ -84,7 +105,7 @@ pub fn process_pdf_with_cancel(
     let required = required_pages.iter().copied().collect::<BTreeSet<_>>();
     let mut pages = Vec::with_capacity(native.pages.len());
     let mut native_pages = Vec::new();
-    for page in native.pages {
+    for mut page in native.pages {
         let spans = if required.contains(&page.page_number) {
             let spans = ocr_run
                 .as_ref()
@@ -114,6 +135,16 @@ pub fn process_pdf_with_cancel(
                 }]
             }
         };
+        if let Some(reasons) = ocr_run
+            .as_ref()
+            .and_then(|run| run.page_quality_reasons.get(&page.page_number))
+        {
+            for reason in reasons {
+                if !page.assessment.reason_codes.contains(reason) {
+                    page.assessment.reason_codes.push(*reason);
+                }
+            }
+        }
         pages.push(ProcessedPage {
             page_number: page.page_number,
             assessment: page.assessment,
@@ -144,6 +175,7 @@ pub fn process_pdf_with_cancel(
         media_type: "application/pdf".to_owned(),
         page_count: native.page_count,
         backend_trace,
+        input_transform: None,
         pages,
     })
 }

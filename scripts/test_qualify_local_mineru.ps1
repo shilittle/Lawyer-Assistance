@@ -30,6 +30,8 @@ function Invoke-Qualification {
     [Parameter(Mandatory = $true)][string]$MineruMock,
     [Parameter(Mandatory = $true)][string]$GpuMock,
     [Parameter(Mandatory = $true)][string]$Evidence,
+    [ValidateRange(10, 7200)]
+    [int]$TimeoutSeconds = 30,
     [switch]$KeepArtifacts
   )
 
@@ -37,7 +39,7 @@ function Invoke-Qualification {
     MineruCommand = $MineruMock
     NvidiaSmiCommand = $GpuMock
     EvidencePath = $Evidence
-    TimeoutSeconds = 30
+    TimeoutSeconds = $TimeoutSeconds
   }
   if ($KeepArtifacts) {
     $arguments.KeepArtifacts = $true
@@ -63,29 +65,63 @@ if (-not [string]::IsNullOrEmpty($env:LA_QUALIFICATION_SECRET_CANARY)) { exit 23
 if ($m -cne "ocr" -or $b -cne "pipeline" -or $l -cne "ch") { exit 24 }
 if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { exit 25 }
 $pdfAscii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($p))
-if (-not $pdfAscii.Contains("/Subtype /Image") -or $pdfAscii.Contains("/Font")) { exit 26 }
-$expected = @(
-  "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5U=",
-  "5Y6f5ZGK77ya5byg5LiJ",
-  "6KKr5ZGK77ya5p+Q5p+Q56eR5oqA5pyJ6ZmQ5YWs5Y+4",
-  "6IGU57O755S16K+d77yaMTM4MDAxMzgwMDA=",
-  "6Lqr5Lu96K+B5Y+377yaMTEwMTA1MTk0OTEyMzEwMDJY",
-  "6YKu566x77yaY2FzZS50ZXN0QGV4YW1wbGUuaW52YWxpZA==",
-  "5qGI5Y+377ya77yIMjAyNu+8ieS6rDAxMDHmsJHliJ0xMjPlj7c=",
-  "5Lul5LiK5YaF5a655YWo6YOo5Li66Ieq5Yqo5YyW5rWL6K+V6Jma5p6E5pWw5o2u44CC"
-) | ForEach-Object { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)) }
+if ([regex]::Matches($pdfAscii, "/Subtype /Image").Count -ne 3 -or -not $pdfAscii.Contains("/Count 3") -or $pdfAscii.Contains("/Font")) { exit 26 }
+$jobRoot = Split-Path -Parent $p
+if ($env:USERPROFILE -cne (Join-Path $jobRoot "runtime") -or $env:HOME -cne (Join-Path $jobRoot "runtime")) { exit 27 }
+$encodedPages = @(
+  [pscustomobject]@{ Lines = @(
+    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5Ug56ysMemhtQ==",
+    "5Y6f5ZGK77ya5byg5LiJ",
+    "6KKr5ZGK77ya5p+Q5p+Q56eR5oqA5pyJ6ZmQ5YWs5Y+4",
+    "6IGU57O755S16K+d77yaMTM4MDAxMzgwMDA=",
+    "6Lqr5Lu96K+B5Y+377yaMTEwMTA1MTk0OTEyMzEwMDJY",
+    "6YKu566x77yaY2FzZS50ZXN0QGV4YW1wbGUuaW52YWxpZA==",
+    "5qGI5Y+377yaKDIwMjYp5LqsMDEwMeawkeWInTEyM+WPtw==",
+    "6aG16Z2i5qCH6K+G77yaTE9DQUwtQ0FOQVJZLVBBR0UtT05F"
+  ) },
+  [pscustomobject]@{ Lines = @(
+    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5Ug56ysMumhtQ==",
+    "55Sz6K+35Lq677ya5p2O5Zub",
+    "6KKr55Sz6K+35Lq677ya5p+Q5p+Q6LS45piT5pyJ6ZmQ5YWs5Y+4",
+    "6IGU57O755S16K+d77yaMTM5MDAxMzkwMDA=",
+    "6Lqr5Lu96K+B5Y+377yaMzEwMTAxMTk4MDAxMDEwMDM3",
+    "6YKu566x77yaY2FzZS50d29AZXhhbXBsZS5pbnZhbGlk",
+    "5qGI5Y+377yaKDIwMjYp5rKqMDEwMeawkeWInTQ1NuWPtw==",
+    "6aG16Z2i5qCH6K+G77yaTE9DQUwtQ0FOQVJZLVBBR0UtVFdP"
+  ) },
+  [pscustomobject]@{ Lines = @(
+    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5Ug56ysM+mhtQ==",
+    "5aeU5omY5Lq677ya546L5LqU",
+    "55u45a+55pa577ya5p+Q5p+Q5pyN5Yqh5pyJ6ZmQ5YWs5Y+4",
+    "6IGU57O755S16K+d77yaMTM3MDAxMzcwMDA=",
+    "6Lqr5Lu96K+B5Y+377yaNDQwMTA2MTk5MDAyMDIwMDE4",
+    "6YKu566x77yaY2FzZS50aHJlZUBleGFtcGxlLmludmFsaWQ=",
+    "5qGI5Y+377yaKDIwMjYp57KkMDEwNuawkeWInTc4OeWPtw==",
+    "6aG16Z2i5qCH6K+G77yaTE9DQUwtQ0FOQVJZLVBBR0UtVEhSRUU="
+  ) }
+)
+$expectedPages = @($encodedPages | ForEach-Object {
+  [pscustomobject]@{ Lines = @($_.Lines | ForEach-Object {
+    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_))
+  }) }
+})
 $content = @()
-for ($index = 0; $index -lt $expected.Count; $index += 1) {
-  $top = 40 + ($index * 80)
-  $content += [ordered]@{
-    type = "text"
-    text = $expected[$index]
-    bbox = @(40, $top, 540, ($top + 40))
-    page_idx = 0
+for ($pageIndex = 0; $pageIndex -lt 3; $pageIndex += 1) {
+  $expected = @($expectedPages[$pageIndex].Lines)
+  for ($index = 0; $index -lt $expected.Count; $index += 1) {
+    $top = 40 + ($index * 80)
+    $content += [ordered]@{
+      type = "text"
+      text = $expected[$index]
+      bbox = @(40, $top, 540, ($top + 40))
+      page_idx = $pageIndex
+    }
   }
 }
 $middle = [ordered]@{
-  pdf_info = @([ordered]@{ page_idx = 0; page_size = @(595, 841) })
+  pdf_info = @(for ($pageIndex = 0; $pageIndex -lt 3; $pageIndex += 1) {
+    [ordered]@{ page_idx = $pageIndex; page_size = @(595, 841) }
+  })
   _backend = "pipeline"
   _version_name = "3.4.3"
 }
@@ -98,10 +134,10 @@ exit 0
 '@
 
 $mockGpuSource = @'
-if (($args -join " ") -cne "--query-gpu=name,driver_version,memory.total --format=csv,noheader,nounits") {
+if (($args -join " ") -cne "--query-gpu=index,name,driver_version,memory.total --format=csv,noheader,nounits") {
   exit 31
 }
-Write-Output "NVIDIA GeForce RTX 5090, 572.70, 32607"
+Write-Output "0, NVIDIA GeForce RTX 5090, 572.70, 32607"
 exit 0
 '@
 
@@ -139,17 +175,22 @@ try {
   Assert-True -Condition (-not [bool]$evidence.mineru.modelManifestProvided) -Message "missing manifest was incorrectly reported as provided"
   Assert-True -Condition (-not [bool]$evidence.mineru.modelManifestTrustEstablished) -Message "manifest trust was incorrectly established"
   Assert-True -Condition (@($evidence.gpu.devices).Count -eq 1) -Message "GPU metadata count changed"
+  Assert-True -Condition ([int]$evidence.gpu.selectedCudaDevice -eq 0) -Message "selected CUDA device was not recorded"
+  Assert-True -Condition ([int]$evidence.gpu.devices[0].index -eq 0) -Message "GPU index was not recorded"
   Assert-True -Condition ($evidence.gpu.devices[0].name -ceq "NVIDIA GeForce RTX 5090") -Message "GPU name was not recorded"
   Assert-True -Condition ($evidence.gpu.devices[0].driverVersion -ceq "572.70") -Message "GPU driver was not recorded"
   Assert-True -Condition ([int]$evidence.gpu.devices[0].memoryMiB -eq 32607) -Message "GPU memory was not recorded"
-  Assert-True -Condition ([int]$evidence.verification.pageCount -eq 1) -Message "page count check changed"
-  Assert-True -Condition ([int]$evidence.verification.pageIndices[0] -eq 0) -Message "page_idx check changed"
+  Assert-True -Condition ([int]$evidence.verification.pageCount -eq 3) -Message "page count check changed"
+  Assert-True -Condition ((@($evidence.verification.pageIndices) -join ",") -ceq "0,1,2") -Message "page_idx check changed"
   Assert-True -Condition ([int]$evidence.verification.pageSize[0] -eq 595 -and [int]$evidence.verification.pageSize[1] -eq 841) -Message "page_size check changed"
-  Assert-True -Condition ([int]$evidence.verification.exactTextItems -eq 8) -Message "exact OCR item count changed"
+  Assert-True -Condition ([int]$evidence.verification.exactVerifiedTextEntries -eq 24) -Message "exact verified OCR entry count changed"
   Assert-True -Condition ($evidence.hashes.generatedInputSha256 -match '^[0-9a-f]{64}$') -Message "input hash was not recorded"
   Assert-True -Condition ($evidence.mineru.commandSha256 -match '^[0-9a-f]{64}$') -Message "worker hash was not recorded"
   Assert-True -Condition (-not [bool]$evidence.retention.artifactsRetained) -Message "artifacts must be removed by default"
   Assert-True -Condition (-not [bool]$evidence.retention.artifactPathRecorded) -Message "evidence must not record local paths"
+  $minimumTimeoutEvidence = Invoke-Qualification -MineruMock $mockMineru -GpuMock $mockGpu -Evidence (Join-Path $testRoot "qualification-min-timeout.json") -TimeoutSeconds 10
+  $maximumTimeoutEvidence = Invoke-Qualification -MineruMock $mockMineru -GpuMock $mockGpu -Evidence (Join-Path $testRoot "qualification-max-timeout.json") -TimeoutSeconds 7200
+  Assert-True -Condition ([bool]$minimumTimeoutEvidence.qualified -and [bool]$maximumTimeoutEvidence.qualified) -Message "qualification timeout boundaries changed"
   $defaultJob = Join-Path ([IO.Path]::GetTempPath()) ("lawyer-assistance-mineru-qualification-" + $evidence.runId)
   Assert-True -Condition (-not (Test-Path -LiteralPath $defaultJob)) -Message "default qualification artifacts were retained"
   $evidenceHashBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash
@@ -172,7 +213,7 @@ try {
 
   $badMineru = Join-Path $testRoot "mock-mineru-bad-text.ps1"
   Write-Utf8NoBom -LiteralPath $badMineru -Value $mockMineruSource.Replace(
-    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5U=",
+    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5Ug56ysMemhtQ==",
     "QkFE"
   )
   $rejectedBadText = $false

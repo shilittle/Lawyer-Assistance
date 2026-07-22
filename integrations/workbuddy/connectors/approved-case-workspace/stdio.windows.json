@@ -2,15 +2,9 @@
   "mcpServers": {
     "lawyer_assistance": {
       "type": "stdio",
-      "description": "Qualification-gated Lawyer Assistance approved-case-workspace MCP server (Windows; exact 15-tool surface)",
+      "description": "Qualification-gated Lawyer Assistance approved-case-workspace MCP server; App-issued opaque session ID only; exact 15-tool surface; no path, environment or secret injection",
       "command": "C:/LawyerAssistance/bin/lawyer-assistance-mcp.exe",
-      "args": ["--privacy-profile", "approved_case_workspace", "stdio"],
-      "env": {
-        "LAWYER_ASSISTANCE_LEGAL_DB": "C:/LawyerAssistance/data/legal_core.sqlite",
-        "LAWYER_ASSISTANCE_USER_DB": "C:/LawyerAssistance/data/user.sqlite",
-        "LAWYER_ASSISTANCE_ALLOWED_ROOTS": "C:/LawyerAssistance/empty-input",
-        "LAWYER_ASSISTANCE_OUTPUT_ROOT": "C:/LawyerAssistance/work-products"
-      }
+      "args": ["--privacy-profile", "approved_case_workspace", "--approved-session-id", "<APP_ISSUED_SERVER_ID>", "stdio"]
     }
   }
 }

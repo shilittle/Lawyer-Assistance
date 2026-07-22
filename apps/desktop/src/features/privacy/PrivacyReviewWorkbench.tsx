@@ -3,7 +3,7 @@ import { FormEvent, useCallback, useMemo, useState } from "react";
 import {
   approvePrivacyReview,
   deletePrivacyReview,
-  exportApprovedReviewPdf,
+  exportApprovedPrivacyReview,
   loadLatestPrivacyReview,
   preparePrivacyMaterial,
 } from "../../ipc/privacy/client";
@@ -11,7 +11,16 @@ import type {
   ApprovePrivacyReviewResponse,
   EditedRedactedPage,
   PrivacyReview,
+  ReceiptDestination,
+  SafeExportFormat,
 } from "../../ipc/privacy/types";
+import {
+  applyPrivacyRiskReviewAction,
+  redoPrivacyRiskReview,
+  undoPrivacyRiskReview,
+} from "../../ipc/privacy/risk-client";
+import type { PrivacyRiskReviewAction } from "../../ipc/privacy/risk-types";
+import { RiskReviewPanel } from "./RiskReviewPanel";
 import { deletePrivacyReviewAfterConfirmation } from "./privacyReviewDeletion";
 
 type ReviewOperation =
@@ -20,11 +29,18 @@ type ReviewOperation =
   | "loading"
   | "approving"
   | "exporting"
-  | "deleting";
+  | "deleting"
+  | "risk_review";
+
+export type ApprovalTarget = {
+  kind: "local_safe_export";
+  format: SafeExportFormat;
+};
 
 export interface ApprovalDraft {
   reviewer: string;
   ttlSeconds: string;
+  target: ApprovalTarget;
 }
 
 export interface PrivacyReviewWorkbenchProps {
@@ -47,20 +63,83 @@ export interface PrivacyReviewWorkbenchViewProps {
   onLoadLatest: () => void;
   onDelete: () => void;
   onEditedPageChange: (pageNumber: number, value: string) => void;
+  onRiskAction?: (action: PrivacyRiskReviewAction) => void;
+  onRiskUndo?: () => void;
+  onRiskRedo?: () => void;
   onApprovalDraftChange: (value: ApprovalDraft) => void;
   onApprove: () => void;
   onExport: () => void;
 }
 
-const LOCAL_SAFE_PDF_DESTINATION = {
-  kind: "verified_local_provider" as const,
-  identifier: "local-safe-pdf-export-v1",
+interface LocalSafeExportScope {
+  label: string;
+  destination: ReceiptDestination;
+  purpose: string;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const LOCAL_SAFE_EXPORT_SCOPES: Record<
+  SafeExportFormat,
+  LocalSafeExportScope
+> = {
+  pdf: {
+    label: "重建 PDF",
+    destination: {
+      kind: "verified_local_provider",
+      identifier: "local-safe-pdf-export-v1",
+    },
+    purpose: "local_safe_pdf_export",
+  },
+  txt: {
+    label: "纯文本 TXT",
+    destination: {
+      kind: "verified_local_provider",
+      identifier: "local-safe-txt-export-v1",
+    },
+    purpose: "local_safe_txt_export",
+  },
+  markdown: {
+    label: "Markdown",
+    destination: {
+      kind: "verified_local_provider",
+      identifier: "local-safe-markdown-export-v1",
+    },
+    purpose: "local_safe_markdown_export",
+  },
+  docx: {
+    label: "安全 DOCX",
+    destination: {
+      kind: "verified_local_provider",
+      identifier: "local-safe-docx-export-v1",
+    },
+    purpose: "local_safe_docx_export",
+  },
 };
-const LOCAL_SAFE_PDF_PURPOSE = "local_safe_pdf_export";
+
+// The discriminated target leaves a narrow extension point for future
+// external_provider/external_mcp_host routes; this screen exposes local export only.
+// eslint-disable-next-line react-refresh/only-export-components
+export function localSafeExportScope(target: ApprovalTarget): LocalSafeExportScope {
+  return LOCAL_SAFE_EXPORT_SCOPES[target.format];
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function approvalMatchesTarget(
+  approval: ApprovePrivacyReviewResponse,
+  target: ApprovalTarget,
+): boolean {
+  const scope = localSafeExportScope(target);
+  return (
+    approval.destination.kind === scope.destination.kind &&
+    approval.destination.identifier === scope.destination.identifier &&
+    approval.purpose === scope.purpose
+  );
+}
 
 const DEFAULT_APPROVAL_DRAFT: ApprovalDraft = {
   reviewer: "",
   ttlSeconds: "3600",
+  target: { kind: "local_safe_export", format: "pdf" },
 };
 
 function displayError(error: unknown): string {
@@ -144,11 +223,28 @@ export function PrivacyReviewWorkbenchView({
   onLoadLatest,
   onDelete,
   onEditedPageChange,
+  onRiskAction,
+  onRiskUndo,
+  onRiskRedo,
   onApprovalDraftChange,
   onApprove,
   onExport,
 }: PrivacyReviewWorkbenchViewProps) {
   const busy = disabled || operation !== "idle";
+  const manualRiskReady = Boolean(
+    review?.riskReview?.detectorRunCompleted &&
+      review.riskReview.hardGates.every(
+        (gate) =>
+          gate.passed ||
+          !gate.blocking ||
+          ["calibrated_policy", "approval_mode_allows_automatic", "organization_policy_allows_automatic", "publication_target_fixed"].includes(gate.gateId),
+      ),
+  );
+  const selectedExportScope = localSafeExportScope(approvalDraft.target);
+  const activeApproval =
+    approval && approvalMatchesTarget(approval, approvalDraft.target)
+      ? approval
+      : null;
   const editedByNumber = useMemo(
     () => new Map(editedPages.map((page) => [page.pageNumber, page.redactedText])),
     [editedPages],
@@ -171,9 +267,10 @@ export function PrivacyReviewWorkbenchView({
       <div className="privacy-boundary-warning" role="note">
         <strong>这里只生成本地获批产物，不执行发送</strong>
         <p>
-          选择的 PDF、DOCX、TXT 或 Markdown 仅在本机读取。批准回执只授权精确获批
+          选择的 PDF、PNG、JPEG、DOCX、TXT 或 Markdown 仅在本机读取。图片会确定性包装为单页 PDF 后强制使用隔离的本地 OCR。批准回执只授权精确获批
           JSON、指定目标、用途和有效期；legacy assistant、Provider 附件与 MCP
-          transport 尚未完成同一回执闸门，绝不能把本页结果理解为原件或消息已获准发送。
+          transport 均是不同外发目标，本机导出回执不能授权这些通道。只有对应运行时闸门
+          对精确目标重新授权后才能发送，绝不能把本页结果理解为原件或消息已获准发送。
         </p>
         <p>
           系统输入法、辅助功能、屏幕截图和操作系统剪贴板仍属于 OS 信任边界；处理真实案件时应关闭云输入、云剪贴板与第三方辅助工具。
@@ -246,7 +343,36 @@ export function PrivacyReviewWorkbenchView({
                 <dd><code>{review.processingVersion}</code></dd>
               </div>
             </dl>
+            {review.vaultIsolation ? (
+              <div className="privacy-boundary-warning" role="note">
+                <strong>案件原件已进入本机加密 Vault</strong>
+                <p>
+                  加密静态存储：{review.vaultIsolation.encryptedAtRest ? "已验证" : "未验证"}；
+                  专用 ACL：{review.vaultIsolation.privateAclEnforced ? "已验证" : "未验证"}；
+                  内容索引禁用：{review.vaultIsolation.contentIndexingDisabled ? "已验证" : "未验证"}；
+                  Broker：<code>{review.vaultIsolation.brokerBoundary}</code>。
+                </p>
+                {!review.vaultIsolation.strongServiceIdentityBoundary ? (
+                  <p className="privacy-risk-blocker">
+                    精确限制：<code>{review.vaultIsolation.sameUserProcessLimitation}</code>。
+                    当前没有独立服务身份边界，同一 Windows 用户下的其他进程不能被技术性完全排除。
+                  </p>
+                ) : null}
+              </div>
+            ) : (
+              <p className="privacy-risk-blocker">该记录没有可验证的 Vault 隔离状态，风险审批保持关闭。</p>
+            )}
             <ul className="privacy-backend-trace" aria-label="本机处理后端证据">
+              {review.inputTransform ? (
+                <li key="input-transform">
+                  <strong>图片本地包装</strong>
+                  <span>
+                    {review.inputTransform.pixelWidth}×{review.inputTransform.pixelHeight} 像素 ·{" "}
+                    {review.inputTransform.transformVersion}
+                  </span>
+                  <code>processing PDF {review.inputTransform.processingSha256}</code>
+                </li>
+              ) : null}
               {review.backendTrace.map((trace, index) => (
                 <li key={`${trace.backend}-${index}`}>
                   <strong>{backendLabel(trace.backend)}</strong>
@@ -262,6 +388,22 @@ export function PrivacyReviewWorkbenchView({
               ))}
             </ul>
           </section>
+
+          {review.riskReview ? (
+            <RiskReviewPanel
+              state={review.riskReview}
+              busy={busy}
+              onAction={(action) => onRiskAction?.(action)}
+              onUndo={() => onRiskUndo?.()}
+              onRedo={() => onRiskRedo?.()}
+              onManualApprove={onApprove}
+            />
+          ) : (
+            <section className="privacy-risk-panel" role="alert">
+              <h3>风险审阅状态不可用</h3>
+              <p>仅旧版非 Vault 测试记录允许缺少风险会话；真实案件材料在风险 revision 缺失时严格禁止批准。</p>
+            </section>
+          )}
 
           <div className="privacy-review-pages">
             {review.pages.map((page) => (
@@ -311,8 +453,9 @@ export function PrivacyReviewWorkbenchView({
           </div>
 
           <form className="privacy-approval-form" onSubmit={approve}>
-            <fieldset disabled={busy}>
+            <fieldset disabled={busy || !manualRiskReady}>
               <legend>3. 人工批准与本机回执</legend>
+              {!manualRiskReady ? <p className="privacy-risk-blocker">真实检测、资格、残留扫描、视觉风险或其他人工批准必需闸门尚未全部通过。</p> : null}
               <div className="privacy-grid">
                 <label>
                   <span>批准人</span>
@@ -330,13 +473,40 @@ export function PrivacyReviewWorkbenchView({
                     }
                   />
                 </label>
+                <label>
+                  <span>本机安全导出格式（切换后必须重新批准）</span>
+                  <select
+                    aria-label="本机安全导出格式"
+                    value={approvalDraft.target.format}
+                    onChange={(event) =>
+                      onApprovalDraftChange({
+                        ...approvalDraft,
+                        target: {
+                          kind: "local_safe_export",
+                          format: event.target.value as SafeExportFormat,
+                        },
+                      })
+                    }
+                  >
+                    {Object.entries(LOCAL_SAFE_EXPORT_SCOPES).map(
+                      ([format, scope]) => (
+                        <option key={format} value={format}>
+                          {scope.label}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
                 <div className="privacy-fixed-scope">
-                  <span>固定本机目标与用途</span>
-                  <strong>本机安全 PDF 重建器</strong>
+                  <span>后端固定目标与用途</span>
+                  <strong>{selectedExportScope.label}</strong>
                   <code>
-                    {LOCAL_SAFE_PDF_DESTINATION.identifier} · {LOCAL_SAFE_PDF_PURPOSE}
+                    {selectedExportScope.destination.identifier} ·{" "}
+                    {selectedExportScope.purpose}
                   </code>
-                  <small>固定枚举不接受案件名称、当事人信息或其他自由文本。</small>
+                  <small>
+                    格式只映射到固定枚举，不接受案件名称、当事人信息、自由用途或网页路径。
+                  </small>
                 </div>
                 <label>
                   <span>回执有效期（秒）</span>
@@ -369,37 +539,41 @@ export function PrivacyReviewWorkbenchView({
             </fieldset>
           </form>
 
-          {approval ? (
+          {activeApproval ? (
             <section className="privacy-approved-result" aria-labelledby="privacy-approved-result-title">
-              <h3 id="privacy-approved-result-title">4. 安全重建脱敏 PDF</h3>
+              <h3 id="privacy-approved-result-title">4. 保存获批安全派生文书</h3>
               <p>
-                本机回执已签发，但没有执行 Provider/MCP/assistant 发送。回执 token
-                和精确获批 JSON 仅驻留当前界面内存；修改文本或批准参数会立即作废本次导出状态。
+                已为当前格式签发精确目标回执，但没有执行 Provider、MCP 或 assistant
+                发送。保存命令不接收网页层回传的回执 token、批准 JSON、用途或路径；
+                Rust 会从本机受保护批准代和活动回执重新恢复并复核。
               </p>
               <dl>
                 <div>
                   <dt>回执 ID</dt>
-                  <dd><code>{approval.receiptId}</code></dd>
+                  <dd><code>{activeApproval.receiptId}</code></dd>
                 </div>
                 <div>
                   <dt>获批载荷 SHA-256</dt>
-                  <dd><code>{approval.approvedPayloadSha256}</code></dd>
+                  <dd><code>{activeApproval.approvedPayloadSha256}</code></dd>
                 </div>
                 <div>
                   <dt>有效至</dt>
-                  <dd>{new Date(approval.expiresAtUnix * 1000).toLocaleString("zh-CN")}</dd>
+                  <dd>{new Date(activeApproval.expiresAtUnix * 1000).toLocaleString("zh-CN")}</dd>
                 </div>
               </dl>
               <p className="privacy-export-sync-warning">
                 本轮只允许保存到非网络本地磁盘；UNC、映射网络盘及 OneDrive 等云端占位/召回位置会被后端拒绝。任何后续外发必须另行取得目标绑定回执。
               </p>
               <p className="privacy-export-fidelity-warning" role="note">
-                输出使用固定哈希嵌入的常用中文字体；若获批文本含字体不支持的字符，签发或导出会失败关闭。它仍是文本重排版脱敏副本，不保留原版式、签章或图片，也未完成多阅读器渲染、打印或法院提交资格验证。
+                所有格式都只从获批脱敏文本全新构造，不复制原文包、元数据、批注、附件、图片、
+                签章或嵌入对象。PDF 使用固定哈希字体并严格重提取；DOCX 仅含 allowlist
+                文档部件；TXT/Markdown 也会重解析逐页比对。它们均为文本重排版副本，
+                尚未取得法院提交、打印保真或多阅读器兼容资格。
               </p>
               <button disabled={busy} type="button" onClick={onExport}>
                 {operation === "exporting"
-                  ? "正在验证回执并重建…"
-                  : "验证精确回执并保存重建 PDF"}
+                  ? `正在验证并重建 ${selectedExportScope.label}…`
+                  : `重新验证活动回执并保存 ${selectedExportScope.label}`}
               </button>
             </section>
           ) : null}
@@ -407,7 +581,7 @@ export function PrivacyReviewWorkbenchView({
           <section className="privacy-review-delete" aria-labelledby="privacy-review-delete-title">
             <h3 id="privacy-review-delete-title">本机数据生命周期</h3>
             <p>
-              删除应用内受保护的复核草稿并撤销其全部回执；不删除所选原始文书或已另存的 PDF。
+              删除应用内受保护的复核草稿并撤销其全部回执；不删除所选原始文书或已另存的安全派生文书。
               不含正文的哈希审计会保留。SQLite secure_delete 仅是尽力清理，不承诺存储介质级取证擦除。
             </p>
             <button className="danger" disabled={busy} type="button" onClick={onDelete}>
@@ -520,6 +694,63 @@ export function PrivacyReviewWorkbench({
     setNotice("");
   }, []);
 
+  const applyRiskAction = useCallback(async (action: PrivacyRiskReviewAction) => {
+    if (disabled || operation !== "idle" || !review?.riskReview) return;
+    const actor = approvalDraft.reviewer.trim();
+    if (!actor || actor.length > 128) {
+      setError("执行风险审阅动作前必须填写不超过 128 个字符的批准人。");
+      return;
+    }
+    begin("risk_review");
+    try {
+      const nextReview = await applyPrivacyRiskReviewAction({
+        redactionId: review.redactionId,
+        expectedRevision: review.riskReview.revision,
+        actor,
+        editedPages,
+        action,
+      });
+      installReview(nextReview);
+      setNotice("风险动作、编辑后脱敏页与 append-only revision 已在本机原子保存。");
+    } catch (reason: unknown) {
+      setError(displayError(reason));
+    } finally {
+      finish();
+    }
+  }, [approvalDraft.reviewer, begin, disabled, editedPages, finish, installReview, operation, review]);
+
+  const undoRisk = useCallback(async () => {
+    if (disabled || operation !== "idle" || !review?.riskReview) return;
+    begin("risk_review");
+    try {
+      installReview(await undoPrivacyRiskReview({
+        redactionId: review.redactionId,
+        expectedRevision: review.riskReview.revision,
+      }));
+      setNotice("已撤销上一项风险审阅动作；页内容与风险 revision 同步恢复。");
+    } catch (reason: unknown) {
+      setError(displayError(reason));
+    } finally {
+      finish();
+    }
+  }, [begin, disabled, finish, installReview, operation, review]);
+
+  const redoRisk = useCallback(async () => {
+    if (disabled || operation !== "idle" || !review?.riskReview) return;
+    begin("risk_review");
+    try {
+      installReview(await redoPrivacyRiskReview({
+        redactionId: review.redactionId,
+        expectedRevision: review.riskReview.revision,
+      }));
+      setNotice("已重做风险审阅动作；页内容与风险 revision 同步前进。");
+    } catch (reason: unknown) {
+      setError(displayError(reason));
+    } finally {
+      finish();
+    }
+  }, [begin, disabled, finish, installReview, operation, review]);
+
   const updateApprovalDraft = useCallback((next: ApprovalDraft) => {
     setApprovalDraft(next);
     setApproval(null);
@@ -528,6 +759,17 @@ export function PrivacyReviewWorkbench({
 
   const approve = useCallback(async () => {
     if (disabled || operation !== "idle" || !review) return;
+    if (!review.riskReview || !review.riskReview.detectorRunCompleted) {
+      setError("风险 revision 或真实检测完成证据缺失；批准已阻断。");
+      return;
+    }
+    const blockingGate = review.riskReview.hardGates.find(
+      (gate) => gate.blocking && !gate.passed && !["calibrated_policy", "approval_mode_allows_automatic", "organization_policy_allows_automatic", "publication_target_fixed"].includes(gate.gateId),
+    );
+    if (blockingGate) {
+      setError(`风险硬闸门 ${blockingGate.gateId} 未通过；批准已阻断。`);
+      return;
+    }
     let ttlSeconds: number;
     try {
       ttlSeconds = validateApprovalDraft(approvalDraft);
@@ -545,17 +787,21 @@ export function PrivacyReviewWorkbench({
     try {
       const response = await approvePrivacyReview({
         redactionId: review.redactionId,
+        expectedRiskRevision: review.riskReview.revision,
         expectedSuggestedRedactedSha256:
           review.suggestedRedactedContentSha256,
         editedPages,
         reviewer: approvalDraft.reviewer.trim(),
-        destination: LOCAL_SAFE_PDF_DESTINATION,
-        purpose: LOCAL_SAFE_PDF_PURPOSE,
+        destination: localSafeExportScope(approvalDraft.target).destination,
+        purpose: localSafeExportScope(approvalDraft.target).purpose,
         ttlSeconds,
       });
+      if (!approvalMatchesTarget(response, approvalDraft.target)) {
+        throw new Error("后端签发的回执目标与所选本机格式不一致。");
+      }
       setApproval(response);
       setNotice(
-        "精确脱敏载荷已在本机复检并签发回执；尚未执行任何 Provider、assistant 或 MCP 发送。",
+        `已为 ${localSafeExportScope(approvalDraft.target).label} 复检并签发精确目标回执；尚未执行任何 Provider、assistant 或 MCP 发送。`,
       );
     } catch (reason: unknown) {
       setApproval(null);
@@ -573,30 +819,36 @@ export function PrivacyReviewWorkbench({
     review,
   ]);
 
-  const exportPdf = useCallback(async () => {
-    if (disabled || operation !== "idle" || !review || !approval) return;
+  const exportArtifact = useCallback(async () => {
+    if (
+      disabled ||
+      operation !== "idle" ||
+      !review ||
+      !approval ||
+      !approvalMatchesTarget(approval, approvalDraft.target)
+    ) {
+      return;
+    }
+    const scope = localSafeExportScope(approvalDraft.target);
     begin("exporting");
     try {
-      const response = await exportApprovedReviewPdf({
+      const response = await exportApprovedPrivacyReview({
         redactionId: review.redactionId,
-        receiptToken: approval.receiptToken,
-        approvedPayloadJson: approval.approvedPayloadJson,
-        destination: approval.destination,
-        purpose: approval.purpose,
+        format: approvalDraft.target.format,
       });
       if (response.cancelled) {
-        setNotice("已取消保存；没有写入脱敏 PDF。");
+        setNotice(`已取消保存；没有写入 ${scope.label}。`);
         return;
       }
       setNotice(
-        `已安全保存 ${response.fileName ?? "脱敏 PDF"}（${response.outputPageCount} 页，SHA-256 ${response.pdfSha256 ?? "未返回"}）。`,
+        `已安全保存 ${response.fileName ?? scope.label}（${response.sourcePageCount} 个源页/段，产物 SHA-256 ${response.artifactSha256 ?? "未返回"}）。`,
       );
     } catch (reason: unknown) {
       setError(displayError(reason));
     } finally {
       finish();
     }
-  }, [approval, begin, disabled, finish, operation, review]);
+  }, [approval, approvalDraft, begin, disabled, finish, operation, review]);
 
   const deleteCurrentReview = useCallback(async () => {
     if (disabled || operation !== "idle" || !review) return;
@@ -654,9 +906,12 @@ export function PrivacyReviewWorkbench({
       onLoadLatest={() => void loadLatest()}
       onDelete={() => void deleteCurrentReview()}
       onEditedPageChange={editPage}
+      onRiskAction={(action) => void applyRiskAction(action)}
+      onRiskUndo={() => void undoRisk()}
+      onRiskRedo={() => void redoRisk()}
       onApprovalDraftChange={updateApprovalDraft}
       onApprove={() => void approve()}
-      onExport={() => void exportPdf()}
+      onExport={() => void exportArtifact()}
     />
   );
 }

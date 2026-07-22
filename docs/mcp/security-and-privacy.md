@@ -4,7 +4,7 @@
 
 所有案件原件、附件、粘贴文本、OCR、截图、文件名或路径、当事人及关联人信息、案号、联系方式、地址、证件或账户、签名印章、事实、证据、草稿、摘要、翻译和派生内容一律视为 `CASE_RAW`。`CASE_REDACTED_PENDING`、待复核内容，以及仅有 `CASE_REDACTED_APPROVED` 标签、文件名或口头声明的内容同样不得进入宿主、MCP、Provider、网络或文件工具。
 
-App 内的本地批准产物并不自动获得 MCP/Provider 外发资格。当前 App→MCP citation receipt 正向签发链和 App→Provider 案件票据链都未实现，因此生产只允许不含任何案件事实的公开法律检索。用户同意、紧急情况、Full Access、其他 prompt 或宿主文件读取不能替代精确活动票据。
+App 内的本地批准产物并不自动获得 MCP/Provider 外发资格。批准 MCP 和批准 Provider 的正向链已分别实现，但每次使用仍要求当前资格、精确 generation、目的地/实例、工具或固定用途、canonical request/payload、短期有效期、撤销 epoch 和防重放全部匹配。默认 public-only 集成仍只允许不含案件事实的公开法律检索。用户同意、紧急情况、Full Access、其他 prompt 或宿主文件读取不能替代这些技术证据。
 
 ## 宿主在规则加载前的披露
 
@@ -16,19 +16,19 @@ WorkBuddy、Codex、OpenCode 或其他宿主可能在 Skill/Agent/prompt 规则�
 
 - `public_law_only` 默认只公开五个法律只读工具，不读取案件材料。
 - `redacted_case` 仅增加 receipt-gated `citation_validate`。其票据必须精确绑定请求字节、目标、用途、来源/抽取/脱敏/批准哈希、策略与探测器版本、密钥版本和短 TTL，并通过持久化活动/撤销状态核验。
-- `approved_case_workspace` 列出十个最小 ID-only 案件工具；当前资格未建立，案件执行返回 `PROFILE_NOT_QUALIFIED`。只有当前 `case_read_approved_material` 直接响应且响应本身为 `CASE_REDACTED_APPROVED` 才可能成为宿主正文来源。
-- 当前 App 不能签发上述 MCP 引证用途票据。因此生产宿主固定使用 `public_law_only`；不得把本地材料页或导出票据改名后复用。
+- `approved_case_workspace` 列出十个最小 ID-only 案件工具；有效 App 资格、standalone session 和逐调用 ticket 存在时执行真实 handler，其他状态 fail closed。资格化前还必须证明 sibling SHA-256 精确等于正式构建时编译进 App 的配对 release hash；仅同名、相同版本输出或仿真 canary 不能建立二进制信任。只有当前 `case_read_approved_material` 直接响应且响应本身为 `CASE_REDACTED_APPROVED` 才可能成为宿主正文来源。
+- 实验 `redacted_case/citation_validate` 的旧引证用途仍没有 App 生产签发入口；不得把批准工作区 ticket、本地材料页或导出票据改名后复用。默认宿主继续使用 `public_law_only`，案件宿主必须使用独立 approved package 和 App-issued session。
 - 三类批准宿主资产默认禁用。Skill、用户同意或客户端白名单不能替代后端 manifest、撤销、哈希、残留扫描、隔离和 Provider 资格。
 - 旧案件状态/patch、任意材料导入、缺口分析、文书生成和路径导出工具在所有 profile 中隐藏；新 work-product 只能通过精确的 write/update 业务工具写入。
 - 原件已进入任务时必须停止并新建干净任务；Skill 不能撤回加载前披露。
 
 ## Provider 边界
 
-Provider transport 在序列化前要求明确数据分类，只放行公开法律或产品公开数据。旧的案件助手、案件分析和法律文书请求被标记为 `CASE_RAW` 并 fail-closed；目前没有把 App 的逐字节批准结果和精确活动票据接到 Provider 请求上的正向路径。不得声称案件 Provider 发送可用。
+Provider transport 在序列化前要求明确数据分类。公开路径只放行代码内固定、且不插入用户内容的公开法律或产品请求；旧助理入口的全部用户自由文本（包括表面上不含个人信息的法律问题）以及旧案件分析、法律文书入口都必须在读取凭据、持久化或网络调用前 fail closed，并转入 Approved Provider 固定任务。独立批准路径从 Rust 受保护存储恢复逐字节批准正文和回执，重验 Provider/endpoint/model/固定用途/策略/探测器/OCR provenance/generation/期限/撤销，再发送并保护输出。前端标签、意图字段、空会话或裸 `ChatRequest` 不能构造该类型，也不能证明公开来源。
 
 ## PDF、OCR 与 MinerU
 
-本地带可靠文本层的 PDF 可以走原生文本提取和本地脱敏。仓库存在实验性的本地 MinerU runner/protocol，但 App 当前向材料处理传入 `None`，尚未接入经过认证的本地 worker、模型完整性、GPU 隔离与可验证输出链。扫描件、手写页、印章/图像承载文字或其他视觉 PDF 在认证完成前必须 fail-closed；不得回退到远程 MinerU、SSH、云 OCR 或外部上传。
+本地带可靠文本层的 PDF 走原生文本提取。`auto_local` 与 `force_local` 已把 App 摄取接到固定本地 MinerU worker，但只在 worker/config/runtime/model 全量受信、Windows Firewall 出站规则经 ActiveStore 复核、合成 canary 和当前环境签名资格有效时运行。启动前后身份、进程树、页数/页序/尺寸/bbox/置信度/输出边界均校验；任一失败即拒绝。扫描、手写、印章或低清内容没有远程 MinerU、SSH、云 OCR、模型下载或外部上传回退。
 
 ## 传输与秘密
 

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     fmt::{self, Display},
+    sync::{atomic::AtomicBool, Arc},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,24 +175,104 @@ pub enum ChatMessageRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: ChatMessageRole,
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatRequestAuthority {
+    ConnectionProbe,
+    LegalPublic,
+    ProductPublic,
+    ApprovedCase,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
-    #[serde(skip, default)]
-    pub data_classification: privacy::DataClassification,
+    #[serde(skip)]
+    pub(crate) authority: ChatRequestAuthority,
 }
 
 impl ChatRequest {
+    #[must_use]
+    pub fn legal_public(
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self::public(
+            messages,
+            stream,
+            temperature,
+            max_tokens,
+            ChatRequestAuthority::LegalPublic,
+        )
+    }
+
+    #[must_use]
+    pub fn product_public(
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self::public(
+            messages,
+            stream,
+            temperature,
+            max_tokens,
+            ChatRequestAuthority::ProductPublic,
+        )
+    }
+
+    /// Constructs a case request that can only exercise the fail-closed
+    /// unapproved path. Normal transport APIs reject this authority before
+    /// serialization and before any network request. Production approved
+    /// traffic must use `prepare_approved_chat` and `authorize_approved_chat`.
+    #[must_use]
+    pub fn unapproved_case_for_rejection(
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            messages,
+            stream,
+            temperature,
+            max_tokens,
+            authority: ChatRequestAuthority::ApprovedCase,
+        }
+    }
+
+    fn public(
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        authority: ChatRequestAuthority,
+    ) -> Self {
+        debug_assert!(matches!(
+            authority,
+            ChatRequestAuthority::LegalPublic | ChatRequestAuthority::ProductPublic
+        ));
+        Self {
+            messages,
+            stream,
+            temperature,
+            max_tokens,
+            authority,
+        }
+    }
+
     pub fn connection_probe() -> Self {
         Self {
             messages: vec![
@@ -207,8 +288,168 @@ impl ChatRequest {
             stream: true,
             temperature: Some(0.0),
             max_tokens: Some(64),
-            data_classification: privacy::DataClassification::ProductPublic,
+            authority: ChatRequestAuthority::ConnectionProbe,
         }
+    }
+
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    pub const fn stream(&self) -> bool {
+        self.stream
+    }
+    pub fn set_stream(&mut self, stream: bool) {
+        self.stream = stream;
+    }
+
+    pub const fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
+    pub const fn max_tokens(&self) -> Option<u32> {
+        self.max_tokens
+    }
+
+    pub const fn data_classification(&self) -> privacy::DataClassification {
+        match self.authority {
+            ChatRequestAuthority::ConnectionProbe | ChatRequestAuthority::ProductPublic => {
+                privacy::DataClassification::ProductPublic
+            }
+            ChatRequestAuthority::LegalPublic => privacy::DataClassification::LegalPublic,
+            ChatRequestAuthority::ApprovedCase => privacy::DataClassification::CaseRedactedApproved,
+        }
+    }
+
+    pub(crate) fn approved_case(
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            messages,
+            stream,
+            temperature,
+            max_tokens,
+            authority: ChatRequestAuthority::ApprovedCase,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovedChatBinding {
+    pub purpose: String,
+    pub policy_id: String,
+    pub policy_version: u32,
+    pub detector_version: String,
+    pub approval_generation_id: String,
+    pub approved_redacted_content_sha256: String,
+    pub ocr_provenance_sha256: String,
+    pub expires_at_unix: u64,
+}
+
+pub struct ApprovedChatDraft {
+    pub(crate) request: ChatRequest,
+    pub(crate) canonical_payload: Vec<u8>,
+    pub(crate) canonical_payload_sha256: String,
+    pub(crate) transport_body_sha256: String,
+    pub(crate) provider_id: String,
+    pub(crate) provider_kind: ProviderKind,
+    pub(crate) model_id: String,
+    pub(crate) endpoint_origin: String,
+    pub(crate) binding: ApprovedChatBinding,
+}
+
+impl ApprovedChatDraft {
+    pub fn canonical_payload(&self) -> &[u8] {
+        &self.canonical_payload
+    }
+
+    pub fn canonical_payload_sha256(&self) -> &str {
+        &self.canonical_payload_sha256
+    }
+    pub fn transport_body_sha256(&self) -> &str {
+        &self.transport_body_sha256
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub const fn provider_kind(&self) -> ProviderKind {
+        self.provider_kind
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub fn endpoint_origin(&self) -> &str {
+        &self.endpoint_origin
+    }
+
+    pub fn binding(&self) -> &ApprovedChatBinding {
+        &self.binding
+    }
+}
+
+impl fmt::Debug for ApprovedChatDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovedChatDraft")
+            .field("canonical_payload", &"<redacted>")
+            .field("canonical_payload_sha256", &self.canonical_payload_sha256)
+            .field("provider_id", &self.provider_id)
+            .field("transport_body_sha256", &self.transport_body_sha256)
+            .field("provider_kind", &self.provider_kind)
+            .field("model_id", &self.model_id)
+            .field("endpoint_origin", &self.endpoint_origin)
+            .field("binding", &self.binding)
+            .finish()
+    }
+}
+
+pub struct ApprovedChatRequest {
+    pub(crate) draft: ApprovedChatDraft,
+    pub(crate) outbound: privacy::ApprovedOutboundPayload,
+    pub(crate) consumed: Arc<AtomicBool>,
+}
+
+impl ApprovedChatRequest {
+    pub fn canonical_payload_sha256(&self) -> &str {
+        self.outbound.payload_sha256()
+    }
+
+    pub fn receipt_id(&self) -> Option<&str> {
+        self.outbound.receipt_id()
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.draft.provider_id
+    }
+
+    pub fn purpose(&self) -> &str {
+        &self.draft.binding.purpose
+    }
+
+    pub const fn expires_at_unix(&self) -> u64 {
+        self.draft.binding.expires_at_unix
+    }
+}
+
+impl fmt::Debug for ApprovedChatRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovedChatRequest")
+            .field("canonical_payload", &"<redacted>")
+            .field("canonical_payload_sha256", &self.canonical_payload_sha256())
+            .field("receipt_id", &self.receipt_id())
+            .field("provider_id", &self.provider_id())
+            .field("purpose", &self.purpose())
+            .field("expires_at_unix", &self.expires_at_unix())
+            .finish()
     }
 }
 

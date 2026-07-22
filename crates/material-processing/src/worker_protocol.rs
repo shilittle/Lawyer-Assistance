@@ -279,6 +279,7 @@ pub enum WorkerHealthCheckIdV1 {
     WorkerIntegrity,
     ConfigIntegrity,
     ModelIntegrity,
+    SupportIntegrity,
     RuntimeVersions,
     GpuRuntime,
     OfflineFlags,
@@ -420,6 +421,8 @@ pub enum OcrVisualRiskV1 {
 pub enum OcrWarningV1 {
     ComplexLayout,
     LowContrast,
+    LowResolution,
+    LowConfidence,
     PartialTextLine,
     SuspectedBlank,
     UnsupportedGlyph,

@@ -68,7 +68,7 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
                 / "lawyer-assistance-approved-workspace"
                 / "assets"
                 / "connectors"
-                / "http.bearer.json"
+                / "stdio.windows.json"
             )
             asset.write_text(asset.read_text(encoding="utf-8") + "\n", encoding="utf-8")
             self.validate_fixture(integrations)
@@ -85,7 +85,7 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.validate_fixture(integrations)
-            self.assertTrue(any("approved profile args drift" in error for error in approved.ERRORS))
+            self.assertTrue(any("approved session args drift" in error for error in approved.ERRORS))
 
     def test_sensitive_workspace_root_is_rejected(self) -> None:
         environment = {
@@ -103,7 +103,7 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
     def test_codex_config_must_remain_disabled_until_qualified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             integrations = self.copy_integrations(directory)
-            config = integrations / "codex" / "config.approved-workspace.http.toml"
+            config = integrations / "codex" / "config.approved-workspace.stdio.toml"
             config.write_text(
                 config.read_text(encoding="utf-8").replace("enabled = false", "enabled = true"),
                 encoding="utf-8",
@@ -225,8 +225,75 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
             )
         )
 
-    def test_rust_case_tool_constant_matches_host_contract(self) -> None:
+    def test_app_issued_session_placeholder_cannot_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            paths = (
+                integrations / "workbuddy" / "connectors" / "approved-case-workspace" / "stdio.windows.json",
+                integrations / "workbuddy" / "skill" / "lawyer-assistance-approved-workspace" / "assets" / "connectors" / "stdio.windows.json",
+            )
+            for path in paths:
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(
+                        approved.SESSION_PLACEHOLDER,
+                        "srv_NOT_A_VALID_APP_SESSION",
+                    ),
+                    encoding="utf-8",
+                )
+            self.validate_fixture(integrations)
+            self.assertTrue(any("approved session args drift" in error for error in approved.ERRORS))
+
+    def test_approved_stdio_rejects_environment_or_path_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            paths = (
+                integrations / "workbuddy" / "connectors" / "approved-case-workspace" / "stdio.windows.json",
+                integrations / "workbuddy" / "skill" / "lawyer-assistance-approved-workspace" / "assets" / "connectors" / "stdio.windows.json",
+            )
+            for path in paths:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data["mcpServers"]["lawyer_assistance"]["env"] = {
+                    "LAWYER_ASSISTANCE_USER_DB": "C:/case/raw.sqlite"
+                }
+                path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self.validate_fixture(integrations)
+            self.assertTrue(any("only stdio session fields" in error for error in approved.ERRORS))
+
+    def test_static_approved_http_asset_cannot_reappear(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            path = integrations / "codex" / "config.approved-workspace.http.toml"
+            path.write_text(
+                "[mcp_servers.lawyer_assistance]\n"
+                "url = \"http://127.0.0.1:8787/mcp\"\n"
+                "bearer_token_env_var = \"LAWYER_ASSISTANCE_MCP_TOKEN\"\n",
+                encoding="utf-8",
+            )
+            self.validate_fixture(integrations)
+            self.assertTrue(any("static HTTP/Unix asset is forbidden" in error for error in approved.ERRORS))
+
+    def test_work_product_readback_invariant_cannot_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            skill = (
+                integrations
+                / "workbuddy"
+                / "skill"
+                / "lawyer-assistance-approved-workspace"
+                / "SKILL.md"
+            )
+            skill.write_text(
+                skill.read_text(encoding="utf-8").replace(
+                    approved.VERIFY_INVARIANT,
+                    "VERIFY_REMOVED",
+                ),
+                encoding="utf-8",
+            )
+            self.validate_fixture(integrations)
+            self.assertTrue(any("WORK_PRODUCT_VERIFY" in error for error in approved.ERRORS))
+
         approved.validate_rust_registry()
+    def test_rust_case_tool_constant_matches_host_contract(self) -> None:
         self.assertEqual([], approved.ERRORS)
 
 

@@ -14,4 +14,4 @@
 3. Call `system_status`; require a ready public legal database, compatible schema, and `public_law_only` profile.
 4. Allow only public law names, public article identifiers, public jurisdictions, and public research dates into tool arguments.
 
-`CASE_RAW`, `CASE_REDACTED_PENDING`, pending-review content, label-only `CASE_REDACTED_APPROVED` content, and App artifacts themselves are forbidden in Codex. The App→MCP citation receipt positive path is not implemented, so every case workflow remains safely disabled.
+`CASE_RAW`, `CASE_REDACTED_PENDING`, pending-review content, label-only `CASE_REDACTED_APPROVED` content, and App artifacts themselves are forbidden in this public-only Codex package. Every case workflow remains disabled here by design. A separate approved package requires a new clean opaque-ID-only task and a current App-issued session; never move text between the packages.

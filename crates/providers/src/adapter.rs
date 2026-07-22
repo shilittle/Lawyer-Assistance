@@ -2,10 +2,13 @@ use crate::{
     credentials::ApiSecret,
     redaction::truncate_for_log,
     types::{
-        ChatCompletion, ChatMessageRole, ChatRequest, ChatUsage, ConnectionTest, ProviderError,
-        ProviderErrorKind, ProviderKind, ProviderOptions, ProviderProfile,
+        ApprovedChatBinding, ApprovedChatDraft, ApprovedChatRequest, ChatCompletion, ChatMessage,
+        ChatMessageRole, ChatRequest, ChatRequestAuthority, ChatUsage, ConnectionTest,
+        ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderKind, ProviderOptions,
+        ProviderProfile,
     },
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
     error::Error as StdError,
@@ -15,7 +18,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::stream::{StreamEvent, StreamParser};
@@ -29,6 +32,33 @@ const PRIVATE_DNS_REJECTION: &str = "provider-dns-rejected-special-address";
 static SYNCHRONOUS_TRANSPORT_RUNTIME: OnceLock<
     Result<Arc<tokio::runtime::Runtime>, ProviderError>,
 > = OnceLock::new();
+
+const APPROVED_CHAT_SCHEMA_VERSION: u16 = 1;
+const EXTERNAL_PROVIDER_DESTINATION: &str = "external_provider";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalApprovedChatEnvelopeV1 {
+    schema_version: u16,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    transport_body_sha256: String,
+    provider_id: String,
+    provider_kind: ProviderKind,
+    model_id: String,
+    endpoint_origin: String,
+    destination_kind: String,
+    purpose: String,
+    policy_id: String,
+    policy_version: u32,
+    detector_version: String,
+    approval_generation_id: String,
+    approved_redacted_content_sha256: String,
+    ocr_provenance_sha256: String,
+    expires_at_unix: u64,
+}
 
 #[derive(Debug)]
 struct ProviderDnsResolver {
@@ -96,33 +126,94 @@ impl fmt::Debug for TransportHeader {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
+struct ApprovedTransportAuthorization {
+    canonical_payload: Arc<[u8]>,
+    canonical_payload_sha256: String,
+    body_sha256: String,
+    provider_id: String,
+    provider_kind: ProviderKind,
+    model_id: String,
+    endpoint_origin: String,
+    purpose: String,
+    policy_id: String,
+    policy_version: u32,
+    detector_version: String,
+    approval_generation_id: String,
+    approved_redacted_content_sha256: String,
+    ocr_provenance_sha256: String,
+    expires_at_unix: u64,
+    receipt_id: String,
+    transport_consumed: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+enum TransportAuthorization {
+    Public {
+        body_sha256: String,
+        endpoint_origin: String,
+        authority: ChatRequestAuthority,
+    },
+    Approved(Box<ApprovedTransportAuthorization>),
+}
+
+#[derive(Clone)]
 pub struct TransportRequest {
-    pub method: String,
-    pub url: String,
-    pub headers: Vec<TransportHeader>,
-    pub body: String,
-    pub expects_stream: bool,
-    pub allow_private_network: bool,
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) headers: Vec<TransportHeader>,
+    pub(crate) body: String,
+    pub(crate) expects_stream: bool,
+    pub(crate) allow_private_network: bool,
+    authorization: TransportAuthorization,
 }
 
 impl TransportRequest {
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn headers(&self) -> &[TransportHeader] {
+        &self.headers
+    }
+
     pub fn header_value(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|header| header.name.eq_ignore_ascii_case(name))
             .map(|header| header.value.as_str())
     }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub const fn expects_stream(&self) -> bool {
+        self.expects_stream
+    }
+
+    pub const fn allow_private_network(&self) -> bool {
+        self.allow_private_network
+    }
 }
 
 impl fmt::Debug for TransportRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let authorization = match &self.authorization {
+            TransportAuthorization::Public { .. } => "public",
+            TransportAuthorization::Approved(_) => "approved_case",
+        };
         formatter
             .debug_struct("TransportRequest")
             .field("method", &self.method)
             .field("url", &self.url)
             .field("headers", &self.headers)
             .field("body", &"<redacted>")
+            .field("authorization", &authorization)
             .finish()
     }
 }
@@ -253,7 +344,26 @@ impl ReqwestStreamingTransport {
         request: &ChatRequest,
     ) -> Result<StreamingTransportResponse, ProviderError> {
         let request = build_transport_request(profile, secret, request)?;
+        self.send_transport_request(secret, request).await
+    }
+
+    pub async fn send_approved_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
+    ) -> Result<StreamingTransportResponse, ProviderError> {
+        let request = build_approved_transport_request(profile, secret, request)?;
+        self.send_transport_request(secret, request).await
+    }
+
+    async fn send_transport_request(
+        &self,
+        secret: &ApiSecret,
+        request: TransportRequest,
+    ) -> Result<StreamingTransportResponse, ProviderError> {
         let client = select_client(&self.safe_client, &self.private_network_client, &request)?;
+        validate_transport_authorization(&request, true)?;
         let mut builder = client.post(&request.url);
 
         for header in &request.headers {
@@ -402,6 +512,7 @@ fn select_client<'a>(
     request: &TransportRequest,
 ) -> Result<&'a reqwest::Client, ProviderError> {
     validate_transport_destination(request)?;
+    validate_transport_authorization(request, false)?;
     Ok(if request.allow_private_network {
         private_network_client
     } else {
@@ -477,6 +588,7 @@ impl ReqwestTransport {
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
+        validate_transport_authorization(&request, true)?;
 
         let started_at = Instant::now();
         let expects_stream = request.expects_stream;
@@ -569,11 +681,26 @@ pub trait ProviderAdapter: Send + Sync {
         request: &ChatRequest,
     ) -> Result<TransportResponse, ProviderError>;
 
+    fn send_approved_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
+    ) -> Result<TransportResponse, ProviderError>;
+
     fn send_chat_with_cancellation(
         &self,
         profile: &ProviderProfile,
         secret: &ApiSecret,
         request: &ChatRequest,
+        cancellation: &RequestCancellation,
+    ) -> Result<TransportResponse, ProviderError>;
+
+    fn send_approved_chat_with_cancellation(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
         cancellation: &RequestCancellation,
     ) -> Result<TransportResponse, ProviderError>;
 
@@ -601,6 +728,14 @@ where
         build_transport_request(profile, secret, request)
     }
 
+    pub fn build_approved_transport_request(
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
+    ) -> Result<TransportRequest, ProviderError> {
+        build_approved_transport_request(profile, secret, request)
+    }
+
     pub fn send_chat(
         &self,
         profile: &ProviderProfile,
@@ -608,6 +743,16 @@ where
         request: &ChatRequest,
     ) -> Result<TransportResponse, ProviderError> {
         let transport_request = Self::build_transport_request(profile, secret, request)?;
+        self.transport.send(transport_request)
+    }
+
+    pub fn send_approved_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
+    ) -> Result<TransportResponse, ProviderError> {
+        let transport_request = Self::build_approved_transport_request(profile, secret, request)?;
         self.transport.send(transport_request)
     }
 
@@ -619,6 +764,18 @@ where
         cancellation: &RequestCancellation,
     ) -> Result<TransportResponse, ProviderError> {
         let transport_request = Self::build_transport_request(profile, secret, request)?;
+        self.transport
+            .send_with_cancellation(transport_request, cancellation)
+    }
+
+    pub fn send_approved_chat_with_cancellation(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
+        cancellation: &RequestCancellation,
+    ) -> Result<TransportResponse, ProviderError> {
+        let transport_request = Self::build_approved_transport_request(profile, secret, request)?;
         self.transport
             .send_with_cancellation(transport_request, cancellation)
     }
@@ -708,6 +865,15 @@ where
         OpenAiCompatibleAdapter::send_chat(self, profile, secret, request)
     }
 
+    fn send_approved_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
+    ) -> Result<TransportResponse, ProviderError> {
+        OpenAiCompatibleAdapter::send_approved_chat(self, profile, secret, request)
+    }
+
     fn send_chat_with_cancellation(
         &self,
         profile: &ProviderProfile,
@@ -716,6 +882,22 @@ where
         cancellation: &RequestCancellation,
     ) -> Result<TransportResponse, ProviderError> {
         OpenAiCompatibleAdapter::send_chat_with_cancellation(
+            self,
+            profile,
+            secret,
+            request,
+            cancellation,
+        )
+    }
+
+    fn send_approved_chat_with_cancellation(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &ApprovedChatRequest,
+        cancellation: &RequestCancellation,
+    ) -> Result<TransportResponse, ProviderError> {
+        OpenAiCompatibleAdapter::send_approved_chat_with_cancellation(
             self,
             profile,
             secret,
@@ -734,8 +916,138 @@ fn build_transport_request(
     secret: &ApiSecret,
     request: &ChatRequest,
 ) -> Result<TransportRequest, ProviderError> {
+    if !matches!(
+        request.authority,
+        ChatRequestAuthority::ConnectionProbe
+            | ChatRequestAuthority::LegalPublic
+            | ChatRequestAuthority::ProductPublic
+    ) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved case chat requires an opaque approved request",
+        ));
+    }
     let url = chat_completions_url(profile)?;
-    let headers = vec![
+    let endpoint_origin = provider_endpoint_origin(profile)?;
+    let body = serde_json::to_string(&build_chat_body(profile, request, false)?).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider request serialization failed",
+        )
+    })?;
+    let authorization = TransportAuthorization::Public {
+        body_sha256: privacy::sha256_hex(body.as_bytes()),
+        endpoint_origin,
+        authority: request.authority,
+    };
+    Ok(TransportRequest {
+        method: "POST".to_owned(),
+        url,
+        headers: provider_headers(secret, request.stream),
+        body,
+        expects_stream: request.stream,
+        allow_private_network: private_network_is_explicitly_allowed(profile),
+        authorization,
+    })
+}
+
+fn build_approved_transport_request(
+    profile: &ProviderProfile,
+    secret: &ApiSecret,
+    approved: &ApprovedChatRequest,
+) -> Result<TransportRequest, ProviderError> {
+    validate_approved_request_for_profile(profile, approved)?;
+    let request = &approved.draft.request;
+    let url = chat_completions_url(profile)?;
+    let body = serde_json::to_string(&build_chat_body(profile, request, true)?).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request serialization failed",
+        )
+    })?;
+    let receipt_id = approved.receipt_id().ok_or_else(|| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request receipt is missing",
+        )
+    })?;
+    if approved
+        .consumed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request has already been consumed",
+        ));
+    }
+    let authorization =
+        TransportAuthorization::Approved(Box::new(ApprovedTransportAuthorization {
+            canonical_payload: Arc::from(approved.draft.canonical_payload.clone()),
+            canonical_payload_sha256: approved.draft.canonical_payload_sha256.clone(),
+            body_sha256: privacy::sha256_hex(body.as_bytes()),
+            provider_id: approved.draft.provider_id.clone(),
+            provider_kind: approved.draft.provider_kind,
+            model_id: approved.draft.model_id.clone(),
+            endpoint_origin: approved.draft.endpoint_origin.clone(),
+            purpose: approved.draft.binding.purpose.clone(),
+            policy_id: approved.draft.binding.policy_id.clone(),
+            policy_version: approved.draft.binding.policy_version,
+            detector_version: approved.draft.binding.detector_version.clone(),
+            approval_generation_id: approved.draft.binding.approval_generation_id.clone(),
+            approved_redacted_content_sha256: approved
+                .draft
+                .binding
+                .approved_redacted_content_sha256
+                .clone(),
+            ocr_provenance_sha256: approved.draft.binding.ocr_provenance_sha256.clone(),
+            expires_at_unix: approved.draft.binding.expires_at_unix,
+            receipt_id: receipt_id.to_owned(),
+            transport_consumed: Arc::new(AtomicBool::new(false)),
+        }));
+    Ok(TransportRequest {
+        method: "POST".to_owned(),
+        url,
+        headers: provider_headers(secret, request.stream),
+        body,
+        expects_stream: request.stream,
+        allow_private_network: private_network_is_explicitly_allowed(profile),
+        authorization,
+    })
+}
+
+fn validate_approved_request_for_profile(
+    profile: &ProviderProfile,
+    approved: &ApprovedChatRequest,
+) -> Result<(), ProviderError> {
+    validate_approved_draft(&approved.draft)?;
+    let now_unix = system_unix_time()?;
+    let endpoint_origin = provider_endpoint_origin(profile)?;
+    let destination = approved.outbound.destination();
+    let active_transport_body_sha256 =
+        approved_transport_body_sha256(profile, &approved.draft.request)?;
+    if approved.outbound.classification() != privacy::DataClassification::CaseRedactedApproved
+        || approved.outbound.payload() != approved.draft.canonical_payload
+        || approved.outbound.payload_sha256() != approved.draft.canonical_payload_sha256
+        || destination.kind != privacy::DestinationKind::ExternalProvider
+        || destination.identifier != approved.draft.provider_id
+        || profile.id != approved.draft.provider_id
+        || profile.kind != approved.draft.provider_kind
+        || effective_model_id(profile) != approved.draft.model_id
+        || endpoint_origin != approved.draft.endpoint_origin
+        || approved.draft.binding.expires_at_unix <= now_unix
+        || active_transport_body_sha256 != approved.draft.transport_body_sha256
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request no longer matches the active provider profile",
+        ));
+    }
+    Ok(())
+}
+
+fn provider_headers(secret: &ApiSecret, stream: bool) -> Vec<TransportHeader> {
+    vec![
         TransportHeader::new(
             "Authorization",
             format!("Bearer {}", secret.expose_secret()),
@@ -743,31 +1055,279 @@ fn build_transport_request(
         TransportHeader::new("Content-Type", "application/json"),
         TransportHeader::new(
             "Accept",
-            if request.stream {
+            if stream {
                 "text/event-stream"
             } else {
                 "application/json"
             },
         ),
-    ];
-
-    let body = build_chat_body(profile, request)?;
-
-    Ok(TransportRequest {
-        method: "POST".to_owned(),
-        url,
-        headers,
-        body: serde_json::to_string(&body).map_err(|error| {
-            ProviderError::new(ProviderErrorKind::InvalidRequest, error.to_string())
-        })?,
-        expects_stream: request.stream,
-        allow_private_network: private_network_is_explicitly_allowed(profile),
-    })
+    ]
 }
 
 pub fn provider_endpoint_origin(profile: &ProviderProfile) -> Result<String, ProviderError> {
     let (_, parsed) = parsed_provider_base_url(profile)?;
     Ok(parsed.origin().ascii_serialization())
+}
+
+fn approved_transport_body_sha256(
+    profile: &ProviderProfile,
+    request: &ChatRequest,
+) -> Result<String, ProviderError> {
+    let body = build_chat_body(profile, request, true)?;
+    let bytes = serde_json::to_vec(&body).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request serialization failed",
+        )
+    })?;
+    Ok(privacy::sha256_hex(&bytes))
+}
+
+pub fn prepare_approved_chat(
+    profile: &ProviderProfile,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    binding: ApprovedChatBinding,
+) -> Result<ApprovedChatDraft, ProviderError> {
+    validate_chat_shape(&messages, temperature, max_tokens)?;
+    validate_approved_binding(&binding)?;
+    if binding.expires_at_unix <= system_unix_time()? {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request expiry must be in the future",
+        ));
+    }
+    let endpoint_origin = provider_endpoint_origin(profile)?;
+    let model_id = effective_model_id(profile).to_owned();
+    validate_provider_binding_text("provider ID", &profile.id)?;
+    validate_provider_binding_text("model ID", &model_id)?;
+    scan_message_content(&messages)?;
+
+    let request = ChatRequest::approved_case(messages, stream, temperature, max_tokens);
+    let transport_body_sha256 = approved_transport_body_sha256(profile, &request)?;
+    let envelope = CanonicalApprovedChatEnvelopeV1 {
+        schema_version: APPROVED_CHAT_SCHEMA_VERSION,
+        messages: request.messages.clone(),
+        transport_body_sha256: transport_body_sha256.clone(),
+        stream: request.stream,
+        temperature: request.temperature,
+        max_tokens: request.max_tokens,
+        provider_id: profile.id.clone(),
+        provider_kind: profile.kind,
+        model_id: model_id.clone(),
+        endpoint_origin: endpoint_origin.clone(),
+        destination_kind: EXTERNAL_PROVIDER_DESTINATION.to_owned(),
+        purpose: binding.purpose.clone(),
+        policy_id: binding.policy_id.clone(),
+        policy_version: binding.policy_version,
+        detector_version: binding.detector_version.clone(),
+        approval_generation_id: binding.approval_generation_id.clone(),
+        approved_redacted_content_sha256: binding.approved_redacted_content_sha256.clone(),
+        ocr_provenance_sha256: binding.ocr_provenance_sha256.clone(),
+        expires_at_unix: binding.expires_at_unix,
+    };
+    let canonical_payload = serde_json::to_vec(&envelope).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request canonicalization failed",
+        )
+    })?;
+    let residual = privacy::scan_residual(&canonical_payload).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request privacy validation failed",
+        )
+    })?;
+    if !residual.passed {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request contains residual sensitive content",
+        ));
+    }
+    let canonical_payload_sha256 = privacy::sha256_hex(&canonical_payload);
+    Ok(ApprovedChatDraft {
+        transport_body_sha256,
+        request,
+        canonical_payload,
+        canonical_payload_sha256,
+        provider_id: profile.id.clone(),
+        provider_kind: profile.kind,
+        model_id,
+        endpoint_origin,
+        binding,
+    })
+}
+
+pub fn authorize_approved_chat(
+    draft: ApprovedChatDraft,
+    signer: privacy::ReceiptSigner,
+    receipt: &privacy::SignedRedactionReceipt,
+) -> Result<ApprovedChatRequest, ProviderError> {
+    validate_approved_draft(&draft)?;
+    let now_unix = system_unix_time()?;
+    if draft.binding.expires_at_unix <= now_unix {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request has expired",
+        ));
+    }
+    let destination = privacy::DestinationScope {
+        kind: privacy::DestinationKind::ExternalProvider,
+        identifier: draft.provider_id.clone(),
+    };
+    if receipt.claims.destination != destination
+        || receipt.claims.purpose != draft.binding.purpose
+        || receipt.claims.policy_id != draft.binding.policy_id
+        || receipt.claims.policy_version != draft.binding.policy_version
+        || receipt.claims.detector_version != draft.binding.detector_version
+        || receipt.claims.redacted_content_sha256 != draft.binding.approved_redacted_content_sha256
+        || receipt.claims.extraction_sha256 != draft.binding.ocr_provenance_sha256
+        || receipt.claims.expires_at_unix != Some(draft.binding.expires_at_unix)
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request receipt binding mismatch",
+        ));
+    }
+    let engine = privacy::EgressPolicyEngine::new(
+        signer,
+        draft.binding.policy_id.clone(),
+        draft.binding.policy_version,
+    )
+    .map_err(map_egress_error)?;
+    let outbound = engine
+        .authorize(&privacy::EgressCandidate {
+            payload: &draft.canonical_payload,
+            classification: privacy::DataClassification::CaseRedactedApproved,
+            destination: &destination,
+            purpose: &draft.binding.purpose,
+            receipt: Some(receipt),
+            now_unix,
+        })
+        .map_err(map_egress_error)?;
+    if outbound.payload_sha256() != draft.canonical_payload_sha256
+        || outbound.payload() != draft.canonical_payload
+        || outbound.classification() != privacy::DataClassification::CaseRedactedApproved
+        || outbound.destination() != &destination
+        || outbound.receipt_id() != Some(receipt.claims.receipt_id.as_str())
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request authorization proof mismatch",
+        ));
+    }
+    Ok(ApprovedChatRequest {
+        draft,
+        outbound,
+        consumed: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+fn validate_approved_draft(draft: &ApprovedChatDraft) -> Result<(), ProviderError> {
+    validate_approved_binding(&draft.binding)?;
+    let expected = CanonicalApprovedChatEnvelopeV1 {
+        schema_version: APPROVED_CHAT_SCHEMA_VERSION,
+        messages: draft.request.messages.clone(),
+        transport_body_sha256: draft.transport_body_sha256.clone(),
+        stream: draft.request.stream,
+        temperature: draft.request.temperature,
+        max_tokens: draft.request.max_tokens,
+        provider_id: draft.provider_id.clone(),
+        provider_kind: draft.provider_kind,
+        model_id: draft.model_id.clone(),
+        endpoint_origin: draft.endpoint_origin.clone(),
+        destination_kind: EXTERNAL_PROVIDER_DESTINATION.to_owned(),
+        purpose: draft.binding.purpose.clone(),
+        policy_id: draft.binding.policy_id.clone(),
+        policy_version: draft.binding.policy_version,
+        detector_version: draft.binding.detector_version.clone(),
+        approval_generation_id: draft.binding.approval_generation_id.clone(),
+        approved_redacted_content_sha256: draft.binding.approved_redacted_content_sha256.clone(),
+        ocr_provenance_sha256: draft.binding.ocr_provenance_sha256.clone(),
+        expires_at_unix: draft.binding.expires_at_unix,
+    };
+    let decoded: CanonicalApprovedChatEnvelopeV1 = serde_json::from_slice(&draft.canonical_payload)
+        .map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "approved provider request canonical payload is invalid",
+            )
+        })?;
+    let rebuilt = serde_json::to_vec(&expected).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request canonicalization failed",
+        )
+    })?;
+    if decoded != expected
+        || rebuilt != draft.canonical_payload
+        || privacy::sha256_hex(&draft.canonical_payload) != draft.canonical_payload_sha256
+        || draft.request.authority != ChatRequestAuthority::ApprovedCase
+        || !valid_lower_sha256(&draft.transport_body_sha256)
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request canonical payload mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_approved_binding(binding: &ApprovedChatBinding) -> Result<(), ProviderError> {
+    validate_provider_binding_text("purpose", &binding.purpose)?;
+    validate_provider_binding_text("policy ID", &binding.policy_id)?;
+    validate_provider_binding_text("detector version", &binding.detector_version)?;
+    validate_provider_binding_text("approval generation ID", &binding.approval_generation_id)?;
+    if binding.policy_version == 0
+        || binding.detector_version != privacy::REDACTION_VERSION
+        || !valid_lower_sha256(&binding.approved_redacted_content_sha256)
+        || !valid_lower_sha256(&binding.ocr_provenance_sha256)
+        || binding.expires_at_unix == 0
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "approved provider request binding is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_binding_text(name: &str, value: &str) -> Result<(), ProviderError> {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!("{name} is invalid"),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn map_egress_error(error: privacy::EgressError) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::InvalidRequest,
+        format!("approved provider request rejected: {}", error.code()),
+    )
+}
+
+fn system_unix_time() -> Result<u64, ProviderError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "system clock is before the Unix epoch",
+            )
+        })
 }
 
 fn chat_completions_url(profile: &ProviderProfile) -> Result<String, ProviderError> {
@@ -806,6 +1366,7 @@ fn parsed_provider_base_url(
 
     match parsed.scheme() {
         "https" => {}
+        "http" if approved_qualification_loopback_http_is_allowed(profile, &parsed) => {}
         "http" => {
             return Err(ProviderError::new(
                 ProviderErrorKind::InvalidProfile,
@@ -829,6 +1390,38 @@ fn parsed_provider_base_url(
     Ok((trimmed, parsed))
 }
 
+fn approved_qualification_loopback_http_is_allowed(
+    profile: &ProviderProfile,
+    parsed: &reqwest::Url,
+) -> bool {
+    profile.kind == ProviderKind::Custom
+        && private_network_is_explicitly_allowed(profile)
+        && parsed.host_str().is_some_and(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host);
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+        && (cfg!(test)
+            || (profile.id == "internal-provider-qualification-canary-v1"
+                && profile.display_name == "Internal Provider Qualification Canary"
+                && profile.model_id == "local-qualification-model-v1"
+                && profile.credential_account_id == "internal-canary"
+                && profile.capabilities
+                    == ProviderCapabilities::custom_openai_compatible_defaults()
+                && profile.options
+                    == (ProviderOptions {
+                        allow_private_network: Some(true),
+                        ..ProviderOptions::default()
+                    })
+                && parsed.port().is_some()
+                && parsed.path() == "/v1"))
+}
+
 fn private_network_is_explicitly_allowed(profile: &ProviderProfile) -> bool {
     profile.kind == ProviderKind::Custom && profile.options.allow_private_network == Some(true)
 }
@@ -844,6 +1437,107 @@ fn validate_transport_destination(request: &TransportRequest) -> Result<(), Prov
         return Err(private_network_profile_error());
     }
     Ok(())
+}
+
+fn validate_transport_authorization(
+    request: &TransportRequest,
+    consume_approved: bool,
+) -> Result<(), ProviderError> {
+    if request.method != "POST"
+        || request.header_value("Content-Type") != Some("application/json")
+        || request
+            .header_value("Authorization")
+            .is_none_or(|value| !value.starts_with("Bearer ") || value.len() <= "Bearer ".len())
+    {
+        return Err(transport_authorization_error());
+    }
+    let parsed = reqwest::Url::parse(&request.url).map_err(|_| transport_authorization_error())?;
+    let endpoint_origin = parsed.origin().ascii_serialization();
+    let body_sha256 = privacy::sha256_hex(request.body.as_bytes());
+
+    match &request.authorization {
+        TransportAuthorization::Public {
+            body_sha256: expected_body_sha256,
+            endpoint_origin: expected_endpoint_origin,
+            authority,
+        } => {
+            if body_sha256 != *expected_body_sha256
+                || endpoint_origin != *expected_endpoint_origin
+                || !matches!(
+                    authority,
+                    ChatRequestAuthority::ConnectionProbe
+                        | ChatRequestAuthority::LegalPublic
+                        | ChatRequestAuthority::ProductPublic
+                )
+            {
+                return Err(transport_authorization_error());
+            }
+        }
+        TransportAuthorization::Approved(authorization) => {
+            let now_unix = system_unix_time()?;
+            let canonical_sha256 = privacy::sha256_hex(&authorization.canonical_payload);
+            let envelope: CanonicalApprovedChatEnvelopeV1 =
+                serde_json::from_slice(&authorization.canonical_payload)
+                    .map_err(|_| transport_authorization_error())?;
+            let rebuilt_canonical =
+                serde_json::to_vec(&envelope).map_err(|_| transport_authorization_error())?;
+            let canonical_bytes: &[u8] = authorization.canonical_payload.as_ref();
+            let body_matches_signed_envelope = body_sha256 == envelope.transport_body_sha256;
+            let body: Value =
+                serde_json::from_str(&request.body).map_err(|_| transport_authorization_error())?;
+            if canonical_sha256 != authorization.canonical_payload_sha256
+                || rebuilt_canonical.as_slice() != canonical_bytes
+                || !body_matches_signed_envelope
+                || envelope.transport_body_sha256 != authorization.body_sha256
+                || body_sha256 != authorization.body_sha256
+                || endpoint_origin != authorization.endpoint_origin
+                || envelope.schema_version != APPROVED_CHAT_SCHEMA_VERSION
+                || envelope.destination_kind != EXTERNAL_PROVIDER_DESTINATION
+                || envelope.provider_id != authorization.provider_id
+                || envelope.provider_kind != authorization.provider_kind
+                || envelope.model_id != authorization.model_id
+                || envelope.endpoint_origin != authorization.endpoint_origin
+                || envelope.purpose != authorization.purpose
+                || envelope.policy_id != authorization.policy_id
+                || envelope.policy_version != authorization.policy_version
+                || envelope.detector_version != authorization.detector_version
+                || envelope.approval_generation_id != authorization.approval_generation_id
+                || envelope.approved_redacted_content_sha256
+                    != authorization.approved_redacted_content_sha256
+                || envelope.ocr_provenance_sha256 != authorization.ocr_provenance_sha256
+                || envelope.expires_at_unix != authorization.expires_at_unix
+                || envelope.expires_at_unix <= now_unix
+                || authorization.receipt_id.is_empty()
+                || authorization.receipt_id.len() > 128
+                || authorization.receipt_id.chars().any(char::is_control)
+                || body.get("model").and_then(Value::as_str)
+                    != Some(authorization.model_id.as_str())
+                || body.get("stream").and_then(Value::as_bool) != Some(envelope.stream)
+                || request.expects_stream != envelope.stream
+            {
+                return Err(transport_authorization_error());
+            }
+            if consume_approved
+                && authorization
+                    .transport_consumed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "approved provider request has already been consumed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn transport_authorization_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::InvalidRequest,
+        "provider transport authorization is invalid",
+    )
 }
 
 fn validate_resolved_addresses(
@@ -965,28 +1659,26 @@ fn resolve_base_url(profile: &ProviderProfile) -> Result<String, ProviderError> 
 fn build_chat_body(
     profile: &ProviderProfile,
     request: &ChatRequest,
+    approved_case: bool,
 ) -> Result<Value, ProviderError> {
-    if !matches!(
-        request.data_classification,
-        privacy::DataClassification::LegalPublic | privacy::DataClassification::ProductPublic
-    ) {
+    let authority_matches = if approved_case {
+        request.authority == ChatRequestAuthority::ApprovedCase
+    } else {
+        matches!(
+            request.authority,
+            ChatRequestAuthority::ConnectionProbe
+                | ChatRequestAuthority::LegalPublic
+                | ChatRequestAuthority::ProductPublic
+        )
+    };
+    if !authority_matches {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            "provider request requires an exact active redaction receipt",
+            "provider request authority does not match the selected send path",
         ));
     }
-    if request.messages.is_empty() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "chat request must include at least one message",
-        ));
-    }
-    if request.max_tokens == Some(0) {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "max tokens must be greater than zero",
-        ));
-    }
+    validate_chat_shape(&request.messages, request.temperature, request.max_tokens)?;
+    scan_message_content(&request.messages)?;
     if profile.kind == ProviderKind::SiliconFlow
         && profile
             .options
@@ -1005,16 +1697,10 @@ fn build_chat_body(
         ));
     }
 
-    let model_id = if profile.kind == ProviderKind::VolcengineArk {
-        non_empty(profile.options.endpoint_id.as_deref()).unwrap_or(&profile.model_id)
-    } else {
-        &profile.model_id
-    };
-
+    let model_id = effective_model_id(profile);
     let mut body = Map::new();
     body.insert("model".to_owned(), json!(model_id));
     body.insert("stream".to_owned(), json!(request.stream));
-    let mut content_redactor = privacy::Redactor::default();
     body.insert(
         "messages".to_owned(),
         Value::Array(
@@ -1022,11 +1708,9 @@ fn build_chat_body(
                 .messages
                 .iter()
                 .map(|message| {
-                    let redacted_content =
-                        redact_message_content(&mut content_redactor, &message.content);
                     json!({
                         "role": role_name(message.role),
-                        "content": redacted_content,
+                        "content": message.content,
                     })
                 })
                 .collect(),
@@ -1053,10 +1737,6 @@ fn build_chat_body(
         );
     }
 
-    // Apply the same explicit defaults used by newly-created profiles even if
-    // a legacy/imported profile omitted a toggle. DeepSeek V4 otherwise turns
-    // thinking on at the service boundary and can consume the entire output
-    // allowance before producing user-visible content.
     let normalized_options = profile.kind.options_with_defaults(profile.options.clone());
     apply_provider_options(profile.kind, &normalized_options, &mut body);
 
@@ -1080,6 +1760,62 @@ fn build_chat_body(
         ));
     }
     Ok(body)
+}
+
+fn validate_chat_shape(
+    messages: &[ChatMessage],
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> Result<(), ProviderError> {
+    if messages.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "chat request must include at least one message",
+        ));
+    }
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "temperature must be finite and between 0 and 2",
+        ));
+    }
+    if max_tokens == Some(0) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "max tokens must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn scan_message_content(messages: &[ChatMessage]) -> Result<(), ProviderError> {
+    let serialized = serde_json::to_vec(messages).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider message privacy validation failed",
+        )
+    })?;
+    let residual = privacy::scan_residual(&serialized).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider message privacy validation failed",
+        )
+    })?;
+    if !residual.passed {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "provider message contains residual sensitive content",
+        ));
+    }
+    Ok(())
+}
+
+fn effective_model_id(profile: &ProviderProfile) -> &str {
+    if profile.kind == ProviderKind::VolcengineArk {
+        non_empty(profile.options.endpoint_id.as_deref()).unwrap_or(&profile.model_id)
+    } else {
+        &profile.model_id
+    }
 }
 
 fn apply_provider_options(
@@ -1148,15 +1884,6 @@ fn role_name(role: ChatMessageRole) -> &'static str {
         ChatMessageRole::System => "system",
         ChatMessageRole::User => "user",
         ChatMessageRole::Assistant => "assistant",
-    }
-}
-
-fn redact_message_content(redactor: &mut privacy::Redactor, content: &str) -> String {
-    if let Ok(mut structured) = serde_json::from_str::<Value>(content) {
-        redactor.redact_json(&mut structured);
-        serde_json::to_string(&structured).unwrap_or_else(|_| redactor.redact(content))
-    } else {
-        redactor.redact(content)
     }
 }
 
@@ -1501,16 +2228,147 @@ mod tests {
     }
 
     fn request_for_contract() -> ChatRequest {
-        ChatRequest {
-            messages: vec![ChatMessage {
+        ChatRequest::product_public(
+            vec![ChatMessage {
                 role: ChatMessageRole::User,
                 content: "ping".to_owned(),
             }],
-            stream: true,
-            temperature: Some(0.2),
-            max_tokens: Some(16),
-            data_classification: privacy::DataClassification::ProductPublic,
+            true,
+            Some(0.2),
+            Some(16),
+        )
+    }
+
+    fn test_transport_request(
+        url: String,
+        mut headers: Vec<TransportHeader>,
+        body: impl Into<String>,
+        expects_stream: bool,
+        allow_private_network: bool,
+    ) -> TransportRequest {
+        if headers
+            .iter()
+            .all(|header| !header.name.eq_ignore_ascii_case("Authorization"))
+        {
+            headers.push(TransportHeader::new(
+                "Authorization",
+                "Bearer synthetic-transport-test-key",
+            ));
         }
+        if headers
+            .iter()
+            .all(|header| !header.name.eq_ignore_ascii_case("Content-Type"))
+        {
+            headers.push(TransportHeader::new("Content-Type", "application/json"));
+        }
+        let endpoint_origin = reqwest::Url::parse(&url)
+            .expect("synthetic transport URL parses")
+            .origin()
+            .ascii_serialization();
+        let body = body.into();
+        let body_sha256 = privacy::sha256_hex(body.as_bytes());
+        TransportRequest {
+            method: "POST".to_owned(),
+            url,
+            headers,
+            body,
+            expects_stream,
+            allow_private_network,
+            authorization: TransportAuthorization::Public {
+                body_sha256,
+                endpoint_origin,
+                authority: ChatRequestAuthority::ProductPublic,
+            },
+        }
+    }
+
+    fn approved_test_profile(base_url: impl Into<String>) -> ProviderProfile {
+        let mut value = profile(ProviderKind::Custom);
+        value.id = "local-approved-provider".to_owned();
+        value.display_name = "Local approved provider".to_owned();
+        value.model_id = "approved-chat-model".to_owned();
+        value.base_url = base_url.into();
+        value.options.allow_private_network = Some(true);
+        value
+    }
+
+    fn approved_test_binding(expires_at_unix: u64) -> ApprovedChatBinding {
+        ApprovedChatBinding {
+            purpose: "assistant_chat".to_owned(),
+            policy_id: "cn-legal-default".to_owned(),
+            policy_version: 1,
+            detector_version: privacy::REDACTION_VERSION.to_owned(),
+            approval_generation_id: "approved-generation-1".to_owned(),
+            approved_redacted_content_sha256: privacy::sha256_hex(
+                b"approved-redacted-case-generation",
+            ),
+            ocr_provenance_sha256: privacy::sha256_hex(b"local-ocr-provenance"),
+            expires_at_unix,
+        }
+    }
+
+    fn approved_test_draft(
+        provider_profile: &ProviderProfile,
+        expires_at_unix: u64,
+    ) -> (ApprovedChatDraft, privacy::ReceiptSigner) {
+        let draft = prepare_approved_chat(
+            provider_profile,
+            vec![
+                ChatMessage {
+                    role: ChatMessageRole::System,
+                    content: "Only use the approved redacted case context.".to_owned(),
+                },
+                ChatMessage {
+                    role: ChatMessageRole::User,
+                    content: "Approved redacted case: [PARTY_1] requests a procedural summary."
+                        .to_owned(),
+                },
+            ],
+            false,
+            Some(0.0),
+            Some(64),
+            approved_test_binding(expires_at_unix),
+        )
+        .expect("synthetic approved draft is valid");
+        let signer = privacy::ReceiptSigner::new([0x5a_u8; 32]).expect("receipt signer");
+        (draft, signer)
+    }
+
+    fn approved_test_receipt(
+        draft: &ApprovedChatDraft,
+        signer: &privacy::ReceiptSigner,
+        purpose: &str,
+    ) -> privacy::SignedRedactionReceipt {
+        signer
+            .issue(privacy::RedactionReceiptClaims {
+                receipt_id: String::new(),
+                source_sha256: vec![privacy::sha256_hex(b"synthetic-source")],
+                extraction_sha256: draft.binding.ocr_provenance_sha256.clone(),
+                redacted_content_sha256: draft.binding.approved_redacted_content_sha256.clone(),
+                approved_payload_sha256: draft.canonical_payload_sha256.clone(),
+                policy_id: draft.binding.policy_id.clone(),
+                policy_version: draft.binding.policy_version,
+                detector_version: draft.binding.detector_version.clone(),
+                destination: privacy::DestinationScope {
+                    kind: privacy::DestinationKind::ExternalProvider,
+                    identifier: draft.provider_id.clone(),
+                },
+                purpose: purpose.to_owned(),
+                unresolved_high_risk_count: 0,
+                review_state: privacy::ReviewState::Approved,
+                issued_at_unix: system_unix_time().expect("system time"),
+                expires_at_unix: Some(draft.binding.expires_at_unix),
+                key_version: 1,
+            })
+            .expect("synthetic receipt is valid")
+    }
+
+    fn approved_test_request(provider_profile: &ProviderProfile) -> ApprovedChatRequest {
+        let expires_at_unix = system_unix_time().expect("system time") + 300;
+        let (draft, signer) = approved_test_draft(provider_profile, expires_at_unix);
+        let receipt = approved_test_receipt(&draft, &signer, &draft.binding.purpose);
+        authorize_approved_chat(draft, signer, &receipt)
+            .expect("synthetic approved request is authorized")
     }
 
     fn build(kind: ProviderKind, options: ProviderOptions) -> TransportRequest {
@@ -1573,16 +2431,11 @@ mod tests {
             stream: false,
             temperature: Some(0.0),
             max_tokens: None,
-            data_classification: privacy::DataClassification::CaseRaw,
+            authority: ChatRequestAuthority::ApprovedCase,
         };
-        for classification in [
-            privacy::DataClassification::CaseRaw,
-            privacy::DataClassification::CaseRedactedPending,
-            privacy::DataClassification::CaseRedactedApproved,
-            privacy::DataClassification::Secret,
-        ] {
+        for authority in [ChatRequestAuthority::ApprovedCase] {
             let mut classified_request = request.clone();
-            classified_request.data_classification = classification;
+            classified_request.authority = authority;
             for kind in [
                 ProviderKind::DeepSeek,
                 ProviderKind::Qwen,
@@ -1602,7 +2455,7 @@ mod tests {
                 )
                 .expect_err("non-public classifications must fail before transport serialization");
                 assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-                assert!(error.to_string().contains("exact active redaction receipt"));
+                assert!(error.to_string().contains("opaque approved request"));
                 assert!(!error.to_string().contains("case material"));
             }
         }
@@ -1633,18 +2486,13 @@ mod tests {
             stream: false,
             temperature: Some(0.0),
             max_tokens: None,
-            data_classification: privacy::DataClassification::CaseRaw,
+            authority: ChatRequestAuthority::ApprovedCase,
         };
         let secret = ApiSecret::new(CANARIES[6]);
 
-        for classification in [
-            privacy::DataClassification::CaseRaw,
-            privacy::DataClassification::CaseRedactedPending,
-            privacy::DataClassification::CaseRedactedApproved,
-            privacy::DataClassification::Secret,
-        ] {
+        for authority in [ChatRequestAuthority::ApprovedCase] {
             let mut classified_request = request.clone();
-            classified_request.data_classification = classification;
+            classified_request.authority = authority;
 
             for kind in [
                 ProviderKind::DeepSeek,
@@ -1684,26 +2532,229 @@ mod tests {
                     );
 
                     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-                    assert!(error.to_string().contains("exact active redaction receipt"));
+                    assert!(error.to_string().contains("opaque approved request"));
                     assert!(
                         transport.requests.lock().expect("requests lock").is_empty(),
-                        "transport ran for {kind:?}, {classification:?}, cancellation={send_with_cancellation}",
+                        "transport ran for {kind:?}, {authority:?}, cancellation={send_with_cancellation}",
                     );
                     let display = error.to_string();
                     let debug = format!("{error:?}");
                     for canary in CANARIES {
                         assert!(
                             !display.contains(canary),
-                            "Display leaked canary for {kind:?}, {classification:?}, cancellation={send_with_cancellation}",
+                            "Display leaked canary for {kind:?}, {authority:?}, cancellation={send_with_cancellation}",
                         );
                         assert!(
                             !debug.contains(canary),
-                            "Debug leaked canary for {kind:?}, {classification:?}, cancellation={send_with_cancellation}",
+                            "Debug leaked canary for {kind:?}, {authority:?}, cancellation={send_with_cancellation}",
                         );
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn caller_cannot_self_classify_raw_case_content_as_public() {
+        const RAW_MARKER: &str = "RAW_CASE_CANARY_NEVER_TRANSPORT";
+        let transport = MockTransport::new(TransportResponse {
+            status: 200,
+            body: "transport must not run".to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 0,
+        });
+        let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+        let request = ChatRequest::product_public(
+            vec![ChatMessage {
+                role: ChatMessageRole::User,
+                content: format!(
+                    "Synthetic case material. Client mobile: 13800138000. Marker: {RAW_MARKER}"
+                ),
+            }],
+            false,
+            Some(0.0),
+            Some(32),
+        );
+
+        let error = adapter
+            .send_chat(
+                &profile(ProviderKind::DeepSeek),
+                &ApiSecret::new("synthetic-secret"),
+                &request,
+            )
+            .expect_err("a caller-provided public label cannot bypass residual scanning");
+
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("residual sensitive content"));
+        assert!(transport.requests.lock().expect("requests lock").is_empty());
+        assert!(!error.to_string().contains(RAW_MARKER));
+        assert!(!format!("{error:?}").contains("13800138000"));
+    }
+
+    #[test]
+    fn approved_receipt_purpose_mismatch_never_reaches_transport() {
+        let provider_profile = approved_test_profile("https://provider.example/v1");
+        let expires_at_unix = system_unix_time().expect("system time") + 300;
+        let (draft, signer) = approved_test_draft(&provider_profile, expires_at_unix);
+        let receipt = approved_test_receipt(&draft, &signer, "different_purpose");
+        let transport = MockTransport::new(TransportResponse {
+            status: 200,
+            body: "transport must not run".to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 0,
+        });
+
+        let error = authorize_approved_chat(draft, signer, &receipt)
+            .expect_err("receipt purpose must exactly match the canonical request");
+
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("receipt binding mismatch"));
+        assert!(transport.requests.lock().expect("requests lock").is_empty());
+    }
+
+    #[test]
+    fn approved_request_rejects_model_and_endpoint_drift_before_transport() {
+        let provider_profile = approved_test_profile("https://provider.example/v1");
+        let approved = approved_test_request(&provider_profile);
+        let transport = MockTransport::new(TransportResponse {
+            status: 200,
+            body: "transport must not run".to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 0,
+        });
+        let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+
+        let mut wrong_model = provider_profile.clone();
+        wrong_model.model_id = "different-approved-model".to_owned();
+        let model_error = adapter
+            .send_approved_chat(&wrong_model, &ApiSecret::new("synthetic-secret"), &approved)
+            .expect_err("model drift invalidates approval");
+        assert_eq!(model_error.kind, ProviderErrorKind::InvalidRequest);
+
+        let mut wrong_endpoint = provider_profile;
+        wrong_endpoint.base_url = "https://different.example/v1".to_owned();
+        let endpoint_error = adapter
+            .send_approved_chat(
+                &wrong_endpoint,
+                &ApiSecret::new("synthetic-secret"),
+                &approved,
+            )
+            .expect_err("endpoint-origin drift invalidates approval");
+        assert_eq!(endpoint_error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(transport.requests.lock().expect("requests lock").is_empty());
+    }
+
+    #[test]
+    fn approved_chat_reaches_loopback_once_and_cannot_be_replayed() {
+        const RAW_MARKER: &str = "RAW_CASE_CANARY_NEVER_SEND";
+        let (base_url, server_thread) = spawn_approved_json_fixture(Duration::from_millis(600));
+        let provider_profile = approved_test_profile(base_url);
+        let approved = approved_test_request(&provider_profile);
+        let transport =
+            ReqwestTransport::new_with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+                .expect("transport builds");
+        let adapter = OpenAiCompatibleAdapter::new(transport);
+
+        let response = adapter
+            .send_approved_chat(
+                &provider_profile,
+                &ApiSecret::new("synthetic-loopback-secret"),
+                &approved,
+            )
+            .expect("valid approved chat reaches the local fixture");
+        assert_eq!(response.status, 200);
+
+        let replay = adapter
+            .send_approved_chat(
+                &provider_profile,
+                &ApiSecret::new("synthetic-loopback-secret"),
+                &approved,
+            )
+            .expect_err("approved chat authorization is one-shot");
+        assert_eq!(replay.kind, ProviderErrorKind::InvalidRequest);
+        assert!(replay.to_string().contains("already been consumed"));
+
+        let requests = server_thread.join().expect("loopback fixture exits");
+        assert_eq!(requests.len(), 1, "exactly one HTTP request is permitted");
+        let wire = String::from_utf8_lossy(&requests[0]);
+        assert!(wire.contains("Approved redacted case: [PARTY_1] requests a procedural summary."));
+        assert!(wire.contains("\"model\":\"approved-chat-model\""));
+        assert!(!wire.contains(RAW_MARKER));
+        assert!(!wire.contains("13800138000"));
+    }
+
+    #[test]
+    fn tampered_approved_body_is_rejected_with_zero_loopback_requests() {
+        let (base_url, server_thread) = spawn_approved_json_fixture(Duration::from_millis(600));
+        let provider_profile = approved_test_profile(base_url);
+        let approved = approved_test_request(&provider_profile);
+        let secret = ApiSecret::new("synthetic-loopback-secret");
+        let mut request =
+            OpenAiCompatibleAdapter::<ReqwestTransport>::build_approved_transport_request(
+                &provider_profile,
+                &secret,
+                &approved,
+            )
+            .expect("approved transport request builds");
+        request.body.push(' ');
+        if let TransportAuthorization::Approved(authorization) = &mut request.authorization {
+            authorization.body_sha256 = privacy::sha256_hex(request.body.as_bytes());
+        }
+        let transport =
+            ReqwestTransport::new_with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+                .expect("transport builds");
+
+        let error = transport
+            .send(request)
+            .expect_err("body tampering is rejected before network I/O");
+
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(server_thread
+            .join()
+            .expect("loopback fixture exits")
+            .is_empty());
+    }
+
+    #[test]
+    fn expired_approved_authorization_is_rejected_with_zero_loopback_requests() {
+        let (base_url, server_thread) = spawn_approved_json_fixture(Duration::from_millis(600));
+        let provider_profile = approved_test_profile(base_url);
+        let approved = approved_test_request(&provider_profile);
+        let secret = ApiSecret::new("synthetic-loopback-secret");
+        let mut request =
+            OpenAiCompatibleAdapter::<ReqwestTransport>::build_approved_transport_request(
+                &provider_profile,
+                &secret,
+                &approved,
+            )
+            .expect("approved transport request builds");
+        let expired_at = system_unix_time().expect("system time").saturating_sub(1);
+        let authorization = match &mut request.authorization {
+            TransportAuthorization::Approved(value) => value,
+            TransportAuthorization::Public { .. } => panic!("approved authorization expected"),
+        };
+        let mut envelope: CanonicalApprovedChatEnvelopeV1 =
+            serde_json::from_slice(&authorization.canonical_payload)
+                .expect("canonical envelope parses");
+        envelope.expires_at_unix = expired_at;
+        let canonical_payload =
+            serde_json::to_vec(&envelope).expect("canonical envelope serializes");
+        authorization.canonical_payload_sha256 = privacy::sha256_hex(&canonical_payload);
+        authorization.canonical_payload = Arc::<[u8]>::from(canonical_payload);
+        authorization.expires_at_unix = expired_at;
+        let transport =
+            ReqwestTransport::new_with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+                .expect("transport builds");
+
+        let error = transport
+            .send(request)
+            .expect_err("expired authorization is rejected before network I/O");
+
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(server_thread
+            .join()
+            .expect("loopback fixture exits")
+            .is_empty());
     }
 
     #[test]
@@ -2524,17 +3575,16 @@ mod tests {
                     .expect("transport builds");
 
             let response = transport
-                .send(TransportRequest {
-                    method: "POST".to_owned(),
-                    url: source_url,
-                    headers: vec![
+                .send(test_transport_request(
+                    source_url,
+                    vec![
                         TransportHeader::new("Authorization", redirect_authorization_value()),
                         TransportHeader::new("Content-Type", "application/json"),
                     ],
-                    body: "{\"case\":\"confidential-lawyer-body\"}".to_owned(),
-                    expects_stream: false,
-                    allow_private_network: true,
-                })
+                    "{\"case\":\"confidential-lawyer-body\"}",
+                    false,
+                    true,
+                ))
                 .expect("redirect response is returned without following it");
 
             assert_eq!(response.status, status);
@@ -2595,14 +3645,13 @@ mod tests {
                 .expect("transport builds");
 
         let response = transport
-            .send(TransportRequest {
-                method: "POST".to_owned(),
+            .send(test_transport_request(
                 url,
-                headers: vec![TransportHeader::new("Content-Type", "application/json")],
-                body: "{}".to_owned(),
-                expects_stream: true,
-                allow_private_network: true,
-            })
+                vec![TransportHeader::new("Content-Type", "application/json")],
+                "{}",
+                true,
+                true,
+            ))
             .expect("regular chunks keep a stream alive beyond the old total deadline");
 
         server_thread.join().expect("SSE fixture exits");
@@ -2657,14 +3706,7 @@ mod tests {
                 .expect("transport builds");
 
         let error = transport
-            .send(TransportRequest {
-                method: "POST".to_owned(),
-                url,
-                headers: Vec::new(),
-                body: "{}".to_owned(),
-                expects_stream: true,
-                allow_private_network: true,
-            })
+            .send(test_transport_request(url, Vec::new(), "{}", true, true))
             .expect_err("a response with no bytes inside the idle window times out");
 
         server_thread.join().expect("stalled fixture exits");
@@ -2682,14 +3724,7 @@ mod tests {
         .expect("transport builds");
 
         let error = transport
-            .send(TransportRequest {
-                method: "POST".to_owned(),
-                url,
-                headers: Vec::new(),
-                body: "{}".to_owned(),
-                expects_stream: true,
-                allow_private_network: true,
-            })
+            .send(test_transport_request(url, Vec::new(), "{}", true, true))
             .expect_err("regular keepalives cannot extend the absolute deadline");
 
         let _ = server_thread.join();
@@ -2756,18 +3791,54 @@ mod tests {
             .expect("outer runtime builds");
 
         let response = runtime.block_on(async {
-            transport.send(TransportRequest {
-                method: "POST".to_owned(),
-                url,
-                headers: Vec::new(),
-                body: "{}".to_owned(),
-                expects_stream: true,
-                allow_private_network: true,
-            })
+            transport.send(test_transport_request(url, Vec::new(), "{}", true, true))
         });
 
         server_thread.join().expect("SSE fixture exits");
         assert_eq!(response.expect("nested runtime is avoided").status, 200);
+    }
+
+    fn spawn_approved_json_fixture(
+        observation_window: Duration,
+    ) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("approved provider listener binds");
+        listener
+            .set_nonblocking(true)
+            .expect("approved provider listener becomes nonblocking");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("approved provider address resolves")
+        );
+        let server_thread = thread::spawn(move || {
+            const BODY: &[u8] = br#"{"model":"approved-chat-model","choices":[{"message":{"content":"ok"}}],"usage":null}"#;
+            let mut requests = Vec::new();
+            let mut deadline = Instant::now() + observation_window;
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        requests.push(read_http_request(&mut stream));
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            BODY.len()
+                        );
+                        stream
+                            .write_all(headers.as_bytes())
+                            .and_then(|_| stream.write_all(BODY))
+                            .and_then(|_| stream.flush())
+                            .expect("approved provider fixture writes response");
+                        deadline = Instant::now() + Duration::from_millis(150);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("approved provider fixture failed: {error}"),
+                }
+            }
+            requests
+        });
+        (base_url, server_thread)
     }
 
     fn spawn_redirect_fixture(

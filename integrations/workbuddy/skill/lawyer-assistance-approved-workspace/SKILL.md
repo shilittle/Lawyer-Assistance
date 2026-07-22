@@ -39,8 +39,9 @@ Opaque case arguments are limited to contract fields such as `case_id`, `materia
 ## Work-product sink invariant
 
 `WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
+`WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
 
-Create content only with `case_write_work_product`; revise it only with `case_update_work_product` and optimistic concurrency. Bind exact approved `material_id`/`publication_id` sources, keep redacted placeholders, use an idempotency key, and stop on residual-scan or identity-leak rejection. Do not save, export, email, upload, attach, paste, or cache substantive results elsewhere. `case_export_work_product_manifest` returns a manifest; it never authorizes a host filesystem export.
+Create content only with `case_write_work_product`; revise it only with `case_update_work_product` and optimistic concurrency. After every successful write or update, call `case_read_work_product` for the exact returned `work_product_id` and version in this current task; use only that read-back response as the verified result, and stop if version, source bindings, content hash, status, or placeholders differ. Bind exact approved `material_id`/`publication_id` sources, keep redacted placeholders, use an idempotency key, and stop on residual-scan or identity-leak rejection. Do not save, export, email, upload, attach, paste, or cache substantive results elsewhere. `case_export_work_product_manifest` returns a manifest; it never authorizes a host filesystem export.
 
 Read as needed:
 

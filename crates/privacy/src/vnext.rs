@@ -15,11 +15,15 @@ use std::{
 
 pub const DOMAIN_SCHEMA_VERSION: &str = "lawyer-assistance-privacy-domain-v2";
 pub const CANONICAL_JSON_VERSION: &str = "canonical-json-v1";
-pub const APPROVED_MATERIAL_MANIFEST_VERSION: &str = "approved-material-manifest-v1";
+pub const APPROVED_MATERIAL_MANIFEST_VERSION: &str = "approved-material-manifest-v2";
+pub const APPROVED_EGRESS_GUARD_VERSION: &str = "approved-egress-guard-v2";
+pub const APPROVED_EGRESS_NORMALIZATION_VERSION: &str = "nfkc-sensitive-text-v1";
 pub const WORK_PRODUCT_MANIFEST_VERSION: &str = "work-product-manifest-v1";
 pub const APPROVED_CLASSIFICATION: &str = "CASE_REDACTED_APPROVED";
 pub const MAX_REASON_CODES: usize = 64;
 pub const MAX_VERSION_VALUES: usize = 64;
+pub const MAX_APPROVED_EGRESS_FINGERPRINTS: usize = 16_384;
+pub const MAX_APPROVED_EGRESS_TERM_CHAR_LENGTH: u32 = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VNextSchemaError {
@@ -461,6 +465,10 @@ pub struct DocumentRiskV1 {
     pub policy_sha256: Sha256Hex,
     pub calibration_evidence_version: Option<String>,
     pub qualification_report_id: Option<String>,
+    pub auto_approval_policy_mode: AutoApprovalPolicyMode,
+    pub production_automatic_enabled: bool,
+    pub shadow_would_auto_approve: bool,
+    pub automatic_publish_allowed: bool,
     pub reason_codes: Vec<String>,
 }
 
@@ -490,7 +498,14 @@ impl DocumentRiskV1 {
             || p2 != self.total_p2
             || self.hard_gate_evaluation_hash != gates.evaluation_hash
             || (matches!(self.route, DocumentRoute::AutoApprovalEligible)
-                && (p0 > 0 || p1 > 0 || !gates.all_blocking_gates_passed()))
+                && (p0 > 0
+                    || p1 > 0
+                    || !gates.all_blocking_gates_passed()
+                    || !self.automatic_publish_allowed))
+            || (self.automatic_publish_allowed
+                && !matches!(self.route, DocumentRoute::AutoApprovalEligible))
+            || (self.shadow_would_auto_approve
+                && self.auto_approval_policy_mode != AutoApprovalPolicyMode::Shadow)
             || (matches!(self.route, DocumentRoute::Blocked) && gates.all_blocking_gates_passed())
         {
             return Err(VNextSchemaError::InvalidRiskEvaluation);
@@ -515,6 +530,8 @@ pub struct ApprovedMaterialManifestV1 {
     pub content_sha256: Sha256Hex,
     pub content_bytes: u64,
     pub source_sha256: Sha256Hex,
+    pub source_name_sha256: Sha256Hex,
+    pub source_revision_hash: Sha256Hex,
     pub extraction_sha256: Sha256Hex,
     pub ocr_output_sha256: Option<Sha256Hex>,
     pub finding_summary_hash: Sha256Hex,
@@ -603,6 +620,101 @@ impl SignedApprovedMaterialManifestV1 {
         let canonical = canonical_json_v1(&self.claims)?;
         let computed = crate::sha256_hex(&canonical);
         if self.canonical_claims_sha256.as_str() != computed {
+            return Err(VNextSchemaError::InvalidManifest);
+        }
+        Ok(())
+    }
+}
+
+/// The provenance class of a keyed, case-bound egress fingerprint.
+///
+/// This enum deliberately contains no original case value. Persisted guards only carry keyed
+/// fingerprints and normalized character lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApprovedEgressTermKindV1 {
+    CaseDictionary,
+    SourceTerm,
+    RawCanary,
+}
+
+impl ApprovedEgressTermKindV1 {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::CaseDictionary => "CASE_DICTIONARY",
+            Self::SourceTerm => "SOURCE_TERM",
+            Self::RawCanary => "RAW_CANARY",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BlindEgressFingerprintV1 {
+    pub kind: ApprovedEgressTermKindV1,
+    pub normalized_char_length: u32,
+    pub fingerprint: Sha256Hex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ApprovedEgressGuardV1 {
+    pub schema_version: String,
+    pub normalization_version: String,
+    pub workspace_instance_id: WorkspaceInstanceId,
+    pub case_id: CaseId,
+    pub material_id: MaterialId,
+    pub document_version: u64,
+    pub publication_id: PublicationId,
+    pub content_sha256: Sha256Hex,
+    pub source_name_sha256: Sha256Hex,
+    pub source_revision_hash: Sha256Hex,
+    pub dictionary_revision_hash: Sha256Hex,
+    pub mapping_revision_hash: Sha256Hex,
+    pub fingerprints: Vec<BlindEgressFingerprintV1>,
+}
+
+impl ApprovedEgressGuardV1 {
+    pub fn validate(&self) -> Result<(), VNextSchemaError> {
+        if self.schema_version != APPROVED_EGRESS_GUARD_VERSION
+            || self.normalization_version != APPROVED_EGRESS_NORMALIZATION_VERSION
+            || self.document_version == 0
+            || self.fingerprints.len() > MAX_APPROVED_EGRESS_FINGERPRINTS
+            || self.fingerprints.iter().any(|entry| {
+                entry.normalized_char_length == 0
+                    || entry.normalized_char_length > MAX_APPROVED_EGRESS_TERM_CHAR_LENGTH
+            })
+            || self.fingerprints.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(VNextSchemaError::InvalidManifest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SignedApprovedEgressGuardV1 {
+    pub claims: ApprovedEgressGuardV1,
+    pub canonical_claims_sha256: Sha256Hex,
+    pub signing_algorithm: String,
+    pub signing_key_id: String,
+    pub signing_key_version: u64,
+    pub signature: String,
+}
+
+impl SignedApprovedEgressGuardV1 {
+    pub fn validate_structure(&self) -> Result<(), VNextSchemaError> {
+        self.claims.validate()?;
+        if self.signing_algorithm.is_empty()
+            || self.signing_key_id.is_empty()
+            || self.signing_key_version == 0
+            || !valid_lower_hex(&self.signature, 64)
+        {
+            return Err(VNextSchemaError::InvalidManifest);
+        }
+        let canonical = canonical_json_v1(&self.claims)?;
+        if self.canonical_claims_sha256.as_str() != crate::sha256_hex(&canonical) {
             return Err(VNextSchemaError::InvalidManifest);
         }
         Ok(())
@@ -985,6 +1097,10 @@ mod tests {
             policy_sha256: hash(b"policy"),
             calibration_evidence_version: Some("cal-v1".to_owned()),
             qualification_report_id: Some("qual-v1".to_owned()),
+            auto_approval_policy_mode: AutoApprovalPolicyMode::Balanced,
+            production_automatic_enabled: true,
+            shadow_would_auto_approve: false,
+            automatic_publish_allowed: true,
             reason_codes: Vec::new(),
         };
         assert!(risk.validate(&gates).is_ok());

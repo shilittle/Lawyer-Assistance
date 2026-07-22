@@ -1,6 +1,6 @@
 {
   "name": "@lawyer-assistance/desktop",
-  "version": "0.4.0-beta.1",
+  "version": "0.4.0-beta.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "verify:frontend-dist": "node scripts/verify_frontend_dist.mjs",
     "verify:legal-resource": "python scripts/verify_legal_resource.py",
     "release:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_portable_release.ps1",
+    "release:installer:unsigned": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_unsigned_installer_release.ps1",
     "release:signed": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_signed_release.ps1"
   },
   "dependencies": {

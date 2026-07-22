@@ -13,12 +13,15 @@ use std::{
     time::Duration,
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager};
+mod approved_mcp;
 
 mod atomic_file;
 mod commands;
 mod crash_log;
 mod mcp_manager;
+mod mineru_components;
 mod privacy_manager;
+mod privacy_qualification;
 mod privacy_workflow;
 mod single_instance;
 mod state;
@@ -238,6 +241,37 @@ pub fn run() {
                 // never prevent the updated application from launching.
                 crash_log::record_maintenance_failure(&crash_log_path, "updater_cleanup");
             }
+            commands::application_backup::cleanup_stale_application_backup_snapshots(
+                &app_local_data_dir,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to clean sensitive application-backup temporaries: {}",
+                    error.message
+                ))
+            })?;
+            let approved_mcp_workspace =
+                approved_mcp::ApprovedMcpWorkspace::new(app_local_data_dir.clone());
+            let workspace_instance_id =
+                approved_mcp_workspace
+                    .workspace_instance_id()
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to initialize the private workspace identity: {}",
+                            error.message()
+                        ))
+                    })?;
+            commands::application_backup::apply_pending_application_restore_with_approved(
+                &app_local_data_dir,
+                &workspace_instance_id,
+                &approved_mcp_workspace,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to apply pending five-component application restore: {}",
+                    error.message
+                ))
+            })?;
             commands::release::apply_pending_database_restore(&app_local_data_dir).map_err(
                 |error| {
                     std::io::Error::other(format!(
@@ -272,20 +306,54 @@ pub fn run() {
                 ))
             })?;
             let legal_core_path = resolve_legal_core_resource(app)?;
-            let privacy_manager = privacy_manager::PrivacyManager::new(app_local_data_dir.clone())
+            let privacy_manager =
+                privacy_manager::PrivacyManager::new_with_ocr_qualification_invalidator(
+                    app_local_data_dir.clone(),
+                    Arc::new(approved_mcp_workspace.clone()),
+                )
                 .map_err(|error| {
                     std::io::Error::other(format!("failed to initialize privacy settings: {error}"))
                 })?;
-            let privacy_workflow = privacy_workflow::PrivacyWorkflowManager::new(
+            let mineru_components =
+                mineru_components::MineruComponentManager::new(app_local_data_dir.clone())
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to initialize local MinerU components: {error}"
+                        ))
+                    })?;
+            let component_status = mineru_components.status().map_err(|error| {
+                std::io::Error::other(format!("failed to verify local MinerU components: {error}"))
+            })?;
+            if privacy_manager
+                .current_config()
+                .ocr
+                .worker_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with(mineru_components.managed_root()))
+                && !component_status.active_integrity_valid
+            {
+                privacy_manager
+                    .revoke_local_mineru_qualification()
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to invalidate drifted MinerU qualification: {error}"
+                        ))
+                    })?;
+            }
+            let privacy_workflow =
+                privacy_workflow::PrivacyWorkflowManager::new_with_approved_publication_invalidator(
                 app_local_data_dir.clone(),
+                workspace_instance_id,
+                Arc::new(approved_mcp_workspace.clone()),
             )
             .map_err(|error| {
                 std::io::Error::other(format!("failed to initialize privacy workflow: {error}"))
             })?;
-            let mcp_manager = mcp_manager::McpManager::new(
-                app_local_data_dir,
+            let mcp_manager = mcp_manager::McpManager::new_with_approved_workspace(
+                app_local_data_dir.clone(),
                 legal_core_path.clone(),
                 user_database_path.clone(),
+                approved_mcp_workspace.clone(),
             )
             .map_err(|error| {
                 std::io::Error::other(format!("failed to initialize MCP settings: {error}"))
@@ -293,6 +361,8 @@ pub fn run() {
             app.manage(state::AppState::new(legal_core_path, user_database_path));
             app.manage(mcp_manager.clone());
             app.manage(privacy_manager);
+            app.manage(mineru_components);
+            app.manage(approved_mcp_workspace);
             app.manage(Arc::clone(&managed_exit_drain));
             app.manage(privacy_workflow);
             if mcp_manager.auto_start_enabled() {
@@ -369,26 +439,75 @@ pub fn run() {
             commands::mcp::stop_mcp_server,
             commands::mcp::write_mcp_bearer_token,
             commands::mcp::delete_mcp_bearer_token,
+            commands::approved_mcp::publish_approved_generation,
+            commands::approved_mcp::list_approved_generations,
+            commands::approved_mcp::list_approved_privacy_review_selections,
+            commands::approved_mcp::revoke_approved_generation,
+            commands::approved_mcp::approve_review_for_approved_workspace,
+            commands::approved_mcp::run_approved_mcp_qualification,
+            commands::approved_mcp::get_approved_mcp_qualification_status,
+            commands::approved_mcp::revoke_approved_mcp_qualification,
+            commands::approved_mcp::create_standalone_approved_mcp_session,
+            commands::approved_mcp::list_standalone_approved_mcp_sessions,
+            commands::approved_mcp::revoke_standalone_approved_mcp_session,
             commands::privacy::get_privacy_config,
             commands::privacy::save_privacy_config,
             commands::privacy::get_local_ocr_status,
+            commands::privacy::discover_local_mineru,
+            commands::privacy::install_local_mineru_trust,
+            commands::privacy::install_local_mineru_network_isolation,
+            commands::privacy::run_local_mineru_qualification,
+            commands::privacy::revoke_local_mineru_qualification,
             commands::privacy::inspect_local_mineru_qualification_report,
+            commands::mineru_components::get_mineru_component_status,
+            commands::mineru_components::import_mineru_component_catalog,
+            commands::mineru_components::install_mineru_offline_package,
+            commands::mineru_components::download_install_mineru_package,
+            commands::mineru_components::rollback_mineru_component,
+            commands::mineru_components::uninstall_mineru_component,
             commands::privacy_workflow::delete_privacy_review,
             commands::provider::list_provider_profiles,
             commands::privacy_workflow::prepare_privacy_material,
             commands::privacy_workflow::load_privacy_review,
             commands::privacy_workflow::load_latest_privacy_review,
+            commands::privacy_workflow::load_privacy_risk_review,
+            commands::privacy_workflow::apply_privacy_risk_review_action,
+            commands::privacy_workflow::undo_privacy_risk_review,
+            commands::privacy_workflow::redo_privacy_risk_review,
             commands::privacy_workflow::approve_privacy_review,
-            commands::privacy_workflow::export_approved_review_pdf,
+            commands::privacy_export::export_approved_privacy_review,
+            commands::privacy_lifecycle::get_privacy_lifecycle_status,
+            commands::privacy_lifecycle::set_privacy_retention_policy,
+            commands::privacy_lifecycle::set_privacy_legal_hold,
+            commands::privacy_lifecycle::reveal_privacy_mapping,
+            commands::privacy_lifecycle::revoke_privacy_mapping,
+            commands::privacy_lifecycle::rotate_privacy_mapping_key,
+            commands::privacy_lifecycle::destroy_privacy_mapping_key,
+            commands::privacy_lifecycle::run_privacy_retention_sweep,
+            commands::privacy_lifecycle::create_privacy_backup,
+            commands::privacy_lifecycle::verify_privacy_backup,
+            commands::privacy_lifecycle::export_privacy_backup_bundle,
+            commands::privacy_lifecycle::import_privacy_backup_bundle,
+            commands::privacy_lifecycle::revoke_privacy_backup,
+            commands::privacy_lifecycle::stage_privacy_restore,
+            commands::privacy_provider::approve_approved_provider_task,
+            commands::privacy_provider::dispatch_approved_provider,
+            commands::privacy_provider::get_provider_qualification_status,
+            commands::privacy_provider::run_provider_qualification,
+            commands::privacy_provider::revoke_provider_qualification,
+            commands::privacy_provider::list_approved_provider_outputs,
+            commands::privacy_provider::load_approved_provider_output,
+            commands::privacy_provider::revoke_approved_provider_output,
             commands::provider::upsert_provider_profile,
             commands::provider::delete_provider_profile,
             commands::provider::get_provider_api_key_status,
             commands::provider::write_provider_api_key,
             commands::provider::delete_provider_api_key,
             commands::provider::test_provider_connection,
+            commands::application_backup::export_application_backup,
+            commands::application_backup::verify_application_backup,
+            commands::application_backup::stage_application_restore,
             commands::release::get_version_info,
-            commands::release::backup_user_database,
-            commands::release::restore_user_database,
             commands::release::export_diagnostic_report,
             commands::updater::check_for_application_update,
             commands::updater::download_install_application_update,

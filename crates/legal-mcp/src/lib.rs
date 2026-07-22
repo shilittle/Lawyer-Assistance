@@ -1,3 +1,4 @@
+pub mod approved_backend;
 pub mod approved_workspace;
 pub mod config;
 pub mod handler;
@@ -6,7 +7,9 @@ mod privacy_gate;
 mod public_output;
 pub mod receipt_gate;
 pub mod registry;
+pub mod release_binary;
 pub mod service_adapter;
+pub mod standalone_approved;
 pub mod stdio;
 
 use clap::Parser;
@@ -30,6 +33,8 @@ pub enum StartupError {
     Database(#[from] database::DatabaseInitError),
     #[error("MCP transport failed: {0}")]
     Transport(String),
+    #[error(transparent)]
+    ApprovedSession(#[from] standalone_approved::StandaloneApprovedError),
 }
 
 /// Parse configuration and run the selected MCP transport.
@@ -70,7 +75,31 @@ pub async fn run_cli(cli: Cli) -> Result<(), StartupError> {
         println!("initialized {}", created.display());
         return Ok(());
     }
-    let config = cli.resolve()?;
+    if cli.approved_session_id.is_none() && cli.approved_qualification_canary_id.is_some() {
+        return Err(StartupError::ApprovedSession(
+            standalone_approved::StandaloneApprovedError::InvalidBinding,
+        ));
+    }
+    let standalone = if let Some(server_instance_id) = cli.approved_session_id.as_deref() {
+        validate_standalone_cli_boundary(&cli)?;
+        let app_directory = match cli.approved_qualification_canary_id.as_deref() {
+            Some(canary_id) => {
+                standalone_approved::qualification_canary_app_local_data_directory(canary_id)?
+            }
+            None => standalone_approved::default_app_local_data_directory()?,
+        };
+        Some(standalone_approved::load_standalone_for_binary(
+            &app_directory,
+            server_instance_id,
+            &cli.command,
+        )?)
+    } else {
+        None
+    };
+    let config = match standalone.as_ref() {
+        Some(loaded) => loaded.config.clone(),
+        None => cli.resolve()?,
+    };
     let services = LegalServices::new(ServiceConfig {
         legal_core_path: config.legal_db.clone(),
         user_database_path: config.user_db.clone(),
@@ -78,8 +107,16 @@ pub async fn run_cli(cli: Cli) -> Result<(), StartupError> {
         allowed_output_root: config.output_root.clone(),
     })?;
     let profile = config.privacy_profile;
-    let adapter = ServiceAdapter::for_profile(services, profile);
-    let server = LegalMcpServer::new(ToolRegistry::for_profile(profile), adapter);
+    let adapter = match standalone.as_ref() {
+        Some(loaded) => ServiceAdapter::for_standalone_approved(services, loaded.broker.clone()),
+        None => ServiceAdapter::for_profile(services, profile),
+    };
+    let registry = if standalone.is_some() {
+        ToolRegistry::for_standalone_approved()
+    } else {
+        ToolRegistry::for_profile(profile)
+    };
+    let server = LegalMcpServer::new(registry, adapter);
     match config.command.clone() {
         Command::Stdio => {
             let transport =
@@ -102,6 +139,35 @@ pub async fn run_cli(cli: Cli) -> Result<(), StartupError> {
             .map_err(|error| StartupError::Transport(error.to_string())),
         Command::InitUserDb => unreachable!("handled before service construction"),
     }
+}
+
+fn validate_standalone_cli_boundary(
+    cli: &Cli,
+) -> Result<(), standalone_approved::StandaloneApprovedError> {
+    use registry::PrivacyProfile;
+
+    let profile_valid = cli
+        .privacy_profile
+        .is_none_or(|profile| profile == PrivacyProfile::ApprovedCaseWorkspace);
+    if !profile_valid
+        || cli.config.is_some()
+        || cli.legal_db.is_some()
+        || cli.user_db.is_some()
+        || !cli.allowed_root.is_empty()
+        || cli.output_dir.is_some()
+        || cli.bearer_env.is_some()
+        || cli.bearer_token_file.is_some()
+        || !cli.allowed_origin.is_empty()
+        || !cli.allowed_host.is_empty()
+        || cli.max_body_bytes.is_some()
+        || cli.request_timeout_ms.is_some()
+        || cli.max_concurrency.is_some()
+        || cli.dangerously_allow_insecure_non_loopback_http
+        || matches!(cli.command, Command::InitUserDb)
+    {
+        return Err(standalone_approved::StandaloneApprovedError::InvalidBinding);
+    }
+    Ok(())
 }
 
 fn init_stderr_tracing() {

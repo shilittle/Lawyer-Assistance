@@ -1,9 +1,12 @@
 use crate::{commands::case::IpcError, state::AppState};
+#[cfg(test)]
 use rusqlite::{backup::Backup, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -30,16 +33,6 @@ pub struct VersionInfo {
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BackupRequest {
-    pub destination_path: Option<String>,
-}
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RestoreRequest {
-    pub source_path: Option<String>,
-}
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticRequest {
     pub destination_path: Option<String>,
 }
@@ -60,6 +53,7 @@ struct PendingRestoreMarker {
 }
 
 const PENDING_RESTORE_FORMAT_VERSION: u8 = 1;
+#[cfg(test)]
 const MAX_DATABASE_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 #[tauri::command]
@@ -85,53 +79,13 @@ pub fn get_version_info(state: State<'_, AppState>) -> Result<VersionInfo, IpcEr
         source_manifest_hash: metadata("source_manifest_sha256"),
     })
 }
+#[cfg(test)]
 fn require_protected_database_backup() -> Result<(), IpcError> {
     Err(IpcError::new(
         "privacy_required",
         "Plaintext user database backup is disabled until encrypted local-only backup is available.",
     ))
 }
-#[tauri::command]
-pub fn backup_user_database(
-    state: State<'_, AppState>,
-    request: BackupRequest,
-) -> Result<FileOperationResponse, IpcError> {
-    let Some(path) = request.destination_path.filter(|p| !p.trim().is_empty()) else {
-        return Ok(cancelled());
-    };
-    require_protected_database_backup()?;
-    let restore = restore_paths(state.user_database_path())?;
-    let protected = protected_application_paths(
-        state.user_database_path(),
-        state.legal_core_path(),
-        state.crash_log_path(),
-        &restore,
-    );
-    backup_database(state.user_database_path(), Path::new(&path), &protected)?;
-    Ok(FileOperationResponse {
-        completed: true,
-        cancelled: false,
-        path: Some(path),
-        restart_required: false,
-    })
-}
-#[tauri::command]
-pub fn restore_user_database(
-    state: State<'_, AppState>,
-    request: RestoreRequest,
-) -> Result<FileOperationResponse, IpcError> {
-    let Some(path) = request.source_path.filter(|p| !p.trim().is_empty()) else {
-        return Ok(cancelled());
-    };
-    stage_database_restore(Path::new(&path), state.user_database_path())?;
-    Ok(FileOperationResponse {
-        completed: true,
-        cancelled: false,
-        path: Some(path),
-        restart_required: true,
-    })
-}
-
 #[tauri::command]
 pub fn export_diagnostic_report(
     state: State<'_, AppState>,
@@ -230,6 +184,7 @@ fn cancelled() -> FileOperationResponse {
     }
 }
 
+#[cfg(test)]
 fn backup_database(
     source: &Path,
     destination: &Path,
@@ -287,6 +242,7 @@ fn backup_database(
     Ok(())
 }
 
+#[cfg(test)]
 fn stage_database_restore(source: &Path, destination: &Path) -> Result<(), IpcError> {
     if !source.is_file() {
         return Err(IpcError::new("validation", "backup file does not exist"));
@@ -457,6 +413,7 @@ fn unique_sibling(path: &Path, role: &str) -> Result<PathBuf, IpcError> {
     Ok(parent.join(format!(".{name}.{role}-{}", uuid::Uuid::new_v4())))
 }
 
+#[cfg(test)]
 fn write_pending_marker(marker_path: &Path, marker: &PendingRestoreMarker) -> Result<(), IpcError> {
     let incoming = unique_sibling(marker_path, "marker-incoming")?;
     let bytes = serde_json::to_vec(marker)?;

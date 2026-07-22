@@ -5,6 +5,7 @@ const MAX_OCR_PAGES: usize = 10_000;
 const MAX_BLOCKS_PER_PAGE: usize = 100_000;
 const MAX_POLYGON_POINTS: usize = 128;
 const MAX_TEXT_BYTES_PER_BLOCK: usize = 16 * 1024 * 1024;
+const LOW_CONFIDENCE_WARNING_PPM: u32 = 700_000;
 const MAX_REASON_CODES: usize = 128;
 
 pub fn validate_worker_request_v1(request: &WorkerRequestV1) -> Result<(), OcrIntegrityError> {
@@ -333,6 +334,10 @@ fn validate_page(
     {
         return Err(OcrIntegrityError::ConfidenceSummaryMismatch);
     }
+    let warns_low_confidence = page.warnings.contains(&OcrWarningV1::LowConfidence);
+    if (confidence_min < LOW_CONFIDENCE_WARNING_PPM) != warns_low_confidence {
+        return Err(OcrIntegrityError::ConfidenceSummaryMismatch);
+    }
     validate_visual_risk_evidence(page)
 }
 
@@ -517,6 +522,7 @@ fn validate_health(
         WorkerHealthCheckIdV1::WorkerIntegrity,
         WorkerHealthCheckIdV1::ConfigIntegrity,
         WorkerHealthCheckIdV1::ModelIntegrity,
+        WorkerHealthCheckIdV1::SupportIntegrity,
         WorkerHealthCheckIdV1::RuntimeVersions,
         WorkerHealthCheckIdV1::GpuRuntime,
         WorkerHealthCheckIdV1::OfflineFlags,

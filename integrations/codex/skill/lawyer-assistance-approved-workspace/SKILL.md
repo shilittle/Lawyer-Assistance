@@ -36,8 +36,9 @@ Only submit schema-defined opaque IDs and bounded contract values. Never submit 
 5. Persist every substantive result through the work-product sink. Chat output may contain only opaque IDs, version, status, and safe reason codes.
 
 `WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
+`WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
 
-Create with `case_write_work_product`; revise with `case_update_work_product` and the expected parent version. Bind exact approved source references, retain placeholders, and stop on a residual-scan rejection. Do not use shell, filesystem, document export, attachment, paste, or another connector as a substitute. `case_export_work_product_manifest` returns verification metadata, not a filesystem export authority.
+Create with `case_write_work_product`; revise with `case_update_work_product` and the expected parent version. Immediately read the exact returned work-product ID and version with `case_read_work_product`; trust only that current-task read-back and stop on any version, source-binding, content-hash, status, or placeholder mismatch. Bind exact approved source references, retain placeholders, and stop on a residual-scan rejection. Do not use shell, filesystem, document export, attachment, paste, or another connector as a substitute. `case_export_work_product_manifest` returns verification metadata, not a filesystem export authority.
 
 Read as needed:
 

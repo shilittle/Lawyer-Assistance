@@ -2,7 +2,7 @@
 
 Treat every case original, attachment, pasted passage, OCR result, screenshot, filename or path, identity detail, case number, fact, evidence item, draft, summary, translation, and derivative as `CASE_RAW`. `CASE_REDACTED_PENDING`, pending review, and label-only or verbally claimed `CASE_REDACTED_APPROVED` content remain forbidden because the host cannot verify an exact active approval chain.
 
-The current Codex integration supports public-law research only. The App→MCP citation receipt positive path is not implemented, so do not process case material even when the App has locally redacted and approved it. User consent, Full Access, an anonymization claim, an attachment, or a host-side file read cannot substitute for technical verification.
+This Codex package supports public-law research only and intentionally has no approved session. Do not process case material here even when the App has approved a generation. The separate approved package accepts content only from a direct current `case_read_approved_material` response in a new clean opaque-ID-only task. User consent, Full Access, an anonymization claim, an attachment, paste, or a host-side file read cannot substitute for technical verification.
 
 If the task contains or may already contain case content, do not read, quote, summarize, transform, store, or share it. Do not call MCP, network, filesystem, shell, command, browser, connector, automation, expert, team, subagent, Skill, Provider, or memory capabilities. Provide only cleanup guidance.
 

@@ -32,7 +32,7 @@ use std::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-pub const VAULT_STORE_SCHEMA_VERSION: u32 = 1;
+pub const VAULT_STORE_SCHEMA_VERSION: u32 = 2;
 pub const VAULT_OBJECT_ENVELOPE_VERSION: &str = "vault-object-envelope-v1";
 pub const VAULT_OBJECT_COMMIT_VERSION: &str = "vault-object-commit-v1";
 pub const VAULT_PRIVATE_METADATA_VERSION: &str = "vault-private-metadata-v1";
@@ -136,7 +136,7 @@ impl VaultObjectKind {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct VaultPrivateMetadataInputV1 {
     pub original_file_name: String,
     pub original_source_path: Option<String>,
@@ -182,7 +182,7 @@ impl VaultPrivateMetadataInputV1 {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct VaultPrivateMetadataV1 {
     pub schema_version: String,
@@ -351,7 +351,7 @@ impl VaultObjectEnvelopeV1 {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct DecryptedVaultObjectV1 {
     pub workspace_instance_id: WorkspaceInstanceId,
     pub case_id: CaseId,
@@ -396,6 +396,18 @@ pub struct VaultObjectSummaryV1 {
     pub content_bytes: u64,
     pub chunk_count: u32,
     pub envelope_sha256: Sha256Hex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct VaultIsolationStatusV1 {
+    pub isolation_level: String,
+    pub private_acl_enforced: bool,
+    pub content_indexing_disabled: bool,
+    pub encrypted_at_rest: bool,
+    pub broker_boundary: String,
+    pub strong_service_identity_boundary: bool,
+    pub same_user_process_limitation: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -450,6 +462,97 @@ impl VaultStore {
             root,
             workspace_instance_id,
         })
+    }
+
+    pub fn isolation_status(&self) -> Result<VaultIsolationStatusV1, VaultStoreError> {
+        let private_acl_enforced = verify_vault_private_acl(&self.root.root)?;
+        let content_indexing_disabled = platform::content_indexing_disabled(&self.root.root)?;
+        Ok(VaultIsolationStatusV1 {
+            isolation_level: "windows_current_user_encrypted_vault".to_owned(),
+            private_acl_enforced,
+            content_indexing_disabled,
+            encrypted_at_rest: true,
+            broker_boundary: "in_process_vault_broker_interface_v1".to_owned(),
+            strong_service_identity_boundary: false,
+            same_user_process_limitation:
+                "same_user_processes_are_not_technically_excluded_without_a_service_identity"
+                    .to_owned(),
+        })
+    }
+
+    /// Returns the authenticated workspace identity bound into the Vault database and every
+    /// object AAD. Backup code exposes this identifier, never the private source metadata.
+    pub fn workspace_instance_id(&self) -> &WorkspaceInstanceId {
+        &self.workspace_instance_id
+    }
+
+    /// Returns the fixed encrypted-storage root. Callers may only use this for local backup and
+    /// restore plumbing; raw object content remains available exclusively through read_object.
+    pub fn encrypted_backup_root(&self) -> &Path {
+        &self.root.root
+    }
+
+    /// Checkpoint WAL state and validate the complete SQLite image before an encrypted backup.
+    /// The export implementation additionally keeps an IMMEDIATE transaction open while files
+    /// are pinned and read, so a successful archive represents one database generation.
+    pub fn prepare_encrypted_backup_snapshot(&self) -> Result<(), VaultStoreError> {
+        let db = open_database(&self.root)?;
+        checkpoint_and_validate_database(&db)
+    }
+
+    pub(crate) fn begin_encrypted_backup_snapshot(&self) -> Result<Connection, VaultStoreError> {
+        let db = open_database(&self.root)?;
+        checkpoint_and_validate_database(&db)?;
+        db.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        validate_database_integrity(&db)?;
+        Ok(db)
+    }
+
+    /// Decrypt and authenticate every committed object and every retained case key. Plaintext is
+    /// held only in zeroizing object buffers and is dropped before this method returns.
+    pub fn verify_all_committed_objects(&self) -> Result<u64, VaultStoreError> {
+        let db = open_database(&self.root)?;
+        validate_database_integrity(&db)?;
+        let mut statement = db
+            .prepare(
+                "SELECT case_id,object_id,version FROM object_journal
+                 WHERE state='committed' ORDER BY case_id,object_id,version",
+            )
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        let mut count = 0_u64;
+        for row in rows {
+            let (case, object, version) = row.map_err(|_| VaultStoreError::DatabaseFailed)?;
+            let case = CaseId::parse(case).map_err(|_| VaultStoreError::ContentCorrupt)?;
+            let object = ObjectId::parse(object).map_err(|_| VaultStoreError::ContentCorrupt)?;
+            let version = u64::try_from(version).map_err(|_| VaultStoreError::ContentCorrupt)?;
+            let decrypted = self.read_object(&case, &object, version)?;
+            drop(decrypted);
+            count = count
+                .checked_add(1)
+                .ok_or(VaultStoreError::ContentCorrupt)?;
+        }
+        drop(statement);
+        verify_all_case_key_files(self)?;
+        Ok(count)
+    }
+
+    pub(crate) fn verify_case_key_for_backup(
+        &self,
+        case_id: &CaseId,
+    ) -> Result<(), VaultStoreError> {
+        let key = self.load_case_key(case_id)?;
+        drop(key);
+        Ok(())
     }
 
     pub fn create_source_object(
@@ -1085,6 +1188,7 @@ impl FixedLocalStorageRoot {
         fs::create_dir_all(root).map_err(|_| VaultStoreError::IoFailed)?;
         platform::validate_fixed_local_root(root)?;
         let canonical_root = fs::canonicalize(root).map_err(|_| VaultStoreError::InvalidRoot)?;
+        enforce_vault_private_acl_tree(&canonical_root)?;
         platform::mark_not_content_indexed(&canonical_root)?;
         Ok(Self { canonical_root })
     }
@@ -1095,6 +1199,8 @@ impl FixedLocalStorageRoot {
         }
         platform::validate_fixed_local_root(root)?;
         let canonical_root = fs::canonicalize(root).map_err(|_| VaultStoreError::InvalidRoot)?;
+        enforce_vault_private_acl_tree(&canonical_root)?;
+        platform::mark_not_content_indexed(&canonical_root)?;
         Ok(Self { canonical_root })
     }
 
@@ -1177,6 +1283,37 @@ impl FixedLocalStorageRoot {
         validate_relative_storage_path(relative)?;
         Ok(self.canonical_root.join(relative))
     }
+}
+
+/// Validate an existing security-control file on an ordinary fixed local
+/// filesystem. The check rejects reparse-point ancestors, symlinks and files
+/// with more than one hard link. It is intentionally path-only: callers still
+/// need to authenticate and bind the file contents after opening it.
+pub fn validate_fixed_local_regular_file(path: &Path) -> Result<(), VaultStoreError> {
+    if !path.is_absolute() {
+        return Err(VaultStoreError::InvalidRoot);
+    }
+    platform::reject_reparse_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| VaultStoreError::ObjectNotAvailable)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(VaultStoreError::UnsafeFilesystem);
+    }
+    let parent = path.parent().ok_or(VaultStoreError::InvalidRoot)?;
+    platform::validate_fixed_local_root(parent)?;
+    validate_vault_file_identity(path)
+}
+
+/// Validate an existing directory used as a fixed local security boundary.
+pub fn validate_fixed_local_directory(path: &Path) -> Result<(), VaultStoreError> {
+    if !path.is_absolute() {
+        return Err(VaultStoreError::InvalidRoot);
+    }
+    platform::reject_reparse_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| VaultStoreError::ObjectNotAvailable)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(VaultStoreError::UnsafeFilesystem);
+    }
+    platform::validate_fixed_local_root(path)
 }
 
 fn validate_relative_storage_path(relative: &Path) -> Result<(), VaultStoreError> {
@@ -1300,7 +1437,18 @@ fn initialize_database(
     match existing {
         Some((version, workspace))
             if version == VAULT_STORE_SCHEMA_VERSION
-                && workspace == workspace_instance_id.as_str() => {}
+                && workspace == workspace_instance_id.as_str() =>
+        {
+            initialize_vault_lifecycle_schema(&db)?;
+        }
+        Some((1, workspace)) if workspace == workspace_instance_id.as_str() => {
+            initialize_vault_lifecycle_schema(&db)?;
+            db.execute(
+                "UPDATE vault_meta SET schema_version=?1 WHERE singleton=1 AND schema_version=1",
+                [VAULT_STORE_SCHEMA_VERSION],
+            )
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        }
         Some(_) => return Err(VaultStoreError::DatabaseFailed),
         None => {
             let journal_count: i64 = db
@@ -1320,6 +1468,7 @@ fn initialize_database(
                 params![VAULT_STORE_SCHEMA_VERSION, workspace_instance_id.as_str()],
             )
             .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            initialize_vault_lifecycle_schema(&db)?;
         }
     }
     platform::mark_not_content_indexed(&root.database)?;
@@ -1353,6 +1502,61 @@ fn open_database(root: &ValidatedVaultRoot) -> Result<Connection, VaultStoreErro
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")
         .map_err(|_| VaultStoreError::DatabaseFailed)?;
     Ok(db)
+}
+
+fn checkpoint_and_validate_database(db: &Connection) -> Result<(), VaultStoreError> {
+    let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = db
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|_| VaultStoreError::DatabaseFailed)?;
+    if busy != 0 {
+        return Err(VaultStoreError::DatabaseFailed);
+    }
+    validate_database_integrity(db)
+}
+
+fn validate_database_integrity(db: &Connection) -> Result<(), VaultStoreError> {
+    let integrity: String = db
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|_| VaultStoreError::DatabaseFailed)?;
+    if integrity != "ok" {
+        return Err(VaultStoreError::ContentCorrupt);
+    }
+    let foreign_key_violation: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| VaultStoreError::DatabaseFailed)?;
+    if foreign_key_violation.is_some() {
+        return Err(VaultStoreError::ContentCorrupt);
+    }
+    Ok(())
+}
+
+fn verify_all_case_key_files(store: &VaultStore) -> Result<(), VaultStoreError> {
+    let entries = fs::read_dir(&store.root.keys).map_err(|_| VaultStoreError::IoFailed)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| VaultStoreError::IoFailed)?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| VaultStoreError::IoFailed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(VaultStoreError::UnsafeFilesystem);
+        }
+        validate_vault_file_identity(&entry.path())?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::UnsafeFilesystem)?;
+        let case = name
+            .strip_suffix(".key.json")
+            .ok_or(VaultStoreError::UnsafeFilesystem)?;
+        let case = CaseId::parse(case.to_owned()).map_err(|_| VaultStoreError::ContentCorrupt)?;
+        store.verify_case_key_for_backup(&case)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1461,6 +1665,9 @@ fn validate_controlled_path(
         || (!require_file && !metadata.is_dir())
     {
         return Err(VaultStoreError::UnsafeFilesystem);
+    }
+    if require_file {
+        validate_vault_file_identity(path)?;
     }
     Ok(())
 }
@@ -1762,6 +1969,15 @@ mod platform {
         Ok(())
     }
 
+    pub fn content_indexing_disabled(path: &Path) -> Result<bool, VaultStoreError> {
+        let wide = wide(path);
+        let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(VaultStoreError::UnsafeFilesystem);
+        }
+        Ok(attributes & FILE_ATTRIBUTE_NOT_CONTENT_INDEXED != 0)
+    }
+
     fn check_not_reparse(path: &Path) -> Result<(), VaultStoreError> {
         let wide = wide(path);
         let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
@@ -1794,6 +2010,10 @@ mod platform {
     }
 
     pub fn reject_reparse_components(_root: &Path, _path: &Path) -> Result<(), VaultStoreError> {
+        Err(VaultStoreError::PlatformUnavailable)
+    }
+
+    pub fn content_indexing_disabled(_path: &Path) -> Result<bool, VaultStoreError> {
         Err(VaultStoreError::PlatformUnavailable)
     }
 
@@ -2150,3 +2370,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
+include!("vault_file_identity.rs");
+include!("vault_private_acl.rs");
+include!("vault_lifecycle.rs");
+include!("vault_lifecycle_tests.rs");

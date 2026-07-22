@@ -41,5 +41,6 @@ Stop on `PROFILE_NOT_QUALIFIED`, missing classification, ID mismatch, unavailabl
 Analyze only verified redacted content through the deployment-approved Provider. Preserve placeholders and never infer or recover identities. Do not route content to an outside search or any forbidden capability.
 
 `WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
+`WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
 
-Create every substantive result with `case_write_work_product`; revise only with `case_update_work_product` using the expected parent version. Bind exact approved source references and keep placeholders. Chat may report only opaque IDs, version, status, and safe reason codes. A manifest export is not filesystem export authority.
+Create every substantive result with `case_write_work_product`; revise only with `case_update_work_product` using the expected parent version. Immediately call `case_read_work_product` for the exact returned ID and version and trust only that current-task read-back; stop on version, source-binding, hash, status, or placeholder mismatch. Bind exact approved source references and keep placeholders. Chat may report only opaque IDs, version, status, and safe reason codes. A manifest export is not filesystem export authority.

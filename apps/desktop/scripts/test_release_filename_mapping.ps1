@@ -38,12 +38,45 @@ foreach ($invalidVersion in @(
   }
 }
 
+$ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
+foreach ($releaseScript in @(
+  "build_portable_release.ps1",
+  "build_unsigned_installer_release.ps1",
+  "build_signed_release.ps1"
+)) {
+  $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot $releaseScript) -Raw -Encoding UTF8
+  foreach ($required in @(
+    "lawyer-assistance-mcp",
+    "Assert-LawyerAssistanceMcpReleaseBinary",
+    "LAWYER_ASSISTANCE_MCP_RELEASE_SHA256",
+    "compiled-release-sha256",
+    "mcpEvidence",
+    "mcpBinary"
+  )) {
+    if (-not $source.Contains($required)) {
+      throw "$releaseScript does not enforce MCP sibling release evidence: $required"
+    }
+  }
+}
+$desktopBuildSource = Get-Content -LiteralPath (Join-Path $ProjectRoot "apps\desktop\src-tauri\build.rs") -Raw -Encoding UTF8
+if (-not $desktopBuildSource.Contains("cargo:rerun-if-env-changed=LAWYER_ASSISTANCE_MCP_RELEASE_SHA256")) {
+  throw "Desktop build does not bind rebuilds to the MCP release trust anchor"
+}
+foreach ($installerScript in @("build_unsigned_installer_release.ps1", "build_signed_release.ps1")) {
+  $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot $installerScript) -Raw -Encoding UTF8
+  if (-not $source.Contains('externalBin = @("binaries/lawyer-assistance-mcp")')) {
+    throw "$installerScript does not configure the fixed Tauri externalBin sibling"
+  }
+}
+
 $parseFailures = @()
 foreach ($script in @(
   "release_filenames.ps1",
   "build_latest_json.ps1",
   "release_file_ops.ps1",
+  "mcp_sidecar_release.ps1",
   "build_portable_release.ps1",
+  "build_unsigned_installer_release.ps1",
   "build_signed_release.ps1",
   "test_release_filename_mapping.ps1"
 )) {

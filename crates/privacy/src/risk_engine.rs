@@ -1,8 +1,8 @@
 //! Deterministic backend-only risk routing and hard-gate evaluation.
 
 use crate::vnext::{
-    canonical_json_v1, ConfidencePpm, DocumentRiskV1, DocumentRoute, EntityType,
-    HardGateEvaluationV1, HardGateResultV1, PageRiskV1, Sha256Hex, VNextSchemaError,
+    canonical_json_v1, AutoApprovalPolicyMode, ConfidencePpm, DocumentRiskV1, DocumentRoute,
+    EntityType, HardGateEvaluationV1, HardGateResultV1, PageRiskV1, Sha256Hex, VNextSchemaError,
     REQUIRED_HARD_GATES,
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,10 @@ pub struct RiskPolicyV1 {
     pub minimum_ocr_confidence_ppm: ConfidencePpm,
     pub minimum_ocr_coverage_ppm: ConfidencePpm,
     pub maximum_quick_review_p2: u32,
+    pub auto_approval_mode: AutoApprovalPolicyMode,
+    pub production_automatic_enabled: bool,
     pub calibrated_for_automatic: bool,
+    pub calibration_evidence_sha256: Option<Sha256Hex>,
     pub organization_allows_automatic: bool,
 }
 
@@ -38,11 +41,32 @@ pub struct QualificationSnapshotV1 {
 }
 
 impl QualificationSnapshotV1 {
+    /// Strict production gate used by the approved-case MCP boundary.
+    pub fn approved_workspace_qualified_at(&self, now_unix: u64) -> bool {
+        self.qualification_report_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value.len() <= 160)
+            && self.qualification_report_sha256.is_some()
+            && self.processing_chain_qualified
+            && self.exact_worker_model_match
+            && self.network_isolation_enforced
+            && self.model_manifest_trust_established
+            && self.production_case_ocr_authorized
+            && self
+                .expires_at_unix
+                .is_some_and(|expires_at| now_unix < expires_at)
+            && !self.revoked
+    }
+
     fn qualified_at(&self, now_unix: u64, ocr_used: bool) -> bool {
         let report_current = self
             .expires_at_unix
             .is_some_and(|expires_at| now_unix < expires_at);
-        self.processing_chain_qualified
+        self.qualification_report_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value.len() <= 160)
+            && self.qualification_report_sha256.is_some()
+            && self.processing_chain_qualified
             && self.exact_worker_model_match
             && report_current
             && !self.revoked
@@ -155,12 +179,22 @@ pub fn evaluate_document(
         .map(|page| page.cluster_inconsistency_count)
         .sum::<u32>();
     let qualification_passed = qualification.qualified_at(now_unix, ocr_used);
-    let calibrated =
-        policy.calibrated_for_automatic && assessment.calibration_evidence_version.is_some();
-    let approval_mode_allows_automatic = matches!(
-        assessment.requested_approval_route,
-        RequestedApprovalRoute::Automatic
+    let calibrated = policy.calibrated_for_automatic
+        && policy.calibration_evidence_sha256.is_some()
+        && assessment
+            .calibration_evidence_version
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value.len() <= 128);
+    let policy_mode_allows_automatic = matches!(
+        policy.auto_approval_mode,
+        AutoApprovalPolicyMode::Balanced | AutoApprovalPolicyMode::Batch
     );
+    let approval_mode_allows_automatic = policy.production_automatic_enabled
+        && policy_mode_allows_automatic
+        && matches!(
+            assessment.requested_approval_route,
+            RequestedApprovalRoute::Automatic
+        );
 
     let qualification_evidence = qualification
         .qualification_report_sha256
@@ -252,17 +286,37 @@ pub fn evaluate_document(
         "provenance_not_receiptable",
         provenance_evidence,
     ));
+    let calibration_evidence = policy
+        .calibration_evidence_sha256
+        .iter()
+        .cloned()
+        .chain(std::iter::once(policy.policy_sha256.clone()))
+        .collect();
     gates.push(gate(
         "calibrated_policy",
         calibrated,
         "automatic_policy_not_calibrated",
-        vec![policy.policy_sha256.clone()],
+        calibration_evidence,
     ));
+    let approval_mode_reason = if !policy.production_automatic_enabled {
+        "production_automatic_feature_disabled"
+    } else if !policy_mode_allows_automatic {
+        match policy.auto_approval_mode {
+            AutoApprovalPolicyMode::Strict => "strict_mode_requires_human",
+            AutoApprovalPolicyMode::Shadow => "shadow_mode_requires_human",
+            AutoApprovalPolicyMode::Disabled => "automatic_approval_disabled",
+            AutoApprovalPolicyMode::Balanced | AutoApprovalPolicyMode::Batch => {
+                "approval_mode_requires_human"
+            }
+        }
+    } else {
+        "approval_mode_requires_human"
+    };
     gates.push(gate(
         "approval_mode_allows_automatic",
         approval_mode_allows_automatic,
-        "approval_mode_requires_human",
-        Vec::new(),
+        approval_mode_reason,
+        vec![policy.policy_sha256.clone()],
     ));
     gates.push(gate(
         "organization_policy_allows_automatic",
@@ -302,13 +356,34 @@ pub fn evaluate_document(
         .map(|page| to_page_risk(page, policy))
         .collect::<Vec<_>>();
     let readiness_score = document_readiness(&page_risks, p0, p1);
+    let auto_p2_limit = match policy.auto_approval_mode {
+        AutoApprovalPolicyMode::Balanced => 0,
+        AutoApprovalPolicyMode::Batch | AutoApprovalPolicyMode::Shadow => {
+            policy.maximum_quick_review_p2
+        }
+        AutoApprovalPolicyMode::Strict | AutoApprovalPolicyMode::Disabled => 0,
+    };
+    let hypothetical_gates_passed = hard_gates.gates.iter().all(|gate| {
+        gate.passed || !gate.blocking || gate.gate_id == "approval_mode_allows_automatic"
+    });
+    let shadow_would_auto_approve = policy.auto_approval_mode == AutoApprovalPolicyMode::Shadow
+        && hypothetical_gates_passed
+        && p0 == 0
+        && p1 == 0
+        && p2 <= auto_p2_limit;
+    let automatic_publish_allowed = approval_mode_allows_automatic
+        && hard_gates.all_blocking_gates_passed()
+        && p0 == 0
+        && p1 == 0
+        && p2 <= auto_p2_limit;
     let route = route_document(
         &hard_gates,
         assessment,
+        policy,
+        automatic_publish_allowed,
         p0,
         p1,
         p2,
-        policy.maximum_quick_review_p2,
     );
     let reason_codes = hard_gates
         .gates
@@ -331,6 +406,10 @@ pub fn evaluate_document(
         policy_sha256: policy.policy_sha256.clone(),
         calibration_evidence_version: assessment.calibration_evidence_version.clone(),
         qualification_report_id: qualification.qualification_report_id.clone(),
+        auto_approval_policy_mode: policy.auto_approval_mode,
+        production_automatic_enabled: policy.production_automatic_enabled,
+        shadow_would_auto_approve,
+        automatic_publish_allowed,
         reason_codes,
     };
     risk.validate(&hard_gates)?;
@@ -426,10 +505,11 @@ fn document_readiness(pages: &[PageRiskV1], p0: u32, p1: u32) -> u32 {
 fn route_document(
     gates: &HardGateEvaluationV1,
     assessment: &DocumentAssessmentV1,
+    policy: &RiskPolicyV1,
+    automatic_publish_allowed: bool,
     p0: u32,
     p1: u32,
     p2: u32,
-    maximum_quick_review_p2: u32,
 ) -> DocumentRoute {
     let safety_gate_failed = gates.gates.iter().any(|gate| {
         !gate.passed
@@ -444,14 +524,18 @@ fn route_document(
     if p0 > 0 || safety_gate_failed {
         return DocumentRoute::Blocked;
     }
-    if gates.all_blocking_gates_passed() {
+    if automatic_publish_allowed {
         return DocumentRoute::AutoApprovalEligible;
     }
     if p1 > 0
-        || p2 > maximum_quick_review_p2
+        || p2 > policy.maximum_quick_review_p2
         || matches!(
             assessment.requested_approval_route,
             RequestedApprovalRoute::Human
+        )
+        || matches!(
+            policy.auto_approval_mode,
+            AutoApprovalPolicyMode::Strict | AutoApprovalPolicyMode::Disabled
         )
     {
         DocumentRoute::FullReviewRequired
@@ -459,7 +543,6 @@ fn route_document(
         DocumentRoute::QuickReviewRequired
     }
 }
-
 fn validate_inputs(
     policy: &RiskPolicyV1,
     assessment: &DocumentAssessmentV1,
@@ -513,7 +596,10 @@ mod tests {
             minimum_ocr_confidence_ppm: ConfidencePpm::new(900_000).expect("confidence"),
             minimum_ocr_coverage_ppm: ConfidencePpm::new(950_000).expect("coverage"),
             maximum_quick_review_p2: 2,
+            auto_approval_mode: AutoApprovalPolicyMode::Balanced,
+            production_automatic_enabled: true,
             calibrated_for_automatic: true,
+            calibration_evidence_sha256: Some(hash(b"calibration")),
             organization_allows_automatic: true,
         }
     }
@@ -601,8 +687,13 @@ mod tests {
     fn shadow_mode_never_auto_publishes() {
         let mut input = assessment();
         input.requested_approval_route = RequestedApprovalRoute::ShadowHuman;
+        let mut policy = policy();
+        policy.auto_approval_mode = AutoApprovalPolicyMode::Shadow;
+        policy.production_automatic_enabled = false;
         let (risk, gates) =
-            evaluate_document(&policy(), &qualification(), &input, 1).expect("evaluate");
+            evaluate_document(&policy, &qualification(), &input, 1).expect("evaluate");
+        assert!(risk.shadow_would_auto_approve);
+        assert!(!risk.automatic_publish_allowed);
         assert_eq!(risk.route, DocumentRoute::QuickReviewRequired);
         assert!(
             !gates

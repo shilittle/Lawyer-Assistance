@@ -702,3 +702,26 @@ fn stable_errors_never_include_file_name_or_parser_details() {
     assert!(!error.to_string().contains("private-name"));
     assert!(!error.to_string().contains("private-body"));
 }
+
+#[test]
+fn image_extensions_require_magic_match_and_local_ocr() {
+    assert_eq!(detect_format("scan.PNG").unwrap(), FileFormat::Png);
+    assert_eq!(detect_format("photo.jpg").unwrap(), FileFormat::Jpeg);
+    assert_eq!(detect_format("photo.JPEG").unwrap(), FileFormat::Jpeg);
+
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01";
+    assert_eq!(
+        ingest_bytes("scan.png", png).unwrap_err(),
+        IngestError::ImageRequiresLocalOcr
+    );
+
+    let jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
+    assert_eq!(
+        ingest_bytes("photo.jpeg", jpeg).unwrap_err(),
+        IngestError::ImageRequiresLocalOcr
+    );
+    assert_eq!(
+        ingest_bytes("renamed.jpg", png).unwrap_err(),
+        IngestError::FormatMismatch
+    );
+}

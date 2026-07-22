@@ -2,7 +2,7 @@
 
 ## 生产基线
 
-生产只部署 `public_law_only`。启动后必须确认 `tools/list` 精确等于五项公开法律工具；出现第六项、案件工具或顺序漂移都停止使用。
+默认生产部署 `public_law_only`。启动后必须确认 `tools/list` 精确等于五项公开法律工具；出现第六项、案件工具或顺序漂移都停止使用。案件工作仅使用后文独立的 App-qualified approved stdio package，不能修改默认配置获得。
 
 发布包不携带法律库、用户库、客户材料、导出文件或令牌。先准备兼容的 `legal_core.sqlite`，再显式创建/迁移固定名 `user.sqlite`：
 
@@ -80,8 +80,26 @@ CLI、环境和配置文件存在优先级时，最终解析结果仍必须是 `
 
 ## `approved_case_workspace` 状态
 
-独立集成资产已提供，但当前默认禁用，案件执行必须返回 `PROFILE_NOT_QUALIFIED`。不要通过修改客户端 `enabled`、用户同意或放宽 Skill 绕过资格。完成 App 所列隔离、manifest 信任、模型与 Provider 资格后，仍需核对精确 15 工具、双通道残留扫描和三类宿主规则，详见[批准案件工作区 profile](approved-case-workspace.md)。
+独立集成资产已提供并默认禁用。先在 App 中完成材料人工批准/发布、approved MCP 资格和 standalone session，再只把显示的 `srv_…` ID 写入精确 Windows stdio 模板：
+
+```text
+lawyer-assistance-mcp --privacy-profile approved_case_workspace --approved-session-id <APP_ISSUED_SERVER_ID> stdio
+```
+
+只使用 formal App 随包发布的 paired MCP sibling。release 构建先测量该 sibling 并把 SHA-256 编译进 App；普通未绑定 development App、复制来的同名 executable、版本/canary 模仿或任意其他 binary 不能取得 qualification。不要添加 config、数据库/根/路径、环境、Bearer、bind/origin 或 HTTP 参数，也不要通过修改 `enabled`、用户同意或放宽 Skill 绕过资格。缺失或失效的 paired hash/qualification/session/ticket 必须 `PROFILE_NOT_QUALIFIED` 或具体匿名失败；有效状态执行真实 handler。核对精确 15 工具、双通道残留扫描和三类宿主规则，详见[批准案件工作区 profile](approved-case-workspace.md)。
 
 宿主任务只能以 opaque ID 开始，不能附加/粘贴原件或提供真实路径。若原始材料已经进入任务，删除受污染任务并新建干净任务；不能在同一上下文继续。
 
 旧版新建案件、材料导入、apply/get-state、文书生成或导出安装步骤已经失效；不得沿用旧配置重新开启。
+
+## 本地 MinerU component 与当前机器状态
+
+MinerU component 不随 Git 源码或普通 MCP ZIP 内置。历史 Windows v3 与短根 v5 candidate 永久禁止发布或改名复用。v4 provenance 源码门禁与 16/16 builder tests 已完成，但当前尚无 final v4 package/hash；必须从 clean commit A 确定性重建、显式审批、签名、短根安装/remeasure 和 GPU probe 后，才可进入 App Firewall/Job qualification。项目仓库为 private；最终 v4 发布后，推荐先在 App 外通过 GitHub 认证下载 catalog、`.minisig`、descriptor 与全部 parts，再本地导入。App 自动下载只对已能访问该 private Release 的运行环境成立，不得向 App/catalog 注入 GitHub token。必须验证 detached Minisign、每个 part 的 exact size/SHA-256 和 package/manifest/provenance hash，再通过 App component manager 安装。不要手工拼接到任意长目录：final installed tree 中任何路径超过 259 UTF-16 code units 都会以 `component_runtime_path_too_long` fail closed。
+
+历史 v3 首次完整 install/re-measure 与短根 v5 路径门禁复测均已通过其诊断边界；相关 installed-tree synthetic diagnostic 也通过。它们只解释 259 UTF-16 路径门禁的来源，不是 v4 构件证据，且组件安装或 RTX 5090 diagnostic 均不授权真实案件 OCR。
+
+当前机器的 Firewall elevation 两次被 UAC 取消，因此 `networkIsolationEnforced=false`、`modelManifestTrustEstablished=false`、`appAutoEnableAuthorized=false`、`productionCaseOcrAuthorized=false`。在 App 后端四项都变为当前有效之前，只能处理可靠原生文本层；扫描/视觉 PDF 必须阻断，不能转发远程 OCR。
+
+## 签名发布状态
+
+Updater private key/password 已存在，detached catalog verification 已成功；final updater `.sig` 与 `latest.json` 仍等待 exact signed installer。当前唯一外部签名 credential blocker 是缺少带可读 private key 的有效 Authenticode certificate。显式 unsigned installer 不能冒充 trusted-publisher build，也不能发布 updater metadata。

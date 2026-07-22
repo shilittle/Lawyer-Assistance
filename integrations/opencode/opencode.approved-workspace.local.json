@@ -4,15 +4,9 @@
   "mcp": {
     "lawyer_assistance": {
       "type": "local",
-      "command": ["/absolute/path/to/lawyer-assistance-mcp", "--privacy-profile", "approved_case_workspace", "stdio"],
+      "command": ["C:/LawyerAssistance/bin/lawyer-assistance-mcp.exe", "--privacy-profile", "approved_case_workspace", "--approved-session-id", "<APP_ISSUED_SERVER_ID>", "stdio"],
       "enabled": false,
-      "timeout": 30000,
-      "environment": {
-        "LAWYER_ASSISTANCE_LEGAL_DB": "/absolute/path/to/legal_core.sqlite",
-        "LAWYER_ASSISTANCE_USER_DB": "/absolute/path/to/user.sqlite",
-        "LAWYER_ASSISTANCE_ALLOWED_ROOTS": "/absolute/path/to/empty-input",
-        "LAWYER_ASSISTANCE_OUTPUT_ROOT": "/absolute/path/to/work-products"
-      }
+      "timeout": 30000
     }
   },
   "permission": {

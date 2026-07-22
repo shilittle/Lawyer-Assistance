@@ -91,6 +91,12 @@ pub struct FindingCandidateV1 {
     pub value_fingerprint: Sha256Hex,
     pub proposed_replacement: Option<String>,
     pub private_value_ref: PrivateValueRefV1,
+    /// True only when the detector's deterministic checksum/format validation passed.
+    pub validation_passed: bool,
+    /// Detector policy permits a deterministic backend replacement for this candidate.
+    pub automatic_replacement_allowed: bool,
+    /// True only after the replacement was applied and exact-range absence was verified.
+    pub replacement_verified: bool,
 }
 
 impl FindingCandidateV1 {
@@ -134,6 +140,7 @@ pub struct FindingBatchV1 {
     pub p0_count: u32,
     pub p1_count: u32,
     pub p2_count: u32,
+    pub p3_count: u32,
     pub finding_summary_hash: Sha256Hex,
 }
 
@@ -148,7 +155,7 @@ pub fn build_findings(
     policy: &FindingPolicyV1,
 ) -> Result<FindingBatchV1, FindingEngineError> {
     policy.validate()?;
-    if document_version == 0 || candidates.is_empty() {
+    if document_version == 0 {
         return Err(FindingEngineError::EmptyInput);
     }
     if candidates.len() > MAX_FINDING_CANDIDATES {
@@ -218,6 +225,7 @@ pub fn build_findings(
     let p0_count = count_severity(&findings, FindingSeverity::P0Blocking)?;
     let p1_count = count_severity(&findings, FindingSeverity::P1High)?;
     let p2_count = count_severity(&findings, FindingSeverity::P2Medium)?;
+    let p3_count = count_severity(&findings, FindingSeverity::P3Resolved)?;
     let canonical = canonical_json_v1(&findings).map_err(|_| FindingEngineError::InvalidOutput)?;
     let finding_summary_hash =
         Sha256Hex::parse(sha256_hex(&canonical)).map_err(|_| FindingEngineError::InvalidOutput)?;
@@ -233,6 +241,7 @@ pub fn build_findings(
         p0_count,
         p1_count,
         p2_count,
+        p3_count,
         finding_summary_hash,
     })
 }
@@ -264,6 +273,8 @@ fn merge_group(
     let mut layout_confidence_ppm = None;
     let mut normalization_hash = None;
     let mut confusable_hash = None;
+    let mut validation_passed = true;
+    let mut replacement_verified = true;
 
     for candidate in &group {
         detector_sources.insert(candidate.detector_source.clone());
@@ -301,6 +312,8 @@ fn merge_group(
             min_confidence(layout_confidence_ppm, candidate.layout_confidence_ppm);
         normalization_hash = normalization_hash.or(candidate.normalization_evidence_hash.clone());
         confusable_hash = confusable_hash.or(candidate.confusable_evidence_hash.clone());
+        validation_passed &= candidate.validation_passed;
+        replacement_verified &= candidate.replacement_verified;
     }
     if replacements.len() > 1 {
         conflict = true;
@@ -315,10 +328,24 @@ fn merge_group(
         .next()
         .unwrap_or_else(|| stable_replacement(key.4, &cluster_id));
 
+    let high_confidence =
+        calibrated_confidence_ppm.is_some_and(|value| value >= policy.high_confidence_ppm);
+    let low_ocr = ocr_confidence_ppm.is_some_and(|value| value < policy.low_ocr_confidence_ppm);
+    let verified_resolution = validation_passed
+        && replacement_verified
+        && detector_agreement
+        && high_confidence
+        && !low_ocr;
     let mut reason_codes = BTreeSet::new();
     let severity = if conflict {
         reason_codes.insert("detector_or_location_conflict".to_owned());
         FindingSeverity::P0Blocking
+    } else if !validation_passed {
+        reason_codes.insert("deterministic_validation_failed".to_owned());
+        FindingSeverity::P0Blocking
+    } else if verified_resolution {
+        reason_codes.insert("deterministic_replacement_verified".to_owned());
+        FindingSeverity::P3Resolved
     } else if high_risk_entity(key.4) || case_dictionary_match {
         reason_codes.insert("unresolved_high_risk_entity".to_owned());
         FindingSeverity::P1High
@@ -387,7 +414,11 @@ fn merge_group(
         review_priority: priority,
         reason_codes: reason_codes.into_iter().collect(),
         proposed_replacement,
-        resolution_state: ReviewResolution::Unresolved,
+        resolution_state: if verified_resolution {
+            ReviewResolution::Accepted
+        } else {
+            ReviewResolution::Unresolved
+        },
         human_override: None,
         provenance_hash,
         private_value_ref: first.private_value_ref.clone(),
@@ -643,6 +674,9 @@ mod tests {
                 object_version: 1,
                 value_locator_hash: hash('e'),
             },
+            validation_passed: true,
+            automatic_replacement_allowed: true,
+            replacement_verified: true,
         }
     }
 
@@ -664,7 +698,8 @@ mod tests {
         assert_eq!(left.findings, right.findings);
         assert_eq!(left.finding_summary_hash, right.finding_summary_hash);
         assert!(left.findings[0].detector_agreement);
-        assert_eq!(left.findings[0].severity, FindingSeverity::P1High);
+        assert_eq!(left.findings[0].severity, FindingSeverity::P3Resolved);
+        assert_eq!(left.p3_count, 1);
     }
 
     #[test]
@@ -687,6 +722,17 @@ mod tests {
             .all(|finding| finding.severity == FindingSeverity::P0Blocking));
     }
 
+    #[test]
+    fn zero_finding_document_is_a_valid_deterministic_result() {
+        let batch = build(Vec::new());
+        assert!(batch.findings.is_empty());
+        assert_eq!(batch.cluster_count, 0);
+        assert_eq!(batch.p0_count, 0);
+        assert_eq!(batch.p1_count, 0);
+        assert_eq!(batch.p2_count, 0);
+        assert_eq!(batch.p3_count, 0);
+        assert_eq!(batch.finding_summary_hash.as_str(), sha256_hex(b"[]"));
+    }
     #[test]
     fn malformed_span_replacement_and_geometry_fail_closed() {
         let mut invalid = candidate("rule", 'a');

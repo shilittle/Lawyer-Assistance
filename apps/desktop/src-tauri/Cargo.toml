@@ -4,6 +4,10 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+default = []
+standalone-mcp-e2e = ["legal-mcp/standalone-mcp-e2e"]
+
 [lib]
 name = "lawyer_assistance_desktop"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -22,6 +26,7 @@ base64.workspace = true
 database.workspace = true
 domain.workspace = true
 file-ingest.workspace = true
+hmac = "0.12"
 legal-mcp.workspace = true
 legal-services.workspace = true
 providers.workspace = true
@@ -35,6 +40,7 @@ serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tauri-plugin-single-instance.workspace = true
@@ -43,9 +49,9 @@ tokio-util = "0.7.17"
 uuid.workspace = true
 windows-sys.workspace = true
 unicode-normalization = "0.1.25"
+zeroize = "1.8"
 genpdf = "0.2.0"
 font-subset = "0.1.0"
 lopdf = "0.26.0"
 
 [dev-dependencies]
-tempfile.workspace = true

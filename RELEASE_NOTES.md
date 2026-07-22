@@ -1,63 +1,164 @@
-# Lawyer Assistance MCP 0.4.0-beta.1
+# Lawyer Assistance MCP 0.4.0-beta.2
 
-> **Privacy vNext prerelease.** This release implements the encrypted local-redaction architecture, approved-workspace contracts and host guardrails requested after v0.3.1. It is a controlled-testing prerelease, not production qualification for real client material.
+> **Privacy vNext functional prerelease.** This release replaces the earlier fail-closed-only privacy skeleton with an implemented local-OCR qualification path, approved MCP, approved Provider, safe derived-file, lifecycle, mapping, and five-component encrypted-backup paths. The development machine is not production-OCR-qualified. The default external surface remains public-law-only. Case workflows become usable only through an exact current App qualification and short-lived authorization; documentation, consent, Full Access, or a host allowlist cannot turn a failed gate into permission.
 
-> **Current qualification is intentionally fail-closed.** `networkIsolationEnforced=false`, `modelManifestTrustEstablished=false`, `appAutoEnableAuthorized=false` and `productionCaseOcrAuthorized=false`. Real scanned case OCR, automatic approval and approved-case MCP execution stay disabled until those gates are independently qualified.
+> **Acceptance uses synthetic data only.** Repository tests and machine canaries must never contain real client or case material. Raw or pending material must not enter GitHub, WorkBuddy, Codex, OpenCode, a browser/search engine, remote OCR, cloud storage, another MCP/Skill, memory, subagent, screenshot, terminal output, or log.
 
-## Privacy vNext scope
+## What changed
 
-- Encrypted local vault primitives, Windows DPAPI key wrapping, AES-256-GCM chunk storage, nonce reservation, encrypted source metadata and fail-closed tamper/truncation checks are implemented in the privacy crate.
-- Local OCR worker protocol `la-mineru-worker-v1` is defined and validated for host-to-worker hello, health, OCR, progress, cancel and shutdown messages. Remote MinerU, SSH OCR and cloud OCR remain forbidden for production case material.
-- Finding and risk engines now use opaque IDs, private value references, deterministic aliases, integer confidence, detector/model provenance hashes, page/document risk and the exact hard-gate model.
-- Approved material and work-product workspaces are immutable, signed, atomic, journaled and user-boundary scoped. Work products can only be written from verified approved material references and are blocked by residual sensitive-content scans.
-- Desktop privacy settings expose local-worker/GPU preferences and the blocked capability matrix. These settings do not authorize production OCR or auto approval while qualification flags are false.
-- The new `approved_case_workspace` MCP profile and host assets are discoverable but unqualified. Tool execution fails closed and returns anonymous qualification errors rather than raw case content.
-- WorkBuddy, Codex and OpenCode approved-workspace instructions explicitly forbid attachments, paste, browser/search, cloud storage, other MCP servers, remote OCR, memory or subagents for unapproved case material.
+- Local MinerU is connected to App ingestion. `auto_local` routes only PDFs/pages needing visual OCR and `force_local` routes all PDF pages, but only while the signed current-machine qualification remains valid.
+- The App builds and signs a complete worker/tools/runtime/model inventory, installs and remeasures exact Windows Firewall outbound-block rules, runs the fixed synthetic canary, persists qualification, reloads it on restart, and invalidates it on expiry, revocation or environment/hash/version drift.
+- Approved material publication and all ten `approved_case_workspace` handlers execute against immutable signed generations. Work products use immutable versions, optimistic concurrency, idempotency, journal recovery, exact source binding, and residual scanning.
+- Every work-product version persists exactly `content.envelope.json`, `manifest.json`, and `commit.json`. Content is encrypted with a fresh per-generation AES-256-GCM key and nonce; Windows DPAPI CurrentUser wraps the key, and authenticated data binds workspace/case/work-product/version, signed-manifest hash, content hash/size/media type. Only the scoped `WorkProductService` may authenticate and decrypt it after source, revocation, filesystem, manifest, commit, hash, and residual checks. A legacy plaintext `content.bin` or any extra/missing file fails closed.
+- Formal packaging first builds the paired MCP sibling, measures its SHA-256, and compiles that value into the App. Approved-MCP qualification requires this trust anchor in addition to sibling path/file identity, version and behavior; an unbound development App or substituted same-name binary fails closed. The actual sibling process has passed the stdio/HTTP approved-flow E2E.
+- App-issued MCP tickets bind the server instance, transport, tool, schema, purpose, canonical request bytes, destination, target IDs/generation, nonce, expiry and revocation epoch. Consumption is persistent and replay protected.
+- The standalone approved-MCP wire replay journal is now V2. Each reservation persists an authenticated, session/server/epoch-bound pending transition in Windows Credential Manager before the SQLite commit, advances the authenticated head only for the exact expected next tail, and then clears the pending record. Recovery accepts only the exact one-step committed tail; a pre-database crash, missing pending record, multi-step advance, fork, rollback, binding mismatch or tamper remains fail closed and requires revocation plus reprovisioning. The pending record contains hashes/MACs and a nonce, never case text or ticket secrets.
+- Standalone approved hosts receive only an opaque App-issued `srv_…` ID. Session descriptors are DPAPI-protected and session secrets remain in Windows Credential Manager; static host assets contain no database/root/config path, environment secret, bearer or HTTP credential.
+- Approved Provider dispatch is a separate backend-restored type. It revalidates exact content/generation/Provider/endpoint/model/purpose/policy/detector/OCR/expiry/revocation immediately before transport. Naked case requests still fail before serialization and send zero network requests.
+- Safe reconstructed PDF, DOCX, TXT and Markdown exports reload the protected approval server-side, refuse unsafe/overwrite/link/cloud destinations, reread the installed file, compare content/hash, rescan residual risk, and append a generation-bound audit.
+- Privacy lifecycle UI covers retention, legal holds, expiry sweeps, protected output/work-product lifecycle, mapping reveal/revoke, mapping-key rotation/destruction, and crash recovery. It does not claim forensic media erasure.
+- `.lavbackup` V3 authenticates and encrypts five components as one DPAPI-current-user set: the `user.sqlite` snapshot, encrypted privacy bundle, ciphertext-only case Vault archive, approved-workspace archive, and encrypted work-products archive. Every component uses independent chunk AAD under the same fresh backup key. Restore is staged, reverified on restart, installed as one transaction and rolls back all five components on any failure. V2 three-component bundles are accepted only for read/restore compatibility; new complete backups are V3. V1 fails closed. `.lavprivacy` remains a privacy-only maintenance format.
+- WorkBuddy, Codex and OpenCode keep separate public and approved packages. Approved packages are Windows stdio only, begin with opaque IDs, stop on contaminated context, and explicitly forbid attachments, paste, host files, browser/search, remote OCR, another MCP/Skill, memory, subagents and unapproved Providers.
+
 
 ## Compatibility contract
 
-| Item | Current value |
+| Item | `0.4.0-beta.2` value |
 |---|---|
-| Binary release | `0.4.0-beta.1` |
+| Binary release | `0.4.0-beta.2` |
 | MCP protocol metadata | `2025-11-25` |
 | Public service schema | `1` |
 | Legal archive schema | `4` |
 | Legal runtime schema | `1` when present |
 | User database schema | `10` |
-| Production profile | `public_law_only` |
-| Production tools | `5`, all read-only |
-| Experimental profile | `redacted_case`, `6` tools; no App production signing path |
-| Designed but unqualified profile | `approved_case_workspace`, public five plus ten approved-workspace tools; execution blocked |
-| Case/material/document raw tools | Hidden and unavailable |
+| Default profile | `public_law_only` |
+| Default tools | 5 read-only public-law tools |
+| Experimental profile | `redacted_case`: public five plus receipt-gated `citation_validate`; it remains separate from approved workspace sessions |
+| Qualified profile | `approved_case_workspace`: public five plus ten opaque-ID-only approved material/work-product tools |
+| Approved static transport | Windows stdio with an App-issued opaque standalone session ID |
+| Hidden legacy case tools | unavailable in every profile |
 
-Production MCP still exposes exactly `system_status`, `legal_search`, `legal_get_article`, `legal_get_versions` and `legal_get_relations` under `public_law_only`. Stdio and HTTP must expose the same production tool names, order and schemas.
+`public_law_only` still exposes exactly, in order:
+
+1. `system_status`
+2. `legal_search`
+3. `legal_get_article`
+4. `legal_get_versions`
+5. `legal_get_relations`
+
+The approved profile adds exactly:
+
+1. `case_list`
+2. `case_get_public_metadata`
+3. `case_list_approved_materials`
+4. `case_read_approved_material`
+5. `case_search_approved_materials`
+6. `case_list_work_products`
+7. `case_read_work_product`
+8. `case_write_work_product`
+9. `case_update_work_product`
+10. `case_export_work_product_manifest`
+
+No approved request accepts a path, filename, URI, URL, directory, glob, command, shell fragment, raw OCR, pending review content, private mapping, secret, bearer, or free metadata object. Both MCP result channels are independently privacy scanned.
+
+## Qualification and operating contract
+
+Discovery is not qualification. Qualification is not document approval. Document approval is not general egress permission. MCP and Provider each require an additional exact destination/purpose authorization.
+
+The App is authoritative for these independent gates:
+
+- synthetic canary compatibility;
+- local processing-chain integrity;
+- Windows network isolation;
+- model/runtime trust;
+- production scan authorization;
+- App automatic routing authorization (never automatic approval);
+- approved MCP qualification/session;
+- approved Provider qualification and exact dispatch approval.
+
+Every gate has its own evidence, expiry/revocation/invalidation condition and anonymous reason code. Missing or changed evidence fails closed. There is no HTTP/SSH/cloud/remote MinerU or model-download fallback.
+
+### MinerU evidence boundary on the development machine
+
+- The earlier signed, self-contained v3 Windows x86_64 candidate (`11,793,618,181` bytes, six hash-bound parts) and the later short-root v5 candidate are historical engineering artifacts only. Their install/re-measure and detached-catalog checks remain useful diagnostic evidence, but both candidates are permanently excluded from publication and must not be reused as release assets.
+- These are engineering diagnostics and component-integrity evidence, not production-case OCR qualification. They did not establish the App-owned Windows Firewall/Job Object chain. Both elevation prompts were cancelled, so `networkIsolationEnforced`, `modelManifestTrustEstablished`, `appAutoEnableAuthorized`, and `productionCaseOcrAuthorized` remain `false`.
+- The v4 provenance source gates are implemented and their 16 builder tests pass. The package/catalog provenance binds the clean source commit, build-script SHA-256, worker-source-tree SHA-256, selected runtime distributions, and exact model revisions. There is not yet a final v4 artifact or final v4 hash: after clean commit A, v4 must be rebuilt deterministically, explicitly approved, signed, installed under a short root, remeasured, GPU-probed, and then qualified through the App-owned Firewall/Job/canary/restart path. No historical v3/v5 hash may stand in for that evidence.
+- A long final installation root exposed native dependency incompatibility beyond the legacy Win32 path budget. The identical historical package bytes worked from a shorter root; the installer now rejects any final component file over 259 UTF-16 code units with `component_runtime_path_too_long`. The historical short-root v5 install/re-measure passed `1/1` with 387 filtered in `1209.75 s`, and a synthetic-only diagnostic launched directly from that installed tree also passed. Neither result is App Firewall/Job production qualification or a publishable release artifact.
+- `shilittle/Lawyer-Assistance` is private. Unauthenticated clients cannot rely on candidate catalog GitHub asset URLs. The recommended installation path is to authenticate to GitHub outside the App, download the catalog, detached signature, descriptor and all six parts, then import them locally. App automatic download is conditional on the running environment already being able to access that private Release; never inject a GitHub token or case data into component metadata.
+
+See [`docs/privacy-vnext/OPERATIONS.md`](docs/privacy-vnext/OPERATIONS.md) for the end-user sequence and [`docs/mcp/approved-case-workspace.md`](docs/mcp/approved-case-workspace.md) for the host contract.
 
 ## Install and migration
 
-1. Obtain a separately licensed compatible `legal_core.sqlite`.
-2. Back up `user.sqlite` and its SQLite auxiliary files, then verify archive/binary checksums.
-3. Create or migrate the fixed-name user database explicitly:
+### Desktop
+
+1. Verify the downloaded artifact and its adjacent SHA-256/manifest.
+2. For the unsigned technical prerelease, confirm the filename contains `unsigned`, the manifest says `signed=false`, and no updater artifact is present. Windows publisher identity is not established for that artifact.
+3. Install or unpack under the current Windows user. Do not copy a real `user.sqlite`, privacy store, `.lavbackup`, `.lavprivacy`, case material, Provider credential or session descriptor into the installation tree.
+4. On first start, let the App migrate the local databases and initialize the encrypted case Vault, approved workspace, and encrypted work-product store. Create a new five-component `.lavbackup` V3 before relying on restart restore. V2 three-component bundles remain read/restore-compatible but are not newly emitted as the complete format; legacy single-database and V1 bundles fail closed.
+5. Use **隐私与本地处理** to discover, save, trust, isolate and qualify the local OCR installation. Do not process a visual case PDF until all required backend gates are current.
+
+### Public-law MCP
+
+1. Obtain a separately licensed compatible `legal_core.sqlite` and verify it independently.
+2. Explicitly create/migrate the fixed-name user database:
 
    ```text
    lawyer-assistance-mcp --user-db /absolute/path/user.sqlite init-user-db
    ```
 
-4. Start stdio or loopback HTTP with `--privacy-profile public_law_only` and dedicated empty input/output roots.
-5. Verify `tools/list` is exactly the five public-law tools, then call `system_status` with `schema_version: 1` and continue only on `ready`.
-6. Smoke-test only with public legal names, provisions and dates. Never attach, paste or import client/case material into hosts.
+3. Start `--privacy-profile public_law_only` over stdio or loopback HTTP and require the exact five-tool catalog.
+4. Call `system_status` and continue only on `ready`. Use public legal names, provisions and dates only.
 
-The approved-case-workspace host examples are packaging and integration artifacts for controlled testing. They are not permission to process raw or merely pending case material.
+### Approved MCP
 
-## Release asset and updater limits
+1. **Breaking replay-journal migration:** stop every pre-V2 approved MCP host, revoke each old standalone session in the App, and create a fresh session. V1 Credential Manager state and `standalone-wire-replay-v1.sqlite` are never authenticated, migrated, rolled back or replayed as V2. Explicit revocation best-effort deletes the exact V1/V2 credential targets and fixed local replay files; any cleanup failure remains fail closed. Do not copy, rename, edit or reuse an old replay database or credential.
+2. Complete local App review and manual approval, publish the exact generation, and run approved-MCP qualification.
+3. Create a standalone session in the App and copy only its opaque `srv_…` ID into the disabled Windows stdio template:
 
-- The GitHub repository is private and this Release is marked prerelease. Anonymous asset download and the `/releases/latest` updater route are therefore not qualified.
-- The Windows installer may be unsigned by Authenticode on this machine. Minisign/Tauri updater signatures prove updater payload integrity but do not prove Windows publisher identity.
-- MCP archives contain no legal database, user database, case material, exported document, token, Provider credential or machine-local configuration.
+   ```text
+   lawyer-assistance-mcp --privacy-profile approved_case_workspace --approved-session-id <APP_ISSUED_SERVER_ID> stdio
+   ```
+
+4. Do not add config/database/root/path/env/bearer/bind/origin/HTTP options. Require exactly 15 tools and start a clean host task with opaque IDs only.
+5. Stop on `PROFILE_NOT_QUALIFIED`, mismatch, expiry, revocation, replay, integrity or residual-scan errors. Never downgrade to a file, browser, another tool, remote OCR or copied text.
+
+## Release assets and acceptance checklist
+
+Expected unsigned prerelease artifacts from a clean final commit:
+
+- `Lawyer-Assistance_0.4.0-beta.2_windows-x86_64-portable.zip`
+- `Lawyer-Assistance_0.4.0-beta.2_windows-x86_64-portable.zip.sha256`
+- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe`
+- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe.sha256`
+- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe.manifest.json`
+- `lawyer-assistance-mcp-v0.4.0-beta.2-x86_64-pc-windows-msvc.zip`
+- `lawyer-assistance-mcp-v0.4.0-beta.2-x86_64-pc-windows-msvc.zip.sha256`
+
+After the formal Authenticode-signed build succeeds, also expect the signed installer (uploaded as `Lawyer.Assistance_0.4.0-beta.2_x64-setup.exe`), its updater `.sig`, and `latest.json`. The updater private key/password are available and catalog signature verification has succeeded, but the final installer-bound updater artifacts are still pending that clean signed build. Do not publish `latest.json` for the unsigned installer and do not label an unsigned artifact as signed.
+
+Before upload:
+
+- verify every adjacent checksum and embedded/archive manifest;
+- reject traversal, duplicate, database, secret, session, credential, case-content and stale-member entries;
+- confirm the portable and installer executable ProductVersion is `0.4.0-beta.2`;
+- confirm the unsigned manifest records `signed=false` and `updaterArtifactGenerated=false`, or verify Authenticode and Minisign for the signed path;
+- install/start the installer and portable build, run local health/privacy smoke tests, and run the actual MCP binary stdio/HTTP canaries;
+- re-fetch the GitHub Release after upload and compare every asset name and byte size.
+
+MCP archives contain no legal/user/privacy database, case material, exported document, token, Provider credential, App-issued session descriptor, secret, or machine-local configuration.
+
+## External credential blocker
+
+The only currently evidenced external credential gap is that no valid Authenticode code-signing certificate with a readable private key is available to the release identity. The updater private key and password are present; detached Minisign catalog verification has succeeded. Final installer `.sig` and `latest.json` remain pending because they must bind the exact final Authenticode-signed installer, not because the updater credentials are absent.
+
 
 ## Known limits
 
-A host may send a first message or attachment before Skill/Agent rules load. MCP cannot prevent, retract or prove deletion of that prior disclosure. If raw case material enters a host context, the approved-workspace instructions require a clean task and zero further tool use.
-
-Reliable text-layer PDFs can still be processed locally through the existing reviewed redaction path. Scanned, handwritten, stamped or image-only case PDFs must fail closed until local OCR isolation, model-manifest trust and production authorization are qualified. There is no remote MinerU, SSH or cloud OCR fallback.
-
-The new privacy vault and approved-workspace modules are Windows-oriented where platform cryptography and filesystem isolation rely on Windows APIs. Cross-platform MCP packaging remains public-law-only unless separately qualified.
+- A host may upload the first message or attachment before a Skill/Agent rule loads. MCP cannot prevent, retract or prove deletion of that earlier disclosure. If a task is contaminated, stop and create a clean opaque-ID-only task after following host/Provider retention cleanup.
+- Only reconstructed safe PDF/DOCX/TXT/Markdown is claimed. Pixel-perfect layout-preserving redaction is not claimed.
+- Mapping/key destruction and logical cleanup are not forensic erasure of SSD cells, filesystem history, external backups, host caches or previously disclosed copies.
+- Qualification is machine/user/install specific. Copying a report, session ID, database or model tree to another environment does not transfer qualification.
+- Public-law host packages remain intentionally case-free even though the separate approved-session implementation exists.
+- Real client material is excluded from release acceptance. Synthetic positive E2E proves the implemented chain, not legal accuracy for every handwriting, stamp, scan quality or jurisdictional document form; low confidence and unsupported cases must fail closed and receive human review.
+- An unsigned installer has no verified Windows publisher identity and may trigger SmartScreen/AV warnings. Authenticode and clean-machine Windows 10/11 reputation qualification are release-operations evidence, not privacy feature claims; updater credentials being available does not confer publisher identity on an unsigned installer.

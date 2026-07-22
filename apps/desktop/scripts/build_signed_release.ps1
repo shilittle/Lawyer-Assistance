@@ -6,6 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "release_filenames.ps1")
+. (Join-Path $PSScriptRoot "release_file_ops.ps1")
+. (Join-Path $PSScriptRoot "mcp_sidecar_release.ps1")
 $ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
 
 function Assert-CleanGitWorktree([string]$Root, [string]$Message) {
@@ -68,6 +70,7 @@ if ($certificate.NotAfter -le (Get-Date)) { throw "Code-signing certificate has 
 $signingConfigPath = Join-Path $ProjectRoot ".release-secrets\tauri.code-signing.conf.json"
 $signingConfig = [ordered]@{
   bundle = [ordered]@{
+    externalBin = @("binaries/lawyer-assistance-mcp")
     windows = [ordered]@{
       certificateThumbprint = $CodeSigningThumbprint.ToUpperInvariant()
       digestAlgorithm = "sha256"
@@ -84,15 +87,36 @@ $nsisDir = Join-Path $releaseDir "bundle\nsis"
 $expectedInstaller = Join-Path $nsisDir "${productName}_${version}_x64-setup.exe"
 $expectedSignature = "$expectedInstaller.sig"
 $expectedExecutable = Join-Path $releaseDir "lawyer-assistance.exe"
+$mcpPaths = Get-LawyerAssistanceMcpReleasePaths $ProjectRoot
+$expectedMcpExecutable = [string]$mcpPaths.ReleaseBinary
+$tauriMcpSidecar = [string]$mcpPaths.TauriSidecar
 $frontendKeep = Join-Path $ProjectRoot "apps\desktop\frontend-dist\.gitkeep"
-foreach ($stale in @($expectedExecutable, $expectedInstaller, $expectedSignature)) {
+foreach ($stale in @($expectedExecutable, $expectedMcpExecutable, $tauriMcpSidecar, $expectedInstaller, $expectedSignature)) {
   if (Test-Path -LiteralPath $stale -PathType Leaf) { Remove-Item -LiteralPath $stale -Force }
 }
 $buildStartedAt = (Get-Date).ToUniversalTime()
+$signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction Stop |
+  Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $signtool) { throw "signtool.exe was not found" }
 $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -LiteralPath $UpdaterPrivateKeyPath -Raw
 $previousSourceDateEpoch = $env:SOURCE_DATE_EPOCH
+$previousMcpReleaseSha256 = $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256
 $env:SOURCE_DATE_EPOCH = $sourceDateEpoch
 try {
+  Push-Location $ProjectRoot
+  try {
+    & cargo build --release --locked --offline --package legal-mcp --bin lawyer-assistance-mcp
+    if ($LASTEXITCODE -ne 0) { throw "MCP signed release build failed with exit code $LASTEXITCODE" }
+  } finally {
+    Pop-Location
+  }
+  ConvertTo-LawyerAssistanceIndependentMcpBinary $expectedMcpExecutable
+  & $signtool.FullName sign /sha1 $CodeSigningThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $expectedMcpExecutable | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw "MCP Authenticode signing failed" }
+  $mcpReleaseSha256 = (Get-FileHash -LiteralPath $expectedMcpExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($mcpReleaseSha256 -notmatch '^[0-9a-f]{64}$') { throw "MCP release trust anchor is invalid" }
+  $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 = $mcpReleaseSha256
+  Install-LawyerAssistanceMcpTauriSidecar $expectedMcpExecutable $tauriMcpSidecar
   Push-Location (Join-Path $ProjectRoot "apps\desktop")
   & $tauri build --config $signingConfigPath
   if ($LASTEXITCODE -ne 0) { throw "Tauri signed build failed with exit code $LASTEXITCODE" }
@@ -107,6 +131,12 @@ try {
   } else {
     $env:SOURCE_DATE_EPOCH = $previousSourceDateEpoch
   }
+  if ($null -eq $previousMcpReleaseSha256) {
+    Remove-Item Env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 -ErrorAction SilentlyContinue
+  } else {
+    $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 = $previousMcpReleaseSha256
+  }
+  Remove-LawyerAssistanceMcpTauriSidecar $tauriMcpSidecar
 }
 
 $installer = Get-Item -LiteralPath $expectedInstaller -ErrorAction SilentlyContinue
@@ -119,7 +149,8 @@ if (-not $appExe -or -not $installer -or -not $signature) {
 if ($installer.Name -cne $releaseFilenames.SignedArtifact) {
   throw "Tauri generated an unexpected signed installer filename: $($installer.Name)"
 }
-foreach ($artifact in @($appExe, $installer, $signature)) {
+foreach ($artifact in @($appExe, $installer, $signature, (Get-Item -LiteralPath $expectedMcpExecutable -ErrorAction SilentlyContinue))) {
+  if (-not $artifact) { throw "Signed MCP release binary was not generated" }
   if ($artifact.LastWriteTimeUtc -lt $buildStartedAt.AddSeconds(-2) -or
       $artifact.LastWriteTimeUtc -gt $buildCompletedAt.AddSeconds(5)) {
     throw "Release output is outside this build invocation: $($artifact.FullName)"
@@ -130,10 +161,12 @@ $normalizedProductVersion = if ($productVersion -match '^(\d+\.\d+\.\d+)\.0$') {
 if ($normalizedProductVersion -ne $version) {
   throw "Executable ProductVersion '$productVersion' does not match $version"
 }
-$signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction Stop |
-  Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
-if (-not $signtool) { throw "signtool.exe was not found" }
-foreach ($artifact in @($appExe, $installer)) {
+$mcpEvidence = Assert-LawyerAssistanceMcpReleaseBinary `
+  $expectedMcpExecutable $version ([DateTimeOffset]$buildStartedAt) ([DateTimeOffset]$buildCompletedAt)
+if ([string]$mcpEvidence.sha256 -ne $mcpReleaseSha256) {
+  throw "Packaged MCP binary differs from the trust anchor compiled into the App"
+}
+foreach ($artifact in @($appExe, $installer, (Get-Item -LiteralPath $expectedMcpExecutable))) {
   & $signtool.FullName verify /pa /all /v $artifact.FullName | Out-Host
   if ($LASTEXITCODE -ne 0) { throw "Authenticode verification failed: $($artifact.FullName)" }
 }
@@ -145,6 +178,9 @@ $portableProvenance = [ordered]@{
   sourceDateEpoch = $sourceDateEpoch
   executablePath = $appExe.FullName
   executableSha256 = (Get-FileHash -LiteralPath $appExe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+  mcpBinaryPath = $expectedMcpExecutable
+  mcpBinarySha256 = [string]$mcpEvidence.sha256
+  mcpQualificationBinding = "compiled-release-sha256+canonical-path-identity+file-identity+sha256+version"
   buildStartedAtUtc = ([DateTimeOffset]$buildStartedAt).ToString("o")
   buildCompletedAtUtc = ([DateTimeOffset]$buildCompletedAt).ToString("o")
   authenticodeVerified = $true

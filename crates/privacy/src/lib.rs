@@ -4,22 +4,58 @@
 //! with stable placeholders. Unlabelled semantic entities still require local
 //! preview and human review.
 
+pub mod application_backup;
+pub mod case_dictionary;
+pub mod deterministic;
 pub mod egress;
+pub mod evaluation;
 pub mod finding_engine;
+pub mod lifecycle;
+pub mod local_ner;
+pub mod mcp_ticket;
 pub mod protected_blob;
 pub mod qualification;
 pub mod receipt;
+mod redaction_mapping;
+pub mod residual_scan;
+pub mod review_session;
 pub mod risk_engine;
 pub mod store;
+pub mod vault_backup;
 pub mod vault_crypto;
 pub mod vault_store;
 pub mod vnext;
 pub mod work_products;
 pub mod workspace;
 
+pub use application_backup::{
+    open_application_backup, seal_application_backup, seal_application_backup_v3,
+    ApplicationBackupCreateRequest, ApplicationBackupCreateRequestV3, ApplicationBackupError,
+    ApplicationBackupMetadata, ApplicationBackupOpenContext, OpenedApplicationBackup,
+    APPLICATION_BACKUP_CHUNK_BYTES, APPLICATION_BACKUP_CRYPTO_SUITE,
+    APPLICATION_BACKUP_SCHEMA_VERSION, APPLICATION_BACKUP_V3_CRYPTO_SUITE,
+    APPLICATION_BACKUP_V3_SCHEMA_VERSION, MAX_APPLICATION_BACKUP_BYTES,
+    MAX_APPROVED_WORKSPACE_BACKUP_BYTES, MAX_USER_DATABASE_BACKUP_BYTES,
+    MAX_WORK_PRODUCTS_BACKUP_BYTES,
+};
 pub use egress::{
     scan_residual, ApprovedOutboundPayload, DataClassification, EgressCandidate, EgressError,
     EgressPolicyEngine, PrivacyEgressAuditRecord, ResidualScanResult,
+};
+pub use lifecycle::{
+    ApprovedOutputAccessContextV1, ApprovedOutputSummaryV1, BackupExportRequestV1,
+    BackupVerificationContextV1, CleanupReportV1, EncryptedPrivacyBackupStore, LifecycleError,
+    LoadedApprovedOutputV1, MappingAccessContextV1, MappingKeySummaryV1, MappingRevisionStatusV1,
+    MappingRevisionSummaryV1, PrivacyLifecycle, RetentionBindingSummaryV1, RetentionPolicyV1,
+    SaveApprovedOutputV1, SensitiveMappingEntryV1, SensitiveMappingPayloadV1, VerifiedBackupV1,
+    BACKUP_CRYPTO_SUITE, ENCRYPTED_BACKUP_SCHEMA_VERSION, LOGICAL_ERASURE_DISCLOSURE,
+    PORTABLE_BACKUP_SCHEMA_VERSION, PRIVACY_LIFECYCLE_SCHEMA_VERSION,
+    SENSITIVE_MAPPING_SCHEMA_VERSION,
+};
+pub use mcp_ticket::{
+    McpAccessTargetV1, McpAccessTicketClaimsV1, McpAccessTicketRequestV1, McpAccessTicketStore,
+    McpTicketError, McpTicketSigningKey, McpTicketVerificationContextV1, McpTransportBindingV1,
+    SignedMcpAccessTicketV1, MCP_ACCESS_TICKET_PROFILE, MCP_ACCESS_TICKET_VERSION,
 };
 pub use protected_blob::{
     protect_local, unprotect_local, ProtectedBlobError, LOCAL_PROTECTION_SCHEME,
@@ -33,10 +69,28 @@ pub use receipt::{
     sha256_hex, DestinationKind, DestinationScope, ReceiptError, ReceiptSigner,
     ReceiptVerificationContext, RedactionReceiptClaims, ReviewState, SignedRedactionReceipt,
 };
+pub use redaction_mapping::RedactionMappingEntry;
+pub use review_session::{
+    HardGateViewV1, PrivacyFindingViewV1, ResidualSummaryViewV1, ReviewActionV1,
+    ReviewAnalysisReplacementV1, ReviewSessionError, ReviewSessionInputV1, ReviewSessionV1,
+    ReviewStateViewV1, VerifiedReviewActionContextV1, VisualRiskDecisionV1, VisualRiskResolutionV1,
+    MAX_REVIEW_HISTORY, REVIEW_SESSION_SCHEMA_VERSION, REVIEW_STATE_VIEW_SCHEMA_VERSION,
+};
 pub use store::{
-    ActiveReceiptVerification, LoadedReviewDraft, PrivacyStore, PrivacyStoreError,
-    RegisterPrivacyMaterial, SaveReviewDraft, MAX_ACTIVE_RECEIPT_TTL_SECONDS,
-    PRIVACY_STORE_SCHEMA_VERSION,
+    ActiveReceiptVerification, ApproveReviewWithRiskRevision, LoadedReviewDraft,
+    LoadedRiskReviewRevision, PrivacyStore, PrivacyStoreError, RegisterPrivacyMaterial,
+    RiskReviewRevisionSummary, SaveReviewDraft, SaveRiskReviewRevision,
+    MAX_ACTIVE_RECEIPT_TTL_SECONDS, PRIVACY_STORE_SCHEMA_VERSION,
+};
+pub use vault_backup::{
+    export_encrypted_vault_backup, stage_encrypted_vault_backup, VaultBackupError,
+    VaultBackupSummaryV1, ENCRYPTED_VAULT_BACKUP_SCHEMA_VERSION, MAX_ENCRYPTED_VAULT_BACKUP_BYTES,
+    MAX_ENCRYPTED_VAULT_BACKUP_CONTENT_BYTES, MAX_ENCRYPTED_VAULT_BACKUP_FILES,
+};
+pub use vault_store::{
+    fixed_local_file_identity, validate_fixed_local_directory, validate_fixed_local_regular_file,
+    VaultCleanupReportV1, VaultRetentionBindingV1, VAULT_LIFECYCLE_SCHEMA_VERSION,
+    VAULT_LOGICAL_ERASURE_DISCLOSURE,
 };
 
 use serde::{Deserialize, Serialize};
@@ -367,6 +421,34 @@ impl Redactor {
     /// local review state for irreversible output scans.
     pub fn detected_sensitive_values(&self) -> Vec<String> {
         self.detected_values.iter().cloned().collect()
+    }
+
+    /// Returns an owned, deterministic snapshot of only aliases that were
+    /// actually emitted during this redaction session. Configured-but-absent
+    /// terms and values seen only during discovery are excluded.
+    ///
+    /// The returned type does not implement serialization, redacts its
+    /// sensitive field from `Debug`, and zeroizes that field on drop. Callers
+    /// must persist it only through the encrypted mapping lifecycle API.
+    #[must_use]
+    pub fn detected_alias_mappings(&self) -> Vec<RedactionMappingEntry> {
+        let mut mappings = BTreeMap::new();
+        for (sensitive_value, kind) in &self.known_terms {
+            let detected_value = sensitive_value.trim();
+            if detected_value.is_empty() || !self.detected_values.contains(detected_value) {
+                continue;
+            }
+            let digest: [u8; 32] = Sha256::digest(sensitive_value.as_bytes()).into();
+            if let Some(alias) = self.aliases.get(&(*kind, digest)) {
+                mappings
+                    .entry(alias.clone())
+                    .or_insert_with(|| sensitive_value.clone());
+            }
+        }
+        mappings
+            .into_iter()
+            .map(|(alias, sensitive_value)| RedactionMappingEntry::new(alias, sensitive_value))
+            .collect()
     }
 
     fn apply(&mut self, input: &str, mut spans: Vec<Span>) -> String {

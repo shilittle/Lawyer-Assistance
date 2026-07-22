@@ -1,3 +1,5 @@
+pub mod application_backup;
+pub mod approved_mcp;
 pub mod assistant;
 pub mod assistant_run;
 pub mod case;
@@ -5,7 +7,11 @@ pub mod document;
 pub mod graph;
 pub mod legal;
 pub mod mcp;
+pub mod mineru_components;
 pub mod privacy;
+pub mod privacy_export;
+pub mod privacy_lifecycle;
+pub mod privacy_provider;
 pub mod privacy_workflow;
 pub mod provider;
 pub mod release;

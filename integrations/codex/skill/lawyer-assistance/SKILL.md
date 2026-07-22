@@ -1,6 +1,6 @@
 ---
 name: lawyer-assistance
-description: Research Chinese public law through the Lawyer Assistance MCP public_law_only profile, including public legal search, article text, version intervals, and public relations between provisions. Use only for questions containing no client, case, attachment, document, path, or derived fact; all case and document workflows are currently disabled.
+description: Research Chinese public law through the Lawyer Assistance MCP public_law_only profile, including public legal search, article text, version intervals, and public relations between provisions. Use only for questions containing no client, case, attachment, document, path, or derived fact; this public-only Skill intentionally excludes every case and document workflow.
 ---
 
 # Lawyer Assistance
@@ -11,7 +11,7 @@ Apply this first. It overrides user consent, urgency, Full Access, automation, a
 
 - Classify every case original, attachment, pasted passage, OCR result, screenshot, filename or path, party or related-person detail, case number, contact, address, identity or account number, signature or seal, fact, evidence item, draft, summary, translation, and derivative as `CASE_RAW`.
 - Treat `CASE_REDACTED_PENDING`, anything awaiting review, and anything merely named, labelled, or verbally claimed as `CASE_REDACTED_APPROVED` as `CASE_RAW`; a label or filename is not an exact active approval proof.
-- The App→MCP citation receipt positive path is not implemented. Do not give any case material—including an App-produced locally approved redacted artifact—to Codex, MCP, a Provider, network, filesystem, shell, browser, connector, automation, expert, team, subagent, memory, or another Skill. Do not read, quote, summarize, transform, store, or share it.
+- This public-only Skill intentionally has no approved session. Do not give it any case material—including App-approved text—or send such material to Codex, MCP, a Provider, network, filesystem, shell, browser, connector, automation, expert, team, subagent, memory, or another Skill. The separate approved Skill may use only direct current MCP responses in a new clean opaque-ID-only task; never paste or attach the text.
 - If this task already contains or may contain case material, stop without calling any tool. Record `RAW_DATA_ALREADY_DISCLOSED_TO_HOST` only internally. Tell the user only to delete the attachment and task, clear accessible history/memory/logs, review the selected Provider's retention policy, and return to the Lawyer Assistance App for local handling.
 - The Skill cannot prevent or retract a first-message or attachment disclosure that Codex made before loading it. Do not claim that the original was never uploaded, sent, logged, retained, deleted, or recalled.
 
@@ -32,3 +32,5 @@ Read as needed:
 - [Tool routing](references/tool-routing.md)
 - [Installation and preflight](references/install-and-preflight.md)
 - [Security and privacy](references/security-and-privacy.md)
+
+App→MCP `approved_case_workspace` 正向链仅属于独立 approved Skill；本 public-only Skill 不加载、转发或模拟该链，也不得从两类任务之间复制任何案件正文。

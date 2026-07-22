@@ -473,6 +473,12 @@ fn validate_profile(profile: &ProviderProfile) -> Result<(), ProviderError> {
         "profile.credentialAccountId",
         &profile.credential_account_id,
     )?;
+    if profile.id.starts_with("internal-provider-qualification-") {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidProfile,
+            "the internal Provider qualification namespace is reserved",
+        ));
+    }
     validation::required_text(
         "profile.displayName",
         &profile.display_name,
@@ -1492,6 +1498,14 @@ mod tests {
             panic!("connection command must call the provider test boundary")
         }
 
+        fn send_approved_chat(
+            &self,
+            _profile: &ProviderProfile,
+            _secret: &ApiSecret,
+            _request: &providers::ApprovedChatRequest,
+        ) -> Result<providers::TransportResponse, ProviderError> {
+            panic!("connection command must not call approved Provider transport")
+        }
         fn send_chat_with_cancellation(
             &self,
             _profile: &ProviderProfile,
@@ -1502,6 +1516,15 @@ mod tests {
             panic!("connection command must call the provider test boundary")
         }
 
+        fn send_approved_chat_with_cancellation(
+            &self,
+            _profile: &ProviderProfile,
+            _secret: &ApiSecret,
+            _request: &providers::ApprovedChatRequest,
+            _cancellation: &providers::RequestCancellation,
+        ) -> Result<providers::TransportResponse, ProviderError> {
+            panic!("connection command must not call approved Provider transport")
+        }
         fn test_connection(
             &self,
             _profile: &ProviderProfile,

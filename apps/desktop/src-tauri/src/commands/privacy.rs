@@ -1,7 +1,9 @@
+use crate::mcp_manager::McpManager;
 use crate::privacy_manager::{
-    LocalOcrStatus, PrivacyConfig, PrivacyConfigurationSnapshot, PrivacyManager,
-    PrivacyManagerError, PrivacyVNextCapabilityMatrix,
+    LocalMineruDiscoveryResult, LocalOcrStatus, PrivacyConfig, PrivacyConfigurationSnapshot,
+    PrivacyManager, PrivacyManagerError, PrivacyVNextCapabilityMatrix,
 };
+use crate::privacy_qualification::TrustInstallationStatus;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -32,6 +34,14 @@ pub struct SavePrivacyConfigRequest {
 pub struct InspectLocalMineruQualificationReportRequest {
     pub report_json: String,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunLocalMineruQualificationRequest {
+    pub ttl_seconds: u64,
+    pub production_case_ocr_authorized: bool,
+    pub app_auto_enable_authorized: bool,
+}
 #[tauri::command]
 pub async fn get_privacy_config(
     manager: State<'_, PrivacyManager>,
@@ -59,6 +69,92 @@ pub async fn save_privacy_config(
             message: "隐私配置保存任务未完成。".to_owned(),
         })?
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn discover_local_mineru(
+    manager: State<'_, PrivacyManager>,
+) -> Result<LocalMineruDiscoveryResult, IpcError> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.discover_local_mineru())
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "本机 MinerU 自动发现任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn install_local_mineru_trust(
+    manager: State<'_, PrivacyManager>,
+) -> Result<TrustInstallationStatus, IpcError> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.install_local_mineru_trust())
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "Local MinerU trust installation did not complete.".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn install_local_mineru_network_isolation(
+    manager: State<'_, PrivacyManager>,
+) -> Result<PrivacyConfigurationSnapshot, IpcError> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.install_local_mineru_network_isolation())
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "Local MinerU network isolation installation did not complete.".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn run_local_mineru_qualification(
+    manager: State<'_, PrivacyManager>,
+    request: RunLocalMineruQualificationRequest,
+) -> Result<PrivacyConfigurationSnapshot, IpcError> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.run_local_mineru_qualification(
+            request.ttl_seconds,
+            request.production_case_ocr_authorized,
+            request.app_auto_enable_authorized,
+        )
+    })
+    .await
+    .map_err(|_| IpcError {
+        error_type: "runtime_failure".to_owned(),
+        message: "Local MinerU qualification did not complete.".to_owned(),
+    })?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn revoke_local_mineru_qualification(
+    manager: State<'_, PrivacyManager>,
+    mcp: State<'_, McpManager>,
+) -> Result<PrivacyConfigurationSnapshot, IpcError> {
+    let manager = manager.inner().clone();
+    let mcp = mcp.inner().clone();
+    let snapshot =
+        tauri::async_runtime::spawn_blocking(move || manager.revoke_local_mineru_qualification())
+            .await
+            .map_err(|_| IpcError {
+                error_type: "runtime_failure".to_owned(),
+                message: "Local MinerU qualification revocation did not complete.".to_owned(),
+            })?
+            .map_err(IpcError::from)?;
+    mcp.revoke_active_approved_tickets()
+        .map_err(|error| IpcError {
+            error_type: error.code().to_owned(),
+            message: providers::redact_sensitive(error.message()),
+        })?;
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -95,7 +191,8 @@ pub async fn get_local_ocr_status(
         .map_err(|_| IpcError {
             error_type: "runtime_failure".to_owned(),
             message: "本地 OCR 状态检查任务未完成。".to_owned(),
-        })
+        })?
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -113,6 +210,8 @@ mod tests {
                     "mode": "off",
                     "workerPath": null,
                     "modelDirectory": null,
+                    "toolsConfigPath": null,
+                    "runtimeExecutablePaths": [],
                     "device": "auto",
                     "languages": ["zh", "en"],
                     "timeoutSeconds": 300,
@@ -158,6 +257,14 @@ mod tests {
                 model_directory_present: false,
                 integrity_verified: false,
                 network_isolation_verified: false,
+                worker_protocol_version: None,
+                worker_protocol_identity_sha256: None,
+                worker_health_evidence_sha256: None,
+                python_version: None,
+                mineru_version: None,
+                pytorch_version: None,
+                cuda_runtime_version: None,
+                gpu_driver_version: None,
             },
             qualification,
             capabilities,
@@ -174,7 +281,6 @@ mod tests {
         assert_eq!(value["qualification"]["productionCaseOcrAuthorized"], false);
         assert_eq!(value["capabilities"]["scannedCaseOcrEnabled"], false);
         assert_eq!(value["capabilities"]["automaticApprovalEnabled"], false);
-        assert_eq!(value["capabilities"]["approvedCaseMcpEnabled"], false);
         assert_eq!(value["config"]["ocr"]["forbidCloudFallback"], true);
         assert_eq!(value["config"]["ocr"]["forbidRemoteUpload"], true);
         assert_eq!(value["config"]["ocr"]["forbidTelemetry"], true);

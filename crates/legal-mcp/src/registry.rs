@@ -115,6 +115,17 @@ impl ToolRegistry {
         if profile == PrivacyProfile::ApprovedCaseWorkspace {
             candidates.extend(approved_workspace::build_tools());
         }
+        Self::from_candidates(profile, candidates)
+    }
+
+    pub fn for_standalone_approved() -> Self {
+        let profile = PrivacyProfile::ApprovedCaseWorkspace;
+        let mut candidates = build_tools(profile);
+        candidates.extend(approved_workspace::build_host_tools());
+        Self::from_candidates(profile, candidates)
+    }
+
+    fn from_candidates(profile: PrivacyProfile, candidates: Vec<Tool>) -> Self {
         let tools = candidates
             .into_iter()
             .filter(|tool| profile.allows_tool(tool.name.as_ref()))
@@ -911,6 +922,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn standalone_approved_registry_exposes_business_schemas_without_ticket_fields() {
+        let registry = ToolRegistry::for_standalone_approved();
+        assert_eq!(
+            registry
+                .list()
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES
+        );
+        for name in approved_workspace::APPROVED_CASE_WORKSPACE_TOOL_NAMES {
+            let tool = registry.get(name).expect("standalone approved tool");
+            let schema = serde_json::to_string(&tool.input_schema).expect("host schema JSON");
+            assert!(!schema.contains("access_ticket"), "{name}");
+        }
+    }
     #[test]
     fn registry_is_fixed_and_strict() {
         let registry = ToolRegistry::new();
