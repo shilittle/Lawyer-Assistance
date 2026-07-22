@@ -27,7 +27,7 @@ pub const LOCAL_NER_DETECTOR_VERSION: &str = "privacy-local-linear-chain-ner-v1"
 pub const LOCAL_NER_MODEL_VERSION: &str = "cn-legal-linear-chain-ner-2026.07.1";
 pub const LOCAL_NER_MODEL_SCHEMA_VERSION: &str = "lawyer-assistance-local-ner-model-v1";
 pub const LOCAL_NER_MODEL_ASSET_SHA256: &str =
-    "60c1112bc85a41af897de78ee88b713fbf55064e5dcb59321e8f36b01c36cfd5";
+    "000260a4f95bfd1923d19d69988d724c4725c9029d705cef99d7fd38fc252d9e";
 pub const LOCAL_NER_MODEL_MANIFEST_SHA256: &str =
     "7f5eb5c36445f8f618dd0c978bfb56229252d8b8a329ac619be32291e108409d";
 

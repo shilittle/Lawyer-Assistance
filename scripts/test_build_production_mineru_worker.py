@@ -1,6 +1,10 @@
 import base64
 import hashlib
+import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,12 +20,41 @@ class ProductionMineruBuilderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.repository_root = self.root / "repository"
+        (self.repository_root / "scripts").mkdir(parents=True)
+        shutil.copyfile(
+            Path(builder.__file__),
+            self.repository_root / "scripts/build_production_mineru_worker.py",
+        )
+        shutil.copytree(
+            Path(__file__).parents[1] / "workers/mineru",
+            self.repository_root / "workers/mineru",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        (self.repository_root / "LICENSE").write_text(
+            "Lawyer Assistance synthetic license\n", encoding="utf-8", newline="\n"
+        )
+        (self.repository_root / ".gitattributes").write_text(
+            "* -text\n", encoding="utf-8", newline="\n"
+        )
+        (self.repository_root / ".gitignore").write_text(
+            "*.ignored\n__pycache__/\n*.pyc\n", encoding="utf-8", newline="\n"
+        )
+        self._git("init", "--quiet")
+        self._git("config", "user.name", "Synthetic Builder Test")
+        self._git("config", "user.email", "builder-test@example.invalid")
+        self._git("add", "--all")
+        self._git("commit", "--quiet", "-m", "synthetic source fixture")
+        self.fixture_module_name = (
+            f"build_production_mineru_worker_fixture_{id(self):x}"
+        )
+        self.repo_builder = self._load_fixture_builder()
         self.python_home = self.root / "cpython"
         self.site_packages = self.root / "environment/Lib/site-packages"
         self.pipeline = self.root / "models/pipeline"
         self.vlm = self.root / "models/vlm"
-        self.worker_source = Path(__file__).parents[1] / "workers/mineru"
-        self.repository_license = self.root / "LICENSE"
+        self.worker_source = self.repository_root / "workers/mineru"
+        self.repository_license = self.repository_root / "LICENSE"
         for directory in (
             self.python_home / "Lib/email/mime",
             self.python_home / "Lib/site-packages",
@@ -56,18 +89,18 @@ class ProductionMineruBuilderTests(unittest.TestCase):
         (self.site_packages / "empty_package/__pycache__").mkdir()
         (self.site_packages / "empty_package/__pycache__/bad.pyc").write_bytes(b"bytecode")
 
-        for name, version in builder.REQUIRED_DISTRIBUTIONS.items():
+        for name, version in self.repo_builder.REQUIRED_DISTRIBUTIONS.items():
             dist = self.site_packages / f"{name.replace('-', '_')}-{version}.dist-info"
             dist.mkdir()
             requirements = ""
             if name == "mineru":
                 requirements = "".join(
                     f"Requires-Dist: {dependency}=={dependency_version}\n"
-                    for dependency, dependency_version in builder.REQUIRED_DISTRIBUTIONS.items()
+                    for dependency, dependency_version in self.repo_builder.REQUIRED_DISTRIBUTIONS.items()
                     if dependency != "mineru"
                 )
             license_metadata = (
-                f"License-Expression: {builder.MINERU_LICENSE_ID}\n"
+                f"License-Expression: {self.repo_builder.MINERU_LICENSE_ID}\n"
                 if name == "mineru"
                 else "License: Synthetic Test License\n"
             )
@@ -94,39 +127,79 @@ class ProductionMineruBuilderTests(unittest.TestCase):
                 listed.append(f"{relative},sha256={digest.decode('ascii')},{len(payload)}")
             listed.append(f"{dist.name}/RECORD,,")
             (dist / "RECORD").write_text("\n".join(listed) + "\n", encoding="utf-8")
-        for relative in builder.QUALIFIED_MODELS["pipeline"]["files"]:
+        for relative in self.repo_builder.QUALIFIED_MODELS["pipeline"]["files"]:
             path = self.pipeline / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"pipeline:{relative}".encode("utf-8"))
-        for relative in builder.QUALIFIED_MODELS["vlm"]["files"]:
+        for relative in self.repo_builder.QUALIFIED_MODELS["vlm"]["files"]:
             path = self.vlm / relative
             path.write_bytes(f"vlm:{relative}".encode("utf-8"))
-        self.repository_license.write_text("Lawyer Assistance synthetic license", encoding="utf-8")
-        self.identity = builder.RuntimeIdentity(
-            python_version=builder.CPYTHON_VERSION,
+        self.identity = self.repo_builder.RuntimeIdentity(
+            python_version=self.repo_builder.CPYTHON_VERSION,
             architecture="windows-x86_64",
             distributions=tuple(
                 sorted(
-                    (builder.canonical_distribution_name(name), version)
-                    for name, version in builder.REQUIRED_DISTRIBUTIONS.items()
+                    (self.repo_builder.canonical_distribution_name(name), version)
+                    for name, version in self.repo_builder.REQUIRED_DISTRIBUTIONS.items()
                 )
             ),
         )
 
+    def _git(self, *arguments: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repository_root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+
+    def _git_bytes(self, *arguments: str) -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(self.repository_root), *arguments],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        ).stdout
+
+    def _load_fixture_builder(self, path: Path | None = None):
+        source = path or self.repository_root / "scripts/build_production_mineru_worker.py"
+        name = self.fixture_module_name if path is None else f"{self.fixture_module_name}_external"
+        spec = importlib.util.spec_from_file_location(name, source)
+        if spec is None or spec.loader is None:
+            self.fail("could not load the synthetic builder module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def _source_binding(self):
+        return self.repo_builder._repository_source_binding(
+            self.repository_root,
+            self.worker_source,
+            self.repository_license,
+        )
+
     def tearDown(self) -> None:
+        for name in tuple(sys.modules):
+            if name.startswith(self.fixture_module_name):
+                sys.modules.pop(name, None)
         self.temporary.cleanup()
 
     def build_stage(self, name: str = "stage"):
-        selected = builder.resolve_runtime_distributions(self.site_packages)
+        active_builder = self.repo_builder
+        selected = active_builder.resolve_runtime_distributions(self.site_packages)
         measurements = tuple(
-            builder.measure_distribution(self.site_packages, item) for item in selected
+            active_builder.measure_distribution(self.site_packages, item) for item in selected
         )
-        cpython_hash, cpython_records = builder.measure_cpython(self.python_home)
-        commit = "1" * 40
-        script_hash, _ = builder.sha256_file(Path(builder.__file__))
+        cpython_hash, cpython_records = active_builder.measure_cpython(self.python_home)
+        commit = self._git("rev-parse", "HEAD")
+        source_binding = active_builder._repository_source_binding(
+            self.repository_root, self.worker_source, self.repository_license
+        )
         provenance = {
-            "schemaVersion": builder.PROVENANCE_SCHEMA_VERSION,
-            "provenanceVersion": builder.PROVENANCE_INPUT_VERSION,
+            "schemaVersion": active_builder.PROVENANCE_SCHEMA_VERSION,
+            "provenanceVersion": active_builder.PROVENANCE_INPUT_VERSION,
             "approval": {
                 "approvedForRedistribution": True,
                 "reviewer": "synthetic-test-reviewer",
@@ -134,11 +207,11 @@ class ProductionMineruBuilderTests(unittest.TestCase):
             },
             "source": {
                 "repositoryCommit": commit,
-                "buildScriptSha256": script_hash,
-                "workerSourceTreeSha256": builder.measure_worker_source(self.worker_source),
+                "buildScriptSha256": source_binding.build_script_sha256,
+                "workerSourceTreeSha256": source_binding.worker_source_tree_sha256,
             },
             "cpython": {
-                "version": builder.CPYTHON_VERSION,
+                "version": active_builder.CPYTHON_VERSION,
                 "sourceUrl": "https://www.python.org/ftp/python/3.12.13/python-3.12.13-embed-amd64.zip",
                 "contentSha256": cpython_hash,
                 "license": "PSF-2.0",
@@ -151,7 +224,7 @@ class ProductionMineruBuilderTests(unittest.TestCase):
             "runtimeProfile": {
                 "platform": "windows-x86_64",
                 "rootDistribution": "mineru==3.4.3",
-                "extras": list(builder.MINERU_RUNTIME_EXTRAS),
+                "extras": list(active_builder.MINERU_RUNTIME_EXTRAS),
             },
             "distributions": [
                 {
@@ -161,8 +234,8 @@ class ProductionMineruBuilderTests(unittest.TestCase):
                     "sourceUrl": item.source_urls[0],
                     "license": item.license_declaration,
                     "licenseEvidenceKind": item.license_evidence_kind,
-                    "licenseFiles": builder._file_records_json(item.license_files),
-                    "installationRecord": builder._file_records_json(
+                    "licenseFiles": active_builder._file_records_json(item.license_files),
+                    "installationRecord": active_builder._file_records_json(
                         (item.installation_record,)
                     )[0],
                     "upstreamArtifact": dict(item.upstream_artifact)
@@ -174,31 +247,31 @@ class ProductionMineruBuilderTests(unittest.TestCase):
             "models": [
                 {
                     "root": root,
-                    "name": builder.QUALIFIED_MODELS[root]["name"],
-                    "revision": builder.QUALIFIED_MODELS[root]["revision"],
+                    "name": active_builder.QUALIFIED_MODELS[root]["name"],
+                    "revision": active_builder.QUALIFIED_MODELS[root]["revision"],
                     "sourceUrl": (
-                        f"https://huggingface.co/{builder.QUALIFIED_MODELS[root]['name']}"
-                        f"/tree/{builder.QUALIFIED_MODELS[root]['revision']}"
+                        f"https://huggingface.co/{active_builder.QUALIFIED_MODELS[root]['name']}"
+                        f"/tree/{active_builder.QUALIFIED_MODELS[root]['revision']}"
                     ),
-                    "license": builder.QUALIFIED_MODELS[root]["license"],
+                    "license": active_builder.QUALIFIED_MODELS[root]["license"],
                     "licenseEvidenceUrl": (
-                        f"https://huggingface.co/{builder.QUALIFIED_MODELS[root]['name']}"
-                        f"/blob/{builder.QUALIFIED_MODELS[root]['revision']}/README.md"
+                        f"https://huggingface.co/{active_builder.QUALIFIED_MODELS[root]['name']}"
+                        f"/blob/{active_builder.QUALIFIED_MODELS[root]['revision']}/README.md"
                     ),
-                    "licenseEvidenceSha256": builder.QUALIFIED_MODELS[root][
+                    "licenseEvidenceSha256": active_builder.QUALIFIED_MODELS[root][
                         "license_evidence_sha256"
                     ],
-                    "files": builder._file_records_json(builder.inventory_tree(model)),
+                    "files": active_builder._file_records_json(active_builder.inventory_tree(model)),
                 }
                 for root, model in (("pipeline", self.pipeline), ("vlm", self.vlm))
             ],
         }
         provenance_input = self.root / f"{name}-provenance-input.json"
-        provenance_input.write_bytes(builder.canonical_json(provenance))
+        provenance_input.write_bytes(active_builder.canonical_json(provenance))
         with mock.patch.object(
-            builder, "probe_runtime_identity", return_value=self.identity
-        ), mock.patch.object(builder, "_repository_identity", return_value=commit):
-            return builder.build_self_contained_stage(
+            active_builder, "probe_runtime_identity", return_value=self.identity
+        ):
+            return active_builder.build_self_contained_stage(
                 python_home=self.python_home,
                 site_packages=self.site_packages,
                 pipeline_model=self.pipeline,
@@ -206,7 +279,7 @@ class ProductionMineruBuilderTests(unittest.TestCase):
                 worker_source=self.worker_source,
                 repository_license=self.repository_license,
                 provenance_input=provenance_input,
-                repository_root=self.root,
+                repository_root=self.repository_root,
                 output=self.root / name,
             )
 
@@ -306,18 +379,160 @@ class ProductionMineruBuilderTests(unittest.TestCase):
 
     def test_output_is_create_new_and_failed_stage_is_cleaned(self) -> None:
         self.build_stage("existing")
-        with self.assertRaises(builder.BuildFailure) as failure:
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
             self.build_stage("existing")
         self.assertEqual(failure.exception.code, "output_exists")
-        original = builder._copy_tree
+        original = self.repo_builder._copy_tree
         with mock.patch.object(
-            builder, "_copy_tree", side_effect=builder.BuildFailure("synthetic_copy_failure")
+            self.repo_builder,
+            "_copy_tree",
+            side_effect=self.repo_builder.BuildFailure("synthetic_copy_failure"),
         ):
-            with self.assertRaises(builder.BuildFailure):
+            with self.assertRaises(self.repo_builder.BuildFailure):
                 self.build_stage("failed")
         self.assertIsNotNone(original)
         self.assertFalse((self.root / "failed").exists())
         self.assertFalse(any(self.root.glob(".failed.incoming-*")))
+
+    def test_repository_source_binding_accepts_only_clean_head_bytes(self) -> None:
+        binding = self._source_binding()
+        builder_head = self._git_bytes(
+            "show", "HEAD:scripts/build_production_mineru_worker.py"
+        )
+        license_head = self._git_bytes("show", "HEAD:LICENSE")
+        self.assertEqual(binding.repository_commit, self._git("rev-parse", "HEAD"))
+        self.assertEqual(
+            binding.build_script_sha256,
+            self.repo_builder.sha256_bytes(builder_head),
+        )
+        self.assertEqual(
+            binding.worker_source_tree_sha256,
+            self.repo_builder.measure_worker_source(self.worker_source),
+        )
+        self.assertEqual(
+            binding.repository_license,
+            self.repo_builder.FileRecord(
+                "licenses/lawyer-assistance/LICENSE.txt",
+                len(license_head),
+                self.repo_builder.sha256_bytes(license_head),
+            ),
+        )
+
+    def test_repository_source_binding_rejects_tracked_drift(self) -> None:
+        target = self.worker_source / "lawyer_assistance_mineru_worker/main.py"
+        target.write_bytes(target.read_bytes() + b"\n# tracked drift\n")
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self._source_binding()
+        self.assertEqual(failure.exception.code, "repository_not_clean")
+
+    def test_repository_source_binding_checks_head_bytes_after_status_bypass(self) -> None:
+        relative = "workers/mineru/lawyer_assistance_mineru_worker/main.py"
+        self._git("update-index", "--assume-unchanged", "--", relative)
+        target = self.repository_root / relative
+        target.write_bytes(target.read_bytes() + b"\n# hidden drift\n")
+        self.assertEqual(
+            self._git("status", "--porcelain=v1", "--untracked-files=all"), ""
+        )
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self._source_binding()
+        self.assertEqual(failure.exception.code, "repository_source_bytes_changed")
+
+    def test_repository_source_binding_rejects_untracked_and_ignored_extras(self) -> None:
+        package = self.worker_source / "lawyer_assistance_mineru_worker"
+        untracked = package / "untracked-source.py"
+        untracked.write_text("unexpected = True\n", encoding="utf-8", newline="\n")
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self._source_binding()
+        self.assertEqual(failure.exception.code, "repository_not_clean")
+        untracked.unlink()
+
+        ignored = package / "shadow.ignored"
+        ignored.write_text("ignored but unsafe\n", encoding="utf-8", newline="\n")
+        self.assertEqual(
+            self._git("status", "--porcelain=v1", "--untracked-files=all"), ""
+        )
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self._source_binding()
+        self.assertEqual(
+            failure.exception.code, "repository_source_inventory_changed"
+        )
+
+    def test_repository_source_binding_rejects_outside_worker_and_license(self) -> None:
+        outside_worker = self.root / "outside-worker"
+        shutil.copytree(self.worker_source, outside_worker)
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self.repo_builder._repository_source_binding(
+                self.repository_root,
+                outside_worker,
+                self.repository_license,
+            )
+        self.assertEqual(failure.exception.code, "repository_source_path_invalid")
+
+        outside_license = self.root / "outside-LICENSE"
+        shutil.copyfile(self.repository_license, outside_license)
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self.repo_builder._repository_source_binding(
+                self.repository_root,
+                self.worker_source,
+                outside_license,
+            )
+        self.assertEqual(failure.exception.code, "repository_source_path_invalid")
+
+    def test_repository_source_binding_rejects_outside_executing_builder(self) -> None:
+        outside_builder = self.root / "external-builder.py"
+        shutil.copyfile(
+            self.repository_root / "scripts/build_production_mineru_worker.py",
+            outside_builder,
+        )
+        external_module = self._load_fixture_builder(outside_builder)
+        with self.assertRaises(external_module.BuildFailure) as failure:
+            external_module._repository_source_binding(
+                self.repository_root,
+                self.worker_source,
+                self.repository_license,
+            )
+        self.assertEqual(failure.exception.code, "repository_source_path_invalid")
+
+    def test_repository_source_binding_rejects_hidden_builder_replacement(self) -> None:
+        relative = "scripts/build_production_mineru_worker.py"
+        self._git("update-index", "--assume-unchanged", "--", relative)
+        target = self.repository_root / relative
+        target.write_bytes(target.read_bytes() + b"\n# replacement\n")
+        self.assertEqual(
+            self._git("status", "--porcelain=v1", "--untracked-files=all"), ""
+        )
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self._source_binding()
+        self.assertEqual(failure.exception.code, "repository_source_bytes_changed")
+
+    def test_repository_source_binding_rejects_hidden_license_replacement(self) -> None:
+        self._git("update-index", "--assume-unchanged", "--", "LICENSE")
+        self.repository_license.write_bytes(
+            self.repository_license.read_bytes() + b"replacement\n"
+        )
+        self.assertEqual(
+            self._git("status", "--porcelain=v1", "--untracked-files=all"), ""
+        )
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self._source_binding()
+        self.assertEqual(failure.exception.code, "repository_source_bytes_changed")
+
+    def test_repository_source_binding_rejects_ignored_symlink_reparse(self) -> None:
+        link = (
+            self.worker_source
+            / "lawyer_assistance_mineru_worker"
+            / "unsafe-link.ignored"
+        )
+        try:
+            os.symlink(self.repository_license, link)
+        except (NotImplementedError, OSError) as error:
+            self.skipTest(f"symlink creation unavailable: {error}")
+        self.assertEqual(
+            self._git("status", "--porcelain=v1", "--untracked-files=all"), ""
+        )
+        with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+            self._source_binding()
+        self.assertEqual(failure.exception.code, "filesystem_rejected")
 
     def test_provenance_approval_is_explicit_canonical_and_create_new(self) -> None:
         draft = self.root / "approval-draft.json"

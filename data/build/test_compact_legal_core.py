@@ -105,6 +105,30 @@ class CompactLegalCoreTests(unittest.TestCase):
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return payload
 
+    def test_checked_in_runtime_evidence_binds_archival_manifest_bytes(self) -> None:
+        generated = ROOT / "data" / "generated"
+        archival_manifest = generated / "legal_core_full_manifest.json"
+        distribution = json.loads(
+            (generated / "legal_core_distribution_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        runtime_report = json.loads(
+            (generated / "legal_core_runtime_report.json").read_text(encoding="utf-8")
+        )
+        archival_manifest_sha256 = compact.sha256_file(archival_manifest)
+
+        self.assertEqual(
+            distribution["archival_manifest_filename"], archival_manifest.name
+        )
+        self.assertEqual(
+            distribution["archival_manifest_sha256"], archival_manifest_sha256
+        )
+        self.assertEqual(
+            runtime_report["archival_manifest"]["sha256"],
+            archival_manifest_sha256,
+        )
+
     def test_builds_verified_contentless_deduplicated_runtime_database(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

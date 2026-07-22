@@ -1,7 +1,7 @@
 LAWYER ASSISTANCE THIRD-PARTY SOFTWARE NOTICES
 
 This file is generated from the exact Rust/JavaScript installations and reviewed bundled assets.
-Cargo.lock SHA-256: 6334813bb338904e9a4e101af028065bd78f0a7b4631c41c1a5f33d8682bf3c2
+Cargo.lock SHA-256: db5c16687d92867e130b3a2657f7e4c3999bb118f062237666b4785b4f4f6986
 pnpm-lock.yaml SHA-256: 0fb82acfb6b20715a3a421291be35b74fd300075e46e095d0fc14de814269c34
 Components: 544; unique bundled notice texts: 304
 

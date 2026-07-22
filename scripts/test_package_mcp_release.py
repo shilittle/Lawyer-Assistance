@@ -179,7 +179,7 @@ Fixture limits.
             (root / "integrations" / ".DS_Store").write_bytes(b"machine-local-metadata")
             canary_test = root / "integrations" / "test_release_canary.py"
             canary_test.write_text(
-                'SECRET = "Bearer abcdefghijklmnop-1234"\nRAW_CASE_CANARY = True\n',
+                'SECRET = "Bearer not-a-real-abcdefghijklmnop-1234"\nRAW_CASE_CANARY = True\n',
                 encoding="utf-8",
             )
             paths = {
@@ -197,7 +197,7 @@ Fixture limits.
     def test_high_confidence_secret_session_and_case_canary_content_is_rejected(self) -> None:
         samples = {
             "private-key": b"-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n",
-            "bearer": b"Authorization: Bearer abcdefghijklmnop-1234\n",
+            "bearer": b"Authorization: Bearer not-a-real-abcdefghijklmnop-1234\n",
             "prefixed-token": b"access_token=ghp_1234567890abcdefghijklmnop\n",
             "session": b"session=srv_0123456789abcdef0123456789abcdef\n",
             "case-canary": b"RAW_CASE_CANARY\n",

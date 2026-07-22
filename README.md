@@ -216,10 +216,17 @@ pnpm test
 pnpm build
 python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
 python data/build/audit_provider_security.py
+python -m unittest discover -s workers/mineru/tests -t workers/mineru -p "test_*.py" -v
+python -m unittest scripts.test_build_production_mineru_worker scripts.test_build_mineru_component_package
+python -m unittest integrations.test_validate_examples integrations.test_validate_approved_workspace_examples
+python integrations/validate_examples.py
+python integrations/validate_approved_workspace_examples.py
 python apps/desktop/scripts/verify_legal_resource.py
 python -m unittest scripts.test_generate_third_party_notices
 python scripts/generate_third_party_notices.py --check
 python -m unittest scripts.test_package_mcp_release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_qualify_local_mineru.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-standalone-approved-mcp.ps1
 ```
 
 Run the repeatable Provider secret/logging audit:

@@ -52,6 +52,15 @@ jobs:
       - name: Test all data build and audit tools
         run: python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
 
+      - name: Test local MinerU worker and release builders
+        run: |
+          python -m unittest discover -s workers/mineru/tests -t workers/mineru -p "test_*.py" -v
+          python -m unittest scripts.test_build_production_mineru_worker scripts.test_build_mineru_component_package -v
+
+      - name: Test local MinerU qualification harness
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_qualify_local_mineru.ps1
+
       - name: Audit provider secrets and sensitive logging
         run: python data/build/audit_provider_security.py
 
@@ -345,10 +354,14 @@ jobs:
         run: powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_filename_mapping.ps1
 
       - name: Lint Rust
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Test Rust
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Test the actual approved-workspace MCP binary over stdio and HTTP
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-standalone-approved-mcp.ps1
 
       - name: Verify complete third-party notices
         run: |

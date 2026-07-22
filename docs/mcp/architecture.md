@@ -38,7 +38,7 @@
 
 带可靠文本层的本地 PDF 原生提取；需要视觉解析的页面在当前签名资格有效时由 App 传入受信本地 MinerU runner。完整 worker/config/runtime/model inventory、Windows Firewall ActiveStore、启动前后身份、进程树、页完整性与输出边界均复核。final installed component path 还受 259 UTF-16 code units 上限约束，以避开当前原生依赖的长路径导入缺陷。资格缺失或漂移时扫描/视觉 PDF fail closed；不存在 SSH/云 OCR/模型下载回退。
 
-历史签名六分片 v3 与短根 v5 candidate 的 install/re-measure 和 RTX 5090 synthetic diagnostic 仅保留为工程证据，两者永久禁止发布。v4 provenance 源码门禁与 16/16 builder tests 已完成，但 clean commit A 后的确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 及 App Firewall/Job/canary/restart 资格尚未完成，因此不存在 final v4 artifact/hash。两次 UAC 取消意味着四项机器门仍为 `false`；历史 hash 或 Full Access 不能进入“qualified”分支。private Release 对未认证客户端不可达，当前不能声称组件可公开自动下载。
+历史签名六分片 v3 与短根 v5 candidate 的 install/re-measure 和 RTX 5090 synthetic diagnostic 仅保留为工程证据，两者永久禁止发布。v4 provenance 源码门禁与 25/25 builder tests 已完成，但 clean commit A 后的确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 及 App Firewall/Job/canary/restart 资格尚未完成，因此不存在 final v4 artifact/hash。两次 UAC 取消意味着四项机器门仍为 `false`；历史 hash 或 Full Access 不能进入“qualified”分支。private Release 对未认证客户端不可达，当前不能声称组件可公开自动下载。
 
 ## 演进规则
 

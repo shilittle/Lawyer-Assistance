@@ -36,7 +36,8 @@ support-integrity verification is never bypassed.
 Run unit tests without OCR material:
 
 ```powershell
-python -m unittest discover workers/mineru/tests -v
+python -m unittest discover -s workers/mineru/tests -t workers/mineru -p "test_*.py" -v
+python -m unittest scripts.test_build_production_mineru_worker scripts.test_build_mineru_component_package -v
 ```
 
 Run the real local synthetic probe after staging a development launcher:
@@ -64,12 +65,19 @@ only counts, hashes, timings, page confidence, and warning codes (including
 
 Build the self-contained, still-unsigned production staging tree:
 
+The provenance input below must first be created with `provenance-draft`,
+reviewed, and converted exactly once with `provenance-approve`. The draft and
+stage commands bind the clean repository `HEAD`, the checked-in builder,
+worker sources, and repository license; replacements or extra source files are
+rejected.
+
 ```powershell
 python scripts/build_production_mineru_worker.py stage `
   --python-home C:\path\to\cpython-3.12.13 `
   --site-packages C:\path\to\mineru\Lib\site-packages `
   --pipeline-model C:\path\to\models\pipeline `
   --vlm-model C:\path\to\models\vlm `
+  --provenance-input C:\path\to\approved-provenance.json `
   --output C:\fixed-local-disk\mineru-production-stage
 ```
 

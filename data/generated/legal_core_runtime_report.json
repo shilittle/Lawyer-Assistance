@@ -29,7 +29,7 @@
   "source_revalidated_after_compaction": true,
   "archival_manifest": {
     "path": "<WORKSPACE>/data\\generated\\legal_core_full_manifest.json",
-    "sha256": "dc7c350c7c681da073a3a43f48866b5bcf5a0cdb740ed86565f4270a10c5d824",
+    "sha256": "f159820e11f8869c2d9355203c7720ef59943cc5645ef46a0591cf8d12bf3f16",
     "filename": "legal_core_full.sqlite"
   },
   "counts": {

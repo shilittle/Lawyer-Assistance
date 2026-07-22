@@ -17,7 +17,7 @@
   "archival_source_sha256": "31cf1995cc09f0e3e00f70bfcf20cf67548f1a6362706ccc11d1fd3b2ebc26ac",
   "archival_source_size_bytes": 4512894976,
   "archival_manifest_filename": "legal_core_full_manifest.json",
-  "archival_manifest_sha256": "dc7c350c7c681da073a3a43f48866b5bcf5a0cdb740ed86565f4270a10c5d824",
+  "archival_manifest_sha256": "f159820e11f8869c2d9355203c7720ef59943cc5645ef46a0591cf8d12bf3f16",
   "source_verification": "trusted_archival_manifest",
   "source_revalidated_after_compaction": true,
   "counts": {

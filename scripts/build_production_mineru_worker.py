@@ -236,6 +236,15 @@ class DistributionMeasurement:
     content_sha256: str
 
 
+@dataclass(frozen=True)
+class RepositorySourceBinding:
+    repository_commit: str
+    build_script_sha256: str
+    worker_source_tree_sha256: str
+    worker_stage_files: tuple[FileRecord, ...]
+    repository_license: FileRecord
+
+
 def canonical_json(value: object) -> bytes:
     return json.dumps(
         value,
@@ -818,47 +827,193 @@ def _validate_official_url(value: object, code: str) -> str:
     return value
 
 
-def _repository_identity(repository_root: Path, *, require_clean: bool = True) -> str:
-    root = validate_local_path(repository_root, directory=True)
-    environment = {
+def _git_environment() -> dict[str, str]:
+    return {
         "SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"),
         "WINDIR": os.environ.get("WINDIR", r"C:\Windows"),
         "PATH": os.environ.get("PATH", ""),
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
+
+
+def _git_output(root: Path, arguments: Sequence[str]) -> bytes:
+    environment = {
+        **_git_environment(),
+    }
     try:
-        top = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        return subprocess.run(
+            ["git", "-C", str(root), *arguments],
             check=True,
             capture_output=True,
-            text=True,
-            timeout=30,
-            env=environment,
-        ).stdout.strip()
-        commit = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=environment,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=no"],
-            check=True,
-            capture_output=True,
-            text=True,
             timeout=30,
             env=environment,
         ).stdout
     except (OSError, subprocess.SubprocessError) as error:
         raise BuildFailure("repository_identity_failed") from error
-    if Path(top).resolve(strict=True) != root or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+
+
+def _repository_identity(repository_root: Path) -> tuple[Path, str]:
+    root = validate_local_path(repository_root, directory=True)
+    try:
+        top = Path(
+            os.fsdecode(_git_output(root, ("rev-parse", "--show-toplevel"))).strip()
+        ).resolve(strict=True)
+        commit = _git_output(root, ("rev-parse", "HEAD")).decode("ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise BuildFailure("repository_identity_invalid") from error
+    if top != root or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         raise BuildFailure("repository_identity_invalid")
-    if require_clean and dirty:
+    dirty = _git_output(
+        root,
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+    )
+    if dirty:
         raise BuildFailure("repository_not_clean")
-    return commit
+    return root, commit
+
+
+def _head_tree(root: Path, pathspec: str) -> dict[str, tuple[str, str]]:
+    raw = _git_output(
+        root,
+        ("ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", pathspec),
+    )
+    entries: dict[str, tuple[str, str]] = {}
+    try:
+        records = raw.split(b"\0")
+        for record in records:
+            if not record:
+                continue
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, kind, object_id = metadata.decode("ascii").split(" ")
+            path = raw_path.decode("utf-8")
+            if (
+                kind != "blob"
+                or mode not in {"100644", "100755"}
+                or not re.fullmatch(r"[0-9a-f]{40,64}", object_id)
+                or path in entries
+            ):
+                raise ValueError("invalid tree entry")
+            entries[path] = (mode, object_id)
+    except (UnicodeError, ValueError) as error:
+        raise BuildFailure("repository_source_tree_invalid") from error
+    return entries
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.normpath(str(left))) == os.path.normcase(
+        os.path.normpath(str(right))
+    )
+
+
+def _head_file_record(
+    root: Path,
+    tree: Mapping[str, tuple[str, str]],
+    repository_path: str,
+    worktree_path: Path,
+    logical_path: str,
+) -> FileRecord:
+    entry = tree.get(repository_path)
+    if entry is None:
+        raise BuildFailure("repository_source_not_tracked")
+    resolved = validate_local_path(worktree_path, directory=False)
+    try:
+        head_bytes = _git_output(root, ("cat-file", "blob", entry[1]))
+        worktree_bytes = resolved.read_bytes()
+    except OSError as error:
+        raise BuildFailure("repository_source_read_failed") from error
+    if worktree_bytes != head_bytes:
+        raise BuildFailure("repository_source_bytes_changed")
+    return FileRecord(logical_path, len(head_bytes), sha256_bytes(head_bytes))
+
+
+def _repository_source_binding(
+    repository_root: Path,
+    worker_source: Path,
+    repository_license: Path,
+) -> RepositorySourceBinding:
+    root, commit = _repository_identity(repository_root)
+    expected_worker = validate_local_path(root / "workers" / "mineru", directory=True)
+    expected_builder = validate_local_path(
+        root / "scripts" / "build_production_mineru_worker.py", directory=False
+    )
+    expected_license = validate_local_path(root / "LICENSE", directory=False)
+    actual_worker = validate_local_path(worker_source, directory=True)
+    actual_builder = validate_local_path(Path(__file__), directory=False)
+    actual_license = validate_local_path(repository_license, directory=False)
+    if (
+        not _same_path(actual_worker, expected_worker)
+        or not _same_path(actual_builder, expected_builder)
+        or not _same_path(actual_license, expected_license)
+    ):
+        raise BuildFailure("repository_source_path_invalid")
+
+    worker_tree = _head_tree(root, "workers/mineru")
+    actual_worker_files: dict[str, Path] = {}
+    for relative, path, _metadata in _source_files(actual_worker):
+        repository_path = f"workers/mineru/{relative}"
+        if repository_path in actual_worker_files:
+            raise BuildFailure("repository_source_inventory_changed")
+        actual_worker_files[repository_path] = path
+    if set(actual_worker_files) != set(worker_tree):
+        raise BuildFailure("repository_source_inventory_changed")
+
+    stage_files: list[FileRecord] = []
+    launcher_path = "workers/mineru/launcher/sitecustomize.py"
+    if launcher_path not in actual_worker_files:
+        raise BuildFailure("repository_source_inventory_changed")
+    stage_files.append(
+        _head_file_record(
+            root,
+            worker_tree,
+            launcher_path,
+            actual_worker_files[launcher_path],
+            "worker/sitecustomize.py",
+        )
+    )
+    package_prefix = "workers/mineru/lawyer_assistance_mineru_worker/"
+    for repository_path in sorted(actual_worker_files):
+        if not repository_path.startswith(package_prefix):
+            continue
+        relative = repository_path.removeprefix(package_prefix)
+        if _skip_runtime_file(relative) is not None:
+            continue
+        stage_files.append(
+            _head_file_record(
+                root,
+                worker_tree,
+                repository_path,
+                actual_worker_files[repository_path],
+                f"worker/lawyer_assistance_mineru_worker/{relative}",
+            )
+        )
+    stage_files.sort(key=lambda item: item.relative_path)
+
+    builder_tree = _head_tree(root, "scripts/build_production_mineru_worker.py")
+    builder_record = _head_file_record(
+        root,
+        builder_tree,
+        "scripts/build_production_mineru_worker.py",
+        actual_builder,
+        "scripts/build_production_mineru_worker.py",
+    )
+    license_tree = _head_tree(root, "LICENSE")
+    license_record = _head_file_record(
+        root,
+        license_tree,
+        "LICENSE",
+        actual_license,
+        "licenses/lawyer-assistance/LICENSE.txt",
+    )
+    return RepositorySourceBinding(
+        repository_commit=commit,
+        build_script_sha256=builder_record.sha256,
+        worker_source_tree_sha256=_records_hash(
+            "la-mineru-worker-source-v1", stage_files
+        ),
+        worker_stage_files=tuple(stage_files),
+        repository_license=license_record,
+    )
 
 
 def _logical_source_records(
@@ -1034,11 +1189,13 @@ def validate_provenance_input(
     *,
     provenance_input: Path,
     repository_root: Path,
+    repository_license: Path,
     python_home: Path,
     worker_source: Path,
     distributions: Sequence[DistributionMeasurement],
     pipeline_records: Sequence[FileRecord],
     vlm_records: Sequence[FileRecord],
+    source_binding: RepositorySourceBinding | None = None,
 ) -> dict[str, object]:
     value, raw = _strict_json(provenance_input, "provenance_input_invalid")
     _require_fields(
@@ -1075,17 +1232,18 @@ def validate_provenance_input(
         or approval["reviewedAtUnix"] <= 0
     ):
         raise BuildFailure("provenance_approval_invalid")
-    repository_commit = _repository_identity(repository_root)
+    binding = source_binding or _repository_source_binding(
+        repository_root, worker_source, repository_license
+    )
     source = _require_fields(
         value["source"],
         {"repositoryCommit", "buildScriptSha256", "workerSourceTreeSha256"},
         "provenance_source_invalid",
     )
-    script_hash, _ = sha256_file(Path(__file__).resolve(strict=True))
     if source != {
-        "repositoryCommit": repository_commit,
-        "buildScriptSha256": script_hash,
-        "workerSourceTreeSha256": measure_worker_source(worker_source),
+        "repositoryCommit": binding.repository_commit,
+        "buildScriptSha256": binding.build_script_sha256,
+        "workerSourceTreeSha256": binding.worker_source_tree_sha256,
     }:
         raise BuildFailure("provenance_source_changed")
     cpython_hash, cpython_records = measure_cpython(python_home)
@@ -1186,8 +1344,9 @@ def write_provenance_draft(
     if cpython_license.strip().casefold() in UNKNOWN_LICENSE_VALUES:
         raise BuildFailure("cpython_provenance_invalid")
     cpython_hash, cpython_records = measure_cpython(python_home)
-    script_hash, _ = sha256_file(Path(__file__).resolve(strict=True))
-    repository_commit = _repository_identity(repository_root, require_clean=False)
+    source_binding = _repository_source_binding(
+        repository_root, worker_source, Path(repository_root) / "LICENSE"
+    )
     model_values: list[dict[str, object]] = []
     model_records = {
         "pipeline": _model_observation(pipeline),
@@ -1235,9 +1394,9 @@ def write_provenance_draft(
             "reviewedAtUnix": 0,
         },
         "source": {
-            "repositoryCommit": repository_commit,
-            "buildScriptSha256": script_hash,
-            "workerSourceTreeSha256": measure_worker_source(worker_source),
+            "repositoryCommit": source_binding.repository_commit,
+            "buildScriptSha256": source_binding.build_script_sha256,
+            "workerSourceTreeSha256": source_binding.worker_source_tree_sha256,
         },
         "cpython": {
             "version": CPYTHON_VERSION,
@@ -1405,6 +1564,17 @@ def _logical_copy(
     relative = validate_relative_path(relative, allowed_top)
     copied = _copy_verified(source, stage / PurePosixPath(relative))
     return FileRecord(relative, copied.size_bytes, copied.sha256)
+
+
+def _verify_staged_repository_sources(
+    stage: Path, binding: RepositorySourceBinding
+) -> None:
+    expected = (*binding.worker_stage_files, binding.repository_license)
+    for record in expected:
+        path = validate_local_path(stage / PurePosixPath(record.relative_path), directory=False)
+        digest, size = sha256_file(path)
+        if digest != record.sha256 or size != record.size_bytes:
+            raise BuildFailure("repository_source_copy_changed")
 
 
 def _excluded_executables(
@@ -2021,6 +2191,9 @@ def build_self_contained_stage(
     site_packages = validate_local_path(site_packages, directory=True)
     worker_source = validate_local_path(worker_source, directory=True)
     repository_license = validate_local_path(repository_license, directory=False)
+    source_binding = _repository_source_binding(
+        repository_root, worker_source, repository_license
+    )
     pipeline, vlm = validate_models(pipeline_model, vlm_model)
     identity = probe_runtime_identity(python_home, site_packages)
     selected = resolve_runtime_distributions(site_packages)
@@ -2030,11 +2203,13 @@ def build_self_contained_stage(
     approved_provenance = validate_provenance_input(
         provenance_input=provenance_input,
         repository_root=repository_root,
+        repository_license=repository_license,
         python_home=python_home,
         worker_source=worker_source,
         distributions=measurements,
         pipeline_records=pipeline_records_observed,
         vlm_records=vlm_records_observed,
+        source_binding=source_binding,
     )
     approved_models = {
         str(model["root"]): model for model in approved_provenance["models"]
@@ -2102,6 +2277,7 @@ def build_self_contained_stage(
             (repository_license, "licenses/lawyer-assistance/LICENSE.txt"),
         ):
             records.append(_logical_copy(source, stage, relative, allowed_top={"licenses"}))
+        _verify_staged_repository_sources(stage, source_binding)
         license_manifest = stage / "licenses" / "python-distributions.json"
         license_manifest.write_bytes(canonical_json(license_inventory))
         license_hash, license_size = sha256_file(license_manifest)

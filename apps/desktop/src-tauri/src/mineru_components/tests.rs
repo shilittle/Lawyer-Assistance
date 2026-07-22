@@ -2,6 +2,36 @@ use super::catalog::{ComponentCatalogEntryV1, ComponentCatalogV1};
 use super::package::ComponentPackageManifestV1;
 use super::{catalog, package, *};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+
+const REAL_COMPONENT_EXPECTED_PACKAGE_SHA256_ENV: &str =
+    "LA_REAL_MINERU_COMPONENT_EXPECTED_PACKAGE_SHA256";
+
+fn parse_real_component_expected_package_sha256(
+    value: Option<OsString>,
+) -> Result<String, &'static str> {
+    let value = value
+        .ok_or("LA_REAL_MINERU_COMPONENT_EXPECTED_PACKAGE_SHA256 is required")?
+        .into_string()
+        .map_err(|_| "LA_REAL_MINERU_COMPONENT_EXPECTED_PACKAGE_SHA256 must be UTF-8")?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "LA_REAL_MINERU_COMPONENT_EXPECTED_PACKAGE_SHA256 must be 64 lowercase hex characters",
+        );
+    }
+    Ok(value)
+}
+
+fn real_component_expected_package_sha256() -> String {
+    parse_real_component_expected_package_sha256(std::env::var_os(
+        REAL_COMPONENT_EXPECTED_PACKAGE_SHA256_ENV,
+    ))
+    .expect("a pinned expected production package SHA-256 is required")
+}
 
 fn fixture(version: &str) -> (ComponentPackageManifestV1, Vec<u8>, ComponentCatalogEntryV1) {
     fixture_with_runtime(version, true, true)
@@ -276,6 +306,33 @@ fn catalog(entries: Vec<ComponentCatalogEntryV1>) -> ComponentCatalogV1 {
 }
 
 #[test]
+fn real_component_expected_package_sha256_is_required_and_strictly_lowercase_hex() {
+    let valid = "0123456789abcdef".repeat(4);
+    assert_eq!(
+        parse_real_component_expected_package_sha256(Some(OsString::from(&valid))),
+        Ok(valid)
+    );
+    assert_eq!(
+        parse_real_component_expected_package_sha256(None),
+        Err("LA_REAL_MINERU_COMPONENT_EXPECTED_PACKAGE_SHA256 is required")
+    );
+    for invalid in [
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+        format!("{} ", "a".repeat(63)),
+    ] {
+        assert_eq!(
+            parse_real_component_expected_package_sha256(Some(OsString::from(invalid))),
+            Err(
+                "LA_REAL_MINERU_COMPONENT_EXPECTED_PACKAGE_SHA256 must be 64 lowercase hex characters"
+            )
+        );
+    }
+}
+
+#[test]
 fn package_manifest_ceiling_fits_production_inventory_but_rejects_larger_headers() {
     assert_eq!(package::MAX_MANIFEST_BYTES, 16 * 1024 * 1024);
     let temporary = tempfile::tempdir().unwrap();
@@ -462,6 +519,13 @@ async fn sharded_offline_import_is_canonical_atomic_and_rejects_extra_or_tampere
     entry.part_set_manifest_size_bytes = Some(descriptor_bytes.len() as u64);
     entry.part_set_manifest_sha256 = Some(package::sha256_bytes(&descriptor_bytes));
     entry.parts = catalog_parts;
+    let trusted_descriptor = package::read_part_set_manifest(&descriptor_path, &entry).unwrap();
+    assert_eq!(
+        usize::from(trusted_descriptor.part_count),
+        entry.parts.len()
+    );
+    assert_eq!(trusted_descriptor.parts.len(), entry.parts.len());
+    assert!(entry.parts.len() > 1);
 
     let mut signed_shape = catalog(vec![entry.clone()]);
     signed_shape.schema_version = 2;
@@ -797,6 +861,7 @@ fn package_requires_outer_and_manifest_hash_and_catalog_enforces_url_and_size_ca
 #[test]
 #[ignore = "requires the locally built, signed 11+ GiB production MinerU release set"]
 fn real_signed_sharded_release_imports_installs_and_remeasures() {
+    let expected_package_sha256 = real_component_expected_package_sha256();
     let release = std::env::var_os("LA_REAL_MINERU_COMPONENT_RELEASE_DIRECTORY")
         .map(PathBuf::from)
         .expect("LA_REAL_MINERU_COMPONENT_RELEASE_DIRECTORY is required");
@@ -826,14 +891,32 @@ fn real_signed_sharded_release_imports_installs_and_remeasures() {
     );
     assert_eq!(
         imported.available_packages[0].package_sha256,
-        "d2ee7db7e116c4782771294fbf4f116d0d2c1833f89b35ecebbe67e9213e8190"
+        expected_package_sha256
     );
+
+    let trusted_catalog =
+        catalog::load_trusted_catalog(manager.managed_root()).expect("trusted catalog reloads");
+    let trusted_entry = trusted_catalog
+        .entries
+        .first()
+        .expect("one trusted production catalog entry");
+    assert_eq!(trusted_entry.package_sha256, expected_package_sha256);
+    let trusted_descriptor = package::read_part_set_manifest(&descriptor_path, trusted_entry)
+        .expect("descriptor and its dynamic part inventory bind to the trusted catalog");
+    assert!(!trusted_entry.parts.is_empty());
+    assert_eq!(
+        usize::from(trusted_descriptor.part_count),
+        trusted_entry.parts.len()
+    );
+    assert_eq!(trusted_descriptor.parts.len(), trusted_entry.parts.len());
+    let expected_manifest_sha256 = trusted_entry.package_manifest_sha256.clone();
 
     let mutation = manager
         .install_offline_package(&descriptor_path)
-        .expect("all six pinned parts assemble and install atomically");
+        .expect("all catalog-pinned parts assemble and install atomically");
     let binding = mutation.binding.expect("installed component is activated");
     assert_eq!(binding.component_version.to_string(), "0.4.0-beta.2");
+    assert_eq!(binding.manifest_sha256, expected_manifest_sha256);
     assert!(binding.worker_path.is_file());
     assert!(binding.model_root.join("pipeline").is_dir());
     assert!(binding.model_root.join("vlm").is_dir());

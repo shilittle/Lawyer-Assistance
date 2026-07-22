@@ -2252,7 +2252,7 @@ mod tests {
         {
             headers.push(TransportHeader::new(
                 "Authorization",
-                "Bearer synthetic-transport-test-key",
+                "Bearer not-a-real-synthetic-transport-test-key",
             ));
         }
         if headers

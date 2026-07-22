@@ -31,7 +31,7 @@
 
 | 能力 | 当前实现状态 | 仍需最终验收 |
 |---|---|---|
-| 本地 MinerU OCR 与资格持久化 | `CODE_COMPLETE` | 历史 v3/v5 candidate 仅保留诊断证据并永久禁止发布；v4 provenance 源码门禁及 16/16 builder tests 已完成，但尚无 final v4 artifact/hash；clean commit A 后仍须确定性重建、显式审批、签名、短根安装、remeasure、GPU probe、firewall/trust/canary/restart/App E2E |
+| 本地 MinerU OCR 与资格持久化 | `CODE_COMPLETE` | 历史 v3/v5 candidate 仅保留诊断证据并永久禁止发布；v4 provenance 源码门禁及 25/25 builder tests 已完成，但尚无 final v4 artifact/hash；clean commit A 后仍须确定性重建、显式审批、签名、短根安装、remeasure、GPU probe、firewall/trust/canary/restart/App E2E |
 | Approved MCP 十工具与 App ticket/session | `E2E_COMPLETE` | 实际 sibling binary stdio/HTTP 与 compile-time SHA-256 trust anchor 已测；最终合并后对 release-candidate 二进制复跑并记录 artifact hash |
 | Approved Provider 正向链 | `E2E_COMPLETE` | 最终合并后复跑 loopback wire 与 network-zero negatives |
 | PDF/DOCX/TXT/Markdown 安全派生、encrypted work products、mapping、lifecycle、five-component backup V3 | `CODE_COMPLETE` | 最终构建 App 的选择器、暂存、重启、五组件重开与回滚验收；V2 三组件只读/恢复兼容，V1 fail closed |
@@ -99,7 +99,7 @@ automatic 默认关闭。开放前必须有离线、版本化、可重复的校�
 - 历史签名、自包含 v3 `.laocrpkg` candidate 为 `11,793,618,181` bytes，共六分片；其 catalog detached Minisign 和首次完整 component install/re-measure（`1 passed` / `1287.01 s`）只作为工程诊断记录。v3 永久禁止发布。
 - MinerU 3.4.3 / PyTorch 2.8.0+cu128 / CUDA 12.8 / RTX 5090 已完成合成两页、低清、旋转 direct-worker diagnostic；不可读手写以 `output_incomplete` 阻断。
 - 长工作树 final runtime path 失败而同字节短路径成功；259 UTF-16 code units 前置门禁已加入。历史短根 v5 install/re-measure 为 `1 passed`、`0 failed`、387 filtered、`1209.75 s`，installed-tree synthetic-only 两页 diagnostic 也通过；v5 同样永久禁止发布。
-- v4 provenance 源码门禁已经实现，相关 builder unit suites 为 `16 passed`。它绑定 clean repository commit、build-script SHA-256、worker source-tree SHA-256、选定 runtime distributions 与 exact model revisions。当前尚未从 clean commit A 生成 final v4 artifact，因而不存在可记录的 final v4 hash；必须在 A 后确定性重建、人工显式审批、签名、短根安装/remeasure、GPU probe，并完成 App Firewall/Job/canary/restart 资格链。
+- v4 provenance 源码门禁已经实现，相关 builder unit suites 为 `25 passed`。它绑定 clean repository commit、build-script SHA-256、worker source-tree SHA-256、选定 runtime distributions 与 exact model revisions。当前尚未从 clean commit A 生成 final v4 artifact，因而不存在可记录的 final v4 hash；必须在 A 后确定性重建、人工显式审批、签名、短根安装/remeasure、GPU probe，并完成 App Firewall/Job/canary/restart 资格链。
 - formal App 对 paired MCP sibling 的 compile-time SHA-256 trust anchor 与真实 stdio/HTTP binary E2E 已通过其代码/传输边界。
 - 项目 GitHub 仓库为 private；catalog asset URL 对未认证客户端不可用。推荐 GitHub 认证下载完整资产集后本地导入，App 自动下载只适用于已能访问 private Release 的环境。
 

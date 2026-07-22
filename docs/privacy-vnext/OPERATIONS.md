@@ -42,7 +42,27 @@ For final deployment, use only an App-managed v4 component imported from its exp
 
 Historical v3 and short-root v5 candidates passed the component-integrity and synthetic diagnostic boundaries recorded on 2026-07-22. MinerU 3.4.3 on the local RTX 5090 completed synthetic two-page, low-resolution and rotated direct-worker diagnostics; unreadable handwriting stopped with `output_incomplete`. Those candidates are permanently excluded from publication. Their bytes, signatures, install results and hashes are historical diagnostic evidence only and must not be presented as v4 release provenance.
 
-The v4 provenance source gates are implemented and their builder unit suites pass 16/16. Package/catalog provenance binds the clean repository commit, build-script SHA-256, worker-source-tree SHA-256, exact selected runtime distributions and model revisions. A final v4 package has not yet been built from clean commit A, so this guide intentionally records no final v4 artifact hash. After A it still requires deterministic rebuild, explicit provenance approval, signing, short-root installation, installed-tree remeasurement, GPU probe, and the complete App-owned Windows Firewall/Job Object/canary/restart qualification.
+The v4 provenance source gates are implemented and their builder unit suites pass 25/25. Package/catalog provenance binds the clean repository commit, build-script SHA-256, worker-source-tree SHA-256, exact selected runtime distributions and model revisions. A final v4 package has not yet been built from clean commit A, so this guide intentionally records no final v4 artifact hash. After A it still requires deterministic rebuild, explicit provenance approval, signing, short-root installation, installed-tree remeasurement, GPU probe, and the complete App-owned Windows Firewall/Job Object/canary/restart qualification.
+
+For the final signed-component install/remeasure gate, set the package SHA from
+the independently measured packager result (not by blindly copying an
+unsigned catalog field), then verify that the detached-signed catalog and
+descriptor bind the same value:
+
+```powershell
+$env:LA_REAL_MINERU_COMPONENT_RELEASE_DIRECTORY = 'C:\path\to\signed-release'
+$env:LA_REAL_MINERU_COMPONENT_OFFLINE_SET_DIRECTORY = 'C:\path\to\offline-set'
+$env:LA_REAL_MINERU_COMPONENT_STATE_DIRECTORY = 'C:\short\component-state'
+$env:LA_REAL_MINERU_COMPONENT_EXPECTED_PACKAGE_SHA256 = '<64-lowercase-hex-from-independent-build-record>'
+cargo test --locked --offline -p lawyer-assistance-desktop `
+  mineru_components::tests::real_signed_sharded_release_imports_installs_and_remeasures `
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The test rejects a missing, uppercase, padded, malformed, or stale expected
+hash. It also revalidates the signed catalog, dynamic part inventory, package
+manifest binding, installed tree, and activation state; no historical v3/v5
+hash may be supplied.
 
 
 ### Automatic invalidation
