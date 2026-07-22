@@ -103,7 +103,7 @@
 - 仓库为 private；推荐在 App 外通过 GitHub 认证下载完整 catalog/signature/descriptor/parts 后本地导入。未认证 App 不把 private asset URL 可达性当作安全或可用性事实，也不接收 GitHub token。
 - cryptographic signature 不证明第三方内容可再分发；provenance/licensing audit 未完成的 candidate 禁止发布。
 
-验收边界：历史 v3/v5 candidate 的 install/re-measure 与 synthetic diagnostic 仅作为路径兼容和本地运行诊断，两者永久禁止发布。v4 provenance 源码门禁与 25/25 builder tests 已完成，但 clean commit A 后仍须确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 与 App Firewall/Job/canary/restart qualification；当前没有 final v4 artifact/hash。
+验收边界：历史 v3/v5 candidate 的 install/re-measure 与 synthetic diagnostic 仅作为路径兼容和本地运行诊断，两者永久禁止发布。v4 provenance 源码门禁与 27/27 builder tests 已完成，但最终 clean source commit 后仍须确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 与 App Firewall/Job/canary/restart qualification；当前没有 final v4 artifact/hash。
 
 ### 4.4 OCR 不完整导致漏脱敏
 

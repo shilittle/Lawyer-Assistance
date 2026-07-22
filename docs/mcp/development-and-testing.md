@@ -56,7 +56,7 @@ public-only 验收只使用公开法律查询：连接、核对精确五工具�
 - direct MinerU 3.4.3/RTX 5090 diagnostics: synthetic two-page, low-resolution and rotated inputs succeeded; unreadable handwriting returned `output_incomplete`;
 - long final runtime root failed while identical historical bytes under a short root succeeded; the 259 UTF-16 preflight gate is covered by unit tests;
 - the historical installed-tree diagnostic passed, but is neither v4 evidence nor App Firewall/Job qualification;
-- v4 provenance source gates and the two builder suites pass 25/25; no final v4 bytes/hash exist before clean commit A deterministic rebuild, explicit approval, signing, short-root install/remeasure and GPU probe;
+- v4 provenance source gates and the two builder suites pass 27/27; no final v4 bytes/hash exist before a deterministic rebuild from the final clean source commit, explicit approval, signing, short-root install/remeasure and GPU probe;
 - two UAC elevation attempts were cancelled, so Firewall/Job/App production OCR was not qualified and all four machine gates remain `false`.
 - because the repository is private, eventual v4 assets require authenticated GitHub download followed by local App import unless the runtime already has private-Release access.
 

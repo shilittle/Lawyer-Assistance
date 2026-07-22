@@ -29,7 +29,7 @@
 
 “目标支持”只表示代码与 workflow 面向该平台；没有成功的目标平台发布矩阵和真实宿主验收，就不能写成“已认证”。
 
-历史 Windows MinerU v3/v5 candidate 的安装与 synthetic-only diagnostic 只作为兼容性诊断，两者永久禁止发布，也不是 production qualification。v4 provenance 源码门禁与 25/25 builder tests 已完成，但 clean commit A 后的确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 和 App Firewall/Job qualification 仍待执行，当前没有 final v4 artifact/hash。项目 Release 为 private；未认证客户端不能直接使用 catalog asset URL，最终发布后仍推荐认证下载完整资产集再本地导入。
+历史 Windows MinerU v3/v5 candidate 的安装与 synthetic-only diagnostic 只作为兼容性诊断，两者永久禁止发布，也不是 production qualification。v4 provenance 源码门禁与 27/27 builder tests 已完成，但最终 clean source commit 后的确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 和 App Firewall/Job qualification 仍待执行，当前没有 final v4 artifact/hash。项目 Release 为 private；未认证客户端不能直接使用 catalog asset URL，最终发布后仍推荐认证下载完整资产集再本地导入。
 
 ## 宿主
 

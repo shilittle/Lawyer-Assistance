@@ -53,6 +53,18 @@ PROVENANCE_OUTPUT_VERSION = "lawyer-assistance-mineru-component-provenance-v1"
 PROVENANCE_SCHEMA_VERSION = 1
 PROVENANCE_OUTPUT_RELATIVE = "licenses/mineru-component-provenance.json"
 THIRD_PARTY_NOTICES_RELATIVE = "licenses/THIRD_PARTY_NOTICES.txt"
+RUNTIME_IDENTITY_PROBE = (
+    "import json,struct,sys,sysconfig;"
+    "print(json.dumps({"
+    "'implementation':sys.implementation.name,"
+    "'python':'.'.join(str(part) for part in sys.version_info[:3]),"
+    "'releaseLevel':sys.version_info.releaselevel,"
+    "'serial':sys.version_info.serial,"
+    "'platform':sysconfig.get_platform().lower(),"
+    "'pointerBits':struct.calcsize('P')*8,"
+    "'maxsize':sys.maxsize"
+    "},separators=(',',':')))"
+)
 MINERU_RUNTIME_EXTRAS = ("pipeline", "vlm")
 MINERU_LICENSE_ID = "LicenseRef-MinerU-Open-Source-License"
 UNKNOWN_LICENSE_VALUES = {
@@ -666,7 +678,7 @@ def probe_runtime_identity(python_home: Path, site_packages: Path) -> RuntimeIde
                 "-I",
                 "-S",
                 "-c",
-                "import json,platform,sys;print(json.dumps({'python':platform.python_version(),'machine':platform.machine(),'maxsize':sys.maxsize},separators=(',',':')))"
+                RUNTIME_IDENTITY_PROBE,
             ],
             check=True,
             capture_output=True,
@@ -676,18 +688,15 @@ def probe_runtime_identity(python_home: Path, site_packages: Path) -> RuntimeIde
         value = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError) as error:
         raise BuildFailure("python_probe_failed") from error
-    if (
-        value != {
-            "python": CPYTHON_VERSION,
-            "machine": "AMD64",
-            "maxsize": 9223372036854775807,
-        }
-        and value != {
-            "python": CPYTHON_VERSION,
-            "machine": "x86_64",
-            "maxsize": 9223372036854775807,
-        }
-    ):
+    if value != {
+        "implementation": "cpython",
+        "python": CPYTHON_VERSION,
+        "releaseLevel": "final",
+        "serial": 0,
+        "platform": "win-amd64",
+        "pointerBits": 64,
+        "maxsize": 9223372036854775807,
+    }:
         raise BuildFailure("python_version_unqualified")
     identity = RuntimeIdentity(
         python_version=value["python"],

@@ -180,6 +180,131 @@ class ProductionMineruBuilderTests(unittest.TestCase):
             self.repository_license,
         )
 
+    def test_runtime_probe_uses_abi_metadata_in_sanitized_environment(self) -> None:
+        expected = {
+            "implementation": "cpython",
+            "python": self.repo_builder.CPYTHON_VERSION,
+            "releaseLevel": "final",
+            "serial": 0,
+            "platform": "win-amd64",
+            "pointerBits": 64,
+            "maxsize": 9223372036854775807,
+        }
+
+        def completed(command, **options):
+            environment = options["env"]
+            self.assertEqual(
+                command,
+                [
+                    str(self.python_home / "python.exe"),
+                    "-I",
+                    "-S",
+                    "-c",
+                    self.repo_builder.RUNTIME_IDENTITY_PROBE,
+                ],
+            )
+            self.assertEqual(
+                set(environment),
+                {
+                    "SystemRoot",
+                    "WINDIR",
+                    "PATH",
+                    "PYTHONNOUSERSITE",
+                    "PYTHONSAFEPATH",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "PIP_NO_INDEX",
+                    "HF_HUB_OFFLINE",
+                    "TRANSFORMERS_OFFLINE",
+                    "NO_PROXY",
+                    "no_proxy",
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                },
+            )
+            self.assertEqual(environment["PATH"], str(self.python_home))
+            self.assertTrue(options["check"])
+            self.assertTrue(options["capture_output"])
+            self.assertEqual(options["timeout"], 30)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=self.repo_builder.canonical_json(expected),
+                stderr=b"",
+            )
+
+        with mock.patch.object(
+            self.repo_builder.subprocess, "run", side_effect=completed
+        ):
+            identity = self.repo_builder.probe_runtime_identity(
+                self.python_home, self.site_packages
+            )
+        self.assertEqual(identity.python_version, self.repo_builder.CPYTHON_VERSION)
+        self.assertEqual(identity.architecture, "windows-x86_64")
+
+    def test_runtime_probe_rejects_every_identity_mismatch(self) -> None:
+        expected = {
+            "implementation": "cpython",
+            "python": self.repo_builder.CPYTHON_VERSION,
+            "releaseLevel": "final",
+            "serial": 0,
+            "platform": "win-amd64",
+            "pointerBits": 64,
+            "maxsize": 9223372036854775807,
+        }
+        mutations = {
+            "implementation": "pypy",
+            "python": "3.12.12",
+            "releaseLevel": "candidate",
+            "serial": 1,
+            "platform": "win-arm64",
+            "pointerBits": 32,
+            "maxsize": 2147483647,
+        }
+        candidates = []
+        for field, value in mutations.items():
+            candidate = dict(expected)
+            candidate[field] = value
+            candidates.append((field, candidate))
+        candidates.append(
+            (
+                "missing_field",
+                {
+                    key: value
+                    for key, value in expected.items()
+                    if key != "platform"
+                },
+            )
+        )
+        candidates.append(("extra_field", {**expected, "machine": "AMD64"}))
+        candidates.append(
+            (
+                "obsolete_empty_machine_shape",
+                {
+                    "python": self.repo_builder.CPYTHON_VERSION,
+                    "machine": "",
+                    "maxsize": 9223372036854775807,
+                },
+            )
+        )
+
+        for label, candidate in candidates:
+            with self.subTest(label=label), mock.patch.object(
+                self.repo_builder.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["python.exe"],
+                    0,
+                    stdout=self.repo_builder.canonical_json(candidate),
+                    stderr=b"",
+                ),
+            ):
+                with self.assertRaises(self.repo_builder.BuildFailure) as failure:
+                    self.repo_builder.probe_runtime_identity(
+                        self.python_home, self.site_packages
+                    )
+                self.assertEqual(failure.exception.code, "python_version_unqualified")
+
     def tearDown(self) -> None:
         for name in tuple(sys.modules):
             if name.startswith(self.fixture_module_name):
