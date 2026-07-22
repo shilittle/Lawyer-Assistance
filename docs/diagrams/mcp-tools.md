@@ -30,7 +30,7 @@
 
 ### `diagram.export`
 
-请求：`{"schema_version":1,"artifact_uri":"lawyer-assistance://diagrams/<64位小写十六进制>","format":"html"}`。第一阶段格式只允许 `html`；工具校验并返回已登记制品的不可变描述，不联网、不打开 GUI。
+请求：`{"schema_version":1,"artifact_uri":"lawyer-assistance://diagrams/<64位小写十六进制>","format":"html"}`。第一阶段格式只允许 `html`；工具读取同目录 sibling Spec，核对 URI/spec hash 与规范化字节，用固定渲染器重渲染并逐字节比对已存 HTML，全部通过后才返回不可变描述。孤儿、换绑或任一侧篡改均 fail closed；工具不联网、不打开 GUI。
 
 ## 调用示例
 

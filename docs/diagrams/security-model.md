@@ -6,7 +6,9 @@
 
 ## 数据准入
 
-`diagram_authoring` 是显式 opt-in 能力，但第一阶段尚未实现或强制校验 App 签发的逐次 CASE_RAW 批准凭据。因此已完成的安全边界只覆盖虚构/公开数据；真实案件接入必须在批准凭据正向链落地后另行开放。CASE_RAW 范围不能由模型声明、文件名或“已脱敏”标签自行扩大。外部模型计费测试只能使用纯虚构 fixtures；API 密钥由凭据存储提供并禁止进入日志、样例、制品和版本控制。本次验收未调用 DeepSeek 或其他计费 API。
+`diagram_authoring` 是显式 opt-in 能力，但第一阶段尚未实现或强制校验 App 签发的逐次 CASE_RAW 批准凭据。因此已完成的安全边界只覆盖虚构/公开数据；真实案件接入必须在批准凭据正向链落地后另行开放。CASE_RAW 范围不能由模型声明、文件名或“已脱敏”标签自行扩大。外部模型计费测试只能使用纯虚构 fixtures；API 密钥由凭据存储提供并禁止进入日志、样例、制品和版本控制。
+
+计费事实按阶段记录：确定性渲染和自动回归本身不调用、也不依赖 DeepSeek。2026-07-21 的最终 opt-in QA 另行使用官方 `deepseek-v4-flash` 完成 3 次纯合成数据调用，usage 分别为 14、3,409、3,560 tokens，合计 6,983；同批旧应用内 3 项 ignored 计费测试在 Provider transport 前被 `CaseRaw` 门禁拒绝，未产生网络请求或计费。完整证据见 `acceptance-2026-07-21.md`，不得把前者写成“本次未调用”，也不得把后者写成“真实互操作成功”。
 
 ## 模型—渲染隔离
 
@@ -30,7 +32,7 @@ Schema 限制 500 节点、1200 边、100 组、1000 来源及各字段长度；
 
 ## 制品完整性
 
-制品使用规范化 Spec（其中包含模板版本）计算内容地址，HTML 内嵌渲染器版本；同一地址出现不同内容时拒绝覆盖。文件写入位于专用 output root 下并采用原子安装。路径必须在写入前解析并验证仍位于根目录。更新要求 `expected_spec_hash`，防止静默覆盖并发版本。provenance 记录生成者、时间、版本、来源 ID、确认状态及模型/确定性代码的职责范围。
+制品使用规范化 Spec（其中包含模板版本）计算内容地址，HTML 内嵌渲染器版本；同一地址出现不同内容时拒绝覆盖。Spec 与 HTML 先写入同一 staging 目录并同步，再以目录级原子提交为一个 sibling bundle，内容地址下不会只提交其中一件。每次 render/update/export 都重新验证 output root、diagram root 和父链身份且拒绝 symlink/junction/reparse；操作期间持有目录身份句柄，Windows 目录提交通过已验证 handle 完成，Unix 使用 `renameat`。export 和 URI 更新会读取 sibling Spec，验证规范化字节、URI/spec hash、当前领域语义，并用固定渲染器重渲染逐字节比对 HTML；孤儿、换绑或任一侧篡改均 fail closed。更新另要求 `expected_spec_hash`，防止静默覆盖并发版本。provenance 记录生成者、时间、版本、来源 ID、确认状态及模型/确定性代码的职责范围。
 
 ## 日志与错误
 

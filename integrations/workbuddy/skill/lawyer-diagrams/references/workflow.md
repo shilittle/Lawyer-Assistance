@@ -2,7 +2,7 @@
 
 ## 执行顺序
 
-1. 确认数据为纯虚构、公开或已由可信本地批准链授权。
+1. 确认数据为纯虚构、公开，或当前调用可逐字节验证且范围覆盖本次材料版本、目的和图示工具的 Privacy 批准产物。
 2. `diagram.list_templates({"schema_version":1})`：发现七个可用模板。
 3. `diagram.get_schema({"schema_version":1,"template_id":"..."})`：读取公共 Schema 与模板约束。
 4. 生成完整 Spec；Spec 内的 `schema_version` 是字符串 `"1.0"`。

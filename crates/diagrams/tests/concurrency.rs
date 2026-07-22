@@ -33,5 +33,14 @@ fn concurrent_identical_renders_converge_on_one_immutable_artifact() {
         .expect("diagram directory")
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
-    assert_eq!(files.len(), 2, "one HTML and one canonical DiagramSpec");
+    assert_eq!(files.len(), 1, "one atomically committed artifact bundle");
+    let siblings = std::fs::read_dir(files[0].path())
+        .expect("artifact bundle")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        siblings.len(),
+        2,
+        "one HTML and one canonical sibling DiagramSpec"
+    );
 }

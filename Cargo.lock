@@ -1096,10 +1096,12 @@ name = "diagrams"
 version = "0.3.1"
 dependencies = [
  "jsonschema",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

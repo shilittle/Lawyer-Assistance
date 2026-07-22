@@ -165,12 +165,25 @@ async fn diagram_mcp_lists_validates_and_renders_without_echoing_input_text() {
         .as_str()
         .expect("content-addressed artifact URI");
     assert!(artifact_uri.starts_with("lawyer-assistance://diagrams/"));
-    let html_files = std::fs::read_dir(output.join("diagrams"))
+    let bundles = std::fs::read_dir(output.join("diagrams"))
         .expect("diagram output directory")
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("html"))
-        .count();
-    assert_eq!(html_files, 1);
+        .collect::<Vec<_>>();
+    assert_eq!(bundles.len(), 1);
+    let sibling_names = std::fs::read_dir(bundles[0].path())
+        .expect("atomic artifact bundle")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        sibling_names,
+        [
+            std::ffi::OsString::from("artifact.diagram.json"),
+            std::ffi::OsString::from("artifact.html"),
+        ]
+        .into_iter()
+        .collect()
+    );
 }
 
 fn names(registry: &ToolRegistry) -> Vec<String> {

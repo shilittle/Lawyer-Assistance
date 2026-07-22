@@ -317,7 +317,8 @@ fn injected_text_is_escaped_and_strict_csp_remains_enabled() {
         directory
             .path()
             .join("diagrams")
-            .join(format!("{key}.html")),
+            .join(key)
+            .join("artifact.html"),
     )
     .expect("rendered HTML");
     assert!(!html.contains("<script>alert(1)</script>"));
@@ -330,6 +331,171 @@ fn injected_text_is_escaped_and_strict_csp_remains_enabled() {
     assert!(!html.contains("unsafe-inline"));
     assert!(!html.contains("innerHTML"));
     assert!(!html.contains("fetch("));
+}
+
+#[test]
+fn export_rejects_orphan_tamper_and_uri_hash_rebinding() {
+    let directory = tempfile::tempdir().expect("temp output");
+    let service = DiagramService::new(directory.path()).expect("diagram service");
+    let response = service.render(&fixture_spec()).expect("safe render");
+    let uri = response.artifact_uri.expect("artifact URI");
+    let key = uri.rsplit('/').next().expect("artifact key");
+    let artifact = directory.path().join("diagrams").join(key);
+    let spec_path = artifact.join("artifact.diagram.json");
+    let html_path = artifact.join("artifact.html");
+    let spec = fs::read(&spec_path).expect("canonical spec");
+    let html = fs::read(&html_path).expect("fixed renderer HTML");
+
+    let mut tampered_html = html.clone();
+    tampered_html.extend_from_slice(b"<!-- tampered -->");
+    fs::write(&html_path, tampered_html).expect("tamper HTML");
+    let error = service
+        .export(&uri, ExportFormat::Html)
+        .expect_err("tampered HTML must never export");
+    assert_eq!(error.code(), "artifact_integrity_failed");
+    fs::write(&html_path, &html).expect("restore HTML");
+
+    let mut noncanonical_spec = spec.clone();
+    noncanonical_spec.push(b'\n');
+    fs::write(&spec_path, noncanonical_spec).expect("tamper canonical spec bytes");
+    let error = service
+        .export(&uri, ExportFormat::Html)
+        .expect_err("non-canonical sibling spec bytes must never export");
+    assert_eq!(error.code(), "artifact_integrity_failed");
+    fs::write(&spec_path, &spec).expect("restore canonical spec");
+
+    let mut tampered_spec: serde_json::Value =
+        serde_json::from_slice(&spec).expect("canonical spec JSON");
+    tampered_spec["title"] = serde_json::Value::String("被篡改的标题".to_owned());
+    fs::write(
+        &spec_path,
+        serde_json::to_vec(&tampered_spec).expect("tampered JSON"),
+    )
+    .expect("tamper spec");
+    let error = service
+        .export(&uri, ExportFormat::Html)
+        .expect_err("spec/hash mismatch must never export");
+    assert_eq!(error.code(), "artifact_integrity_failed");
+    fs::write(&spec_path, &spec).expect("restore spec");
+
+    fs::remove_file(&spec_path).expect("simulate interrupted orphan");
+    let error = service
+        .export(&uri, ExportFormat::Html)
+        .expect_err("orphan HTML must never export");
+    assert_eq!(error.code(), "artifact_integrity_failed");
+    fs::write(&spec_path, &spec).expect("restore spec again");
+
+    let rebound_key = "0".repeat(64);
+    let rebound = directory.path().join("diagrams").join(&rebound_key);
+    fs::create_dir(&rebound).expect("rebound artifact directory");
+    fs::write(rebound.join("artifact.diagram.json"), &spec).expect("copy sibling spec");
+    fs::write(rebound.join("artifact.html"), &html).expect("copy sibling HTML");
+    let error = service
+        .export(
+            &format!("lawyer-assistance://diagrams/{rebound_key}"),
+            ExportFormat::Html,
+        )
+        .expect_err("artifact URI cannot be rebound to a different spec hash");
+    assert_eq!(error.code(), "artifact_integrity_failed");
+}
+
+#[test]
+fn committed_artifact_is_one_atomic_sibling_bundle_without_staging_orphans() {
+    let directory = tempfile::tempdir().expect("temp output");
+    let service = DiagramService::new(directory.path()).expect("diagram service");
+    let response = service.render(&fixture_spec()).expect("safe render");
+    let key = response
+        .artifact_uri
+        .as_deref()
+        .and_then(|uri| uri.rsplit('/').next())
+        .expect("artifact key");
+    let entries = fs::read_dir(directory.path().join("diagrams"))
+        .expect("diagram root")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("diagram entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file_name(), key);
+    assert!(entries[0].file_type().expect("artifact type").is_dir());
+    let mut siblings = fs::read_dir(entries[0].path())
+        .expect("artifact bundle")
+        .map(|entry| entry.expect("artifact sibling").file_name())
+        .collect::<Vec<_>>();
+    siblings.sort();
+    assert_eq!(
+        siblings,
+        vec![
+            std::ffi::OsString::from("artifact.diagram.json"),
+            std::ffi::OsString::from("artifact.html"),
+        ]
+    );
+}
+
+#[test]
+fn after_init_diagram_root_reparse_replacement_fails_closed() {
+    let directory = tempfile::tempdir().expect("temp output");
+    let service = DiagramService::new(directory.path()).expect("diagram service");
+    let diagram_root = directory.path().join("diagrams");
+    let original = directory.path().join("diagrams-original");
+    let outside = directory.path().join("outside-diagrams");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::rename(&diagram_root, &original).expect("move initialized diagram root");
+    create_directory_symlink(&outside, &diagram_root).expect("replace root with reparse point");
+
+    let error = service
+        .render(&fixture_spec())
+        .expect_err("post-init reparse replacement must fail closed");
+    assert_eq!(error.code(), "unsafe_output_root");
+    assert_eq!(
+        fs::read_dir(&outside)
+            .expect("outside remains readable")
+            .count(),
+        0
+    );
+
+    fs::remove_dir(&diagram_root).expect("remove test reparse point");
+    fs::rename(&original, &diagram_root).expect("restore diagram root for cleanup");
+}
+
+#[cfg(unix)]
+fn create_directory_symlink(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => Ok(()),
+        Err(symlink_error) => {
+            let status = Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    symlink_error.kind(),
+                    "failed to create a directory symlink or junction",
+                ))
+            }
+        }
+    }
 }
 
 #[test]
