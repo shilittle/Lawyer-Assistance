@@ -12,13 +12,13 @@
 
 不得包含 `legal_core.sqlite`、`user.sqlite`、案件材料、OCR 输出、导出文书、Bearer、票据、Credential Manager 内容、机器本地配置或 Provider Key。
 
-实验 MinerU runner 代码不等于发布包内置可用 OCR。当前 App 未连接经过认证的 worker/model；不得随包偷偷下载模型、调用远程服务或把扫描件送出本机。未来若打包本地 GPU worker，必须单独完成模型来源/许可证、哈希、进程隔离、离线网络、更新与回滚审查。
+App 已接入受约束的本地 MinerU worker、组件管理与资格链，但安装 App 本身不等于 OCR 已获生产授权。只有签名组件目录、固定版本 worker/model、完整性与本机 GPU/运行时检查、Windows Firewall 隔离、合成 canary 和当前环境重测全部通过后，扫描材料才可进入本机 worker；其余状态一律 fail closed。组件包可从项目固定 GitHub Release 下载，但组件管理 API 不接收案件材料，OCR 处理没有 HTTP、SSH、云服务或远程回退。
 
 ## Profile 固化
 
 发布的 stdio 示例显式传入 `--privacy-profile public_law_only`；Codex 再设置精确五工具 `enabled_tools`，OpenCode 通配权限为 `deny`。HTTP 服务端也必须使用 public-only，并在宿主连接后核对五项。
 
-不要发布启用 `redacted_case` 的默认配置。当前 App 无法签发其 citation 用途票据，生产启用只会造成不可用或误导。案件读写、材料导入、文书生成和导出工具不属于当前发布面。
+不要把实验 `redacted_case` 设为默认配置；App 仍不签发其旧 `citation_validate` 用途票据。正式案件宿主能力位于独立的 `approved_case_workspace` package：精确五项公开工具加十项 opaque-ID-only 案件/成果工具，并要求当前 App 资格、standalone session、精确 generation 与逐调用 ticket。旧宽泛案件 patch、任意路径材料导入、旧文书生成和路径导出工具不属于发布面。
 
 ## 升级
 
@@ -40,6 +40,6 @@
 
 ## 可复现与发布验收
 
-打包器固定成员顺序、时间戳、所有权和权限，并生成逐文件 manifest。可复现哈希、签名、三平台 CI、真实宿主 public-only 验收和干净机安全检查都是发布运营门禁；本地单测不能替代。
+正式构建先生成固定 MCP sibling（签名版在 Authenticode 签名之后取值），再把该文件的 SHA-256 作为只读信任锚编译进同批 App；无信任锚的普通开发构建不得资格化 approved workspace。运行时仍重验 canonical path、文件身份、SHA-256、版本和 canary。打包器固定成员顺序、时间戳、所有权和权限，并生成逐文件 manifest。可复现哈希、签名、三平台 CI、真实宿主 public-only 验收和干净机安全检查都是发布运营门禁；本地单测不能替代。
 
 早期 0.2.0 文档中的 12 工具包与案件闭环已被隐私 breaking change 取代，仅保留为历史，不得重新发布。

@@ -1,0 +1,47 @@
+.privacy-qualification-controls {
+  display: grid;
+  gap: 1rem;
+  margin-block: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border-subtle, #d8dee9);
+  border-radius: 0.75rem;
+  background: var(--surface-raised, #fff);
+}
+
+.privacy-qualification-steps {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+  padding-left: 1.5rem;
+}
+
+.privacy-qualification-steps > li {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.privacy-qualification-steps button {
+  justify-self: start;
+}
+
+.privacy-qualification-steps span {
+  color: var(--text-muted, #5f6b7a);
+  font-size: 0.875rem;
+}
+
+.privacy-qualification-authorize {
+  padding: 0.75rem;
+  border: 1px solid var(--border-subtle, #d8dee9);
+  border-radius: 0.5rem;
+}
+
+.privacy-qualification-authorize label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.privacy-qualification-authorize input[type="text"],
+.privacy-qualification-authorize input:not([type]) {
+  max-width: 8rem;
+}

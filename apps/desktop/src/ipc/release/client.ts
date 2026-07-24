@@ -18,16 +18,6 @@ export interface FileOperationResponse {
 
 export const getVersionInfo = (): Promise<VersionInfo> => invoke("get_version_info");
 
-export const backupUserDatabase = (
-  destinationPath: string | null,
-): Promise<FileOperationResponse> =>
-  invoke("backup_user_database", { request: { destinationPath } });
-
-export const restoreUserDatabase = (
-  sourcePath: string | null,
-): Promise<FileOperationResponse> =>
-  invoke("restore_user_database", { request: { sourcePath } });
-
 export const exportDiagnosticReport = (
   destinationPath: string | null,
 ): Promise<FileOperationResponse> =>

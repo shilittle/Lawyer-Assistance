@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
+from unittest.mock import patch
 
 from scripts.package_mcp_release import (
     PackageError,
+    RepositoryProvenance,
     _read_archive,
+    _scan_support_content,
     build_package,
     collect_payloads,
+    inspect_repository_provenance,
     sha256_bytes,
+    verify_embedded_manifest,
+    workspace_version,
 )
 
 
@@ -49,10 +57,25 @@ Fixture limits.
         (docs / "README.md").write_text("MCP docs\n", encoding="utf-8")
         integrations = root / "integrations/workbuddy"
         integrations.mkdir(parents=True)
-        (integrations / "connector.json").write_text('{"token":"${TOKEN}"}\n', encoding="utf-8")
+        (integrations / "connector.json").write_text(
+            '{"token":"{env:TOKEN}"}\n', encoding="utf-8"
+        )
         binary = root / "lawyer-assistance-mcp"
         binary.write_bytes(b"test-binary")
         return root, binary
+
+    def provenance(self, root: Path, binary: Path) -> RepositoryProvenance:
+        data = binary.read_bytes()
+        return RepositoryProvenance(
+            source_commit="a" * 40,
+            source_commit_timestamp=1,
+            source_clean=True,
+            binary_sha256=sha256_bytes(data),
+            binary_size=len(data),
+            binary_version="9.8.7",
+            binary_fresh=True,
+            release_ready=True,
+        )
 
     def test_tarball_is_deterministic_manifested_and_database_free(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -68,28 +91,75 @@ Fixture limits.
             manifest_name = f"{first.package_root}/MANIFEST.sha256"
             self.assertIn(release_notes_name, members)
             self.assertIn(manifest_name, members)
-            self.assertIn(
-                b"  RELEASE_NOTES.md\n",
-                members[manifest_name],
-            )
+            self.assertIn(b"  RELEASE_NOTES.md\n", members[manifest_name])
+            verify_embedded_manifest(members, first.package_root)
 
     def test_windows_zip_is_verified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, binary = self.fixture(directory)
             windows_binary = binary.with_suffix(".exe")
             binary.rename(windows_binary)
-            result = build_package(root, windows_binary, "x86_64-pc-windows-msvc", root / "out")
+            result = build_package(
+                root, windows_binary, "x86_64-pc-windows-msvc", root / "out"
+            )
             self.assertEqual(result.archive.suffix, ".zip")
             self.assertTrue(result.archive.is_file())
+            verify_embedded_manifest(_read_archive(result.archive), result.package_root)
 
-    def test_database_or_secret_like_support_file_is_rejected(self) -> None:
+    def test_database_secret_or_session_support_path_is_rejected(self) -> None:
+        candidates = (
+            Path("integrations/user.sqlite"),
+            Path("integrations/sessions/descriptor.json"),
+            Path("integrations/case-material/intake.txt"),
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                with tempfile.TemporaryDirectory() as directory:
+                    root, binary = self.fixture(directory)
+                    forbidden = root / candidate
+                    forbidden.parent.mkdir(parents=True, exist_ok=True)
+                    forbidden.write_bytes(b"not release material")
+                    with self.assertRaises(PackageError):
+                        collect_payloads(root, binary, "x86_64-unknown-linux-gnu")
+
+    def test_target_and_workspace_version_cannot_escape_output_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, binary = self.fixture(directory)
-            forbidden = root / "integrations" / "user.sqlite"
-            forbidden.write_bytes(b"not really sqlite")
-            with self.assertRaises(PackageError):
-                collect_payloads(root, binary, "x86_64-unknown-linux-gnu")
+            with self.assertRaisesRegex(PackageError, "target triple"):
+                collect_payloads(root, binary, "../escape")
 
+            (root / "Cargo.toml").write_text(
+                '[workspace]\n[workspace.package]\nversion = "../escape"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PackageError, "version is invalid"):
+                workspace_version(root)
+
+    def test_nonrelease_provenance_is_visibly_marked_in_archive_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, binary = self.fixture(directory)
+            verified = self.provenance(root, binary)
+            preflight = RepositoryProvenance(
+                source_commit=verified.source_commit,
+                source_commit_timestamp=verified.source_commit_timestamp,
+                source_clean=False,
+                binary_sha256=verified.binary_sha256,
+                binary_size=verified.binary_size,
+                binary_version=verified.binary_version,
+                binary_fresh=True,
+                release_ready=False,
+            )
+            result = build_package(
+                root,
+                binary,
+                "x86_64-unknown-linux-gnu",
+                root / "out",
+                preflight,
+            )
+            self.assertIn("-NONRELEASE.tar.gz", result.archive.name)
+            record_name = f"{result.package_root}/PACKAGE-PROVENANCE.json"
+            record = json.loads(_read_archive(result.archive)[record_name])
+            self.assertFalse(record["releaseReady"])
     def test_release_notes_must_match_workspace_version_and_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, binary = self.fixture(directory)
@@ -100,19 +170,169 @@ Fixture limits.
             with self.assertRaisesRegex(PackageError, "RELEASE_NOTES"):
                 collect_payloads(root, binary, "x86_64-unknown-linux-gnu")
 
-    def test_developer_cache_files_do_not_affect_payload(self) -> None:
+    def test_developer_cache_and_validator_tests_do_not_affect_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, binary = self.fixture(directory)
             cache = root / "integrations" / "__pycache__" / "validator.cpython-313.pyc"
             cache.parent.mkdir(parents=True)
             cache.write_bytes(b"machine-local-bytecode")
             (root / "integrations" / ".DS_Store").write_bytes(b"machine-local-metadata")
+            canary_test = root / "integrations" / "test_release_canary.py"
+            canary_test.write_text(
+                'SECRET = "Bearer not-a-real-abcdefghijklmnop-1234"\nRAW_CASE_CANARY = True\n',
+                encoding="utf-8",
+            )
             paths = {
                 payload.path
-                for payload in collect_payloads(root, binary, "x86_64-unknown-linux-gnu")
+                for payload in collect_payloads(
+                    root, binary, "x86_64-unknown-linux-gnu"
+                )
             }
-            self.assertNotIn("integrations/__pycache__/validator.cpython-313.pyc", paths)
+            self.assertNotIn(
+                "integrations/__pycache__/validator.cpython-313.pyc", paths
+            )
             self.assertNotIn("integrations/.DS_Store", paths)
+            self.assertNotIn("integrations/test_release_canary.py", paths)
+
+    def test_high_confidence_secret_session_and_case_canary_content_is_rejected(self) -> None:
+        samples = {
+            "private-key": b"-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n",
+            "bearer": b"Authorization: Bearer not-a-real-abcdefghijklmnop-1234\n",
+            "prefixed-token": b"access_token=ghp_1234567890abcdefghijklmnop\n",
+            "session": b"session=srv_0123456789abcdef0123456789abcdef\n",
+            "case-canary": b"RAW_CASE_CANARY\n",
+            "secret-assignment": b"client_secret=not-a-placeholder\n",
+        }
+        for name, data in samples.items():
+            with self.subTest(name=name), self.assertRaises(PackageError):
+                _scan_support_content(PurePosixPath(f"{name}.txt"), data)
+
+    def test_documented_secret_placeholders_are_allowed(self) -> None:
+        data = b"\n".join(
+            (
+                b"Authorization: Bearer {env:LAWYER_ASSISTANCE_TOKEN}",
+                b"client_secret=<from-secret-store>",
+                b"password=REDACTED",
+                b"Bearer authentication remains loopback-only.",
+            )
+        )
+        _scan_support_content(PurePosixPath("README.md"), data)
+
+    def test_archive_reader_rejects_traversal_and_case_alias_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traversal = root / "traversal.zip"
+            with zipfile.ZipFile(traversal, "w") as package:
+                package.writestr("release/../escape.txt", b"escape")
+            with self.assertRaises(PackageError):
+                _read_archive(traversal)
+
+            case_alias = root / "case-alias.zip"
+            with zipfile.ZipFile(case_alias, "w") as package:
+                package.writestr("release/README.md", b"one")
+                package.writestr("release/readme.md", b"two")
+            with self.assertRaises(PackageError):
+                _read_archive(case_alias)
+
+    def test_embedded_manifest_detects_member_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, binary = self.fixture(directory)
+            result = build_package(
+                root, binary, "x86_64-unknown-linux-gnu", root / "out"
+            )
+            members = _read_archive(result.archive)
+            readme_name = f"{result.package_root}/README.md"
+            members[readme_name] += b"tampered"
+            with self.assertRaisesRegex(PackageError, "hash or size"):
+                verify_embedded_manifest(members, result.package_root)
+
+    def test_package_provenance_is_embedded_and_manifested(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, binary = self.fixture(directory)
+            provenance = self.provenance(root, binary)
+            result = build_package(
+                root,
+                binary,
+                "x86_64-unknown-linux-gnu",
+                root / "out",
+                provenance,
+            )
+            members = _read_archive(result.archive)
+            provenance_name = f"{result.package_root}/PACKAGE-PROVENANCE.json"
+            manifest_name = f"{result.package_root}/MANIFEST.sha256"
+            self.assertIn(provenance_name, members)
+            record = json.loads(members[provenance_name])
+            self.assertEqual(record["sourceCommit"], "a" * 40)
+            self.assertEqual(record["binarySha256"], provenance.binary_sha256)
+            self.assertTrue(record["releaseReady"])
+            self.assertIn(b"  PACKAGE-PROVENANCE.json\n", members[manifest_name])
+            verify_embedded_manifest(members, result.package_root)
+
+    def test_binary_change_after_provenance_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, binary = self.fixture(directory)
+            provenance = self.provenance(root, binary)
+            binary.write_bytes(b"changed-after-verification")
+            with self.assertRaisesRegex(PackageError, "changed after provenance"):
+                collect_payloads(
+                    root,
+                    binary,
+                    "x86_64-unknown-linux-gnu",
+                    provenance,
+                )
+
+    def test_repository_provenance_requires_clean_fresh_matching_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, binary = self.fixture(directory)
+            commit = "b" * 40
+            status = ""
+
+            def command_output(command: list[str], command_root: Path) -> str:
+                self.assertEqual(command_root, root.resolve())
+                if command == ["git", "rev-parse", "--show-toplevel"]:
+                    return str(root.resolve())
+                if command == ["git", "rev-parse", "HEAD"]:
+                    return commit
+                if command == ["git", "show", "-s", "--format=%ct", "HEAD"]:
+                    return "1"
+                if command == [
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=normal",
+                ]:
+                    return status
+                if command == [str(binary.resolve()), "--version"]:
+                    return "lawyer-assistance-mcp 9.8.7"
+                self.fail(f"unexpected provenance command: {command}")
+
+            with patch(
+                "scripts.package_mcp_release._run_checked",
+                side_effect=command_output,
+            ):
+                provenance = inspect_repository_provenance(
+                    root, binary, expected_commit=commit
+                )
+            self.assertTrue(provenance.release_ready)
+            self.assertEqual(provenance.source_commit, commit)
+            self.assertEqual(provenance.binary_sha256, sha256_bytes(binary.read_bytes()))
+
+            status = " M README.md"
+            with patch(
+                "scripts.package_mcp_release._run_checked",
+                side_effect=command_output,
+            ), self.assertRaisesRegex(PackageError, "clean Git worktree"):
+                inspect_repository_provenance(root, binary)
+
+            with patch(
+                "scripts.package_mcp_release._run_checked",
+                side_effect=command_output,
+            ):
+                preflight = inspect_repository_provenance(
+                    root, binary, allow_nonrelease_inputs=True
+                )
+            self.assertFalse(preflight.source_clean)
+            self.assertFalse(preflight.release_ready)
 
 
 if __name__ == "__main__":

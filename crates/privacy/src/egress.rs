@@ -34,10 +34,21 @@ pub struct ResidualScanResult {
 pub fn scan_residual(payload: &[u8]) -> Result<ResidualScanResult, EgressError> {
     let text = std::str::from_utf8(payload).map_err(|_| EgressError::NonUtf8Payload)?;
     let mut redactor = Redactor::default();
-    if let Ok(mut value) = serde_json::from_str::<Value>(text) {
-        redactor.redact_json(&mut value);
-    } else {
-        let _ = redactor.redact(text);
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(object)) => {
+            let mut value = Value::Object(object);
+            redactor.redact_json(&mut value);
+        }
+        Ok(Value::Array(array)) => {
+            let mut value = Value::Array(array);
+            redactor.redact_json(&mut value);
+        }
+        Ok(Value::String(value)) => {
+            let _ = redactor.redact(&value);
+        }
+        Ok(Value::Null | Value::Bool(_) | Value::Number(_)) | Err(_) => {
+            let _ = redactor.redact(text);
+        }
     }
     let RedactionSummary {
         counts, changed, ..
@@ -345,6 +356,14 @@ mod tests {
         assert_eq!(scan.counts.get("person_name"), Some(&1));
     }
 
+    #[test]
+    fn json_scalar_values_cannot_bypass_residual_detection() {
+        for payload in [b"13800138000".as_slice(), br#""13800138000""#.as_slice()] {
+            let scan = scan_residual(payload).expect("scan JSON scalar mobile number");
+            assert!(!scan.passed);
+            assert_eq!(scan.counts.get("phone_number"), Some(&1));
+        }
+    }
     #[test]
     fn public_payload_without_residual_sensitive_content_is_allowed() {
         let signer = signer();

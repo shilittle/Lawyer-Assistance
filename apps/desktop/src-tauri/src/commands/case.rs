@@ -31,6 +31,15 @@ const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_CASE_FILE_IDS: usize = 64;
 const MAX_SOURCE_ID_BYTES: usize = 1_024;
 
+fn require_approved_provider_case_route(task: &'static str) -> Result<(), IpcError> {
+    Err(IpcError::new(
+        "approved_provider_required",
+        format!(
+            "This case operation may run only through the approved Provider workflow; select fixed task `{task}` in Privacy."
+        ),
+    ))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpcError {
@@ -740,6 +749,8 @@ pub async fn generate_structured_case_extraction(
     state: State<'_, AppState>,
     request: StructuredCaseExtractionRequest,
 ) -> Result<GenerateStructuredCaseExtractionResponse, IpcError> {
+    // Keep the boundary before database, credential, and transport access.
+    require_approved_provider_case_route("structured_extraction")?;
     validate_extraction_request(&request)?;
     let app_state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1179,8 +1190,8 @@ where
     } else {
         4096
     };
-    let initial_request = ChatRequest {
-        messages: vec![
+    let initial_request = ChatRequest::unapproved_case_for_rejection(
+        vec![
             ChatMessage {
                 role: ChatMessageRole::System,
                 content: EXTRACTION_SYSTEM_PROMPT.to_owned(),
@@ -1190,11 +1201,10 @@ where
                 content: material_prompt,
             },
         ],
-        stream: false,
-        temperature: (!thinking_enabled).then_some(0.0),
-        max_tokens: Some(extraction_max_tokens),
-        data_classification: privacy::DataClassification::CaseRaw,
-    };
+        false,
+        (!thinking_enabled).then_some(0.0),
+        Some(extraction_max_tokens),
+    );
     let initial_response = adapter
         .send_chat(&profile, &secret, &initial_request)
         .map_err(|error| redact_provider_error(error, &secret))?;
@@ -1239,8 +1249,8 @@ where
                     provider_snapshot: None,
                 });
             }
-            let repair_request = ChatRequest {
-                messages: vec![
+            let repair_request = ChatRequest::unapproved_case_for_rejection(
+        vec![
                     ChatMessage {
                         role: ChatMessageRole::System,
                         content: REPAIR_SYSTEM_PROMPT.to_owned(),
@@ -1253,11 +1263,10 @@ where
                         ),
                     },
                 ],
-                stream: false,
-                temperature: (!thinking_enabled).then_some(0.0),
-                max_tokens: Some(extraction_max_tokens),
-                data_classification: privacy::DataClassification::CaseRaw,
-            };
+        false,
+        (!thinking_enabled).then_some(0.0),
+        Some(extraction_max_tokens),
+    );
             let repair_output = match adapter.send_chat(&profile, &secret, &repair_request) {
                 Ok(response) => provider_completion_content(response)
                     .map(|output| redact_model_output(&output, &secret)),
@@ -2797,6 +2806,18 @@ mod tests {
     };
 
     #[test]
+    fn legacy_structured_extraction_redirect_is_typed_and_stops_before_transport() {
+        let transport_calls = std::cell::Cell::new(0_u32);
+        let result = require_approved_provider_case_route("structured_extraction").map(|_| {
+            transport_calls.set(transport_calls.get() + 1);
+        });
+        let error = result.expect_err("legacy case egress is redirected");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert!(error.message.contains("structured_extraction"));
+        assert_eq!(transport_calls.get(), 0);
+    }
+
+    #[test]
     fn manual_case_dates_require_real_iso_calendar_dates() {
         for valid in [None, Some("2024-02-29"), Some("2026-07-13")] {
             validate_optional_case_date("occurredOn", valid)
@@ -3249,9 +3270,12 @@ mod tests {
         assert_eq!(row.invalid_reason.as_deref(), Some("date_out_of_range"));
     }
 
-    fn assert_exact_case_receipt_gate(error: &IpcError) {
-        assert_eq!(error.error_type, "invalid_request");
-        assert!(error.message.contains("exact active redaction receipt"));
+    fn assert_unapproved_case_transport_gate(error: &IpcError) {
+        assert_eq!(
+            error.error_type,
+            ProviderErrorKind::InvalidRequest.as_str(),
+            "unapproved case authority must fail at the typed provider boundary",
+        );
     }
 
     fn assert_case_extraction_egress_blocked(
@@ -3265,7 +3289,7 @@ mod tests {
             generation_request(),
         )
         .expect_err("CASE_RAW extraction requires an exact active receipt");
-        assert_exact_case_receipt_gate(&error);
+        assert_unapproved_case_transport_gate(&error);
         assert_eq!(
             transport.request_count(),
             0,
@@ -3296,7 +3320,7 @@ mod tests {
             "Synthetic material".to_owned(),
         )
         .expect_err("CASE_RAW extraction requires an exact active receipt");
-        assert_exact_case_receipt_gate(&error);
+        assert_unapproved_case_transport_gate(&error);
         assert_eq!(transport.request_count(), 0);
     }
     #[test]

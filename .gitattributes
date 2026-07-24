@@ -1,2 +1,47 @@
+* text=auto eol=lf
+
+# Never pass packaged/binary payloads through text conversion.
+*.7z binary
+*.bin binary
+*.db binary
+*.dll binary
+*.docx binary
+*.exe binary
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.laocrpkg binary
+*.msi binary
+*.msix binary
+*.onnx binary
+*.pdf binary
+*.pdb binary
+*.png binary
+*.pt binary
+*.pth binary
+*.safetensors binary
 *.sqlite binary
+*.ttf binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.xz binary
+*.zip binary
+
 *.golden text eol=lf
+
+# Security and release inputs are hashed as raw bytes. Keep their checkout
+# representation identical to the committed blob on every platform.
+.gitattributes text eol=lf
+Cargo.lock text eol=lf
+LICENSE text eol=lf
+pnpm-lock.yaml text eol=lf
+crates/privacy/assets/local-ner-cn-legal-v1-final.json text eol=lf
+crates/privacy/tests/fixtures/*.json text eol=lf
+data/generated/*.json text eol=lf
+scripts/build_mineru_component_package.py text eol=lf
+scripts/build_production_mineru_worker.py text eol=lf
+workers/mineru/**/*.py text eol=lf
+workers/mineru/*.md text eol=lf
+workers/mineru/*.lock text eol=lf

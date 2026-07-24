@@ -1,16 +1,13 @@
 import { useEffect, useState } from "react";
 import {
-  backupUserDatabase,
   exportDiagnosticReport,
   getVersionInfo,
-  restoreUserDatabase,
   type VersionInfo,
 } from "./ipc/release/client";
 import {
   checkForApplicationUpdate,
   formatIpcError,
   installApplicationUpdate,
-  relaunchApplication,
   type ApplicationUpdate,
   type DownloadEvent,
 } from "./ipc/release/updater";
@@ -44,53 +41,6 @@ export function ReleaseWorkspace() {
       setVersionInfoError(formatIpcError(error));
     });
   }, []);
-
-  async function backup() {
-    if (operation !== "idle") return;
-    setOperation("maintenance");
-    try {
-      const result = await backupUserDatabase(null);
-      setStatus(result.cancelled ? "已取消备份。" : "备份已完成。 ");
-    } catch (error) {
-      setStatus(formatIpcError(error));
-    } finally {
-      setOperation("idle");
-    }
-  }
-
-  async function restore() {
-    if (operation !== "idle") return;
-    if (!window.confirm("恢复会替换当前用户数据库。确认继续？")) return;
-
-    setOperation("maintenance");
-    try {
-      const result = await restoreUserDatabase(null);
-      if (result.cancelled) {
-        setStatus("已取消恢复。");
-        setOperation("idle");
-        return;
-      }
-
-      if (result.restartRequired) {
-        setOperation("restarting");
-        setStatus("恢复完成，正在重启应用以加载新数据库……");
-        try {
-          await relaunchApplication();
-        } catch (error) {
-          setStatus(
-            `应用重启失败：${formatIpcError(error)}。请完全退出并重新打开应用，恢复内容才会生效。`,
-          );
-        }
-        return;
-      }
-
-      setStatus("恢复完成。");
-      setOperation("idle");
-    } catch (error) {
-      setStatus(formatIpcError(error));
-      setOperation("idle");
-    }
-  }
 
   async function exportDiagnostics() {
     if (operation !== "idle") return;
@@ -226,22 +176,12 @@ export function ReleaseWorkspace() {
       ) : null}
       <p className="muted">更新包必须通过内置公钥验签；安装完成后应用会立即重启。</p>
 
-      <h3>备份与恢复</h3>
-      <p className="muted">点击操作后，通过系统文件对话框选择备份文件，不在页面中显示本地位置。</p>
-      <div className="button-row">
-        <button type="button" disabled={operation !== "idle"} onClick={() => void backup()}>
-          导出备份
-        </button>
-        <button
-          type="button"
-          className="danger"
-          disabled={operation !== "idle"}
-          onClick={() => void restore()}
-        >
-          恢复备份
-        </button>
-      </div>
-      <p className="muted">恢复前会校验备份完整性与兼容性；成功后立即重启，失败时保持当前数据不变。</p>
+      <h3>完整应用加密备份与恢复</h3>
+      <p className="muted">
+        备份操作已统一迁移到“隐私与本地处理 → 隐私生命周期、映射与加密备份”。
+        该入口只使用原生文件对话框处理 <code>.lavbackup</code>，并把用户数据库、加密隐私 bundle、加密案件 Vault、已批准工作区归档与加密 work products 绑定为同一五组件认证备份集；
+        五组件会在重启时原子恢复或整体回滚；V2 三组件仅保留读取/恢复兼容，V1 与旧版明文单库恢复均 fail closed。
+      </p>
 
       <h3>隐私安全诊断</h3>
       <p className="muted">通过系统文件对话框选择保存位置；页面不会显示本地位置。</p>

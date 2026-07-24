@@ -2,7 +2,7 @@
 
 Rust-first legal-assistance platform with a cross-platform-targeted MCP server and an optional Windows Tauri 2 professional review station. WorkBuddy, Codex, and OpenCode share the same public-law MCP contract.
 
-Production MCP and all checked-in host integrations use `public_law_only`:
+Production defaults and the ordinary checked-in host integrations use `public_law_only`:
 
 ```text
 lawyer-assistance-mcp --privacy-profile public_law_only stdio
@@ -11,20 +11,24 @@ lawyer-assistance-mcp --privacy-profile public_law_only serve --bind 127.0.0.1:8
 
 Its exact surface is five read-only tools: `system_status`, `legal_search`, `legal_get_article`, `legal_get_versions`, and `legal_get_relations`. stdio and HTTP must expose the same names and order.
 
-The experimental `redacted_case` profile adds only receipt-gated `citation_validate` (six tools total). The App cannot yet issue a receipt bound to that MCP purpose, destination, and exact request bytes, so production remains on the public five. Case reads/writes, material import, gap analysis, document generation, and export are hidden in both profiles. Shared case/document implementations in `crates/legal-services` are not an external MCP capability.
+The experimental `redacted_case` profile still adds only receipt-gated `citation_validate` (six tools total) and remains separate from case-workspace authorization. The App does not issue that legacy citation-purpose receipt. Case reads/writes, material import, gap analysis, document generation, and path export remain hidden in both profiles; shared `legal-services` implementations are not external MCP capabilities.
 
-Provider transport also lacks an App-to-Provider case receipt path. It accepts only explicitly public legal/product classifications before serialization; legacy case-bearing requests are `CASE_RAW` and fail closed. Local App review and approval do not automatically authorize MCP or Provider egress.
+`approved_case_workspace` is a separate, disabled-by-default Windows stdio integration. After the App locally redacts and manually approves an immutable generation, current-machine qualification and an App-issued standalone session can authorize ten opaque-ID-only material/work-product tools. A formal App build also carries the SHA-256 of its exact paired MCP sibling as a compile-time trust anchor; an ordinary unbound development build or a substituted same-name binary cannot qualify. Work-product content is never stored as plaintext `content.bin`: each immutable version has exactly `content.envelope.json`, `manifest.json`, and `commit.json`; a fresh AES-256-GCM key/nonce protects the content, DPAPI CurrentUser wraps the key, and only the scoped `WorkProductService` may authenticate/decrypt after all source, revocation, manifest, filesystem, hash, and residual checks. Missing, stale, revoked, mismatched or replayed state, legacy plaintext, or an unexpected generation file fails closed; no prompt or client allowlist bypasses it.
+
+Provider transport has a separate approved positive path. Rust restores the protected generation and receipt, binds exact Provider/endpoint/model/purpose/provenance/expiry/revocation, rechecks immediately before transport, scans the response, and persists it as protected output. A naked or legacy case-bearing `ChatRequest` remains `CASE_RAW`, fails before serialization and sends zero requests. Local approval alone is never general MCP or Provider permission.
 
 MCP and repository prompts cannot prevent or retract a first message or attachment that a host sent before loading its Skill/Agent rules. Do not put client or case material into WorkBuddy, Codex, OpenCode, or another external model task.
 
-For local material preparation, PDF/DOCX/TXT/Markdown can enter the App's local extraction, automated redaction, human review, exact receipt and safe text-PDF workflow. The reconstructed PDF embeds a hash-pinned common CJK font; unsupported glyphs fail closed instead of rendering tofu. A confirmed lifecycle action deletes the App's protected review payload and every associated receipt while preserving hash-only audit; it never deletes the user-selected source or separately saved PDF.
+For local material preparation, PDF/DOCX/TXT/Markdown enter the App's bounded local extraction/OCR, automated finding/aliasing, side-by-side human review, residual scan and exact approval workflow. Approved content can be rebuilt as safe PDF, DOCX, UTF-8 TXT or Markdown; each file is re-read, hash/content checked and residual-scanned. Lifecycle actions revoke or logically/cryptographically delete protected state while preserving payload-free hash audit; they never delete a user-selected source or separately saved export.
+
+Local MinerU is connected to App ingestion through `auto_local` and `force_local`. It runs only after the App has signed a complete worker/config/runtime/model inventory, installed and remeasured exact Windows Firewall outbound blocks, completed the fixed synthetic canary, persisted qualification, and revalidated the current environment. Page/order/size/bbox/confidence/output limits, timeout/cancel, pre/post identity checks and process-tree containment fail closed. There is no model download, SSH/cloud/remote OCR or silent fallback.
 
 
 HTTP remains loopback-only by default. A non-loopback cleartext bind is rejected even with Bearer authentication; production remote access terminates TLS at a trusted reverse proxy connected to the loopback listener.
 
 ## Current Scope
 
-As of 2026-07-19, the historical engineering scope of Stages 0–7 remains implemented for local desktop use: offline legal retrieval, provider configuration, citation-grounded public-law answers, local case/evidence work, six local legal-document workflows, case/law graphs, and the Windows release/update/backup lifecycle. Stage 8 adds an assistant-first product layer and a local privacy/redaction workflow. The 2026-07-19 privacy hardening is a current constraint over those historical outcomes: case-bearing Provider requests fail closed, external MCP hosts receive only the public-law five-tool profile, and scanned/visual PDF processing remains blocked until local OCR is authenticated end to end. Authenticode certification and clean-machine Windows 10/11 qualification remain external release-operations gates:
+As of 2026-07-22, the historical engineering scope of Stages 0–8 remains available for local desktop use. Privacy vNext adds a qualification-gated local OCR chain, independent approved MCP and Provider positive paths, four reconstructed safe export formats, encrypted mapping/lifecycle administration, encrypted-at-rest work products, and a five-component application backup V3 covering the user database, encrypted privacy bundle, ciphertext-only case Vault archive, approved-workspace archive, and encrypted work-products archive. V2 three-component bundles remain read/restore-compatible; V1 fails closed. The public MCP default remains five-tool and case-free. Every case path is conditional on current signed backend evidence and exact purpose authorization; absence or drift fails closed. The updater key/password are available and detached catalog signature verification has succeeded, while final updater artifacts still await the clean signed build. The only currently evidenced external signing blocker is the missing usable Authenticode certificate; clean-machine Windows 10/11 reputation remains release acceptance work, not a privacy feature substitute:
 
 - Tauri 2 desktop shell for Windows x86_64
 - React, TypeScript, and Vite frontend
@@ -41,8 +45,8 @@ As of 2026-07-19, the historical engineering scope of Stages 0–7 remains imple
   - `get_law_versions`
   - `get_law_relations`
 - React offline search workspace with law results, article results, article details, versions, and relations
-- Conversation-first Assistant workspace with unbound or case-bound local conversations, bounded history, typed run events and cancellation; Provider transport is public-only and rejects case-bearing runs before serialization
-- Rust-side PDF, DOCX, UTF-8 TXT and Markdown privacy import with format checks and hard limits; reliable text-layer PDFs can be reviewed and exported as a font-embedded safe text PDF, protected review state can be explicitly revoked/deleted, while the MinerU runner is not connected by the App and scanned/visual PDFs fail closed
+- Conversation-first Assistant workspace with unbound or case-bound local conversations, bounded history, typed run events and cancellation; legacy case-bearing Provider calls fail before serialization, while the separate privacy-approved path restores and verifies exact protected payloads in Rust
+- Rust-side PDF, DOCX, UTF-8 TXT and Markdown privacy import with format checks and hard limits; reliable text layers use native extraction, qualified visual pages use the pinned local MinerU worker, and approved generations export as reconstructed PDF/DOCX/TXT/Markdown
 - Versioned Research, Document and Map Artifacts with source/provider/citation audit, safe Markdown, Rust-generated DOCX/JSON, fixed Cytoscape mapping, append-only edits and regeneration
 - Pending case-change proposals with case digest/CAS checks, explicit apply or reject, and no model-direct writes to confirmed case records
 - Provider profile CRUD with DeepSeek as the only default/top-level preset;
@@ -57,11 +61,11 @@ As of 2026-07-19, the historical engineering scope of Stages 0–7 remains imple
 - Provider settings page with a single DeepSeek quick-create action, collapsed optional/custom provider creation, model ID, Base URL, extension options, masked key status, and connection test results
 - Source-bounded legal answer context assembly from the local legal database
 - Citation parser and Rust-side validator for `[SRC:...]` source ids
-- Citation-grounded public-law answer command using BYOK provider profiles and in-process mock-provider tests; no case-bearing Provider egress path is enabled
+- Citation-grounded public-law answer command using BYOK Provider profiles; case-bearing tasks use only the separate exact-approved Provider workflow, never the public command
 - Legal answer records persisted with verified citation reports, not trusted raw model citations
 - React citation Q&A workspace with candidate sources, clickable verified inline citations, explicit invalid/duplicate marker styling, citation validation status, and local source text
 - Case project CRUD persisted in `user.sqlite`
-- MCP privacy profiles with a production `public_law_only` five-tool surface; experimental `redacted_case` adds one receipt-gated citation tool but has no App signing path, and all case/material/document tools remain hidden
+- MCP privacy profiles with a default `public_law_only` five-tool surface; experimental `redacted_case` adds one legacy receipt-gated citation tool; separately qualified `approved_case_workspace` adds ten opaque-ID-only approved material/work-product tools through App-issued sessions
 - Case workspace data model for files, parties, facts, evidence, legal issues, validated legal basis records, and explicit project-scoped fact-evidence/fact-issue links; composite database constraints reject cross-case relationships
 - Rust-side case gap analysis for timeline conflicts, party name inconsistencies, missing evidence support, missing source/date metadata, invalid evidence references, and open legal issues without validated legal basis
 - Case legal basis binding through local `[SRC:...]` source ids with Rust-side citation/effectiveness validation and read-only lookups against `legal_core.sqlite`
@@ -69,9 +73,9 @@ As of 2026-07-19, the historical engineering scope of Stages 0–7 remains imple
 - React case workspace with project list, editable persisted case files/parties/facts/evidence/issues, fact timeline, evidence catalog, legal basis panel, explicit fact-evidence and fact-issue link editors, gap panel, and extraction review panel
 - Six reviewed legal-document templates for local desktop workflows, with structured validation, local citation traceability, rendered Markdown/source preview, and pure-Rust PDF export; local approval/export does not grant MCP or Provider egress
 - Case and formal-law graph workspaces with namespaced identities, confirmed nodes, persisted fact-evidence/fact-issue/issue-citation edges, formal `law_relations`, provenance, filtering, search, layout controls, details and exact source jumps
-- Version information, atomic backup, validated restart-time restore, payload-free crash/maintenance events and redacted diagnostic export
+- Version information, authenticated five-component `.lavbackup` V3 for `user.sqlite`, the encrypted privacy bundle, ciphertext-only encrypted case Vault archive, approved-workspace archive and encrypted work-products archive; V2 three-component read/restore compatibility; staged restart restore with all-component rollback; privacy-only maintenance bundle; payload-free crash/maintenance events; and redacted diagnostic export
 - A signed-update protocol with strict GitHub URL policy, semantic-version checks, streaming download, Minisign verification, trusted-filename binding, NSIS handoff and stale-installer cleanup
-- Reproducible release scripts for Authenticode-signed NSIS, updater `latest.json`, deterministic portable ZIP, legal-resource identity verification and complete third-party notices
+- Reproducible release scripts for an explicitly named unsigned NSIS technical artifact, Authenticode-signed NSIS, updater `latest.json`, deterministic portable ZIP, MCP archive, legal-resource identity verification and complete third-party notices
 - Rust unit tests, Vitest, ESLint, and Windows GitHub Actions CI
 
 The complete archival database is generated from official public sources and is
@@ -94,15 +98,17 @@ fetch/audit payloads and the case/template corpora that the current UI does not
 query. The archival database and its strict-audit reports remain the coverage
 and rebuild authority.
 
-Stage 3 implements the compatibility legal-answer Tauri Channel streaming, cancellation, local citation
-validation and verified persistence. Stage 4 implements local case/evidence
-persistence, legal-basis binding, provider-driven structured extraction, one
-automatic repair, bounded review state, user confirmation and atomic
-persistence. Its legacy case-extraction flow still sends selected case-material
-summaries. Stage 8 separately imports the actual bytes of up to two selected
-PDF/DOCX/TXT/Markdown files through Rust and can expose their bounded extracted
-text to an Assistant run after the UI shows the exact scope. Embeddings and
-local-model workflows remain explicitly outside the product architecture.
+Stage 3 implements compatibility legal-answer Tauri Channel streaming,
+cancellation, local citation validation and verified persistence for public,
+non-case questions. Stage 4 and Stage 8 retain local case/evidence persistence
+and bounded local file extraction, but their historical naked-case Provider and
+Assistant routes are now fail-closed before transport. Case facts may leave the
+local privacy workflow only as a current, explicitly approved redacted
+generation whose receipt is rebound to the exact Provider or approved MCP
+destination, purpose, model, request and expiry. Selecting a case material,
+showing a scope, or extracting text never constitutes network authorization.
+Embeddings and silent local/remote model fallbacks remain outside the product
+architecture.
 
 The 2026-07-13 hardening pass adds bounded IPC text/array/response inputs,
 strict Gregorian `YYYY-MM-DD` validation, UUID v4 answer record ids, correct
@@ -112,12 +118,11 @@ links. It also repairs unmarked or legacy `user.sqlite` v6 shapes through one
 atomic canonical rebuild, serializes read-then-write transactions with
 `BEGIN IMMEDIATE`, rejects stale case-workspace responses, preserves finalized
 Q&A context across page changes, locks extraction navigation correctly, and
-supports editing persisted case child records. The declared engineering scope
-is complete. The native MCP control page has a local Windows release-app
-start/auth/stop/auto-start acceptance record; broader hands-on GUI,
-clean-machine, signing, SmartScreen, AV/EDR, and Windows 10/11 qualification
-remain required release-operations evidence and do not reopen completed
-application development.
+supports editing persisted case child records. Privacy-vNext delivery status is
+schema, negative-only gate or package build is not treated as a completed
+positive workflow. Native MCP, packaged-app GUI, clean-machine, signing,
+SmartScreen, AV/EDR and Windows-version evidence are reported separately so
+external qualification is never confused with implemented product behavior.
 
 ## Repository Data Policy
 
@@ -171,8 +176,9 @@ Every formal Tauri build runs the read-only resource gate before compilation.
 ## Project Documents
 
 - [MCP architecture, tools, installation and host integrations](docs/mcp/README.md)
+- [Privacy vNext operations guide](docs/privacy-vnext/OPERATIONS.md)
 - [MCP security and privacy](docs/mcp/security-and-privacy.md)
-- [v0.3.1 privacy-hardening release notes and MCP compatibility](RELEASE_NOTES.md)
+- [v0.4.0-beta.2 Privacy vNext prerelease notes and MCP compatibility](RELEASE_NOTES.md)
 - [WorkBuddy integration package](integrations/workbuddy/README.md)
 - [Codex integration package](integrations/codex/README.md)
 - [OpenCode integration package](integrations/opencode/README.md)
@@ -210,10 +216,17 @@ pnpm test
 pnpm build
 python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
 python data/build/audit_provider_security.py
+python -m unittest discover -s workers/mineru/tests -t workers/mineru -p "test_*.py" -v
+python -m unittest scripts.test_build_production_mineru_worker scripts.test_build_mineru_component_package
+python -m unittest integrations.test_validate_examples integrations.test_validate_approved_workspace_examples
+python integrations/validate_examples.py
+python integrations/validate_approved_workspace_examples.py
 python apps/desktop/scripts/verify_legal_resource.py
 python -m unittest scripts.test_generate_third_party_notices
 python scripts/generate_third_party_notices.py --check
 python -m unittest scripts.test_package_mcp_release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_qualify_local_mineru.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-standalone-approved-mcp.ps1
 ```
 
 Run the repeatable Provider secret/logging audit:
@@ -259,6 +272,18 @@ Build a fresh deterministic portable ZIP from a clean commit:
 ```powershell
 pnpm --filter @lawyer-assistance/desktop release:portable
 ```
+
+Build the explicitly unsigned NSIS technical prerelease from a clean commit:
+
+```powershell
+pnpm --filter @lawyer-assistance/desktop release:installer:unsigned
+```
+
+It emits `Lawyer.Assistance_<version>_windows-x86_64-unsigned-setup.exe`,
+its `.sha256`, and `.manifest.json`. The script verifies `signed=false`,
+`updaterArtifactGenerated=false`, and refuses signing secrets. It does not
+generate `latest.json` or an updater `.sig`; never rename this artifact to look
+signed.
 
 Build the formal Authenticode-signed NSIS, updater signature, `latest.json`, and
 signed portable ZIP. The updater key password must come from the release secret

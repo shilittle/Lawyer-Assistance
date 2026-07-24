@@ -29,6 +29,14 @@ class ProviderSecurityAuditTests(unittest.TestCase):
 
         self.assertEqual(findings, [])
 
+    def test_allows_explicitly_marked_fake_bearer_in_contract_tests(self) -> None:
+        findings = scan_text(
+            Path("example.rs"),
+            'let authorization = "Bearer not-a-real-synthetic-contract-token";',
+        )
+
+        self.assertEqual(findings, [])
+
     def test_rejects_sensitive_logging_even_for_runtime_variables(self) -> None:
         findings = scan_text(
             Path("example.ts"),

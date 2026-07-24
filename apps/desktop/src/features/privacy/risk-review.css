@@ -1,0 +1,82 @@
+.privacy-risk-panel {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border-color, #cbd5e1);
+  border-radius: 0.75rem;
+  background: var(--panel-background, #fff);
+}
+.privacy-risk-overview,
+.privacy-risk-toolbar,
+.privacy-risk-explanation > header,
+.privacy-risk-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.privacy-readiness { display: grid; min-width: 8rem; text-align: center; }
+.privacy-readiness strong { font-size: 2rem; }
+.privacy-risk-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.5rem;
+  margin: 0;
+}
+.privacy-risk-metrics > div,
+.privacy-auto-decision,
+.privacy-risk-pages article {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.65rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.5rem;
+}
+.privacy-risk-metrics dt { font-size: 0.8rem; color: #475569; }
+.privacy-risk-metrics dd { margin: 0; font-weight: 700; }
+.privacy-auto-decision { border-inline-start: 0.35rem solid #2563eb; }
+.privacy-risk-blocker { font-weight: 700; color: #991b1b; }
+.privacy-hard-gates ol {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: 0.4rem;
+  padding: 0;
+  list-style-position: inside;
+}
+.privacy-hard-gates li { display: grid; grid-template-columns: 1.2rem minmax(10rem, auto) 1fr; gap: 0.35rem; padding: 0.45rem; border: 1px solid #cbd5e1; border-radius: 0.4rem; }
+.privacy-hard-gates .is-pass { border-inline-start: 0.35rem solid #15803d; }
+.privacy-hard-gates .is-fail { border-inline-start: 0.35rem solid #b91c1c; font-weight: 600; }
+.privacy-risk-toolbar label { display: flex; align-items: center; gap: 0.35rem; }
+.privacy-risk-layout { display: grid; grid-template-columns: minmax(13rem, 0.8fr) minmax(18rem, 2fr); gap: 0.75rem; }
+.privacy-risk-pages,
+.privacy-risk-findings { display: grid; align-content: start; gap: 0.45rem; max-height: 36rem; overflow: auto; }
+.privacy-risk-finding { display: grid; grid-template-columns: 1.4rem 1fr; gap: 0.2rem 0.5rem; text-align: start; padding: 0.65rem; border: 1px solid #94a3b8; border-inline-start-width: 0.45rem; background: #fff; color: #0f172a; }
+.privacy-risk-finding > span:not(.risk-icon) { grid-column: 2; }
+.privacy-risk-finding.is-p0 { border-inline-start-color: #b91c1c; }
+.privacy-risk-finding.is-p1 { border-inline-start-color: #c2410c; }
+.privacy-risk-finding.is-p2,
+.privacy-risk-finding.is-uncertain { border-inline-start-color: #a16207; }
+.privacy-risk-finding.is-p3 { border-inline-start-color: #64748b; background: #f1f5f9; }
+.privacy-risk-finding.has-conflict { outline: 2px dashed #c2410c; }
+.privacy-risk-finding.is-cluster-selected { box-shadow: 0 0 0 3px #2563eb; }
+.privacy-risk-finding[aria-pressed="true"] { outline: 3px solid #1d4ed8; outline-offset: 2px; }
+.risk-icon { display: inline-grid; place-items: center; width: 1.25rem; height: 1.25rem; border: 1px solid currentColor; border-radius: 50%; font-weight: 900; }
+.privacy-risk-explanation { padding: 0.75rem; border: 1px solid #94a3b8; border-radius: 0.5rem; }
+.privacy-risk-explanation dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 0.5rem; }
+.privacy-risk-explanation dl > div { min-width: 0; }
+.privacy-risk-explanation dd { margin: 0.2rem 0 0; overflow-wrap: anywhere; }
+.privacy-risk-actions,
+.privacy-risk-edit-grid { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; margin-top: 0.75rem; }
+.privacy-risk-edit-grid label { display: grid; gap: 0.25rem; min-width: 12rem; }
+.privacy-risk-footer .is-danger { border-color: #b91c1c; color: #991b1b; }
+@media (max-width: 860px) {
+  .privacy-risk-layout { grid-template-columns: 1fr; }
+  .privacy-hard-gates li { grid-template-columns: 1.2rem 1fr; }
+  .privacy-hard-gates li span:last-child { grid-column: 2; }
+}
+@media (forced-colors: active) {
+  .privacy-risk-finding,
+  .privacy-hard-gates li { border-width: 2px; }
+  .privacy-risk-finding.is-cluster-selected { outline: 3px solid Highlight; }
+}

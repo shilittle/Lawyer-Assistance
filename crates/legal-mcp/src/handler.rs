@@ -47,6 +47,9 @@ impl ServerHandler for LegalMcpServer {
             crate::registry::PrivacyProfile::RedactedCase => {
                 "Redacted-case profile. Only citation_validate is added, and every call requires an App-issued rct_v1 receipt bound to the exact approved CitationValidateRequest bytes, ExternalMcpHost destination, fixed purpose, and TTL. Page-material receipts cannot be reused. If the Windows receipt key or persisted receipt state is unavailable, the tool remains listed but every call fails closed. Raw OCR, paths, case state, writes, generation, and export remain unavailable. Both result channels are privacy-scanned."
             }
+            crate::registry::PrivacyProfile::ApprovedCaseWorkspace => {
+                "Approved-case-workspace profile. Ten opaque-ID-only case and work-product tools execute only through signed approved generations and exact App-signed read/write grants. Send only each tool's declared business arguments: access_ticket is an internal broker capability and is rejected on the host wire. The broker validates the live descriptor, qualification, revocation epoch, transport, JSON-RPC request identity, canonical request, tool and purpose before issuing and immediately consuming a one-time internal ticket. Missing qualification, grant mismatch, expiry, revocation, binding mismatch, or replay fails closed. Paths, filenames, raw OCR, pending review content, private mappings, and vault diagnostics are never accepted. Both result channels are independently privacy-scanned."
+            }
         };
 
         ServerInfo::new(capabilities)
@@ -99,8 +102,21 @@ impl ServerHandler for LegalMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let mut request_params = serde_json::to_value(&request)
+            .map_err(|_| ErrorData::invalid_params("Invalid tools/call params.", None))?;
+        let request_meta = serde_json::to_value(&context.meta)
+            .map_err(|_| ErrorData::invalid_params("Invalid tools/call metadata.", None))?;
+        if request_meta
+            .as_object()
+            .is_some_and(|meta| !meta.is_empty())
+        {
+            request_params
+                .as_object_mut()
+                .ok_or_else(|| ErrorData::invalid_params("Invalid tools/call params.", None))?
+                .insert("_meta".to_owned(), request_meta);
+        }
         let name = request.name.into_owned();
         if self.registry.get(&name).is_none() {
             return Err(ErrorData::new(
@@ -109,7 +125,16 @@ impl ServerHandler for LegalMcpServer {
                 None,
             ));
         }
-        self.adapter.call(&name, request.arguments).await
+        let request_id = serde_json::to_value(context.id)
+            .map_err(|_| ErrorData::invalid_params("Invalid JSON-RPC request id.", None))?;
+        self.adapter
+            .call_with_request_id(
+                &name,
+                request.arguments,
+                Some(request_id),
+                Some(request_params),
+            )
+            .await
     }
 }
 

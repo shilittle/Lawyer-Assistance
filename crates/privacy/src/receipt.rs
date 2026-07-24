@@ -1,7 +1,11 @@
+use crate::vnext::{CaseId, Sha256Hex};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 pub const RECEIPT_TOKEN_PREFIX: &str = "rct_v1";
 pub const MIN_RECEIPT_KEY_BYTES: usize = 32;
@@ -124,6 +128,27 @@ impl ReceiptSigner {
             return Err(ReceiptError::KeyTooShort);
         }
         Ok(Self { key: key.to_vec() })
+    }
+
+    /// Creates a per-installation, per-case HMAC fingerprint without exposing the signing key.
+    /// The temporary message copy is explicitly zeroed before return.
+    pub fn case_value_fingerprint(
+        &self,
+        case_id: &CaseId,
+        private_value: &str,
+    ) -> Result<Sha256Hex, ReceiptError> {
+        if private_value.is_empty() || private_value.len() > 4 * 1024 * 1024 {
+            return Err(ReceiptError::InvalidClaims);
+        }
+        let mut message = Vec::with_capacity(64 + case_id.as_str().len() + private_value.len());
+        message.extend_from_slice(b"LawyerAssistance/private-value-fingerprint/v1\0");
+        message.extend_from_slice(case_id.as_str().as_bytes());
+        message.push(0);
+        message.extend_from_slice(private_value.as_bytes());
+        let fingerprint = hex(&hmac_sha256(&self.key, &message));
+        message.fill(0);
+        compiler_fence(Ordering::SeqCst);
+        Sha256Hex::parse(fingerprint).map_err(|_| ReceiptError::InvalidClaims)
     }
 
     pub fn issue(
@@ -430,5 +455,42 @@ mod tests {
             signer.verify(&receipt, &context(payload, &receipt.claims.destination)),
             Err(ReceiptError::NotApproved)
         );
+    }
+
+    #[test]
+    fn private_value_fingerprint_is_deterministic_and_case_key_scoped() {
+        let case_one =
+            CaseId::parse("case_11111111111111111111111111111111").expect("first synthetic case");
+        let case_two =
+            CaseId::parse("case_22222222222222222222222222222222").expect("second synthetic case");
+        let signer_one = ReceiptSigner::new([3u8; 32]).expect("first installation key");
+        let signer_two = ReceiptSigner::new([4u8; 32]).expect("second installation key");
+        let private_value = "synthetic-private-value-zhang-san";
+
+        let first = signer_one
+            .case_value_fingerprint(&case_one, private_value)
+            .expect("fingerprint");
+        assert_eq!(
+            first,
+            signer_one
+                .case_value_fingerprint(&case_one, private_value)
+                .expect("stable fingerprint")
+        );
+        assert_ne!(
+            first,
+            signer_one
+                .case_value_fingerprint(&case_two, private_value)
+                .expect("case scope")
+        );
+        assert_ne!(
+            first,
+            signer_two
+                .case_value_fingerprint(&case_one, private_value)
+                .expect("key scope")
+        );
+        assert!(matches!(
+            signer_one.case_value_fingerprint(&case_one, ""),
+            Err(ReceiptError::InvalidClaims)
+        ));
     }
 }

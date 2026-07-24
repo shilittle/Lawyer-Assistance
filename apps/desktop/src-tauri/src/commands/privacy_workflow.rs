@@ -1,10 +1,12 @@
 use crate::{
-    privacy_manager::PrivacyManager,
+    privacy_manager::{OcrMode, PrivacyManager, PrivacyManagerError},
     privacy_workflow::{
-        ApprovePrivacyReviewRequest, ApprovePrivacyReviewResponse, BuiltSafePdf,
-        DeletePrivacyReviewRequest, DeletePrivacyReviewResponse, ExportApprovedReviewPdfRequest,
-        LoadPrivacyReviewRequest, PreparePrivacyMaterialRequest, PreparePrivacyMaterialResponse,
-        PrivacyReviewView, PrivacyWorkflowError, PrivacyWorkflowManager,
+        ApplyPrivacyRiskReviewActionRequest, ApprovePrivacyReviewRequest,
+        ApprovePrivacyReviewResponse, BuiltSafePdf, DeletePrivacyReviewRequest,
+        DeletePrivacyReviewResponse, ExportApprovedReviewPdfRequest, LoadPrivacyReviewRequest,
+        LocalOcrExecutionContext, PreparePrivacyMaterialRequest, PreparePrivacyMaterialResponse,
+        PrivacyReviewView, PrivacyRiskReviewRevisionRequest, PrivacyWorkflowError,
+        PrivacyWorkflowManager,
     },
 };
 use serde::Serialize;
@@ -26,6 +28,15 @@ use windows_sys::Win32::Storage::FileSystem::{
 pub struct IpcError {
     pub error_type: String,
     pub message: String,
+}
+
+impl From<PrivacyManagerError> for IpcError {
+    fn from(error: PrivacyManagerError) -> Self {
+        Self {
+            error_type: error.code().to_owned(),
+            message: providers::redact_sensitive(error.message()),
+        }
+    }
 }
 
 impl From<PrivacyWorkflowError> for IpcError {
@@ -51,7 +62,10 @@ pub async fn prepare_privacy_material(
             .dialog()
             .file()
             .set_title("选择要在本机脱敏的材料")
-            .add_filter("支持的材料", &["pdf", "docx", "txt", "md", "markdown"])
+            .add_filter(
+                "支持的材料",
+                &["pdf", "png", "jpg", "jpeg", "docx", "txt", "md", "markdown"],
+            )
             .blocking_pick_file();
         let Some(selected) = selected else {
             return Ok(PreparePrivacyMaterialResponse {
@@ -64,10 +78,46 @@ pub async fn prepare_privacy_material(
             message: "所选材料不是本地文件。".to_owned(),
         })?;
         let config = configuration.current_config();
-        let ocr_status = configuration.local_ocr_status();
-        let review = workflow
-            .prepare_selected_material(&path, &config, &ocr_status, request.custom_terms)
+        let ocr_status = configuration.local_ocr_status().map_err(IpcError::from)?;
+        let mineru_config = match config.ocr.mode {
+            OcrMode::Off => None,
+            OcrMode::ForceLocal => configuration
+                .local_mineru_config()
+                .map_err(IpcError::from)?,
+            OcrMode::AutoLocal => match configuration.local_mineru_config() {
+                Ok(value) => value,
+                Err(error) if error.code() == "ocr_derived_publication_invalidation_failed" => {
+                    return Err(error.into());
+                }
+                Err(_) => None,
+            },
+        };
+        let ocr_qualification = mineru_config
+            .as_ref()
+            .map(|_| configuration.local_ocr_qualification_snapshot())
+            .transpose()
             .map_err(IpcError::from)?;
+        let review = match workflow.prepare_selected_material_with_qualification(
+            &path,
+            &config,
+            &ocr_status,
+            LocalOcrExecutionContext {
+                mineru_config: mineru_config.as_ref(),
+                qualification: ocr_qualification.as_ref(),
+            },
+            request.case_id,
+            request.custom_terms,
+        ) {
+            Ok(review) => review,
+            Err(error) => {
+                if local_ocr_error_revokes_qualification(error.code()) {
+                    configuration
+                        .revoke_local_mineru_qualification()
+                        .map_err(IpcError::from)?;
+                }
+                return Err(error.into());
+            }
+        };
         Ok(PreparePrivacyMaterialResponse {
             cancelled: false,
             review: Some(review),
@@ -78,6 +128,22 @@ pub async fn prepare_privacy_material(
         error_type: "runtime_failure".to_owned(),
         message: "本地材料处理任务未完成。".to_owned(),
     })?
+}
+
+fn local_ocr_error_revokes_qualification(code: &str) -> bool {
+    matches!(
+        code,
+        "ocr_worker_untrusted"
+            | "ocr_worker_isolation_unverified"
+            | "ocr_process_containment_unavailable"
+            | "ocr_config_unsafe"
+            | "ocr_runtime_untrusted"
+            | "ocr_runtime_changed"
+            | "ocr_worker_protocol_violation"
+            | "ocr_worker_unhealthy"
+            | "ocr_worker_identity_mismatch"
+            | "ocr_model_untrusted"
+    )
 }
 
 #[tauri::command]
@@ -110,6 +176,65 @@ pub async fn load_latest_privacy_review(
 }
 
 #[tauri::command]
+pub async fn load_privacy_risk_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: LoadPrivacyReviewRequest,
+) -> Result<privacy::ReviewStateViewV1, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.load_risk_review(&request.redaction_id))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "Local risk review load task did not complete.".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn apply_privacy_risk_review_action(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: ApplyPrivacyRiskReviewActionRequest,
+) -> Result<PrivacyReviewView, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.apply_risk_review_action(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "Local risk review action task did not complete.".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn undo_privacy_risk_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: PrivacyRiskReviewRevisionRequest,
+) -> Result<PrivacyReviewView, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.undo_risk_review(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "Local risk review undo task did not complete.".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn redo_privacy_risk_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: PrivacyRiskReviewRevisionRequest,
+) -> Result<PrivacyReviewView, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.redo_risk_review(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "Local risk review redo task did not complete.".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+#[tauri::command]
 pub async fn delete_privacy_review(
     workflow: State<'_, PrivacyWorkflowManager>,
     request: DeletePrivacyReviewRequest,
@@ -130,7 +255,7 @@ pub async fn approve_privacy_review(
     request: ApprovePrivacyReviewRequest,
 ) -> Result<ApprovePrivacyReviewResponse, IpcError> {
     let workflow = workflow.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || workflow.approve_review(request))
+    tauri::async_runtime::spawn_blocking(move || workflow.approve_local_safe_export_review(request))
         .await
         .map_err(|_| IpcError {
             error_type: "runtime_failure".to_owned(),
@@ -150,6 +275,7 @@ pub struct ExportApprovedReviewPdfResponse {
     pub output_page_count: u32,
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn export_approved_review_pdf(
     app: tauri::AppHandle,
@@ -251,6 +377,7 @@ pub async fn export_approved_review_pdf(
     })?
 }
 
+#[allow(dead_code)]
 fn validate_safe_pdf_destination(path: &Path) -> Result<(), IpcError> {
     if !crate::privacy_manager::is_normal_local_absolute(path)
         || !crate::privacy_manager::local_path_chain_is_ordinary(path)
@@ -300,6 +427,7 @@ fn validate_safe_pdf_destination(path: &Path) -> Result<(), IpcError> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn install_safe_pdf<Authorize>(
     path: &Path,
     built: &BuiltSafePdf,

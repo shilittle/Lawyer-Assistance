@@ -2,15 +2,27 @@ use crate::privacy_manager::{LocalOcrStatus, OcrMode as ConfigOcrMode, PrivacyCo
 use file_ingest::FileFormat;
 use material_processing::{
     approved_text_sha256, reconstruct_approved_text_pdf, ApprovedTextPage, BackendTrace,
-    ExtractionBackend, OcrMode, PageExtractionDecision, ProcessedSpan, ProcessingError,
-    ProcessingLimits, QualityReasonCode, SafePdfArtifact, SafePdfExportError, SafePdfExportLimits,
-    SafePdfExportRequest, SpanKind, TextLayerAssessment,
+    ExtractionBackend, LocalMineruConfig, OcrMode, PageExtractionDecision, ProcessedSpan,
+    ProcessingError, ProcessingLimits, QualityReasonCode, SafePdfArtifact, SafePdfExportError,
+    SafePdfExportLimits, SafePdfExportRequest, SpanKind, TextLayerAssessment,
+};
+use material_processing::{InputTransformTrace, RasterImageFormat};
+use privacy::risk_engine::{
+    DocumentAssessmentV1, PageAssessmentV1, QualificationSnapshotV1, RequestedApprovalRoute,
+    RiskPolicyV1,
+};
+use privacy::vnext::{
+    canonical_json_v1, AutoApprovalPolicyMode, CaseId, ConfidencePpm, FindingSeverity, MaterialId,
+    PrivacyFindingV1, Sha256Hex, WorkspaceInstanceId,
 };
 use privacy::{
-    scan_residual, sha256_hex, ActiveReceiptVerification, DataClassification, DestinationKind,
-    DestinationScope, EgressCandidate, EgressPolicyEngine, PrivacyEgressAuditRecord, PrivacyStore,
-    PrivacyStoreError, ReceiptSigner, RedactionOptions, RedactionReceiptClaims, RedactionSummary,
-    Redactor, RegisterPrivacyMaterial, ReviewState, SaveReviewDraft, REDACTION_VERSION,
+    scan_residual, sha256_hex, vault_store::VaultIsolationStatusV1, ActiveReceiptVerification,
+    DataClassification, DestinationKind, DestinationScope, EgressCandidate, EgressPolicyEngine,
+    LifecycleError, PrivacyEgressAuditRecord, PrivacyLifecycle, PrivacyStore, PrivacyStoreError,
+    ReceiptSigner, RedactionOptions, RedactionReceiptClaims, RedactionSummary, Redactor,
+    RegisterPrivacyMaterial, ReviewActionV1, ReviewSessionInputV1, ReviewSessionV1, ReviewState,
+    ReviewStateViewV1, SaveReviewDraft, SaveRiskReviewRevision, SensitiveMappingEntryV1,
+    SensitiveMappingPayloadV1, VerifiedReviewActionContextV1, REDACTION_VERSION,
 };
 use providers::{
     windows_credentials::WindowsCredentialStore, ApiSecret, CredentialStore, ProviderCredentialKey,
@@ -18,7 +30,7 @@ use providers::{
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, OpenOptions},
     io::Read,
@@ -33,6 +45,33 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
 };
 
+mod approved_provider;
+pub(crate) mod approved_workspace;
+mod case_dictionary_store;
+mod lifecycle_admin;
+mod local_detection;
+mod provider_qualification;
+mod safe_derived;
+mod vault_broker;
+#[allow(unused_imports)]
+pub use approved_provider::{
+    ApproveApprovedProviderTaskRequest, ApproveApprovedProviderTaskResponse,
+    ApprovedProviderOutput, ApprovedProviderOutputSummary, ApprovedProviderPriorOutputRef,
+    ApprovedProviderTask, DispatchApprovedProviderRequest, DispatchApprovedProviderResponse,
+    ListApprovedProviderOutputsRequest, LoadApprovedProviderOutputRequest,
+    RevokeApprovedProviderOutputRequest,
+};
+pub use lifecycle_admin::{
+    BackupIdRequest, CleanupReportView, DestroyMappingKeyRequest, LifecycleStatusRequest,
+    LifecycleStatusView, RetentionPolicyView, RevealMappingRequest, RevealMappingResponse,
+    RevokeMappingRequest, RotateMappingKeyRequest, RunRetentionSweepRequest, SetLegalHoldRequest,
+    SetRetentionPolicyRequest, StagePrivacyRestoreRequest, VerifiedBackupView,
+};
+pub use provider_qualification::{
+    ProviderQualificationRequest, ProviderQualificationRunRequest, ProviderQualificationStatus,
+};
+pub use safe_derived::{export_reason, ExportApprovedPrivacyReviewRequest, SafeExportFormat};
+
 const PRIVACY_DIRECTORY_NAME: &str = "privacy";
 const PRIVACY_DATABASE_NAME: &str = "privacy-workflow.sqlite";
 const MAX_SELECTED_FILE_BYTES: u64 = file_ingest::MAX_FILE_BYTES as u64;
@@ -40,12 +79,15 @@ const FILE_INGEST_PROCESSING_VERSION: &str = "lawyer-assistance-file-ingest-v1";
 const POLICY_ID: &str = "cn-legal-default";
 const POLICY_VERSION: u32 = 1;
 const REVIEW_PAYLOAD_SCHEMA_VERSION: u16 = 1;
+const RISK_WORKFLOW_STATE_SCHEMA_VERSION: &str = "privacy-risk-workflow-state-v1";
 const APPROVED_PAYLOAD_SCHEMA_VERSION: u16 = 1;
 const RECEIPT_KEY_VERSION: u32 = 1;
 const RECEIPT_KEY_SERVICE: &str = "LawyerAssistancePrivacy";
 const RECEIPT_KEY_PROVIDER: &str = "redaction-receipt-signing";
 const RECEIPT_KEY_ACCOUNT: &str = "v1";
+#[allow(dead_code)]
 const LOCAL_SAFE_PDF_DESTINATION_IDENTIFIER: &str = "local-safe-pdf-export-v1";
+#[allow(dead_code)]
 const LOCAL_SAFE_PDF_PURPOSE: &str = "local_safe_pdf_export";
 const MAX_FORBIDDEN_CANARIES: usize = 10_000;
 const MAX_SINGLE_CANARY_BYTES: usize = 16 * 1024;
@@ -104,6 +146,17 @@ impl PrivacyWorkflowError {
     fn store(error: PrivacyStoreError) -> Self {
         Self::new(error.code(), "本机隐私数据库操作失败。")
     }
+
+    fn lifecycle(error: LifecycleError) -> Self {
+        Self::new(error.code(), "本机隐私生命周期操作失败。")
+    }
+
+    fn vault(error: privacy::vault_store::VaultStoreError) -> Self {
+        Self::new(
+            error.code(),
+            "本机加密案卷库操作失败；未进行明文或网络回退。",
+        )
+    }
 }
 
 impl fmt::Display for PrivacyWorkflowError {
@@ -117,6 +170,8 @@ impl std::error::Error for PrivacyWorkflowError {}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparePrivacyMaterialRequest {
+    #[serde(default)]
+    pub case_id: Option<String>,
     #[serde(default)]
     pub custom_terms: Vec<String>,
 }
@@ -136,6 +191,22 @@ pub struct LoadPrivacyReviewRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApplyPrivacyRiskReviewActionRequest {
+    pub redaction_id: String,
+    pub expected_revision: u64,
+    pub actor: String,
+    pub edited_pages: Vec<EditedRedactedPage>,
+    pub action: ReviewActionV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrivacyRiskReviewRevisionRequest {
+    pub redaction_id: String,
+    pub expected_revision: u64,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeletePrivacyReviewRequest {
     pub redaction_id: String,
     pub expected_source_sha256: String,
@@ -146,6 +217,16 @@ pub struct DeletePrivacyReviewRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DeletePrivacyReviewResponse {
     pub deleted: bool,
+}
+
+/// Public-safe pointer to the real encrypted mapping revision. It contains no mapping plaintext
+/// and is intended for exact downstream binding (for example, a future approved-MCP ticket).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct CurrentMappingRevisionBindingV1 {
+    pub mapping_id: String,
+    pub revision: u64,
+    pub mapping_revision_hash: Sha256Hex,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +244,10 @@ pub struct ReviewPageView {
 pub struct PrivacyReviewView {
     pub redaction_id: String,
     pub material_id: String,
+    pub case_id: Option<String>,
+    pub vault_object_id: Option<String>,
+    pub vault_object_version: Option<u64>,
+    pub vault_isolation: Option<VaultIsolationStatusV1>,
     pub source_display_name: String,
     pub source_sha256: String,
     pub extraction_sha256: String,
@@ -170,10 +255,45 @@ pub struct PrivacyReviewView {
     pub processing_version: String,
     pub media_type: String,
     pub page_count: u32,
+    pub input_transform: Option<InputTransformTrace>,
     pub backend_trace: Vec<BackendTrace>,
     pub summary: RedactionSummary,
     pub review_state: String,
     pub pages: Vec<ReviewPageView>,
+    pub risk_review: Option<ReviewStateViewV1>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovedPrivacyReviewSelection {
+    pub redaction_id: String,
+    pub material_id: String,
+    pub case_id: String,
+    pub approved_payload_sha256: String,
+    pub mcp_publish_approved: bool,
+    pub mcp_publish_approval_expires_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApproveReviewForApprovedWorkspaceRequest {
+    pub redaction_id: String,
+    pub expected_approved_payload_sha256: String,
+    pub reviewer: String,
+    pub ttl_seconds: u64,
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveReviewForApprovedWorkspaceResponse {
+    pub receipt_id: String,
+    pub approved_payload_sha256: String,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub destination_identifier: String,
+    pub purpose: String,
+    pub mcp_publish_approved: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -194,6 +314,8 @@ pub struct ReceiptDestinationInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovePrivacyReviewRequest {
     pub redaction_id: String,
+    #[serde(default)]
+    pub expected_risk_revision: Option<u64>,
     pub expected_suggested_redacted_sha256: String,
     pub edited_pages: Vec<EditedRedactedPage>,
     pub reviewer: String,
@@ -206,7 +328,9 @@ pub struct ApprovePrivacyReviewRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovePrivacyReviewResponse {
     pub receipt_id: String,
+    #[serde(skip_serializing)]
     pub receipt_token: String,
+    #[serde(skip_serializing)]
     pub approved_payload_json: String,
     pub approved_payload_sha256: String,
     pub redacted_content_sha256: String,
@@ -218,6 +342,7 @@ pub struct ApprovePrivacyReviewResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExportApprovedReviewPdfRequest {
     pub redaction_id: String,
@@ -228,6 +353,7 @@ pub struct ExportApprovedReviewPdfRequest {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct BuiltSafePdf {
     pub bytes: Vec<u8>,
     pub sha256: String,
@@ -253,12 +379,26 @@ struct StoredReviewPayload {
     schema_version: u16,
     material_id: String,
     redaction_id: String,
+    #[serde(default)]
+    case_id: Option<String>,
+    #[serde(default)]
+    vault_object_id: Option<String>,
+    #[serde(default)]
+    vault_object_version: Option<u64>,
+    #[serde(default)]
+    vault_isolation: Option<VaultIsolationStatusV1>,
+    /// Sensitive filenames remain inside the encrypted review payload. Public SQLite rows keep
+    /// only `source_name_sha256`.
+    #[serde(default)]
+    source_display_name: String,
     source_sha256: String,
     extraction_sha256: String,
     suggested_redacted_content_sha256: String,
     processing_version: String,
     media_type: String,
     page_count: u32,
+    #[serde(default)]
+    input_transform: Option<InputTransformTrace>,
     backend_trace: Vec<BackendTrace>,
     summary: RedactionSummary,
     forbidden_canaries: Vec<String>,
@@ -273,6 +413,7 @@ struct LocalExtractedDocument {
     media_type: String,
     page_count: u32,
     backend_trace: Vec<BackendTrace>,
+    input_transform: Option<InputTransformTrace>,
     segments: Vec<LocalExtractedSegment>,
 }
 
@@ -309,6 +450,17 @@ struct ApprovedPayload<'a> {
     pages: &'a [CanonicalRedactedPage],
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicationTargetBindingV1<'a> {
+    schema_version: &'static str,
+    destination_kind: &'a DestinationKind,
+    destination_identifier: &'a str,
+    purpose: &'a str,
+    approved_payload_sha256: &'a str,
+    redacted_content_sha256: &'a str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OwnedApprovedPayload {
@@ -319,16 +471,78 @@ struct OwnedApprovedPayload {
     pages: Vec<CanonicalRedactedPage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRiskWorkflowStateV1 {
+    schema_version: String,
+    session: ReviewSessionV1,
+    current_pages: Vec<CanonicalRedactedPage>,
+    undo_pages: Vec<Vec<CanonicalRedactedPage>>,
+    redo_pages: Vec<Vec<CanonicalRedactedPage>>,
+}
+
+struct PrepareMaterialBytesInput<'a> {
+    bytes: &'a [u8],
+    source_display_name: String,
+    config: &'a PrivacyConfig,
+    ocr_status: &'a LocalOcrStatus,
+    mineru_config: Option<&'a LocalMineruConfig>,
+    ocr_qualification: Option<&'a QualificationSnapshotV1>,
+    custom_terms: Vec<String>,
+    vault_binding: Option<&'a vault_broker::VaultImportBinding>,
+}
+#[derive(Clone, Copy)]
+pub struct LocalOcrExecutionContext<'a> {
+    pub mineru_config: Option<&'a LocalMineruConfig>,
+    pub qualification: Option<&'a QualificationSnapshotV1>,
+}
+
 #[derive(Clone)]
 pub struct PrivacyWorkflowManager {
     shared: Arc<PrivacyWorkflowShared>,
 }
 
+pub(crate) trait ApprovedPublicationInvalidator: Send + Sync {
+    fn invalidate_case(
+        &self,
+        case_id: &CaseId,
+        reason_code: &'static str,
+    ) -> Result<u64, &'static str>;
+
+    fn invalidate_material(
+        &self,
+        case_id: &CaseId,
+        material_id: &MaterialId,
+        reason_code: &'static str,
+    ) -> Result<u64, &'static str>;
+
+    fn invalidate_all(&self, reason_code: &'static str) -> Result<u64, &'static str>;
+
+    /// Revokes and physically cleans only approved artifacts bound to the supplied App-local
+    /// redaction generations. Retention must never widen this operation to a case or workspace.
+    fn invalidate_lifecycle_bindings(
+        &self,
+        lifecycle_binding_ids: &BTreeSet<String>,
+        reason_code: &'static str,
+    ) -> Result<u64, &'static str>;
+}
+
 struct PrivacyWorkflowShared {
     database_path: PathBuf,
+    workspace_instance_id: WorkspaceInstanceId,
+    provider_qualification_root: PathBuf,
+    vault_broker: Arc<dyn vault_broker::VaultBroker>,
+    approved_publication_invalidator: Option<Arc<dyn ApprovedPublicationInvalidator>>,
     operation_gate: Mutex<()>,
+    mapping_reveal_authorizations: Mutex<BTreeMap<String, u64>>,
     receipt_signer_override: Mutex<Option<ReceiptSigner>>,
+    provider_qualification_key_override:
+        Mutex<Option<Arc<dyn provider_qualification::ProviderQualificationKeyProvider>>>,
     now_unix_override: Mutex<Option<u64>>,
+}
+
+pub(crate) struct ApplicationBackupPrivacyGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
 }
 
 impl fmt::Debug for PrivacyWorkflowManager {
@@ -340,26 +554,219 @@ impl fmt::Debug for PrivacyWorkflowManager {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_workspace_instance_id() -> WorkspaceInstanceId {
+    WorkspaceInstanceId::parse("ws_90909090909090909090909090909090")
+        .expect("static test workspace identifier")
+}
 impl PrivacyWorkflowManager {
-    pub fn new(app_local_data_directory: PathBuf) -> Result<Self, PrivacyWorkflowError> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(
+        app_local_data_directory: PathBuf,
+        workspace_instance_id: WorkspaceInstanceId,
+    ) -> Result<Self, PrivacyWorkflowError> {
+        Self::new_internal(app_local_data_directory, workspace_instance_id, None)
+    }
+
+    pub(crate) fn new_with_approved_publication_invalidator(
+        app_local_data_directory: PathBuf,
+        workspace_instance_id: WorkspaceInstanceId,
+        invalidator: Arc<dyn ApprovedPublicationInvalidator>,
+    ) -> Result<Self, PrivacyWorkflowError> {
+        Self::new_internal(
+            app_local_data_directory,
+            workspace_instance_id,
+            Some(invalidator),
+        )
+    }
+
+    fn new_internal(
+        app_local_data_directory: PathBuf,
+        workspace_instance_id: WorkspaceInstanceId,
+        approved_publication_invalidator: Option<Arc<dyn ApprovedPublicationInvalidator>>,
+    ) -> Result<Self, PrivacyWorkflowError> {
         let directory = app_local_data_directory.join(PRIVACY_DIRECTORY_NAME);
         fs::create_dir_all(&directory).map_err(|_| {
             PrivacyWorkflowError::new("privacy_store_unavailable", "本机隐私数据库目录无法创建。")
         })?;
         validate_ordinary_directory(&directory)?;
+        let vault_broker: Arc<dyn vault_broker::VaultBroker> = Arc::new(
+            vault_broker::LocalEncryptedVaultBroker::initialize(
+                &app_local_data_directory,
+                workspace_instance_id.clone(),
+            )
+            .map_err(PrivacyWorkflowError::vault)?,
+        );
         let manager = Self {
             shared: Arc::new(PrivacyWorkflowShared {
                 database_path: directory.join(PRIVACY_DATABASE_NAME),
+                workspace_instance_id,
+                provider_qualification_root: directory.join("provider-qualification"),
+                vault_broker,
+                approved_publication_invalidator,
                 operation_gate: Mutex::new(()),
+                mapping_reveal_authorizations: Mutex::new(BTreeMap::new()),
                 receipt_signer_override: Mutex::new(None),
+                provider_qualification_key_override: Mutex::new(None),
                 now_unix_override: Mutex::new(None),
             }),
         };
-        let connection = manager.open_connection()?;
+        if pending_restore_artifacts_exist(&directory)? {
+            manager.invalidate_all_publications("privacy_restore_startup_recovery")?;
+        }
+        lifecycle_admin::apply_pending_privacy_restore(
+            &directory,
+            manager.shared.workspace_instance_id.as_str(),
+        )?;
+        let mut connection = manager.open_connection()?;
         PrivacyStore::initialize(&connection).map_err(PrivacyWorkflowError::store)?;
+        let now_unix = unix_now()?;
+        manager
+            .shared
+            .vault_broker
+            .recover_cleanups(now_unix)
+            .map_err(PrivacyWorkflowError::vault)?;
+        let lifecycle = PrivacyLifecycle::initialize(
+            &mut connection,
+            manager.shared.workspace_instance_id.clone(),
+            now_unix,
+        )
+        .map_err(PrivacyWorkflowError::lifecycle)?;
+        manager.recover_prepared_retention_sweeps(
+            &lifecycle,
+            &mut connection,
+            now_unix,
+            "privacy_retention_startup_recovery",
+        )?;
+        manager.run_retention_sweep_with_publication_invalidation(
+            &lifecycle,
+            &mut connection,
+            &format!("cln_{}", Uuid::new_v4().simple()),
+            now_unix,
+            "privacy_retention_startup_cleanup",
+        )?;
+        manager
+            .shared
+            .vault_broker
+            .run_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now_unix)
+            .map_err(PrivacyWorkflowError::vault)?;
         drop(connection);
         validate_ordinary_database_file(&manager.shared.database_path)?;
         Ok(manager)
+    }
+
+    pub(super) fn invalidate_case_publications(
+        &self,
+        case_id: &CaseId,
+        reason_code: &'static str,
+    ) -> Result<u64, PrivacyWorkflowError> {
+        self.shared
+            .approved_publication_invalidator
+            .as_ref()
+            .map(|invalidator| invalidator.invalidate_case(case_id, reason_code))
+            .transpose()
+            .map_err(approved_publication_invalidation_error)
+            .map(|count| count.unwrap_or(0))
+    }
+
+    fn invalidate_material_publications(
+        &self,
+        case_id: &CaseId,
+        material_id: &MaterialId,
+        reason_code: &'static str,
+    ) -> Result<u64, PrivacyWorkflowError> {
+        self.shared
+            .approved_publication_invalidator
+            .as_ref()
+            .map(|invalidator| invalidator.invalidate_material(case_id, material_id, reason_code))
+            .transpose()
+            .map_err(approved_publication_invalidation_error)
+            .map(|count| count.unwrap_or(0))
+    }
+
+    pub(super) fn invalidate_all_publications(
+        &self,
+        reason_code: &'static str,
+    ) -> Result<u64, PrivacyWorkflowError> {
+        self.shared
+            .approved_publication_invalidator
+            .as_ref()
+            .map(|invalidator| invalidator.invalidate_all(reason_code))
+            .transpose()
+            .map_err(approved_publication_invalidation_error)
+            .map(|count| count.unwrap_or(0))
+    }
+
+    fn invalidate_lifecycle_bindings(
+        &self,
+        lifecycle_binding_ids: &BTreeSet<String>,
+        reason_code: &'static str,
+    ) -> Result<u64, PrivacyWorkflowError> {
+        if lifecycle_binding_ids.is_empty() {
+            return Ok(0);
+        }
+        self.shared
+            .approved_publication_invalidator
+            .as_ref()
+            .map(|invalidator| {
+                invalidator.invalidate_lifecycle_bindings(lifecycle_binding_ids, reason_code)
+            })
+            .transpose()
+            .map_err(approved_publication_invalidation_error)
+            .map(|count| count.unwrap_or(0))
+    }
+
+    fn run_retention_sweep_with_publication_invalidation(
+        &self,
+        lifecycle: &PrivacyLifecycle,
+        connection: &mut Connection,
+        cleanup_id: &str,
+        now_unix: u64,
+        reason_code: &'static str,
+    ) -> Result<privacy::CleanupReportV1, PrivacyWorkflowError> {
+        lifecycle
+            .prepare_retention_sweep(connection, cleanup_id, now_unix)
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+        let lifecycle_binding_ids = lifecycle
+            .revalidate_prepared_retention_sweep_for_external_invalidation(
+                connection, cleanup_id, now_unix,
+            )
+            .map_err(PrivacyWorkflowError::lifecycle)?
+            .ok_or_else(|| PrivacyWorkflowError::lifecycle(LifecycleError::CleanupIntegrity))?;
+        self.invalidate_lifecycle_bindings(&lifecycle_binding_ids, reason_code)?;
+        lifecycle
+            .commit_retention_sweep(connection, cleanup_id, now_unix)
+            .map_err(PrivacyWorkflowError::lifecycle)
+    }
+
+    fn recover_prepared_retention_sweeps(
+        &self,
+        lifecycle: &PrivacyLifecycle,
+        connection: &mut Connection,
+        recovered_at_unix: u64,
+        reason_code: &'static str,
+    ) -> Result<Vec<privacy::CleanupReportV1>, PrivacyWorkflowError> {
+        let cleanup_ids = prepared_retention_cleanup_ids(connection)?;
+        let mut reports = Vec::with_capacity(cleanup_ids.len());
+        for cleanup_id in cleanup_ids {
+            let Some(lifecycle_binding_ids) = lifecycle
+                .revalidate_prepared_retention_sweep_for_external_invalidation(
+                    connection,
+                    &cleanup_id,
+                    recovered_at_unix,
+                )
+                .map_err(PrivacyWorkflowError::lifecycle)?
+            else {
+                continue;
+            };
+            self.invalidate_lifecycle_bindings(&lifecycle_binding_ids, reason_code)?;
+            reports.push(
+                lifecycle
+                    .commit_retention_sweep(connection, &cleanup_id, recovered_at_unix)
+                    .map_err(PrivacyWorkflowError::lifecycle)?,
+            );
+        }
+        Ok(reports)
     }
 
     fn gate(&self) -> MutexGuard<'_, ()> {
@@ -368,6 +775,28 @@ impl PrivacyWorkflowManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    pub(crate) fn begin_application_backup_pair(&self) -> ApplicationBackupPrivacyGuard<'_> {
+        ApplicationBackupPrivacyGuard {
+            _guard: self.gate(),
+        }
+    }
+
+    pub(crate) fn export_encrypted_vault_backup_locked(
+        &self,
+        _guard: &ApplicationBackupPrivacyGuard<'_>,
+    ) -> Result<(Vec<u8>, privacy::VaultBackupSummaryV1), privacy::VaultBackupError> {
+        self.shared.vault_broker.export_encrypted_backup()
+    }
+
+    fn privacy_lifecycle(
+        &self,
+        connection: &Connection,
+    ) -> Result<PrivacyLifecycle, PrivacyWorkflowError> {
+        PrivacyLifecycle::open(connection, self.shared.workspace_instance_id.clone())
+            .map_err(PrivacyWorkflowError::lifecycle)
+    }
+
     fn receipt_signer(&self) -> Result<ReceiptSigner, PrivacyWorkflowError> {
         let override_signer = self
             .shared
@@ -402,6 +831,18 @@ impl PrivacyWorkflowManager {
     }
 
     #[cfg(test)]
+    fn set_test_provider_qualification_keys(
+        &self,
+        keys: Arc<dyn provider_qualification::ProviderQualificationKeyProvider>,
+    ) {
+        *self
+            .shared
+            .provider_qualification_key_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(keys);
+    }
+
+    #[cfg(test)]
     fn set_test_now(&self, now_unix: u64) {
         *self
             .shared
@@ -428,36 +869,225 @@ impl PrivacyWorkflowManager {
                 )
             })?;
         PrivacyStore::initialize(&connection).map_err(PrivacyWorkflowError::store)?;
+        vault_broker::initialize_vault_link_schema(&connection)
+            .map_err(PrivacyWorkflowError::vault)?;
+        case_dictionary_store::initialize_schema(&connection)?;
         Ok(connection)
     }
 
+    #[cfg(test)]
     pub fn prepare_selected_material(
         &self,
         path: &Path,
         config: &PrivacyConfig,
         ocr_status: &LocalOcrStatus,
+        mineru_config: Option<&LocalMineruConfig>,
+        requested_case_id: Option<String>,
         custom_terms: Vec<String>,
     ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
-        let _gate = self.gate();
-        let (bytes, source_display_name) = read_bounded_selected_material(path)?;
-        self.prepare_material_bytes(
-            &bytes,
-            source_display_name,
+        self.prepare_selected_material_with_qualification(
+            path,
             config,
             ocr_status,
+            LocalOcrExecutionContext {
+                mineru_config,
+                qualification: None,
+            },
+            requested_case_id,
             custom_terms,
         )
     }
 
+    pub fn prepare_selected_material_with_qualification(
+        &self,
+        path: &Path,
+        config: &PrivacyConfig,
+        ocr_status: &LocalOcrStatus,
+        ocr_execution: LocalOcrExecutionContext<'_>,
+        requested_case_id: Option<String>,
+        custom_terms: Vec<String>,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        let LocalOcrExecutionContext {
+            mineru_config,
+            qualification: ocr_qualification,
+        } = ocr_execution;
+        let _gate = self.gate();
+        let (source_bytes, source_display_name) = read_bounded_selected_material(path)?;
+        let source_bytes = vault_broker::ZeroizingBytes::new(source_bytes);
+        let case_id = requested_case_id
+            .map_or_else(
+                || CaseId::parse(format!("case_{}", Uuid::new_v4().simple())),
+                CaseId::parse,
+            )
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "invalid_case_id",
+                    "案件标识无效；必须使用 App 生成的匿名 caseId。",
+                )
+            })?;
+        let material_id = MaterialId::parse(format!("mat_{}", Uuid::new_v4().simple()))
+            .expect("generated material identifiers satisfy the opaque-id contract");
+        let source_media_type = file_ingest::detect_format(&source_display_name)
+            .map_err(ingest_error)?
+            .mime_type();
+        let now_unix = self.current_unix()?;
+        let mut connection = self.open_connection()?;
+        let lifecycle = self.privacy_lifecycle(&connection)?;
+        let policy = lifecycle
+            .retention_policy(&connection)
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+        let expires_at_unix = now_unix
+            .checked_add(policy.review_retention_seconds)
+            .ok_or_else(|| {
+                PrivacyWorkflowError::new("invalid_retention", "原件保留期限超出范围。")
+            })?;
+        let isolation = self
+            .shared
+            .vault_broker
+            .isolation_status()
+            .map_err(PrivacyWorkflowError::vault)?;
+        validate_vault_isolation(&isolation)?;
+        let binding = self
+            .shared
+            .vault_broker
+            .import_source(vault_broker::ImportSourceRequest {
+                case_id: &case_id,
+                material_id: &material_id,
+                original_file_name: &source_display_name,
+                original_source_path: path,
+                original_media_type: source_media_type,
+                content: &source_bytes,
+                imported_at_unix: now_unix,
+            })
+            .map_err(PrivacyWorkflowError::vault)?;
+        self.shared
+            .vault_broker
+            .bind_retention(&binding, expires_at_unix, false, policy.revision, now_unix)
+            .map_err(PrivacyWorkflowError::vault)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| PrivacyWorkflowError::new("privacy_store_busy", "本机隐私数据库繁忙。"))?;
+        let source_name_sha256 = sha256_hex(source_display_name.as_bytes());
+        PrivacyStore::register_material(
+            &transaction,
+            &RegisterPrivacyMaterial {
+                material_id: material_id.as_str(),
+                project_id: Some(case_id.as_str()),
+                attachment_id: Some(binding.object_id.as_str()),
+                source_sha256: binding.source_sha256.as_str(),
+                source_name_sha256: &source_name_sha256,
+                media_type: source_media_type,
+                page_count: None,
+            },
+        )
+        .map_err(PrivacyWorkflowError::store)?;
+        vault_broker::persist_vault_import(
+            &transaction,
+            &binding,
+            expires_at_unix,
+            policy.revision,
+            now_unix,
+        )
+        .map_err(PrivacyWorkflowError::vault)?;
+        transaction.commit().map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_store_commit_failed",
+                "加密原件与本机材料索引未能原子登记；原件仍受 Vault 保留期保护。",
+            )
+        })?;
+        drop(connection);
+        drop(source_bytes);
+
+        let source_lease = self
+            .shared
+            .vault_broker
+            .read_source(&binding)
+            .map_err(PrivacyWorkflowError::vault)?;
+        let result = self.prepare_material_bytes_bound(PrepareMaterialBytesInput {
+            bytes: source_lease.content(),
+            source_display_name,
+            config,
+            ocr_status,
+            mineru_config,
+            custom_terms,
+            ocr_qualification,
+            vault_binding: Some(&binding),
+        });
+        drop(source_lease);
+        match result {
+            Ok(review) => Ok(review),
+            Err(error) => {
+                let connection = self.open_connection()?;
+                vault_broker::mark_vault_processing_failed(&connection, &material_id, error.code())
+                    .map_err(PrivacyWorkflowError::vault)?;
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[cfg(test)]
     fn prepare_material_bytes(
         &self,
         bytes: &[u8],
         source_display_name: String,
         config: &PrivacyConfig,
         ocr_status: &LocalOcrStatus,
+        mineru_config: Option<&LocalMineruConfig>,
         custom_terms: Vec<String>,
     ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
-        let processed = extract_local_material(bytes, &source_display_name, config, ocr_status)?;
+        self.prepare_material_bytes_bound(PrepareMaterialBytesInput {
+            bytes,
+            source_display_name,
+            config,
+            ocr_status,
+            mineru_config,
+            custom_terms,
+            ocr_qualification: None,
+            vault_binding: None,
+        })
+    }
+
+    fn prepare_material_bytes_bound(
+        &self,
+        input: PrepareMaterialBytesInput<'_>,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        let PrepareMaterialBytesInput {
+            bytes,
+            source_display_name,
+            config,
+            ocr_status,
+            mineru_config,
+            custom_terms,
+            ocr_qualification,
+            vault_binding,
+        } = input;
+        let processed = extract_local_material(
+            bytes,
+            &source_display_name,
+            config,
+            ocr_status,
+            mineru_config,
+        )?;
+        let vault_isolation = if let Some(binding) = vault_binding {
+            if processed.source_sha256 != binding.source_sha256.as_str()
+                || bytes.len() as u64 != binding.content_bytes
+            {
+                return Err(PrivacyWorkflowError::new(
+                    "vault_source_mismatch",
+                    "Vault 解密原件与导入时的哈希或长度不一致；处理已停止。",
+                ));
+            }
+            let status = self
+                .shared
+                .vault_broker
+                .isolation_status()
+                .map_err(PrivacyWorkflowError::vault)?;
+            validate_vault_isolation(&status)?;
+            Some(status)
+        } else {
+            None
+        };
 
         let options = RedactionOptions {
             custom_terms,
@@ -470,6 +1100,7 @@ impl PrivacyWorkflowManager {
                 "自定义敏感词为空、过长或数量超限。",
             )
         })?;
+        let dictionary_custom_terms = options.custom_terms.clone();
         let mut redactor = Redactor::new(options);
         let original_texts = processed
             .segments
@@ -512,6 +1143,25 @@ impl PrivacyWorkflowManager {
             });
         }
         let summary = redactor.summary();
+        let mapping_entries = redactor
+            .detected_alias_mappings()
+            .into_iter()
+            .map(|entry| {
+                let (alias, sensitive_value) = entry.into_parts();
+                SensitiveMappingEntryV1 {
+                    alias,
+                    sensitive_value,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mapping_payload = if mapping_entries.is_empty() {
+            None
+        } else {
+            Some(
+                SensitiveMappingPayloadV1::new(mapping_entries)
+                    .map_err(PrivacyWorkflowError::lifecycle)?,
+            )
+        };
         let normalized_original = normalize_for_canary_scan(
             &stored_pages
                 .iter()
@@ -538,12 +1188,20 @@ impl PrivacyWorkflowManager {
         let extraction_sha256 = sha256_hex(&extraction_bytes);
         let suggested_bytes = canonical_redacted_bytes(&canonical_pages)?;
         let suggested_redacted_content_sha256 = sha256_hex(&suggested_bytes);
-        let material_id = format!("mat_{}", Uuid::new_v4().simple());
+        let material_id = vault_binding.map_or_else(
+            || format!("mat_{}", Uuid::new_v4().simple()),
+            |binding| binding.material_id.as_str().to_owned(),
+        );
         let redaction_id = format!("red_{}", Uuid::new_v4().simple());
         let stored = StoredReviewPayload {
             schema_version: REVIEW_PAYLOAD_SCHEMA_VERSION,
             material_id: material_id.clone(),
             redaction_id: redaction_id.clone(),
+            case_id: vault_binding.map(|binding| binding.case_id.as_str().to_owned()),
+            vault_object_id: vault_binding.map(|binding| binding.object_id.as_str().to_owned()),
+            vault_object_version: vault_binding.map(|binding| binding.object_version),
+            vault_isolation,
+            source_display_name: source_display_name.clone(),
             source_sha256: processed.source_sha256.clone(),
             extraction_sha256: extraction_sha256.clone(),
             suggested_redacted_content_sha256: suggested_redacted_content_sha256.clone(),
@@ -551,6 +1209,7 @@ impl PrivacyWorkflowManager {
             media_type: processed.media_type.clone(),
             page_count: processed.page_count,
             backend_trace: processed.backend_trace.clone(),
+            input_transform: processed.input_transform.clone(),
             summary,
             pages: stored_pages,
             forbidden_canaries,
@@ -559,14 +1218,72 @@ impl PrivacyWorkflowManager {
             PrivacyWorkflowError::new("review_payload_invalid", "本地审阅数据无法序列化。")
         })?;
 
-        let connection = self.open_connection()?;
-        connection
-            .execute_batch("BEGIN IMMEDIATE;")
+        let now_unix = self.current_unix()?;
+        let case_dictionary = if let Some(case_id) = stored.case_id.as_ref() {
+            let case_id = CaseId::parse(case_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "The case-bound dictionary identity is invalid.",
+                )
+            })?;
+            let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "The dictionary material identity is invalid.",
+                )
+            })?;
+            Some(case_dictionary_store::ensure_case_dictionary(
+                self,
+                &case_id,
+                &material_id,
+                &dictionary_custom_terms,
+                now_unix,
+            )?)
+        } else {
+            None
+        };
+        let detector_run = stored
+            .case_id
+            .as_ref()
+            .map(|_| {
+                local_detection::run_local_detectors(
+                    self,
+                    &stored,
+                    mineru_config,
+                    ocr_qualification,
+                    now_unix,
+                    case_dictionary.as_ref().ok_or_else(|| {
+                        PrivacyWorkflowError::new(
+                            "privacy_case_dictionary_missing",
+                            "The case dictionary evidence is unavailable.",
+                        )
+                    })?,
+                )
+            })
+            .transpose()?;
+        let risk_state = initial_risk_workflow_state(
+            &stored,
+            detector_run.as_ref(),
+            case_dictionary.as_ref(),
+            now_unix,
+        )?;
+        let mut connection = self.open_connection()?;
+        let lifecycle = self.privacy_lifecycle(&connection)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| PrivacyWorkflowError::new("privacy_store_busy", "本机隐私数据库繁忙。"))?;
         let source_name_sha256 = sha256_hex(source_display_name.as_bytes());
-        let store_result = (|| -> Result<(), PrivacyStoreError> {
+        if let Some(binding) = vault_binding {
+            vault_broker::complete_vault_material_processing(
+                &transaction,
+                binding,
+                &stored.media_type,
+                stored.page_count,
+            )
+            .map_err(PrivacyWorkflowError::vault)?;
+        } else {
             PrivacyStore::register_material(
-                &connection,
+                &transaction,
                 &RegisterPrivacyMaterial {
                     material_id: &material_id,
                     project_id: None,
@@ -576,32 +1293,71 @@ impl PrivacyWorkflowManager {
                     media_type: &stored.media_type,
                     page_count: Some(stored.page_count),
                 },
-            )?;
-            PrivacyStore::save_review_draft(
-                &connection,
-                &SaveReviewDraft {
-                    redaction_id: &redaction_id,
-                    material_id: &material_id,
-                    extraction_sha256: &extraction_sha256,
-                    redacted_content_sha256: &suggested_redacted_content_sha256,
-                    policy_id: POLICY_ID,
-                    policy_version: POLICY_VERSION,
-                    detector_version: REDACTION_VERSION,
-                    unresolved_high_risk_count: 0,
-                    review_payload_plaintext: &protected_plaintext,
-                },
             )
-        })();
-        match store_result {
-            Ok(()) => connection.execute_batch("COMMIT;").map_err(|_| {
-                PrivacyWorkflowError::new("privacy_store_commit_failed", "本机审阅数据未能提交。")
-            })?,
-            Err(error) => {
-                let _ = connection.execute_batch("ROLLBACK;");
-                return Err(PrivacyWorkflowError::store(error));
-            }
+            .map_err(PrivacyWorkflowError::store)?;
         }
-        stored_to_view(stored, "review_required", source_display_name)
+        let unresolved_high_risk_count = risk_state
+            .as_ref()
+            .map(|state| {
+                state
+                    .session
+                    .findings
+                    .iter()
+                    .filter(|finding| {
+                        matches!(
+                            finding.severity,
+                            FindingSeverity::P0Blocking | FindingSeverity::P1High
+                        )
+                    })
+                    .count()
+            })
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(u32::MAX);
+        PrivacyStore::save_review_draft(
+            &transaction,
+            &SaveReviewDraft {
+                redaction_id: &redaction_id,
+                material_id: &material_id,
+                extraction_sha256: &extraction_sha256,
+                redacted_content_sha256: &suggested_redacted_content_sha256,
+                policy_id: POLICY_ID,
+                policy_version: POLICY_VERSION,
+                detector_version: REDACTION_VERSION,
+                unresolved_high_risk_count,
+                review_payload_plaintext: &protected_plaintext,
+            },
+        )
+        .map_err(PrivacyWorkflowError::store)?;
+        if let Some(state) = risk_state.as_ref() {
+            append_risk_revision(&transaction, state, 0)?;
+        }
+        lifecycle
+            .bind_redaction_retention(&transaction, &redaction_id, now_unix)
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+        if let Some(payload) = mapping_payload.as_ref() {
+            lifecycle
+                .save_mapping_revision_in_transaction(
+                    &transaction,
+                    &format!("map_{}", Uuid::new_v4().simple()),
+                    &redaction_id,
+                    1,
+                    payload,
+                    now_unix,
+                )
+                .map_err(PrivacyWorkflowError::lifecycle)?;
+        }
+        transaction.commit().map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_store_commit_failed",
+                "本机审阅、保留期与加密映射未能原子提交。",
+            )
+        })?;
+        let mut view = stored_to_view(stored, "review_required")?;
+        view.risk_review = risk_state
+            .as_ref()
+            .map(|state| state.session.view().map_err(review_session_error))
+            .transpose()?;
+        Ok(view)
     }
 
     pub fn load_review(
@@ -631,6 +1387,344 @@ impl PrivacyWorkflowManager {
             .transpose()
     }
 
+    pub fn list_approved_review_selections(
+        &self,
+    ) -> Result<Vec<ApprovedPrivacyReviewSelection>, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT redaction_id,approved_payload_sha256
+                 FROM privacy_redactions
+                 WHERE review_state='approved' AND approved_payload_sha256 IS NOT NULL
+                 ORDER BY rowid DESC LIMIT 256",
+            )
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_database_error",
+                    "Approved review metadata could not be indexed.",
+                )
+            })?;
+        let indexed = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_database_error",
+                    "Approved review metadata could not be indexed.",
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_database_error",
+                    "Approved review metadata could not be indexed.",
+                )
+            })?;
+        drop(statement);
+
+        let mut selections = Vec::with_capacity(indexed.len());
+        for (redaction_id, approved_payload_sha256) in indexed {
+            let loaded = PrivacyStore::load_review_draft(&connection, &redaction_id)
+                .map_err(PrivacyWorkflowError::store)?;
+            if loaded.review_state != "approved" {
+                continue;
+            }
+            let stored: StoredReviewPayload =
+                serde_json::from_slice(&loaded.review_payload_plaintext).map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "review_payload_invalid",
+                        "Approved review metadata could not be verified.",
+                    )
+                })?;
+            validate_loaded_review(&loaded, &stored)?;
+            let approved_pages = stored
+                .pages
+                .iter()
+                .map(|page| CanonicalRedactedPage {
+                    page_number: page.page_number,
+                    text: page.suggested_redacted_text.clone(),
+                })
+                .collect::<Vec<_>>();
+            let canonical_approved_payload = serde_json::to_vec(&ApprovedPayload {
+                schema_version: APPROVED_PAYLOAD_SCHEMA_VERSION,
+                source_sha256: &stored.source_sha256,
+                extraction_sha256: &stored.extraction_sha256,
+                media_type: &stored.media_type,
+                pages: &approved_pages,
+            })
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "review_payload_invalid",
+                    "Approved review payload could not be canonicalized.",
+                )
+            })?;
+            if sha256_hex(&canonical_approved_payload) != approved_payload_sha256 {
+                return Err(PrivacyWorkflowError::new(
+                    "review_payload_mismatch",
+                    "Approved review payload does not match its protected approval index.",
+                ));
+            }
+            let mcp_publish_approval_expires_at_unix = self
+                .active_approved_workspace_receipt_expiry(
+                    &connection,
+                    &redaction_id,
+                    &canonical_approved_payload,
+                )?;
+            let Some(case_id) = stored.case_id else {
+                continue;
+            };
+            CaseId::parse(case_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "review_payload_invalid",
+                    "Approved review case binding is invalid.",
+                )
+            })?;
+            MaterialId::parse(loaded.material_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "review_payload_invalid",
+                    "Approved review material binding is invalid.",
+                )
+            })?;
+            Sha256Hex::parse(approved_payload_sha256.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "review_payload_invalid",
+                    "Approved review payload binding is invalid.",
+                )
+            })?;
+            selections.push(ApprovedPrivacyReviewSelection {
+                redaction_id,
+                material_id: loaded.material_id,
+                case_id,
+                approved_payload_sha256,
+                mcp_publish_approved: mcp_publish_approval_expires_at_unix.is_some(),
+                mcp_publish_approval_expires_at_unix,
+            });
+        }
+        Ok(selections)
+    }
+
+    fn active_approved_workspace_receipt_expiry(
+        &self,
+        connection: &Connection,
+        redaction_id: &str,
+        approved_payload: &[u8],
+    ) -> Result<Option<u64>, PrivacyWorkflowError> {
+        let destination = DestinationScope {
+            kind: DestinationKind::ExternalMcpHost,
+            identifier: privacy::workspace::APPROVED_WORKSPACE_DESTINATION_SCOPE.to_owned(),
+        };
+        let protected_token = connection
+            .query_row(
+                "SELECT signed_token FROM privacy_receipts
+                 WHERE redaction_id=?1 AND destination_kind='external_mcp_host'
+                   AND destination_identifier_sha256=?2 AND purpose=?3
+                   AND revoked_at_unix IS NULL
+                 ORDER BY issued_at_unix DESC,receipt_id DESC LIMIT 1",
+                rusqlite::params![
+                    redaction_id,
+                    sha256_hex(destination.identifier.as_bytes()),
+                    privacy::workspace::APPROVED_MATERIAL_READ_PURPOSE,
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_database_error",
+                    "Approved workspace receipt status could not be read.",
+                )
+            })?;
+        let Some(protected_token) = protected_token else {
+            return Ok(None);
+        };
+        let Ok(token_bytes) = privacy::unprotect_local(&protected_token) else {
+            return Ok(None);
+        };
+        let Ok(token) = std::str::from_utf8(&token_bytes) else {
+            return Ok(None);
+        };
+        let signer = self.receipt_signer()?;
+        let now_unix = self.current_unix()?;
+        let receipt = match PrivacyStore::verify_active_receipt_token(
+            connection,
+            &signer,
+            &ActiveReceiptVerification {
+                redaction_id,
+                signed_token: token,
+                approved_payload,
+                destination: &destination,
+                purpose: privacy::workspace::APPROVED_MATERIAL_READ_PURPOSE,
+                now_unix,
+                expected_key_version: RECEIPT_KEY_VERSION,
+            },
+        ) {
+            Ok(receipt) => receipt,
+            Err(_) => return Ok(None),
+        };
+        Ok(receipt
+            .claims
+            .expires_at_unix
+            .filter(|expires_at| *expires_at > now_unix))
+    }
+
+    pub fn approve_review_for_approved_workspace(
+        &self,
+        request: ApproveReviewForApprovedWorkspaceRequest,
+    ) -> Result<ApproveReviewForApprovedWorkspaceResponse, PrivacyWorkflowError> {
+        if !request.confirmed
+            || !valid_identifier(&request.redaction_id)
+            || !valid_hash(&request.expected_approved_payload_sha256)
+        {
+            return Err(PrivacyWorkflowError::new(
+                "approved_workspace_approval_confirmation_required",
+                "Explicit confirmation of the exact approved MCP publication is required.",
+            ));
+        }
+        let reviewer = request.reviewer.trim().to_owned();
+        let expected_payload_sha256 = request.expected_approved_payload_sha256.clone();
+        let approval_request = {
+            let _gate = self.gate();
+            let connection = self.open_connection()?;
+            let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
+                .map_err(PrivacyWorkflowError::store)?;
+            if loaded.review_state != "approved" || loaded.unresolved_high_risk_count != 0 {
+                return Err(PrivacyWorkflowError::new(
+                    "redaction_not_approved",
+                    "Only a current, fully approved case-bound review can be approved for MCP publication.",
+                ));
+            }
+            let stored: StoredReviewPayload =
+                serde_json::from_slice(&loaded.review_payload_plaintext).map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "review_payload_invalid",
+                        "The approved review payload could not be verified.",
+                    )
+                })?;
+            validate_loaded_review(&loaded, &stored)?;
+            self.verify_stored_vault_source(&connection, &stored)?;
+            let case_id = stored.case_id.as_ref().ok_or_else(|| {
+                PrivacyWorkflowError::new(
+                    "approved_workspace_case_binding_required",
+                    "Approved MCP publication requires an exact case-bound review.",
+                )
+            })?;
+            CaseId::parse(case_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "review_payload_invalid",
+                    "The approved review case binding is invalid.",
+                )
+            })?;
+            let pages = stored
+                .pages
+                .iter()
+                .map(|page| CanonicalRedactedPage {
+                    page_number: page.page_number,
+                    text: page.suggested_redacted_text.clone(),
+                })
+                .collect::<Vec<_>>();
+            reject_normalized_canaries(&pages, &stored.forbidden_canaries)?;
+            let canonical_payload = serde_json::to_vec(&ApprovedPayload {
+                schema_version: APPROVED_PAYLOAD_SCHEMA_VERSION,
+                source_sha256: &stored.source_sha256,
+                extraction_sha256: &stored.extraction_sha256,
+                media_type: &stored.media_type,
+                pages: &pages,
+            })
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "canonicalization_failed",
+                    "The approved MCP payload could not be canonicalized.",
+                )
+            })?;
+            let canonical_payload_sha256 = sha256_hex(&canonical_payload);
+            let indexed_payload_sha256 = connection
+                .query_row(
+                    "SELECT approved_payload_sha256 FROM privacy_redactions
+                     WHERE redaction_id=?1 AND review_state='approved'",
+                    [&request.redaction_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "privacy_store_database_error",
+                        "The approved MCP payload binding could not be read.",
+                    )
+                })?
+                .flatten();
+            if indexed_payload_sha256.as_deref() != Some(canonical_payload_sha256.as_str())
+                || canonical_payload_sha256 != expected_payload_sha256
+            {
+                return Err(PrivacyWorkflowError::new(
+                    "approved_payload_mismatch",
+                    "The approved review changed before MCP publication approval.",
+                ));
+            }
+            let redacted_content_sha256 = sha256_hex(&canonical_redacted_bytes(&pages)?);
+            if redacted_content_sha256 != loaded.redacted_content_sha256 {
+                return Err(PrivacyWorkflowError::new(
+                    "review_payload_mismatch",
+                    "The approved review pages do not match the current protected review index.",
+                ));
+            }
+            let risk = self.load_risk_state_unlocked(&connection, &request.redaction_id)?;
+            if risk.session.redacted_content_sha256.as_str() != redacted_content_sha256
+                || !risk.session.detector_run_completed
+                || risk.session.document_risk.total_p0 != 0
+                || risk.session.document_risk.total_p1 != 0
+                || !risk.session.residual_scan.passed
+                || risk.session.rejected
+            {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_risk_gates_blocked",
+                    "The latest risk review revision does not permit approved MCP publication.",
+                ));
+            }
+            ApprovePrivacyReviewRequest {
+                redaction_id: request.redaction_id.clone(),
+                expected_risk_revision: Some(risk.session.revision),
+                expected_suggested_redacted_sha256: loaded.redacted_content_sha256,
+                edited_pages: pages
+                    .into_iter()
+                    .map(|page| EditedRedactedPage {
+                        page_number: page.page_number,
+                        redacted_text: page.text,
+                    })
+                    .collect(),
+                reviewer,
+                destination: ReceiptDestinationInput {
+                    kind: DestinationKind::ExternalMcpHost,
+                    identifier: privacy::workspace::APPROVED_WORKSPACE_DESTINATION_SCOPE.to_owned(),
+                },
+                purpose: privacy::workspace::APPROVED_MATERIAL_READ_PURPOSE.to_owned(),
+                ttl_seconds: request.ttl_seconds,
+            }
+        };
+        let approved = self.approve_review(approval_request)?;
+        if approved.approved_payload_sha256 != expected_payload_sha256
+            || approved.destination.kind != DestinationKind::ExternalMcpHost
+            || approved.destination.identifier
+                != privacy::workspace::APPROVED_WORKSPACE_DESTINATION_SCOPE
+            || approved.purpose != privacy::workspace::APPROVED_MATERIAL_READ_PURPOSE
+        {
+            return Err(PrivacyWorkflowError::new(
+                "approved_workspace_receipt_invalid",
+                "The approved MCP publication receipt has an invalid fixed binding.",
+            ));
+        }
+        Ok(ApproveReviewForApprovedWorkspaceResponse {
+            receipt_id: approved.receipt_id,
+            approved_payload_sha256: approved.approved_payload_sha256,
+            issued_at_unix: approved.issued_at_unix,
+            expires_at_unix: approved.expires_at_unix,
+            destination_identifier: approved.destination.identifier,
+            purpose: approved.purpose,
+            mcp_publish_approved: true,
+        })
+    }
+
     pub fn delete_review(
         &self,
         request: DeletePrivacyReviewRequest,
@@ -647,6 +1741,105 @@ impl PrivacyWorkflowManager {
         }
 
         let mut connection = self.open_connection()?;
+        if vault_broker::load_vault_binding_for_redaction(&connection, &request.redaction_id)
+            .map_err(PrivacyWorkflowError::vault)?
+            .is_some()
+        {
+            let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
+                .map_err(PrivacyWorkflowError::store)?;
+            if request.expected_source_sha256
+                != connection
+                    .query_row(
+                        "SELECT source_sha256 FROM privacy_materials WHERE material_id=?1",
+                        [&loaded.material_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|_| {
+                        PrivacyWorkflowError::new(
+                            "privacy_store_database_error",
+                            "待删除原件身份无法核验。",
+                        )
+                    })?
+                || request.expected_extraction_sha256 != loaded.extraction_sha256
+            {
+                return Err(PrivacyWorkflowError::new(
+                    "redaction_stale",
+                    "审阅记录已变化，请重新载入后再删除。",
+                ));
+            }
+            let stored: StoredReviewPayload =
+                serde_json::from_slice(&loaded.review_payload_plaintext).map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "review_payload_invalid",
+                        "本机审阅数据无法解密或解析。",
+                    )
+                })?;
+            validate_loaded_review(&loaded, &stored)?;
+            let binding = self
+                .verify_stored_vault_source(&connection, &stored)?
+                .ok_or_else(|| {
+                    PrivacyWorkflowError::new(
+                        "vault_reference_mismatch",
+                        "受 Vault 管理的审阅缺少原件引用；删除已拒绝。",
+                    )
+                })?;
+            let (legal_hold, policy_revision) = connection
+                .query_row(
+                    "SELECT legal_hold,policy_revision FROM privacy_retention_bindings
+                     WHERE redaction_id=?1",
+                    [&request.redaction_id],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "retention_binding_unavailable",
+                        "原件保留与法律保留状态无法核验；删除已拒绝。",
+                    )
+                })?;
+            if legal_hold {
+                return Err(PrivacyWorkflowError::new(
+                    "legal_hold_active",
+                    "该案件材料处于法律保留状态，不能删除原件或审阅。",
+                ));
+            }
+            let policy_revision = u64::try_from(policy_revision).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "retention_binding_invalid",
+                    "原件保留策略版本无效；删除已拒绝。",
+                )
+            })?;
+            let case_id = CaseId::parse(stored.case_id.clone().ok_or_else(|| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "A Vault-backed review must remain case-bound before deletion.",
+                )
+            })?)
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "The review case identity is invalid.",
+                )
+            })?;
+            let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "The review material identity is invalid.",
+                )
+            })?;
+            self.invalidate_material_publications(&case_id, &material_id, "vault_source_deleted")?;
+            let now_unix = self.current_unix()?;
+            let bound_at_unix = now_unix.checked_sub(1).ok_or_else(|| {
+                PrivacyWorkflowError::new("invalid_time", "本机时间无效；删除已拒绝。")
+            })?;
+            self.shared
+                .vault_broker
+                .bind_retention(&binding, now_unix, false, policy_revision, bound_at_unix)
+                .map_err(PrivacyWorkflowError::vault)?;
+            self.shared
+                .vault_broker
+                .run_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now_unix)
+                .map_err(PrivacyWorkflowError::vault)?;
+        }
         let deleted = match PrivacyStore::delete_redaction_material_exact(
             &mut connection,
             &request.redaction_id,
@@ -690,11 +1883,526 @@ impl PrivacyWorkflowManager {
                 "本机审阅数据与哈希索引不一致。",
             ));
         }
-        stored_to_view(
-            stored,
-            &loaded.review_state,
-            "本机材料（名称未持久化）".to_owned(),
+        let risk_review = PrivacyStore::load_latest_risk_review_revision(&connection, redaction_id)
+            .map_err(PrivacyWorkflowError::store)?
+            .map(|revision| {
+                decode_risk_state(&revision)?
+                    .session
+                    .view()
+                    .map_err(review_session_error)
+            })
+            .transpose()?;
+        let mut view = stored_to_view(stored, &loaded.review_state)?;
+        view.risk_review = risk_review;
+        Ok(view)
+    }
+    fn verify_stored_vault_source(
+        &self,
+        connection: &Connection,
+        stored: &StoredReviewPayload,
+    ) -> Result<Option<vault_broker::VaultImportBinding>, PrivacyWorkflowError> {
+        let binding =
+            vault_broker::load_vault_binding_for_material(connection, &stored.material_id)
+                .map_err(PrivacyWorkflowError::vault)?;
+        match (
+            binding,
+            stored.case_id.as_deref(),
+            stored.vault_object_id.as_deref(),
+            stored.vault_object_version,
+            stored.vault_isolation.as_ref(),
+        ) {
+            (None, None, None, None, None) => Ok(None),
+            (Some(binding), Some(case_id), Some(object_id), Some(version), Some(_))
+                if binding.case_id.as_str() == case_id
+                    && binding.object_id.as_str() == object_id
+                    && binding.object_version == version
+                    && binding.source_sha256.as_str() == stored.source_sha256 =>
+            {
+                let status = self
+                    .shared
+                    .vault_broker
+                    .isolation_status()
+                    .map_err(PrivacyWorkflowError::vault)?;
+                validate_vault_isolation(&status)?;
+                let lease = self
+                    .shared
+                    .vault_broker
+                    .read_source(&binding)
+                    .map_err(PrivacyWorkflowError::vault)?;
+                if sha256_hex(lease.content()) != stored.source_sha256 {
+                    return Err(PrivacyWorkflowError::new(
+                        "vault_source_mismatch",
+                        "批准前 Vault 原件完整性复核失败；批准已拒绝。",
+                    ));
+                }
+                drop(lease);
+                Ok(Some(binding))
+            }
+            _ => Err(PrivacyWorkflowError::new(
+                "vault_reference_mismatch",
+                "审阅记录与 Vault 原件引用不一致；操作已拒绝。",
+            )),
+        }
+    }
+    pub fn load_risk_review(
+        &self,
+        redaction_id: &str,
+    ) -> Result<ReviewStateViewV1, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        let connection = self.open_connection()?;
+        self.load_risk_state_unlocked(&connection, redaction_id)?
+            .session
+            .view()
+            .map_err(review_session_error)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn current_mapping_revision_binding(
+        &self,
+        redaction_id: &str,
+    ) -> Result<Option<CurrentMappingRevisionBindingV1>, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        if !valid_identifier(redaction_id) {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_mapping_revision_request_invalid",
+                "The mapping revision request is invalid.",
+            ));
+        }
+        let connection = self.open_connection()?;
+        let row = connection
+            .query_row(
+                "SELECT mapping_id,revision,mapping_revision_sha256
+                 FROM privacy_sensitive_mappings
+                 WHERE redaction_id=?1 AND revoked_at_unix IS NULL
+                 ORDER BY revision DESC,created_at_unix DESC,mapping_id ASC LIMIT 1",
+                [redaction_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_mapping_revision_query_failed",
+                    "The encrypted mapping revision could not be queried.",
+                )
+            })?;
+        row.map(|(mapping_id, revision, hash)| {
+            if !valid_identifier(&mapping_id) {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_mapping_revision_invalid",
+                    "The encrypted mapping revision metadata is invalid.",
+                ));
+            }
+            Ok(CurrentMappingRevisionBindingV1 {
+                mapping_id,
+                revision: u64::try_from(revision).map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "privacy_mapping_revision_invalid",
+                        "The encrypted mapping revision metadata is invalid.",
+                    )
+                })?,
+                mapping_revision_hash: Sha256Hex::parse(hash).map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "privacy_mapping_revision_invalid",
+                        "The encrypted mapping revision hash is invalid.",
+                    )
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    fn load_risk_state_unlocked(
+        &self,
+        connection: &Connection,
+        redaction_id: &str,
+    ) -> Result<StoredRiskWorkflowStateV1, PrivacyWorkflowError> {
+        let loaded = PrivacyStore::load_latest_risk_review_revision(connection, redaction_id)
+            .map_err(PrivacyWorkflowError::store)?
+            .ok_or_else(|| {
+                PrivacyWorkflowError::new(
+                    "privacy_risk_state_missing",
+                    "This review has no persisted production risk revision.",
+                )
+            })?;
+        decode_risk_state(&loaded)
+    }
+
+    pub fn apply_risk_review_action(
+        &self,
+        request: ApplyPrivacyRiskReviewActionRequest,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        if !valid_identifier(&request.redaction_id)
+            || request.expected_revision == 0
+            || request.actor.trim().is_empty()
+            || request.actor.trim().len() > 128
+            || request.actor.chars().any(char::is_control)
+        {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_review_input_invalid",
+                "Risk review action metadata is invalid.",
+            ));
+        }
+        let mut connection = self.open_connection()?;
+        let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
+            .map_err(PrivacyWorkflowError::store)?;
+        let mut stored: StoredReviewPayload =
+            serde_json::from_slice(&loaded.review_payload_plaintext).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "review_payload_invalid",
+                    "The protected editable review payload cannot be decoded.",
+                )
+            })?;
+        validate_loaded_review(&loaded, &stored)?;
+        self.verify_stored_vault_source(&connection, &stored)?;
+        let case_id = CaseId::parse(stored.case_id.clone().ok_or_else(|| {
+            PrivacyWorkflowError::new(
+                "privacy_case_dictionary_missing",
+                "A production risk review must remain case-bound.",
+            )
+        })?)
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_review_identity_invalid",
+                "The risk review case identity is invalid.",
+            )
+        })?;
+        let current_dictionary =
+            case_dictionary_store::load_required_case_dictionary(&connection, self, &case_id)?;
+        let mut state = self.load_risk_state_unlocked(&connection, &request.redaction_id)?;
+        verify_dictionary_revision(&state.session, &current_dictionary)?;
+        if state.session.revision != request.expected_revision {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_review_revision_conflict",
+                "Risk review revision changed; reload before applying the action.",
+            ));
+        }
+        let now_unix = self.current_unix()?;
+        let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_review_identity_invalid",
+                "The risk review material identity is invalid.",
+            )
+        })?;
+        let pending_dictionary = if let ReviewActionV1::AddToDictionary {
+            finding_id,
+            category,
+            required,
+        } = &request.action
+        {
+            let finding = state
+                .session
+                .findings
+                .iter()
+                .find(|finding| finding.finding_id.as_str() == finding_id)
+                .ok_or_else(|| {
+                    PrivacyWorkflowError::new(
+                        "privacy_review_finding_not_found",
+                        "The dictionary action references a missing finding.",
+                    )
+                })?;
+            let secret = case_dictionary_store::load_finding_secret(
+                &connection,
+                self,
+                &case_id,
+                &request.redaction_id,
+                finding,
+            )?;
+            case_dictionary_store::prepare_add_finding_revision(
+                self,
+                &current_dictionary,
+                &material_id,
+                secret.as_str(),
+                *category,
+                *required,
+                now_unix,
+            )?
+        } else {
+            None
+        };
+        let action_dictionary = pending_dictionary
+            .as_ref()
+            .map(case_dictionary_store::PendingCaseDictionaryRevisionV1::snapshot)
+            .unwrap_or(&current_dictionary);
+        let edited_pages = normalize_edited_pages(&stored, request.edited_pages)?;
+        reject_normalized_canaries(&edited_pages, &stored.forbidden_canaries)?;
+        let page_texts = edited_pages
+            .iter()
+            .map(|page| page.text.clone())
+            .collect::<Vec<_>>();
+        let residual_scan = case_dictionary_store::scan_residuals(
+            action_dictionary,
+            &page_texts,
+            &stored.source_display_name,
+        )?;
+        let redacted_bytes = canonical_redacted_bytes(&edited_pages)?;
+        let redacted_sha = Sha256Hex::parse(sha256_hex(&redacted_bytes)).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_evidence_invalid",
+                "Edited redacted content hash is invalid.",
+            )
+        })?;
+        let provenance_hash = Sha256Hex::parse(sha256_hex(
+            format!(
+                "privacy-review-action-v1\0{}\0{}\0{}",
+                request.redaction_id,
+                request.expected_revision,
+                redacted_sha.as_str(),
+            )
+            .as_bytes(),
+        ))
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_evidence_invalid",
+                "Review action provenance is invalid.",
+            )
+        })?;
+        let actor_hash =
+            Sha256Hex::parse(sha256_hex(request.actor.trim().as_bytes())).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_input_invalid",
+                    "Reviewer identity hash is invalid.",
+                )
+            })?;
+        if state.undo_pages.len() == privacy::MAX_REVIEW_HISTORY {
+            state.undo_pages.remove(0);
+        }
+        state.undo_pages.push(state.current_pages.clone());
+        state.redo_pages.clear();
+        state.session.assessment.dictionary_entities_stable =
+            dictionary_entities_stable_after_action(&state.session, &request.action);
+        state
+            .session
+            .apply_action(
+                request.expected_revision,
+                &request.action,
+                VerifiedReviewActionContextV1 {
+                    actor_hash: &actor_hash,
+                    occurred_at_unix: now_unix,
+                    verified_redacted_content_sha256: &redacted_sha,
+                    provenance_hash: &provenance_hash,
+                    residual_scan: &residual_scan,
+                    dictionary_revision_hash: Some(action_dictionary.revision_hash()),
+                },
+            )
+            .map_err(review_session_error)?;
+        state.current_pages = edited_pages;
+        install_risk_pages_in_review(&mut stored, &state.current_pages)?;
+        stored.suggested_redacted_content_sha256 = redacted_sha.as_str().to_owned();
+        let review_payload = serde_json::to_vec(&stored).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "review_payload_invalid",
+                "Updated review payload cannot be serialized.",
+            )
+        })?;
+        let unresolved = state
+            .session
+            .document_risk
+            .total_p0
+            .saturating_add(state.session.document_risk.total_p1);
+        if pending_dictionary.is_some() {
+            self.invalidate_case_publications(&case_id, "case_dictionary_revision_changed")?;
+        } else {
+            self.invalidate_material_publications(
+                &case_id,
+                &material_id,
+                "risk_review_revision_changed",
+            )?;
+        }
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| {
+                PrivacyWorkflowError::new("privacy_store_busy", "Risk review store is busy.")
+            })?;
+        if let Some(pending) = pending_dictionary.as_ref() {
+            case_dictionary_store::commit_pending_revision(&transaction, pending)?;
+        }
+        PrivacyStore::update_review_draft_exact(
+            &transaction,
+            &request.redaction_id,
+            &loaded.redacted_content_sha256,
+            redacted_sha.as_str(),
+            unresolved,
+            &review_payload,
         )
+        .map_err(PrivacyWorkflowError::store)?;
+        append_risk_revision(&transaction, &state, request.expected_revision)?;
+        transaction.commit().map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_store_commit_failed",
+                "Editable pages and the risk revision were not committed atomically.",
+            )
+        })?;
+        let mut view = stored_to_view(stored, &loaded.review_state)?;
+        view.risk_review = Some(state.session.view().map_err(review_session_error)?);
+        Ok(view)
+    }
+
+    pub fn undo_risk_review(
+        &self,
+        request: PrivacyRiskReviewRevisionRequest,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        self.move_risk_review_history(request, false)
+    }
+
+    pub fn redo_risk_review(
+        &self,
+        request: PrivacyRiskReviewRevisionRequest,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        self.move_risk_review_history(request, true)
+    }
+
+    fn move_risk_review_history(
+        &self,
+        request: PrivacyRiskReviewRevisionRequest,
+        redo: bool,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        if !valid_identifier(&request.redaction_id) || request.expected_revision == 0 {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_review_input_invalid",
+                "Risk review history request is invalid.",
+            ));
+        }
+        let mut connection = self.open_connection()?;
+        let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
+            .map_err(PrivacyWorkflowError::store)?;
+        let mut stored: StoredReviewPayload =
+            serde_json::from_slice(&loaded.review_payload_plaintext).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "review_payload_invalid",
+                    "Review payload cannot be decoded.",
+                )
+            })?;
+        validate_loaded_review(&loaded, &stored)?;
+        self.verify_stored_vault_source(&connection, &stored)?;
+        let mut state = self.load_risk_state_unlocked(&connection, &request.redaction_id)?;
+        let case_id = CaseId::parse(stored.case_id.clone().ok_or_else(|| {
+            PrivacyWorkflowError::new(
+                "privacy_case_dictionary_missing",
+                "A production risk review must remain case-bound.",
+            )
+        })?)
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_review_identity_invalid",
+                "The risk review case identity is invalid.",
+            )
+        })?;
+        let dictionary =
+            case_dictionary_store::load_required_case_dictionary(&connection, self, &case_id)?;
+        verify_dictionary_revision(&state.session, &dictionary)?;
+        if state.session.revision != request.expected_revision {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_review_revision_conflict",
+                "Risk review revision changed; reload before changing history.",
+            ));
+        }
+        let target_pages = if redo {
+            state.redo_pages.pop()
+        } else {
+            state.undo_pages.pop()
+        }
+        .ok_or_else(|| {
+            PrivacyWorkflowError::new(
+                "privacy_review_history_unavailable",
+                "The requested risk review history entry is unavailable.",
+            )
+        })?;
+        if redo {
+            if state.undo_pages.len() == privacy::MAX_REVIEW_HISTORY {
+                state.undo_pages.remove(0);
+            }
+            state.undo_pages.push(state.current_pages.clone());
+        } else {
+            if state.redo_pages.len() == privacy::MAX_REVIEW_HISTORY {
+                state.redo_pages.remove(0);
+            }
+            state.redo_pages.push(state.current_pages.clone());
+        }
+        let now_unix = self.current_unix()?;
+        if redo {
+            state
+                .session
+                .redo(request.expected_revision, now_unix)
+                .map_err(review_session_error)?;
+        } else {
+            state
+                .session
+                .undo(request.expected_revision, now_unix)
+                .map_err(review_session_error)?;
+        }
+        verify_dictionary_revision(&state.session, &dictionary)?;
+        state.current_pages = target_pages;
+        validate_risk_state(&state, state.session.revision)?;
+        install_risk_pages_in_review(&mut stored, &state.current_pages)?;
+        stored.suggested_redacted_content_sha256 =
+            state.session.redacted_content_sha256.as_str().to_owned();
+        let review_payload = serde_json::to_vec(&stored).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "review_payload_invalid",
+                "Review payload cannot be serialized.",
+            )
+        })?;
+        let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_review_identity_invalid",
+                "The risk review material identity is invalid.",
+            )
+        })?;
+        self.invalidate_material_publications(
+            &case_id,
+            &material_id,
+            "risk_review_revision_changed",
+        )?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| {
+                PrivacyWorkflowError::new("privacy_store_busy", "Risk review store is busy.")
+            })?;
+        PrivacyStore::update_review_draft_exact(
+            &transaction,
+            &request.redaction_id,
+            &loaded.redacted_content_sha256,
+            state.session.redacted_content_sha256.as_str(),
+            state
+                .session
+                .document_risk
+                .total_p0
+                .saturating_add(state.session.document_risk.total_p1),
+            &review_payload,
+        )
+        .map_err(PrivacyWorkflowError::store)?;
+        append_risk_revision(&transaction, &state, request.expected_revision)?;
+        transaction.commit().map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_store_commit_failed",
+                "Review pages and history revision were not committed atomically.",
+            )
+        })?;
+        let mut view = stored_to_view(stored, &loaded.review_state)?;
+        view.risk_review = Some(state.session.view().map_err(review_session_error)?);
+        Ok(view)
+    }
+    /// Renderer-facing approval entry point. External Provider and MCP scopes
+    /// must use their dedicated, fixed-purpose approval commands instead.
+    pub fn approve_local_safe_export_review(
+        &self,
+        request: ApprovePrivacyReviewRequest,
+    ) -> Result<ApprovePrivacyReviewResponse, PrivacyWorkflowError> {
+        if request.destination.kind != DestinationKind::VerifiedLocalProvider {
+            return Err(PrivacyWorkflowError::new(
+                "dedicated_approval_required",
+                "External Provider and MCP destinations require their dedicated approval flow.",
+            ));
+        }
+        self.approve_review(request)
     }
 
     pub fn approve_review(
@@ -717,6 +2425,7 @@ impl PrivacyWorkflowManager {
                 PrivacyWorkflowError::new("review_payload_invalid", "本机审阅数据无法解密或解析。")
             })?;
         validate_loaded_review(&loaded, &stored)?;
+        self.verify_stored_vault_source(&connection, &stored)?;
 
         let edited_pages = normalize_edited_pages(&stored, request.edited_pages)?;
         reject_normalized_canaries(&edited_pages, &stored.forbidden_canaries)?;
@@ -744,7 +2453,27 @@ impl PrivacyWorkflowManager {
                 ),
             ));
         }
-        preflight_safe_pdf_delivery(&edited_pages, &stored.forbidden_canaries)?;
+        if matches!(
+            &request.destination.kind,
+            DestinationKind::VerifiedLocalProvider
+        ) {
+            let destination = DestinationScope {
+                kind: request.destination.kind.clone(),
+                identifier: request.destination.identifier.trim().to_owned(),
+            };
+            let format = SafeExportFormat::from_scope(&destination, request.purpose.trim())
+                .ok_or_else(|| {
+                    PrivacyWorkflowError::new(
+                        "approval_scope_unsupported",
+                        "本机安全导出目标或用途不受支持。",
+                    )
+                })?;
+            safe_derived::preflight_safe_export_delivery(
+                format,
+                &edited_pages,
+                &stored.forbidden_canaries,
+            )?;
+        }
         let approved_payload_sha256 = sha256_hex(&approved_payload);
         let reviewer_sha256 = sha256_hex(request.reviewer.trim().as_bytes());
         let destination = DestinationScope {
@@ -755,6 +2484,154 @@ impl PrivacyWorkflowManager {
         let expires_at_unix = now_unix.checked_add(request.ttl_seconds).ok_or_else(|| {
             PrivacyWorkflowError::new("invalid_receipt_ttl", "回执有效期超出范围。")
         })?;
+        let publication_bound_risk = if stored.case_id.is_some() {
+            let expected_revision = request.expected_risk_revision.ok_or_else(|| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_revision_required",
+                    "The exact risk review revision is required before approval.",
+                )
+            })?;
+            let mut state = self.load_risk_state_unlocked(&connection, &request.redaction_id)?;
+            if state.session.revision != expected_revision
+                || state.session.redacted_content_sha256.as_str() != redacted_content_sha256
+            {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_review_revision_conflict",
+                    "Risk review revision or edited content changed; reload and save the risk review before approval.",
+                ));
+            }
+            let case_id = CaseId::parse(stored.case_id.clone().ok_or_else(|| {
+                PrivacyWorkflowError::new(
+                    "privacy_case_dictionary_missing",
+                    "Approval requires a current case dictionary binding.",
+                )
+            })?)
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "The approval case identity is invalid.",
+                )
+            })?;
+            let dictionary =
+                case_dictionary_store::load_required_case_dictionary(&connection, self, &case_id)?;
+            verify_dictionary_revision(&state.session, &dictionary)?;
+            let approved_page_texts = edited_pages
+                .iter()
+                .map(|page| page.text.clone())
+                .collect::<Vec<_>>();
+            let bound_residual = case_dictionary_store::scan_residuals(
+                &dictionary,
+                &approved_page_texts,
+                &stored.source_display_name,
+            )?;
+            if !bound_residual.passed
+                || bound_residual.evidence_hash != state.session.residual_scan.evidence_hash
+            {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_residual_evidence_conflict",
+                    "The current dictionary or source-name residual evidence does not match the approved revision.",
+                ));
+            }
+            let target_claims = PublicationTargetBindingV1 {
+                schema_version: "privacy-publication-target-binding-v1",
+                destination_kind: &destination.kind,
+                destination_identifier: &destination.identifier,
+                purpose: request.purpose.trim(),
+                approved_payload_sha256: &approved_payload_sha256,
+                redacted_content_sha256: &redacted_content_sha256,
+            };
+            let target_bytes = canonical_json_v1(&target_claims).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_publication_target_invalid",
+                    "The exact publication target cannot be canonicalized.",
+                )
+            })?;
+            let target_hash = Sha256Hex::parse(sha256_hex(&target_bytes)).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_publication_target_invalid",
+                    "The exact publication target hash is invalid.",
+                )
+            })?;
+            let risk_policy = state.session.risk_policy.clone();
+            let qualification = state.session.qualification.clone();
+            state
+                .session
+                .bind_publication_context(
+                    expected_revision,
+                    target_hash,
+                    RequestedApprovalRoute::Human,
+                    risk_policy,
+                    qualification,
+                    now_unix,
+                )
+                .map_err(review_session_error)?;
+            let risk_view = state.session.view().map_err(review_session_error)?;
+            let blockers = risk_view
+                .hard_gates
+                .iter()
+                .filter(|gate| {
+                    gate.blocking
+                        && !gate.passed
+                        && !matches!(
+                            gate.gate_id.as_str(),
+                            "calibrated_policy"
+                                | "approval_mode_allows_automatic"
+                                | "organization_policy_allows_automatic"
+                        )
+                })
+                .map(|gate| gate.gate_id.clone())
+                .collect::<Vec<_>>();
+            if !state.session.detector_run_completed
+                || !blockers.is_empty()
+                || state.session.document_risk.total_p0 != 0
+                || state.session.document_risk.total_p1 != 0
+                || !state.session.residual_scan.passed
+                || state.session.rejected
+            {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_risk_gates_blocked",
+                    format!(
+                        "Production risk gates block approval: {}.",
+                        if blockers.is_empty() {
+                            "detector_or_residual_evidence".to_owned()
+                        } else {
+                            blockers.join(",")
+                        }
+                    ),
+                ));
+            }
+            Some(state)
+        } else {
+            if request.expected_risk_revision.is_some() {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_risk_state_missing",
+                    "A risk revision was supplied for a legacy review without a production risk session.",
+                ));
+            }
+            None
+        };
+        if let Some(case_id) = stored.case_id.as_ref() {
+            let case_id = CaseId::parse(case_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "The approval case identity is invalid.",
+                )
+            })?;
+            let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_review_identity_invalid",
+                    "The approval material identity is invalid.",
+                )
+            })?;
+            self.invalidate_material_publications(
+                &case_id,
+                &material_id,
+                "review_approval_revision_changed",
+            )?;
+        }
+        self.privacy_lifecycle(&connection)?
+            .bind_redaction_retention(&connection, &request.redaction_id, now_unix)
+            .map_err(PrivacyWorkflowError::lifecycle)?;
         let mut approved_stored = stored.clone();
         approved_stored.suggested_redacted_content_sha256 = redacted_content_sha256.clone();
         for (stored_page, approved_page) in approved_stored.pages.iter_mut().zip(&edited_pages) {
@@ -767,15 +2644,52 @@ impl PrivacyWorkflowManager {
         let signer = self.receipt_signer()?;
 
         let mut mutable_connection = connection;
-        match PrivacyStore::approve_review(
-            &mut mutable_connection,
-            &request.redaction_id,
-            &request.expected_suggested_redacted_sha256,
-            &redacted_content_sha256,
-            &approved_payload_sha256,
-            &reviewer_sha256,
-            &approved_review_payload_plaintext,
-        ) {
+        let approval_result = if let Some(state) = publication_bound_risk.as_ref() {
+            let state_plaintext = encode_risk_state(state)?;
+            let risk_sha256 = state.session.risk_sha256().map_err(review_session_error)?;
+            let hard_gate_sha256 = state
+                .session
+                .hard_gate_sha256()
+                .map_err(review_session_error)?;
+            let expected_previous_revision =
+                state.session.revision.checked_sub(1).ok_or_else(|| {
+                    PrivacyWorkflowError::new(
+                        "privacy_review_revision_conflict",
+                        "The publication-bound risk revision is invalid.",
+                    )
+                })?;
+            PrivacyStore::approve_review_with_risk_revision(
+                &mut mutable_connection,
+                &privacy::ApproveReviewWithRiskRevision {
+                    redaction_id: &request.redaction_id,
+                    expected_redacted_sha256: &request.expected_suggested_redacted_sha256,
+                    approved_redacted_content_sha256: &redacted_content_sha256,
+                    approved_payload_sha256: &approved_payload_sha256,
+                    reviewed_by_sha256: &reviewer_sha256,
+                    approved_review_payload_plaintext: &approved_review_payload_plaintext,
+                    risk_revision: SaveRiskReviewRevision {
+                        redaction_id: &request.redaction_id,
+                        expected_previous_revision,
+                        risk_sha256: &risk_sha256,
+                        hard_gate_sha256: &hard_gate_sha256,
+                        action_code: &state.session.last_action_code,
+                        reason_codes: &state.session.document_risk.reason_codes,
+                        state_plaintext: &state_plaintext,
+                    },
+                },
+            )
+        } else {
+            PrivacyStore::approve_review(
+                &mut mutable_connection,
+                &request.redaction_id,
+                &request.expected_suggested_redacted_sha256,
+                &redacted_content_sha256,
+                &approved_payload_sha256,
+                &reviewer_sha256,
+                &approved_review_payload_plaintext,
+            )
+        };
+        match approval_result {
             Ok(()) => {}
             Err(PrivacyStoreError::Conflict) => {
                 let already_approved = mutable_connection
@@ -870,10 +2784,11 @@ impl PrivacyWorkflowManager {
             expires_at_unix,
             destination,
             purpose: request.purpose.trim().to_owned(),
-            transport_enforcement: "local_receipt_issued_provider_transport_not_fully_gated",
+            transport_enforcement: "active_receipt_persisted_exact_destination",
         })
     }
 
+    #[allow(dead_code)]
     pub fn record_safe_pdf_export_cancellation(
         &self,
         request: &ExportApprovedReviewPdfRequest,
@@ -939,6 +2854,7 @@ impl PrivacyWorkflowManager {
         .map_err(PrivacyWorkflowError::store)?;
         Ok(())
     }
+    #[allow(dead_code)]
     pub fn record_safe_pdf_export_event(
         &self,
         request: &ExportApprovedReviewPdfRequest,
@@ -1010,6 +2926,7 @@ impl PrivacyWorkflowManager {
         .map_err(PrivacyWorkflowError::store)?;
         Ok(())
     }
+    #[allow(dead_code)]
     pub fn verify_safe_pdf_authorization(
         &self,
         request: &ExportApprovedReviewPdfRequest,
@@ -1061,6 +2978,7 @@ impl PrivacyWorkflowManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn build_safe_pdf(
         &self,
         request: ExportApprovedReviewPdfRequest,
@@ -1126,6 +3044,7 @@ impl PrivacyWorkflowManager {
                 )
             })?;
         validate_loaded_review(&loaded, &stored)?;
+        self.verify_stored_vault_source(&connection, &stored)?;
         let approved: OwnedApprovedPayload = serde_json::from_str(&request.approved_payload_json)
             .map_err(|_| {
             PrivacyWorkflowError::new(
@@ -1219,6 +3138,632 @@ fn preflight_safe_pdf_delivery(
     .map_err(safe_export_error)?;
     Ok(())
 }
+fn install_risk_pages_in_review(
+    stored: &mut StoredReviewPayload,
+    pages: &[CanonicalRedactedPage],
+) -> Result<(), PrivacyWorkflowError> {
+    if stored.pages.len() != pages.len() {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_risk_state_invalid",
+            "Risk review page count does not match the editable review.",
+        ));
+    }
+    for (stored_page, page) in stored.pages.iter_mut().zip(pages) {
+        if stored_page.page_number != page.page_number {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_risk_state_invalid",
+                "Risk review page identity changed.",
+            ));
+        }
+        stored_page.suggested_redacted_text = page.text.clone();
+    }
+    Ok(())
+}
+fn initial_risk_workflow_state(
+    stored: &StoredReviewPayload,
+    detector_run: Option<&local_detection::CompletedDetectorRunV1>,
+    dictionary: Option<&case_dictionary_store::CaseDictionarySnapshotV1>,
+    now_unix: u64,
+) -> Result<Option<StoredRiskWorkflowStateV1>, PrivacyWorkflowError> {
+    let Some(case_id) = stored.case_id.as_ref() else {
+        return Ok(None);
+    };
+    let case_id = CaseId::parse(case_id.clone()).map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_review_identity_invalid",
+            "Risk review case identity is invalid.",
+        )
+    })?;
+    let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_review_identity_invalid",
+            "Risk review material identity is invalid.",
+        )
+    })?;
+    let detector_run = detector_run.ok_or_else(|| {
+        PrivacyWorkflowError::new(
+            "privacy_detector_run_missing",
+            "A Vault-bound case review requires a completed local detector run.",
+        )
+    })?;
+    let dictionary = dictionary.ok_or_else(|| {
+        PrivacyWorkflowError::new(
+            "privacy_case_dictionary_missing",
+            "A case-bound review requires current encrypted dictionary evidence.",
+        )
+    })?;
+    if dictionary.case_id() != &case_id
+        || dictionary.revision_hash() != &detector_run.dictionary_revision_hash
+    {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_case_dictionary_revision_conflict",
+            "The detector and review dictionary revisions do not match.",
+        ));
+    }
+    let current_pages = stored
+        .pages
+        .iter()
+        .map(|page| CanonicalRedactedPage {
+            page_number: page.page_number,
+            text: page.suggested_redacted_text.clone(),
+        })
+        .collect::<Vec<_>>();
+    let current_page_texts = current_pages
+        .iter()
+        .map(|page| page.text.clone())
+        .collect::<Vec<_>>();
+    let residual_scan = case_dictionary_store::scan_residuals(
+        dictionary,
+        &current_page_texts,
+        &stored.source_display_name,
+    )?;
+    let mut pages = stored
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(page_index, page)| page_assessment_from_stored(page_index, page))
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_findings_to_page_assessments(&mut pages, &detector_run.findings)?;
+    let provenance_hash = Sha256Hex::parse(sha256_hex(
+        format!(
+            "privacy-initial-review-v2\0{}\0{}\0{}\0{}",
+            stored.source_sha256,
+            stored.extraction_sha256,
+            stored.suggested_redacted_content_sha256,
+            detector_run.detector_evidence_hash.as_str(),
+        )
+        .as_bytes(),
+    ))
+    .map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_risk_evidence_invalid",
+            "Risk provenance hash is invalid.",
+        )
+    })?;
+    let policy_sha256 = Sha256Hex::parse(sha256_hex(b"privacy-app-manual-fail-closed-policy-v1"))
+        .map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_risk_policy_invalid",
+            "Risk policy hash is invalid.",
+        )
+    })?;
+    let risk_policy = RiskPolicyV1 {
+        policy_id: "privacy-app-manual-fail-closed-v1".to_owned(),
+        policy_version: 1,
+        policy_sha256,
+        minimum_ocr_confidence_ppm: ConfidencePpm::new(900_000).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_policy_invalid",
+                "OCR confidence policy is invalid.",
+            )
+        })?,
+        minimum_ocr_coverage_ppm: ConfidencePpm::new(950_000).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_policy_invalid",
+                "OCR coverage policy is invalid.",
+            )
+        })?,
+        maximum_quick_review_p2: 0,
+        auto_approval_mode: AutoApprovalPolicyMode::Disabled,
+        production_automatic_enabled: false,
+        calibrated_for_automatic: false,
+        calibration_evidence_sha256: None,
+        organization_allows_automatic: false,
+    };
+    // This gate concerns required dictionary-matched entities, not whether a
+    // dictionary feature exists globally. With no dictionary match it is
+    // vacuously satisfied; every actual dictionary match must be resolved.
+    let required_dictionary_entities_stable = detector_run.findings.iter().all(|finding| {
+        !finding.case_dictionary_match
+            || matches!(
+                finding.severity,
+                FindingSeverity::P3Resolved | FindingSeverity::Informational
+            )
+    });
+    let deterministic_high_risk_fields_resolved = !detector_run.findings.iter().any(|finding| {
+        matches!(
+            finding.severity,
+            FindingSeverity::P0Blocking | FindingSeverity::P1High
+        )
+    });
+    let assessment = DocumentAssessmentV1 {
+        pages,
+        finding_summary_hash: detector_run.finding_summary_hash.clone(),
+        dictionary_entities_stable: required_dictionary_entities_stable,
+        deterministic_high_risk_fields_resolved,
+        independent_residual_scan_passed: residual_scan.passed,
+        independent_residual_scan_hash: Some(residual_scan.evidence_hash.clone()),
+        provenance_receiptable: true,
+        provenance_hash: Some(provenance_hash),
+        publication_target_fixed: false,
+        publication_target_hash: None,
+        requested_approval_route: RequestedApprovalRoute::Human,
+        calibration_evidence_version: Some(
+            detector_run.model_attestation.calibration_version.clone(),
+        ),
+    };
+    let session = ReviewSessionV1::new(ReviewSessionInputV1 {
+        redaction_id: stored.redaction_id.clone(),
+        case_id,
+        material_id,
+        document_version: 1,
+        detector_run_completed: true,
+        redacted_content_sha256: Sha256Hex::parse(stored.suggested_redacted_content_sha256.clone())
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_risk_evidence_invalid",
+                    "Redacted content hash is invalid.",
+                )
+            })?,
+        dictionary_revision_hash: Some(dictionary.revision_hash().clone()),
+        findings: detector_run.findings.clone(),
+        assessment,
+        residual_scan,
+        risk_policy,
+        qualification: detector_run.qualification.clone(),
+        created_at_unix: now_unix,
+    })
+    .map_err(review_session_error)?;
+    Ok(Some(StoredRiskWorkflowStateV1 {
+        schema_version: RISK_WORKFLOW_STATE_SCHEMA_VERSION.to_owned(),
+        session,
+        current_pages,
+        undo_pages: Vec::new(),
+        redo_pages: Vec::new(),
+    }))
+}
+
+fn apply_findings_to_page_assessments(
+    pages: &mut [PageAssessmentV1],
+    findings: &[PrivacyFindingV1],
+) -> Result<(), PrivacyWorkflowError> {
+    for finding in findings {
+        let page_index = usize::try_from(finding.page_index).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_evidence_invalid",
+                "Finding page index is out of range.",
+            )
+        })?;
+        let page = pages.get_mut(page_index).ok_or_else(|| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_evidence_invalid",
+                "Finding references a missing review page.",
+            )
+        })?;
+        let severity_count = match finding.severity {
+            FindingSeverity::P0Blocking => &mut page.p0_count,
+            FindingSeverity::P1High => &mut page.p1_count,
+            FindingSeverity::P2Medium => &mut page.p2_count,
+            FindingSeverity::P3Resolved | FindingSeverity::Informational => &mut page.p3_count,
+        };
+        *severity_count = severity_count.checked_add(1).ok_or_else(|| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_evidence_invalid",
+                "Finding severity count overflowed.",
+            )
+        })?;
+        if !matches!(
+            finding.severity,
+            FindingSeverity::P3Resolved | FindingSeverity::Informational
+        ) {
+            let count = page
+                .unresolved_entity_counts
+                .entry(finding.entity_type)
+                .or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                PrivacyWorkflowError::new(
+                    "privacy_risk_evidence_invalid",
+                    "Unresolved entity count overflowed.",
+                )
+            })?;
+        }
+        if finding
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "detector_or_location_conflict")
+        {
+            page.detector_conflict_count =
+                page.detector_conflict_count.checked_add(1).ok_or_else(|| {
+                    PrivacyWorkflowError::new(
+                        "privacy_risk_evidence_invalid",
+                        "Detector conflict count overflowed.",
+                    )
+                })?;
+        }
+        let mut reason_codes = page.reason_codes.iter().cloned().collect::<BTreeSet<_>>();
+        reason_codes.extend(finding.reason_codes.iter().cloned());
+        page.reason_codes = reason_codes.into_iter().collect();
+    }
+    Ok(())
+}
+
+fn page_assessment_from_stored(
+    page_index: usize,
+    page: &StoredReviewPage,
+) -> Result<PageAssessmentV1, PrivacyWorkflowError> {
+    let page_index = u32::try_from(page_index).map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_risk_evidence_invalid",
+            "Page index is out of range.",
+        )
+    })?;
+    let ocr_used = page
+        .spans
+        .iter()
+        .any(|span| span.backend == ExtractionBackend::MineruLocal);
+    let mut confidences = page
+        .spans
+        .iter()
+        .filter_map(|span| span.confidence)
+        .map(confidence_ppm)
+        .collect::<Result<Vec<_>, _>>()?;
+    confidences.sort_unstable();
+    let (ocr_min_ppm, ocr_mean_ppm, ocr_p10_ppm, coverage_ppm) = if ocr_used {
+        let min = confidences.first().copied();
+        let mean = if confidences.is_empty() {
+            None
+        } else {
+            let sum = confidences
+                .iter()
+                .map(|value| u64::from(value.get()))
+                .sum::<u64>();
+            ConfidencePpm::new(u32::try_from(sum / confidences.len() as u64).unwrap_or(0)).ok()
+        };
+        let p10 = if confidences.is_empty() {
+            None
+        } else {
+            Some(confidences[(confidences.len() - 1) / 10])
+        };
+        let coverage = if page.spans.is_empty() {
+            0
+        } else {
+            u32::try_from(
+                (confidences.len() as u64).saturating_mul(1_000_000) / page.spans.len() as u64,
+            )
+            .unwrap_or(0)
+        };
+        (
+            min,
+            mean,
+            p10,
+            ConfidencePpm::new(coverage).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_risk_evidence_invalid",
+                    "OCR coverage is invalid.",
+                )
+            })?,
+        )
+    } else {
+        (
+            None,
+            None,
+            None,
+            ConfidencePpm::new(1_000_000).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_risk_evidence_invalid",
+                    "Native coverage is invalid.",
+                )
+            })?,
+        )
+    };
+    let mut visual = BTreeSet::new();
+    for reason in &page.assessment.reason_codes {
+        match reason {
+            QualityReasonCode::VisualContentPresent => {
+                visual.insert("generic_visual_content".to_owned());
+            }
+            QualityReasonCode::PageAnnotationsPresent => {
+                visual.insert("page_annotations".to_owned());
+            }
+            QualityReasonCode::InteractiveFormPresent => {
+                visual.insert("interactive_form".to_owned());
+            }
+            QualityReasonCode::OcrLowResolution => {
+                visual.insert("ocr_low_resolution".to_owned());
+            }
+            QualityReasonCode::OcrLowConfidence => {
+                visual.insert("ocr_low_confidence".to_owned());
+            }
+            _ => {}
+        }
+    }
+    Ok(PageAssessmentV1 {
+        page_index,
+        p0_count: 0,
+        p1_count: 0,
+        p2_count: 0,
+        p3_count: 0,
+        ocr_used,
+        ocr_min_ppm,
+        ocr_mean_ppm,
+        ocr_p10_ppm,
+        coverage_ppm,
+        unknown_long_number_count: 0,
+        unresolved_entity_counts: BTreeMap::new(),
+        unresolved_visual_risks: visual.into_iter().collect(),
+        completeness_passed: !page.spans.is_empty()
+            && !matches!(page.assessment.decision, PageExtractionDecision::Blocked),
+        detector_conflict_count: 0,
+        cluster_inconsistency_count: 0,
+        reason_codes: Vec::new(),
+    })
+}
+
+fn confidence_ppm(value: f32) -> Result<ConfidencePpm, PrivacyWorkflowError> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_risk_evidence_invalid",
+            "OCR confidence is outside the verified range.",
+        ));
+    }
+    ConfidencePpm::new((value * 1_000_000.0).round() as u32).map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_risk_evidence_invalid",
+            "OCR confidence is invalid.",
+        )
+    })
+}
+
+fn review_session_error(error: privacy::ReviewSessionError) -> PrivacyWorkflowError {
+    PrivacyWorkflowError::new(
+        error.code(),
+        "Local risk review state failed strict validation.",
+    )
+}
+
+fn approved_publication_invalidation_error(code: &'static str) -> PrivacyWorkflowError {
+    PrivacyWorkflowError::new(
+        code,
+        "Existing approved publications could not be revoked before the privacy revision changed.",
+    )
+}
+
+fn pending_restore_artifacts_exist(directory: &Path) -> Result<bool, PrivacyWorkflowError> {
+    let active_name = PRIVACY_DATABASE_NAME;
+    [
+        format!("{active_name}.restore-incoming"),
+        format!("{active_name}.restore-pending.dpapi"),
+        format!("{active_name}.restore-rollback"),
+        format!("{active_name}.application-restore-incoming"),
+    ]
+    .into_iter()
+    .try_fold(false, |found, name| {
+        directory
+            .join(name)
+            .try_exists()
+            .map(|exists| found || exists)
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_restore_state_unavailable",
+                    "Pending privacy restore state could not be inspected.",
+                )
+            })
+    })
+}
+
+fn prepared_retention_cleanup_ids(
+    connection: &Connection,
+) -> Result<Vec<String>, PrivacyWorkflowError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT cleanup_id FROM privacy_cleanup_journal
+             WHERE state='prepared' ORDER BY cleanup_id",
+        )
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_cleanup_state_unavailable",
+                "Pending retention cleanup state could not be inspected.",
+            )
+        })?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_cleanup_state_unavailable",
+                "Pending retention cleanup state could not be inspected.",
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_cleanup_state_unavailable",
+                "Pending retention cleanup state could not be inspected.",
+            )
+        })?;
+    Ok(rows)
+}
+
+fn encode_risk_state(state: &StoredRiskWorkflowStateV1) -> Result<Vec<u8>, PrivacyWorkflowError> {
+    validate_risk_state(state, state.session.revision)?;
+    serde_json::to_vec(state).map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_risk_state_invalid",
+            "Risk review state cannot be serialized.",
+        )
+    })
+}
+
+fn decode_risk_state(
+    loaded: &privacy::LoadedRiskReviewRevision,
+) -> Result<StoredRiskWorkflowStateV1, PrivacyWorkflowError> {
+    let state: StoredRiskWorkflowStateV1 = serde_json::from_slice(&loaded.state_plaintext)
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_risk_state_invalid",
+                "Persisted risk review state failed strict decoding.",
+            )
+        })?;
+    validate_risk_state(&state, loaded.revision)?;
+    if state.session.risk_sha256().map_err(review_session_error)? != loaded.risk_sha256
+        || state
+            .session
+            .hard_gate_sha256()
+            .map_err(review_session_error)?
+            != loaded.hard_gate_sha256
+    {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_risk_state_tampered",
+            "Persisted risk review hashes do not match the protected state.",
+        ));
+    }
+    Ok(state)
+}
+
+fn validate_risk_state(
+    state: &StoredRiskWorkflowStateV1,
+    expected_revision: u64,
+) -> Result<(), PrivacyWorkflowError> {
+    if state.schema_version != RISK_WORKFLOW_STATE_SCHEMA_VERSION
+        || state.session.revision != expected_revision
+        || state.undo_pages.len() > privacy::MAX_REVIEW_HISTORY
+        || state.redo_pages.len() > privacy::MAX_REVIEW_HISTORY
+        || state.current_pages.len() != state.session.assessment.pages.len()
+    {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_risk_state_invalid",
+            "Risk review revision or page history is inconsistent.",
+        ));
+    }
+    state.session.validate().map_err(review_session_error)?;
+    let bytes = canonical_redacted_bytes(&state.current_pages)?;
+    if sha256_hex(&bytes) != state.session.redacted_content_sha256.as_str() {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_risk_state_tampered",
+            "Risk review page bytes do not match the protected revision hash.",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_dictionary_revision(
+    session: &ReviewSessionV1,
+    dictionary: &case_dictionary_store::CaseDictionarySnapshotV1,
+) -> Result<(), PrivacyWorkflowError> {
+    if session.case_id != *dictionary.case_id()
+        || session.dictionary_revision_hash.as_ref() != Some(dictionary.revision_hash())
+    {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_case_dictionary_revision_conflict",
+            "The case dictionary changed after this risk revision; rerun detection and review before approval.",
+        ));
+    }
+    Ok(())
+}
+
+fn dictionary_entities_stable_after_action(
+    session: &ReviewSessionV1,
+    action: &ReviewActionV1,
+) -> bool {
+    session.findings.iter().all(|finding| {
+        let becomes_dictionary_entry = matches!(
+            action,
+            ReviewActionV1::AddToDictionary { finding_id, .. }
+                if finding.finding_id.as_str() == finding_id
+        );
+        if (!finding.case_dictionary_match && !becomes_dictionary_entry)
+            || !matches!(
+                finding.resolution_state,
+                privacy::vnext::ReviewResolution::Unresolved
+                    | privacy::vnext::ReviewResolution::Revoked
+            )
+        {
+            return true;
+        }
+        match action {
+            ReviewActionV1::AcceptReplacement {
+                finding_id,
+                apply_cluster,
+            }
+            | ReviewActionV1::ChangePlaceholder {
+                finding_id,
+                apply_cluster,
+                ..
+            } => {
+                finding.finding_id.as_str() == finding_id
+                    || (*apply_cluster
+                        && session
+                            .findings
+                            .iter()
+                            .find(|candidate| candidate.finding_id.as_str() == finding_id)
+                            .and_then(|candidate| candidate.cluster_id.as_ref())
+                            == finding.cluster_id.as_ref())
+            }
+            ReviewActionV1::ChangeEntityType { finding_id, .. }
+            | ReviewActionV1::MarkNotSensitive { finding_id }
+            | ReviewActionV1::SplitCluster { finding_id } => {
+                finding.finding_id.as_str() == finding_id
+            }
+            ReviewActionV1::MergeClusters { cluster_ids } => finding
+                .cluster_id
+                .as_ref()
+                .is_some_and(|cluster| cluster_ids.iter().any(|value| value == cluster.as_str())),
+            _ => false,
+        }
+    })
+}
+
+fn append_risk_revision(
+    connection: &Connection,
+    state: &StoredRiskWorkflowStateV1,
+    expected_previous_revision: u64,
+) -> Result<(), PrivacyWorkflowError> {
+    let state_plaintext = encode_risk_state(state)?;
+    let risk_sha256 = state.session.risk_sha256().map_err(review_session_error)?;
+    let hard_gate_sha256 = state
+        .session
+        .hard_gate_sha256()
+        .map_err(review_session_error)?;
+    PrivacyStore::append_risk_review_revision(
+        connection,
+        &SaveRiskReviewRevision {
+            redaction_id: &state.session.redaction_id,
+            expected_previous_revision,
+            risk_sha256: &risk_sha256,
+            hard_gate_sha256: &hard_gate_sha256,
+            action_code: &state.session.last_action_code,
+            reason_codes: &state.session.document_risk.reason_codes,
+            state_plaintext: &state_plaintext,
+        },
+    )
+    .map(|_| ())
+    .map_err(PrivacyWorkflowError::store)
+}
+fn validate_vault_isolation(status: &VaultIsolationStatusV1) -> Result<(), PrivacyWorkflowError> {
+    if status.isolation_level != "windows_current_user_encrypted_vault"
+        || !status.private_acl_enforced
+        || !status.content_indexing_disabled
+        || !status.encrypted_at_rest
+        || status.broker_boundary != "in_process_vault_broker_interface_v1"
+        || status.same_user_process_limitation
+            != "same_user_processes_are_not_technically_excluded_without_a_service_identity"
+    {
+        return Err(PrivacyWorkflowError::new(
+            "vault_isolation_unverified",
+            "Vault 加密、专用 ACL、索引禁用或 Broker 边界未通过实时核验。",
+        ));
+    }
+    Ok(())
+}
 fn canonical_redacted_bytes(
     pages: &[CanonicalRedactedPage],
 ) -> Result<Vec<u8>, PrivacyWorkflowError> {
@@ -1234,7 +3779,6 @@ fn canonical_redacted_bytes(
 fn stored_to_view(
     stored: StoredReviewPayload,
     review_state: &str,
-    source_display_name: String,
 ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
     if stored.page_count as usize != stored.pages.len() {
         return Err(PrivacyWorkflowError::new(
@@ -1242,6 +3786,11 @@ fn stored_to_view(
             "审阅页数与本地提取摘要不一致。",
         ));
     }
+    let source_display_name = if stored.source_display_name.trim().is_empty() {
+        "Local material".to_owned()
+    } else {
+        stored.source_display_name.clone()
+    };
     let pages = stored
         .pages
         .into_iter()
@@ -1256,6 +3805,10 @@ fn stored_to_view(
     Ok(PrivacyReviewView {
         redaction_id: stored.redaction_id,
         material_id: stored.material_id,
+        case_id: stored.case_id,
+        vault_object_id: stored.vault_object_id,
+        vault_object_version: stored.vault_object_version,
+        vault_isolation: stored.vault_isolation,
         source_display_name,
         source_sha256: stored.source_sha256,
         extraction_sha256: stored.extraction_sha256,
@@ -1264,9 +3817,11 @@ fn stored_to_view(
         media_type: stored.media_type,
         page_count: stored.page_count,
         backend_trace: stored.backend_trace,
+        input_transform: stored.input_transform,
         summary: stored.summary,
         review_state: review_state.to_owned(),
         pages,
+        risk_review: None,
     })
 }
 
@@ -1290,6 +3845,20 @@ fn validate_loaded_review(
     Ok(())
 }
 
+fn approval_destination_supported(destination: &ReceiptDestinationInput, purpose: &str) -> bool {
+    match &destination.kind {
+        DestinationKind::ExternalProvider | DestinationKind::ExternalMcpHost => {
+            valid_identifier(destination.identifier.trim()) && valid_identifier(purpose)
+        }
+        DestinationKind::VerifiedLocalProvider => {
+            let scope = DestinationScope {
+                kind: DestinationKind::VerifiedLocalProvider,
+                identifier: destination.identifier.trim().to_owned(),
+            };
+            SafeExportFormat::from_scope(&scope, purpose).is_some()
+        }
+    }
+}
 fn validate_approval_request(
     request: &ApprovePrivacyReviewRequest,
 ) -> Result<(), PrivacyWorkflowError> {
@@ -1298,12 +3867,7 @@ fn validate_approval_request(
         || !valid_identifier(request.reviewer.trim())
         || !valid_identifier(request.destination.identifier.trim())
         || !valid_identifier(request.purpose.trim())
-        || !matches!(
-            &request.destination.kind,
-            DestinationKind::VerifiedLocalProvider
-        )
-        || request.destination.identifier.trim() != LOCAL_SAFE_PDF_DESTINATION_IDENTIFIER
-        || request.purpose.trim() != LOCAL_SAFE_PDF_PURPOSE
+        || !approval_destination_supported(&request.destination, request.purpose.trim())
         || !(MIN_RECEIPT_TTL_SECONDS..=MAX_RECEIPT_TTL_SECONDS).contains(&request.ttl_seconds)
     {
         return Err(PrivacyWorkflowError::new(
@@ -1546,10 +4110,25 @@ fn extract_local_material(
     source_name: &str,
     config: &PrivacyConfig,
     ocr_status: &LocalOcrStatus,
+    mineru_config: Option<&LocalMineruConfig>,
 ) -> Result<LocalExtractedDocument, PrivacyWorkflowError> {
     let format = file_ingest::detect_format(source_name).map_err(ingest_error)?;
     match format {
-        FileFormat::Pdf => extract_pdf_material(bytes, config, ocr_status),
+        FileFormat::Pdf => extract_pdf_material(bytes, config, ocr_status, mineru_config),
+        FileFormat::Png => extract_raster_material(
+            bytes,
+            RasterImageFormat::Png,
+            config,
+            ocr_status,
+            mineru_config,
+        ),
+        FileFormat::Jpeg => extract_raster_material(
+            bytes,
+            RasterImageFormat::Jpeg,
+            config,
+            ocr_status,
+            mineru_config,
+        ),
         FileFormat::Docx | FileFormat::Txt | FileFormat::Markdown => {
             extract_segmented_material(bytes, source_name)
         }
@@ -1560,11 +4139,16 @@ fn extract_pdf_material(
     bytes: &[u8],
     config: &PrivacyConfig,
     ocr_status: &LocalOcrStatus,
+    mineru_config: Option<&LocalMineruConfig>,
 ) -> Result<LocalExtractedDocument, PrivacyWorkflowError> {
-    if !config.ocr.strict_offline || !config.ocr.forbid_cloud_fallback {
+    if !config.ocr.strict_offline
+        || !config.ocr.forbid_cloud_fallback
+        || !config.ocr.forbid_remote_upload
+        || !config.ocr.forbid_telemetry
+    {
         return Err(PrivacyWorkflowError::new(
             "unsafe_ocr_configuration",
-            "真实案件必须保持严格离线且禁止云端 OCR 回退。",
+            "真实案件必须保持严格离线，并禁止云端回退、远端上传和遥测。",
         ));
     }
     if config.ocr.mode == ConfigOcrMode::ForceLocal
@@ -1585,9 +4169,7 @@ fn extract_pdf_material(
         max_pages: config.ocr.max_pages as usize,
         ..ProcessingLimits::default()
     };
-    // No certified worker manifest/firewall evidence is yet represented in
-    // settings. Healthy text layers remain local; OCR-required pages fail.
-    let processed = material_processing::process_pdf(bytes, ocr_mode, None, limits)
+    let processed = material_processing::process_pdf(bytes, ocr_mode, mineru_config, limits)
         .map_err(PrivacyWorkflowError::processing)?;
     if processed.source_sha256 != sha256_hex(bytes) {
         return Err(PrivacyWorkflowError::new(
@@ -1611,10 +4193,95 @@ fn extract_pdf_material(
         media_type: processed.media_type,
         page_count: processed.page_count,
         backend_trace: processed.backend_trace,
+        input_transform: processed.input_transform,
         segments,
     })
 }
 
+fn extract_raster_material(
+    bytes: &[u8],
+    format: RasterImageFormat,
+    config: &PrivacyConfig,
+    ocr_status: &LocalOcrStatus,
+    mineru_config: Option<&LocalMineruConfig>,
+) -> Result<LocalExtractedDocument, PrivacyWorkflowError> {
+    if !config.ocr.strict_offline
+        || !config.ocr.forbid_cloud_fallback
+        || !config.ocr.forbid_remote_upload
+        || !config.ocr.forbid_telemetry
+    {
+        return Err(PrivacyWorkflowError::new(
+            "unsafe_ocr_configuration",
+            "图片案件材料必须保持严格离线，并禁止云端回退、远端上传和遥测。",
+        ));
+    }
+    if config.ocr.mode != ConfigOcrMode::Off
+        && (!ocr_status.integrity_verified || !ocr_status.network_isolation_verified)
+    {
+        return Err(PrivacyWorkflowError::new(
+            "ocr_worker_isolation_unverified",
+            "图片必须使用已认证且已验证网络隔离的本地 OCR 组件。",
+        ));
+    }
+    let ocr_mode = match config.ocr.mode {
+        ConfigOcrMode::Off => OcrMode::Off,
+        ConfigOcrMode::AutoLocal => OcrMode::AutoLocal,
+        ConfigOcrMode::ForceLocal => OcrMode::ForceLocal,
+    };
+    let limits = ProcessingLimits {
+        max_input_bytes: MAX_SELECTED_FILE_BYTES as usize,
+        max_pages: config.ocr.max_pages as usize,
+        ..ProcessingLimits::default()
+    };
+    let processed =
+        material_processing::process_raster_image(bytes, format, ocr_mode, mineru_config, limits)
+            .map_err(PrivacyWorkflowError::processing)?;
+    let expected_source_sha256 = sha256_hex(bytes);
+    let transform = processed.input_transform.as_ref().ok_or_else(|| {
+        PrivacyWorkflowError::new(
+            "input_transform_missing",
+            "图片 OCR 结果缺少原图到处理 PDF 的本地转换证据。",
+        )
+    })?;
+    if processed.source_sha256 != expected_source_sha256
+        || processed.media_type != format.media_type()
+        || processed.page_count != 1
+        || processed.pages.len() != 1
+        || transform.schema_version != 1
+        || transform.transform_version != material_processing::RASTER_TO_PDF_TRANSFORM_VERSION
+        || transform.source_media_type != format.media_type()
+        || transform.source_sha256 != expected_source_sha256
+        || transform.processing_media_type != "application/pdf"
+        || !valid_hash(&transform.processing_sha256)
+        || transform.processing_sha256 == transform.source_sha256
+        || transform.pixel_width == 0
+        || transform.pixel_height == 0
+    {
+        return Err(PrivacyWorkflowError::new(
+            "input_transform_mismatch",
+            "图片原件、确定性处理 PDF 与 OCR 结果的证据绑定不一致。",
+        ));
+    }
+    let segments = processed
+        .pages
+        .into_iter()
+        .map(|page| LocalExtractedSegment {
+            page_number: page.page_number,
+            locator: format!("page:{}", page.page_number),
+            assessment: page.assessment,
+            spans: page.spans,
+        })
+        .collect::<Vec<_>>();
+    Ok(LocalExtractedDocument {
+        processing_version: processed.processing_version,
+        source_sha256: processed.source_sha256,
+        media_type: processed.media_type,
+        page_count: processed.page_count,
+        backend_trace: processed.backend_trace,
+        input_transform: processed.input_transform,
+        segments,
+    })
+}
 fn extract_segmented_material(
     bytes: &[u8],
     source_name: &str,
@@ -1656,6 +4323,7 @@ fn extract_segmented_material(
         source_sha256: extracted.sha256_hex,
         media_type: extracted.mime_type,
         page_count,
+        input_transform: None,
         backend_trace: vec![BackendTrace {
             backend: ExtractionBackend::NativeText,
             worker_sha256: None,
@@ -1788,9 +4456,62 @@ mod tests {
         content::{Content, Operation},
         dictionary, Document, Object, Stream,
     };
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tempfile::TempDir;
 
     const TEST_NOW: u64 = 1_700_000_000;
+
+    #[derive(Default)]
+    struct TogglePublicationInvalidator {
+        fail: AtomicBool,
+        case_calls: AtomicU64,
+        material_calls: AtomicU64,
+    }
+
+    impl ApprovedPublicationInvalidator for TogglePublicationInvalidator {
+        fn invalidate_case(
+            &self,
+            _case_id: &CaseId,
+            _reason_code: &'static str,
+        ) -> Result<u64, &'static str> {
+            self.case_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err("approved_workspace_invalidation_injected_failure")
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn invalidate_material(
+            &self,
+            _case_id: &CaseId,
+            _material_id: &MaterialId,
+            _reason_code: &'static str,
+        ) -> Result<u64, &'static str> {
+            self.material_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err("approved_workspace_invalidation_injected_failure")
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn invalidate_all(&self, _reason_code: &'static str) -> Result<u64, &'static str> {
+            Ok(0)
+        }
+
+        fn invalidate_lifecycle_bindings(
+            &self,
+            _lifecycle_binding_ids: &BTreeSet<String>,
+            _reason_code: &'static str,
+        ) -> Result<u64, &'static str> {
+            if self.fail.load(Ordering::SeqCst) {
+                Err("approved_workspace_invalidation_injected_failure")
+            } else {
+                Ok(0)
+            }
+        }
+    }
 
     fn local_ocr_status() -> LocalOcrStatus {
         LocalOcrStatus {
@@ -1804,13 +4525,24 @@ mod tests {
             model_directory_present: false,
             integrity_verified: false,
             network_isolation_verified: false,
+            worker_protocol_version: None,
+            worker_protocol_identity_sha256: None,
+            worker_health_evidence_sha256: None,
+            python_version: None,
+            mineru_version: None,
+            pytorch_version: None,
+            cuda_runtime_version: None,
+            gpu_driver_version: None,
         }
     }
 
     fn manager_with_test_signer() -> (TempDir, PrivacyWorkflowManager, ReceiptSigner) {
         let directory = tempfile::tempdir().expect("temp privacy directory");
-        let manager =
-            PrivacyWorkflowManager::new(directory.path().to_path_buf()).expect("privacy manager");
+        let manager = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("privacy manager");
         let signer = ReceiptSigner::new([7u8; 32]).expect("test receipt signer");
         manager.set_test_runtime(signer.clone(), TEST_NOW);
         (directory, manager, signer)
@@ -1827,9 +4559,91 @@ mod tests {
                 source_name.to_owned(),
                 &PrivacyConfig::default(),
                 &local_ocr_status(),
+                None,
                 Vec::new(),
             )
             .expect("prepare local text review")
+    }
+
+    fn prepare_case_text(
+        manager: &PrivacyWorkflowManager,
+        source_name: &str,
+        text: &str,
+        case_id: &str,
+    ) -> PrivacyReviewView {
+        prepare_case_text_with_terms(manager, source_name, text, case_id, Vec::new())
+    }
+
+    fn prepare_case_text_with_terms(
+        manager: &PrivacyWorkflowManager,
+        source_name: &str,
+        text: &str,
+        case_id: &str,
+        custom_terms: Vec<String>,
+    ) -> PrivacyReviewView {
+        let source_directory = tempfile::tempdir().expect("temporary case source");
+        let source_path = source_directory.path().join(source_name);
+        fs::write(&source_path, text).expect("write synthetic case source");
+        manager
+            .prepare_selected_material(
+                &source_path,
+                &PrivacyConfig::default(),
+                &local_ocr_status(),
+                None,
+                Some(case_id.to_owned()),
+                custom_terms,
+            )
+            .expect("prepare Vault-bound case text")
+    }
+
+    fn confirm_case_review(
+        manager: &PrivacyWorkflowManager,
+        review: &PrivacyReviewView,
+        suffix: &str,
+    ) -> PrivacyReviewView {
+        let target_pages = edited_pages(review, suffix);
+        let finding_ids = review
+            .risk_review
+            .as_ref()
+            .expect("initial risk revision")
+            .findings
+            .iter()
+            .map(|finding| finding.finding_id.clone())
+            .collect::<Vec<_>>();
+        let mut current = review.clone();
+        for finding_id in finding_ids {
+            let revision = current
+                .risk_review
+                .as_ref()
+                .expect("current finding revision")
+                .revision;
+            current = manager
+                .apply_risk_review_action(ApplyPrivacyRiskReviewActionRequest {
+                    redaction_id: current.redaction_id.clone(),
+                    expected_revision: revision,
+                    actor: "local-reviewer".to_owned(),
+                    edited_pages: target_pages.clone(),
+                    action: ReviewActionV1::AcceptReplacement {
+                        finding_id,
+                        apply_cluster: false,
+                    },
+                })
+                .expect("accept detected replacement");
+        }
+        let revision = current
+            .risk_review
+            .as_ref()
+            .expect("resolved finding revision")
+            .revision;
+        manager
+            .apply_risk_review_action(ApplyPrivacyRiskReviewActionRequest {
+                redaction_id: current.redaction_id.clone(),
+                expected_revision: revision,
+                actor: "local-reviewer".to_owned(),
+                edited_pages: target_pages,
+                action: ReviewActionV1::ConfirmEditedOutput,
+            })
+            .expect("confirm edited output")
     }
 
     fn edited_pages(review: &PrivacyReviewView, suffix: &str) -> Vec<EditedRedactedPage> {
@@ -1849,6 +4663,7 @@ mod tests {
     ) -> ApprovePrivacyReviewRequest {
         ApprovePrivacyReviewRequest {
             redaction_id: review.redaction_id.clone(),
+            expected_risk_revision: None,
             expected_suggested_redacted_sha256: review.suggested_redacted_content_sha256.clone(),
             edited_pages,
             reviewer: "local-reviewer".to_owned(),
@@ -1889,6 +4704,438 @@ mod tests {
             && haystack
                 .windows(needle.len())
                 .any(|window| window == needle)
+    }
+
+    #[test]
+    fn vault_bound_case_runs_real_local_ner_without_public_raw_value() {
+        const RAW_PERSON: &str = "\u{5f20}\u{4e09}";
+        let (directory, manager, _signer) = manager_with_test_signer();
+        let source_path = directory.path().join("synthetic-local-ner-case.txt");
+        fs::write(
+            &source_path,
+            format!("\u{539f}\u{544a}\u{ff1a}{RAW_PERSON}\u{3002}"),
+        )
+        .expect("write synthetic NER case material");
+
+        let review = manager
+            .prepare_selected_material(
+                &source_path,
+                &PrivacyConfig::default(),
+                &local_ocr_status(),
+                None,
+                Some("case_34343434343434343434343434343434".to_owned()),
+                Vec::new(),
+            )
+            .expect("prepare Vault-bound NER material");
+        let risk = review.risk_review.as_ref().expect("risk review");
+        assert!(risk.detector_run_completed);
+        let person_finding = risk
+            .findings
+            .iter()
+            .find(|finding| finding.entity_type == privacy::vnext::EntityType::PersonName)
+            .expect("person finding from local model");
+        assert!(person_finding
+            .detector_sources
+            .iter()
+            .any(|source| source == "local_ner"));
+        assert!(person_finding
+            .model_versions
+            .contains_key("local_ner_manifest_sha256"));
+        let public_risk = serde_json::to_vec(risk).expect("serialize public risk view");
+        assert!(!contains_bytes(&public_risk, RAW_PERSON.as_bytes()));
+
+        let vault_root = directory.path().join(vault_broker::VAULT_ROOT_DIRECTORY);
+        let mut pending = vec![vault_root];
+        while let Some(path) = pending.pop() {
+            for entry in fs::read_dir(path).expect("enumerate Vault") {
+                let entry = entry.expect("Vault entry");
+                if entry.file_type().expect("Vault entry type").is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let bytes = fs::read(entry.path()).expect("read encrypted Vault artifact");
+                    assert!(!contains_bytes(&bytes, RAW_PERSON.as_bytes()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_material_is_vault_backed_reverified_and_cryptographically_cleaned() {
+        const RAW_CANARY: &str = "SYNTHETIC_SELECTED_VAULT_PRIVATE_CANARY";
+        const SOURCE_NAME: &str = "synthetic-selected-private.txt";
+        let (directory, manager, _signer) = manager_with_test_signer();
+        let source_path = directory.path().join(SOURCE_NAME);
+        fs::write(&source_path, format!("case party: {RAW_CANARY}"))
+            .expect("write synthetic selected material");
+
+        let review = manager
+            .prepare_selected_material(
+                &source_path,
+                &PrivacyConfig::default(),
+                &local_ocr_status(),
+                None,
+                Some("case_12121212121212121212121212121212".to_owned()),
+                vec![RAW_CANARY.to_owned()],
+            )
+            .expect("prepare selected material through encrypted vault");
+        assert_eq!(
+            review.case_id.as_deref(),
+            Some("case_12121212121212121212121212121212")
+        );
+        assert!(review
+            .vault_object_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("obj_")));
+        assert_eq!(review.vault_object_version, Some(1));
+        let isolation = review
+            .vault_isolation
+            .as_ref()
+            .expect("vault isolation evidence");
+        assert!(isolation.private_acl_enforced);
+        assert!(isolation.content_indexing_disabled);
+        assert!(isolation.encrypted_at_rest);
+        assert!(!isolation.strong_service_identity_boundary);
+
+        let vault_root = directory.path().join(vault_broker::VAULT_ROOT_DIRECTORY);
+        let mut pending = vec![vault_root];
+        while let Some(path) = pending.pop() {
+            for entry in fs::read_dir(path).expect("enumerate vault") {
+                let entry = entry.expect("vault entry");
+                if entry.file_type().expect("vault entry type").is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let bytes = fs::read(entry.path()).expect("read encrypted vault artifact");
+                    assert!(!contains_bytes(&bytes, RAW_CANARY.as_bytes()));
+                    assert!(!contains_bytes(&bytes, SOURCE_NAME.as_bytes()));
+                }
+            }
+        }
+
+        let reviewed = confirm_case_review(&manager, &review, "");
+        let reviewed_risk = reviewed
+            .risk_review
+            .as_ref()
+            .expect("confirmed risk revision");
+        let mut request = approval_request(&reviewed, edited_pages(&reviewed, ""));
+        request.expected_risk_revision = Some(reviewed_risk.revision);
+        let approval = manager
+            .approve_review(request)
+            .expect("approval revalidates the encrypted source and exact risk revision");
+        assert!(!approval.receipt_id.is_empty());
+        let connection = manager.open_connection().expect("privacy connection");
+        let binding =
+            vault_broker::load_vault_binding_for_redaction(&connection, &review.redaction_id)
+                .expect("vault link query")
+                .expect("vault link");
+        drop(connection);
+
+        let deleted = manager
+            .delete_review(deletion_request(&review))
+            .expect("delete review and cryptographically clean vault source");
+        assert!(deleted.deleted);
+        assert!(
+            source_path.exists(),
+            "the user-selected original is never deleted"
+        );
+        assert!(matches!(
+            manager.shared.vault_broker.read_source(&binding),
+            Err(privacy::vault_store::VaultStoreError::ObjectNotAvailable)
+        ));
+        assert!(manager.load_review(&review.redaction_id).is_err());
+    }
+    #[test]
+    fn prepare_atomically_persists_encrypted_mapping_and_retention() {
+        const RAW_SYNTHETIC_TERM: &str = "synthetic-private-party";
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = manager
+            .prepare_material_bytes(
+                format!("case party: {RAW_SYNTHETIC_TERM}").as_bytes(),
+                "synthetic-mapping.txt".to_owned(),
+                &PrivacyConfig::default(),
+                &local_ocr_status(),
+                None,
+                vec![RAW_SYNTHETIC_TERM.to_owned()],
+            )
+            .expect("prepare synthetic mapping review");
+
+        let mut connection = manager.open_connection().expect("privacy connection");
+        let (mapping_id, ciphertext): (String, Vec<u8>) = connection
+            .query_row(
+                "SELECT mapping_id,ciphertext FROM privacy_sensitive_mappings
+                 WHERE redaction_id=?1 AND revision=1",
+                [&review.redaction_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("encrypted mapping revision 1");
+        assert!(!contains_bytes(&ciphertext, RAW_SYNTHETIC_TERM.as_bytes()));
+        let retention_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM privacy_retention_bindings
+                 WHERE redaction_id=?1 AND legal_hold=0",
+                [&review.redaction_id],
+                |row| row.get(0),
+            )
+            .expect("retention binding");
+        assert_eq!(retention_count, 1);
+
+        let lifecycle = manager
+            .privacy_lifecycle(&connection)
+            .expect("privacy lifecycle");
+        let access_id = "access_synthetic_mapping_reveal";
+        let purpose = "synthetic_mapping_reveal";
+        let payload = lifecycle
+            .load_mapping_revision(
+                &mut connection,
+                &mapping_id,
+                &privacy::MappingAccessContextV1 {
+                    access_id,
+                    redaction_id: &review.redaction_id,
+                    purpose,
+                    now_unix: TEST_NOW,
+                    private_mapping_access_authorized: true,
+                },
+            )
+            .expect("authorized mapping reveal");
+        assert!(payload
+            .entries
+            .iter()
+            .any(|entry| entry.sensitive_value == RAW_SYNTHETIC_TERM));
+        assert!(!format!("{payload:?}").contains(RAW_SYNTHETIC_TERM));
+        drop(payload);
+        drop(connection);
+        let current_mapping = manager
+            .current_mapping_revision_binding(&review.redaction_id)
+            .expect("query real mapping revision")
+            .expect("current mapping revision");
+        assert_eq!(current_mapping.mapping_id, mapping_id);
+        assert_eq!(current_mapping.revision, 1);
+    }
+
+    #[test]
+    fn case_custom_term_is_vault_encrypted_revision_bound_and_used_by_dictionary_detector() {
+        const CASE_ID: &str = "case_61616161616161616161616161616161";
+        const SUBJECT: &str = "SYNTHETIC_SUBJECT_ALPHA";
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = prepare_case_text_with_terms(
+            &manager,
+            "dictionary-subject.txt",
+            &format!("Protected case subject: {SUBJECT}."),
+            CASE_ID,
+            vec![SUBJECT.to_owned()],
+        );
+        let risk = review.risk_review.as_ref().expect("risk review");
+        assert!(risk.findings.iter().any(|finding| {
+            finding.case_dictionary_match
+                && finding
+                    .detector_sources
+                    .iter()
+                    .any(|source| source == "case_dictionary")
+        }));
+
+        let connection = manager.open_connection().expect("privacy connection");
+        let case_id = CaseId::parse(CASE_ID.to_owned()).expect("case id");
+        let dictionary =
+            case_dictionary_store::load_required_case_dictionary(&connection, &manager, &case_id)
+                .expect("encrypted dictionary");
+        let state = manager
+            .load_risk_state_unlocked(&connection, &review.redaction_id)
+            .expect("risk state");
+        assert_eq!(
+            state.session.dictionary_revision_hash.as_ref(),
+            Some(dictionary.revision_hash())
+        );
+        drop(connection);
+        let raw_database = fs::read(&manager.shared.database_path).expect("read public database");
+        assert!(!contains_bytes(&raw_database, SUBJECT.as_bytes()));
+    }
+
+    #[test]
+    fn source_display_name_is_protected_and_blocks_independent_residual_scan() {
+        const SOURCE_NAME: &str = "SYNTHETIC_SOURCE_CASE.txt";
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = prepare_case_text(
+            &manager,
+            SOURCE_NAME,
+            "Referenced upload SYNTHETIC_SOURCE_CASE.txt, contact 13800138000.",
+            "case_62626262626262626262626262626262",
+        );
+        assert_eq!(review.source_display_name, SOURCE_NAME);
+        let residual = &review
+            .risk_review
+            .as_ref()
+            .expect("risk review")
+            .residual_scan;
+        assert!(!residual.passed);
+        assert!(residual
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "residual_source_name"));
+
+        let raw_database = fs::read(&manager.shared.database_path).expect("read public database");
+        assert!(!contains_bytes(&raw_database, SOURCE_NAME.as_bytes()));
+        let restored = manager
+            .load_review(&review.redaction_id)
+            .expect("load protected display name");
+        assert_eq!(restored.source_display_name, SOURCE_NAME);
+    }
+
+    #[test]
+    fn add_to_dictionary_commits_real_vault_revision_and_future_actions_reverify_it() {
+        const RAW_VALUE: &str = "13800138000";
+        const CASE_ID: &str = "case_63636363636363636363636363636363";
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = prepare_case_text(
+            &manager,
+            "dictionary-action.txt",
+            &format!("Contact phone: {RAW_VALUE}."),
+            CASE_ID,
+        );
+        let initial = review.risk_review.as_ref().expect("initial risk");
+        let finding_id = initial
+            .findings
+            .first()
+            .expect("detected phone finding")
+            .finding_id
+            .clone();
+        let updated = manager
+            .apply_risk_review_action(ApplyPrivacyRiskReviewActionRequest {
+                redaction_id: review.redaction_id.clone(),
+                expected_revision: initial.revision,
+                actor: "dictionary-reviewer".to_owned(),
+                edited_pages: edited_pages(&review, ""),
+                action: ReviewActionV1::AddToDictionary {
+                    finding_id,
+                    category: privacy::case_dictionary::DictionaryCategoryV1::ContactInformation,
+                    required: true,
+                },
+            })
+            .expect("persist dictionary action and risk revision atomically");
+        let updated_risk = updated.risk_review.as_ref().expect("updated risk");
+        assert!(updated_risk
+            .findings
+            .iter()
+            .any(|finding| finding.case_dictionary_match));
+
+        let connection = manager.open_connection().expect("privacy connection");
+        let case_id = CaseId::parse(CASE_ID.to_owned()).expect("case id");
+        let dictionary =
+            case_dictionary_store::load_required_case_dictionary(&connection, &manager, &case_id)
+                .expect("updated encrypted dictionary");
+        let state = manager
+            .load_risk_state_unlocked(&connection, &review.redaction_id)
+            .expect("updated risk state");
+        assert_eq!(dictionary.revision(), 2);
+        verify_dictionary_revision(&state.session, &dictionary).expect("exact revision binding");
+        drop(connection);
+        let raw_database = fs::read(&manager.shared.database_path).expect("read public database");
+        assert!(!contains_bytes(&raw_database, RAW_VALUE.as_bytes()));
+    }
+
+    #[test]
+    fn stale_dictionary_revision_blocks_review_action_and_approval() {
+        const CASE_ID: &str = "case_64646464646464646464646464646464";
+        const DRIFT_TERM: &str = "SYNTHETIC_DICTIONARY_DRIFT";
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = prepare_case_text(
+            &manager,
+            "dictionary-drift.txt",
+            "Contact phone: 13800138000.",
+            CASE_ID,
+        );
+        let case_id = CaseId::parse(CASE_ID.to_owned()).expect("case id");
+        let material_id = MaterialId::parse(review.material_id.clone()).expect("material id");
+        case_dictionary_store::ensure_case_dictionary(
+            &manager,
+            &case_id,
+            &material_id,
+            &[DRIFT_TERM.to_owned()],
+            TEST_NOW + 1,
+        )
+        .expect("advance real dictionary head");
+
+        let risk = review.risk_review.as_ref().expect("stale risk");
+        let action_error = manager
+            .apply_risk_review_action(ApplyPrivacyRiskReviewActionRequest {
+                redaction_id: review.redaction_id.clone(),
+                expected_revision: risk.revision,
+                actor: "dictionary-reviewer".to_owned(),
+                edited_pages: edited_pages(&review, ""),
+                action: ReviewActionV1::ConfirmEditedOutput,
+            })
+            .expect_err("stale dictionary action must fail closed");
+        assert_eq!(
+            action_error.code(),
+            "privacy_case_dictionary_revision_conflict"
+        );
+
+        let mut approval = approval_request(&review, edited_pages(&review, ""));
+        approval.expected_risk_revision = Some(risk.revision);
+        let approval_error = manager
+            .approve_review(approval)
+            .expect_err("stale dictionary approval must fail closed");
+        assert_eq!(
+            approval_error.code(),
+            "privacy_case_dictionary_revision_conflict"
+        );
+        let raw_database = fs::read(&manager.shared.database_path).expect("read public database");
+        assert!(!contains_bytes(&raw_database, DRIFT_TERM.as_bytes()));
+    }
+
+    #[test]
+    fn publication_invalidation_failure_preserves_dictionary_revision() {
+        const CASE_ID: &str = "case_67676767676767676767676767676767";
+        const BLOCKED_TERM: &str = "SYNTHETIC_BLOCKED_DICTIONARY_VALUE";
+        let directory = tempfile::tempdir().expect("temp privacy directory");
+        let invalidator = Arc::new(TogglePublicationInvalidator::default());
+        let manager = PrivacyWorkflowManager::new_with_approved_publication_invalidator(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+            invalidator.clone(),
+        )
+        .expect("privacy manager with invalidator");
+        manager.set_test_runtime(
+            ReceiptSigner::new([31_u8; 32]).expect("test signer"),
+            TEST_NOW,
+        );
+        let review = prepare_case_text(
+            &manager,
+            "invalidation-failure.txt",
+            "Synthetic contact phone: 13800138000.",
+            CASE_ID,
+        );
+        let case_id = CaseId::parse(CASE_ID.to_owned()).expect("case id");
+        let material_id = MaterialId::parse(review.material_id).expect("material id");
+        let connection = manager.open_connection().expect("privacy database");
+        let before =
+            case_dictionary_store::load_required_case_dictionary(&connection, &manager, &case_id)
+                .expect("initial dictionary");
+        drop(connection);
+
+        invalidator.fail.store(true, Ordering::SeqCst);
+        let error = match case_dictionary_store::ensure_case_dictionary(
+            &manager,
+            &case_id,
+            &material_id,
+            &[BLOCKED_TERM.to_owned()],
+            TEST_NOW + 1,
+        ) {
+            Ok(_) => panic!("failed publication revocation must block dictionary mutation"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code(),
+            "approved_workspace_invalidation_injected_failure"
+        );
+        assert!(invalidator.case_calls.load(Ordering::SeqCst) >= 2);
+
+        let connection = manager.open_connection().expect("privacy database");
+        let after =
+            case_dictionary_store::load_required_case_dictionary(&connection, &manager, &case_id)
+                .expect("dictionary after blocked mutation");
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.revision_hash(), before.revision_hash());
+        let raw_database = fs::read(&manager.shared.database_path).expect("read public database");
+        assert!(!contains_bytes(&raw_database, BLOCKED_TERM.as_bytes()));
     }
 
     fn pdf_with_text(text: Option<&str>) -> Vec<u8> {
@@ -1936,6 +5183,16 @@ mod tests {
         let mut bytes = Vec::new();
         document.save_to(&mut bytes).expect("save PDF");
         bytes
+    }
+
+    fn tiny_rgba_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
     }
 
     #[test]
@@ -1998,6 +5255,7 @@ mod tests {
                 "absent-custom.txt".to_owned(),
                 &PrivacyConfig::default(),
                 &local_ocr_status(),
+                None,
                 vec!["case-secret-never-present".to_owned()],
             )
             .expect_err("an absent custom term must not create a canary");
@@ -2017,6 +5275,35 @@ mod tests {
         let error = validate_approval_request(&approval_request(&review, pages))
             .expect_err("501-page approval must fail before receipt issuance");
         assert_eq!(error.code(), "invalid_approval_request");
+    }
+
+    #[test]
+    fn renderer_generic_approval_rejects_external_provider_and_mcp_scopes() {
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = prepare_text(&manager, "dedicated-approval.txt", "原告：张三。");
+        for (kind, identifier, purpose) in [
+            (
+                DestinationKind::ExternalProvider,
+                "provider-main",
+                "case_summary",
+            ),
+            (
+                DestinationKind::ExternalMcpHost,
+                "approved-case-workspace",
+                "approved_material_read",
+            ),
+        ] {
+            let mut request = approval_request(&review, edited_pages(&review, ""));
+            request.destination = ReceiptDestinationInput {
+                kind,
+                identifier: identifier.to_owned(),
+            };
+            request.purpose = purpose.to_owned();
+            let error = manager
+                .approve_local_safe_export_review(request)
+                .expect_err("external scopes must use their dedicated approval entry point");
+            assert_eq!(error.code(), "dedicated_approval_required");
+        }
     }
 
     #[test]
@@ -2060,6 +5347,7 @@ mod tests {
                 "scan.pdf".to_owned(),
                 &off,
                 &local_ocr_status(),
+                None,
                 Vec::new(),
             )
             .expect_err("OCR-off scan must fail");
@@ -2073,10 +5361,31 @@ mod tests {
                 "scan.pdf".to_owned(),
                 &auto,
                 &local_ocr_status(),
+                None,
                 Vec::new(),
             )
             .expect_err("unverified local OCR must fail");
         assert_eq!(error.code(), "ocr_backend_unavailable");
+    }
+
+    #[test]
+    fn png_material_requires_verified_isolated_local_ocr() {
+        let bytes = tiny_rgba_png();
+        let mut off = PrivacyConfig::default();
+        off.ocr.mode = ConfigOcrMode::Off;
+        let error = extract_local_material(&bytes, "scan.png", &off, &local_ocr_status(), None)
+            .expect_err("OCR-off PNG must fail");
+        assert_eq!(error.code(), "ocr_disabled");
+
+        let mut auto = PrivacyConfig::default();
+        auto.ocr.mode = ConfigOcrMode::AutoLocal;
+        let error = extract_local_material(&bytes, "scan.png", &auto, &local_ocr_status(), None)
+            .expect_err("unverified PNG OCR must fail");
+        assert_eq!(error.code(), "ocr_worker_isolation_unverified");
+
+        let error = extract_local_material(&bytes, "renamed.jpg", &off, &local_ocr_status(), None)
+            .expect_err("extension and image bytes must agree");
+        assert_eq!(error.code(), "invalid_raster_image");
     }
 
     #[test]
@@ -2110,13 +5419,26 @@ mod tests {
 
     #[test]
     fn edited_approval_restart_receipt_binding_and_safe_pdf_are_end_to_end() {
+        const RESTART_SAFE_NOW: u64 = 4_000_000_000;
         let (directory, manager, signer) = manager_with_test_signer();
+        manager.set_test_runtime(signer.clone(), RESTART_SAFE_NOW);
         let source_name = "极密案件-张三.txt";
         let source_text = "原告：张三，联系电话13800138000。";
-        let review = prepare_text(&manager, source_name, source_text);
-        let edited = edited_pages(&review, "\n人工已逐项复核。");
+        let review = prepare_case_text(
+            &manager,
+            source_name,
+            source_text,
+            "case_45454545454545454545454545454545",
+        );
+        let review = confirm_case_review(&manager, &review, "\n人工已逐项复核。");
+        let risk = review
+            .risk_review
+            .as_ref()
+            .expect("confirmed risk revision");
+        let mut request = approval_request(&review, edited_pages(&review, ""));
+        request.expected_risk_revision = Some(risk.revision);
         let approval = manager
-            .approve_review(approval_request(&review, edited))
+            .approve_review(request)
             .expect("approve manually edited content");
 
         let raw_database = fs::read(&manager.shared.database_path).expect("read privacy DB");
@@ -2142,9 +5464,12 @@ mod tests {
         );
 
         drop(manager);
-        let restarted =
-            PrivacyWorkflowManager::new(directory.path().to_path_buf()).expect("restart manager");
-        restarted.set_test_runtime(signer.clone(), TEST_NOW);
+        let restarted = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("restart manager");
+        restarted.set_test_runtime(signer.clone(), RESTART_SAFE_NOW);
         let restored = restarted
             .load_review(&review.redaction_id)
             .expect("restore final approved pages after restart");
@@ -2156,18 +5481,26 @@ mod tests {
             approval.redacted_content_sha256
         );
 
+        let mut reissue_request = approval_request(
+            &restored,
+            restored
+                .pages
+                .iter()
+                .map(|page| EditedRedactedPage {
+                    page_number: page.page_number,
+                    redacted_text: page.redacted_text.clone(),
+                })
+                .collect(),
+        );
+        reissue_request.expected_risk_revision = Some(
+            restored
+                .risk_review
+                .as_ref()
+                .expect("restored risk revision")
+                .revision,
+        );
         let reissued = restarted
-            .approve_review(approval_request(
-                &restored,
-                restored
-                    .pages
-                    .iter()
-                    .map(|page| EditedRedactedPage {
-                        page_number: page.page_number,
-                        redacted_text: page.redacted_text.clone(),
-                    })
-                    .collect(),
-            ))
+            .approve_review(reissue_request)
             .expect("reissue exact approved payload after restart");
         let base = export_request(&restored, &reissued);
         let artifact = restarted
@@ -2279,14 +5612,18 @@ mod tests {
                 .code(),
             "redaction_receipt_expired"
         );
-        restarted.set_test_now(TEST_NOW);
+        restarted.set_test_now(RESTART_SAFE_NOW);
 
         let receipt = signer
             .decode_token(&reissued.receipt_token)
             .expect("decode test receipt");
         let connection = restarted.open_connection().expect("open privacy DB");
-        PrivacyStore::revoke_receipt(&connection, &receipt.claims.receipt_id, TEST_NOW + 1)
-            .expect("revoke receipt");
+        PrivacyStore::revoke_receipt(
+            &connection,
+            &receipt.claims.receipt_id,
+            RESTART_SAFE_NOW + 1,
+        )
+        .expect("revoke receipt");
         drop(connection);
         assert_eq!(
             restarted
@@ -2300,12 +5637,21 @@ mod tests {
     #[test]
     fn deleting_review_revokes_receipts_removes_protected_state_and_preserves_audit() {
         let (_directory, manager, _signer) = manager_with_test_signer();
-        let review = prepare_text(&manager, "delete-review.txt", "Client phone 13800138000.");
+        let review = prepare_case_text(
+            &manager,
+            "delete-review.txt",
+            "Client phone 13800138000.",
+            "case_56565656565656565656565656565656",
+        );
+        let review = confirm_case_review(&manager, &review, " reviewed.");
+        let risk = review
+            .risk_review
+            .as_ref()
+            .expect("confirmed risk revision");
+        let mut request = approval_request(&review, edited_pages(&review, ""));
+        request.expected_risk_revision = Some(risk.revision);
         let approval = manager
-            .approve_review(approval_request(
-                &review,
-                edited_pages(&review, " reviewed."),
-            ))
+            .approve_review(request)
             .expect("approve review before deletion");
         let old_export = export_request(&review, &approval);
 
@@ -2384,6 +5730,332 @@ mod tests {
                 .expect("repeat deletion is idempotent"),
             DeletePrivacyReviewResponse { deleted: false }
         );
+    }
+
+    #[test]
+    fn safe_export_approval_is_not_mcp_approval_and_dedicated_receipt_expires_closed() {
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = prepare_case_text(
+            &manager,
+            "approved-mcp.txt",
+            "Synthetic client 13800138000.",
+            "case_78787878787878787878787878787878",
+        );
+        let review = confirm_case_review(&manager, &review, " reviewed.");
+        let risk = review
+            .risk_review
+            .as_ref()
+            .expect("confirmed risk revision");
+        let mut safe_request = approval_request(&review, edited_pages(&review, ""));
+        safe_request.expected_risk_revision = Some(risk.revision);
+        let safe_approval = manager
+            .approve_review(safe_request)
+            .expect("ordinary safe export approval");
+
+        let selections = manager
+            .list_approved_review_selections()
+            .expect("list after ordinary approval");
+        let selection = selections
+            .iter()
+            .find(|selection| selection.redaction_id == review.redaction_id)
+            .expect("approved review selection");
+        assert_eq!(
+            selection.approved_payload_sha256,
+            safe_approval.approved_payload_sha256
+        );
+        assert!(!selection.mcp_publish_approved);
+        assert!(selection.mcp_publish_approval_expires_at_unix.is_none());
+
+        let base = ApproveReviewForApprovedWorkspaceRequest {
+            redaction_id: review.redaction_id.clone(),
+            expected_approved_payload_sha256: safe_approval.approved_payload_sha256.clone(),
+            reviewer: "mcp-reviewer".to_owned(),
+            ttl_seconds: 3_600,
+            confirmed: false,
+        };
+        assert!(manager
+            .approve_review_for_approved_workspace(base.clone())
+            .is_err());
+        let mut stale = base.clone();
+        stale.confirmed = true;
+        stale.expected_approved_payload_sha256 = "0".repeat(64);
+        assert!(manager
+            .approve_review_for_approved_workspace(stale)
+            .is_err());
+
+        let mut exact = base;
+        exact.confirmed = true;
+        let approved = manager
+            .approve_review_for_approved_workspace(exact)
+            .expect("dedicated approved MCP approval");
+        assert!(approved.mcp_publish_approved);
+        assert_eq!(
+            approved.destination_identifier,
+            privacy::workspace::APPROVED_WORKSPACE_DESTINATION_SCOPE
+        );
+        assert_eq!(
+            approved.purpose,
+            privacy::workspace::APPROVED_MATERIAL_READ_PURPOSE
+        );
+        let response_wire = serde_json::to_string(&approved).expect("serialize safe metadata");
+        for forbidden in ["receiptToken", "approvedPayloadJson", "redactedText"] {
+            assert!(!response_wire.contains(forbidden));
+        }
+
+        let selections = manager
+            .list_approved_review_selections()
+            .expect("list after dedicated approval");
+        let selection = selections
+            .iter()
+            .find(|selection| selection.redaction_id == review.redaction_id)
+            .expect("approved MCP selection");
+        assert!(selection.mcp_publish_approved);
+        assert_eq!(
+            selection.mcp_publish_approval_expires_at_unix,
+            Some(approved.expires_at_unix)
+        );
+        let source = manager
+            .load_approved_generation_source(
+                &review.redaction_id,
+                &approved.approved_payload_sha256,
+            )
+            .expect("dedicated receipt authorizes approved generation source");
+        assert!(source.case_dictionary_terms.is_empty());
+        assert_eq!(
+            source.source_terms.as_slice(),
+            ["approved-mcp.txt", "approved-mcp"]
+        );
+        assert!(source
+            .raw_canary_terms
+            .iter()
+            .any(|value| value == "13800138000"));
+        assert!(!String::from_utf8_lossy(&source.approved_payload).contains("13800138000"));
+        let current_mapping = manager
+            .current_mapping_revision_binding(&review.redaction_id)
+            .expect("current mapping binding")
+            .expect("mapping exists for detected phone number");
+        assert_ne!(
+            source.mapping_revision_hash,
+            current_mapping.mapping_revision_hash
+        );
+        assert_eq!(source.dictionary_revision_hash.as_str().len(), 64);
+        assert_eq!(source.source_name_sha256.as_str().len(), 64);
+        assert_eq!(source.source_revision_hash.as_str().len(), 64);
+        drop(source);
+
+        let connection = manager.open_connection().expect("privacy database");
+        let original_source_name_hash = connection
+            .query_row(
+                "SELECT source_name_sha256 FROM privacy_materials WHERE material_id=?1",
+                [&review.material_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("source-name hash");
+        connection
+            .execute(
+                "UPDATE privacy_materials SET source_name_sha256=?2 WHERE material_id=?1",
+                rusqlite::params![&review.material_id, "0".repeat(64)],
+            )
+            .expect("inject source-name drift");
+        drop(connection);
+        assert_eq!(
+            manager
+                .load_approved_generation_source(
+                    &review.redaction_id,
+                    &approved.approved_payload_sha256,
+                )
+                .expect_err("source-name drift must block publication")
+                .code(),
+            "approved_generation_source_name_mismatch"
+        );
+        let connection = manager.open_connection().expect("privacy database");
+        connection
+            .execute(
+                "UPDATE privacy_materials SET source_name_sha256=?2 WHERE material_id=?1",
+                rusqlite::params![&review.material_id, original_source_name_hash],
+            )
+            .expect("restore source-name binding");
+        let (mapping_expires_at, mapping_key_version) = connection
+            .query_row(
+                "SELECT expires_at_unix,key_version FROM privacy_sensitive_mappings
+                 WHERE redaction_id=?1 ORDER BY revision DESC LIMIT 1",
+                [&review.redaction_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("mapping expiry and key");
+        drop(connection);
+
+        manager.set_test_now(u64::try_from(mapping_expires_at).expect("mapping expiry"));
+        assert_eq!(
+            manager
+                .load_approved_generation_source(
+                    &review.redaction_id,
+                    &approved.approved_payload_sha256,
+                )
+                .expect_err("expired mapping must block publication")
+                .code(),
+            "privacy_mapping_revision_expired"
+        );
+        manager.set_test_now(TEST_NOW);
+
+        let connection = manager.open_connection().expect("privacy database");
+        connection
+            .execute(
+                "UPDATE privacy_mapping_keys SET state='revoked',revoked_at_unix=?2
+                 WHERE key_version=?1",
+                rusqlite::params![mapping_key_version, i64::try_from(TEST_NOW + 1).unwrap()],
+            )
+            .expect("inject mapping-key revocation");
+        drop(connection);
+        assert_eq!(
+            manager
+                .load_approved_generation_source(
+                    &review.redaction_id,
+                    &approved.approved_payload_sha256,
+                )
+                .expect_err("revoked mapping key must block publication")
+                .code(),
+            "privacy_mapping_key_revoked"
+        );
+
+        manager.set_test_now(approved.expires_at_unix + 1);
+        let expired = manager
+            .list_approved_review_selections()
+            .expect("list after expiry");
+        assert!(!expired[0].mcp_publish_approved);
+        assert!(expired[0].mcp_publish_approval_expires_at_unix.is_none());
+    }
+
+    #[test]
+    fn gated_publish_blocks_concurrent_delete_receipt_revoke_and_edit_until_commit() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let (_directory, manager, _signer) = manager_with_test_signer();
+        let review = prepare_case_text(
+            &manager,
+            "approved-mcp-race.txt",
+            "Synthetic client 13800138000.",
+            "case_79797979797979797979797979797979",
+        );
+        let review = confirm_case_review(&manager, &review, " reviewed.");
+        let risk = review
+            .risk_review
+            .as_ref()
+            .expect("confirmed risk revision");
+        let mut safe_request = approval_request(&review, edited_pages(&review, ""));
+        safe_request.expected_risk_revision = Some(risk.revision);
+        let safe_approval = manager
+            .approve_review(safe_request)
+            .expect("ordinary approval before dedicated approval");
+        let dedicated = manager
+            .approve_review_for_approved_workspace(ApproveReviewForApprovedWorkspaceRequest {
+                redaction_id: review.redaction_id.clone(),
+                expected_approved_payload_sha256: safe_approval.approved_payload_sha256.clone(),
+                reviewer: "mcp-race-reviewer".to_owned(),
+                ttl_seconds: 3_600,
+                confirmed: true,
+            })
+            .expect("dedicated approval before race");
+        let current = manager
+            .load_review(&review.redaction_id)
+            .expect("current approved review");
+        let current_revision = current
+            .risk_review
+            .as_ref()
+            .expect("current risk revision")
+            .revision;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let publish_manager = manager.clone();
+        let publish_redaction_id = review.redaction_id.clone();
+        let publish_hash = dedicated.approved_payload_sha256.clone();
+        let expected_hash = publish_hash.clone();
+        let publish_thread = thread::spawn(move || {
+            publish_manager
+                .with_approved_generation_source_publish(
+                    &publish_redaction_id,
+                    &publish_hash,
+                    |source| {
+                        entered_tx.send(()).expect("announce publish commit");
+                        release_rx.recv().expect("release publish commit");
+                        Ok::<String, &'static str>(source.approved_payload_sha256)
+                    },
+                )
+                .expect("final source verification")
+                .expect("synthetic commit")
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publish entered guarded commit");
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (delete_done_tx, delete_done_rx) = mpsc::channel();
+        let delete_manager = manager.clone();
+        let delete_request = deletion_request(&review);
+        let delete_ready = ready_tx.clone();
+        let delete_thread = thread::spawn(move || {
+            delete_ready.send(()).expect("delete ready");
+            delete_done_tx
+                .send(delete_manager.delete_review(delete_request).is_ok())
+                .expect("delete result");
+        });
+
+        let (edit_done_tx, edit_done_rx) = mpsc::channel();
+        let edit_manager = manager.clone();
+        let edit_ready = ready_tx.clone();
+        let edit_request = ApplyPrivacyRiskReviewActionRequest {
+            redaction_id: review.redaction_id.clone(),
+            expected_revision: current_revision,
+            actor: "concurrent-editor".to_owned(),
+            edited_pages: edited_pages(&current, ""),
+            action: ReviewActionV1::RejectPublication,
+        };
+        let edit_thread = thread::spawn(move || {
+            edit_ready.send(()).expect("edit ready");
+            edit_done_tx
+                .send(edit_manager.apply_risk_review_action(edit_request).is_ok())
+                .expect("edit result");
+        });
+
+        let (revoke_done_tx, revoke_done_rx) = mpsc::channel();
+        let revoke_manager = manager.clone();
+        let receipt_id = dedicated.receipt_id;
+        let revoke_thread = thread::spawn(move || {
+            ready_tx.send(()).expect("revoke ready");
+            let revoked = {
+                let _gate = revoke_manager.gate();
+                revoke_manager.open_connection().is_ok_and(|connection| {
+                    PrivacyStore::revoke_receipt(&connection, &receipt_id, TEST_NOW + 1).is_ok()
+                })
+            };
+            revoke_done_tx.send(revoked).expect("revoke result");
+        });
+
+        for _ in 0..3 {
+            ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("race contender ready");
+        }
+        thread::sleep(Duration::from_millis(75));
+        assert!(delete_done_rx.try_recv().is_err());
+        assert!(edit_done_rx.try_recv().is_err());
+        assert!(revoke_done_rx.try_recv().is_err());
+
+        release_tx.send(()).expect("release guarded publish");
+        assert_eq!(publish_thread.join().expect("join publish"), expected_hash);
+        assert!(delete_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delete terminal result"));
+        let _ = edit_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("edit terminal result");
+        let _ = revoke_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("revoke terminal result");
+        delete_thread.join().expect("join delete");
+        edit_thread.join().expect("join edit");
+        revoke_thread.join().expect("join revoke");
     }
 
     #[test]

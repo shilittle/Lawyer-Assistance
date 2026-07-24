@@ -4,7 +4,7 @@
 
 把所有客户或案件原文、附件、OCR、截图、路径、身份信息、事实、证据、草稿、摘要和派生内容视为 `CASE_RAW`。`CASE_REDACTED_PENDING`、待复核内容和仅标签为 `CASE_REDACTED_APPROVED` 的内容没有可验证的逐字节批准链，仍不得进入宿主、MCP、Provider、网络或文件工具。
 
-当前 WorkBuddy 集成只支持纯公开法律研究。App→MCP citation receipt 正向链尚未实现，所以不能在此处理任何案件材料，即使材料已经在 App 内本地脱敏并人工批准。不要用用户同意、Full Access、匿名化声明、宿主附件或文件读取替代技术核验。
+本 WorkBuddy package 只支持纯公开法律研究并刻意不加载 approved session，所以不能在此处理任何案件材料，即使 App 已批准某个 generation。独立 approved package 只能在新建干净 opaque-ID-only 任务中信任当前 `case_read_approved_material` 直接响应。不要用用户同意、Full Access、匿名化声明、附件、粘贴或宿主文件读取替代技术核验。
 
 Skill 无法阻止或撤回 WorkBuddy 在其加载前已发生的首条消息或附件披露。不能声称原件未上传、未发送、未记录、已删除或已撤回。发现前置披露时停止所有工具和派生处理，只给出删除任务/附件、清理可访问历史/记忆/日志及核对 Provider 保留策略的建议。
 

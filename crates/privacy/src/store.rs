@@ -5,8 +5,10 @@ use crate::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use std::{collections::BTreeSet, fmt};
 
-pub const PRIVACY_STORE_SCHEMA_VERSION: i64 = 1;
+pub const PRIVACY_STORE_SCHEMA_VERSION: i64 = 4;
+const RISK_REVIEW_REVISION_PROFILE: &str = "privacy-risk-review-revision-v1";
 pub const MAX_ACTIVE_RECEIPT_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_ID_BYTES: usize = 128;
 const MAX_TOKEN_BYTES: usize = 32_768;
@@ -24,6 +26,7 @@ pub enum PrivacyStoreError {
     InvalidReceipt,
     ReceiptRevoked,
     ReceiptExpired,
+    ReceiptConsumed,
 }
 
 impl PrivacyStoreError {
@@ -38,6 +41,7 @@ impl PrivacyStoreError {
             Self::InvalidReceipt => "redaction_receipt_invalid",
             Self::ReceiptRevoked => "redaction_receipt_revoked",
             Self::ReceiptExpired => "redaction_receipt_expired",
+            Self::ReceiptConsumed => "redaction_receipt_consumed",
         }
     }
 }
@@ -87,6 +91,62 @@ pub struct LoadedReviewDraft {
     pub unresolved_high_risk_count: u32,
     pub review_state: String,
     pub review_payload_plaintext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveRiskReviewRevision<'a> {
+    pub redaction_id: &'a str,
+    pub expected_previous_revision: u64,
+    pub risk_sha256: &'a str,
+    pub hard_gate_sha256: &'a str,
+    pub action_code: &'a str,
+    pub reason_codes: &'a [String],
+    pub state_plaintext: &'a [u8],
+}
+
+pub struct LoadedRiskReviewRevision {
+    pub redaction_id: String,
+    pub revision: u64,
+    pub state_sha256: String,
+    pub risk_sha256: String,
+    pub hard_gate_sha256: String,
+    pub action_code: String,
+    pub reason_codes: Vec<String>,
+    pub previous_revision_hash: String,
+    pub revision_hash: String,
+    pub state_plaintext: Vec<u8>,
+}
+
+impl fmt::Debug for LoadedRiskReviewRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedRiskReviewRevision")
+            .field("redaction_id", &self.redaction_id)
+            .field("revision", &self.revision)
+            .field("state_sha256", &self.state_sha256)
+            .field("risk_sha256", &self.risk_sha256)
+            .field("hard_gate_sha256", &self.hard_gate_sha256)
+            .field("action_code", &self.action_code)
+            .field("reason_codes", &self.reason_codes)
+            .field("previous_revision_hash", &self.previous_revision_hash)
+            .field("revision_hash", &self.revision_hash)
+            .field("state_plaintext", &"<protected-risk-review-state>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RiskReviewRevisionSummary {
+    pub redaction_id: String,
+    pub revision: u64,
+    pub state_sha256: String,
+    pub risk_sha256: String,
+    pub hard_gate_sha256: String,
+    pub action_code: String,
+    pub reason_codes: Vec<String>,
+    pub previous_revision_hash: String,
+    pub revision_hash: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +215,37 @@ impl PrivacyStore {
                     FOREIGN KEY(material_id)
                         REFERENCES privacy_materials(material_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS privacy_risk_review_revisions (
+                    redaction_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    state_sha256 TEXT NOT NULL CHECK(length(state_sha256) = 64),
+                    risk_sha256 TEXT NOT NULL CHECK(length(risk_sha256) = 64),
+                    hard_gate_sha256 TEXT NOT NULL CHECK(length(hard_gate_sha256) = 64),
+                    action_code TEXT NOT NULL CHECK(length(action_code) BETWEEN 1 AND 128),
+                    reason_codes_json TEXT NOT NULL CHECK(
+                        json_valid(reason_codes_json)
+                        AND json_type(reason_codes_json) = 'array'
+                        AND length(reason_codes_json) <= 65536
+                    ),
+                    protected_state_blob BLOB NOT NULL CHECK(length(protected_state_blob) > 0),
+                    protection_scheme TEXT NOT NULL CHECK(
+                        protection_scheme = 'windows_dpapi_current_user_v1'
+                    ),
+                    previous_revision_hash TEXT NOT NULL CHECK(
+                        length(previous_revision_hash) IN (0,64)
+                    ),
+                    revision_hash TEXT NOT NULL UNIQUE CHECK(length(revision_hash) = 64),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(redaction_id, revision),
+                    FOREIGN KEY(redaction_id)
+                        REFERENCES privacy_redactions(redaction_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_privacy_risk_review_latest
+                    ON privacy_risk_review_revisions(redaction_id, revision DESC);
+                CREATE TRIGGER IF NOT EXISTS trg_privacy_risk_review_no_update
+                BEFORE UPDATE ON privacy_risk_review_revisions BEGIN
+                    SELECT RAISE(ABORT, 'privacy risk review revisions are append only');
+                END;
                 CREATE TABLE IF NOT EXISTS privacy_receipts (
                     receipt_id TEXT PRIMARY KEY CHECK(length(receipt_id) BETWEEN 1 AND 128),
                     redaction_id TEXT NOT NULL,
@@ -174,6 +265,12 @@ impl PrivacyStore {
                         expires_at_unix IS NULL OR expires_at_unix > issued_at_unix
                     ),
                     revoked_at_unix INTEGER,
+                    consumed_at_unix INTEGER CHECK(
+                        consumed_at_unix IS NULL OR consumed_at_unix > 0
+                    ),
+                    consumption_id TEXT CHECK(
+                        consumption_id IS NULL OR length(consumption_id) BETWEEN 1 AND 128
+                    ),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(redaction_id)
                         REFERENCES privacy_redactions(redaction_id) ON DELETE CASCADE
@@ -228,6 +325,34 @@ impl PrivacyStore {
                 ",
             )
             .map_err(|_| PrivacyStoreError::Database)?;
+        let receipt_columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(privacy_receipts)")
+                .map_err(|_| PrivacyStoreError::Database)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|_| PrivacyStoreError::Database)?;
+            rows.collect::<Result<BTreeSet<_>, _>>()
+                .map_err(|_| PrivacyStoreError::Database)?
+        };
+        if !receipt_columns.contains("consumed_at_unix") {
+            connection
+                .execute(
+                    "ALTER TABLE privacy_receipts ADD COLUMN consumed_at_unix INTEGER
+                     CHECK(consumed_at_unix IS NULL OR consumed_at_unix > 0)",
+                    [],
+                )
+                .map_err(|_| PrivacyStoreError::Database)?;
+        }
+        if !receipt_columns.contains("consumption_id") {
+            connection
+                .execute(
+                    "ALTER TABLE privacy_receipts ADD COLUMN consumption_id TEXT
+                     CHECK(consumption_id IS NULL OR length(consumption_id) BETWEEN 1 AND 128)",
+                    [],
+                )
+                .map_err(|_| PrivacyStoreError::Database)?;
+        }
         let version = connection
             .query_row(
                 "SELECT value FROM privacy_schema_metadata WHERE key = 'schema_version'",
@@ -237,11 +362,24 @@ impl PrivacyStore {
             .optional()
             .map_err(|_| PrivacyStoreError::Database)?;
         match version {
-            Some(value) if value != PRIVACY_STORE_SCHEMA_VERSION.to_string() => {
-                return Err(PrivacyStoreError::UnsupportedSchema);
+            Some(value) if value == PRIVACY_STORE_SCHEMA_VERSION.to_string() => {
+                crate::lifecycle::initialize_lifecycle_schema(connection)?;
             }
-            Some(_) => {}
+            Some(value) if value == "1" || value == "2" || value == "3" => {
+                crate::lifecycle::initialize_lifecycle_schema(connection)?;
+                let changed = connection
+                    .execute(
+                        "UPDATE privacy_schema_metadata SET value=?1,updated_at=CURRENT_TIMESTAMP
+                         WHERE key='schema_version' AND value=?2",
+                        rusqlite::params![PRIVACY_STORE_SCHEMA_VERSION.to_string(), value],
+                    )
+                    .map_err(|_| PrivacyStoreError::Database)?;
+                if changed != 1 {
+                    return Err(PrivacyStoreError::Conflict);
+                }
+            }
             None => {
+                crate::lifecycle::initialize_lifecycle_schema(connection)?;
                 connection
                     .execute(
                         "INSERT INTO privacy_schema_metadata(key,value) VALUES('schema_version',?1)",
@@ -249,6 +387,7 @@ impl PrivacyStore {
                     )
                     .map_err(|_| PrivacyStoreError::Database)?;
             }
+            Some(_) => return Err(PrivacyStoreError::UnsupportedSchema),
         }
         Ok(())
     }
@@ -328,6 +467,242 @@ impl PrivacyStore {
             )
             .map_err(|_| PrivacyStoreError::Database)?;
         Ok(())
+    }
+
+    /// Replaces a pending review payload only when its exact redacted-content hash still matches.
+    /// The caller is expected to execute this together with an append-only risk revision inside
+    /// one SQLite transaction, preventing the editable draft and risk state from diverging.
+    pub fn update_review_draft_exact(
+        connection: &Connection,
+        redaction_id: &str,
+        expected_redacted_sha256: &str,
+        redacted_content_sha256: &str,
+        unresolved_high_risk_count: u32,
+        review_payload_plaintext: &[u8],
+    ) -> Result<(), PrivacyStoreError> {
+        valid_id(redaction_id)?;
+        valid_hash(expected_redacted_sha256)?;
+        valid_hash(redacted_content_sha256)?;
+        if review_payload_plaintext.is_empty() {
+            return Err(PrivacyStoreError::InvalidInput);
+        }
+        let protected = protect_local(review_payload_plaintext)
+            .map_err(|_| PrivacyStoreError::ProtectedBlob)?;
+        let changed = connection
+            .execute(
+                "UPDATE privacy_redactions
+                 SET redacted_content_sha256=?3,unresolved_high_risk_count=?4,
+                     protected_review_blob=?5,protection_scheme=?6
+                 WHERE redaction_id=?1 AND review_state='review_required'
+                   AND redacted_content_sha256=?2",
+                params![
+                    redaction_id,
+                    expected_redacted_sha256,
+                    redacted_content_sha256,
+                    unresolved_high_risk_count,
+                    protected,
+                    LOCAL_PROTECTION_SCHEME,
+                ],
+            )
+            .map_err(|_| PrivacyStoreError::Database)?;
+        if changed != 1 {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub fn append_risk_review_revision(
+        connection: &Connection,
+        input: &SaveRiskReviewRevision<'_>,
+    ) -> Result<RiskReviewRevisionSummary, PrivacyStoreError> {
+        valid_id(input.redaction_id)?;
+        valid_hash(input.risk_sha256)?;
+        valid_hash(input.hard_gate_sha256)?;
+        valid_id(input.action_code)?;
+        if input.state_plaintext.is_empty() || input.reason_codes.len() > 64 {
+            return Err(PrivacyStoreError::InvalidInput);
+        }
+        let unique_reasons = input.reason_codes.iter().collect::<BTreeSet<_>>();
+        if unique_reasons.len() != input.reason_codes.len()
+            || input
+                .reason_codes
+                .iter()
+                .any(|reason| valid_id(reason).is_err())
+        {
+            return Err(PrivacyStoreError::InvalidInput);
+        }
+        let reason_codes_json = serde_json::to_string(input.reason_codes)
+            .map_err(|_| PrivacyStoreError::InvalidInput)?;
+        if reason_codes_json.len() > 65_536 {
+            return Err(PrivacyStoreError::InvalidInput);
+        }
+        let previous = connection
+            .query_row(
+                "SELECT revision,revision_hash FROM privacy_risk_review_revisions
+                 WHERE redaction_id=?1 ORDER BY revision DESC LIMIT 1",
+                [input.redaction_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| PrivacyStoreError::Database)?;
+        let (previous_revision, previous_revision_hash) = match previous {
+            Some((revision, hash)) => (
+                u64::try_from(revision).map_err(|_| PrivacyStoreError::Database)?,
+                hash,
+            ),
+            None => (0, String::new()),
+        };
+        if previous_revision != input.expected_previous_revision {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        let revision = previous_revision
+            .checked_add(1)
+            .ok_or(PrivacyStoreError::InvalidInput)?;
+        let state_sha256 = sha256_hex(input.state_plaintext);
+        let protected =
+            protect_local(input.state_plaintext).map_err(|_| PrivacyStoreError::ProtectedBlob)?;
+        let protected_sha256 = sha256_hex(&protected);
+        let revision_hash = risk_review_revision_hash(&RiskReviewRevisionHashInput {
+            redaction_id: input.redaction_id,
+            revision,
+            state_sha256: &state_sha256,
+            risk_sha256: input.risk_sha256,
+            hard_gate_sha256: input.hard_gate_sha256,
+            action_code: input.action_code,
+            reason_codes_json: &reason_codes_json,
+            protected_sha256: &protected_sha256,
+            previous_revision_hash: &previous_revision_hash,
+        });
+        let revision_sql = i64::try_from(revision).map_err(|_| PrivacyStoreError::InvalidInput)?;
+        let changed = connection
+            .execute(
+                "INSERT INTO privacy_risk_review_revisions(
+                    redaction_id,revision,state_sha256,risk_sha256,hard_gate_sha256,
+                    action_code,reason_codes_json,protected_state_blob,protection_scheme,
+                    previous_revision_hash,revision_hash
+                 )
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11
+                 WHERE EXISTS(SELECT 1 FROM privacy_redactions WHERE redaction_id=?1)",
+                params![
+                    input.redaction_id,
+                    revision_sql,
+                    state_sha256,
+                    input.risk_sha256,
+                    input.hard_gate_sha256,
+                    input.action_code,
+                    reason_codes_json,
+                    protected,
+                    LOCAL_PROTECTION_SCHEME,
+                    previous_revision_hash,
+                    revision_hash,
+                ],
+            )
+            .map_err(|error| {
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                    PrivacyStoreError::Conflict
+                } else {
+                    PrivacyStoreError::Database
+                }
+            })?;
+        if changed != 1 {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        Ok(RiskReviewRevisionSummary {
+            redaction_id: input.redaction_id.to_owned(),
+            revision,
+            state_sha256,
+            risk_sha256: input.risk_sha256.to_owned(),
+            hard_gate_sha256: input.hard_gate_sha256.to_owned(),
+            action_code: input.action_code.to_owned(),
+            reason_codes: input.reason_codes.to_vec(),
+            previous_revision_hash,
+            revision_hash,
+        })
+    }
+
+    pub fn load_latest_risk_review_revision(
+        connection: &Connection,
+        redaction_id: &str,
+    ) -> Result<Option<LoadedRiskReviewRevision>, PrivacyStoreError> {
+        valid_id(redaction_id)?;
+        let row = connection
+            .query_row(
+                "SELECT revision,state_sha256,risk_sha256,hard_gate_sha256,action_code,
+                        reason_codes_json,protected_state_blob,protection_scheme,
+                        previous_revision_hash,revision_hash
+                 FROM privacy_risk_review_revisions
+                 WHERE redaction_id=?1 ORDER BY revision DESC LIMIT 1",
+                [redaction_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| PrivacyStoreError::Database)?;
+        let Some((
+            revision,
+            state_sha256,
+            risk_sha256,
+            hard_gate_sha256,
+            action_code,
+            reason_codes_json,
+            protected,
+            scheme,
+            previous_revision_hash,
+            revision_hash,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        if scheme != LOCAL_PROTECTION_SCHEME {
+            return Err(PrivacyStoreError::ProtectedBlob);
+        }
+        let revision = u64::try_from(revision).map_err(|_| PrivacyStoreError::Database)?;
+        let reason_codes: Vec<String> =
+            serde_json::from_str(&reason_codes_json).map_err(|_| PrivacyStoreError::Database)?;
+        let protected_sha256 = sha256_hex(&protected);
+        let expected_revision_hash = risk_review_revision_hash(&RiskReviewRevisionHashInput {
+            redaction_id,
+            revision,
+            state_sha256: &state_sha256,
+            risk_sha256: &risk_sha256,
+            hard_gate_sha256: &hard_gate_sha256,
+            action_code: &action_code,
+            reason_codes_json: &reason_codes_json,
+            protected_sha256: &protected_sha256,
+            previous_revision_hash: &previous_revision_hash,
+        });
+        if expected_revision_hash != revision_hash {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        let state_plaintext =
+            unprotect_local(&protected).map_err(|_| PrivacyStoreError::ProtectedBlob)?;
+        if sha256_hex(&state_plaintext) != state_sha256 {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        Ok(Some(LoadedRiskReviewRevision {
+            redaction_id: redaction_id.to_owned(),
+            revision,
+            state_sha256,
+            risk_sha256,
+            hard_gate_sha256,
+            action_code,
+            reason_codes,
+            previous_revision_hash,
+            revision_hash,
+            state_plaintext,
+        }))
     }
 
     pub fn load_review_draft(
@@ -534,6 +909,65 @@ impl PrivacyStore {
             .commit()
             .map_err(|_| PrivacyStoreError::Database)
     }
+    /// Atomically appends the exact publication-bound risk revision and approves the matching
+    /// editable review. A stale risk revision or draft hash rolls back both changes.
+    pub fn approve_review_with_risk_revision(
+        connection: &mut Connection,
+        input: &ApproveReviewWithRiskRevision<'_>,
+    ) -> Result<(), PrivacyStoreError> {
+        valid_id(input.redaction_id)?;
+        valid_hash(input.expected_redacted_sha256)?;
+        valid_hash(input.approved_redacted_content_sha256)?;
+        valid_hash(input.approved_payload_sha256)?;
+        valid_hash(input.reviewed_by_sha256)?;
+        if input.risk_revision.redaction_id != input.redaction_id
+            || input.approved_review_payload_plaintext.is_empty()
+            || input.approved_review_payload_plaintext.len() > MAX_APPROVED_PAYLOAD_BYTES
+        {
+            return Err(PrivacyStoreError::InvalidInput);
+        }
+        let protected_review_blob = protect_local(input.approved_review_payload_plaintext)
+            .map_err(|_| PrivacyStoreError::ProtectedBlob)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| PrivacyStoreError::Database)?;
+        Self::append_risk_review_revision(&transaction, &input.risk_revision)?;
+        let changed = transaction
+            .execute(
+                "UPDATE privacy_redactions
+                 SET review_state='approved',approved_payload_sha256=?2,
+                     reviewed_by_sha256=?3,protected_review_blob=?5,
+                     redacted_content_sha256=?6,reviewed_at=CURRENT_TIMESTAMP
+                 WHERE redaction_id=?1 AND unresolved_high_risk_count=0
+                   AND redacted_content_sha256=?4
+                   AND (review_state='review_required'
+                        OR (review_state='approved' AND approved_payload_sha256=?2))",
+                params![
+                    input.redaction_id,
+                    input.approved_payload_sha256,
+                    input.reviewed_by_sha256,
+                    input.expected_redacted_sha256,
+                    protected_review_blob,
+                    input.approved_redacted_content_sha256,
+                ],
+            )
+            .map_err(|_| PrivacyStoreError::Database)?;
+        if changed != 1 {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        transaction
+            .execute(
+                "UPDATE privacy_materials SET state='approved',updated_at=CURRENT_TIMESTAMP
+                 WHERE material_id=(
+                    SELECT material_id FROM privacy_redactions WHERE redaction_id=?1
+                 )",
+                [input.redaction_id],
+            )
+            .map_err(|_| PrivacyStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| PrivacyStoreError::Database)
+    }
 
     pub fn persist_receipt(
         connection: &mut Connection,
@@ -712,7 +1146,7 @@ impl PrivacyStore {
         }
         let row = connection
             .query_row(
-                "SELECT p.signed_token,p.revoked_at_unix,m.source_sha256,
+                "SELECT p.signed_token,p.revoked_at_unix,p.consumed_at_unix,m.source_sha256,
                         r.extraction_sha256,r.redacted_content_sha256,
                         r.approved_payload_sha256,r.policy_id,r.policy_version,
                         r.detector_version,r.unresolved_high_risk_count,
@@ -726,16 +1160,17 @@ impl PrivacyStore {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, u32>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, u32>(9)?,
-                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, u32>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, u32>(10)?,
                         row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
                     ))
                 },
             )
@@ -745,21 +1180,24 @@ impl PrivacyStore {
         if row.1.is_some() {
             return Err(PrivacyStoreError::ReceiptRevoked);
         }
+        if row.2.is_some() {
+            return Err(PrivacyStoreError::ReceiptConsumed);
+        }
         let stored_token = unprotect_local(&row.0).map_err(|_| PrivacyStoreError::ProtectedBlob)?;
         if !constant_time_bytes_eq(&stored_token, verification.signed_token.as_bytes()) {
             return Err(PrivacyStoreError::InvalidReceipt);
         }
-        if row.9 != 0 || row.10 != "approved" || row.11 != "outbound_ready" {
+        if row.10 != 0 || row.11 != "approved" || row.12 != "outbound_ready" {
             return Err(PrivacyStoreError::NotApproved);
         }
         if receipt.claims.source_sha256.len() != 1
-            || receipt.claims.source_sha256.first() != Some(&row.2)
-            || receipt.claims.extraction_sha256 != row.3
-            || receipt.claims.redacted_content_sha256 != row.4
-            || row.5.as_deref() != Some(receipt.claims.approved_payload_sha256.as_str())
-            || receipt.claims.policy_id != row.6
-            || receipt.claims.policy_version != row.7
-            || receipt.claims.detector_version != row.8
+            || receipt.claims.source_sha256.first() != Some(&row.3)
+            || receipt.claims.extraction_sha256 != row.4
+            || receipt.claims.redacted_content_sha256 != row.5
+            || row.6.as_deref() != Some(receipt.claims.approved_payload_sha256.as_str())
+            || receipt.claims.policy_id != row.7
+            || receipt.claims.policy_version != row.8
+            || receipt.claims.detector_version != row.9
         {
             return Err(PrivacyStoreError::InvalidReceipt);
         }
@@ -770,14 +1208,80 @@ impl PrivacyStore {
                     payload: verification.approved_payload,
                     destination: verification.destination,
                     purpose: verification.purpose,
-                    policy_id: &row.6,
-                    policy_version: row.7,
-                    detector_version: &row.8,
+                    policy_id: &row.7,
+                    policy_version: row.8,
+                    detector_version: &row.9,
                     now_unix: verification.now_unix,
                 },
             )
             .map_err(map_receipt_error)?;
         Ok(receipt)
+    }
+
+    /// Atomically consumes an already verified approval immediately before the
+    /// first external Provider write. Consumption is deliberately irreversible:
+    /// a timeout or unknown network result must require a fresh human approval
+    /// instead of risking a duplicate disclosure after restart or retry.
+    pub fn consume_receipt_for_dispatch(
+        connection: &mut Connection,
+        receipt_id: &str,
+        redaction_id: &str,
+        consumption_id: &str,
+        now_unix: u64,
+    ) -> Result<(), PrivacyStoreError> {
+        valid_id(receipt_id)?;
+        valid_id(redaction_id)?;
+        valid_id(consumption_id)?;
+        if now_unix == 0 {
+            return Err(PrivacyStoreError::InvalidInput);
+        }
+        let consumed = i64::try_from(now_unix).map_err(|_| PrivacyStoreError::InvalidInput)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| PrivacyStoreError::Database)?;
+        let changed = transaction
+            .execute(
+                "UPDATE privacy_receipts
+                 SET consumed_at_unix=?4,consumption_id=?3
+                 WHERE receipt_id=?1 AND redaction_id=?2
+                   AND revoked_at_unix IS NULL AND consumed_at_unix IS NULL
+                   AND issued_at_unix<=?4 AND expires_at_unix>?4",
+                params![receipt_id, redaction_id, consumption_id, consumed],
+            )
+            .map_err(|_| PrivacyStoreError::Database)?;
+        if changed != 1 {
+            let state = transaction
+                .query_row(
+                    "SELECT revoked_at_unix,consumed_at_unix,issued_at_unix,expires_at_unix
+                     FROM privacy_receipts WHERE receipt_id=?1 AND redaction_id=?2",
+                    params![receipt_id, redaction_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| PrivacyStoreError::Database)?;
+            return match state {
+                None => Err(PrivacyStoreError::InvalidReceipt),
+                Some((Some(_), _, _, _)) => Err(PrivacyStoreError::ReceiptRevoked),
+                Some((_, Some(_), _, _)) => Err(PrivacyStoreError::ReceiptConsumed),
+                Some((_, _, issued_at, _)) if consumed < issued_at => {
+                    Err(PrivacyStoreError::InvalidReceipt)
+                }
+                Some((_, _, _, expires_at)) if consumed >= expires_at => {
+                    Err(PrivacyStoreError::ReceiptExpired)
+                }
+                Some(_) => Err(PrivacyStoreError::Conflict),
+            };
+        }
+        transaction
+            .commit()
+            .map_err(|_| PrivacyStoreError::Database)
     }
 
     pub fn revoke_receipt(
@@ -877,6 +1381,36 @@ impl PrivacyStore {
             .map_err(|_| PrivacyStoreError::Database)?;
         Ok(event_hash)
     }
+}
+
+struct RiskReviewRevisionHashInput<'a> {
+    redaction_id: &'a str,
+    revision: u64,
+    state_sha256: &'a str,
+    risk_sha256: &'a str,
+    hard_gate_sha256: &'a str,
+    action_code: &'a str,
+    reason_codes_json: &'a str,
+    protected_sha256: &'a str,
+    previous_revision_hash: &'a str,
+}
+
+fn risk_review_revision_hash(input: &RiskReviewRevisionHashInput<'_>) -> String {
+    sha256_hex(
+        format!(
+            "{RISK_REVIEW_REVISION_PROFILE}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            input.redaction_id,
+            input.revision,
+            input.state_sha256,
+            input.risk_sha256,
+            input.hard_gate_sha256,
+            input.action_code,
+            input.reason_codes_json,
+            input.protected_sha256,
+            input.previous_revision_hash,
+        )
+        .as_bytes(),
+    )
 }
 
 fn valid_id(value: &str) -> Result<(), PrivacyStoreError> {
@@ -1049,6 +1583,302 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn risk_review_revisions_are_encrypted_hash_chained_and_optimistic() {
+        let connection = setup();
+        register(&connection);
+        PrivacyStore::save_review_draft(
+            &connection,
+            &SaveReviewDraft {
+                redaction_id: "redaction-risk-1",
+                material_id: "material-1",
+                extraction_sha256: &hash(b"risk-extraction"),
+                redacted_content_sha256: &hash(b"risk-redacted"),
+                policy_id: "cn-legal-risk-v1",
+                policy_version: 1,
+                detector_version: REDACTION_VERSION,
+                unresolved_high_risk_count: 1,
+                review_payload_plaintext: b"review-draft",
+            },
+        )
+        .expect("draft");
+
+        let private_state = br#"{"private":"private-case-value-do-not-store","revision":1}"#;
+        let first = PrivacyStore::append_risk_review_revision(
+            &connection,
+            &SaveRiskReviewRevision {
+                redaction_id: "redaction-risk-1",
+                expected_previous_revision: 0,
+                risk_sha256: &hash(b"risk-1"),
+                hard_gate_sha256: &hash(b"gates-1"),
+                action_code: "review_initialized",
+                reason_codes: &["p1_unresolved".to_owned()],
+                state_plaintext: private_state,
+            },
+        )
+        .expect("first revision");
+        assert_eq!(first.revision, 1);
+        assert!(first.previous_revision_hash.is_empty());
+
+        let (ordinary, protected) = connection
+            .query_row(
+                "SELECT redaction_id||state_sha256||risk_sha256||hard_gate_sha256||
+                        action_code||reason_codes_json||previous_revision_hash||revision_hash,
+                        protected_state_blob
+                 FROM privacy_risk_review_revisions
+                 WHERE redaction_id='redaction-risk-1' AND revision=1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .expect("stored revision");
+        assert!(!ordinary.contains("private-case-value-do-not-store"));
+        assert!(!protected
+            .windows(private_state.len())
+            .any(|value| value == private_state));
+
+        let loaded =
+            PrivacyStore::load_latest_risk_review_revision(&connection, "redaction-risk-1")
+                .expect("load")
+                .expect("latest");
+        assert_eq!(loaded.state_plaintext, private_state);
+        assert!(!format!("{loaded:?}").contains("private-case-value-do-not-store"));
+
+        let second_state = br#"{"revision":2,"resolution":"accepted"}"#;
+        let second = PrivacyStore::append_risk_review_revision(
+            &connection,
+            &SaveRiskReviewRevision {
+                redaction_id: "redaction-risk-1",
+                expected_previous_revision: 1,
+                risk_sha256: &hash(b"risk-2"),
+                hard_gate_sha256: &hash(b"gates-2"),
+                action_code: "accept_replacement",
+                reason_codes: &[],
+                state_plaintext: second_state,
+            },
+        )
+        .expect("second revision");
+        assert_eq!(second.revision, 2);
+        assert_eq!(second.previous_revision_hash, first.revision_hash);
+        assert_eq!(
+            PrivacyStore::append_risk_review_revision(
+                &connection,
+                &SaveRiskReviewRevision {
+                    redaction_id: "redaction-risk-1",
+                    expected_previous_revision: 1,
+                    risk_sha256: &hash(b"risk-stale"),
+                    hard_gate_sha256: &hash(b"gates-stale"),
+                    action_code: "stale_action",
+                    reason_codes: &[],
+                    state_plaintext: b"stale",
+                },
+            ),
+            Err(PrivacyStoreError::Conflict)
+        );
+        assert!(connection
+            .execute(
+                "UPDATE privacy_risk_review_revisions SET action_code='tamper'
+                 WHERE redaction_id='redaction-risk-1' AND revision=2",
+                [],
+            )
+            .is_err());
+
+        connection
+            .execute_batch("DROP TRIGGER trg_privacy_risk_review_no_update;")
+            .expect("drop test trigger");
+        connection
+            .execute(
+                "UPDATE privacy_risk_review_revisions SET protected_state_blob=x'00'
+                 WHERE redaction_id='redaction-risk-1' AND revision=2",
+                [],
+            )
+            .expect("tamper for validation");
+        assert_eq!(
+            PrivacyStore::load_latest_risk_review_revision(&connection, "redaction-risk-1")
+                .map(|_| ()),
+            Err(PrivacyStoreError::Conflict)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn approval_and_risk_revision_commit_atomically_and_reject_stale_revision() {
+        let mut connection = setup();
+        register(&connection);
+        PrivacyStore::save_review_draft(
+            &connection,
+            &SaveReviewDraft {
+                redaction_id: "redaction-risk-approval-1",
+                material_id: "material-1",
+                extraction_sha256: &hash(b"approval-extraction"),
+                redacted_content_sha256: &hash(b"approval-redacted-v1"),
+                policy_id: "cn-legal-risk-v1",
+                policy_version: 1,
+                detector_version: REDACTION_VERSION,
+                unresolved_high_risk_count: 0,
+                review_payload_plaintext: b"approval-review-v1",
+            },
+        )
+        .expect("draft");
+        PrivacyStore::append_risk_review_revision(
+            &connection,
+            &SaveRiskReviewRevision {
+                redaction_id: "redaction-risk-approval-1",
+                expected_previous_revision: 0,
+                risk_sha256: &hash(b"approval-risk-v1"),
+                hard_gate_sha256: &hash(b"approval-gates-v1"),
+                action_code: "review_initialized",
+                reason_codes: &[],
+                state_plaintext: b"approval-risk-state-v1",
+            },
+        )
+        .expect("initial revision");
+
+        let approved_redacted_sha256 = hash(b"approval-redacted-v2");
+        let approved_payload_sha256 = hash(b"approval-payload");
+        let reviewed_by_sha256 = hash(b"approval-reviewer");
+        let risk_sha256 = hash(b"approval-risk-v2");
+        let hard_gate_sha256 = hash(b"approval-gates-v2");
+        macro_rules! approval {
+            ($expected_previous_revision:expr, $expected_redacted_sha256:expr) => {
+                ApproveReviewWithRiskRevision {
+                    redaction_id: "redaction-risk-approval-1",
+                    expected_redacted_sha256: $expected_redacted_sha256,
+                    approved_redacted_content_sha256: &approved_redacted_sha256,
+                    approved_payload_sha256: &approved_payload_sha256,
+                    reviewed_by_sha256: &reviewed_by_sha256,
+                    approved_review_payload_plaintext: b"approval-review-v2",
+                    risk_revision: SaveRiskReviewRevision {
+                        redaction_id: "redaction-risk-approval-1",
+                        expected_previous_revision: $expected_previous_revision,
+                        risk_sha256: &risk_sha256,
+                        hard_gate_sha256: &hard_gate_sha256,
+                        action_code: "bind_publication_context",
+                        reason_codes: &[],
+                        state_plaintext: b"approval-risk-state-v2",
+                    },
+                }
+            };
+        }
+
+        assert_eq!(
+            PrivacyStore::approve_review_with_risk_revision(
+                &mut connection,
+                &approval!(0, &hash(b"approval-redacted-v1")),
+            ),
+            Err(PrivacyStoreError::Conflict)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT review_state FROM privacy_redactions
+                     WHERE redaction_id='redaction-risk-approval-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("review state"),
+            "review_required"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_risk_review_revisions
+                     WHERE redaction_id='redaction-risk-approval-1'",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("revision count"),
+            1
+        );
+
+        assert_eq!(
+            PrivacyStore::approve_review_with_risk_revision(
+                &mut connection,
+                &approval!(1, &hash(b"wrong-redacted-hash")),
+            ),
+            Err(PrivacyStoreError::Conflict)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_risk_review_revisions
+                     WHERE redaction_id='redaction-risk-approval-1'",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("rolled back revision count"),
+            1
+        );
+
+        PrivacyStore::approve_review_with_risk_revision(
+            &mut connection,
+            &approval!(1, &hash(b"approval-redacted-v1")),
+        )
+        .expect("atomic approval");
+        let approved = PrivacyStore::load_review_draft(&connection, "redaction-risk-approval-1")
+            .expect("approved review");
+        assert_eq!(approved.review_state, "approved");
+        assert_eq!(
+            approved.redacted_content_sha256,
+            hash(b"approval-redacted-v2")
+        );
+        assert_eq!(
+            PrivacyStore::load_latest_risk_review_revision(
+                &connection,
+                "redaction-risk-approval-1",
+            )
+            .expect("latest revision")
+            .expect("revision")
+            .revision,
+            2
+        );
+    }
+
+    #[test]
+    fn schema_v2_migrates_to_risk_review_and_receipt_consumption_schema_v4() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .execute_batch(
+                "CREATE TABLE privacy_schema_metadata(
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO privacy_schema_metadata(key,value)
+                 VALUES('schema_version','2');",
+            )
+            .expect("legacy metadata");
+        PrivacyStore::initialize(&connection).expect("migrate");
+        let version = connection
+            .query_row(
+                "SELECT value FROM privacy_schema_metadata WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("version");
+        assert_eq!(version, "4");
+        let table_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='privacy_risk_review_revisions'",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .expect("risk table");
+        assert_eq!(table_count, 1);
+        let receipt_columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(privacy_receipts)")
+                .expect("receipt columns");
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("receipt column rows")
+                .collect::<Result<BTreeSet<_>, _>>()
+                .expect("receipt column names")
+        };
+        assert!(receipt_columns.contains("consumed_at_unix"));
+        assert!(receipt_columns.contains("consumption_id"));
+    }
     #[test]
     fn egress_audit_is_append_only_and_contains_no_plaintext() {
         let mut connection = setup();
@@ -1208,6 +2038,28 @@ mod tests {
                 },
             ),
             Err(PrivacyStoreError::ReceiptExpired)
+        );
+        PrivacyStore::consume_receipt_for_dispatch(
+            &mut connection,
+            &receipt.claims.receipt_id,
+            "redaction-1",
+            "dispatch-once-1",
+            150,
+        )
+        .expect("first exact dispatch claim");
+        assert_eq!(
+            PrivacyStore::verify_active_receipt_token(&connection, &signer, &verification),
+            Err(PrivacyStoreError::ReceiptConsumed)
+        );
+        assert_eq!(
+            PrivacyStore::consume_receipt_for_dispatch(
+                &mut connection,
+                &receipt.claims.receipt_id,
+                "redaction-1",
+                "dispatch-replay-2",
+                151,
+            ),
+            Err(PrivacyStoreError::ReceiptConsumed)
         );
         PrivacyStore::revoke_receipt(&connection, &receipt.claims.receipt_id, 160).expect("revoke");
         assert_eq!(
@@ -1459,4 +2311,15 @@ mod tests {
             )
             .is_err());
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveReviewWithRiskRevision<'a> {
+    pub redaction_id: &'a str,
+    pub expected_redacted_sha256: &'a str,
+    pub approved_redacted_content_sha256: &'a str,
+    pub approved_payload_sha256: &'a str,
+    pub reviewed_by_sha256: &'a str,
+    pub approved_review_payload_plaintext: &'a [u8],
+    pub risk_revision: SaveRiskReviewRevision<'a>,
 }

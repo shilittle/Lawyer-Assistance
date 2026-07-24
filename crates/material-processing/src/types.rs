@@ -2,6 +2,40 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const MATERIAL_PROCESSING_VERSION: &str = "lawyer-assistance-material-processing-v1";
+pub const RASTER_TO_PDF_TRANSFORM_VERSION: &str = "lawyer-assistance-raster-to-pdf-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RasterImageFormat {
+    Png,
+    Jpeg,
+}
+
+impl RasterImageFormat {
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+}
+
+/// Evidence for the deterministic, in-memory image-to-PDF transform used only
+/// to feed the isolated OCR worker. Both hashes are retained so an approval is
+/// bound to the original image rather than merely to its derived PDF wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputTransformTrace {
+    pub schema_version: u16,
+    pub transform_version: String,
+    pub source_media_type: String,
+    pub source_sha256: String,
+    pub processing_media_type: String,
+    pub processing_sha256: String,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+pub const WINDOWS_FIREWALL_ISOLATION_MECHANISM: &str = "windows_defender_firewall_program_block_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +64,8 @@ pub enum QualityReasonCode {
     VisualContentPresent,
     PageAnnotationsPresent,
     InteractiveFormPresent,
+    OcrLowResolution,
+    OcrLowConfidence,
     ForcedLocalOcr,
     OcrDisabled,
 }
@@ -105,6 +141,8 @@ pub struct ProcessedDocument {
     pub media_type: String,
     pub page_count: u32,
     pub backend_trace: Vec<BackendTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_transform: Option<InputTransformTrace>,
     pub pages: Vec<ProcessedPage>,
 }
 
@@ -151,12 +189,56 @@ impl DeviceSelection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalMineruRuntimeExecutableRole {
+    Launcher,
+    Executable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalMineruRuntimeExecutable {
+    pub path: PathBuf,
+    pub expected_sha256: String,
+    pub expected_size_bytes: u64,
+    pub role: LocalMineruRuntimeExecutableRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalMineruRuntimeManifestV1 {
+    pub schema_version: u16,
+    pub version: String,
+    pub executables: Vec<LocalMineruRuntimeManifestExecutableV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalMineruRuntimeManifestExecutableV1 {
+    pub path_sha256: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub role: LocalMineruRuntimeExecutableRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkIsolationRuleEvidence {
+    pub program_path: PathBuf,
+    pub firewall_rule_name: String,
+    pub expected_policy_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkIsolationEvidence {
+    /// Legacy qualification bit. Production execution never trusts this bit
+    /// without re-measuring every active Windows Firewall rule.
     pub verified: bool,
     pub mechanism: String,
     pub checked_at_unix: u64,
+    pub rules: Vec<NetworkIsolationRuleEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +246,11 @@ pub struct NetworkIsolationEvidence {
 pub struct LocalMineruConfig {
     pub executable: PathBuf,
     pub expected_executable_sha256: String,
+    pub runtime_executables: Vec<LocalMineruRuntimeExecutable>,
+    pub runtime_manifest: PathBuf,
+    pub expected_runtime_manifest_sha256: String,
+    pub support_manifest: PathBuf,
+    pub expected_support_manifest_sha256: String,
     pub mineru_config: PathBuf,
     pub expected_config_sha256: String,
     pub model_root: PathBuf,
@@ -177,6 +264,12 @@ pub struct LocalMineruConfig {
     pub max_output_bytes: u64,
     pub strict_offline: bool,
     pub network_isolation: NetworkIsolationEvidence,
+    /// App-signed qualification report binding. This is an opaque local ID;
+    /// it is never a path and is never accepted from a document or renderer.
+    pub qualification_report_id: String,
+    /// SHA-256 of the canonical `hello` identity captured during the current
+    /// app qualification. Production execution rejects any identity drift.
+    pub expected_worker_identity_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,6 +283,8 @@ pub struct ProcessingLimits {
     pub min_printable_ratio: f32,
     pub max_replacement_ratio: f32,
     pub min_reading_order_score: f32,
+    pub min_ocr_confidence: f32,
+    pub max_page_dimension: f32,
 }
 
 impl Default for ProcessingLimits {
@@ -204,6 +299,8 @@ impl Default for ProcessingLimits {
             min_printable_ratio: 0.90,
             max_replacement_ratio: 0.02,
             min_reading_order_score: 0.50,
+            min_ocr_confidence: 0.70,
+            max_page_dimension: 100_000.0,
         }
     }
 }
@@ -213,6 +310,8 @@ impl Default for ProcessingLimits {
 pub enum ProcessingError {
     InvalidInput,
     InputTooLarge,
+    InvalidRasterImage,
+    RasterImageDimensionsExceeded,
     CorruptPdf,
     EncryptedPdf,
     PageLimitExceeded,
@@ -222,13 +321,21 @@ pub enum ProcessingError {
     OcrBackendUnavailable,
     OcrWorkerUntrusted,
     OcrWorkerIsolationUnverified,
+    OcrProcessContainmentUnavailable,
     OcrConfigUnsafe,
+    OcrRuntimeUntrusted,
+    OcrRuntimeChanged,
+    OcrWorkerProtocolViolation,
+    OcrWorkerUnhealthy,
+    OcrWorkerIdentityMismatch,
     OcrModelUntrusted,
     OcrTimeout,
     OcrFailed,
     OcrOutputUnsafe,
     OcrOutputTooLarge,
     OcrOutputIncomplete,
+    OcrOutputLowConfidence,
+    OcrCleanupFailed,
     Cancelled,
 }
 
@@ -237,6 +344,8 @@ impl ProcessingError {
         match self {
             Self::InvalidInput => "invalid_material",
             Self::InputTooLarge => "material_too_large",
+            Self::InvalidRasterImage => "invalid_raster_image",
+            Self::RasterImageDimensionsExceeded => "raster_image_dimensions_exceeded",
             Self::CorruptPdf => "corrupt_pdf",
             Self::EncryptedPdf => "encrypted_pdf",
             Self::PageLimitExceeded => "pdf_page_limit_exceeded",
@@ -246,13 +355,21 @@ impl ProcessingError {
             Self::OcrBackendUnavailable => "ocr_backend_unavailable",
             Self::OcrWorkerUntrusted => "ocr_worker_untrusted",
             Self::OcrWorkerIsolationUnverified => "ocr_worker_isolation_unverified",
+            Self::OcrProcessContainmentUnavailable => "ocr_process_containment_unavailable",
             Self::OcrConfigUnsafe => "ocr_config_unsafe",
+            Self::OcrRuntimeUntrusted => "ocr_runtime_untrusted",
+            Self::OcrRuntimeChanged => "ocr_runtime_changed",
+            Self::OcrWorkerProtocolViolation => "ocr_worker_protocol_violation",
+            Self::OcrWorkerUnhealthy => "ocr_worker_unhealthy",
+            Self::OcrWorkerIdentityMismatch => "ocr_worker_identity_mismatch",
             Self::OcrModelUntrusted => "ocr_model_untrusted",
             Self::OcrTimeout => "ocr_timeout",
             Self::OcrFailed => "ocr_failed",
             Self::OcrOutputUnsafe => "ocr_output_unsafe",
             Self::OcrOutputTooLarge => "ocr_output_too_large",
             Self::OcrOutputIncomplete => "ocr_output_incomplete",
+            Self::OcrOutputLowConfidence => "ocr_output_low_confidence",
+            Self::OcrCleanupFailed => "ocr_cleanup_failed",
             Self::Cancelled => "processing_cancelled",
         }
     }
@@ -261,6 +378,10 @@ impl ProcessingError {
         match self {
             Self::InvalidInput => "The material is not a supported PDF.",
             Self::InputTooLarge => "The material exceeds the processing size limit.",
+            Self::InvalidRasterImage => "The PNG or JPEG image is malformed or unsupported.",
+            Self::RasterImageDimensionsExceeded => {
+                "The image dimensions exceed the safe local OCR limit."
+            }
             Self::CorruptPdf => "The PDF is malformed or unsupported.",
             Self::EncryptedPdf => "Encrypted PDFs cannot be processed.",
             Self::PageLimitExceeded => "The PDF exceeds the page limit.",
@@ -272,13 +393,31 @@ impl ProcessingError {
             Self::OcrWorkerIsolationUnverified => {
                 "The local OCR worker network isolation has not been verified."
             }
+            Self::OcrProcessContainmentUnavailable => {
+                "The local OCR worker process tree could not be contained."
+            }
             Self::OcrConfigUnsafe => "The local OCR configuration is unsafe.",
+            Self::OcrRuntimeUntrusted => "The local OCR runtime allowlist did not pass validation.",
+            Self::OcrRuntimeChanged => "The local OCR runtime identity changed during execution.",
+            Self::OcrWorkerProtocolViolation => {
+                "The local OCR worker violated the versioned IPC protocol."
+            }
+            Self::OcrWorkerUnhealthy => {
+                "The local OCR worker did not pass the bound protocol health checks."
+            }
+            Self::OcrWorkerIdentityMismatch => {
+                "The local OCR worker protocol identity changed after qualification."
+            }
             Self::OcrModelUntrusted => "The local OCR model pack did not pass validation.",
             Self::OcrTimeout => "Local OCR exceeded its time limit.",
             Self::OcrFailed => "Local OCR failed.",
             Self::OcrOutputUnsafe => "Local OCR produced an unsafe output tree.",
             Self::OcrOutputTooLarge => "Local OCR output exceeds the size limit.",
             Self::OcrOutputIncomplete => "Local OCR output does not cover every required page.",
+            Self::OcrOutputLowConfidence => {
+                "Local OCR output contains missing or low-confidence text."
+            }
+            Self::OcrCleanupFailed => "Local OCR temporary artifacts could not be removed.",
             Self::Cancelled => "Material processing was cancelled.",
         }
     }

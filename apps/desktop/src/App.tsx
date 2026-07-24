@@ -19,7 +19,6 @@ import {
   getPendingStructuredCaseExtraction,
   getCaseWorkspace,
   listCaseProjects,
-  generateStructuredCaseExtraction,
   updatePendingStructuredCaseExtraction,
   upsertCaseFile,
   upsertCaseFact,
@@ -71,7 +70,6 @@ import { formatHealthCheck } from "./ipc/health/format";
 import { healthCheck } from "./ipc/health/client";
 import type { HealthCheckResponse } from "./ipc/health/types";
 import {
-  answerLegalQuestion,
   cancelLegalAnswer,
   findLegalAnswerCandidates,
   getArticle,
@@ -101,11 +99,9 @@ import {
   isLegalAnswerStreamActive,
   isLegalAnswerStreamCancellable,
   markLegalAnswerCancelling,
-  reduceLegalAnswerStreamEvent,
   restoreLegalAnswerAfterRejectedCancellation,
   settleLegalAnswerCancellation,
   shouldCancelLegalAnswerOnPageLeave,
-  startLegalAnswerStream,
 } from "./ipc/legal/stream";
 import type {
   ArticleSearchResult,
@@ -127,6 +123,7 @@ import {
   proposeAssistantLegalBasis,
 } from "./ipc/assistant/client";
 import type { AssistantConversation } from "./ipc/assistant/types";
+import type { ApprovedProviderTask } from "./ipc/privacy/types";
 import {
   deleteProviderApiKey,
   deleteProviderProfile,
@@ -1293,14 +1290,6 @@ function errorMessage(error: unknown): string {
   return publicErrorMessage(error);
 }
 
-function createLegalAnswerRequestId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return `answer-${crypto.randomUUID()}`;
-  }
-
-  return `answer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
 export function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("assistant");
   const [health, setHealth] = useState<HealthState>({ kind: "loading" });
@@ -1313,6 +1302,12 @@ export function App() {
   const [assistantCaseHandoff, setAssistantCaseHandoff] = useState<
     { projectId: string; title: string; requestId: number } | null
   >(null);
+  const [approvedProviderTaskRequest, setApprovedProviderTaskRequest] = useState<{
+    task: ApprovedProviderTask;
+    notice: string;
+    requestId: number;
+  } | null>(null);
+  const approvedProviderTaskRequestSequence = useRef(0);
   const assistantCaseHandoffSequence = useRef(0);
   const assistantDraftDirty = useRef(false);
   const assistantMutationActive = useRef(false);
@@ -2974,133 +2969,12 @@ export function App() {
     }
   }
 
-  async function submitLegalAnswer(event?: FormEvent<HTMLFormElement>) {
+  function submitLegalAnswer(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
-    const request = buildLegalAnswerCandidateRequest();
-    if (!request.question) {
-      setQaState({ kind: "error", message: "请输入法律问题" });
-      return;
-    }
-    if (!qaProviderId) {
-      setQaState({ kind: "error", message: "请先选择已保存的 Provider" });
-      return;
-    }
-    const projectId = selectedCaseProjectId;
-    if (
-      !projectId ||
-      caseState.kind === "loading" ||
-      caseMutationInFlight ||
-      !isPersistedCaseWorkspace(
-        caseWorkspace,
-        projectId,
-        caseProjectDraft.projectId,
-      ) ||
-      caseWorkspaceWriteBlocked
-    ) {
-      setQaState({
-        kind: "error",
-        message: "请先在案件工作台保存并成功加载一个案件；法律回答必须归属案件。",
-      });
-      return;
-    }
-
-    if (activeQaRequestId.current) {
-      await cancelCurrentLegalAnswer();
-      if (activeQaRequestId.current) {
-        setQaState({
-          kind: "error",
-          message: "上一轮回答仍在结束中，请等待后再发起新请求。",
-        });
-        return;
-      }
-    }
-
-    const requestId = createLegalAnswerRequestId();
-    activeQaRequestId.current = requestId;
-    activeQaRequestProjectId.current = projectId;
-    qaLeaveCancellationRequestId.current = null;
-    setQaSubmittedQuestion(request.question);
-    setQaState({ kind: "loading" });
-    setQaAnswer(null);
-    setQaStream(startLegalAnswerStream(requestId));
-
-    try {
-      const response = await answerLegalQuestion(
-        {
-          ...request,
-          requestId,
-          projectId,
-          providerId: qaProviderId,
-          temperature: 0.1,
-          maxTokens: 1024,
-        },
-        (streamEvent) => {
-          if (
-            activeQaRequestId.current !== requestId ||
-            activeQaRequestProjectId.current !== projectId ||
-            selectedCaseProjectIdRef.current !== projectId
-          ) {
-            return;
-          }
-          setQaStream((current) =>
-            reduceLegalAnswerStreamEvent(current, streamEvent),
-          );
-        },
-      );
-      if (
-        activeQaRequestId.current !== requestId ||
-        activeQaRequestProjectId.current !== projectId ||
-        !legalAnswerRequestStillOwnsCurrentCase(
-          projectId,
-          selectedCaseProjectIdRef.current,
-        )
-      ) {
-        return;
-      }
-      setQaAnswer(response);
-      setQaContext(response.context);
-      setSelectedQaSourceId(response.context.sources[0]?.sourceId ?? null);
-      setQaStream((current) => ({
-        ...current,
-        status: "done",
-        answer: response.answer,
-        message: "引用已完成校验，回答已保存",
-      }));
-      setQaState({ kind: "idle" });
-      void refreshLegalAnswerHistory(projectId);
-    } catch (error: unknown) {
-      if (activeQaRequestId.current === requestId) {
-        if (
-          !legalAnswerRequestStillOwnsCurrentCase(
-            projectId,
-            selectedCaseProjectIdRef.current,
-          )
-        ) {
-          return;
-        }
-        const message = errorMessage(error);
-        setQaStream((current) =>
-          current.status === "cancelled" || current.status === "error"
-            ? current
-            : {
-                ...current,
-                status: message.toLowerCase().includes("cancel")
-                  ? "cancelled"
-                  : "error",
-                message,
-              },
-        );
-        setQaState({ kind: "idle" });
-      }
-    } finally {
-      if (qaLeaveCancellationRequestId.current === requestId) {
-        qaLeaveCancellationRequestId.current = null;
-      }
-      if (activeQaRequestId.current === requestId) {
-        activeQaRequestId.current = null;
-        activeQaRequestProjectId.current = null;
-      }
-    }
+    redirectLegacyEgressToApprovedProvider(
+      "case_legal_qa",
+      "案件法律问答必须先完成本地脱敏和人工批准；已为你切换到 Approved Provider 的固定任务“案件法律问答”。",
+    );
   }
 
   async function cancelCurrentLegalAnswer() {
@@ -3933,112 +3807,11 @@ export function App() {
     );
   }
 
-  async function runStructuredExtraction() {
-    if (!caseChildrenReady || !caseWorkspace) {
-      showCaseValidationError(
-        "请先保存并成功加载案件，再开始整理材料信息。",
-        "case-project-title",
-      );
-      return;
-    }
-    if (activeCaseEntityEditor !== null) {
-      setCaseState({
-        kind: "error",
-        message: "请先保存或取消当前案件子项编辑，再开始整理材料信息。",
-      });
-      return;
-    }
-    if (!extractionProviderId) {
-      showCaseValidationError(
-        "请选择用于整理材料信息的模型服务。",
-        "extraction-provider",
-      );
-      return;
-    }
-    if (extractionFileIds.length === 0) {
-      setCaseState({
-        kind: "error",
-        message: "请先在案件材料列表勾选至少一份材料。",
-      });
-      return;
-    }
-    if (extractionSourcesLocked || caseInteractionIsLocked()) {
-      return;
-    }
-    if (blockWorkspaceReloadForDirtyDrafts([], "开始整理材料信息")) {
-      return;
-    }
-
-    extractionLifecycleLock.current = true;
-    clearCaseValidationError();
-    extractionReviewReturnFocusRef.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    setExtractionDiscardError(null);
-    beginExtractionDraftSaveSession();
-    const context = createExtractionContext(
-      createId("extraction-request"),
-      caseWorkspace.project.projectId,
-      extractionProviderId,
-      extractionFileIds,
+  function runStructuredExtraction() {
+    redirectLegacyEgressToApprovedProvider(
+      "structured_extraction",
+      "案件材料整理不得从旧入口发送原文；已为你切换到 Approved Provider 的固定任务“结构化提取”。",
     );
-    dispatchExtraction({ type: "start", context });
-    try {
-      const response = await generateStructuredCaseExtraction({
-        projectId: context.projectId,
-        providerId: context.providerId,
-        fileIds: context.sourceFileIds,
-      });
-      if (
-        response.result.status === "review_required" &&
-        response.result.extraction &&
-        structuredCaseExtractionIsPublic(response.result.extraction) &&
-        response.result.reviewId &&
-        response.providerSnapshot &&
-        Number.isSafeInteger(response.reviewRevision) &&
-        (response.reviewRevision ?? -1) >= 0
-      ) {
-        const reviewRevision = response.reviewRevision as number;
-        beginExtractionDraftSaveSession(
-          { kind: "saved", expiresAt: "" },
-          reviewRevision,
-        );
-        dispatchExtraction({
-          type: "generated",
-          requestId: context.requestId,
-          reviewId: response.result.reviewId,
-          draft: response.result.extraction,
-          revision: reviewRevision,
-          repaired: response.result.repaired,
-          providerSnapshot: response.providerSnapshot,
-        });
-      } else {
-        extractionLifecycleLock.current = false;
-        beginExtractionDraftSaveSession();
-        dispatchExtraction({
-          type: "failed",
-          requestId: context.requestId,
-          message:
-            response.result.error?.message ??
-            (response.result.status === "review_required"
-              ? "待审阅结果无法安全载入，请重新加载案件后重试。"
-              : "材料信息整理失败"),
-          repairAttempted: response.result.repairAttempted,
-          rawOutput: response.result.rawOutput,
-          repairOutput: response.result.repairOutput,
-        });
-      }
-    } catch (error: unknown) {
-      extractionLifecycleLock.current = false;
-      beginExtractionDraftSaveSession();
-      dispatchExtraction({
-        type: "failed",
-        requestId: context.requestId,
-        message: errorMessage(error),
-        repairAttempted: false,
-      });
-    }
   }
 
   function updateExtractionDraft(
@@ -4841,6 +4614,19 @@ export function App() {
     }
   }
 
+  function redirectLegacyEgressToApprovedProvider(
+    task: ApprovedProviderTask,
+    notice: string,
+  ): void {
+    approvedProviderTaskRequestSequence.current += 1;
+    setApprovedProviderTaskRequest({
+      task,
+      notice,
+      requestId: approvedProviderTaskRequestSequence.current,
+    });
+    navigateFromShell("privacy");
+  }
+
   function navigateFromShell(nextView: ViewMode) {
     const mcpNavigation = decideMcpWorkspaceNavigation(
       viewMode,
@@ -4892,6 +4678,9 @@ export function App() {
         setGraphDocumentId(selectedDocument.documentId);
         setGraphMode("law");
       }
+    }
+    if (nextView !== "privacy") {
+      setApprovedProviderTaskRequest(null);
     }
     setViewMode(nextView);
   }
@@ -4999,6 +4788,9 @@ export function App() {
           onDraftDirtyChange={handleAssistantDraftDirtyChange}
           onMutationActivityChange={handleAssistantMutationActivityChange}
           onOpenProviderSettings={() => navigateFromShell("providers")}
+          onOpenApprovedProvider={(task, notice) =>
+            redirectLegacyEgressToApprovedProvider(task, notice)
+          }
           onRunActivityChange={handleAssistantRunActivityChange}
         />
       </div>
@@ -5413,9 +5205,9 @@ export function App() {
                 </button>
                 <button
                   type="submit"
-                  disabled={!qaProviderId || qaRequestLocked}
+                  disabled={qaRequestLocked}
                 >
-                  生成带引用回答
+                  转到脱敏批准后问答
                 </button>
                 {isLegalAnswerStreamCancellable(qaStream) ? (
                   <button
@@ -5760,6 +5552,7 @@ export function App() {
         <SettingsWorkspace mode="privacy">
           <Suspense fallback={<p className="empty-state">正在加载隐私设置…</p>}>
             <PrivacyWorkspace
+              providerTaskRequest={approvedProviderTaskRequest}
               onDraftDirtyChange={handlePrivacyDraftDirtyChange}
               onMutationActivityChange={handlePrivacyMutationActivityChange}
             />

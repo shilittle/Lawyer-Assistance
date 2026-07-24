@@ -427,7 +427,7 @@ def _validate_principal_privacy_rules(integrations_root: Path) -> None:
         for marker in ("CASE_RAW", "CASE_REDACTED_PENDING", "CASE_REDACTED_APPROVED", RAW_DATA_STOP_CODE):
             check(marker in text, f"{display_path(path)}: missing mandatory privacy marker {marker}")
         check("App→MCP" in text, f"{display_path(path)}: missing App-to-MCP boundary")
-        check("正向链" in text or "positive path" in text, f"{display_path(path)}: missing unimplemented receipt-chain statement")
+        check("正向链" in text or "positive path" in text, f"{display_path(path)}: missing approved receipt-chain positive-path boundary")
         check("Provider" in text, f"{display_path(path)}: Provider egress prohibition missing")
         check("MCP" in text, f"{display_path(path)}: MCP prohibition missing")
         check("文件" in text or "filesystem" in text, f"{display_path(path)}: file/filesystem prohibition missing")

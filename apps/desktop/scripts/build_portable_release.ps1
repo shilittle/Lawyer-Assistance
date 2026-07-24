@@ -8,6 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "release_file_ops.ps1")
+. (Join-Path $PSScriptRoot "mcp_sidecar_release.ps1")
 
 function Invoke-Checked([string]$Description, [scriptblock]$Command) {
   & $Command
@@ -69,6 +70,8 @@ foreach ($staleArtifact in @($zip, "$zip.sha256")) {
 }
 
 $exe = Join-Path $TargetDir "lawyer-assistance.exe"
+$mcpPaths = Get-LawyerAssistanceMcpReleasePaths $ProjectRoot
+$mcpExe = [string]$mcpPaths.ReleaseBinary
 $resourceRoot = Join-Path $PSScriptRoot "..\src-tauri\resources"
 $legalResource = Join-Path $resourceRoot "legal_core.sqlite"
 $frontendKeep = Join-Path $ProjectRoot "apps\desktop\frontend-dist\.gitkeep"
@@ -76,6 +79,8 @@ $buildMode = "fresh-offline-build"
 $buildStartedAt = [DateTimeOffset]::UtcNow
 $buildCompletedAt = $null
 $expectedExecutableHash = $null
+$expectedMcpHash = $null
+$compiledMcpTrustAnchor = $null
 
 if ([string]::IsNullOrWhiteSpace($ExistingBuildProvenancePath)) {
   if ($RequireAuthenticode) {
@@ -84,8 +89,12 @@ if ([string]::IsNullOrWhiteSpace($ExistingBuildProvenancePath)) {
   if (Test-Path -LiteralPath $exe -PathType Leaf) {
     Remove-Item -LiteralPath $exe -Force
   }
+  if (Test-Path -LiteralPath $mcpExe -PathType Leaf) {
+    Remove-Item -LiteralPath $mcpExe -Force
+  }
   $previousSourceDateEpoch = $env:SOURCE_DATE_EPOCH
   $previousCargoNetOffline = $env:CARGO_NET_OFFLINE
+  $previousMcpReleaseSha256 = $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256
   $env:SOURCE_DATE_EPOCH = $sourceDateEpoch
   $env:CARGO_NET_OFFLINE = "true"
   try {
@@ -94,6 +103,13 @@ if ([string]::IsNullOrWhiteSpace($ExistingBuildProvenancePath)) {
     }
     Push-Location $ProjectRoot
     try {
+      Invoke-Checked "Offline MCP release build" {
+        & cargo build --release --locked --offline --package legal-mcp --bin lawyer-assistance-mcp
+      }
+      ConvertTo-LawyerAssistanceIndependentMcpBinary $mcpExe
+      $compiledMcpTrustAnchor = (Get-FileHash -LiteralPath $mcpExe -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($compiledMcpTrustAnchor -notmatch '^[0-9a-f]{64}$') { throw "MCP release trust anchor is invalid" }
+      $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 = $compiledMcpTrustAnchor
       Invoke-Checked "Offline Rust release build" {
         & cargo build --release --locked --offline --package lawyer-assistance-desktop --bin lawyer-assistance
       }
@@ -112,6 +128,11 @@ if ([string]::IsNullOrWhiteSpace($ExistingBuildProvenancePath)) {
       Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue
     } else {
       $env:CARGO_NET_OFFLINE = $previousCargoNetOffline
+    }
+    if ($null -eq $previousMcpReleaseSha256) {
+      Remove-Item Env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 -ErrorAction SilentlyContinue
+    } else {
+      $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 = $previousMcpReleaseSha256
     }
   }
   $buildCompletedAt = [DateTimeOffset]::UtcNow
@@ -163,9 +184,17 @@ if ([string]::IsNullOrWhiteSpace($ExistingBuildProvenancePath)) {
   }
   $expectedExecutableHash = ([string]$provenance.executableSha256).ToLowerInvariant()
   if ($expectedExecutableHash -notmatch '^[0-9a-f]{64}$') { throw "Build provenance contains an invalid executable hash" }
+  $provenanceMcpPath = [IO.Path]::GetFullPath([string]$provenance.mcpBinaryPath)
+  if (-not $provenanceMcpPath.Equals($mcpExe, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Build provenance identifies an unexpected MCP binary path"
+  }
+  $expectedMcpHash = ([string]$provenance.mcpBinarySha256).ToLowerInvariant()
+  if ($expectedMcpHash -notmatch '^[0-9a-f]{64}$') { throw "Build provenance contains an invalid MCP binary hash" }
+  $compiledMcpTrustAnchor = $expectedMcpHash
 }
 
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Fresh release executable was not generated: $exe" }
+ConvertTo-LawyerAssistanceIndependentMcpBinary $mcpExe
 $exeItem = Get-Item -LiteralPath $exe
 if ($exeItem.LastWriteTimeUtc -lt $buildStartedAt.UtcDateTime.AddSeconds(-2) -or
     $exeItem.LastWriteTimeUtc -gt $buildCompletedAt.UtcDateTime.AddSeconds(5)) {
@@ -180,9 +209,22 @@ $exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvari
 if ($expectedExecutableHash -and $exeHash -ne $expectedExecutableHash) {
   throw "Release executable does not match its one-time build provenance"
 }
+$mcpEvidence = Assert-LawyerAssistanceMcpReleaseBinary $mcpExe $version $buildStartedAt $buildCompletedAt
+if ($expectedMcpHash -and [string]$mcpEvidence.sha256 -ne $expectedMcpHash) {
+  throw "MCP release binary does not match its one-time build provenance"
+}
+if ([string]$mcpEvidence.sha256 -ne $compiledMcpTrustAnchor) {
+  throw "Portable MCP binary differs from the trust anchor compiled into the App"
+}
+if ($RequireAuthenticode -and
+    (Get-AuthenticodeSignature -LiteralPath $mcpExe).Status -ne
+      [Management.Automation.SignatureStatus]::Valid) {
+  throw "Signed portable MCP sibling does not have a valid Authenticode signature"
+}
 
 $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion
-if ($productVersion -notmatch '^(\d+\.\d+\.\d+)(?:\.0)?(?:[-+].*)?$' -or $Matches[1] -ne $version) {
+$normalizedProductVersion = if ($productVersion -match '^(\d+\.\d+\.\d+)\.0$') { $Matches[1] } else { $productVersion }
+if ($normalizedProductVersion -ne $version) {
   throw "Executable ProductVersion '$productVersion' does not match $version"
 }
 if ($RequireAuthenticode) {
@@ -227,6 +269,7 @@ if ($LASTEXITCODE -ne 0) { throw "Unable to read Node.js version" }
 
 New-Item -ItemType Directory -Path (Join-Path $stage "resources") -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination $stage
+Install-LawyerAssistanceIndependentFile $mcpExe (Join-Path $stage "lawyer-assistance-mcp.exe")
 foreach ($name in @("legal_core.sqlite", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "DATA_SOURCES.md")) {
   $source = Join-Path $resourceRoot $name
   if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required release resource missing: $source" }
@@ -240,9 +283,15 @@ foreach ($name in @("legal_core.sqlite", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt
 
 $copiedLegalResource = Join-Path $stage "resources\legal_core.sqlite"
 $copiedExecutable = Join-Path $stage "lawyer-assistance.exe"
+$copiedMcpExecutable = Join-Path $stage "lawyer-assistance-mcp.exe"
 if ((Get-FileHash -LiteralPath $copiedExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $exeHash) {
   throw "Copied executable differs from the freshly verified release executable"
 }
+if ((Get-FileHash -LiteralPath $copiedMcpExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne
+    [string]$mcpEvidence.sha256) {
+  throw "Copied MCP sibling differs from the freshly verified release binary"
+}
+Assert-LawyerAssistanceSingleLinkFile $copiedMcpExecutable
 if ((Get-Item -LiteralPath $copiedLegalResource).Length -ne $actualLegalSize -or
     (Get-FileHash -LiteralPath $copiedLegalResource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $actualLegalHash) {
   throw "Copied legal database differs from the verified release resource"
@@ -276,6 +325,15 @@ $manifest = [ordered]@{
     sourceDateEpoch = [long]$sourceDateEpoch
     executablePath = "target/x86_64-pc-windows-msvc/release/lawyer-assistance.exe"
     executableSha256 = $exeHash
+    mcpBinaryPath = "target/x86_64-pc-windows-msvc/release/lawyer-assistance-mcp.exe"
+    mcpBinarySha256 = [string]$mcpEvidence.sha256
+  }
+  mcpBinary = [ordered]@{
+    siblingPath = [string]$mcpEvidence.siblingPath
+    version = [string]$mcpEvidence.version
+    size = [long]$mcpEvidence.size
+    sha256 = [string]$mcpEvidence.sha256
+    qualificationBinding = "compiled-release-sha256+canonical-path-identity+file-identity+sha256+version"
   }
   toolchain = [ordered]@{
     rustc = $rustVersion
@@ -320,6 +378,7 @@ try {
 } finally { $zipStream.Dispose() }
 
 if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $exeHash -or
+    (Get-FileHash -LiteralPath $mcpExe -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$mcpEvidence.sha256 -or
     (& git -C $ProjectRoot rev-parse HEAD).Trim() -ne $commit) {
   throw "Release inputs changed while the portable archive was being assembled"
 }

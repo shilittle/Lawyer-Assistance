@@ -114,6 +114,14 @@ pub enum SafePdfExportError {
     PdfReopenFailed,
     UnsafePdfObject,
     ReextractedTextMismatch { page_number: u32 },
+    DerivedTextReopenFailed,
+    DerivedTextMismatch { page_number: u32 },
+    DocxBuildFailed,
+    DocxReopenFailed,
+    UnsafeDocxPackage,
+    UnsafeDocxContentType,
+    UnsafeDocxRelationship,
+    UnsafeDocxBody,
 }
 
 impl fmt::Display for SafePdfExportError {
@@ -154,6 +162,31 @@ impl fmt::Display for SafePdfExportError {
                     formatter,
                     "re-extracted text differs for source page {page_number}"
                 )
+            }
+            Self::DerivedTextReopenFailed => {
+                formatter.write_str("the reconstructed text artifact could not be reopened")
+            }
+            Self::DerivedTextMismatch { page_number } => {
+                write!(
+                    formatter,
+                    "reopened text differs for source page {page_number}"
+                )
+            }
+            Self::DocxBuildFailed => formatter.write_str("failed to build reconstructed DOCX"),
+            Self::DocxReopenFailed => {
+                formatter.write_str("the reconstructed DOCX could not be safely reopened")
+            }
+            Self::UnsafeDocxPackage => {
+                formatter.write_str("the reconstructed DOCX package is not allowlisted")
+            }
+            Self::UnsafeDocxContentType => {
+                formatter.write_str("the reconstructed DOCX has unsafe content types")
+            }
+            Self::UnsafeDocxRelationship => {
+                formatter.write_str("the reconstructed DOCX has unsafe relationships")
+            }
+            Self::UnsafeDocxBody => {
+                formatter.write_str("the reconstructed DOCX body is not allowlisted")
             }
         }
     }
@@ -233,7 +266,63 @@ pub fn reconstruct_approved_text_pdf(
     })
 }
 
-fn validate_request(
+/// Reopen and strictly verify caller-supplied PDF bytes against the exact
+/// approved redacted pages. This is the post-install counterpart to
+/// [`reconstruct_approved_text_pdf`]: it audits the installed PDF object graph,
+/// re-extracts every source page, and repeats forbidden-canary checks.
+pub fn verify_approved_text_pdf_bytes(
+    bytes: &[u8],
+    request: &SafePdfExportRequest,
+    limits: SafePdfExportLimits,
+) -> Result<SafePdfArtifact, SafePdfExportError> {
+    validate_request(request, &limits)?;
+    let actual_approval_hash = approved_text_sha256(&request.pages)?;
+    if !constant_time_eq(
+        actual_approval_hash.as_bytes(),
+        request.approved_text_sha256.as_bytes(),
+    ) {
+        return Err(SafePdfExportError::ApprovalHashMismatch);
+    }
+    if bytes.len() > limits.max_output_bytes {
+        return Err(SafePdfExportError::LimitExceeded("max_output_bytes"));
+    }
+    scan_forbidden(
+        request.pages.iter().map(|page| page.text.as_str()),
+        &request.forbidden_canaries,
+    )?;
+
+    // Placements are derived only from the approved pages and the fixed
+    // renderer. Rebuilding the in-memory layout also repeats glyph coverage
+    // validation without trusting any structure from the installed file.
+    let (_, placements) = build_clean_pdf(&request.pages)?;
+    let reopened = Document::load_mem(bytes).map_err(|_| SafePdfExportError::PdfReopenFailed)?;
+    audit_clean_object_graph(&reopened)?;
+    let output_page_count = u32::try_from(reopened.get_pages().len())
+        .map_err(|_| SafePdfExportError::LimitExceeded("output_page_count"))?;
+    let extracted_pages = verify_reextracted_pages(&reopened, request, &placements, &limits)?;
+    scan_forbidden(
+        extracted_pages.iter().map(String::as_str),
+        &request.forbidden_canaries,
+    )?;
+    scan_pdf_bytes_for_ascii_canaries(bytes, &request.forbidden_canaries)?;
+
+    let mut extracted_hasher = Sha256::new();
+    extracted_hasher.update(b"lawyer-assistance-reextracted-pages-v1\0");
+    for (source, text) in request.pages.iter().zip(&extracted_pages) {
+        extracted_hasher.update(source.page_number.to_be_bytes());
+        extracted_hasher.update(text.as_bytes());
+    }
+    Ok(SafePdfArtifact {
+        media_type: PDF_MEDIA_TYPE.to_owned(),
+        bytes: bytes.to_vec(),
+        sha256: sha256_hex(bytes),
+        approved_text_sha256: actual_approval_hash,
+        extracted_text_sha256: hex_digest(extracted_hasher.finalize().as_slice()),
+        output_page_count,
+        source_page_placements: placements,
+    })
+}
+pub(crate) fn validate_request(
     request: &SafePdfExportRequest,
     limits: &SafePdfExportLimits,
 ) -> Result<(), SafePdfExportError> {
@@ -616,7 +705,7 @@ fn audit_dictionary(
     Ok(())
 }
 
-fn scan_forbidden<'a>(
+pub(crate) fn scan_forbidden<'a>(
     texts: impl Iterator<Item = &'a str>,
     forbidden_canaries: &[String],
 ) -> Result<(), SafePdfExportError> {
@@ -633,7 +722,7 @@ fn scan_forbidden<'a>(
     Ok(())
 }
 
-fn scan_pdf_bytes_for_ascii_canaries(
+pub(crate) fn scan_pdf_bytes_for_ascii_canaries(
     bytes: &[u8],
     forbidden_canaries: &[String],
 ) -> Result<(), SafePdfExportError> {
@@ -654,7 +743,7 @@ fn compact_for_verification(text: &str) -> String {
         .collect()
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -664,11 +753,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_digest(Sha256::digest(bytes).as_slice())
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

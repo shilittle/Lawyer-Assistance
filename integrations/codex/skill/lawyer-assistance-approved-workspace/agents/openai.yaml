@@ -1,0 +1,11 @@
+interface:
+  display_name: "Lawyer Assistance Approved Workspace"
+  short_description: "Use verified approved case materials safely"
+  default_prompt: "Use $lawyer-assistance-approved-workspace in a clean task to process an approved case by opaque IDs only."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "lawyer_assistance"
+      description: "Qualification-gated Lawyer Assistance approved-case-workspace MCP server using an App-issued opaque stdio session"
+policy:
+  allow_implicit_invocation: false

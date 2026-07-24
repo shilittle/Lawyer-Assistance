@@ -80,6 +80,63 @@ impl AssistantRunIntent {
     }
 }
 
+fn approved_provider_task_for_assistant_request(
+    request: &StartAssistantRunRequest,
+) -> &'static str {
+    if request.regeneration_target.is_some() {
+        return "regenerate";
+    }
+    match request.intent {
+        AssistantRunIntent::LegalResearch => "case_legal_qa",
+        AssistantRunIntent::FileAnalysis => "case_organization",
+        AssistantRunIntent::DocumentDraft => "document_generation",
+        AssistantRunIntent::MapBuild => "relationship_graph",
+        AssistantRunIntent::CaseAnalysis => "legal_analysis",
+    }
+}
+
+fn approved_provider_required_for_assistant(
+    request: &StartAssistantRunRequest,
+) -> AssistantIpcError {
+    let task = approved_provider_task_for_assistant_request(request);
+    AssistantIpcError::new(
+        "approved_provider_required",
+        format!(
+            "This assistant request may run only through the approved Provider workflow; select fixed task `{task}` in Privacy."
+        ),
+    )
+}
+
+fn conversation_has_legacy_private_context(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<bool, AssistantIpcError> {
+    let present = connection.query_row(
+        "SELECT CASE WHEN
+             EXISTS(SELECT 1 FROM messages WHERE conversation_id = ?1)
+             OR EXISTS(SELECT 1 FROM artifacts WHERE conversation_id = ?1)
+             OR EXISTS(SELECT 1 FROM agent_runs WHERE conversation_id = ?1)
+             OR EXISTS(SELECT 1 FROM conversation_sources WHERE conversation_id = ?1)
+         THEN 1 ELSE 0 END",
+        [conversation_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(present != 0)
+}
+
+fn authorize_legacy_assistant_public_path(
+    _state: &AppState,
+    request: &StartAssistantRunRequest,
+) -> Result<(), AssistantIpcError> {
+    // Arbitrary user text has no trustworthy public provenance. An empty conversation, a
+    // caller-selected LegalResearch intent, and heuristic PII scanning cannot prove that factual
+    // text is unrelated to a real case. Production therefore redirects every legacy Assistant
+    // request before validation, database access, credential access, persistence, or transport.
+    // LegalPublic remains reserved for code-owned fixed templates with no user interpolation;
+    // this command exposes no such template.
+    Err(approved_provider_required_for_assistant(request))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartAssistantRunRequest {
@@ -789,7 +846,7 @@ impl ProviderBudgetMeter {
         self.usage.input_body_bytes = self
             .usage
             .input_body_bytes
-            .checked_add(wire.body.len())
+            .checked_add(wire.body().len())
             .ok_or_else(|| AssistantIpcError::new("limit_exceeded", "run input size overflowed"))?;
         self.budget.check_usage(&self.usage)?;
         Ok(())
@@ -1178,6 +1235,9 @@ pub async fn start_assistant_run(
     request: StartAssistantRunRequest,
     on_event: Channel<AssistantRunEvent>,
 ) -> Result<StartAssistantRunResponse, AssistantIpcError> {
+    // This is the authoritative legacy egress boundary. It rejects every user-authored prompt
+    // before the Windows credential store and completion transport even exist.
+    authorize_legacy_assistant_public_path(state.inner(), &request)?;
     let events = AssistantRunEventEmitter::new(
         &request.run_id,
         Arc::new(ChannelAssistantRunEventSink(Mutex::new(on_event))),
@@ -1186,6 +1246,9 @@ pub async fn start_assistant_run(
     let state = state.inner().clone();
     let worker_events = events.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // Re-check on the worker before constructing either dependency. This
+        // catches conversation changes between command admission and spawn.
+        authorize_legacy_assistant_public_path(&state, &request)?;
         let store = providers::windows_credentials::WindowsCredentialStore::new();
         let transport = RealtimeAssistantCompletionTransport::new()?;
         start_assistant_run_with_completion_transport(
@@ -1194,6 +1257,7 @@ pub async fn start_assistant_run(
             &store,
             transport,
             &worker_events,
+            true,
         )
     })
     .await
@@ -1223,6 +1287,9 @@ where
         credential_store,
         adapter,
         &events,
+        // This helper exists only under cfg(test), so legacy internal adapter
+        // tests can still exercise their own fail-closed receipt boundaries.
+        false,
     )
 }
 
@@ -1232,12 +1299,18 @@ fn start_assistant_run_with_completion_transport<S, T>(
     credential_store: &S,
     transport: T,
     events: &AssistantRunEventEmitter,
+    enforce_public_legacy_boundary: bool,
 ) -> Result<StartAssistantRunResponse, AssistantIpcError>
 where
     S: CredentialStore<Error = ProviderError>,
     T: AssistantCompletionTransport,
 {
     validate_start_request(&request)?;
+    if enforce_public_legacy_boundary {
+        // Re-check after crossing onto the worker to close the metadata race;
+        // the first check still occurred before credential/transport creation.
+        authorize_legacy_assistant_public_path(state, &request)?;
+    }
     let initial_connection = database::open_user_database(state.user_database_path())?;
     if database::get_agent_run(&initial_connection, &request.run_id)?.is_some() {
         return Err(AssistantIpcError::new(
@@ -1253,7 +1326,12 @@ where
     let _ = events.status(AssistantRunEventStatus::Preparing);
     let provider_cancellation = guard.provider_cancellation();
     let local_cancellation = guard.token();
-    let prepared = prepare_run(state, &request, credential_store)?;
+    let prepared = prepare_run(
+        state,
+        &request,
+        credential_store,
+        enforce_public_legacy_boundary,
+    )?;
     persist_running_run(state, &request, &prepared)?;
     let _ = events.status(AssistantRunEventStatus::Running);
 
@@ -1350,6 +1428,7 @@ fn prepare_run<S>(
     state: &AppState,
     request: &StartAssistantRunRequest,
     credential_store: &S,
+    enforce_public_legacy_boundary: bool,
 ) -> Result<PreparedRun, AssistantIpcError>
 where
     S: CredentialStore<Error = ProviderError>,
@@ -1363,8 +1442,27 @@ where
             "archived conversations cannot start runs",
         ));
     }
-    let history = build_bounded_conversation_history(&connection, &conversation)?;
-    let regeneration = prepare_regeneration(&connection, &conversation, request)?;
+    let (history, regeneration) = if enforce_public_legacy_boundary {
+        if conversation.project_id.is_some()
+            || conversation_has_legacy_private_context(&connection, &conversation.conversation_id)?
+        {
+            return Err(approved_provider_required_for_assistant(request));
+        }
+        (
+            ConversationHistory {
+                prompt: String::new(),
+                message_count: 0,
+                truncated: false,
+                sha256: sha256_hex(b""),
+            },
+            None,
+        )
+    } else {
+        (
+            build_bounded_conversation_history(&connection, &conversation)?,
+            prepare_regeneration(&connection, &conversation, request)?,
+        )
+    };
 
     let budget = request.budget.unwrap_or(DEFAULT_RUN_BUDGET);
     budget.validate()?;
@@ -2623,6 +2721,17 @@ fn execute_legal_research<T>(
 where
     T: AssistantCompletionTransport,
 {
+    if prepared.conversation.project_id.is_some()
+        || !request.attachment_ids.is_empty()
+        || !prepared.attachments.is_empty()
+        || prepared.history.message_count != 0
+        || prepared.regeneration.is_some()
+        || prepared.case_context.is_some()
+        || prepared.case_digest.is_some()
+    {
+        return Err(approved_provider_required_for_assistant(request));
+    }
+
     let legal_connection = database::open_legal_core_read_only(state.legal_core_path())?;
     let legal_question = prepared
         .regeneration
@@ -2714,7 +2823,7 @@ where
         ),
     );
     let legal_user_content = with_regeneration_source(prepared, legal_user_content);
-    let chat = ordinary_chat_request(LEGAL_RESEARCH_SYSTEM_PROMPT, legal_user_content);
+    let chat = legal_public_chat_request(LEGAL_RESEARCH_SYSTEM_PROMPT, legal_user_content);
     let answer = send_public_text_completion(
         transport,
         &prepared.profile,
@@ -2862,9 +2971,9 @@ fn answer_with_internal_citation_markers(
     Ok(validation_answer)
 }
 
-fn ordinary_chat_request(task_system_prompt: &str, user_content: String) -> ChatRequest {
-    ChatRequest {
-        messages: vec![
+fn legal_public_chat_request(task_system_prompt: &str, user_content: String) -> ChatRequest {
+    ChatRequest::legal_public(
+        vec![
             ChatMessage {
                 role: ChatMessageRole::System,
                 content: format!("{COMMON_SYSTEM_RULES}\n\n{task_system_prompt}"),
@@ -2874,11 +2983,28 @@ fn ordinary_chat_request(task_system_prompt: &str, user_content: String) -> Chat
                 content: user_content,
             },
         ],
-        stream: false,
-        temperature: Some(0.0),
-        max_tokens: None,
-        data_classification: privacy::DataClassification::CaseRaw,
-    }
+        false,
+        Some(0.0),
+        None,
+    )
+}
+
+fn ordinary_chat_request(task_system_prompt: &str, user_content: String) -> ChatRequest {
+    ChatRequest::unapproved_case_for_rejection(
+        vec![
+            ChatMessage {
+                role: ChatMessageRole::System,
+                content: format!("{COMMON_SYSTEM_RULES}\n\n{task_system_prompt}"),
+            },
+            ChatMessage {
+                role: ChatMessageRole::User,
+                content: user_content,
+            },
+        ],
+        false,
+        Some(0.0),
+        None,
+    )
 }
 
 fn structured_user_content(
@@ -3754,7 +3880,10 @@ mod tests {
     use providers::{ProviderCapabilities, ProviderCredentialKey, ProviderKind, ProviderOptions};
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc, Mutex,
+        },
     };
 
     #[derive(Debug, Default)]
@@ -3784,13 +3913,21 @@ mod tests {
     #[derive(Debug, Clone)]
     struct MockCredentialStore {
         secret: Option<ApiSecret>,
+        read_calls: Arc<AtomicUsize>,
     }
 
     impl Default for MockCredentialStore {
         fn default() -> Self {
             Self {
                 secret: Some(ApiSecret::new("mock-assistant-secret-1234")),
+                read_calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+    }
+
+    impl MockCredentialStore {
+        fn read_calls(&self) -> usize {
+            self.read_calls.load(AtomicOrdering::SeqCst)
         }
     }
 
@@ -3801,6 +3938,7 @@ mod tests {
             &self,
             _key: &ProviderCredentialKey,
         ) -> Result<Option<ApiSecret>, Self::Error> {
+            self.read_calls.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(self.secret.clone())
         }
 
@@ -3882,14 +4020,21 @@ mod tests {
     }
 
     fn product_public_chat_request(task_system_prompt: &str, user_content: &str) -> ChatRequest {
-        let mut request = ordinary_chat_request(task_system_prompt, user_content.to_owned());
-        request.data_classification = privacy::DataClassification::ProductPublic;
-        request
+        let request = ordinary_chat_request(task_system_prompt, user_content.to_owned());
+        ChatRequest::product_public(
+            request.messages,
+            request.stream,
+            request.temperature,
+            request.max_tokens,
+        )
     }
 
-    fn assert_exact_redaction_receipt_gate(error: &AssistantIpcError) {
-        assert_eq!(error.error_type, "invalid_request");
-        assert!(error.message.contains("exact active redaction receipt"));
+    fn assert_unapproved_case_transport_gate(error: &AssistantIpcError) {
+        assert_eq!(
+            error.error_type,
+            ProviderErrorKind::InvalidRequest.as_str(),
+            "unapproved case authority must fail at the typed provider boundary",
+        );
     }
 
     fn map_envelope(title: &str) -> String {
@@ -4107,7 +4252,7 @@ mod tests {
             &AssistantRunEventEmitter::noop("run:structured-repair"),
         )
         .expect_err("CASE_RAW structured output requires an exact receipt");
-        assert_exact_redaction_receipt_gate(&error);
+        assert_unapproved_case_transport_gate(&error);
         assert_eq!(meter.usage.provider_round_trips, 0);
         assert!(transport.requests().is_empty());
     }
@@ -4130,7 +4275,7 @@ mod tests {
             &AssistantRunEventEmitter::noop("run:no-second-repair"),
         )
         .unwrap_err();
-        assert_exact_redaction_receipt_gate(&error);
+        assert_unapproved_case_transport_gate(&error);
         assert_eq!(meter.usage.provider_round_trips, 0);
         assert!(transport.requests().is_empty());
     }
@@ -4157,7 +4302,7 @@ mod tests {
             &AssistantRunEventEmitter::noop("run:reduced-budget"),
         )
         .unwrap_err();
-        assert_exact_redaction_receipt_gate(&error);
+        assert_unapproved_case_transport_gate(&error);
         assert_eq!(meter.usage.provider_round_trips, 0);
         assert!(transport.requests().is_empty());
     }
@@ -4330,11 +4475,285 @@ mod tests {
         }
     }
 
+    #[test]
+    fn assistant_production_boundary_rejects_all_user_free_text_even_without_pii_or_case_binding() {
+        let fixture = TestFixture::new(false, false, false);
+        let public = run_request(
+            &fixture,
+            "run:public-boundary",
+            AssistantRunIntent::LegalResearch,
+            "What remedies are generally available for breach of contract?",
+        );
+        let error = authorize_legacy_assistant_public_path(&fixture.state, &public)
+            .expect_err("even apparently public free text requires the approved workflow");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert!(error.message.contains("case_legal_qa"));
+
+        let no_pii_case_facts = run_request(
+            &fixture,
+            "run:no-pii-case-facts",
+            AssistantRunIntent::LegalResearch,
+            "2025年3月1日交付100万元，约定两个月归还但至今未还，诉讼时效如何计算？",
+        );
+        let error = authorize_legacy_assistant_public_path(&fixture.state, &no_pii_case_facts)
+            .expect_err("case facts without recognized PII cannot self-classify as public");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert!(!error.message.contains("100万元"));
+
+        let mut forged_intent = no_pii_case_facts.clone();
+        forged_intent.run_id = "run:forged-public-intent".to_owned();
+        forged_intent.conversation_id = "conversation:caller-claimed-empty".to_owned();
+        let error = authorize_legacy_assistant_public_path(&fixture.state, &forged_intent)
+            .expect_err("caller-controlled intent and conversation metadata grant no authority");
+        assert_eq!(error.error_type, "approved_provider_required");
+
+        let sensitive = run_request(
+            &fixture,
+            "run:sensitive-boundary",
+            AssistantRunIntent::LegalResearch,
+            "请根据本案材料判断责任。",
+        );
+        let error = authorize_legacy_assistant_public_path(&fixture.state, &sensitive)
+            .expect_err("case context is redirected");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert!(error.message.contains("case_legal_qa"));
+
+        let identified = run_request(
+            &fixture,
+            "run:identified-boundary",
+            AssistantRunIntent::LegalResearch,
+            "Analyze contract remedies for phone 13800138000.",
+        );
+        assert_eq!(
+            authorize_legacy_assistant_public_path(&fixture.state, &identified)
+                .expect_err("identifier-bearing prompt is redirected")
+                .error_type,
+            "approved_provider_required"
+        );
+
+        let case_fixture = TestFixture::new(true, false, false);
+        let case_request = run_request(
+            &case_fixture,
+            "run:case-boundary",
+            AssistantRunIntent::LegalResearch,
+            "What remedies are generally available for breach of contract?",
+        );
+        assert_eq!(
+            authorize_legacy_assistant_public_path(&case_fixture.state, &case_request)
+                .expect_err("case-bound conversation is redirected")
+                .error_type,
+            "approved_provider_required"
+        );
+
+        let connection =
+            database::open_user_database(fixture.state.user_database_path()).expect("database");
+        database::create_message(
+            &connection,
+            &database::NewMessageRow {
+                message_id: "message:private-history".to_owned(),
+                conversation_id: fixture.conversation_id.clone(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "RAW_HISTORY_CANARY_MUST_NOT_BE_READ".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("private history inserted");
+        drop(connection);
+        let error = authorize_legacy_assistant_public_path(&fixture.state, &public)
+            .expect_err("conversation history is redirected by metadata existence only");
+        assert_eq!(error.error_type, "approved_provider_required");
+    }
+
+    #[test]
+    fn every_non_public_assistant_intent_redirects_before_continuation() {
+        let fixture = TestFixture::new(false, false, false);
+        let cases = [
+            (AssistantRunIntent::FileAnalysis, "case_organization"),
+            (AssistantRunIntent::DocumentDraft, "document_generation"),
+            (AssistantRunIntent::MapBuild, "relationship_graph"),
+            (AssistantRunIntent::CaseAnalysis, "legal_analysis"),
+        ];
+        for (index, (intent, task)) in cases.into_iter().enumerate() {
+            let request = run_request(
+                &fixture,
+                &format!("run:redirect-{index}"),
+                intent,
+                "Perform this task.",
+            );
+            let continuation_calls = std::cell::Cell::new(0_u32);
+            let result =
+                authorize_legacy_assistant_public_path(&fixture.state, &request).map(|_| {
+                    continuation_calls.set(continuation_calls.get() + 1);
+                });
+            let error = result.expect_err("non-public assistant intent is redirected");
+            assert_eq!(error.error_type, "approved_provider_required");
+            assert!(error.message.contains(task));
+            assert_eq!(continuation_calls.get(), 0);
+        }
+
+        let mut regeneration = run_request(
+            &fixture,
+            "run:regenerate-redirect",
+            AssistantRunIntent::LegalResearch,
+            "What remedies are generally available for breach of contract?",
+        );
+        regeneration.regeneration_target = Some(AssistantRegenerationTarget {
+            artifact_id: "artifact:test".to_owned(),
+            source_version_number: 1,
+            expected_current_version: 1,
+        });
+        let error = authorize_legacy_assistant_public_path(&fixture.state, &regeneration)
+            .expect_err("regeneration is redirected before artifact lookup");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert!(error.message.contains("regenerate"));
+
+        let mut invalid_legacy = run_request(
+            &fixture,
+            "run:invalid-legacy-redirect",
+            AssistantRunIntent::DocumentDraft,
+            "ignored",
+        );
+        invalid_legacy.prompt.clear();
+        let error = authorize_legacy_assistant_public_path(&fixture.state, &invalid_legacy)
+            .expect_err("legacy intent is typed before ordinary request validation");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert!(error.message.contains("document_generation"));
+    }
+
+    #[test]
+    fn enforced_command_path_rejects_sensitive_prompt_without_transport_or_persistence() {
+        let fixture = TestFixture::new(false, false, false);
+        let request = run_request(
+            &fixture,
+            "run:enforced-sensitive",
+            AssistantRunIntent::LegalResearch,
+            "事实如下：我与对方签订了合同，请分析本案。",
+        );
+        let transport = MockTransport::with_contents(["must not be sent".to_owned()]);
+        let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+        let events = AssistantRunEventEmitter::noop(&request.run_id);
+        let error = start_assistant_run_with_completion_transport(
+            &fixture.state,
+            request,
+            &MockCredentialStore::default(),
+            adapter,
+            &events,
+            true,
+        )
+        .expect_err("sensitive prompt is rejected at command enforcement");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert!(transport.requests().is_empty());
+        let connection =
+            database::open_user_database(fixture.state.user_database_path()).expect("database");
+        assert!(
+            database::get_agent_run(&connection, "run:enforced-sensitive")
+                .expect("run lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enforced_command_path_rejects_apparently_public_free_text_without_credentials_or_transport()
+    {
+        let fixture = TestFixture::new(false, false, true);
+        let request = run_request(
+            &fixture,
+            "run:enforced-public",
+            AssistantRunIntent::LegalResearch,
+            "《民法典》第577条规定了什么？",
+        );
+        let transport = MockTransport::with_contents(["must not be sent".to_owned()]);
+        let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+        let events = AssistantRunEventEmitter::noop(&request.run_id);
+        let credentials = MockCredentialStore::default();
+        let error = start_assistant_run_with_completion_transport(
+            &fixture.state,
+            request,
+            &credentials,
+            adapter,
+            &events,
+            true,
+        )
+        .expect_err("production free text never reaches LegalPublic");
+        assert_eq!(error.error_type, "approved_provider_required");
+        assert_eq!(credentials.read_calls(), 0);
+        assert!(transport.requests().is_empty());
+        let connection =
+            database::open_user_database(fixture.state.user_database_path()).expect("database");
+        assert!(database::get_agent_run(&connection, "run:enforced-public")
+            .expect("run lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn enforced_command_path_redirects_regeneration_and_repair_before_credentials_or_transport() {
+        let fixture = TestFixture::new(false, false, true);
+        let mut regeneration = run_request(
+            &fixture,
+            "run:enforced-regeneration",
+            AssistantRunIntent::LegalResearch,
+            "Regenerate this result.",
+        );
+        regeneration.regeneration_target = Some(AssistantRegenerationTarget {
+            artifact_id: "artifact:caller-controlled".to_owned(),
+            source_version_number: 1,
+            expected_current_version: 1,
+        });
+        let regeneration_transport =
+            MockTransport::with_contents(["must not regenerate".to_owned()]);
+        let regeneration_credentials = MockCredentialStore::default();
+        let regeneration_error = start_assistant_run_with_completion_transport(
+            &fixture.state,
+            regeneration,
+            &regeneration_credentials,
+            OpenAiCompatibleAdapter::new(regeneration_transport.clone()),
+            &AssistantRunEventEmitter::noop("run:enforced-regeneration"),
+            true,
+        )
+        .expect_err("legacy regeneration redirects to its fixed approved task");
+        assert_eq!(regeneration_error.error_type, "approved_provider_required");
+        assert!(regeneration_error.message.contains("regenerate"));
+        assert_eq!(regeneration_credentials.read_calls(), 0);
+        assert!(regeneration_transport.requests().is_empty());
+
+        let repair = run_request(
+            &fixture,
+            "run:enforced-repair",
+            AssistantRunIntent::DocumentDraft,
+            "Draft a document and repair malformed output if needed.",
+        );
+        let repair_transport = MockTransport::with_contents([
+            "malformed first response".to_owned(),
+            "must not attempt repair".to_owned(),
+        ]);
+        let repair_credentials = MockCredentialStore::default();
+        let repair_error = start_assistant_run_with_completion_transport(
+            &fixture.state,
+            repair,
+            &repair_credentials,
+            OpenAiCompatibleAdapter::new(repair_transport.clone()),
+            &AssistantRunEventEmitter::noop("run:enforced-repair"),
+            true,
+        )
+        .expect_err("legacy repair is unreachable before approved fixed-task dispatch");
+        assert_eq!(repair_error.error_type, "approved_provider_required");
+        assert!(repair_error.message.contains("document_generation"));
+        assert_eq!(repair_credentials.read_calls(), 0);
+        assert!(repair_transport.requests().is_empty());
+    }
+
     fn assert_case_egress_blocked(
         fixture: &TestFixture,
         request: StartAssistantRunRequest,
     ) -> AssistantIpcError {
         let run_id = request.run_id.clone();
+        let expected_error_type = if request.intent == AssistantRunIntent::LegalResearch {
+            "approved_provider_required"
+        } else {
+            ProviderErrorKind::InvalidRequest.as_str()
+        };
         let transport = MockTransport::with_contents(["transport must not be called".to_owned()]);
         let error = start_assistant_run_with_dependencies(
             &fixture.state,
@@ -4343,7 +4762,7 @@ mod tests {
             transport.clone(),
         )
         .expect_err("CASE_RAW assistant run requires an exact active receipt");
-        assert_exact_redaction_receipt_gate(&error);
+        assert_eq!(error.error_type, expected_error_type);
         assert!(
             transport.requests().is_empty(),
             "receipt gate must run before provider transport"
@@ -4355,7 +4774,7 @@ mod tests {
             .expect("run query succeeds")
             .expect("failed run remains auditable");
         assert_eq!(run.status, "failed");
-        assert_eq!(run.error_type.as_deref(), Some("invalid_request"));
+        assert_eq!(run.error_type.as_deref(), Some(expected_error_type));
         assert!(
             database::list_messages(&connection, &fixture.conversation_id)
                 .expect("messages query succeeds")
@@ -4713,47 +5132,96 @@ mod tests {
         );
     }
     #[test]
-    fn legal_research_without_public_provenance_requires_receipt() {
+    fn test_only_legacy_dependency_helper_can_still_exercise_legal_public_serialization() {
         let fixture = TestFixture::new(false, false, true);
+        let expected_citation = "《中华人民共和国民法典》第五百七十七条第一款（2021年起施行）";
+        let transport = MockTransport::with_contents([format!(
+            "当事人一方不履行合同义务，应当承担违约责任。{expected_citation}"
+        )]);
+        start_assistant_run_with_dependencies(
+            &fixture.state,
+            run_request(
+                &fixture,
+                "run:legal-public",
+                AssistantRunIntent::LegalResearch,
+                "《民法典》第577条规定了什么？",
+            ),
+            &MockCredentialStore::default(),
+            transport.clone(),
+        )
+        .expect("standalone public legal research succeeds");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        let body = requests[0].body();
+        assert!(body.contains(expected_citation));
+        assert!(body.contains("《民法典》第577条规定了什么？"));
+        assert!(!body.contains("project:test"));
+        assert!(!body.contains("Confirmed case summary"));
+    }
+    #[test]
+    fn case_bound_legal_research_remains_network_zero() {
+        let fixture = TestFixture::new(true, false, true);
         assert_case_egress_blocked(
             &fixture,
             run_request(
                 &fixture,
-                "run:legal",
+                "run:case-bound-legal",
                 AssistantRunIntent::LegalResearch,
                 "《民法典》第577条规定了什么？",
             ),
         );
     }
     #[test]
-    fn legal_research_source_filtering_does_not_bypass_receipt_gate() {
+    fn legal_research_with_conversation_history_remains_network_zero() {
         let fixture = TestFixture::new(false, false, true);
+        let connection = database::open_user_database(fixture.state.user_database_path())
+            .expect("user database opens");
+        database::create_message(
+            &connection,
+            &database::NewMessageRow {
+                message_id: "message:prior-case-context".to_owned(),
+                conversation_id: fixture.conversation_id.clone(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "Prior case-specific conversation context".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("history message inserts");
+        drop(connection);
         assert_case_egress_blocked(
             &fixture,
             run_request(
                 &fixture,
-                "run:filtered-legal-sources",
+                "run:history-contaminated-legal",
                 AssistantRunIntent::LegalResearch,
                 "《民法典》第577条规定了什么？",
             ),
         );
     }
     #[test]
-    fn receipt_gate_precedes_legal_research_regeneration() {
-        let fixture = TestFixture::new(false, false, true);
-        assert_case_egress_blocked(
-            &fixture,
+    fn legal_research_with_attachment_is_rejected_before_transport() {
+        let fixture = TestFixture::new(false, true, true);
+        let transport = MockTransport::with_contents(["transport must not be called".to_owned()]);
+        let error = start_assistant_run_with_dependencies(
+            &fixture.state,
             run_request(
                 &fixture,
-                "run:legal-origin",
+                "run:attachment-contaminated-legal",
                 AssistantRunIntent::LegalResearch,
                 "《民法典》第577条规定了什么？",
             ),
-        );
+            &MockCredentialStore::default(),
+            transport.clone(),
+        )
+        .expect_err("legal research cannot consume an attachment");
+        assert_eq!(error.error_type, "invalid_request");
+        assert!(transport.requests().is_empty());
     }
     #[test]
-    fn receipt_gate_precedes_legal_citation_validation() {
-        let fixture = TestFixture::new(false, false, true);
+    fn case_binding_precedes_legal_citation_validation() {
+        let fixture = TestFixture::new(true, false, true);
         assert_case_egress_blocked(
             &fixture,
             run_request(

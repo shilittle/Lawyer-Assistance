@@ -1,9 +1,13 @@
 [package]
 name = "legal-mcp"
-version = "0.3.1"
+version = "0.4.0-beta.2"
 edition = "2021"
 license = "MIT"
 publish = false
+
+[features]
+default = []
+standalone-mcp-e2e = []
 
 [[bin]]
 name = "lawyer-assistance-mcp"
@@ -14,6 +18,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 database = { path = "../database" }
+dirs = "6.0"
 hmac = "0.12"
 legal-services = { path = "../legal-services" }
 privacy.workspace = true

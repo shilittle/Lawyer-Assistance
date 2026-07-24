@@ -11,7 +11,7 @@ description: 通过 Lawyer Assistance MCP 的 public_law_only profile 检索中�
 
 - 案件原件、附件、粘贴文本、OCR、截图、文件名和路径、当事人及关联人信息、案号、联系方式、地址、证件或账户、签名印章、事实、证据、草稿、摘要、翻译及派生内容，一律视为 `CASE_RAW`。
 - `CASE_REDACTED_PENDING`、任何待复核内容，以及仅有 `CASE_REDACTED_APPROVED` 名称、标签、口头声明或文件名而没有可由当前链路逐字节核验的批准凭据的内容，仍按 `CASE_RAW` 处理。
-- 当前 App→MCP citation receipt 正向链尚未实现。因此不要把任何案件材料（包括 App 本地生成的脱敏批准产物）交给 WorkBuddy、MCP、Provider、网络、文件、命令、浏览器、连接器、自动化、专家、团队、memory 或其他 Skill；不要读取、复述、总结、转换、保存或分享。
+- 本 public-only Skill 刻意不加载 approved session。不要把任何案件材料（包括 App 批准文本）交给本 Skill、WorkBuddy、MCP、Provider、网络、文件、命令、浏览器、连接器、自动化、专家、团队、memory 或其他 Skill；不要读取、复述、总结、转换、保存或分享。独立 approved Skill 只能在新建干净任务中使用当前 MCP 直接响应，绝不能粘贴或附加正文。
 - 若当前任务已经或可能包含案件内容，立即停止且不调用任何工具。在内部记为 `RAW_DATA_ALREADY_DISCLOSED_TO_HOST`，面向用户只建议删除附件和任务、清理 WorkBuddy 历史/记忆及可访问日志、核对 Provider 保留策略，并回到 Lawyer Assistance App 本地处理。
 - Skill 可能在 WorkBuddy 已发送首条消息或附件后才加载，无法阻止或撤回这次宿主前置披露。不得声称原件未上传、未发送、未记录、已删除或已撤回。
 
@@ -34,3 +34,5 @@ description: 通过 Lawyer Assistance MCP 的 public_law_only profile 检索中�
 - [公开法律研究流程](references/workflow.md)
 - [安全与隐私](references/security-and-privacy.md)
 - [公开法律检索示例](references/end-to-end-examples.md)
+
+App→MCP `approved_case_workspace` 正向链仅属于独立 approved Skill；本 public-only Skill 不加载、转发或模拟该链，也不得从两类任务之间复制任何案件正文。

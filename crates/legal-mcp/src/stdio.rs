@@ -1,10 +1,37 @@
+use crate::handler::LegalMcpServer;
 use rmcp::{
     model::{ClientRequest, JsonRpcMessage, ProtocolVersion},
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
-    transport::Transport,
-    RoleServer,
+    transport::{async_rw::AsyncRwTransport, Transport},
+    RoleServer, ServiceExt,
 };
 use std::future::Future;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Serve an already-constructed server over an explicit stdio-like byte stream.
+///
+/// The packaged binary uses this entry point for its real stdio transport. The
+/// desktop qualification path exercises that binary as a separate OS process;
+/// only unit tests use an in-process byte stream. This helper itself does not
+/// read environment variables, process stdio, paths, or credentials.
+pub async fn serve_on_io<R, W>(server: LegalMcpServer, reader: R, writer: W) -> Result<(), String>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let transport = StableProtocolTransport::new(AsyncRwTransport::<RoleServer, _, _>::new_server(
+        reader, writer,
+    ));
+    let running = server
+        .serve(transport)
+        .await
+        .map_err(|error| error.to_string())?;
+    running
+        .waiting()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 /// Transport boundary that prevents the SDK's broader version table from
 /// advertising release candidates supported by the dependency but not by this

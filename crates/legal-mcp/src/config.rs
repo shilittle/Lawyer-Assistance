@@ -51,6 +51,15 @@ pub struct Cli {
     #[arg(long, global = true, value_enum)]
     pub privacy_profile: Option<PrivacyProfile>,
 
+    /// Opaque App-issued standalone session id. The binary resolves its
+    /// descriptor only below the fixed per-user App data directory.
+    #[arg(long, global = true)]
+    pub approved_session_id: Option<String>,
+
+    /// Internal fixed-root qualification canary. This never accepts a path.
+    #[arg(long, global = true, hide = true)]
+    pub approved_qualification_canary_id: Option<String>,
+
     /// Name of the environment variable containing the bearer token.
     #[arg(long, global = true)]
     pub bearer_env: Option<String>,
@@ -205,7 +214,7 @@ impl EmbeddedHttpConfig {
     /// any ambient process state.
     pub fn resolve(self) -> Result<ResolvedConfig, ConfigError> {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port);
-        let allowed_origins = normalize_origins(self.allowed_origins)?;
+        let allowed_origins = normalize_allowed_origins(self.allowed_origins)?;
         let allowed_hosts = default_allowed_hosts(bind);
         validate_limits(
             self.max_body_bytes,
@@ -349,7 +358,7 @@ impl Cli {
             .or(file_bind)
             .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787));
 
-        let allowed_origins = normalize_origins(choose_strings(
+        let allowed_origins = normalize_allowed_origins(choose_strings(
             self.allowed_origin,
             env_csv("LAWYER_ASSISTANCE_MCP_ALLOWED_ORIGINS"),
             file.allowed_origins,
@@ -614,7 +623,10 @@ fn validate_env_name(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn normalize_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+/// Validate and canonicalize the exact browser origins allowed to call an
+/// HTTP MCP endpoint. App-issued standalone sessions share this validator so
+/// descriptors never persist a non-canonical host-supplied allowlist.
+pub fn normalize_allowed_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
     if values.len() > MAX_ALLOWLIST_ENTRIES {
         return Err(ConfigError::Invalid(
             "allowed origins contains too many entries".into(),
@@ -802,10 +814,11 @@ mod tests {
     #[test]
     fn origins_are_canonical_and_pathless() {
         assert_eq!(
-            normalize_origins(vec!["HTTPS://EXAMPLE.COM:443".into()]).expect("valid origin"),
+            normalize_allowed_origins(vec!["HTTPS://EXAMPLE.COM:443".into()])
+                .expect("valid origin"),
             vec!["https://example.com"]
         );
-        assert!(normalize_origins(vec!["https://example.com/path".into()]).is_err());
+        assert!(normalize_allowed_origins(vec!["https://example.com/path".into()]).is_err());
         assert!(normalize_request_origin("null").is_none());
     }
 

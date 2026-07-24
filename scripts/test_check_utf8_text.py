@@ -86,6 +86,19 @@ class Utf8TextGateTests(unittest.TestCase):
             self.assertEqual(paths, ("tracked.md", "untracked.ts"))
             self.assertEqual([issue.rule for issue in issues], ["invalid-utf8"])
 
+    def test_repository_scan_skips_an_intentionally_deleted_tracked_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            tracked = root / "removed.md"
+            tracked.write_text("\u6cd5\u5f8b\u6587\u4e66\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "removed.md"], check=True)
+            tracked.unlink()
+
+            paths, issues = scan_repository(root)
+            self.assertEqual(paths, ("removed.md",))
+            self.assertEqual(issues, [])
+
 
 if __name__ == "__main__":
     unittest.main()

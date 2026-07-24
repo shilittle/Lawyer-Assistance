@@ -44,6 +44,7 @@ import {
   listProviderProfiles,
 } from "../../ipc/provider/client";
 import type { ProviderProfile } from "../../ipc/provider/types";
+import type { ApprovedProviderTask } from "../../ipc/privacy/types";
 import { publicErrorMessage, publicTitle } from "../../publicOutput";
 import {
   ASSISTANT_RUN_INTENT_LABELS,
@@ -78,10 +79,47 @@ export interface AssistantWorkspaceProps {
   onDraftDirtyChange?: (dirty: boolean) => void;
   onCaseProposalApplied?: (projectId: string) => void;
   onMutationActivityChange?: (active: boolean) => void;
+  onOpenApprovedProvider?: (
+    task: ApprovedProviderTask,
+    notice: string,
+  ) => void;
   onOpenProviderSettings?: () => void;
   onRunActivityChange?: (active: boolean) => void;
   proposalApplyBlockedReason?: string | null;
   runBoundary?: AssistantRunBoundary;
+}
+
+export function approvedProviderTaskForAssistantIntent(
+  intent: AssistantRunIntent,
+  regenerating = false,
+): ApprovedProviderTask {
+  if (regenerating) return "regenerate";
+  switch (intent) {
+    case "legal_research":
+      return "case_legal_qa";
+    case "file_analysis":
+      return "case_organization";
+    case "document_draft":
+      return "document_generation";
+    case "map_build":
+      return "relationship_graph";
+    case "case_analysis":
+      return "legal_analysis";
+  }
+}
+
+export function assistantRunIsIndependentPublicLegal(input: {
+  intent: AssistantRunIntent;
+  projectId: string | null;
+  messageCount: number;
+  artifactCount: number;
+  runCount: number;
+  selectedAttachmentCount: number;
+}): boolean {
+  void input;
+  // User-authored free text has no trustworthy public provenance. The legacy Assistant never
+  // sends it directly, even when the surrounding conversation shell appears empty.
+  return false;
 }
 
 const RUN_INTENTS = Object.keys(
@@ -477,6 +515,7 @@ export function AssistantWorkspace({
   onDraftDirtyChange,
   onCaseProposalApplied,
   onMutationActivityChange,
+  onOpenApprovedProvider,
   onOpenProviderSettings,
   onRunActivityChange,
   proposalApplyBlockedReason,
@@ -889,14 +928,33 @@ export function AssistantWorkspace({
       ? notice
       : null;
   const caseIntentWithoutCase = intent === "case_analysis" && !conversationProjectId;
+  const independentPublicLegalShell = Boolean(
+    detail &&
+      assistantRunIsIndependentPublicLegal({
+        intent,
+        projectId: detail.conversation.projectId,
+        messageCount: detail.messages.length,
+        artifactCount: detail.artifacts.length,
+        runCount: detail.runs.length,
+        selectedAttachmentCount: selectedAttachmentIds.length,
+      }),
+  );
+  const routesToApprovedProvider = Boolean(
+    detail &&
+      prompt.trim() &&
+      !activeRun &&
+      !independentPublicLegalShell &&
+      onOpenApprovedProvider,
+  );
   const canSend = Boolean(
     detail &&
       prompt.trim() &&
-      selectedProvider &&
-      selectedProviderConfigured === true &&
       !activeRun &&
-      !caseIntentWithoutCase &&
-      !requiredAttachmentsMissing,
+      (routesToApprovedProvider ||
+        (selectedProvider &&
+          selectedProviderConfigured === true &&
+          !caseIntentWithoutCase &&
+          !requiredAttachmentsMissing)),
   );
 
   async function createConversation(event: FormEvent) {
@@ -1196,6 +1254,20 @@ export function AssistantWorkspace({
       }
     } catch (error: unknown) {
       if (!mounted.current) return;
+      if (
+        error instanceof AssistantIpcClientError &&
+        error.errorType === "approved_provider_required" &&
+        onOpenApprovedProvider
+      ) {
+        onOpenApprovedProvider(
+          approvedProviderTaskForAssistantIntent(
+            runIntent,
+            regenerationTarget !== undefined,
+          ),
+          "用户自由文本不得从旧助理入口直接发送；已切换到脱敏工作区，并预选对应的 Approved Provider 固定任务。",
+        );
+        return;
+      }
       const cancelled =
         error instanceof AssistantIpcClientError &&
         error.errorType === "cancelled";
@@ -1217,7 +1289,15 @@ export function AssistantWorkspace({
 
   async function startRun(event: FormEvent) {
     event.preventDefault();
-    if (!canSend || !detail || !selectedProvider) return;
+    if (!detail || !prompt.trim() || activeRun) return;
+    if (!independentPublicLegalShell && onOpenApprovedProvider) {
+      onOpenApprovedProvider(
+        approvedProviderTaskForAssistantIntent(intent),
+        "旧助理入口不再直接发送任何用户自由文本；已切换到脱敏工作区并预选对应的 Approved Provider 固定任务。",
+      );
+      return;
+    }
+    if (!canSend || !selectedProvider) return;
     await performRun({
       conversationId: detail.conversation.conversationId,
       intent,
@@ -1237,11 +1317,9 @@ export function AssistantWorkspace({
       !detail ||
       detail.conversation.conversationId !== request.conversationId ||
       activeRun !== null ||
-      operation !== null ||
-      !selectedProvider ||
-      selectedProviderConfigured !== true
+      operation !== null
     ) {
-      throw new Error("当前会话或模型服务尚未准备好，不能重新生成。");
+      throw new Error("当前会话尚未准备好，不能重新生成。");
     }
     const artifact = detail.artifacts.find(
       (candidate) => candidate.artifactId === request.artifactId,
@@ -1283,6 +1361,16 @@ export function AssistantWorkspace({
       (request.kind === "map" && regenerationIntent === "map_build");
     if (!kindMatches) {
       throw new Error("成果类型与原生成任务不一致，已停止重新生成。");
+    }
+    if (onOpenApprovedProvider) {
+      onOpenApprovedProvider(
+        approvedProviderTaskForAssistantIntent(regenerationIntent, true),
+        "重新生成必须使用当前脱敏 generation 和受保护历史输出；已切换到 Approved Provider 固定任务“重新生成”。",
+      );
+      return false;
+    }
+    if (!selectedProvider || selectedProviderConfigured !== true) {
+      throw new Error("模型服务尚未准备好，不能重新生成。");
     }
     const confirmed = confirmArtifactRegeneration({
       artifactTitle: artifact.title,
@@ -1639,7 +1727,11 @@ export function AssistantWorkspace({
               </section>
               <div className="assistant-composer-submit">
                 <button disabled={!canSend} type="submit">
-                  {activeRun ? "另一个任务正在运行" : "发送任务"}
+                  {activeRun
+                    ? "另一个任务正在运行"
+                    : routesToApprovedProvider
+                      ? "前往脱敏批准"
+                      : "发送任务"}
                 </button>
                 {activeRun ? (
                   <button

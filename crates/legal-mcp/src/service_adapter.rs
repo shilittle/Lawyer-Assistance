@@ -21,7 +21,9 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::{
-    privacy_gate, public_output, receipt_gate::RedactedReceiptGate, registry::PrivacyProfile,
+    approved_backend::ApprovedWorkspaceBackend, approved_workspace, privacy_gate, public_output,
+    receipt_gate::RedactedReceiptGate, registry::PrivacyProfile,
+    standalone_approved::StandaloneCallBroker,
 };
 
 const MAX_TOOL_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
@@ -157,6 +159,8 @@ pub struct ServiceAdapter {
     services: Arc<LegalServices>,
     profile: PrivacyProfile,
     receipt_gate: Option<RedactedReceiptGate>,
+    approved_backend: Option<ApprovedWorkspaceBackend>,
+    standalone_broker: Option<StandaloneCallBroker>,
     cursors: CursorCodec,
     in_flight: InFlightOperations,
 }
@@ -169,6 +173,7 @@ impl ServiceAdapter {
     pub fn for_profile(services: LegalServices, profile: PrivacyProfile) -> Self {
         let receipt_gate = match profile {
             PrivacyProfile::PublicLawOnly => None,
+            PrivacyProfile::ApprovedCaseWorkspace => None,
             PrivacyProfile::RedactedCase => RedactedReceiptGate::load_from_windows_credentials(
                 &services.config().user_database_path,
             )
@@ -184,6 +189,20 @@ impl ServiceAdapter {
         Self::from_parts(services, PrivacyProfile::RedactedCase, Some(receipt_gate))
     }
 
+    pub fn for_approved_workspace(
+        services: LegalServices,
+        backend: ApprovedWorkspaceBackend,
+    ) -> Self {
+        let mut adapter = Self::from_parts(services, PrivacyProfile::ApprovedCaseWorkspace, None);
+        adapter.approved_backend = Some(backend);
+        adapter
+    }
+    pub fn for_standalone_approved(services: LegalServices, broker: StandaloneCallBroker) -> Self {
+        let mut adapter = Self::from_parts(services, PrivacyProfile::ApprovedCaseWorkspace, None);
+        adapter.standalone_broker = Some(broker);
+        adapter
+    }
+
     fn from_parts(
         services: LegalServices,
         profile: PrivacyProfile,
@@ -193,6 +212,8 @@ impl ServiceAdapter {
             services: Arc::new(services),
             profile,
             receipt_gate,
+            approved_backend: None,
+            standalone_broker: None,
             cursors: CursorCodec::new(),
             in_flight: InFlightOperations::default(),
         }
@@ -207,6 +228,17 @@ impl ServiceAdapter {
         tool_name: &str,
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.call_with_request_id(tool_name, arguments, None, None)
+            .await
+    }
+
+    pub(crate) async fn call_with_request_id(
+        &self,
+        tool_name: &str,
+        arguments: Option<JsonObject>,
+        request_id: Option<Value>,
+        request_params: Option<Value>,
+    ) -> Result<CallToolResult, ErrorData> {
         if !self.profile.allows_tool(tool_name) {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
@@ -215,6 +247,63 @@ impl ServiceAdapter {
             ));
         }
         let arguments = arguments.unwrap_or_default();
+        if approved_workspace::is_approved_workspace_tool(tool_name) {
+            if let Some(broker) = self.standalone_broker.clone() {
+                let request_id = request_id.ok_or_else(|| {
+                    ErrorData::invalid_params("JSON-RPC request id is required.", None)
+                })?;
+                let request_params = request_params.ok_or_else(|| {
+                    ErrorData::invalid_params("Canonical tools/call params are required.", None)
+                })?;
+                if !standalone_call_params_are_plain(&request_params, tool_name, &arguments)
+                    || !approved_workspace::request_is_valid(tool_name, &arguments)
+                {
+                    return Err(ErrorData::invalid_params(
+                        "Tool arguments do not match the declared input schema.",
+                        None,
+                    ));
+                }
+                let tool_name = tool_name.to_owned();
+                let operation = self.begin_blocking_operation()?;
+                return tokio::task::spawn_blocking(move || {
+                    let _operation = operation;
+                    broker.call(request_id, &tool_name, arguments, request_params)
+                })
+                .await
+                .map_err(|_| internal_error());
+            }
+            if let Some(backend) = self.approved_backend.clone() {
+                let (access_ticket, business_arguments) =
+                    approved_workspace::split_access_ticket(arguments).map_err(|_| {
+                        ErrorData::invalid_params(
+                            "Tool arguments do not match the declared input schema.",
+                            None,
+                        )
+                    })?;
+                if !approved_workspace::request_is_valid(tool_name, &business_arguments) {
+                    return Err(ErrorData::invalid_params(
+                        "Tool arguments do not match the declared input schema.",
+                        None,
+                    ));
+                }
+                let tool_name = tool_name.to_owned();
+                let operation = self.begin_blocking_operation()?;
+                return tokio::task::spawn_blocking(move || {
+                    let _operation = operation;
+                    backend.call(&tool_name, &access_ticket, business_arguments)
+                })
+                .await
+                .map_err(|_| internal_error());
+            }
+            let business_arguments = approved_workspace::remove_optional_access_ticket(arguments);
+            if !approved_workspace::request_is_valid(tool_name, &business_arguments) {
+                return Err(ErrorData::invalid_params(
+                    "Tool arguments do not match the declared input schema.",
+                    None,
+                ));
+            }
+            return Ok(approved_workspace_not_qualified());
+        }
         match tool_name {
             "system_status" => self.system_status(arguments).await,
             "legal_search" => {
@@ -592,6 +681,19 @@ fn tool_error(tool_name: &str, error: ServiceError) -> CallToolResult {
     result
 }
 
+fn approved_workspace_not_qualified() -> CallToolResult {
+    let envelope = json!({
+        "schema_version": 1,
+        "status": "unavailable",
+        "reason_code": "PROFILE_NOT_QUALIFIED"
+    });
+    let mut result = CallToolResult::structured_error(envelope);
+    result.content = vec![ContentBlock::text(
+        "Approved case workspace execution is unavailable because local qualification has not been established.",
+    )];
+    result
+}
+
 fn receipt_rejected() -> ErrorData {
     ErrorData::invalid_params(
         "A valid App-issued receipt bound to the exact approved payload is required.",
@@ -599,6 +701,41 @@ fn receipt_rejected() -> ErrorData {
     )
 }
 
+fn standalone_call_params_are_plain(
+    request_params: &Value,
+    tool_name: &str,
+    arguments: &JsonObject,
+) -> bool {
+    let Some(params) = request_params.as_object() else {
+        return false;
+    };
+    if params
+        .keys()
+        .any(|key| !matches!(key.as_str(), "name" | "arguments" | "_meta"))
+        || params.get("name").and_then(Value::as_str) != Some(tool_name)
+        || params.get("_meta").is_some_and(|meta| !meta.is_object())
+        || contains_host_ticket_key(request_params)
+    {
+        return false;
+    }
+    match params.get("arguments") {
+        Some(Value::Object(value)) => value == arguments,
+        None => arguments.is_empty(),
+        _ => false,
+    }
+}
+
+fn contains_host_ticket_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("access_ticket")
+                || key.eq_ignore_ascii_case("accessTicket")
+                || contains_host_ticket_key(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_host_ticket_key),
+        _ => false,
+    }
+}
 fn internal_error() -> ErrorData {
     tracing::error!("MCP request failed at an internal boundary");
     ErrorData::internal_error("服务暂时无法完成操作，请稍后重试。".to_owned(), None)

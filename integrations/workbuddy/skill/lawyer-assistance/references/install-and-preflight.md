@@ -13,4 +13,4 @@
 3. 调用 `system_status`，只在法律库 ready、schema 兼容且 profile 为 `public_law_only` 时继续。
 4. 仅允许公开法律名称、公开条号、公开法域和公开研究日期进入工具参数。
 
-`CASE_RAW`、`CASE_REDACTED_PENDING`、待复核内容、仅有 `CASE_REDACTED_APPROVED` 标签的内容，以及 App 产物本身都不能进入 WorkBuddy。当前 App→MCP citation receipt 正向链未实现，案件材料流程安全禁用。
+`CASE_RAW`、`CASE_REDACTED_PENDING`、待复核内容、仅有 `CASE_REDACTED_APPROVED` 标签的内容，以及 App 产物本身都不能进入本 public-only WorkBuddy package；案件流程在此刻意禁用。独立 approved package 必须新建干净 opaque-ID-only 任务并使用当前 App-issued session，不能在两者间复制正文。

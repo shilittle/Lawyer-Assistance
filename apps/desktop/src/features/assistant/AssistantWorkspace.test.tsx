@@ -7,6 +7,8 @@ import {
   AssistantWorkspace,
   UNVALIDATED_LIVE_DRAFT_NOTICE,
   archiveConversationWithDraftConfirmation,
+  approvedProviderTaskForAssistantIntent,
+  assistantRunIsIndependentPublicLegal,
   assistantWorkspaceHasUnsavedDrafts,
   attachmentDeletionFailureText,
   buildArtifactRegenerationConfirmation,
@@ -15,6 +17,56 @@ import {
   confirmArtifactRegeneration,
   deleteAttachmentWithConfirmation,
 } from "./AssistantWorkspace";
+
+describe("AssistantWorkspace approved Provider routing", () => {
+  it("maps every legacy assistant intent and regeneration to a fixed task", () => {
+    expect(approvedProviderTaskForAssistantIntent("legal_research")).toBe(
+      "case_legal_qa",
+    );
+    expect(approvedProviderTaskForAssistantIntent("file_analysis")).toBe(
+      "case_organization",
+    );
+    expect(approvedProviderTaskForAssistantIntent("document_draft")).toBe(
+      "document_generation",
+    );
+    expect(approvedProviderTaskForAssistantIntent("map_build")).toBe(
+      "relationship_graph",
+    );
+    expect(approvedProviderTaskForAssistantIntent("case_analysis")).toBe(
+      "legal_analysis",
+    );
+    expect(
+      approvedProviderTaskForAssistantIntent("document_draft", true),
+    ).toBe("regenerate");
+  });
+
+  it("routes even a completely empty independent legal-research shell to approval", () => {
+    const clean = {
+      intent: "legal_research" as const,
+      projectId: null,
+      messageCount: 0,
+      artifactCount: 0,
+      runCount: 0,
+      selectedAttachmentCount: 0,
+    };
+    expect(assistantRunIsIndependentPublicLegal(clean)).toBe(false);
+    expect(
+      assistantRunIsIndependentPublicLegal({ ...clean, messageCount: 1 }),
+    ).toBe(false);
+    expect(
+      assistantRunIsIndependentPublicLegal({ ...clean, artifactCount: 1 }),
+    ).toBe(false);
+    expect(
+      assistantRunIsIndependentPublicLegal({ ...clean, projectId: "case-1" }),
+    ).toBe(false);
+    expect(
+      assistantRunIsIndependentPublicLegal({
+        ...clean,
+        intent: "file_analysis",
+      }),
+    ).toBe(false);
+  });
+});
 
 const PROVIDER: ProviderProfile = {
   id: "provider-1",

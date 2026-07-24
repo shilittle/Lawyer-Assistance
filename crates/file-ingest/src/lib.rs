@@ -39,6 +39,8 @@ const PDF_MIME: &str = "application/pdf";
 const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const TXT_MIME: &str = "text/plain; charset=utf-8";
 const MARKDOWN_MIME: &str = "text/markdown; charset=utf-8";
+const PNG_MIME: &str = "image/png";
+const JPEG_MIME: &str = "image/jpeg";
 
 /// A format accepted by the Stage 8 attachment importer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,6 +49,8 @@ pub enum FileFormat {
     Docx,
     Txt,
     Markdown,
+    Png,
+    Jpeg,
 }
 
 impl FileFormat {
@@ -57,6 +61,8 @@ impl FileFormat {
             Self::Docx => "docx",
             Self::Txt => "txt",
             Self::Markdown => "md",
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
         }
     }
 
@@ -67,6 +73,8 @@ impl FileFormat {
             Self::Docx => DOCX_MIME,
             Self::Txt => TXT_MIME,
             Self::Markdown => MARKDOWN_MIME,
+            Self::Png => PNG_MIME,
+            Self::Jpeg => JPEG_MIME,
         }
     }
 }
@@ -110,6 +118,7 @@ pub struct ExtractedDocument {
 pub enum IngestError {
     InvalidFileName,
     UnsupportedExtension,
+    ImageRequiresLocalOcr,
     FormatMismatch,
     FileTooLarge,
     CorruptPdf,
@@ -140,6 +149,7 @@ impl IngestError {
         match self {
             Self::InvalidFileName => "invalid_file_name",
             Self::UnsupportedExtension => "unsupported_extension",
+            Self::ImageRequiresLocalOcr => "image_requires_local_ocr",
             Self::FormatMismatch => "format_mismatch",
             Self::FileTooLarge => "file_too_large",
             Self::CorruptPdf => "corrupt_pdf",
@@ -170,6 +180,9 @@ impl IngestError {
         match self {
             Self::InvalidFileName => "The file name must be a safe basename.",
             Self::UnsupportedExtension => "This file extension is not supported.",
+            Self::ImageRequiresLocalOcr => {
+                "PNG and JPEG images require the isolated local OCR worker."
+            }
             Self::FormatMismatch => "The file extension does not match its content.",
             Self::FileTooLarge => "The file exceeds the attachment size limit.",
             Self::CorruptPdf => "The PDF is malformed or unsupported.",
@@ -223,6 +236,10 @@ pub fn detect_format(file_name: &str) -> Result<FileFormat, IngestError> {
         Ok(FileFormat::Txt)
     } else if extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown") {
         Ok(FileFormat::Markdown)
+    } else if extension.eq_ignore_ascii_case("png") {
+        Ok(FileFormat::Png)
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        Ok(FileFormat::Jpeg)
     } else {
         Err(IngestError::UnsupportedExtension)
     }
@@ -248,6 +265,7 @@ fn ingest_bytes_with_limits(
         FileFormat::Pdf => pdf::extract(bytes, limits)?,
         FileFormat::Docx => docx::extract(bytes, limits)?,
         FileFormat::Txt | FileFormat::Markdown => text::extract(bytes, limits)?,
+        FileFormat::Png | FileFormat::Jpeg => return Err(IngestError::ImageRequiresLocalOcr),
     };
 
     let size_bytes = u64::try_from(bytes.len()).map_err(|_| IngestError::FileTooLarge)?;
@@ -301,6 +319,21 @@ fn verify_magic(format: FileFormat, bytes: &[u8]) -> Result<(), IngestError> {
             let inferred_ooxml_or_zip = inferred
                 .is_some_and(|kind| matches!(kind.mime_type(), DOCX_MIME | "application/zip"));
             if !bytes.starts_with(b"PK\x03\x04") || !inferred_ooxml_or_zip {
+                return Err(IngestError::FormatMismatch);
+            }
+        }
+        FileFormat::Png => {
+            let inferred_png = inferred.is_some_and(|kind| kind.mime_type() == PNG_MIME);
+            if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || !inferred_png {
+                return Err(IngestError::FormatMismatch);
+            }
+        }
+        FileFormat::Jpeg => {
+            let inferred_jpeg = inferred.is_some_and(|kind| kind.mime_type() == JPEG_MIME);
+            if !bytes.starts_with(b"\xff\xd8\xff")
+                || !bytes.ends_with(b"\xff\xd9")
+                || !inferred_jpeg
+            {
                 return Err(IngestError::FormatMismatch);
             }
         }

@@ -5,8 +5,9 @@ param(
   [string]$MineruToolsConfigPath = "",
   [string]$ModelManifestPath = "",
   [string]$EvidencePath = "",
+  [string]$GenerateCanaryOnlyPath = "",
   [switch]$KeepArtifacts,
-  [ValidateRange(1, 3600)]
+  [ValidateRange(10, 7200)]
   [int]$TimeoutSeconds = 1800
 )
 
@@ -19,17 +20,53 @@ $script:ExpectedMethod = "ocr"
 $script:ExpectedLanguage = "ch"
 $script:ExpectedPageWidth = 595
 $script:ExpectedPageHeight = 841
+$script:ExpectedContentListCoordinateExtent = 1000
 $script:QualificationPrefix = "lawyer-assistance-mineru-qualification-"
-$script:ExpectedText = @(
-  "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5U=",
-  "5Y6f5ZGK77ya5byg5LiJ",
-  "6KKr5ZGK77ya5p+Q5p+Q56eR5oqA5pyJ6ZmQ5YWs5Y+4",
-  "6IGU57O755S16K+d77yaMTM4MDAxMzgwMDA=",
-  "6Lqr5Lu96K+B5Y+377yaMTEwMTA1MTk0OTEyMzEwMDJY",
-  "6YKu566x77yaY2FzZS50ZXN0QGV4YW1wbGUuaW52YWxpZA==",
-  "5qGI5Y+377ya77yIMjAyNu+8ieS6rDAxMDHmsJHliJ0xMjPlj7c=",
-  "5Lul5LiK5YaF5a655YWo6YOo5Li66Ieq5Yqo5YyW5rWL6K+V6Jma5p6E5pWw5o2u44CC"
-) | ForEach-Object { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)) }
+$encodedExpectedPages = @(
+  [pscustomobject]@{ Lines = @(
+    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5Ug56ysMemhtQ==",
+    "5Y6f5ZGK77ya5byg5LiJ",
+    "6KKr5ZGK77ya5p+Q5p+Q56eR5oqA5pyJ6ZmQ5YWs5Y+4",
+    "6IGU57O755S16K+d77yaMTM4MDAxMzgwMDA=",
+    "6Lqr5Lu96K+B5Y+377yaMTEwMTA1MTk0OTEyMzEwMDJY",
+    "6YKu566x77yaY2FzZS50ZXN0QGV4YW1wbGUuaW52YWxpZA==",
+    "5qGI5Y+377yaKDIwMjYp5LqsMDEwMeawkeWInTEyM+WPtw==",
+    "6aG16Z2i5qCH6K+G77yaTE9DQUwtQ0FOQVJZLVBBR0UtT05F"
+  ) },
+  [pscustomobject]@{ Lines = @(
+    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5Ug56ysMumhtQ==",
+    "55Sz6K+35Lq677ya5p2O5Zub",
+    "6KKr55Sz6K+35Lq677ya5p+Q5p+Q6LS45piT5pyJ6ZmQ5YWs5Y+4",
+    "6IGU57O755S16K+d77yaMTM5MDAxMzkwMDA=",
+    "6Lqr5Lu96K+B5Y+377yaMzEwMTAxMTk4MDAxMDEwMDM3",
+    "6YKu566x77yaY2FzZS50d29AZXhhbXBsZS5pbnZhbGlk",
+    "5qGI5Y+377yaKDIwMjYp5rKqMDEwMeawkeWInTQ1NuWPtw==",
+    "6aG16Z2i5qCH6K+G77yaTE9DQUwtQ0FOQVJZLVBBR0UtVFdP"
+  ) },
+  [pscustomobject]@{ Lines = @(
+    "5ZCI5oiQ5rOV5b6L5paH5LmmIE9DUiDmtYvor5Ug56ysM+mhtQ==",
+    "5aeU5omY5Lq677ya546L5LqU",
+    "55u45a+55pa577ya5p+Q5p+Q5pyN5Yqh5pyJ6ZmQ5YWs5Y+4",
+    "6IGU57O755S16K+d77yaMTM3MDAxMzcwMDA=",
+    "6Lqr5Lu96K+B5Y+377yaNDQwMTA2MTk5MDAyMDIwMDE4",
+    "6YKu566x77yaY2FzZS50aHJlZUBleGFtcGxlLmludmFsaWQ=",
+    "5qGI5Y+377yaKDIwMjYp57KkMDEwNuawkeWInTc4OeWPtw==",
+    "6aG16Z2i5qCH6K+G77yaTE9DQUwtQ0FOQVJZLVBBR0UtVEhSRUU="
+  ) }
+)
+$script:ExpectedPages = @($encodedExpectedPages | ForEach-Object {
+  [pscustomobject]@{
+    Lines = @($_.Lines | ForEach-Object {
+      [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_))
+    })
+  }
+})
+$script:ExpectedPageCount = $script:ExpectedPages.Count
+$script:ExpectedTextEntryCount = @($script:ExpectedPages | ForEach-Object { $_.Lines }).Count
+if ($script:ExpectedPageCount -ne 3 -or $script:ExpectedTextEntryCount -ne 24 -or @($script:ExpectedPages | Where-Object { $_.Lines.Count -ne 8 }).Count -ne 0) {
+  throw "the fixed qualification page contract is invalid"
+}
+$encodedExpectedPages = $null
 
 function Get-Sha256Hex {
   param([Parameter(Mandatory = $true)][string]$LiteralPath)
@@ -44,6 +81,17 @@ function Get-TextSha256Hex {
   try {
     $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
     return ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+  } finally {
+    $algorithm.Dispose()
+  }
+}
+
+function Get-BytesSha256Hex {
+  param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+  $algorithm = [Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
   } finally {
     $algorithm.Dispose()
   }
@@ -264,55 +312,63 @@ function New-FixedSyntheticScanPdf {
   param([Parameter(Mandatory = $true)][string]$Destination)
 
   Add-Type -AssemblyName System.Drawing
-  $bitmap = New-Object Drawing.Bitmap(1240, 1754, [Drawing.Imaging.PixelFormat]::Format24bppRgb)
-  $graphics = [Drawing.Graphics]::FromImage($bitmap)
-  $titleFont = $null
-  $bodyFont = $null
-  $brush = $null
-  $jpeg = New-Object IO.MemoryStream
-  try {
-    $graphics.Clear([Drawing.Color]::White)
-    $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-    $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
-    $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $titleFont = New-Object Drawing.Font("Microsoft YaHei", 42, [Drawing.FontStyle]::Bold, [Drawing.GraphicsUnit]::Pixel)
-    $bodyFont = New-Object Drawing.Font("Microsoft YaHei", 32, [Drawing.FontStyle]::Regular, [Drawing.GraphicsUnit]::Pixel)
-    if ($titleFont.Name -cne "Microsoft YaHei" -or $bodyFont.Name -cne "Microsoft YaHei") {
-      throw "the fixed Microsoft YaHei qualification font is unavailable"
-    }
-    $brush = New-Object Drawing.SolidBrush([Drawing.Color]::Black)
-    $graphics.DrawString($script:ExpectedText[0], $titleFont, $brush, 110, 115)
-    $y = 300
-    foreach ($line in $script:ExpectedText[1..($script:ExpectedText.Count - 1)]) {
-      $graphics.DrawString($line, $bodyFont, $brush, 110, $y)
-      $y += 105
-    }
-
-    $encoder = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
-      Where-Object { $_.MimeType -ceq "image/jpeg" } |
-      Select-Object -First 1
-    if ($null -eq $encoder) {
-      throw "JPEG encoder is unavailable"
-    }
-    $parameters = New-Object Drawing.Imaging.EncoderParameters(1)
+  $encoder = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+    Where-Object { $_.MimeType -ceq "image/jpeg" } |
+    Select-Object -First 1
+  if ($null -eq $encoder) {
+    throw "JPEG encoder is unavailable"
+  }
+  $jpegPages = @()
+  foreach ($expectedPage in $script:ExpectedPages) {
+    $bitmap = New-Object Drawing.Bitmap(1240, 1754, [Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    $titleFont = $null
+    $bodyFont = $null
+    $brush = $null
+    $jpeg = New-Object IO.MemoryStream
     try {
-      $parameters.Param[0] = New-Object Drawing.Imaging.EncoderParameter(
-        [Drawing.Imaging.Encoder]::Quality,
-        [int64]95
-      )
-      $bitmap.Save($jpeg, $encoder, $parameters)
-    } finally {
-      if ($null -ne $parameters.Param[0]) {
-        $parameters.Param[0].Dispose()
+      $graphics.Clear([Drawing.Color]::White)
+      $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+      $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
+      $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+      $titleFont = New-Object Drawing.Font("Microsoft YaHei", 42, [Drawing.FontStyle]::Bold, [Drawing.GraphicsUnit]::Pixel)
+      $bodyFont = New-Object Drawing.Font("Microsoft YaHei", 32, [Drawing.FontStyle]::Regular, [Drawing.GraphicsUnit]::Pixel)
+      if ($titleFont.Name -cne "Microsoft YaHei" -or $bodyFont.Name -cne "Microsoft YaHei") {
+        throw "the fixed Microsoft YaHei qualification font is unavailable"
       }
-      $parameters.Dispose()
+      $brush = New-Object Drawing.SolidBrush([Drawing.Color]::Black)
+      $graphics.DrawString($expectedPage.Lines[0], $titleFont, $brush, 110, 115)
+      $y = 300
+      foreach ($line in $expectedPage.Lines[1..($expectedPage.Lines.Count - 1)]) {
+        $graphics.DrawString($line, $bodyFont, $brush, 110, $y)
+        $y += 105
+      }
+      $parameters = New-Object Drawing.Imaging.EncoderParameters(1)
+      try {
+        $parameters.Param[0] = New-Object Drawing.Imaging.EncoderParameter(
+          [Drawing.Imaging.Encoder]::Quality,
+          [int64]95
+        )
+        $bitmap.Save($jpeg, $encoder, $parameters)
+        $jpegPages += ,$jpeg.ToArray()
+      } finally {
+        if ($null -ne $parameters.Param[0]) {
+          $parameters.Param[0].Dispose()
+        }
+        $parameters.Dispose()
+      }
+    } finally {
+      if ($null -ne $brush) { $brush.Dispose() }
+      if ($null -ne $bodyFont) { $bodyFont.Dispose() }
+      if ($null -ne $titleFont) { $titleFont.Dispose() }
+      $graphics.Dispose()
+      $bitmap.Dispose()
+      $jpeg.Dispose()
     }
-  } finally {
-    if ($null -ne $brush) { $brush.Dispose() }
-    if ($null -ne $bodyFont) { $bodyFont.Dispose() }
-    if ($null -ne $titleFont) { $titleFont.Dispose() }
-    $graphics.Dispose()
-    $bitmap.Dispose()
+  }
+  $jpegHashes = @($jpegPages | ForEach-Object { Get-BytesSha256Hex -Bytes $_ })
+  if ($jpegPages.Count -ne $script:ExpectedPageCount -or @($jpegHashes | Sort-Object -Unique).Count -ne $script:ExpectedPageCount) {
+    throw "the fixed qualification page images are not distinct"
   }
 
   $pdf = New-Object IO.MemoryStream
@@ -323,28 +379,38 @@ function New-FixedSyntheticScanPdf {
     [void]$offsets.Add($pdf.Position)
     Write-AsciiBytes -Stream $pdf -Value "1 0 obj`n<< /Type /Catalog /Pages 2 0 R >>`nendobj`n"
     [void]$offsets.Add($pdf.Position)
-    Write-AsciiBytes -Stream $pdf -Value "2 0 obj`n<< /Type /Pages /Count 1 /Kids [3 0 R] >>`nendobj`n"
-    [void]$offsets.Add($pdf.Position)
-    Write-AsciiBytes -Stream $pdf -Value "3 0 obj`n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 841] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>`nendobj`n"
-    [void]$offsets.Add($pdf.Position)
-    Write-AsciiBytes -Stream $pdf -Value ("4 0 obj`n<< /Type /XObject /Subtype /Image /Width 1240 /Height 1754 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {0} >>`nstream`n" -f $jpeg.Length)
-    $jpeg.Position = 0
-    $jpeg.CopyTo($pdf)
-    Write-AsciiBytes -Stream $pdf -Value "`nendstream`nendobj`n"
-    $content = "q`n595 0 0 841 0 0 cm`n/Im0 Do`nQ`n"
-    [void]$offsets.Add($pdf.Position)
-    Write-AsciiBytes -Stream $pdf -Value ("5 0 obj`n<< /Length {0} >>`nstream`n{1}endstream`nendobj`n" -f ([Text.Encoding]::ASCII.GetByteCount($content)), $content)
+    Write-AsciiBytes -Stream $pdf -Value "2 0 obj`n<< /Type /Pages /Count 3 /Kids [3 0 R 4 0 R 5 0 R] >>`nendobj`n"
+    for ($pageIndex = 0; $pageIndex -lt $script:ExpectedPageCount; $pageIndex += 1) {
+      $pageObject = 3 + $pageIndex
+      $imageObject = 6 + $pageIndex
+      $contentObject = 9 + $pageIndex
+      [void]$offsets.Add($pdf.Position)
+      Write-AsciiBytes -Stream $pdf -Value ("{0} 0 obj`n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 841] /Resources << /XObject << /Im{1} {2} 0 R >> >> /Contents {3} 0 R >>`nendobj`n" -f $pageObject, $pageIndex, $imageObject, $contentObject)
+    }
+    for ($pageIndex = 0; $pageIndex -lt $script:ExpectedPageCount; $pageIndex += 1) {
+      $imageObject = 6 + $pageIndex
+      $imageBytes = $jpegPages[$pageIndex]
+      [void]$offsets.Add($pdf.Position)
+      Write-AsciiBytes -Stream $pdf -Value ("{0} 0 obj`n<< /Type /XObject /Subtype /Image /Width 1240 /Height 1754 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {1} >>`nstream`n" -f $imageObject, $imageBytes.Length)
+      $pdf.Write($imageBytes, 0, $imageBytes.Length)
+      Write-AsciiBytes -Stream $pdf -Value "`nendstream`nendobj`n"
+    }
+    for ($pageIndex = 0; $pageIndex -lt $script:ExpectedPageCount; $pageIndex += 1) {
+      $contentObject = 9 + $pageIndex
+      $content = "q`n595 0 0 841 0 0 cm`n/Im$pageIndex Do`nQ`n"
+      [void]$offsets.Add($pdf.Position)
+      Write-AsciiBytes -Stream $pdf -Value ("{0} 0 obj`n<< /Length {1} >>`nstream`n{2}endstream`nendobj`n" -f $contentObject, ([Text.Encoding]::ASCII.GetByteCount($content)), $content)
+    }
 
     $xrefOffset = $pdf.Position
-    Write-AsciiBytes -Stream $pdf -Value "xref`n0 6`n0000000000 65535 f `n"
+    Write-AsciiBytes -Stream $pdf -Value "xref`n0 12`n0000000000 65535 f `n"
     foreach ($offset in $offsets) {
       Write-AsciiBytes -Stream $pdf -Value (("{0:D10} 00000 n `n" -f $offset))
     }
-    Write-AsciiBytes -Stream $pdf -Value ("trailer`n<< /Size 6 /Root 1 0 R >>`nstartxref`n{0}`n%%EOF`n" -f $xrefOffset)
+    Write-AsciiBytes -Stream $pdf -Value ("trailer`n<< /Size 12 /Root 1 0 R >>`nstartxref`n{0}`n%%EOF`n" -f $xrefOffset)
     [IO.File]::WriteAllBytes($Destination, $pdf.ToArray())
   } finally {
     $pdf.Dispose()
-    $jpeg.Dispose()
   }
 }
 
@@ -380,19 +446,27 @@ function Assert-SyntheticScanPdf {
     throw "generated synthetic qualification PDF exceeds its fixed size bound"
   }
   $ascii = [Text.Encoding]::ASCII.GetString($bytes)
-  foreach ($required in @("/Subtype /Image", "/Filter /DCTDecode", "/Count 1", "/MediaBox [0 0 595 841]")) {
+  foreach ($required in @("/Count 3", "/Kids [3 0 R 4 0 R 5 0 R]", "/MediaBox [0 0 595 841]", "/Im0 6 0 R", "/Im1 7 0 R", "/Im2 8 0 R")) {
     if (-not $ascii.Contains($required)) {
       throw "generated qualification PDF does not have the expected image-only structure"
     }
+  }
+  if ([regex]::Matches($ascii, "/Type /Page(?!s)").Count -ne $script:ExpectedPageCount) {
+    throw "generated qualification PDF does not contain the exact expected page count"
+  }
+  if ([regex]::Matches($ascii, "/Subtype /Image").Count -ne $script:ExpectedPageCount -or [regex]::Matches($ascii, "/Filter /DCTDecode").Count -ne $script:ExpectedPageCount) {
+    throw "generated qualification PDF does not contain three distinct raster image objects"
   }
   foreach ($forbidden in @("/Font", "/ToUnicode", " BT ")) {
     if ($ascii.Contains($forbidden)) {
       throw "generated qualification PDF unexpectedly contains a text-layer marker"
     }
   }
-  foreach ($line in $script:ExpectedText) {
-    if (Test-ByteSequence -Haystack $bytes -Needle ([Text.Encoding]::UTF8.GetBytes($line))) {
-      throw "generated qualification PDF unexpectedly contains clear-text canary bytes"
+  foreach ($page in $script:ExpectedPages) {
+    foreach ($line in $page.Lines) {
+      if (Test-ByteSequence -Haystack $bytes -Needle ([Text.Encoding]::UTF8.GetBytes($line))) {
+        throw "generated qualification PDF unexpectedly contains clear-text canary bytes"
+      }
     }
   }
 }
@@ -462,38 +536,55 @@ function Assert-MineruOutput {
     throw "MinerU version did not match the fixed qualification version"
   }
   $pages = @($middle.pdf_info)
-  if ($pages.Count -ne 1 -or [int]$pages[0].page_idx -ne 0) {
-    throw "MinerU middle output did not contain exactly page_idx 0"
+  if ($pages.Count -ne $script:ExpectedPageCount) {
+    throw "MinerU middle output did not contain the exact expected page count"
   }
-  $pageSize = @($pages[0].page_size)
-  if ($pageSize.Count -ne 2 -or [double]$pageSize[0] -ne $script:ExpectedPageWidth -or [double]$pageSize[1] -ne $script:ExpectedPageHeight) {
-    throw "MinerU middle output did not preserve the fixed page_size"
+  if ($content.Count -ne $script:ExpectedTextEntryCount) {
+    throw "MinerU content_list did not contain the exact expected text entry count"
   }
-
-  if ($content.Count -ne $script:ExpectedText.Count) {
-    throw "MinerU content_list did not contain the exact expected OCR item count"
-  }
-  for ($index = 0; $index -lt $script:ExpectedText.Count; $index += 1) {
-    $entry = $content[$index]
-    if ([int]$entry.page_idx -ne 0) {
-      throw "MinerU content_list contained an unexpected page_idx"
+  for ($pageIndex = 0; $pageIndex -lt $script:ExpectedPageCount; $pageIndex += 1) {
+    if ([int]$pages[$pageIndex].page_idx -ne $pageIndex) {
+      throw "MinerU middle output did not preserve the exact page index sequence"
     }
-    if ([string]$entry.text -cne $script:ExpectedText[$index]) {
-      throw "MinerU OCR text did not match the fixed synthetic canary item at index $index"
+    $pageSize = @($pages[$pageIndex].page_size)
+    if ($pageSize.Count -ne 2 -or [double]$pageSize[0] -ne $script:ExpectedPageWidth -or [double]$pageSize[1] -ne $script:ExpectedPageHeight) {
+      throw "MinerU middle output did not preserve the fixed page_size"
     }
-    $bbox = @($entry.bbox)
-    if ($bbox.Count -ne 4) {
-      throw "MinerU content_list item did not contain a four-value bbox"
+    $pageContent = @($content | Where-Object { [int]$_.page_idx -eq $pageIndex })
+    $expectedLines = @($script:ExpectedPages[$pageIndex].Lines)
+    if ($pageContent.Count -ne $expectedLines.Count) {
+      throw "MinerU content_list did not preserve the exact per-page text entry count"
     }
-    foreach ($coordinate in $bbox) {
-      $number = [double]$coordinate
-      if ([double]::IsNaN($number) -or [double]::IsInfinity($number) -or $number -lt 0) {
-        throw "MinerU content_list item contained an invalid bbox"
+    for ($lineIndex = 0; $lineIndex -lt $expectedLines.Count; $lineIndex += 1) {
+      $entry = $pageContent[$lineIndex]
+      $expectedNormalized = [regex]::Replace([string]$expectedLines[$lineIndex], "\s", "")
+      $actualNormalized = [regex]::Replace([string]$entry.text, "\s", "")
+      if ($actualNormalized -cne $expectedNormalized) {
+        $mismatch = 0
+        while ($mismatch -lt [Math]::Min($actualNormalized.Length, $expectedNormalized.Length) -and $actualNormalized[$mismatch] -ceq $expectedNormalized[$mismatch]) {
+          $mismatch += 1
+        }
+        $expectedCode = if ($mismatch -lt $expectedNormalized.Length) { "U+{0:X4}" -f [int][char]$expectedNormalized[$mismatch] } else { "END" }
+        $actualCode = if ($mismatch -lt $actualNormalized.Length) { "U+{0:X4}" -f [int][char]$actualNormalized[$mismatch] } else { "END" }
+        throw "MinerU OCR text mismatch on synthetic page $pageIndex line $lineIndex at offset $mismatch ($expectedCode/$actualCode)"
+      }
+      $bbox = @($entry.bbox)
+      if ($bbox.Count -ne 4) {
+        throw "MinerU content_list item did not contain a four-value bbox"
+      }
+      foreach ($coordinate in $bbox) {
+        $number = [double]$coordinate
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number) -or $number -lt 0) {
+          throw "MinerU content_list item contained an invalid bbox"
+        }
+      }
+      if ([double]$bbox[0] -ge [double]$bbox[2] -or [double]$bbox[1] -ge [double]$bbox[3] -or [double]$bbox[2] -gt $script:ExpectedContentListCoordinateExtent -or [double]$bbox[3] -gt $script:ExpectedContentListCoordinateExtent) {
+        throw "MinerU content_list item bbox exceeded the fixed 0-1000 coordinate space"
       }
     }
-    if ([double]$bbox[0] -gt [double]$bbox[2] -or [double]$bbox[1] -gt [double]$bbox[3] -or [double]$bbox[2] -gt $script:ExpectedPageWidth -or [double]$bbox[3] -gt $script:ExpectedPageHeight) {
-      throw "MinerU content_list item bbox exceeded the fixed page_size"
-    }
+  }
+  if (@($content | Where-Object { [int]$_.page_idx -lt 0 -or [int]$_.page_idx -ge $script:ExpectedPageCount }).Count -ne 0) {
+    throw "MinerU content_list contained an unexpected page_idx"
   }
 
   return [pscustomobject]@{
@@ -501,10 +592,10 @@ function Assert-MineruOutput {
     MiddlePath = $middlePath
     Version = [string]$middle._version_name
     PageCount = $pages.Count
-    PageIndex = [int]$pages[0].page_idx
-    PageWidth = [int]$pageSize[0]
-    PageHeight = [int]$pageSize[1]
-    TextItemCount = $content.Count
+    PageIndices = @($pages | ForEach-Object { [int]$_.page_idx })
+    PageWidth = $script:ExpectedPageWidth
+    PageHeight = $script:ExpectedPageHeight
+    TextEntryCount = $content.Count
   }
 }
 
@@ -517,7 +608,7 @@ function Get-GpuMetadata {
 
   $result = Invoke-SanitizedProcess `
     -Descriptor $Descriptor `
-    -Arguments @("--query-gpu=name,driver_version,memory.total", "--format=csv,noheader,nounits") `
+    -Arguments @("--query-gpu=index,name,driver_version,memory.total", "--format=csv,noheader,nounits") `
     -Environment $Environment `
     -WorkingDirectory $WorkingDirectory `
     -TimeoutMilliseconds 30000
@@ -530,23 +621,36 @@ function Get-GpuMetadata {
       continue
     }
     $fields = @($line.Split(',') | ForEach-Object { $_.Trim() })
-    if ($fields.Count -ne 3) {
+    if ($fields.Count -ne 4) {
       throw "nvidia-smi returned an unexpected metadata shape"
     }
+    $index = 0
+    if (-not [uint32]::TryParse($fields[0], [ref]$index)) {
+      throw "nvidia-smi returned an invalid device index"
+    }
     $memoryMiB = 0
-    if (-not [int]::TryParse($fields[2], [ref]$memoryMiB) -or $memoryMiB -le 0) {
+    if (-not [int]::TryParse($fields[3], [ref]$memoryMiB) -or $memoryMiB -le 0) {
       throw "nvidia-smi returned an invalid memory total"
     }
-    $descriptorHash = Get-TextSha256Hex -Value ("{0}|{1}|{2}" -f $fields[0], $fields[1], $memoryMiB)
+    $descriptorHash = Get-TextSha256Hex -Value ("{0}|{1}|{2}|{3}" -f $index, $fields[1], $fields[2], $memoryMiB)
     $gpus += [ordered]@{
-      name = $fields[0]
-      driverVersion = $fields[1]
+      index = $index
+      name = $fields[1]
+      driverVersion = $fields[2]
       memoryMiB = $memoryMiB
       descriptorSha256 = $descriptorHash
     }
   }
-  if ($gpus.Count -eq 0 -or -not ($gpus | Where-Object { $_.name -match 'RTX\s+5090' })) {
-    throw "the fixed RTX 5090 qualification target was not reported"
+  if ($gpus.Count -lt 1 -or $gpus.Count -gt 16) {
+    throw "nvidia-smi returned an unsupported device count"
+  }
+  $indices = @($gpus | ForEach-Object { [uint32]$_.index })
+  if (@($indices | Select-Object -Unique).Count -ne $indices.Count) {
+    throw "nvidia-smi returned duplicate device indices"
+  }
+  $selected = @($gpus | Where-Object { [uint32]$_.index -eq 0 })
+  if ($selected.Count -ne 1 -or [int]$selected[0].memoryMiB -lt 6144) {
+    throw "CUDA_VISIBLE_DEVICES=0 did not resolve to one qualified local GPU"
   }
   return $gpus
 }
@@ -593,8 +697,39 @@ function Remove-QualificationJob {
   }
 }
 
+if (-not [string]::IsNullOrWhiteSpace($GenerateCanaryOnlyPath)) {
+  if ($KeepArtifacts -or -not [string]::IsNullOrWhiteSpace($EvidencePath)) {
+    throw "GenerateCanaryOnlyPath cannot be combined with KeepArtifacts or EvidencePath"
+  }
+
+  $destination = [IO.Path]::GetFullPath($GenerateCanaryOnlyPath)
+  if (-not $destination.EndsWith(".pdf", [StringComparison]::OrdinalIgnoreCase)) {
+    throw "GenerateCanaryOnlyPath must name a PDF"
+  }
+  if ([IO.File]::Exists($destination) -or [IO.Directory]::Exists($destination)) {
+    throw "GenerateCanaryOnlyPath destination must not already exist"
+  }
+  $parent = [IO.Path]::GetDirectoryName($destination)
+  [void](Assert-FixedLocalPath -LiteralPath $parent -Description "canary destination parent" -Directory)
+  if (-not [string]::Equals([IO.Path]::GetFileName($destination), "qualification-canary.pdf", [StringComparison]::Ordinal)) {
+    throw "GenerateCanaryOnlyPath filename must be qualification-canary.pdf"
+  }
+
+  New-FixedSyntheticScanPdf -Destination $destination
+  Assert-SyntheticScanPdf -LiteralPath $destination
+  [pscustomobject]@{
+    schemaVersion = 1
+    kind = "lawyer-assistance-local-mineru-synthetic-canary"
+    pageCount = 3
+    expectedEntryCount = 24
+  } | ConvertTo-Json -Compress
+  return
+}
+
 $mineru = Resolve-CommandDescriptor -Candidate $MineruCommand -Description "MinerU command"
 $nvidiaSmi = Resolve-CommandDescriptor -Candidate $NvidiaSmiCommand -Description "nvidia-smi command"
+$programFilesPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+$programFilesPath = Assert-FixedLocalPath -LiteralPath $programFilesPath -Description "Program Files directory" -Directory
 $configSha256 = $null
 $configPath = $null
 if (-not [string]::IsNullOrWhiteSpace($MineruToolsConfigPath)) {
@@ -619,7 +754,7 @@ try {
   [void](Assert-FixedLocalPath -LiteralPath $jobRoot -Description "qualification job directory" -Directory)
   [void][IO.Directory]::CreateDirectory($outputRoot)
   [void][IO.Directory]::CreateDirectory($runtimeRoot)
-  foreach ($directory in @("temp", "cache", "hf", "paddle", "matplotlib")) {
+  foreach ($directory in @("temp", "cache", "hf", "paddle", "matplotlib", "modelscope")) {
     [void][IO.Directory]::CreateDirectory((Join-Path $runtimeRoot $directory))
   }
 
@@ -645,6 +780,13 @@ try {
     HF_HOME = (Join-Path $runtimeRoot "hf")
     PADDLE_HOME = (Join-Path $runtimeRoot "paddle")
     MPLCONFIGDIR = (Join-Path $runtimeRoot "matplotlib")
+    MODELSCOPE_CACHE = (Join-Path $runtimeRoot "modelscope")
+    USERPROFILE = $runtimeRoot
+    HOME = $runtimeRoot
+    ProgramFiles = $programFilesPath
+    PIP_NO_INDEX = "1"
+    PYTHONNOUSERSITE = "1"
+    PYTHONSAFEPATH = "1"
   }
   if ($null -ne $configPath) {
     $environment.MINERU_TOOLS_CONFIG_JSON = $configPath
@@ -696,7 +838,7 @@ try {
       productionCaseOcrAuthorized = $false
     }
     invocation = [ordered]@{
-      profile = "mineru -p <generated-canary> -o <isolated-output> -m ocr -b pipeline -l ch"
+      profile = "mineru -p <generated-three-page-canary> -o <isolated-output> -m ocr -b pipeline -l ch"
       method = $script:ExpectedMethod
       backend = $script:ExpectedBackend
       language = $script:ExpectedLanguage
@@ -715,21 +857,22 @@ try {
     }
     gpu = [ordered]@{
       nvidiaSmiSha256 = $nvidiaSmi.CommandSha256
+      selectedCudaDevice = 0
       devices = $gpus
     }
     hashes = [ordered]@{
       scriptSha256 = Get-Sha256Hex -LiteralPath $PSCommandPath
       generatedInputSha256 = Get-Sha256Hex -LiteralPath $inputPath
-      expectedTextSha256 = Get-TextSha256Hex -Value ($script:ExpectedText -join "`n")
+      expectedTextSha256 = Get-TextSha256Hex -Value (@($script:ExpectedPages | ForEach-Object { $_.Lines }) -join "`n")
       contentListSha256 = Get-Sha256Hex -LiteralPath $verification.ContentPath
       middleSha256 = Get-Sha256Hex -LiteralPath $verification.MiddlePath
     }
     verification = [ordered]@{
       outputResolvedWithinIsolatedRoot = $true
       pageCount = $verification.PageCount
-      pageIndices = @($verification.PageIndex)
+      pageIndices = @($verification.PageIndices)
       pageSize = @($verification.PageWidth, $verification.PageHeight)
-      exactTextItems = $verification.TextItemCount
+      exactVerifiedTextEntries = $verification.TextEntryCount
       outputFileCount = $outputStats.FileCount
       outputBytes = $outputStats.TotalBytes
       isolatedJobFileCount = $jobStats.FileCount

@@ -2,11 +2,13 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import type {
+  LocalMineruDiscoveryResult,
   PrivacyConfig,
   PrivacyConfigResponse,
 } from "../../ipc/privacy/types";
 import {
   PrivacyWorkspaceView,
+  applyLocalMineruDiscoveryToDraft,
   privacyConfigDraftIsDirty,
   privacyConfigToDraft,
   privacyDraftToConfig,
@@ -19,12 +21,16 @@ const config: PrivacyConfig = {
     mode: "force_local",
     workerPath: "C:/Local/MinerU/mineru-worker.exe",
     modelDirectory: "C:/Local/MinerU/models",
+    toolsConfigPath: "C:/Local/MinerU/tools.json",
+    runtimeExecutablePaths: ["C:/Local/MinerU/runtime/python.exe"],
     device: "cuda:0",
     languages: ["zh", "en"],
     timeoutSeconds: 300,
     maxPages: 200,
     strictOffline: true,
     forbidCloudFallback: true,
+    forbidRemoteUpload: true,
+    forbidTelemetry: true,
   },
 };
 
@@ -32,7 +38,7 @@ const response: PrivacyConfigResponse = {
   config,
   configValid: true,
   loadError: null,
-  enforcementState: "local_review_safe_pdf_ready_case_provider_production_mcp_fail_closed_public_legal_tools_only",
+  enforcementState: "local_review_safe_exports_approved_paths_qualification_gated",
   ocrStatus: {
     code: "configured_unverified",
     message: "本地文件已配置并可读取；尚未执行实机验证。",
@@ -45,6 +51,37 @@ const response: PrivacyConfigResponse = {
     integrityVerified: false,
     networkIsolationVerified: false,
   },
+  qualification: {
+    qualificationId: null,
+    qualificationReportId: null,
+    qualificationReportSha256: null,
+    syntheticCanaryQualified: false,
+    processingChainQualified: false,
+    exactWorkerModelMatch: false,
+    networkIsolationEnforced: false,
+    modelManifestTrustEstablished: false,
+    appAutoEnableAuthorized: false,
+    productionCaseOcrAuthorized: false,
+    expiresAtUnix: null,
+    revoked: false,
+    reasonCodes: ["qualification_missing"],
+  },
+  capabilities: {
+    localGpuPreferenceConfigurable: true,
+    scannedCaseOcrEnabled: false,
+    automaticApprovalEnabled: false,
+    appAutoOcrEnabled: false,
+    remoteOcrFallbackAllowed: false,
+    telemetryAllowed: false,
+    rawMaterialUploadAllowed: false,
+    blockingReasonCodes: [
+      "network_isolation_not_enforced",
+      "model_manifest_trust_not_established",
+      "app_auto_enable_not_authorized",
+      "production_case_ocr_not_authorized",
+      "approved_case_workspace_profile_not_qualified",
+    ],
+  },
 };
 
 describe("PrivacyWorkspace configuration", () => {
@@ -56,10 +93,49 @@ describe("PrivacyWorkspace configuration", () => {
     expect(normalized).toEqual(config);
     expect(normalized.ocr.strictOffline).toBe(true);
     expect(normalized.ocr.forbidCloudFallback).toBe(true);
+    expect(normalized.ocr.forbidRemoteUpload).toBe(true);
+    expect(normalized.ocr.forbidTelemetry).toBe(true);
     expect(privacyConfigDraftIsDirty(config, draft)).toBe(false);
     expect(JSON.stringify(normalized)).not.toContain("allowRawCloud");
   });
 
+  it("applies discovered local paths as an unsaved auto-local draft and preserves privacy mode", () => {
+    const current = {
+      ...privacyConfigToDraft(config),
+      privacyMode: "raw_native" as const,
+      device: "cuda:7",
+    };
+    const discovery: LocalMineruDiscoveryResult = {
+      source: "uv_tool",
+      ocrConfig: {
+        ...config.ocr,
+        mode: "auto_local",
+        workerPath: "C:/Users/example/AppData/Roaming/uv/tools/mineru/Scripts/mineru.exe",
+        modelDirectory: "C:/Users/example/.cache/modelscope/models",
+        toolsConfigPath: "C:/Users/example/AppData/Local/Lawyer-Assistance/mineru-local-offline.json",
+        runtimeExecutablePaths: [
+          "C:/Users/example/AppData/Roaming/uv/tools/mineru/Scripts/python.exe",
+        ],
+        device: "auto",
+      },
+      appManagedToolsConfig: true,
+      requiresUserSave: true,
+      trustInstalled: false,
+      networkIsolationInstalled: false,
+      qualified: false,
+    };
+
+    const discovered = applyLocalMineruDiscoveryToDraft(current, discovery);
+    expect(discovered.privacyMode).toBe("raw_native");
+    expect(discovered.ocrMode).toBe("auto_local");
+    expect(discovered.workerPath).toBe(discovery.ocrConfig.workerPath);
+    expect(discovered.modelDirectory).toBe(discovery.ocrConfig.modelDirectory);
+    expect(discovered.toolsConfigPath).toBe(discovery.ocrConfig.toolsConfigPath);
+    expect(discovered.runtimeExecutablePaths).toBe(
+      discovery.ocrConfig.runtimeExecutablePaths.join("\n"),
+    );
+    expect(discovered.device).toBe("auto");
+  });
   it("rejects relative paths, arbitrary devices, and unsafe limits before IPC", () => {
     const draft = privacyConfigToDraft(config);
     expect(() =>
@@ -97,6 +173,7 @@ describe("PrivacyWorkspaceView", () => {
         notice=""
         error=""
         onDraftChange={vi.fn()}
+        onDiscover={vi.fn()}
         onSave={vi.fn()}
         onReset={vi.fn()}
         onRefreshStatus={vi.fn()}
@@ -104,17 +181,34 @@ describe("PrivacyWorkspaceView", () => {
     );
 
     expect(markup).toContain("隐私与本地处理");
+    expect(markup).toContain("自动发现本机 MinerU");
+    expect(markup).toContain("不执行 MinerU、Python、shell");
+    expect(markup).toContain("任何网络命令");
+    expect(markup).toContain("包含 pipeline/vlm 路径的最小离线配置");
     expect(markup).toContain("禁止云端 OCR 回退（真实案件不可关闭）");
     expect(markup).toContain("页面不提供原件外发许可开关");
     expect(markup).toContain("3.4.3-local");
     expect(markup).toContain("model-2026-07");
     expect(markup).toContain("a".repeat(64));
     expect(markup).toContain("未验证，不作隔离声明");
-    expect(markup).toContain("本地脱敏审阅、精确回执和安全 PDF 重建已经可用");
-    expect(markup).toContain("案件 Provider 与生产 MCP");
-    expect(markup).toContain("后端默认拒绝（fail closed）");
-    expect(markup).toContain("只有不携带案件材料的公开法律工具可以外发请求");
-    expect(markup).toContain("获批脱敏案件材料均不得据此发送");
+    expect(markup).toContain("原件、OCR 中间产物和未获批准的案件内容始终禁止外发");
+    expect(markup).toContain("并且对应后端能力显示“已授权”的副本");
+    expect(markup).toContain("任一资格、哈希、目标、用途、时效或消费状态不匹配都会 fail closed");
+    expect(markup).toContain("才能进入 approved MCP");
+    expect(markup).toContain("外部目标只应接收经本地脱敏、复核并批准的材料");
+    expect(markup).toContain("networkIsolationEnforced=false");
+    expect(markup).toContain("modelManifestTrustEstablished=false");
+    expect(markup).toContain("appAutoEnableAuthorized=false");
+    expect(markup).toContain("productionCaseOcrAuthorized=false");
+    expect(markup).toContain("扫描件 OCR");
+    expect(markup).toContain("自动批准");
+    expect(markup).toContain("approved MCP");
+    expect(markup.match(/后端不可启用/gu)).toHaveLength(3);
+    expect(markup).toContain("禁止远端上传原件、OCR 正文与中间产物");
+    expect(markup).toContain("禁止 OCR 遥测与隐式模型下载");
+    expect(markup).toContain("这不构成来源认证、OS");
+    expect(markup).toContain("不得据此处理真实扫描案件或自动批准");
+    expect(markup).toContain("各自独立、持久化且可撤销的资格面板");
     expect(markup).not.toContain("第一阶段边界");
     expect(markup).not.toContain("允许原件上云");
     expect(markup).not.toContain("allowRawCloud");
@@ -130,6 +224,7 @@ describe("PrivacyWorkspaceView", () => {
         notice=""
         error=""
         onDraftChange={vi.fn()}
+        onDiscover={vi.fn()}
         onSave={vi.fn()}
         onReset={vi.fn()}
         onRefreshStatus={vi.fn()}
