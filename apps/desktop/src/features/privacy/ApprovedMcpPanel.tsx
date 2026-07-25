@@ -59,6 +59,12 @@ const APPROVED_TOOLS = [
   "case_write_work_product",
   "case_update_work_product",
   "case_export_work_product_manifest",
+  "diagram.list_templates",
+  "diagram.get_schema",
+  "diagram.validate",
+  "diagram.render",
+  "diagram.update",
+  "diagram.export",
 ] as const;
 const APPROVED_DESTINATION = "approved_case_workspace";
 const APPROVED_READ_PURPOSE = "mcp.case_read_approved_material.v1";
@@ -90,6 +96,8 @@ interface ApprovedMcpPanelViewProps {
   oneTimeHttpProvisioning: ProvisionedStandaloneApprovedMcpSession | null;
   readGrantEnabled: boolean;
   writeGrantEnabled: boolean;
+  diagramReadGrantEnabled: boolean;
+  diagramWriteGrantEnabled: boolean;
   notice: string;
   error: string;
   onSelectedRedactionIdChange: (value: string) => void;
@@ -106,6 +114,8 @@ interface ApprovedMcpPanelViewProps {
   onMcpApprovalConfirmedChange: (value: boolean) => void;
   onReadGrantEnabledChange: (value: boolean) => void;
   onWriteGrantEnabledChange: (value: boolean) => void;
+  onDiagramReadGrantEnabledChange: (value: boolean) => void;
+  onDiagramWriteGrantEnabledChange: (value: boolean) => void;
   onRefresh: () => void;
   onQualify: () => void;
   onRevokeQualification: () => void;
@@ -218,6 +228,8 @@ export function buildStandaloneSession(input: {
   minutes: string;
   readEnabled: boolean;
   writeEnabled: boolean;
+  diagramReadEnabled: boolean;
+  diagramWriteEnabled: boolean;
   httpPort: string;
   allowedOriginsInput: string;
 }): CreateStandaloneApprovedMcpSessionRequest {
@@ -226,9 +238,11 @@ export function buildStandaloneSession(input: {
   const grantGroups = [
     ...(input.readEnabled ? ["read" as const] : []),
     ...(input.writeEnabled ? ["write" as const] : []),
+    ...(input.diagramReadEnabled ? ["diagram_read" as const] : []),
+    ...(input.diagramWriteEnabled ? ["diagram_write" as const] : []),
   ];
   if (grantGroups.length === 0) {
-    throw new Error("Select at least one fixed grant group (read or write).");
+    throw new Error("Select at least one fixed grant group (read, write, diagram_read or diagram_write).");
   }
   const httpPort = input.transport === "streamable_http"
     ? boundedInteger("HTTP loopback 端口", input.httpPort, 1024, 65535)
@@ -251,6 +265,8 @@ export function buildStandaloneStdioSession(input: {
   minutes: string;
   readEnabled: boolean;
   writeEnabled: boolean;
+  diagramReadEnabled: boolean;
+  diagramWriteEnabled: boolean;
 }): CreateStandaloneApprovedMcpSessionRequest {
   return buildStandaloneSession({
     ...input,
@@ -392,6 +408,8 @@ export function ApprovedMcpPanelView({
   oneTimeHttpProvisioning,
   readGrantEnabled,
   writeGrantEnabled,
+  diagramReadGrantEnabled,
+  diagramWriteGrantEnabled,
   notice,
   error,
   onSelectedRedactionIdChange,
@@ -408,6 +426,8 @@ export function ApprovedMcpPanelView({
   onMcpApprovalConfirmedChange,
   onReadGrantEnabledChange,
   onWriteGrantEnabledChange,
+  onDiagramReadGrantEnabledChange,
+  onDiagramWriteGrantEnabledChange,
   onRefresh,
   onQualify,
   onRevokeQualification,
@@ -691,8 +711,36 @@ export function ApprovedMcpPanelView({
               />
               {"\u5199\u5165\uff082 \u9879\u5de5\u4f5c\u6210\u679c\u5de5\u5177\uff09"}
             </label>
+            <label>
+              <input
+                aria-label="图示只读授权组"
+                checked={diagramReadGrantEnabled}
+                disabled={locked || !qualified}
+                type="checkbox"
+                onChange={(event) => onDiagramReadGrantEnabledChange(event.target.checked)}
+              />
+              {"\u56fe\u793a\u53ea\u8bfb\uff084 \u9879\u6a21\u677f\u3001schema\u3001\u6821\u9a8c\u4e0e\u5bfc\u51fa\u5de5\u5177\uff09"}
+            </label>
+            <label>
+              <input
+                aria-label="图示写入授权组"
+                checked={diagramWriteGrantEnabled}
+                disabled={locked || !qualified}
+                type="checkbox"
+                onChange={(event) => onDiagramWriteGrantEnabledChange(event.target.checked)}
+              />
+              {"\u56fe\u793a\u5199\u5165\uff082 \u9879\u6e32\u67d3\u4e0e\u66f4\u65b0\u5de5\u5177\uff09"}
+            </label>
           </fieldset>
-          <button disabled={locked || !qualified || (!readGrantEnabled && !writeGrantEnabled)} type="submit">
+          <button
+            disabled={locked || !qualified || (
+              !readGrantEnabled
+              && !writeGrantEnabled
+              && !diagramReadGrantEnabled
+              && !diagramWriteGrantEnabled
+            )}
+            type="submit"
+          >
             创建 App 签发会话
           </button>
         </form>
@@ -755,8 +803,8 @@ export function ApprovedMcpPanelView({
       <aside className="approved-mcp-host-policy">
         <strong>宿主硬边界</strong>
         <p>
-          会话只能从 opaque ID 开始，并严格匹配 15 项 profile（5 项离线公共法律工具 +
-          10 项批准工作区工具）。禁止附加或粘贴案件原文，禁止读取宿主文件、浏览器、搜索、
+          会话只能从 opaque ID 开始，并严格匹配 21 项 profile（5 项离线公共法律工具 +
+          10 项批准工作区工具 + 6 项批准图示工具）。禁止附加或粘贴案件原文，禁止读取宿主文件、浏览器、搜索、
           其他 MCP、其他 Skill、memory、subagent、远程 OCR 或任何网络回退；上下文受污染时
           必须立即停止。资格、票据、撤销、到期、hash 或残留扫描失败时不得降级。
         </p>
@@ -792,6 +840,8 @@ export function ApprovedMcpPanel({
   const [oneTimeHttpProvisioning, setOneTimeHttpProvisioning] = useState<ProvisionedStandaloneApprovedMcpSession | null>(null);
   const [readGrantEnabled, setReadGrantEnabled] = useState(true);
   const [writeGrantEnabled, setWriteGrantEnabled] = useState(true);
+  const [diagramReadGrantEnabled, setDiagramReadGrantEnabled] = useState(false);
+  const [diagramWriteGrantEnabled, setDiagramWriteGrantEnabled] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
@@ -977,6 +1027,8 @@ export function ApprovedMcpPanel({
         minutes: sessionMinutes,
         readEnabled: readGrantEnabled,
         writeEnabled: writeGrantEnabled,
+        diagramReadEnabled: diagramReadGrantEnabled,
+        diagramWriteEnabled: diagramWriteGrantEnabled,
         httpPort,
         allowedOriginsInput,
       }));
@@ -1060,6 +1112,8 @@ export function ApprovedMcpPanel({
       oneTimeHttpProvisioning={oneTimeHttpProvisioning}
       readGrantEnabled={readGrantEnabled}
       writeGrantEnabled={writeGrantEnabled}
+      diagramReadGrantEnabled={diagramReadGrantEnabled}
+      diagramWriteGrantEnabled={diagramWriteGrantEnabled}
       notice={notice}
       error={error}
       onSelectedRedactionIdChange={setSelectedRedactionId}
@@ -1082,6 +1136,8 @@ export function ApprovedMcpPanel({
       onMcpApprovalConfirmedChange={setMcpApprovalConfirmed}
       onReadGrantEnabledChange={setReadGrantEnabled}
       onWriteGrantEnabledChange={setWriteGrantEnabled}
+      onDiagramReadGrantEnabledChange={setDiagramReadGrantEnabled}
+      onDiagramWriteGrantEnabledChange={setDiagramWriteGrantEnabled}
       onRefresh={refresh}
       onQualify={qualify}
       onRevokeQualification={revokeQualification}

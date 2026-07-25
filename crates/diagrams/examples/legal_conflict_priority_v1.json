@@ -1,0 +1,18 @@
+{
+  "schema_version":"1.0","diagram_type":"legal_conflict_priority","template_id":"legal_conflict_priority_v1","title":"虚构规范冲突优先图（注册样例）","summary":"全部规范与冲突均为虚构测试设定。",
+  "nodes":[
+    {"id":"lc_general","type":"law","label":"示例交易一般法","details":"虚构上位一般规则。","status":"effective","importance":"critical","source_refs":["lc_src"],"tags":["虚构"],"metadata":{"full_name":"示例交易一般法（虚构）","authority_level":"law","validity_status":"fictional_effective","version":"fictional-1.0"}},
+    {"id":"lc_special","type":"regulation","label":"示例交易特别条例","details":"虚构特别规则。","status":"effective","importance":"high","source_refs":["lc_src"],"tags":["虚构"],"metadata":{"full_name":"示例交易特别条例（虚构）","authority_level":"regulation","validity_status":"fictional_effective","version":"fictional-1.0"}},
+    {"id":"lc_old","type":"department_rule","label":"示例旧交易办法","details":"虚构旧规则。","status":"repealed","importance":"normal","source_refs":["lc_src"],"tags":["虚构"],"metadata":{"full_name":"示例旧交易办法（虚构）","authority_level":"department_rule","validity_status":"fictional_repealed","version":"fictional-1.0"}},
+    {"id":"lc_new","type":"department_rule","label":"示例新交易办法","details":"虚构新规则。","status":"effective","importance":"high","source_refs":["lc_src"],"tags":["虚构"],"metadata":{"full_name":"示例新交易办法（虚构）","authority_level":"department_rule","validity_status":"fictional_effective","version":"fictional-1.0"}}
+  ],
+  "edges":[
+    {"id":"lc_edge_conflict","source":"lc_special","target":"lc_general","relation":"conflicts_with","label":"虚构条款差异","strength":"moderate","source_refs":["lc_src"],"metadata":{}},
+    {"id":"lc_edge_priority","source":"lc_general","target":"lc_special","relation":"applies_before","label":"冲突部分优先","strength":"strong","source_refs":["lc_src"],"metadata":{}},
+    {"id":"lc_edge_replace","source":"lc_new","target":"lc_old","relation":"replaces","label":"替代旧规则","strength":"conclusive","source_refs":["lc_src"],"metadata":{}}
+  ],
+  "groups":[],"sources":[{"id":"lc_src","kind":"human_input","title":"虚构冲突设定","locator":"仓库测试样例，无现实法律效力","verification_status":"human_confirmed"}],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["lc_general","lc_new"],"group_by":"status","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T11:10:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["lc_src"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"注册表虚构样例","model_content_scope":"未处理真实规范。","deterministic_content_scope":"校验、布局和 HTML 渲染由固定模板完成。"}
+}

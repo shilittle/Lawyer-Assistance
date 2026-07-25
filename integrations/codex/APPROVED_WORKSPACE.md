@@ -6,7 +6,7 @@ This is a separate, explicit, qualification-gated `approved_case_workspace` inte
 - Replace `<APP_ISSUED_SERVER_ID>` with the exact opaque `srv_[0-9a-f]{32}` ID created by the App; do not add environment, path, config, root, bearer, bind, origin, or HTTP fields.
 - Merge `config.privacy-hardening.toml`.
 - Install the complete `skill/lawyer-assistance-approved-workspace` package and invoke it explicitly.
-- Require an exact 15-tool match with `../tool-catalog.approved-case-workspace.json`.
+- Require an exact 21-tool match with `../tool-catalog.approved-case-workspace.json`; advertised tools remain unusable unless their App-issued grant group is present.
 
 Start a new clean task containing opaque IDs only. Never attach or paste a case document, disclose a filename/path, or ask Codex to read a host file. Only a direct current-task `case_read_approved_material` response carrying `CASE_REDACTED_APPROVED` is a substantive source. Save substantive results only through `case_write_work_product` or `case_update_work_product`, then verify the exact returned ID/version through `case_read_work_product`.
 

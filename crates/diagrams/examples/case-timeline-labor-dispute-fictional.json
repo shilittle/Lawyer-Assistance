@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "diagram_type": "case_timeline",
+  "template_id": "case_timeline_v1",
+  "title": "虚构劳动争议时间轴",
+  "summary": "演示入职、加班记录、欠付工资、仲裁与开庭等时间节点；主体和材料均为虚构。",
+  "nodes": [
+    {"id":"labor_start","type":"event","label":"开始提供劳动","details":"虚构劳动者于 2024 年 3 月开始在测试公司工作。","status":"established","importance":"high","source_refs":["labor_contract"],"tags":["虚构","入职"],"metadata":{"date":"2024-03-01","date_precision":"day","sequence":1}},
+    {"id":"labor_overtime","type":"event","label":"集中加班月份","details":"虚构门禁表只能表明进出时间，不能单独确认工作内容。","status":"supported","importance":"high","source_refs":["labor_access"],"tags":["虚构","加班"],"metadata":{"date":"2025-06","date_precision":"month","sequence":2,"statement_variant":"access_log_only"}},
+    {"id":"labor_wage_due","type":"event","label":"主张欠付工资","details":"虚构工资表显示一笔争议差额，仍需核对计算口径。","status":"disputed","importance":"critical","source_refs":["labor_payroll"],"tags":["虚构","工资"],"metadata":{"date":"2025-07-10","date_precision":"day","sequence":3,"limitation_deadline":"2026-07-10"}},
+    {"id":"labor_arbitration","type":"procedure","label":"申请劳动仲裁","details":"虚构仲裁申请在测试日期提交。","status":"completed","importance":"critical","source_refs":["labor_case_record"],"tags":["虚构","程序"],"metadata":{"date":"2026-01-15","date_precision":"day","sequence":4}},
+    {"id":"labor_hearing","type":"procedure","label":"仲裁开庭月份","details":"只确认开庭月份，具体日期待虚构通知补充。","status":"pending","importance":"high","source_refs":["labor_case_record"],"tags":["虚构","程序"],"metadata":{"date":"2026-03","date_precision":"month","sequence":5}}
+  ],
+  "edges": [
+    {"id":"labor_before_overtime","source":"labor_start","target":"labor_overtime","relation":"occurred_before","label":"先于","strength":"strong","source_refs":["labor_contract","labor_access"],"metadata":{}},
+    {"id":"labor_before_wage","source":"labor_overtime","target":"labor_wage_due","relation":"occurred_before","label":"先于","strength":"moderate","source_refs":["labor_access","labor_payroll"],"metadata":{}},
+    {"id":"labor_before_arbitration","source":"labor_wage_due","target":"labor_arbitration","relation":"occurred_before","label":"先于","strength":"strong","source_refs":["labor_payroll","labor_case_record"],"metadata":{}},
+    {"id":"labor_before_hearing","source":"labor_arbitration","target":"labor_hearing","relation":"occurred_before","label":"先于","strength":"strong","source_refs":["labor_case_record"],"metadata":{}}
+  ],
+  "groups": [
+    {"id":"labor_substance","label":"实体事实","node_ids":["labor_start","labor_overtime","labor_wage_due"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["labor_contract","labor_access","labor_payroll"]},
+    {"id":"labor_procedure","label":"仲裁程序","node_ids":["labor_arbitration","labor_hearing"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["labor_case_record"]}
+  ],
+  "sources": [
+    {"id":"labor_contract","kind":"file","title":"虚构劳动合同","locator":"测试材料 A，第 1 页","artifact_id":"fictional_labor_contract","verification_status":"original_material"},
+    {"id":"labor_access","kind":"table","title":"虚构门禁记录","locator":"测试材料 B，2025 年 6 月表","artifact_id":"fictional_access_log","table":"门禁记录","verification_status":"original_material"},
+    {"id":"labor_payroll","kind":"table","title":"虚构工资核算表","locator":"测试材料 C，第 3 行","artifact_id":"fictional_payroll","table":"工资差额","verification_status":"original_material"},
+    {"id":"labor_case_record","kind":"case_record","title":"虚构仲裁程序记录","locator":"测试卷宗 P1—P2","artifact_id":"fictional_arbitration_record","verification_status":"human_confirmed"}
+  ],
+  "layout_hints": {"direction":"timeline","preferred_root_ids":["labor_start"],"group_by":"status","max_initial_nodes":50,"timeline_lane":"by_procedure"},
+  "display_options": {"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance": {"generated_by":"human","generated_at":"2026-07-21T15:00:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["labor_contract","labor_access","labor_payroll","labor_case_record"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"新增纯虚构劳动争议时间轴场景","model_content_scope":"仅组织虚构时间信息和材料局限，不判断真实案件时效。","deterministic_content_scope":"校验、布局、交互与 HTML 由固定模板生成。"}
+}

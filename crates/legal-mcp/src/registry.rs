@@ -1,4 +1,5 @@
 use crate::approved_workspace;
+use crate::diagram_mcp;
 use clap::ValueEnum;
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde::Deserialize;
@@ -23,7 +24,21 @@ pub const REDACTED_CASE_TOOL_NAMES: [&str; 6] = [
     "citation_validate",
 ];
 
-pub const APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES: [&str; 15] = [
+pub const DIAGRAM_AUTHORING_TOOL_NAMES: [&str; 11] = [
+    "system_status",
+    "legal_search",
+    "legal_get_article",
+    "legal_get_versions",
+    "legal_get_relations",
+    "diagram.list_templates",
+    "diagram.get_schema",
+    "diagram.validate",
+    "diagram.render",
+    "diagram.update",
+    "diagram.export",
+];
+
+pub const APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES: [&str; 21] = [
     "system_status",
     "legal_search",
     "legal_get_article",
@@ -39,6 +54,12 @@ pub const APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES: [&str; 15] = [
     "case_write_work_product",
     "case_update_work_product",
     "case_export_work_product_manifest",
+    "diagram.list_templates",
+    "diagram.get_schema",
+    "diagram.validate",
+    "diagram.render",
+    "diagram.update",
+    "diagram.export",
 ];
 
 pub const DISABLED_SENSITIVE_TOOL_NAMES: [&str; 7] = [
@@ -64,6 +85,9 @@ pub enum PrivacyProfile {
     /// Public law plus opaque-ID-only approved generations and work products.
     #[value(name = "approved_case_workspace", alias = "approved-case-workspace")]
     ApprovedCaseWorkspace,
+    /// Public law plus local diagram authoring for synthetic or public inputs.
+    #[value(name = "diagram_authoring", alias = "diagram-authoring")]
+    DiagramAuthoring,
 }
 
 impl PrivacyProfile {
@@ -74,6 +98,7 @@ impl PrivacyProfile {
             Self::ApprovedCaseWorkspace => {
                 APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES.contains(&name)
             }
+            Self::DiagramAuthoring => DIAGRAM_AUTHORING_TOOL_NAMES.contains(&name),
         }
     }
 }
@@ -88,6 +113,7 @@ impl FromStr for PrivacyProfile {
             "approved_case_workspace" | "approved-case-workspace" => {
                 Ok(Self::ApprovedCaseWorkspace)
             }
+            "diagram_authoring" | "diagram-authoring" => Ok(Self::DiagramAuthoring),
             _ => Err("unsupported privacy profile"),
         }
     }
@@ -114,6 +140,7 @@ impl ToolRegistry {
         let mut candidates = build_tools(profile);
         if profile == PrivacyProfile::ApprovedCaseWorkspace {
             candidates.extend(approved_workspace::build_tools());
+            candidates.extend(diagram_mcp::build_approved_tools());
         }
         Self::from_candidates(profile, candidates)
     }
@@ -122,6 +149,7 @@ impl ToolRegistry {
         let profile = PrivacyProfile::ApprovedCaseWorkspace;
         let mut candidates = build_tools(profile);
         candidates.extend(approved_workspace::build_host_tools());
+        candidates.extend(diagram_mcp::build_approved_host_tools());
         Self::from_candidates(profile, candidates)
     }
 
@@ -154,7 +182,7 @@ impl ToolRegistry {
 }
 
 fn build_tools(profile: PrivacyProfile) -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         make_tool(
             "system_status",
             "System status",
@@ -461,7 +489,11 @@ fn build_tools(profile: PrivacyProfile) -> Vec<Tool> {
             }),
             Hints::mutating(true),
         ),
-    ]
+    ];
+    if profile == PrivacyProfile::DiagramAuthoring {
+        tools.extend(diagram_mcp::tools());
+    }
+    tools
 }
 
 #[derive(Clone, Copy)]
@@ -512,7 +544,9 @@ fn make_tool(
 
 fn citation_validate_input(profile: PrivacyProfile) -> Value {
     match profile {
-        PrivacyProfile::PublicLawOnly | PrivacyProfile::ApprovedCaseWorkspace => json!({
+        PrivacyProfile::PublicLawOnly
+        | PrivacyProfile::ApprovedCaseWorkspace
+        | PrivacyProfile::DiagramAuthoring => json!({
             "type":"object",
             "properties":{
                 "schema_version":schema_version(),

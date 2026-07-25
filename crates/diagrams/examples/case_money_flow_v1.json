@@ -1,0 +1,22 @@
+{
+  "schema_version":"1.0","diagram_type":"case_money_flow","template_id":"case_money_flow_v1","title":"虚构多笔转账与回流（注册样例）","summary":"演示两笔转出和一笔回流，账户、金额与主体均为虚构。",
+  "nodes":[
+    {"id":"cmf_from","type":"account","label":"测试账户 L-001","details":"虚构付款账户。","status":"active","importance":"critical","source_refs":["cmf_src"],"tags":["虚构账户"],"metadata":{"owner":"虚构出借人"}},
+    {"id":"cmf_to","type":"account","label":"测试账户 B-002","details":"虚构收款账户。","status":"active","importance":"critical","source_refs":["cmf_src"],"tags":["虚构账户"],"metadata":{"owner":"虚构借款人"}},
+    {"id":"cmf_amount_1","type":"amount","label":"转出 80,000.00 CNY","details":"虚构第一笔转账。","status":"completed","importance":"high","source_refs":["cmf_src"],"tags":["转出"],"metadata":{"amount":"80000.00","currency":"CNY","date":"2026-03-02","purpose":"fictional_loan_disbursement","voucher_source_ref":"cmf_src"}},
+    {"id":"cmf_amount_2","type":"amount","label":"转出 50,000.00 CNY","details":"虚构第二笔转账。","status":"completed","importance":"high","source_refs":["cmf_src"],"tags":["转出"],"metadata":{"amount":"50000.00","currency":"CNY","date":"2026-03-05","purpose":"fictional_loan_disbursement","voucher_source_ref":"cmf_src"}},
+    {"id":"cmf_back","type":"amount","label":"回流 18,000.00 CNY","details":"同日虚构反向款项，性质待核验。","status":"completed","importance":"critical","source_refs":["cmf_src"],"tags":["回流"],"metadata":{"amount":"18000.00","currency":"CNY","date":"2026-03-05","purpose":"unknown_backflow","voucher_source_ref":"cmf_src"}}
+  ],
+  "edges":[
+    {"id":"cmf_edge_1a","source":"cmf_from","target":"cmf_amount_1","relation":"transferred_to","label":"转出","strength":"strong","source_refs":["cmf_src"],"metadata":{"amount":"80000.00","currency":"CNY","date":"2026-03-02","voucher_source_ref":"cmf_src"}},
+    {"id":"cmf_edge_1b","source":"cmf_amount_1","target":"cmf_to","relation":"transferred_to","label":"入账","strength":"strong","source_refs":["cmf_src"],"metadata":{"amount":"80000.00","currency":"CNY","date":"2026-03-02","voucher_source_ref":"cmf_src"}},
+    {"id":"cmf_edge_2a","source":"cmf_from","target":"cmf_amount_2","relation":"transferred_to","label":"转出","strength":"strong","source_refs":["cmf_src"],"metadata":{"amount":"50000.00","currency":"CNY","date":"2026-03-05","voucher_source_ref":"cmf_src"}},
+    {"id":"cmf_edge_2b","source":"cmf_amount_2","target":"cmf_to","relation":"transferred_to","label":"入账","strength":"strong","source_refs":["cmf_src"],"metadata":{"amount":"50000.00","currency":"CNY","date":"2026-03-05","voucher_source_ref":"cmf_src"}},
+    {"id":"cmf_edge_back_a","source":"cmf_to","target":"cmf_back","relation":"transferred_to","label":"回流转出","strength":"strong","source_refs":["cmf_src"],"metadata":{"amount":"18000.00","currency":"CNY","date":"2026-03-05","voucher_source_ref":"cmf_src"}},
+    {"id":"cmf_edge_back_b","source":"cmf_back","target":"cmf_from","relation":"transferred_to","label":"回流入账","strength":"strong","source_refs":["cmf_src"],"metadata":{"amount":"18000.00","currency":"CNY","date":"2026-03-05","voucher_source_ref":"cmf_src"}}
+  ],
+  "groups":[],"sources":[{"id":"cmf_src","kind":"table","title":"虚构银行流水表","locator":"测试附件 F1，表 1","artifact_id":"fixture_money_flow","table":"表1","verification_status":"original_material"}],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["cmf_from"],"group_by":"status","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T11:25:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["cmf_src"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"注册表虚构样例","model_content_scope":"只整理虚构资金方向；回流性质保持未知。","deterministic_content_scope":"金额校验、布局和 HTML 渲染由固定模板完成。"}
+}

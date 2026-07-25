@@ -78,15 +78,21 @@ CLI、环境和配置文件存在优先级时，最终解析结果仍必须是 `
 
 不要在生产启用。虽然服务端实验 profile 能列出 receipt-gated `citation_validate`，当前 App 不能签发绑定该 MCP 用途的票据，正常调用必然 fail-closed。测试签名器和合成票据只证明拒绝/验证协议，不是部署凭据。
 
+## `diagram_authoring` 状态
+
+该 profile 永久只用于合成或公开材料的本地图示编写。它在公开五工具之外列出六个 `diagram.*` 工具，并生成明文 HTML bundle / 本地 artifact reference。不要为它提供 approved session，不要把真实、待复核或批准案件正文、来源引用或派生内容交给它。真实批准案件图示必须使用下节的 `approved_case_workspace`。
+
 ## `approved_case_workspace` 状态
 
-独立集成资产已提供并默认禁用。先在 App 中完成材料人工批准/发布、approved MCP 资格和 standalone session，再只把显示的 `srv_…` ID 写入精确 Windows stdio 模板：
+独立集成资产已提供并默认禁用。approved MCP policy v2 是 breaking boundary：先停止旧 approved host，在 App 中撤销所有旧 standalone session，再完成材料人工批准/发布、approved MCP 资格，并按最小权限选择 `read`（8）、`write`（2）、`diagram_read`（4）和/或 `diagram_write`（2）创建新 session。旧 `read` / `write` 不会获得图示权限。只把显示的 `srv_…` ID 写入精确 Windows stdio 模板：
 
 ```text
 lawyer-assistance-mcp --privacy-profile approved_case_workspace --approved-session-id <APP_ISSUED_SERVER_ID> stdio
 ```
 
-只使用 formal App 随包发布的 paired MCP sibling。release 构建先测量该 sibling 并把 SHA-256 编译进 App；普通未绑定 development App、复制来的同名 executable、版本/canary 模仿或任意其他 binary 不能取得 qualification。不要添加 config、数据库/根/路径、环境、Bearer、bind/origin 或 HTTP 参数，也不要通过修改 `enabled`、用户同意或放宽 Skill 绕过资格。缺失或失效的 paired hash/qualification/session/ticket 必须 `PROFILE_NOT_QUALIFIED` 或具体匿名失败；有效状态执行真实 handler。核对精确 15 工具、双通道残留扫描和三类宿主规则，详见[批准案件工作区 profile](approved-case-workspace.md)。
+只使用 formal App 随包发布的 paired MCP sibling。release 构建先测量该 sibling 并把 SHA-256 编译进 App；普通未绑定 development App、复制来的同名 executable、版本/canary 模仿或任意其他 binary 不能取得 qualification。不要添加 config、数据库/根/路径、环境、Bearer、bind/origin 或 HTTP 参数，也不要通过修改 `enabled`、用户同意或放宽 Skill 绕过资格。缺失或失效的 paired hash/qualification/session/ticket 必须 `PROFILE_NOT_QUALIFIED` 或具体匿名失败；有效状态执行真实 handler。核对精确 21 工具、四组 v2 grants、双通道残留扫描和三类宿主规则，详见[批准案件工作区 profile](approved-case-workspace.md)。
+
+批准图示的 `diagram.render` / `diagram.update` 只发布加密 protected HTML work-product version；`diagram.export` 只返回 verified descriptor metadata，不返回 HTML、路径或 URI。若宿主尝试使用 `artifact_uri`、输出目录或 `diagram_authoring` 明文 bundle，立即停止。
 
 宿主任务只能以 opaque ID 开始，不能附加/粘贴原件或提供真实路径。若原始材料已经进入任务，删除受污染任务并新建干净任务；不能在同一上下文继续。
 

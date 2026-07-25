@@ -8,12 +8,13 @@
 
 - Local MinerU is connected to App ingestion. `auto_local` routes only PDFs/pages needing visual OCR and `force_local` routes all PDF pages, but only while the signed current-machine qualification remains valid.
 - The App builds and signs a complete worker/tools/runtime/model inventory, installs and remeasures exact Windows Firewall outbound-block rules, runs the fixed synthetic canary, persists qualification, reloads it on restart, and invalidates it on expiry, revocation or environment/hash/version drift.
-- Approved material publication and all ten `approved_case_workspace` handlers execute against immutable signed generations. Work products use immutable versions, optimistic concurrency, idempotency, journal recovery, exact source binding, and residual scanning.
+- Approved material publication and all 16 non-public `approved_case_workspace` handlers execute against immutable signed generations or fixed public template/schema data. The profile now lists exactly 21 tools: five public-law, ten approved material/work-product, and six approved-diagram tools. Work products use immutable versions, optimistic concurrency, idempotency, journal recovery, exact source binding, and residual scanning.
 - Every work-product version persists exactly `content.envelope.json`, `manifest.json`, and `commit.json`. Content is encrypted with a fresh per-generation AES-256-GCM key and nonce; Windows DPAPI CurrentUser wraps the key, and authenticated data binds workspace/case/work-product/version, signed-manifest hash, content hash/size/media type. Only the scoped `WorkProductService` may authenticate and decrypt it after source, revocation, filesystem, manifest, commit, hash, and residual checks. A legacy plaintext `content.bin` or any extra/missing file fails closed.
-- Formal packaging first builds the paired MCP sibling, measures its SHA-256, and compiles that value into the App. Approved-MCP qualification requires this trust anchor in addition to sibling path/file identity, version and behavior; an unbound development App or substituted same-name binary fails closed. The actual sibling process has passed the stdio/HTTP approved-flow E2E.
+- Formal packaging first builds the paired MCP sibling, measures its SHA-256, and compiles that value into the App. Approved-MCP qualification requires this trust anchor in addition to sibling path/file identity, version and behavior; an unbound development App or substituted same-name binary fails closed. The earlier ten-case-tool sibling process passed its stdio/HTTP approved-flow E2E. The integrated final 21-tool binary must be rerun over both transports before release and is not claimed as passed here.
 - App-issued MCP tickets bind the server instance, transport, tool, schema, purpose, canonical request bytes, destination, target IDs/generation, nonce, expiry and revocation epoch. Consumption is persistent and replay protected.
 - The standalone approved-MCP wire replay journal is now V2. Each reservation persists an authenticated, session/server/epoch-bound pending transition in Windows Credential Manager before the SQLite commit, advances the authenticated head only for the exact expected next tail, and then clears the pending record. Recovery accepts only the exact one-step committed tail; a pre-database crash, missing pending record, multi-step advance, fork, rollback, binding mismatch or tamper remains fail closed and requires revocation plus reprovisioning. The pending record contains hashes/MACs and a nonce, never case text or ticket secrets.
-- Standalone approved hosts receive only an opaque App-issued `srv_…` ID. Session descriptors are DPAPI-protected and session secrets remain in Windows Credential Manager; static host assets contain no database/root/config path, environment secret, bearer or HTTP credential.
+- Standalone approved hosts receive only an opaque App-issued `srv_…` ID. Session descriptors are DPAPI-protected and session secrets remain in Windows Credential Manager; static host assets contain no database/root/config path, environment secret, bearer or HTTP credential. Approved-MCP policy v2 defines four explicit grant groups: `read` authorizes the original eight read case tools, `write` the original two write case tools, `diagram_read` four diagram read/validate/export tools, and `diagram_write` two diagram render/update tools. The original groups never silently expand, and every pre-v2 session must be revoked and recreated.
+- `diagram_authoring` remains a permanently synthetic/public profile whose HTML bundle is plaintext and addressed as a local artifact. It is not an approved-case path. Real approved-case diagrams use only `approved_case_workspace`: render/update publish encrypted protected HTML work-product versions and export returns verified descriptor metadata without path, URI, or HTML.
 - Approved Provider dispatch is a separate backend-restored type. It revalidates exact content/generation/Provider/endpoint/model/purpose/policy/detector/OCR/expiry/revocation immediately before transport. Naked case requests still fail before serialization and send zero network requests.
 - Safe reconstructed PDF, DOCX, TXT and Markdown exports reload the protected approval server-side, refuse unsafe/overwrite/link/cloud destinations, reread the installed file, compare content/hash, rescan residual risk, and append a generation-bound audit.
 - Privacy lifecycle UI covers retention, legal holds, expiry sweeps, protected output/work-product lifecycle, mapping reveal/revoke, mapping-key rotation/destruction, and crash recovery. It does not claim forensic media erasure.
@@ -34,7 +35,9 @@
 | Default profile | `public_law_only` |
 | Default tools | 5 read-only public-law tools |
 | Experimental profile | `redacted_case`: public five plus receipt-gated `citation_validate`; it remains separate from approved workspace sessions |
-| Qualified profile | `approved_case_workspace`: public five plus ten opaque-ID-only approved material/work-product tools |
+| Qualified profile | `approved_case_workspace`: public five + ten approved material/work-product + six approved-diagram tools = 21 |
+| Approved session policy | v2; 16 non-public grants split as `read` 8, `write` 2, `diagram_read` 4, `diagram_write` 2; older sessions must be recreated |
+| Synthetic diagram profile | `diagram_authoring`: public/synthetic data only; plaintext local HTML bundle; never approved case material |
 | Approved static transport | Windows stdio with an App-issued opaque standalone session ID |
 | Hidden legacy case tools | unavailable in every profile |
 
@@ -46,7 +49,9 @@
 4. `legal_get_versions`
 5. `legal_get_relations`
 
-The approved profile adds exactly:
+The approved profile adds exactly 16 non-public tools.
+
+Case material/work-product tools:
 
 1. `case_list`
 2. `case_get_public_metadata`
@@ -59,7 +64,16 @@ The approved profile adds exactly:
 9. `case_update_work_product`
 10. `case_export_work_product_manifest`
 
-No approved request accepts a path, filename, URI, URL, directory, glob, command, shell fragment, raw OCR, pending review content, private mapping, secret, bearer, or free metadata object. Both MCP result channels are independently privacy scanned.
+Approved-diagram tools:
+
+1. `diagram.list_templates`
+2. `diagram.get_schema`
+3. `diagram.validate`
+4. `diagram.render`
+5. `diagram.update`
+6. `diagram.export`
+
+No approved request accepts a path, filename, URI, URL, directory, glob, command, shell fragment, raw OCR, pending review content, private mapping, secret, bearer, or free metadata object. Approved `diagram.render`/`diagram.update` persist only encrypted protected `text/html`; approved `diagram.export` returns descriptor metadata only and never returns HTML, a path, or an artifact URI. Both MCP result channels are independently privacy scanned.
 
 ## Qualification and operating contract
 
@@ -112,7 +126,7 @@ See [`docs/privacy-vnext/OPERATIONS.md`](docs/privacy-vnext/OPERATIONS.md) for t
 
 ### Approved MCP
 
-1. **Breaking replay-journal migration:** stop every pre-V2 approved MCP host, revoke each old standalone session in the App, and create a fresh session. V1 Credential Manager state and `standalone-wire-replay-v1.sqlite` are never authenticated, migrated, rolled back or replayed as V2. Explicit revocation best-effort deletes the exact V1/V2 credential targets and fixed local replay files; any cleanup failure remains fail closed. Do not copy, rename, edit or reuse an old replay database or credential.
+1. **Breaking policy-v2 and replay-journal migration:** stop every older approved MCP host, revoke each old standalone session in the App, and create a fresh policy-v2 session. V1 Credential Manager state and `standalone-wire-replay-v1.sqlite` are never authenticated, migrated, rolled back or replayed as V2. Explicit revocation best-effort deletes the exact V1/V2 credential targets and fixed local replay files; any cleanup failure remains fail closed. Do not copy, rename, edit or reuse an old replay database or credential.
 2. Complete local App review and manual approval, publish the exact generation, and run approved-MCP qualification.
 3. Create a standalone session in the App and copy only its opaque `srv_…` ID into the disabled Windows stdio template:
 
@@ -120,8 +134,9 @@ See [`docs/privacy-vnext/OPERATIONS.md`](docs/privacy-vnext/OPERATIONS.md) for t
    lawyer-assistance-mcp --privacy-profile approved_case_workspace --approved-session-id <APP_ISSUED_SERVER_ID> stdio
    ```
 
-4. Do not add config/database/root/path/env/bearer/bind/origin/HTTP options. Require exactly 15 tools and start a clean host task with opaque IDs only.
-5. Stop on `PROFILE_NOT_QUALIFIED`, mismatch, expiry, revocation, replay, integrity or residual-scan errors. Never downgrade to a file, browser, another tool, remote OCR or copied text.
+4. Select only the required v2 grant groups: `read` (8 case reads), `write` (2 case writes), `diagram_read` (4 diagram reads/validate/export), and/or `diagram_write` (2 diagram render/update). The old `read`/`write` groups do not include diagram access.
+5. Do not add config/database/root/path/env/bearer/bind/origin/HTTP options. Require exactly 21 tools and start a clean host task with opaque IDs only. Use diagram tools for real cases only through this profile; render/update create encrypted protected HTML, and export returns metadata only.
+6. Stop on `PROFILE_NOT_QUALIFIED`, mismatch, expiry, revocation, replay, integrity or residual-scan errors. Never downgrade to `diagram_authoring`, a file, browser, another tool, remote OCR or copied text.
 
 ## Release assets and acceptance checklist
 

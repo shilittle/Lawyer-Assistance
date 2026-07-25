@@ -744,6 +744,8 @@ pub struct WorkProductManifestV1 {
     pub source_approved_refs: Vec<ApprovedMaterialRefV1>,
     pub content_media_type: String,
     pub content_sha256: Sha256Hex,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagram_spec_sha256: Option<Sha256Hex>,
     pub content_bytes: u64,
     pub placeholder_policy_version: String,
     pub residual_scan_hash: Sha256Hex,
@@ -754,6 +756,20 @@ pub struct WorkProductManifestV1 {
 
 impl WorkProductManifestV1 {
     pub fn validate(&self) -> Result<(), VNextSchemaError> {
+        let diagram_binding_is_valid = if self.task_type == "legal_diagram" {
+            self.content_media_type == "text/html"
+                && self.diagram_spec_sha256.is_some()
+                && matches!(
+                    self.author_tool.as_str(),
+                    "diagram.render" | "diagram.update"
+                )
+        } else {
+            self.diagram_spec_sha256.is_none()
+                && !matches!(
+                    self.author_tool.as_str(),
+                    "diagram.render" | "diagram.update"
+                )
+        };
         if self.schema_version != WORK_PRODUCT_MANIFEST_VERSION
             || self.version == 0
             || self.content_bytes == 0
@@ -765,6 +781,7 @@ impl WorkProductManifestV1 {
             || self.placeholder_policy_version.is_empty()
             || self.author_tool.is_empty()
             || self.author_tool_version.is_empty()
+            || !diagram_binding_is_valid
             || (self.version == 1 && self.expected_parent_version.is_some())
             || (self.version > 1 && self.expected_parent_version != Some(self.version - 1))
         {

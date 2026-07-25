@@ -3,7 +3,7 @@ use crate::atomic_file;
 use hmac::{Hmac, Mac};
 use legal_mcp::approved_backend::{
     ApprovedMcpQualificationSnapshotV1, ApprovedWorkspaceQualificationError,
-    ApprovedWorkspaceQualificationProvider,
+    ApprovedWorkspaceQualificationProvider, APPROVED_MCP_POLICY_ID, APPROVED_MCP_POLICY_VERSION,
 };
 use legal_mcp::release_binary::{measure_release_binary, ReleaseBinaryMeasurement};
 use privacy::vnext::{canonical_json_v1, strict_json_v1_from_slice, Sha256Hex};
@@ -24,8 +24,6 @@ type HmacSha256 = Hmac<Sha256>;
 const EVIDENCE_SCHEMA: &str = "lawyer-assistance-approved-mcp-qualification-v1";
 const EVIDENCE_DOMAIN: &[u8] = b"lawyer-assistance\0approved-mcp-qualification-evidence-v1\0";
 const EVIDENCE_FILE: &str = "active-evidence-v1.json";
-const POLICY_ID: &str = "approved-mcp-local-egress-v1";
-const POLICY_VERSION: u64 = 1;
 const MIN_QUALIFICATION_TTL_SECONDS: u64 = 60;
 const MAX_QUALIFICATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
@@ -129,8 +127,8 @@ impl ApprovedMcpQualificationStatus {
             mcp_binary_sha256: None,
             mcp_binary_version: None,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            policy_id: POLICY_ID.to_owned(),
-            policy_version: POLICY_VERSION,
+            policy_id: APPROVED_MCP_POLICY_ID.to_owned(),
+            policy_version: APPROVED_MCP_POLICY_VERSION,
             server_key_id: None,
             server_key_version: KEY_VERSION,
             revocation_epoch: None,
@@ -270,8 +268,8 @@ impl DesktopApprovedMcpQualificationProvider {
             stdio_canary_passed: canaries_passed,
             streamable_http_canary_passed: canaries_passed,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            policy_id: POLICY_ID.to_owned(),
-            policy_version: POLICY_VERSION,
+            policy_id: APPROVED_MCP_POLICY_ID.to_owned(),
+            policy_version: APPROVED_MCP_POLICY_VERSION,
             mcp_binary_path_identity_sha256: expected.binary_path_identity_sha256.clone(),
             mcp_binary_file_identity_sha256: expected.binary_file_identity_sha256.clone(),
             mcp_binary_sha256: expected.binary_sha256.clone(),
@@ -402,8 +400,8 @@ impl DesktopApprovedMcpQualificationProvider {
             return Err(qualification_state_error());
         }
         let exact_app_policy_binding = envelope.claims.app_version == env!("CARGO_PKG_VERSION")
-            && envelope.claims.policy_id == POLICY_ID
-            && envelope.claims.policy_version == POLICY_VERSION;
+            && envelope.claims.policy_id == APPROVED_MCP_POLICY_ID
+            && envelope.claims.policy_version == APPROVED_MCP_POLICY_VERSION;
         let exact_server_key_binding = envelope.claims.server_key_id
             == binding.expected.server_key_id
             && envelope.claims.server_key_version == binding.expected.server_key_version;

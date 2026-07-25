@@ -38,13 +38,15 @@ python -m unittest integrations.test_validate_approved_workspace_examples
 8. 带可靠文本层的 PDF 可原生处理；`auto_local`/`force_local` 仅在完整签名资格有效时提供本地 OCR runner。缺失/漂移时扫描/视觉 PDF 必须拒绝，不能回退 SSH、云 OCR、下载或网络。
 9. 本地 MinerU 测试覆盖参数白名单、受控环境、进程树/网络隔离、预后身份、模型全集、超时/取消、页/输出边界、signed sharded package exact hashes 与 final installed path 的 259 UTF-16 gate；单测、component install/re-measure、direct GPU diagnostic 与最终 App/Firewall/Job production E2E 必须分开记录。
 10. WorkBuddy/Codex/OpenCode 的第一操作性规则覆盖 `CASE_RAW`、待复核与仅标签 approved，并保留“pre-Skill 披露无法阻止或撤回”的说明。
-11. `approved_case_workspace` 精确列出 15 项；未资格化调用返回 `PROFILE_NOT_QUALIFIED` 且不回显参数；formal build 必须先测量 paired MCP sibling 并把 SHA-256 编译进 App，缺失/畸形/错 hash/same-name substitution 必须 fail closed；已资格化 actual binary stdio/HTTP 必须完成 read/write/update/reread/replay 正向与负向 E2E。
-12. 三类 approved 宿主副本只信当前 approved read 直接响应，搜索/列表只导航 ID，成果只经 write/update 写回，并显式禁止附件/粘贴/宿主文件/浏览器/远程 OCR/其他 MCP 或 Skill/memory/subagent/未批准 Provider。
-13. public-only 与 approved validator 独立运行；新增 profile 不改变默认五项及其宿主白名单。
+11. `approved_case_workspace` 精确列出 21 项（公开 5 + 案件 10 + 图示 6）；未资格化调用返回 `PROFILE_NOT_QUALIFIED` 且不回显参数；formal build 必须先测量 paired MCP sibling 并把 SHA-256 编译进 App，缺失/畸形/错 hash/same-name substitution 必须 fail closed；集成后的 actual binary stdio/HTTP 必须完成 case 与 diagram 的正负向 E2E。
+12. policy v2 session grants 必须精确为 `read=8`、`write=2`、`diagram_read=4`、`diagram_write=2`；验证旧 read/write 未新增工具、旧 session 被拒绝且必须重建、无对应 diagram grant 时不创建任何 work product。
+13. `diagram_authoring` 仅用合成/公开 fixture 验证明文 bundle；approved diagram render/update 必须发布加密 protected HTML，export 只返回 descriptor metadata，schema/响应/错误均不得出现 path、URI 或 HTML，来源撤销后 update/export fail closed。
+14. 三类 approved 宿主副本只信当前 approved read 直接响应，搜索/列表只导航 ID，成果只经 case write/update 或 approved diagram render/update 写回，并显式禁止附件/粘贴/宿主文件/浏览器/远程 OCR/其他 MCP 或 Skill/memory/subagent/未批准 Provider。
+15. public-only 与 approved validator 独立运行；新增 profile 不改变默认五项及其宿主白名单。
 
 ## 人工宿主验收
 
-public-only 验收只使用公开法律查询：连接、核对精确五工具、`system_status`、法律检索、版本、条文和关系。approved 验收另建干净任务，只用合成 opaque ID，核对 15 工具并完成 direct approved read、write/update、exact-version reread、revoke/replay 失败；任何证据都不得泄露正文、路径、session secret 或 ticket。
+public-only 验收只使用公开法律查询：连接、核对精确五工具、`system_status`、法律检索、版本、条文和关系。approved 验收另建干净任务，只用合成 opaque ID，核对 21 工具和四组 v2 grants，完成 direct approved read、case write/update、diagram validate/render/update/export、exact-version reread、revoke/replay 失败；断言 protected diagram work product 已加密且 export 无 path/URI/HTML。任何证据都不得泄露正文、路径、session secret 或 ticket。较早的 15-tool actual-binary 证据保留为历史 baseline，但不能替代集成后 21-tool binary 的 stdio/HTTP 复跑。
 
 不要把真实或“已脱敏”的案件文件用于截图。若要验证 pre-Skill 风险，仅使用明确合成 canary，并按宿主数据保留政策清理。
 

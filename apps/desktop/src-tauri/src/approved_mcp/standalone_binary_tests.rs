@@ -35,6 +35,39 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_ATTEMPTS: usize = 50;
 const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
 
+fn approved_diagram_spec(publication_id: &str) -> Value {
+    let mut spec: Value = serde_json::from_str(include_str!(
+        "../../../../../crates/diagrams/examples/case_issue_evidence_law_v1.json"
+    ))
+    .expect("approved diagram fixture");
+    spec["title"] = json!("[PERSON_001] approved diagram grant test");
+    spec["summary"] = json!("Alias-only synthetic approved diagram.");
+    spec["sources"] = json!([{
+        "id":publication_id,
+        "kind":"case_record",
+        "title":"Approved source",
+        "locator":"Approved publication",
+        "artifact_id":publication_id,
+        "verification_status":"human_confirmed"
+    }]);
+    for collection in ["nodes", "edges", "groups"] {
+        for item in spec[collection].as_array_mut().expect("diagram collection") {
+            item["source_refs"] = json!([publication_id]);
+            if let Some(metadata) = item
+                .as_object_mut()
+                .and_then(|object| object.get_mut("metadata"))
+                .and_then(Value::as_object_mut)
+            {
+                if metadata.contains_key("official_source") {
+                    metadata.insert("official_source".to_owned(), json!(publication_id));
+                }
+            }
+        }
+    }
+    spec["provenance"]["source_file_ids"] = json!([publication_id]);
+    spec
+}
+
 struct E2eAppRoot {
     path: PathBuf,
 }
@@ -582,6 +615,12 @@ fn run_real_stdio_chain(
             "case_write_work_product",
             "case_update_work_product",
             "case_export_work_product_manifest",
+            "diagram.list_templates",
+            "diagram.get_schema",
+            "diagram.validate",
+            "diagram.render",
+            "diagram.update",
+            "diagram.export",
         ]
     );
     let approved_tools = tools["result"]["tools"]
@@ -591,16 +630,27 @@ fn run_real_stdio_chain(
         .filter(|tool| {
             tool["name"]
                 .as_str()
-                .is_some_and(|name| name.starts_with("case_"))
+                .is_some_and(|name| name.starts_with("case_") || name.starts_with("diagram."))
         })
         .collect::<Vec<_>>();
-    assert_eq!(approved_tools.len(), 10);
+    assert_eq!(approved_tools.len(), 16);
     for tool in approved_tools {
         let schema = serde_json::to_string(&tool["inputSchema"]).expect("tool input schema");
         assert!(
             !schema.contains("access_ticket"),
             "standalone host schema must hide internal access tickets"
         );
+        if tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("diagram."))
+        {
+            for forbidden in ["artifact_uri", "file_name", "attachment", "\"path\""] {
+                assert!(
+                    !schema.contains(forbidden),
+                    "approved diagram host schema must hide {forbidden}"
+                );
+            }
+        }
     }
     assert_no_sensitive(
         &serde_json::to_string(&tools).expect("tools/list response JSON"),
@@ -959,6 +1009,73 @@ fn run_read_only_grant_negative(
     let stderr = stdio.finish();
     assert_clean_process_output(&[], &stderr, &[RAW_PARTY, RAW_PHONE, receipt_token]);
     reaper.revoke(&server_id);
+
+    let legacy_case_session = workspace
+        .provision_standalone_session(
+            "codex".to_owned(),
+            McpTransportBindingV1::Stdio,
+            vec![
+                ApprovedMcpGrantGroupV1::Read,
+                ApprovedMcpGrantGroupV1::Write,
+            ],
+            5 * 60,
+            fixture.host_binding(None),
+        )
+        .expect("provision legacy case-only descriptor");
+    assert_eq!(legacy_case_session.metadata.grants.len(), 10);
+    assert!(legacy_case_session
+        .metadata
+        .grants
+        .iter()
+        .all(|grant| !grant.tool_name.starts_with("diagram.")));
+    let legacy_server_id = legacy_case_session.metadata.server_instance_id.clone();
+    reaper.track(&legacy_server_id);
+    drop(legacy_case_session);
+
+    let mut legacy_stdio = StdioHarness::start(binary, local_app_data, &legacy_server_id);
+    let initialized = legacy_stdio.request(initialize_request(10));
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    legacy_stdio.notify(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let before = legacy_stdio.request(tool_request(
+        11,
+        "case_list_work_products",
+        json!({"schema_version":1,"case_id":published.case_id}),
+    ));
+    require_success(&before);
+    let denied_diagram = legacy_stdio.request(tool_request(
+        12,
+        "diagram.render",
+        json!({
+            "schema_version":1,
+            "case_id":published.case_id,
+            "source_approved_refs":[{
+                "material_id":published.material_id,
+                "publication_id":published.publication_id
+            }],
+            "spec":approved_diagram_spec(&published.publication_id),
+            "status":"draft",
+            "idempotency_key":format!("idem_{}",uuid::Uuid::new_v4().simple())
+        }),
+    ));
+    require_reason(&denied_diagram, "STANDALONE_GRANT_DENIED");
+    let after = legacy_stdio.request(tool_request(
+        13,
+        "case_list_work_products",
+        json!({"schema_version":1,"case_id":published.case_id}),
+    ));
+    require_success(&after);
+    assert_eq!(
+        after["result"]["structuredContent"]["data"]["items"],
+        before["result"]["structuredContent"]["data"]["items"],
+        "denied diagram.render must not create a work product"
+    );
+    assert_no_sensitive(
+        &serde_json::to_string(&denied_diagram).expect("diagram grant denial JSON"),
+        &[RAW_PARTY, RAW_PHONE, receipt_token],
+    );
+    let stderr = legacy_stdio.finish();
+    assert_clean_process_output(&[], &stderr, &[RAW_PARTY, RAW_PHONE, receipt_token]);
+    reaper.revoke(&legacy_server_id);
 }
 
 #[allow(clippy::too_many_arguments)]

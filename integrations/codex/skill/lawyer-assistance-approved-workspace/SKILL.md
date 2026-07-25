@@ -29,7 +29,7 @@ Only submit schema-defined opaque IDs and bounded contract values. Never submit 
 
 ## Workflow and sink
 
-1. Follow [preflight](references/install-and-preflight.md) and require the exact 15-tool qualified surface.
+1. Follow [preflight](references/install-and-preflight.md) and require the exact 21-tool qualified surface; the broker authorizes calls only for the App-issued session's explicitly selected grant groups.
 2. Navigate by opaque IDs and obtain substantive content only through a current exact approved read.
 3. Analyze only that approved redacted content with the deployment-approved Provider. Preserve placeholders and never recover identities or mappings.
 4. Keep case content away from browser/search, email/cloud, another MCP/Skill, memory, subagents, files, and all unapproved Providers.
@@ -38,7 +38,17 @@ Only submit schema-defined opaque IDs and bounded contract values. Never submit 
 `WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
 `WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
 
+`DIAGRAM_WORK_PRODUCT_SINK=diagram.render|diagram.update`
+`DIAGRAM_WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
+`DIAGRAM_GRANTS=diagram_read|diagram_write`
+`DIAGRAM_STORAGE=encrypted_protected_work_product`
+`DIAGRAM_EXPORT=verified_descriptor_metadata_only`
+`DIAGRAM_INPUT_FORBIDDEN=path|filename|artifact_uri|attachment`
+`DIAGRAM_AUTHORING_SCOPE=synthetic_public_only`
+
 Create with `case_write_work_product`; revise with `case_update_work_product` and the expected parent version. Immediately read the exact returned work-product ID and version with `case_read_work_product`; trust only that current-task read-back and stop on any version, source-binding, content-hash, status, or placeholder mismatch. Bind exact approved source references, retain placeholders, and stop on a residual-scan rejection. Do not use shell, filesystem, document export, attachment, paste, or another connector as a substitute. `case_export_work_product_manifest` returns verification metadata, not a filesystem export authority.
+
+Case diagrams require explicit `diagram_read` and `diagram_write` grants. Construct the Spec only from current direct approved reads, bind their exact generations in `source_approved_refs`, and persist through `diagram.render` or `diagram.update`. Both return only opaque work-product metadata; immediately verify the exact returned ID/version with `case_read_work_product`. `diagram.export` returns only verified descriptor metadata bound to the signed work-product manifest—never HTML, a path, a URI, or filesystem authority. The separate `diagram_authoring` profile is restricted to synthetic/public material.
 
 Read as needed:
 

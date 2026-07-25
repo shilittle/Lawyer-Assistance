@@ -110,6 +110,8 @@ pub struct WorkProductWriteV1 {
     pub status: String,
     pub source_approved_refs: Vec<ApprovedMaterialRefV1>,
     pub content_media_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagram_spec_sha256: Option<Sha256Hex>,
     pub placeholder_policy_version: String,
     pub author_tool: String,
     pub author_tool_version: String,
@@ -118,6 +120,20 @@ pub struct WorkProductWriteV1 {
 
 impl WorkProductWriteV1 {
     fn validate(&self) -> Result<(), WorkProductError> {
+        let diagram_binding_is_valid = if self.task_type == "legal_diagram" {
+            self.content_media_type == "text/html"
+                && self.diagram_spec_sha256.is_some()
+                && matches!(
+                    self.author_tool.as_str(),
+                    "diagram.render" | "diagram.update"
+                )
+        } else {
+            self.diagram_spec_sha256.is_none()
+                && !matches!(
+                    self.author_tool.as_str(),
+                    "diagram.render" | "diagram.update"
+                )
+        };
         if !safe_token(&self.task_type, 64)
             || !matches!(
                 self.task_type.as_str(),
@@ -127,12 +143,14 @@ impl WorkProductWriteV1 {
                     | "evidence_summary"
                     | "timeline"
                     | "citation_review"
+                    | "legal_diagram"
             )
             || !matches!(self.status.as_str(), "draft" | "final")
             || !safe_media_type(&self.content_media_type)
             || !safe_token(&self.placeholder_policy_version, 128)
             || !safe_token(&self.author_tool, 128)
             || !safe_token(&self.author_tool_version, 128)
+            || !diagram_binding_is_valid
             || !valid_idempotency_key(&self.idempotency_key)
             || self.source_approved_refs.is_empty()
             || self.source_approved_refs.len() > 256
@@ -534,6 +552,7 @@ impl WorkProductPublisher {
             source_approved_refs: request.source_approved_refs,
             content_media_type: request.content_media_type,
             content_sha256: content_sha256.clone(),
+            diagram_spec_sha256: request.diagram_spec_sha256,
             content_bytes,
             placeholder_policy_version: request.placeholder_policy_version,
             residual_scan_hash,
@@ -1908,7 +1927,10 @@ fn safe_token(value: &str, maximum: usize) -> bool {
 }
 
 fn safe_media_type(value: &str) -> bool {
-    matches!(value, "text/plain" | "text/markdown" | "application/json")
+    matches!(
+        value,
+        "text/plain" | "text/markdown" | "text/html" | "application/json"
+    )
 }
 
 fn valid_idempotency_key(value: &str) -> bool {
@@ -2016,11 +2038,48 @@ mod tests {
             status: "draft".to_owned(),
             source_approved_refs: vec![reference],
             content_media_type: "text/markdown".to_owned(),
+            diagram_spec_sha256: None,
             placeholder_policy_version: "placeholder-v1".to_owned(),
             author_tool: "case_write_work_product".to_owned(),
             author_tool_version: "1".to_owned(),
             idempotency_key: key.to_owned(),
         }
+    }
+
+    #[test]
+    fn legal_diagram_write_contract_requires_specialized_author_media_and_spec_hash() {
+        let (_, _, material_id, publication_id) = ids();
+        let reference = ApprovedMaterialRefV1 {
+            material_id,
+            document_version: 1,
+            publication_id,
+            manifest_sha256: hash(b"manifest"),
+        };
+        let mut diagram = request(reference, "diagram-contract-0001");
+        diagram.task_type = "legal_diagram".to_owned();
+        diagram.content_media_type = "text/html".to_owned();
+        diagram.diagram_spec_sha256 = Some(hash(b"diagram-spec"));
+        diagram.author_tool = "diagram.render".to_owned();
+        diagram.validate().expect("specialized diagram contract");
+
+        let mut missing_hash = diagram.clone();
+        missing_hash.diagram_spec_sha256 = None;
+        assert_eq!(missing_hash.validate(), Err(WorkProductError::InvalidInput));
+
+        let mut generic_author = diagram.clone();
+        generic_author.author_tool = "case_update_work_product".to_owned();
+        assert_eq!(
+            generic_author.validate(),
+            Err(WorkProductError::InvalidInput)
+        );
+
+        let mut wrong_media = diagram.clone();
+        wrong_media.content_media_type = "text/markdown".to_owned();
+        assert_eq!(wrong_media.validate(), Err(WorkProductError::InvalidInput));
+
+        let mut generic = diagram;
+        generic.task_type = "case_analysis".to_owned();
+        assert_eq!(generic.validate(), Err(WorkProductError::InvalidInput));
     }
 
     struct Fixture {

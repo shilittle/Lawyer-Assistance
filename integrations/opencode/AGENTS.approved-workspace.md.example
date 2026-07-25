@@ -17,4 +17,14 @@ Only content returned directly by the current task's `case_read_approved_materia
 `WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
 `WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
 
+`DIAGRAM_WORK_PRODUCT_SINK=diagram.render|diagram.update`
+`DIAGRAM_WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
+`DIAGRAM_GRANTS=diagram_read|diagram_write`
+`DIAGRAM_STORAGE=encrypted_protected_work_product`
+`DIAGRAM_EXPORT=verified_descriptor_metadata_only`
+`DIAGRAM_INPUT_FORBIDDEN=path|filename|artifact_uri|attachment`
+`DIAGRAM_AUTHORING_SCOPE=synthetic_public_only`
+
 Write substantive results only through those two immutable work-product tools, then call `case_read_work_product` for the exact returned ID/version and trust only the current-task read-back. Stop on version, source-binding, content-hash, status, or placeholder mismatch. Bind exact approved sources, preserve placeholders, and never recover an identity. Do not send case material or results to outside search, another MCP/Skill/Provider, a subagent, memory, or filesystem export. The Skill is defense in depth, not a substitute for backend verification, ACLs, network policy, or Provider approval.
+
+Case diagrams require explicit `diagram_read` and `diagram_write` grants. Build only from current direct approved reads and bind their exact `source_approved_refs`; persist through `diagram.render` or `diagram.update`, then verify the exact opaque work-product ID/version via `case_read_work_product`. `diagram.export` is descriptor-only and never grants HTML, path, URI, or filesystem access. The `diagram_authoring` profile is synthetic/public only.

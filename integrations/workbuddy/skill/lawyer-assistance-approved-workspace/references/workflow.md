@@ -9,4 +9,6 @@
 7. After each create/update, call `case_read_work_product` with the exact returned ID and version; stop unless the current response matches version, bound source generation, content hash, status, and placeholders.
 8. Return only the verified opaque work-product ID, version, status, and safe reason codes in chat.
 
+For an approved case diagram, explicitly require the `diagram_read` and `diagram_write` groups. Build the Spec only from the current direct approved-material reads, bind their exact generations in `source_approved_refs`, call `diagram.validate`, then persist through `diagram.render`. For an in-task revision, provide the exact parent work-product ID/version, base Spec/hash, and bounded patch to `diagram.update`. Immediately verify every returned ID/version with `case_read_work_product`. Use `diagram.export` only to obtain verified descriptor metadata bound to the signed work-product manifest; it never returns HTML, a path, or a URI.
+
 Never use host export or filesystem output. `case_export_work_product_manifest` verifies and returns a manifest only.

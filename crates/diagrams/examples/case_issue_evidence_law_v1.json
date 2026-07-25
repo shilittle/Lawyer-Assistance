@@ -1,0 +1,24 @@
+{
+  "schema_version":"1.0","diagram_type":"case_issue_evidence_law","template_id":"case_issue_evidence_law_v1","title":"虚构买卖交付争点（注册样例）","summary":"演示争点、事实、证据、规则与缺失信息，全部内容均为虚构。",
+  "nodes":[
+    {"id":"ciel_issue","type":"issue","label":"货物是否完成交付","details":"签收人身份存在争议。","status":"disputed","importance":"critical","source_refs":["ciel_delivery"],"tags":["虚构","买卖合同"],"metadata":{}},
+    {"id":"ciel_fact","type":"fact","label":"卖方主张已交货","details":"仅由虚构送货单复印件支持。","status":"alleged","importance":"high","source_refs":["ciel_delivery"],"tags":["虚构事实"],"metadata":{"date":"2026-04-08","date_precision":"day"}},
+    {"id":"ciel_evidence","type":"evidence","label":"送货单复印件","details":"无原件且签收人身份不明。","status":"supported","importance":"high","source_refs":["ciel_delivery"],"tags":["证据不足"],"metadata":{"evidence_name":"虚构送货单复印件","evidence_type":"document_copy","authenticity":"unverified","is_original":false,"examined":false,"probative_value":"weak","defects":["无原件","签收人身份不明"]}},
+    {"id":"ciel_rule","type":"rule","label":"虚构交付证明规则","details":"主张交付的一方需要提供足以支持其主张的材料。","status":"effective","importance":"high","source_refs":["ciel_rule_src"],"tags":["虚构规则"],"metadata":{"full_name":"示例交付证明规则（虚构）","version":"2026-test-v1","validity_status":"fictional_only","official_source":"lawyer-assistance://fixtures/delivery-rule"}},
+    {"id":"ciel_missing","type":"missing_information","label":"缺少签收人授权资料","details":"需要补充身份与授权材料。","status":"unknown","importance":"critical","source_refs":["ciel_delivery"],"tags":["待补证"],"metadata":{"requested_item":"receiver_identity_and_authority"}}
+  ],
+  "edges":[
+    {"id":"ciel_edge_proves","source":"ciel_evidence","target":"ciel_fact","relation":"proves","label":"拟证明交付","strength":"weak","source_refs":["ciel_delivery"],"metadata":{}},
+    {"id":"ciel_edge_supports","source":"ciel_fact","target":"ciel_issue","relation":"supports","label":"弱支持已交付主张","strength":"weak","source_refs":["ciel_delivery"],"metadata":{}},
+    {"id":"ciel_edge_apply","source":"ciel_rule","target":"ciel_issue","relation":"applies_to","label":"适用于争点","strength":"strong","source_refs":["ciel_rule_src"],"metadata":{}},
+    {"id":"ciel_edge_requires","source":"ciel_rule","target":"ciel_evidence","relation":"requires","label":"需要证据核验","strength":"moderate","source_refs":["ciel_rule_src"],"metadata":{}}
+  ],
+  "groups":[{"id":"ciel_group","label":"交付争点","node_ids":["ciel_issue","ciel_fact","ciel_evidence","ciel_missing"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["ciel_delivery"]}],
+  "sources":[
+    {"id":"ciel_delivery","kind":"attachment","title":"虚构送货单复印件","locator":"测试附件 D1","artifact_id":"fixture_delivery_copy","attachment":"D1","verification_status":"original_material"},
+    {"id":"ciel_rule_src","kind":"human_input","title":"虚构交付规则设定","locator":"仓库测试样例，无现实法律效力","verification_status":"human_confirmed"}
+  ],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["ciel_issue"],"group_by":"issue","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T11:20:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["ciel_delivery","ciel_rule_src"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"注册表虚构样例","model_content_scope":"仅整理虚构争点与证据缺口，不确认事实。","deterministic_content_scope":"校验、布局和 HTML 渲染由固定模板完成。"}
+}

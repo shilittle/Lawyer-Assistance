@@ -1,0 +1,28 @@
+{
+  "schema_version":"1.0","diagram_type":"case_party_relationship","template_id":"case_party_relationship_v1",
+  "title":"虚构多方担保关系","summary":"演示债权人、债务人、两个保证人和抵押提供方之间的多方关系，全部主体均为虚构。",
+  "nodes":[
+    {"id":"party_creditor","type":"party","label":"星河商贸有限公司","details":"虚构债权人。","status":"active","importance":"critical","source_refs":["src_contract"],"tags":["虚构","债权人"],"metadata":{"role":"债权人","organization_type":"company"}},
+    {"id":"party_debtor","type":"party","label":"远岚制造有限公司","details":"虚构债务人。","status":"active","importance":"critical","source_refs":["src_contract"],"tags":["虚构","债务人"],"metadata":{"role":"债务人","organization_type":"company"}},
+    {"id":"party_guarantor_one","type":"party","label":"青禾服务有限公司","details":"虚构保证人之一。","status":"active","importance":"high","source_refs":["src_guarantee_one"],"tags":["虚构","保证人"],"metadata":{"role":"保证人","organization_type":"company"}},
+    {"id":"party_guarantor_two","type":"party","label":"自然人戊某乙","details":"虚构保证人之二，不对应真实个人。","status":"active","importance":"high","source_refs":["src_guarantee_two"],"tags":["虚构","保证人"],"metadata":{"role":"保证人","organization_type":"individual"}},
+    {"id":"party_mortgagor","type":"party","label":"云泽资产有限公司","details":"虚构抵押提供方。","status":"active","importance":"normal","source_refs":["src_mortgage"],"tags":["虚构","担保提供方"],"metadata":{"role":"抵押提供方","organization_type":"company"}}
+  ],
+  "edges":[
+    {"id":"edge_debt","source":"party_debtor","target":"party_creditor","relation":"owes","label":"负有虚构货款债务","strength":"strong","source_refs":["src_contract"],"metadata":{"amount":"500000.00","currency":"CNY"}},
+    {"id":"edge_guarantee_one","source":"party_guarantor_one","target":"party_debtor","relation":"guarantees","label":"对债务提供保证","strength":"strong","source_refs":["src_guarantee_one"],"metadata":{"scope":"principal_and_fictional_costs"}},
+    {"id":"edge_guarantee_two","source":"party_guarantor_two","target":"party_debtor","relation":"guarantees","label":"对债务提供保证","strength":"moderate","source_refs":["src_guarantee_two"],"metadata":{"scope":"principal_only"}},
+    {"id":"edge_mortgage","source":"party_mortgagor","target":"party_debtor","relation":"guarantees","label":"以虚构设备提供担保","strength":"moderate","source_refs":["src_mortgage"],"metadata":{"collateral":"fictional_equipment"}},
+    {"id":"edge_contract","source":"party_creditor","target":"party_debtor","relation":"contracts_with","label":"签订虚构采购合同","strength":"strong","source_refs":["src_contract"],"metadata":{}}
+  ],
+  "groups":[{"id":"group_security","label":"担保主体","node_ids":["party_guarantor_one","party_guarantor_two","party_mortgagor"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["src_guarantee_one","src_guarantee_two","src_mortgage"]}],
+  "sources":[
+    {"id":"src_contract","kind":"file_page","title":"虚构采购合同","locator":"测试合同第 2 页","artifact_id":"fixture_contract","page":2,"verification_status":"original_material"},
+    {"id":"src_guarantee_one","kind":"attachment","title":"虚构保证文件一","locator":"测试附件 G1","artifact_id":"fixture_g1","attachment":"G1","verification_status":"original_material"},
+    {"id":"src_guarantee_two","kind":"attachment","title":"虚构保证文件二","locator":"测试附件 G2","artifact_id":"fixture_g2","attachment":"G2","verification_status":"original_material"},
+    {"id":"src_mortgage","kind":"attachment","title":"虚构抵押清单","locator":"测试附件 M1","artifact_id":"fixture_m1","attachment":"M1","verification_status":"original_material"}
+  ],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["party_creditor","party_debtor"],"group_by":"party","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T10:20:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["src_contract","src_guarantee_one","src_guarantee_two","src_mortgage"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"第一阶段纯虚构多方担保样例","model_content_scope":"只整理虚构主体、债务与担保关系，不判断现实责任。","deterministic_content_scope":"关系校验、布局和 HTML 渲染由固定模板完成。"}
+}

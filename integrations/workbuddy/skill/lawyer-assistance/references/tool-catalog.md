@@ -12,4 +12,4 @@
 
 所有调用都显式传入 `schema_version: 1`。历史检索日期字段为 `case_date`（`YYYY-MM-DD`）；这里只能填写公开研究基准日期，不能填写从真实案件材料得出的日期。
 
-本 public-only 连接器的工具列表出现任何额外项时立即停用。案件材料、案件状态、个案引证、写入和导出能力在此 package 刻意不可用；独立 approved package 使用另一个精确 15 工具 catalog 和 App-issued session。不得借助附件、粘贴、宿主文件、命令、网络、其他 MCP/Skill、memory 或 subagent 重建或桥接流程。
+本 public-only 连接器的工具列表出现任何额外项时立即停用。案件材料、案件状态、个案引证、写入和导出能力在此 package 刻意不可用；独立 approved package 使用另一个精确 21 工具 catalog 和 App-issued session。不得借助附件、粘贴、宿主文件、命令、网络、其他 MCP/Skill、memory 或 subagent 重建或桥接流程。

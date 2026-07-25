@@ -83,7 +83,7 @@ workspace/<case-id>/work-products/<work-product-id>/<version>/
 
 ### `approved_case_workspace`
 
-显式启用的新 profile，包含现有五项公开法律工具及以下十项案件工具：
+显式启用的新 profile，`tools/list` 精确包含现有五项公开法律工具、以下十项案件工具和六项批准案件图示工具，共 21 项：
 
 - `case_list`
 - `case_get_public_metadata`
@@ -96,7 +96,20 @@ workspace/<case-id>/work-products/<work-product-id>/<version>/
 - `case_update_work_product`
 - `case_export_work_product_manifest`
 
-所有参数 `deny_unknown_fields`，只接受严格 opaque ID、受限枚举、页码/limit/cursor、受限搜索串、受限正文和并发版本。禁止 path、filename、URI、URL、directory、glob、command、shell、任意 metadata object 和任意环境选择。
+批准图示工具：
+
+- `diagram.list_templates`
+- `diagram.get_schema`
+- `diagram.validate`
+- `diagram.render`
+- `diagram.update`
+- `diagram.export`
+
+所有参数 `deny_unknown_fields`，只接受严格 opaque ID、受限枚举、页码/limit/cursor、受限搜索串、受限正文/结构化 spec、精确 approved source refs 和并发版本。禁止 path、filename、URI、URL、directory、glob、command、shell、任意 metadata object 和任意环境选择。
+
+policy v2 对 16 个非公开工具使用四个显式 standalone-session grants：`read` 八项、`write` 两项、`diagram_read` 四项、`diagram_write` 两项。旧 `read` / `write` 集合保持不变，不包含图示能力；未授予 `diagram_read` 时，通用 metadata/list/read/manifest-export 会过滤或拒绝 `legal_diagram`，通用 write/update 也不能创建或改写图示。policy v2 之前的 session 必须撤销并重建，不自动迁移或扩权。
+
+独立 `diagram_authoring` profile 永久只允许合成/公开数据，并生成明文本地 HTML bundle / artifact reference。真实批准案件图示只能走 `approved_case_workspace`：approved Spec/patch 使用闭合 metadata allowlist，所有输入文本拒绝路径、文件名、URI、UNC、盘符和遍历编码；Spec source/provenance/实际引用与 envelope 精确闭合。render/update 将 HTML 和 canonical Spec hash 绑定到加密 protected work-product manifest，update 还保持 parent source lineage 单调不丢失；export 只返回签名 descriptor metadata，不返回 HTML、路径或 URI。
 
 profile 启用门包括：workspace 完整性、manifest verifier、撤销检查、双通道 egress scan、隔离级别政策、资格 tuple 和本地显式设置。默认关闭，不从旧 `redacted_case` 自动迁移。
 
@@ -109,6 +122,7 @@ formal Windows App 与 MCP sibling 是成对发布物：构建流程先生成并
 - 当前调用直接读取且仍有效的批准脱敏正文。
 - opaque IDs、安全状态、公开元数据、hash、版本和计数。
 - 经验证的脱敏 work product。
+- 批准图示的 bounded validation/statistics/hash，以及不含 path/URI/HTML 的 verified descriptor metadata。
 
 禁止输出原路径、原文件名、真实实体、mapping、OCR 私有正文、review draft、receipt secret、签名 key、vault 错误细节和宿主提供的任意附件正文。
 
@@ -123,18 +137,17 @@ formal Windows App 与 MCP sibling 是成对发布物：构建流程先生成并
 1. `case_list` / `case_list_approved_materials` 取得 opaque ID。
 2. `case_read_approved_material` 读取批准材料。
 3. 在会话内处理，不尝试恢复占位符真实值。
-4. `case_write_work_product` 或 `case_update_work_product` 写回脱敏成果。
+4. `case_write_work_product` / `case_update_work_product` 写回普通脱敏成果；需要图示时只用批准 profile 的 `diagram.validate`、`diagram.render`、`diagram.update`，并把结果作为加密 protected HTML work product。
 5. 需要公开法律资料时只调用既有五项公开工具。
 
-处理案件时严格禁止浏览器、网页搜索、邮件、网盘、任意文件读取、OCR、其他 MCP/Skill、memory、子智能体以及把材料发给未经批准的 Provider。若任务上下文已包含原件或待复核材料，立即停止案件处理并提示用户新建干净任务。
+`diagram.export` 只验证并返回 metadata descriptor，不是文件导出授权。处理案件时严格禁止降级到 `diagram_authoring`、浏览器、网页搜索、邮件、网盘、任意文件读取、OCR、其他 MCP/Skill、memory、子智能体以及把材料发给未经批准的 Provider。若任务上下文已包含原件或待复核材料，立即停止案件处理并提示用户新建干净任务。
 
 ## 8. 配置与验证器
 
 - WorkBuddy、Codex、OpenCode 各宿主均要同步更新主 Skill、引用文件、工具目录和权限配置。
 - 保留现有 public-only 验证器；新增独立 approved-profile 验证器，不能通过放宽旧验证器实现。
-- CI 对每个宿主检查十项工具精确集合、禁用字段、正向来源措辞、禁止工具措辞和写回路径。
+- CI 对每个宿主检查 21 项 `tools/list`、16 项 session-grant 精确集合、禁用字段、正向来源措辞、禁止工具措辞和普通/图示写回路径。
 - Skill 只是辅助控制；任何 prompt injection 都不能绕过后端 schema、manifest、ACL 和 egress gate。
 
 ## 9. 当前交付状态
-
 

@@ -88,6 +88,33 @@ SKILL_REQUIRED_FILES = {
         "assets/config.stdio.toml",
     },
 }
+DIAGRAM_SKILL_REQUIRED_FILES = {
+    "SKILL.md",
+    "references/examples.md",
+    "references/security.md",
+    "references/workflow.md",
+}
+DIAGRAM_SKILL_PRIVACY_MARKERS = (
+    "不可覆盖",
+    "CASE_RAW",
+    "CASE_REDACTED_PENDING",
+    "DIAGRAM_AUTHORING_SCOPE=synthetic_public_only",
+    "REAL_CASE_DIAGRAM_ROUTE=approved_case_workspace",
+    "PLAINTEXT_ARTIFACTS=artifact.diagram.json|artifact.html",
+    "REAL_CASE_INPUT_FORBIDDEN=even_if_privacy_approved",
+    "附件",
+    "粘贴",
+    "Provider",
+    "网络",
+    "browser",
+    "search",
+    "远程 OCR",
+    "其他 MCP",
+    "其他 Skill",
+    "memory",
+    "subagent",
+    "不调用任何工具",
+)
 PRINCIPAL_RULE_FILES = (
     Path("workbuddy/skill/lawyer-assistance/SKILL.md"),
     Path("codex/skill/lawyer-assistance/SKILL.md"),
@@ -462,9 +489,63 @@ def _validate_package_links(skill_root: Path) -> None:
                 ERRORS.append(f"{display_path(path)}: package link escapes the Skill: {target}")
 
 
+def _validate_diagram_skill_privacy_rule(integrations_root: Path) -> None:
+    skill_root = integrations_root / "workbuddy" / "skill" / "lawyer-diagrams"
+    skill = skill_root / "SKILL.md"
+    check(skill.is_file(), f"{display_path(skill)}: diagram Skill missing")
+    if not skill.is_file():
+        return
+    metadata = _parse_skill_frontmatter(skill)
+    if metadata is not None:
+        check(
+            set(metadata) == {"name", "description"},
+            f"{display_path(skill)}: diagram Skill frontmatter must contain only name and description",
+        )
+        check(
+            metadata.get("name") == "lawyer-diagrams",
+            f"{display_path(skill)}: diagram Skill name drift",
+        )
+        check(
+            "diagram_authoring" in metadata.get("description", "")
+            and "approved_case_workspace" in metadata.get("description", "")
+            and "Privacy" in metadata.get("description", ""),
+            f"{display_path(skill)}: diagram Skill description must separate raw and approved profiles",
+        )
+    text = skill.read_text(encoding="utf-8")
+    heading = _first_operational_heading(text)
+    check(
+        "CASE_RAW" in heading and "不可覆盖" in heading,
+        f"{display_path(skill)}: first operational section must be the non-overridable CASE_RAW gate",
+    )
+    for marker in DIAGRAM_SKILL_PRIVACY_MARKERS:
+        check(marker in text, f"{display_path(skill)}: missing mandatory privacy marker {marker}")
+    for unsafe_route in (
+        "或本次调用可逐字节验证的 Privacy 批准产物",
+        "或当前调用可验证的 Privacy 批准产物",
+    ):
+        check(
+            unsafe_route not in text,
+            f"{display_path(skill)}: approved case material must not route to diagram_authoring",
+        )
+    present = {
+        path.relative_to(skill_root).as_posix()
+        for path in skill_root.rglob("*")
+        if path.is_file()
+    }
+    missing = sorted(DIAGRAM_SKILL_REQUIRED_FILES - present)
+    check(not missing, f"{display_path(skill_root)}: required self-contained files missing: {missing}")
+    for path in skill_root.rglob("*"):
+        if not path.is_file():
+            continue
+        check(not path.is_symlink(), f"{display_path(path)}: symlinks are forbidden in Skill packages")
+        check(path.stat().st_size <= MAX_SKILL_FILE_BYTES, f"{display_path(path)}: Skill file exceeds size limit")
+    _validate_package_links(skill_root)
+
+
 def validate_skill_packages(integrations_root: Path = INTEGRATIONS) -> None:
     validate_skill_frontmatter(integrations_root)
     _validate_principal_privacy_rules(integrations_root)
+    _validate_diagram_skill_privacy_rule(integrations_root)
     for host, required in SKILL_REQUIRED_FILES.items():
         skill_root = integrations_root / host / "skill" / "lawyer-assistance"
         present = {path.relative_to(skill_root).as_posix() for path in skill_root.rglob("*") if path.is_file()}

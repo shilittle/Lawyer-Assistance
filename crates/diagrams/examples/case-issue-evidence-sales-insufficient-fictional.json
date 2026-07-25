@@ -1,0 +1,34 @@
+{
+  "schema_version":"1.0","diagram_type":"case_issue_evidence_law","template_id":"case_issue_evidence_law_v1",
+  "title":"虚构买卖合同争点与证据不足","summary":"演示交付、验收和欠款争点，并显式保留缺失信息；主体、交易和证据均为虚构。",
+  "nodes":[
+    {"id":"issue_delivery","type":"issue","label":"货物是否完成交付","details":"收货地点和签收人身份存在争议。","status":"disputed","importance":"critical","source_refs":["src_contract","src_delivery_copy"],"tags":["买卖合同","交付"],"metadata":{}},
+    {"id":"fact_delivery","type":"fact","label":"卖方主张已于 4 月 8 日交货","details":"该日期来自虚构送货单复印件。","status":"alleged","importance":"high","source_refs":["src_delivery_copy"],"tags":["虚构事实"],"metadata":{"date":"2026-04-08","date_precision":"day"}},
+    {"id":"evidence_delivery_copy","type":"evidence","label":"送货单复印件","details":"无原件，签收字样无法与买方人员名单对应。","status":"supported","importance":"high","source_refs":["src_delivery_copy"],"tags":["复印件","待核验"],"metadata":{"evidence_name":"虚构送货单复印件","evidence_type":"document_copy","authenticity":"unverified","is_original":false,"examined":false,"probative_value":"weak","defects":["无原件","签收人身份不明"]}},
+    {"id":"missing_receiver","type":"missing_information","label":"缺少签收人身份资料","details":"需要补充授权、在职或实际收货情况。","status":"unknown","importance":"critical","source_refs":["src_delivery_copy"],"tags":["证据不足"],"metadata":{"requested_item":"receiver_identity_and_authority"}},
+    {"id":"issue_payment","type":"issue","label":"是否尚欠价款","details":"合同金额明确，但付款流水不完整。","status":"disputed","importance":"critical","source_refs":["src_contract","src_statement"],"tags":["买卖合同","价款"],"metadata":{}},
+    {"id":"evidence_statement","type":"evidence","label":"单方对账表","details":"由卖方单方制作，未见买方确认。","status":"supported","importance":"normal","source_refs":["src_statement"],"tags":["单方材料"],"metadata":{"evidence_name":"虚构单方对账表","evidence_type":"statement","authenticity":"unverified","examined":false,"probative_value":"weak","opponent_view":"不认可"}},
+    {"id":"rule_sales","type":"rule","label":"虚构买卖合同证明规则","details":"仅作样例：主张交付与欠款的一方需提供足以支持其主张的材料。","status":"effective","importance":"high","source_refs":["src_rule_fixture"],"tags":["虚构规则"],"metadata":{"full_name":"示例买卖证明规则（虚构）","version":"2026-test-v1","validity_status":"fictional_only","official_source":"lawyer-assistance://fixtures/sales-rule"}}
+  ],
+  "edges":[
+    {"id":"edge_copy_proves","source":"evidence_delivery_copy","target":"fact_delivery","relation":"proves","label":"拟证明交付","strength":"weak","source_refs":["src_delivery_copy"],"metadata":{}},
+    {"id":"edge_fact_supports_issue","source":"fact_delivery","target":"issue_delivery","relation":"supports","label":"支持已交付主张","strength":"weak","source_refs":["src_delivery_copy"],"metadata":{}},
+    {"id":"edge_rule_delivery","source":"rule_sales","target":"issue_delivery","relation":"applies_to","label":"适用于交付争点","strength":"strong","source_refs":["src_rule_fixture"],"metadata":{}},
+    {"id":"edge_rule_payment","source":"rule_sales","target":"issue_payment","relation":"applies_to","label":"适用于欠款争点","strength":"strong","source_refs":["src_rule_fixture"],"metadata":{}},
+    {"id":"edge_statement_supports","source":"evidence_statement","target":"issue_payment","relation":"supports","label":"弱支持欠款主张","strength":"weak","source_refs":["src_statement"],"metadata":{}},
+    {"id":"edge_rule_requires_receiver","source":"rule_sales","target":"evidence_delivery_copy","relation":"requires","label":"需要交付证据核验","strength":"moderate","source_refs":["src_rule_fixture"],"metadata":{}}
+  ],
+  "groups":[
+    {"id":"group_delivery","label":"交付争点","node_ids":["issue_delivery","fact_delivery","evidence_delivery_copy","missing_receiver"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["src_delivery_copy"]},
+    {"id":"group_payment","label":"价款争点","node_ids":["issue_payment","evidence_statement"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["src_statement"]}
+  ],
+  "sources":[
+    {"id":"src_contract","kind":"file_page","title":"虚构买卖合同","locator":"测试合同第 1 页","artifact_id":"fixture_sales_contract","page":1,"verification_status":"original_material"},
+    {"id":"src_delivery_copy","kind":"attachment","title":"虚构送货单复印件","locator":"测试附件 D1","artifact_id":"fixture_delivery_copy","attachment":"D1","verification_status":"original_material"},
+    {"id":"src_statement","kind":"table","title":"虚构单方对账表","locator":"测试附件 S1，表 1","artifact_id":"fixture_statement","table":"表1","verification_status":"original_material"},
+    {"id":"src_rule_fixture","kind":"human_input","title":"虚构买卖证明规则设定","locator":"仓库内测试样例，无现实法律效力","verification_status":"human_confirmed"}
+  ],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["issue_delivery","issue_payment"],"group_by":"issue","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T10:25:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["src_contract","src_delivery_copy","src_statement","src_rule_fixture"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"第一阶段纯虚构买卖合同与证据不足样例","model_content_scope":"仅整理虚构争点与证据强弱，未把支持状态提升为事实成立。","deterministic_content_scope":"模板、验证、布局和 HTML 渲染由固定代码执行。"}
+}

@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "diagram_type": "legal_application_chain",
+  "template_id": "legal_application_chain_v1",
+  "title": "虚构同领域一般—特别—例外规则适用链",
+  "summary": "演示同一虚构规范领域内一般规则、特别规则与例外规则的结构化选择，不代表真实法律结论。",
+  "nodes": [
+    {"id":"rule_general","type":"rule","label":"虚构一般规则","details":"对测试领域中的通常情形设定一般处理方式。","status":"effective","importance":"high","source_refs":["law_general"],"tags":["虚构规则","一般规则"],"metadata":{"full_name":"虚构测试规范一般条款","version":"2026-test-v1","validity_status":"fictional_only","official_source":"https://example.invalid/fictional-general"}},
+    {"id":"rule_special","type":"rule","label":"虚构特别规则","details":"对特定主体和特定交易形态缩小一般规则适用范围。","status":"effective","importance":"critical","source_refs":["law_special"],"tags":["虚构规则","特别规则"],"metadata":{"full_name":"虚构测试规范特别条款","version":"2026-test-v1","validity_status":"fictional_only","official_source":"https://example.invalid/fictional-special"}},
+    {"id":"rule_exception","type":"exception_rule","label":"虚构例外规则","details":"在满足例外要件时排除一般处理方式。","status":"effective","importance":"critical","source_refs":["law_exception"],"tags":["虚构规则","例外规则"],"metadata":{"full_name":"虚构测试规范例外条款","version":"2026-test-v1","validity_status":"fictional_only","official_source":"https://example.invalid/fictional-exception"}},
+    {"id":"issue_scope","type":"issue","label":"测试事项属于哪一适用范围","details":"先识别一般范围，再核对特别主体与例外条件。","status":"disputed","importance":"critical","source_refs":["scenario_input"],"tags":["虚构争点"],"metadata":{}},
+    {"id":"element_special","type":"element","label":"是否具备特别主体身份","details":"该要件决定是否进入特别规则。","status":"unknown","importance":"high","source_refs":["scenario_input"],"tags":["待核实"],"metadata":{}},
+    {"id":"element_exception","type":"element","label":"是否满足例外条件","details":"例外条件须单独证明，不得由模型推定。","status":"unknown","importance":"high","source_refs":["scenario_input"],"tags":["待核实"],"metadata":{}},
+    {"id":"conclusion_pending","type":"application_conclusion","label":"待核实要件后选择规则","details":"当前材料不足，不能直接确定一般、特别或例外规则。","status":"uncertain","importance":"critical","source_refs":["scenario_input"],"tags":["人工复核"],"metadata":{}}
+  ],
+  "edges": [
+    {"id":"special_limits_general","source":"rule_special","target":"rule_general","relation":"limits","label":"特别规则限制一般范围","strength":"strong","source_refs":["law_general","law_special"],"metadata":{}},
+    {"id":"exception_to_general","source":"rule_exception","target":"rule_general","relation":"exception_to","label":"构成一般规则例外","strength":"strong","source_refs":["law_general","law_exception"],"metadata":{}},
+    {"id":"general_applies_issue","source":"rule_general","target":"issue_scope","relation":"applies_to","label":"通常先行适用","strength":"moderate","source_refs":["law_general","scenario_input"],"metadata":{}},
+    {"id":"special_applies_issue","source":"rule_special","target":"issue_scope","relation":"applies_to","label":"特别情形优先核对","strength":"strong","source_refs":["law_special","scenario_input"],"metadata":{}},
+    {"id":"general_requires_special","source":"rule_general","target":"element_special","relation":"requires","label":"核对特别主体","strength":"moderate","source_refs":["law_general","scenario_input"],"metadata":{}},
+    {"id":"rule_requires_exception","source":"rule_general","target":"element_exception","relation":"requires","label":"核对例外条件","strength":"moderate","source_refs":["law_general","law_exception"],"metadata":{}},
+    {"id":"special_leads_conclusion","source":"rule_special","target":"conclusion_pending","relation":"leads_to","label":"满足要件时形成特别适用路径","strength":"moderate","source_refs":["law_special"],"metadata":{}},
+    {"id":"exception_leads_conclusion","source":"element_exception","target":"conclusion_pending","relation":"leads_to","label":"满足例外条件时调整结论","strength":"moderate","source_refs":["law_exception","scenario_input"],"metadata":{}}
+  ],
+  "groups": [
+    {"id":"rules_group","label":"同领域规则组","node_ids":["rule_general","rule_special","rule_exception"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["law_general","law_special","law_exception"]},
+    {"id":"application_group","label":"要件与结论","node_ids":["issue_scope","element_special","element_exception","conclusion_pending"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["scenario_input"]}
+  ],
+  "sources": [
+    {"id":"law_general","kind":"law","title":"虚构测试规范一般条款","locator":"虚构规范第 1 条","artifact_id":"fictional_general_rule","uri":"https://example.invalid/fictional-general","law_document":"虚构测试规范","law_version":"2026-test-v1","article":"第 1 条","verification_status":"human_confirmed"},
+    {"id":"law_special","kind":"law","title":"虚构测试规范特别条款","locator":"虚构规范第 2 条","artifact_id":"fictional_special_rule","uri":"https://example.invalid/fictional-special","law_document":"虚构测试规范","law_version":"2026-test-v1","article":"第 2 条","verification_status":"human_confirmed"},
+    {"id":"law_exception","kind":"law","title":"虚构测试规范例外条款","locator":"虚构规范第 3 条","artifact_id":"fictional_exception_rule","uri":"https://example.invalid/fictional-exception","law_document":"虚构测试规范","law_version":"2026-test-v1","article":"第 3 条","verification_status":"human_confirmed"},
+    {"id":"scenario_input","kind":"human_input","title":"纯虚构适用场景设定","locator":"仓库测试夹具，无现实对应事项","verification_status":"human_confirmed"}
+  ],
+  "layout_hints": {"direction":"left_right","preferred_root_ids":["issue_scope"],"group_by":"node_type","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options": {"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance": {"generated_by":"human","generated_at":"2026-07-21T15:10:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["law_general","law_special","law_exception","scenario_input"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"新增一般、特别、例外规则纯虚构适用链","model_content_scope":"只组织虚构规范之间的结构，不生成真实法律结论。","deterministic_content_scope":"关系校验、布局与 HTML 由固定模板生成。"}
+}

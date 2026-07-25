@@ -8,6 +8,7 @@ import type {
   StandaloneApprovedMcpSessionMetadata,
 } from "../../ipc/privacy/approved-mcp-client";
 import {
+  ApprovedMcpPanel,
   ApprovedMcpPanelView,
   buildApprovedGenerationPublication,
   buildApprovedWorkspaceApproval,
@@ -17,6 +18,30 @@ import {
   buildStandaloneStdioSession,
   normalizeAllowedOrigins,
 } from "./ApprovedMcpPanel";
+
+const APPROVED_PROFILE_TOOLS = [
+  "system_status",
+  "legal_search",
+  "legal_get_article",
+  "legal_get_versions",
+  "legal_get_relations",
+  "case_list",
+  "case_get_public_metadata",
+  "case_list_approved_materials",
+  "case_read_approved_material",
+  "case_search_approved_materials",
+  "case_list_work_products",
+  "case_read_work_product",
+  "case_write_work_product",
+  "case_update_work_product",
+  "case_export_work_product_manifest",
+  "diagram.list_templates",
+  "diagram.get_schema",
+  "diagram.validate",
+  "diagram.render",
+  "diagram.update",
+  "diagram.export",
+] as const;
 
 const qualification: ApprovedMcpQualificationStatus = {
   qualified: true,
@@ -29,7 +54,7 @@ const qualification: ApprovedMcpQualificationStatus = {
   exactServerKeyBinding: true,
   appVersion: "0.4.0-beta.2",
   policyId: "approved-mcp-local-egress-v1",
-  policyVersion: 1,
+  policyVersion: 2,
   serverKeyId: "mcpkey_opaque",
   serverKeyVersion: 1,
   revocationEpoch: 3,
@@ -120,6 +145,8 @@ describe("approved MCP request builders", () => {
       minutes: "30",
       readEnabled: true,
       writeEnabled: true,
+      diagramReadEnabled: false,
+      diagramWriteEnabled: false,
     })).toEqual({
       connectorId: "codex",
       transport: "stdio",
@@ -133,7 +160,29 @@ describe("approved MCP request builders", () => {
       minutes: "10081",
       readEnabled: true,
       writeEnabled: true,
+      diagramReadEnabled: false,
+      diagramWriteEnabled: false,
     })).toThrow("1–10080");
+  });
+
+  it("adds the diagram grant groups only when they are explicitly selected", () => {
+    expect(buildStandaloneStdioSession({
+      connectorId: "codex",
+      minutes: "30",
+      readEnabled: true,
+      writeEnabled: true,
+      diagramReadEnabled: true,
+      diagramWriteEnabled: true,
+    }).grantGroups).toEqual(["read", "write", "diagram_read", "diagram_write"]);
+
+    expect(buildStandaloneStdioSession({
+      connectorId: "codex",
+      minutes: "30",
+      readEnabled: false,
+      writeEnabled: false,
+      diagramReadEnabled: true,
+      diagramWriteEnabled: true,
+    }).grantGroups).toEqual(["diagram_read", "diagram_write"]);
   });
 
   it("canonicalizes HTTP origins and rejects path, credentials, bad ports and overlong TTLs", () => {
@@ -148,6 +197,8 @@ describe("approved MCP request builders", () => {
       minutes: "1441",
       readEnabled: true,
       writeEnabled: false,
+      diagramReadEnabled: false,
+      diagramWriteEnabled: false,
       httpPort: "8787",
       allowedOriginsInput: "",
     })).toThrow("1–1440");
@@ -157,6 +208,8 @@ describe("approved MCP request builders", () => {
       minutes: "60",
       readEnabled: true,
       writeEnabled: false,
+      diagramReadEnabled: false,
+      diagramWriteEnabled: false,
       httpPort: "80",
       allowedOriginsInput: "",
     })).toThrow("1024–65535");
@@ -215,9 +268,11 @@ describe("ApprovedMcpPanelView", () => {
       } else if (connectorId === "codex") {
         expect(config).toContain("[mcp_servers.lawyer_assistance]");
         expect(config).toContain("http_headers = { Authorization =");
-        for (const tool of ["system_status", "case_export_work_product_manifest"]) {
-          expect(config).toContain(tool);
-        }
+        const enabledTools = Array.from(
+          config.matchAll(/^ {2}"([^"]+)",$/gmu),
+          (match) => match[1],
+        );
+        expect(enabledTools).toEqual(APPROVED_PROFILE_TOOLS);
       } else {
         const parsed = JSON.parse(config);
         expect(parsed.share).toBe("disabled");
@@ -232,7 +287,18 @@ describe("ApprovedMcpPanelView", () => {
       minutes: "60",
       readEnabled: false,
       writeEnabled: false,
+      diagramReadEnabled: false,
+      diagramWriteEnabled: false,
     })).toThrow("fixed grant group");
+  });
+
+  it("keeps both diagram grant groups disabled by default", () => {
+    const markup = renderToStaticMarkup(<ApprovedMcpPanel />);
+    for (const label of ["图示只读授权组", "图示写入授权组"]) {
+      const input = markup.match(new RegExp(`<input[^>]*aria-label="${label}"[^>]*>`, "u"));
+      expect(input?.[0]).toBeDefined();
+      expect(input?.[0]).not.toContain("checked");
+    }
   });
 
   it("renders qualification, generations and opaque host command without secrets or case text", () => {
@@ -259,6 +325,8 @@ describe("ApprovedMcpPanelView", () => {
         oneTimeHttpProvisioning={{ session: httpSession, oneTimeHttpBearer: `mcp-http-${"e".repeat(64)}` }}
         readGrantEnabled={true}
         writeGrantEnabled={true}
+        diagramReadGrantEnabled={false}
+        diagramWriteGrantEnabled={false}
         notice="已完成"
         error=""
         onSelectedRedactionIdChange={vi.fn()}
@@ -275,6 +343,8 @@ describe("ApprovedMcpPanelView", () => {
         onMcpApprovalConfirmedChange={vi.fn()}
         onReadGrantEnabledChange={vi.fn()}
         onWriteGrantEnabledChange={vi.fn()}
+        onDiagramReadGrantEnabledChange={vi.fn()}
+        onDiagramWriteGrantEnabledChange={vi.fn()}
         onRefresh={vi.fn()}
         onQualify={vi.fn()}
         onRevokeQualification={vi.fn()}
@@ -301,7 +371,9 @@ describe("ApprovedMcpPanelView", () => {
     expect(markup).toContain(session.serverInstanceId);
     expect(markup).toContain("\u590d\u5236 server ID");
     expect(markup).toContain("\u590d\u5236\u65e0\u8def\u5f84\u5bbf\u4e3b\u914d\u7f6e");
-    expect(markup).toContain("严格匹配 15 项 profile");
+    expect(markup).toContain("严格匹配 21 项 profile");
+    expect(markup).toContain("图示只读（4 项模板、schema、校验与导出工具）");
+    expect(markup).toContain("图示写入（2 项渲染与更新工具）");
     expect(markup).toContain("禁止附加或粘贴案件原文");
     expect(markup).toContain("memory、subagent、远程 OCR");
     expect(markup).toContain("独立的 approved MCP 发布批准");

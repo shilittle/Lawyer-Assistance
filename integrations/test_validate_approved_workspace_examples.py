@@ -45,7 +45,7 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
         )
         catalog["tools"][8], catalog["tools"][9] = catalog["tools"][9], catalog["tools"][8]
         approved.validate_catalog(catalog)
-        self.assertTrue(any("exact ordered 15-tool" in error for error in approved.ERRORS))
+        self.assertTrue(any("exact ordered 21-tool" in error for error in approved.ERRORS))
 
     def test_catalog_requires_confirmation_for_work_product_write(self) -> None:
         catalog = json.loads(
@@ -54,6 +54,17 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
             )
         )
         item = next(tool for tool in catalog["tools"] if tool["name"] == "case_write_work_product")
+        item["confirmation_required"] = False
+        approved.validate_catalog(catalog)
+        self.assertTrue(any("write confirmation" in error for error in approved.ERRORS))
+
+    def test_catalog_requires_confirmation_for_diagram_write(self) -> None:
+        catalog = json.loads(
+            (approved.INTEGRATIONS / "tool-catalog.approved-case-workspace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        item = next(tool for tool in catalog["tools"] if tool["name"] == "diagram.render")
         item["confirmation_required"] = False
         approved.validate_catalog(catalog)
         self.assertTrue(any("write confirmation" in error for error in approved.ERRORS))
@@ -123,7 +134,7 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.validate_fixture(integrations)
-            self.assertTrue(any("exact 15 tools required" in error for error in approved.ERRORS))
+            self.assertTrue(any("exact 21 tools required" in error for error in approved.ERRORS))
 
     def test_opencode_wildcard_must_remain_denied(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -200,6 +211,43 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
             )
             self.validate_fixture(integrations)
             self.assertTrue(any("clean replacement task" in error for error in approved.ERRORS))
+
+    def test_diagram_grant_separation_marker_cannot_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            skill = (
+                integrations
+                / "codex"
+                / "skill"
+                / "lawyer-assistance-approved-workspace"
+                / "SKILL.md"
+            )
+            skill.write_text(
+                skill.read_text(encoding="utf-8").replace(
+                    approved.DIAGRAM_GRANTS_INVARIANT,
+                    "DIAGRAM_GRANTS_REMOVED",
+                ),
+                encoding="utf-8",
+            )
+            self.validate_fixture(integrations)
+            self.assertTrue(any("DIAGRAM_GRANTS" in error for error in approved.ERRORS))
+
+    def test_host_documentation_cannot_regress_to_fifteen_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            documentation = integrations / "codex" / "APPROVED_WORKSPACE.md"
+            documentation.write_text(
+                documentation.read_text(encoding="utf-8").replace("21-tool", "15-tool"),
+                encoding="utf-8",
+            )
+            self.validate_fixture(integrations)
+            self.assertTrue(
+                any(
+                    "documentation marker missing: 21-tool" in error
+                    or "stale 15-tool" in error
+                    for error in approved.ERRORS
+                )
+            )
 
     def test_prompt_label_cannot_be_declared_sufficient(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -292,8 +340,8 @@ class ApprovedWorkspaceIntegrationValidationTests(unittest.TestCase):
             self.validate_fixture(integrations)
             self.assertTrue(any("WORK_PRODUCT_VERIFY" in error for error in approved.ERRORS))
 
-        approved.validate_rust_registry()
     def test_rust_case_tool_constant_matches_host_contract(self) -> None:
+        approved.validate_rust_registry()
         self.assertEqual([], approved.ERRORS)
 
 

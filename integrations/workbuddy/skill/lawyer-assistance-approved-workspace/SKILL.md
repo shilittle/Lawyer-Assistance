@@ -41,7 +41,17 @@ Opaque case arguments are limited to contract fields such as `case_id`, `materia
 `WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
 `WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
 
+`DIAGRAM_WORK_PRODUCT_SINK=diagram.render|diagram.update`
+`DIAGRAM_WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
+`DIAGRAM_GRANTS=diagram_read|diagram_write`
+`DIAGRAM_STORAGE=encrypted_protected_work_product`
+`DIAGRAM_EXPORT=verified_descriptor_metadata_only`
+`DIAGRAM_INPUT_FORBIDDEN=path|filename|artifact_uri|attachment`
+`DIAGRAM_AUTHORING_SCOPE=synthetic_public_only`
+
 Create content only with `case_write_work_product`; revise it only with `case_update_work_product` and optimistic concurrency. After every successful write or update, call `case_read_work_product` for the exact returned `work_product_id` and version in this current task; use only that read-back response as the verified result, and stop if version, source bindings, content hash, status, or placeholders differ. Bind exact approved `material_id`/`publication_id` sources, keep redacted placeholders, use an idempotency key, and stop on residual-scan or identity-leak rejection. Do not save, export, email, upload, attach, paste, or cache substantive results elsewhere. `case_export_work_product_manifest` returns a manifest; it never authorizes a host filesystem export.
+
+For a case diagram, enable the separate `diagram_read` and `diagram_write` session grants explicitly. Build the Spec only from current direct approved-material reads, bind every `source_approved_refs` entry to that exact generation, and use `diagram.render` or `diagram.update` as the only diagram sinks. They publish encrypted protected HTML work products and return opaque IDs and hashes only. Immediately verify the exact returned work-product ID/version through `case_read_work_product`. `diagram.export` returns only verified descriptor metadata bound to the signed work-product manifest; it never returns HTML, a path, a URI, or host export authority. Do not use the synthetic/public `diagram_authoring` profile for real case material.
 
 Read as needed:
 

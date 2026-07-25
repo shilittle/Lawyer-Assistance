@@ -25,6 +25,12 @@
     "lawyer_assistance_case_read_work_product": "allow",
     "lawyer_assistance_case_write_work_product": "allow",
     "lawyer_assistance_case_update_work_product": "allow",
-    "lawyer_assistance_case_export_work_product_manifest": "allow"
+    "lawyer_assistance_case_export_work_product_manifest": "allow",
+    "lawyer_assistance_diagram.list_templates": "allow",
+    "lawyer_assistance_diagram.get_schema": "allow",
+    "lawyer_assistance_diagram.validate": "allow",
+    "lawyer_assistance_diagram.render": "allow",
+    "lawyer_assistance_diagram.update": "allow",
+    "lawyer_assistance_diagram.export": "allow"
   }
 }

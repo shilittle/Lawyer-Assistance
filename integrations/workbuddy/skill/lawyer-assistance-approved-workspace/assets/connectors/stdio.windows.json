@@ -2,7 +2,7 @@
   "mcpServers": {
     "lawyer_assistance": {
       "type": "stdio",
-      "description": "Qualification-gated Lawyer Assistance approved-case-workspace MCP server; App-issued opaque session ID only; exact 15-tool surface; no path, environment or secret injection",
+      "description": "Qualification-gated Lawyer Assistance approved-case-workspace MCP server; App-issued opaque session ID only; exact 21-tool surface; no path, environment or secret injection",
       "command": "C:/LawyerAssistance/bin/lawyer-assistance-mcp.exe",
       "args": ["--privacy-profile", "approved_case_workspace", "--approved-session-id", "<APP_ISSUED_SERVER_ID>", "stdio"]
     }

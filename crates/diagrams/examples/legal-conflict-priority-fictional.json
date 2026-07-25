@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "diagram_type": "legal_conflict_priority",
+  "template_id": "legal_conflict_priority_v1",
+  "title": "虚构规范冲突与优先适用",
+  "summary": "演示上位规则、特别规则与旧规则的冲突处理关系，全部规则均为虚构。",
+  "nodes": [
+    {"id":"law_general","type":"law","label":"示例交易一般法","details":"虚构的一般上位规则。","status":"effective","importance":"critical","source_refs":["src_rules"],"tags":["虚构","一般规则"],"metadata":{"full_name":"示例交易一般法（虚构）","authority_level":"law","validity_status":"fictional_effective","version":"fictional-1.0"}},
+    {"id":"reg_special","type":"regulation","label":"示例小额交易特别条例","details":"虚构的特别规则。","status":"effective","importance":"high","source_refs":["src_rules"],"tags":["虚构","特别规则"],"metadata":{"full_name":"示例小额交易特别条例（虚构）","authority_level":"regulation","validity_status":"fictional_effective","version":"fictional-1.0"}},
+    {"id":"rule_old","type":"department_rule","label":"示例旧交易办法","details":"虚构且已被替代的旧规则。","status":"repealed","importance":"normal","source_refs":["src_rules"],"tags":["虚构","旧规则"],"metadata":{"full_name":"示例旧交易办法（虚构）","authority_level":"department_rule","validity_status":"fictional_repealed","version":"fictional-1.0"}},
+    {"id":"rule_new","type":"department_rule","label":"示例新交易办法","details":"虚构的新规则。","status":"effective","importance":"high","source_refs":["src_rules"],"tags":["虚构","新规则"],"metadata":{"full_name":"示例新交易办法（虚构）","authority_level":"department_rule","validity_status":"fictional_effective","version":"fictional-1.0"}}
+  ],
+  "edges": [
+    {"id":"edge_general_special","source":"law_general","target":"reg_special","relation":"superior_to","label":"效力层级高于","strength":"conclusive","source_refs":["src_rules"],"metadata":{}},
+    {"id":"edge_special_conflict","source":"reg_special","target":"law_general","relation":"conflicts_with","label":"在虚构小额场景存在条款差异","strength":"moderate","source_refs":["src_rules"],"metadata":{}},
+    {"id":"edge_general_priority","source":"law_general","target":"reg_special","relation":"applies_before","label":"冲突部分优先","strength":"strong","source_refs":["src_rules"],"metadata":{}},
+    {"id":"edge_new_replaces","source":"rule_new","target":"rule_old","relation":"replaces","label":"替代旧办法","strength":"conclusive","source_refs":["src_rules"],"metadata":{}},
+    {"id":"edge_new_priority","source":"rule_new","target":"rule_old","relation":"applies_before","label":"新规则优先","strength":"conclusive","source_refs":["src_rules"],"metadata":{}}
+  ],
+  "groups": [],
+  "sources": [{"id":"src_rules","kind":"human_input","title":"虚构规范冲突设定","locator":"仓库内测试样例，无现实法律效力","verification_status":"human_confirmed"}],
+  "layout_hints": {"direction":"left_right","preferred_root_ids":["law_general","rule_new"],"group_by":"status","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options": {"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance": {"generated_by":"human","generated_at":"2026-07-21T10:10:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["src_rules"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"第一阶段纯虚构冲突样例","model_content_scope":"未处理真实规范或案件材料。","deterministic_content_scope":"优先关系校验、布局和 HTML 渲染由固定模板执行。"}
+}

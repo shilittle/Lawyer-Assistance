@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use diagrams::DiagramService;
 use hmac::{Hmac, Mac};
 use legal_services::{
     CaseAnalyzeGapsRequest, CaseApplyPatchRequest, CaseGetStateRequest, CaseProposePatchRequest,
@@ -21,8 +22,8 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::{
-    approved_backend::ApprovedWorkspaceBackend, approved_workspace, privacy_gate, public_output,
-    receipt_gate::RedactedReceiptGate, registry::PrivacyProfile,
+    approved_backend::ApprovedWorkspaceBackend, approved_workspace, diagram_mcp, privacy_gate,
+    public_output, receipt_gate::RedactedReceiptGate, registry::PrivacyProfile,
     standalone_approved::StandaloneCallBroker,
 };
 
@@ -161,6 +162,7 @@ pub struct ServiceAdapter {
     receipt_gate: Option<RedactedReceiptGate>,
     approved_backend: Option<ApprovedWorkspaceBackend>,
     standalone_broker: Option<StandaloneCallBroker>,
+    diagram_service: Option<Arc<DiagramService>>,
     cursors: CursorCodec,
     in_flight: InFlightOperations,
 }
@@ -172,33 +174,48 @@ impl ServiceAdapter {
 
     pub fn for_profile(services: LegalServices, profile: PrivacyProfile) -> Self {
         let receipt_gate = match profile {
-            PrivacyProfile::PublicLawOnly => None,
-            PrivacyProfile::ApprovedCaseWorkspace => None,
+            PrivacyProfile::PublicLawOnly
+            | PrivacyProfile::ApprovedCaseWorkspace
+            | PrivacyProfile::DiagramAuthoring => None,
             PrivacyProfile::RedactedCase => RedactedReceiptGate::load_from_windows_credentials(
                 &services.config().user_database_path,
             )
             .ok(),
         };
-        Self::from_parts(services, profile, receipt_gate)
+        let diagram_service = if profile == PrivacyProfile::DiagramAuthoring {
+            DiagramService::new(&services.config().allowed_output_root)
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
+        Self::from_parts(services, profile, receipt_gate, diagram_service)
     }
 
     pub fn for_profile_with_receipt_gate(
         services: LegalServices,
         receipt_gate: RedactedReceiptGate,
     ) -> Self {
-        Self::from_parts(services, PrivacyProfile::RedactedCase, Some(receipt_gate))
+        Self::from_parts(
+            services,
+            PrivacyProfile::RedactedCase,
+            Some(receipt_gate),
+            None,
+        )
     }
 
     pub fn for_approved_workspace(
         services: LegalServices,
         backend: ApprovedWorkspaceBackend,
     ) -> Self {
-        let mut adapter = Self::from_parts(services, PrivacyProfile::ApprovedCaseWorkspace, None);
+        let mut adapter =
+            Self::from_parts(services, PrivacyProfile::ApprovedCaseWorkspace, None, None);
         adapter.approved_backend = Some(backend);
         adapter
     }
     pub fn for_standalone_approved(services: LegalServices, broker: StandaloneCallBroker) -> Self {
-        let mut adapter = Self::from_parts(services, PrivacyProfile::ApprovedCaseWorkspace, None);
+        let mut adapter =
+            Self::from_parts(services, PrivacyProfile::ApprovedCaseWorkspace, None, None);
         adapter.standalone_broker = Some(broker);
         adapter
     }
@@ -207,6 +224,7 @@ impl ServiceAdapter {
         services: LegalServices,
         profile: PrivacyProfile,
         receipt_gate: Option<RedactedReceiptGate>,
+        diagram_service: Option<Arc<DiagramService>>,
     ) -> Self {
         Self {
             services: Arc::new(services),
@@ -215,6 +233,7 @@ impl ServiceAdapter {
             approved_backend: None,
             standalone_broker: None,
             cursors: CursorCodec::new(),
+            diagram_service,
             in_flight: InFlightOperations::default(),
         }
     }
@@ -247,7 +266,7 @@ impl ServiceAdapter {
             ));
         }
         let arguments = arguments.unwrap_or_default();
-        if approved_workspace::is_approved_workspace_tool(tool_name) {
+        if self.profile == PrivacyProfile::ApprovedCaseWorkspace && is_approved_tool(tool_name) {
             if let Some(broker) = self.standalone_broker.clone() {
                 let request_id = request_id.ok_or_else(|| {
                     ErrorData::invalid_params("JSON-RPC request id is required.", None)
@@ -256,7 +275,7 @@ impl ServiceAdapter {
                     ErrorData::invalid_params("Canonical tools/call params are required.", None)
                 })?;
                 if !standalone_call_params_are_plain(&request_params, tool_name, &arguments)
-                    || !approved_workspace::request_is_valid(tool_name, &arguments)
+                    || !approved_request_is_valid(tool_name, &arguments)
                 {
                     return Err(ErrorData::invalid_params(
                         "Tool arguments do not match the declared input schema.",
@@ -280,7 +299,7 @@ impl ServiceAdapter {
                             None,
                         )
                     })?;
-                if !approved_workspace::request_is_valid(tool_name, &business_arguments) {
+                if !approved_request_is_valid(tool_name, &business_arguments) {
                     return Err(ErrorData::invalid_params(
                         "Tool arguments do not match the declared input schema.",
                         None,
@@ -296,7 +315,7 @@ impl ServiceAdapter {
                 .map_err(|_| internal_error());
             }
             let business_arguments = approved_workspace::remove_optional_access_ticket(arguments);
-            if !approved_workspace::request_is_valid(tool_name, &business_arguments) {
+            if !approved_request_is_valid(tool_name, &business_arguments) {
                 return Err(ErrorData::invalid_params(
                     "Tool arguments do not match the declared input schema.",
                     None,
@@ -340,6 +359,9 @@ impl ServiceAdapter {
             }
             "citation_validate" => self.citation_validate(arguments).await,
             "case_get_state" => self.case_get_state(arguments).await,
+            name if diagram_mcp::DIAGRAM_TOOL_NAMES.contains(&name) => {
+                self.diagram_call(name, arguments).await
+            }
             "case_propose_patch" => {
                 self.invoke::<CaseProposePatchRequest, _, _>(
                     tool_name,
@@ -590,6 +612,35 @@ impl ServiceAdapter {
     fn begin_blocking_operation(&self) -> Result<InFlightGuard, ErrorData> {
         self.in_flight.try_begin().ok_or_else(internal_error)
     }
+
+    async fn diagram_call(
+        &self,
+        tool_name: &str,
+        arguments: JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(service) = self.diagram_service.as_ref().map(Arc::clone) else {
+            return Ok(diagram_tool_error("diagram_service_unavailable"));
+        };
+        let owned_name = tool_name.to_owned();
+        let operation = self.begin_blocking_operation()?;
+        let result = tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            diagram_mcp::execute(&service, &owned_name, arguments)
+        })
+        .await
+        .map_err(|_| internal_error())?;
+        match result {
+            Ok(response) => diagram_tool_success(tool_name, response),
+            Err(error) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    error_code = error.code(),
+                    "diagram MCP tool call failed"
+                );
+                Ok(diagram_tool_error_with_path(error.code(), error.path()))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -701,6 +752,19 @@ fn receipt_rejected() -> ErrorData {
     )
 }
 
+fn is_approved_tool(tool_name: &str) -> bool {
+    approved_workspace::is_approved_workspace_tool(tool_name)
+        || diagram_mcp::is_approved_diagram_tool(tool_name)
+}
+
+fn approved_request_is_valid(tool_name: &str, arguments: &JsonObject) -> bool {
+    if approved_workspace::is_approved_workspace_tool(tool_name) {
+        approved_workspace::request_is_valid(tool_name, arguments)
+    } else {
+        diagram_mcp::approved_request_is_valid(tool_name, arguments)
+    }
+}
+
 fn standalone_call_params_are_plain(
     request_params: &Value,
     tool_name: &str,
@@ -736,6 +800,50 @@ fn contains_host_ticket_key(value: &Value) -> bool {
         _ => false,
     }
 }
+
+fn diagram_tool_success(tool_name: &str, response: Value) -> Result<CallToolResult, ErrorData> {
+    let public_text = "图示操作已完成。".to_owned();
+    if !privacy_gate::model_visible_output_is_safe(&public_text, &response) {
+        tracing::warn!(
+            tool = tool_name,
+            reason_code = "sensitive_content_blocked",
+            "diagram MCP model-visible result blocked by privacy boundary"
+        );
+        return Ok(diagram_tool_error("sensitive_content_blocked"));
+    }
+    let envelope_size = serde_json::to_vec(&response)
+        .map_err(|_| internal_error())?
+        .len();
+    if envelope_size > MAX_TOOL_ENVELOPE_BYTES {
+        return Ok(diagram_tool_error("limit_exceeded"));
+    }
+    let mut result = CallToolResult::structured(response);
+    result.content = vec![ContentBlock::text(public_text)];
+    Ok(result)
+}
+
+fn diagram_tool_error(code: &'static str) -> CallToolResult {
+    diagram_tool_error_with_path(code, None)
+}
+
+fn diagram_tool_error_with_path(code: &'static str, path: Option<&str>) -> CallToolResult {
+    let public_text = "图示操作未完成。";
+    let mut envelope = json!({
+        "schema_version":1,
+        "error":{"code":code}
+    });
+    if let Some(path) = path {
+        envelope["error"]["path"] = Value::String(path.to_owned());
+    }
+    debug_assert!(privacy_gate::model_visible_output_is_safe(
+        public_text,
+        &envelope
+    ));
+    let mut result = CallToolResult::structured_error(envelope);
+    result.content = vec![ContentBlock::text(public_text)];
+    result
+}
+
 fn internal_error() -> ErrorData {
     tracing::error!("MCP request failed at an internal boundary");
     ErrorData::internal_error("服务暂时无法完成操作，请稍后重试。".to_owned(), None)

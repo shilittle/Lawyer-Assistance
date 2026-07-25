@@ -21,5 +21,11 @@ enabled_tools = [
   "case_write_work_product",
   "case_update_work_product",
   "case_export_work_product_manifest",
+  "diagram.list_templates",
+  "diagram.get_schema",
+  "diagram.validate",
+  "diagram.render",
+  "diagram.update",
+  "diagram.export",
 ]
 default_tools_approval_mode = "writes"

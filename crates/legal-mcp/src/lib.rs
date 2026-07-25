@@ -1,6 +1,7 @@
 pub mod approved_backend;
 pub mod approved_workspace;
 pub mod config;
+mod diagram_mcp;
 pub mod handler;
 pub mod http;
 mod privacy_gate;

@@ -156,7 +156,7 @@ describe("approved MCP IPC client", () => {
     await createStandaloneApprovedMcpSession({
       connectorId: "workbuddy",
       transport: "stdio",
-      grantGroups: ["read", "write"],
+      grantGroups: ["read", "write", "diagram_read", "diagram_write"],
       ttlSeconds: 600,
       httpPort: null,
       allowedOrigins: [],
@@ -173,7 +173,7 @@ describe("approved MCP IPC client", () => {
         request: {
           connectorId: "workbuddy",
           transport: "stdio",
-          grantGroups: ["read", "write"],
+          grantGroups: ["read", "write", "diagram_read", "diagram_write"],
           ttlSeconds: 600,
           httpPort: null,
           allowedOrigins: [],

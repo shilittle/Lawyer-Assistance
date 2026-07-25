@@ -52,6 +52,33 @@ class PublicOnlyIntegrationValidationTests(unittest.TestCase):
             validator.validate_skill_packages(integrations)
             self.assertTrue(any("CASE_REDACTED_PENDING" in error for error in validator.ERRORS))
 
+    def test_diagram_skill_cannot_drop_subagent_egress_prohibition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            skill = integrations / "workbuddy" / "skill" / "lawyer-diagrams" / "SKILL.md"
+            skill.write_text(
+                skill.read_text(encoding="utf-8").replace("subagent", "delegated-worker"),
+                encoding="utf-8",
+            )
+            validator.validate_skill_packages(integrations)
+            self.assertTrue(any("mandatory privacy marker subagent" in error for error in validator.ERRORS))
+
+    def test_diagram_skill_cannot_route_real_cases_to_raw_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            integrations = self.copy_integrations(directory)
+            skill = integrations / "workbuddy" / "skill" / "lawyer-diagrams" / "SKILL.md"
+            skill.write_text(
+                skill.read_text(encoding="utf-8").replace(
+                    "REAL_CASE_DIAGRAM_ROUTE=approved_case_workspace",
+                    "REAL_CASE_DIAGRAM_ROUTE=diagram_authoring",
+                ),
+                encoding="utf-8",
+            )
+            validator.validate_skill_packages(integrations)
+            self.assertTrue(
+                any("REAL_CASE_DIAGRAM_ROUTE" in error for error in validator.ERRORS)
+            )
+
     def test_label_only_approved_classification_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             integrations = self.copy_integrations(directory)

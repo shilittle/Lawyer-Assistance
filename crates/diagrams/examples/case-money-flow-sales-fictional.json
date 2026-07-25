@@ -1,0 +1,27 @@
+{
+  "schema_version":"1.0","diagram_type":"case_money_flow","template_id":"case_money_flow_v1",
+  "title":"虚构买卖合同分期付款流","summary":"演示预付款、到货款和争议尾款三段资金状态，全部主体与金额均为虚构。",
+  "nodes":[
+    {"id":"party_buyer","type":"party","label":"松谷采购有限公司","details":"虚构买方。","status":"active","importance":"critical","source_refs":["src_sales_flow"],"tags":["虚构","买方"],"metadata":{"role":"买方","organization_type":"company"}},
+    {"id":"party_seller","type":"party","label":"海岑设备有限公司","details":"虚构卖方。","status":"active","importance":"critical","source_refs":["src_sales_flow"],"tags":["虚构","卖方"],"metadata":{"role":"卖方","organization_type":"company"}},
+    {"id":"amount_advance","type":"amount","label":"预付款 30,000.00 CNY","details":"虚构预付款，流水显示已完成。","status":"completed","importance":"high","source_refs":["src_sales_flow"],"tags":["预付款"],"metadata":{"amount":"30000.00","currency":"CNY","date":"2026-01-10","purpose":"fictional_advance_payment","voucher_source_ref":"src_sales_flow"}},
+    {"id":"amount_delivery","type":"amount","label":"到货款 50,000.00 CNY","details":"虚构到货款，流水显示已完成。","status":"completed","importance":"high","source_refs":["src_sales_flow"],"tags":["到货款"],"metadata":{"amount":"50000.00","currency":"CNY","date":"2026-02-18","purpose":"fictional_delivery_payment","voucher_source_ref":"src_sales_flow"}},
+    {"id":"amount_balance","type":"amount","label":"尾款 20,000.00 CNY","details":"是否到期与是否支付均待核验。","status":"pending","importance":"critical","source_refs":["src_contract_fixture"],"tags":["尾款","争议"],"metadata":{"amount":"20000.00","currency":"CNY","date":"2026-03-18","purpose":"fictional_disputed_balance","voucher_source_ref":"src_contract_fixture"}}
+  ],
+  "edges":[
+    {"id":"edge_contract_party","source":"party_buyer","target":"party_seller","relation":"related_to","label":"虚构合同背景关联","strength":"strong","source_refs":["src_contract_fixture"],"metadata":{}},
+    {"id":"edge_advance_out","source":"party_buyer","target":"amount_advance","relation":"transferred_to","label":"支付预付款","strength":"strong","source_refs":["src_sales_flow"],"metadata":{"amount":"30000.00","currency":"CNY","date":"2026-01-10","voucher_source_ref":"src_sales_flow"}},
+    {"id":"edge_advance_in","source":"amount_advance","target":"party_seller","relation":"transferred_to","label":"卖方收取","strength":"strong","source_refs":["src_sales_flow"],"metadata":{"amount":"30000.00","currency":"CNY","date":"2026-01-10","voucher_source_ref":"src_sales_flow"}},
+    {"id":"edge_delivery_out","source":"party_buyer","target":"amount_delivery","relation":"transferred_to","label":"支付到货款","strength":"strong","source_refs":["src_sales_flow"],"metadata":{"amount":"50000.00","currency":"CNY","date":"2026-02-18","voucher_source_ref":"src_sales_flow"}},
+    {"id":"edge_delivery_in","source":"amount_delivery","target":"party_seller","relation":"transferred_to","label":"卖方收取","strength":"strong","source_refs":["src_sales_flow"],"metadata":{"amount":"50000.00","currency":"CNY","date":"2026-02-18","voucher_source_ref":"src_sales_flow"}},
+    {"id":"edge_balance_owed","source":"party_buyer","target":"amount_balance","relation":"owes","label":"卖方主张尚欠尾款","strength":"unknown","source_refs":["src_contract_fixture"],"metadata":{"amount":"20000.00","currency":"CNY","date":"2026-03-18","voucher_source_ref":"src_contract_fixture"}}
+  ],
+  "groups":[],
+  "sources":[
+    {"id":"src_sales_flow","kind":"table","title":"虚构买卖付款流水","locator":"测试附件 SF1，表 1","artifact_id":"fixture_sales_flow","table":"表1","verification_status":"original_material"},
+    {"id":"src_contract_fixture","kind":"file_page","title":"虚构设备买卖合同","locator":"测试合同第 3 页","artifact_id":"fixture_equipment_contract","page":3,"verification_status":"original_material"}
+  ],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["party_buyer"],"group_by":"status","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T10:40:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["src_sales_flow","src_contract_fixture"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"第一阶段纯虚构买卖付款流样例","model_content_scope":"只整理虚构付款状态，争议尾款保持未知。","deterministic_content_scope":"金额校验、资金布局和 HTML 渲染由固定模板执行。"}
+}

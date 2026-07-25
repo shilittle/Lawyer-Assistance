@@ -22,7 +22,9 @@
 
 `redacted_case` 只在第 3 步多列出 `citation_validate`，并在调用服务前验证精确活动票据。票据绑定完整请求字节、固定目的地 `lawyer-assistance-mcp:redacted_case`、固定用途、内容/策略/探测器 provenance、密钥版本和短 TTL，并核对持久化撤销状态。当前 App 没有该签发用途，所以这条路径没有生产正向调用。
 
-`approved_case_workspace` 在第 3 步列出十个额外 ID-only schema。formal release 先构建 exact MCP sibling 并把其 SHA-256 编译进 App；adapter 验证 paired-binary trust anchor、当前 App qualification、DPAPI/Credential Manager standalone session 和逐调用 ticket，再由真实 backend 校验 immutable manifest、签名、内容哈希、scope/purpose、撤销和残留扫描；写入只允许 immutable work-product generation。未资格化仍返回 `PROFILE_NOT_QUALIFIED`，但不存在统一无条件 stub。宿主不能传路径，也不能直接访问工作区目录。
+`approved_case_workspace` 在第 3 步列出十个额外 ID-only 案件 schema 和六个批准图示 schema，因此总面为 21 项。formal release 先构建 exact MCP sibling 并把其 SHA-256 编译进 App；adapter 验证 paired-binary trust anchor、当前 App qualification、DPAPI/Credential Manager policy-v2 standalone session 和逐调用 ticket，再由真实 backend 校验 immutable manifest、签名、内容哈希、scope/purpose、撤销和残留扫描；写入只允许 immutable work-product generation。16 个非公开 grants 分为 `read=8`、`write=2`、`diagram_read=4`、`diagram_write=2`，旧 read/write 集合不扩展。未资格化仍返回 `PROFILE_NOT_QUALIFIED`，但不存在统一无条件 stub。宿主不能传路径，也不能直接访问工作区目录。
+
+图示存在两个不可互换的数据面。`diagram_authoring` 直接使用本地 `DiagramService`，永久只接收合成/公开数据并生成明文 HTML bundle / artifact reference。真实批准案件使用 approved backend：来源引用先按当前 generation 和撤销状态核验，render/update 的确定性 HTML 只进入加密 protected work-product store，export 只返回签名 descriptor metadata。approved schema 和响应都不接受或返回 path、URI、HTML。
 
 旧案件状态、案件变更、任意材料导入、缺口分析、文书生成和路径导出在所有 profile 中均不进入 registry，也必须被 adapter 拒绝。不能用内部共享服务仍存在这些 DTO 或实现来推断对外可用。
 
@@ -32,7 +34,7 @@
 2. **分类与票据。** `CASE_RAW`、`CASE_REDACTED_PENDING`、待复核和仅标签 approved 都不能外发。App 本地批准只证明本地工件状态，不自动满足 MCP/Provider 的目的地与用途绑定。
 3. **协议。** 传输拒绝未知字段、错误 schema、超限请求、未授权 HTTP、非法 Host/Origin 和超时；错误不回显秘密或路径。
 4. **服务。** 法律库只读打开；public-only 调用不读取案件文件、材料根或输出根。
-5. **结果。** 两个 MCP 结果通道、日志和错误分别执行隐私控制；任何一层失败都 fail-closed。
+5. **结果。** 两个 MCP 结果通道、日志和错误分别执行隐私控制；任何一层失败都 fail-closed。批准 diagram export 只是 metadata descriptor，不能转换成宿主文件访问。
 
 ## PDF 与 OCR 路径
 
@@ -42,6 +44,6 @@
 
 ## 演进规则
 
-工具名和顺序以 Rust profile 常量与两个 integration catalog 为共同发布门禁。当前 approved path 已完成 App 正向签票、逐字节请求绑定、目的地实例隔离、撤销/过期与防重放；发布仍必须用实际 binary stdio/HTTP 正向 E2E 和宿主规则验证其完整性。后续新增能力同样必须先完成生产 handler、票据、存储、UI、正负向 E2E 和数据保留审计，不能用文档或配置代替。
+工具名和顺序以 Rust profile 常量与两个 integration catalog 为共同发布门禁。当前 approved path 已完成 App 正向签票、逐字节请求绑定、目的地实例隔离、撤销/过期与防重放；2026-07-24 的集成 debug sibling 已完成 exact 21-tool、六个 diagram 工具、stdio/HTTP case + diagram 正负向 E2E，并验证四组 policy-v2 grants。较早 15-tool E2E 只是历史 baseline；最终签名 release sibling 仍必须重新测量与复跑。后续新增能力同样必须先完成生产 handler、票据、存储、UI、正负向 E2E 和数据保留审计，不能用文档或配置代替。
 
 早期固定 12 工具架构和相关验收是历史记录，已被本 profile 架构取代。

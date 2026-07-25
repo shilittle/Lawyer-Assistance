@@ -4,8 +4,9 @@
 //! bound to a caller-issued, persistent, one-time ticket before it can touch an
 //! approved generation or work product.
 
-use crate::approved_workspace;
+use crate::{approved_workspace, diagram_mcp};
 use base64::Engine as _;
+use diagrams::{apply_update_to_spec, canonical_json_bytes};
 use hmac::{Hmac, Mac};
 use privacy::{
     mcp_ticket::{
@@ -18,8 +19,8 @@ use privacy::{
         PublicationId, Sha256Hex, WorkProductId,
     },
     work_products::{
-        PublishedWorkProductV1, WorkProductError, WorkProductPublisher, WorkProductService,
-        WorkProductWriteV1,
+        PublishedWorkProductV1, VerifiedWorkProductV1, WorkProductError, WorkProductPublisher,
+        WorkProductService, WorkProductWriteV1,
     },
     workspace::{
         ApprovedWorkspaceOperationGuard, ApprovedWorkspaceService, WorkspaceError,
@@ -31,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -42,8 +44,12 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_APPROVED_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CURSOR_BYTES: usize = 512;
 const CURSOR_TTL_SECONDS: u64 = 30 * 60;
+pub const APPROVED_MCP_POLICY_ID: &str = "approved-mcp-local-egress-v1";
+pub const APPROVED_MCP_POLICY_VERSION: u64 = 2;
 const PLACEHOLDER_POLICY_VERSION: &str = "privacy-egress-v1";
 const AUTHOR_TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LEGAL_DIAGRAM_TASK_TYPE: &str = "legal_diagram";
+const LEGAL_DIAGRAM_MEDIA_TYPE: &str = "text/html";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovedBackendInitError {
@@ -139,6 +145,19 @@ struct ApprovedWorkspaceBackendInner {
 #[derive(Clone)]
 pub struct ApprovedWorkspaceBackend {
     inner: Arc<ApprovedWorkspaceBackendInner>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApprovedCallScope {
+    diagram_read: bool,
+}
+
+impl ApprovedCallScope {
+    const INTERNAL_FULL_ACCESS: Self = Self { diagram_read: true };
+
+    const fn standalone(diagram_read: bool) -> Self {
+        Self { diagram_read }
+    }
 }
 
 impl fmt::Debug for ApprovedWorkspaceBackend {
@@ -251,6 +270,36 @@ impl ApprovedWorkspaceBackend {
         access_ticket: &str,
         business_arguments: JsonObject,
     ) -> CallToolResult {
+        self.call_with_scope(
+            tool_name,
+            access_ticket,
+            business_arguments,
+            ApprovedCallScope::INTERNAL_FULL_ACCESS,
+        )
+    }
+
+    pub(crate) fn call_for_standalone(
+        &self,
+        tool_name: &str,
+        access_ticket: &str,
+        business_arguments: JsonObject,
+        diagram_read: bool,
+    ) -> CallToolResult {
+        self.call_with_scope(
+            tool_name,
+            access_ticket,
+            business_arguments,
+            ApprovedCallScope::standalone(diagram_read),
+        )
+    }
+
+    fn call_with_scope(
+        &self,
+        tool_name: &str,
+        access_ticket: &str,
+        business_arguments: JsonObject,
+        scope: ApprovedCallScope,
+    ) -> CallToolResult {
         let now_unix = now_seconds();
         let qualified = if now_unix == 0 {
             false
@@ -291,7 +340,8 @@ impl ApprovedWorkspaceBackend {
             return approved_error(code);
         }
         let response =
-            match self.dispatch_locked(&operation, tool_name, &business_arguments, now_unix) {
+            match self.dispatch_locked(&operation, tool_name, &business_arguments, now_unix, scope)
+            {
                 Ok(data) => approved_success(tool_name, data),
                 Err(code) => approved_error(code),
             };
@@ -365,22 +415,34 @@ impl ApprovedWorkspaceBackend {
         tool_name: &str,
         arguments: &JsonObject,
         now_unix: u64,
+        scope: ApprovedCallScope,
     ) -> Result<Value, &'static str> {
         match tool_name {
             "case_list" => self.case_list(operation, arguments, now_unix),
-            "case_get_public_metadata" => self.case_metadata(operation, arguments, now_unix),
+            "case_get_public_metadata" => self.case_metadata(operation, arguments, now_unix, scope),
             "case_list_approved_materials" => self.case_materials(operation, arguments, now_unix),
             "case_read_approved_material" => self.read_material(operation, arguments, now_unix),
             "case_search_approved_materials" => {
                 self.search_materials(operation, arguments, now_unix)
             }
-            "case_list_work_products" => self.list_work_products(operation, arguments, now_unix),
-            "case_read_work_product" => self.read_work_product(operation, arguments, now_unix),
+            "case_list_work_products" => {
+                self.list_work_products(operation, arguments, now_unix, scope)
+            }
+            "case_read_work_product" => {
+                self.read_work_product(operation, arguments, now_unix, scope)
+            }
             "case_write_work_product" => self.write_work_product(operation, arguments, now_unix),
             "case_update_work_product" => self.update_work_product(operation, arguments, now_unix),
             "case_export_work_product_manifest" => {
-                self.export_work_product_manifest(operation, arguments, now_unix)
+                self.export_work_product_manifest(operation, arguments, now_unix, scope)
             }
+            "diagram.list_templates" | "diagram.get_schema" => {
+                self.diagram_static(tool_name, arguments)
+            }
+            "diagram.validate" => self.diagram_validate(operation, arguments, now_unix),
+            "diagram.render" => self.diagram_render(operation, arguments, now_unix),
+            "diagram.update" => self.diagram_update(operation, arguments, now_unix),
+            "diagram.export" => self.diagram_export(operation, arguments, now_unix),
             _ => Err("UNKNOWN_TOOL"),
         }
     }
@@ -414,6 +476,7 @@ impl ApprovedWorkspaceBackend {
         operation: &ApprovedWorkspaceOperationGuard,
         arguments: &JsonObject,
         now_unix: u64,
+        scope: ApprovedCallScope,
     ) -> Result<Value, &'static str> {
         let case_id = parse_case_id(arguments)?;
         let materials = self.verified_material_summaries(operation, &case_id, now_unix)?;
@@ -425,10 +488,14 @@ impl ApprovedWorkspaceBackend {
             .work_products
             .list_case_locked(operation, &case_id, &self.inner.approved, now_unix)
             .map_err(work_product_error_code)?;
+        let work_product_count = work_products
+            .iter()
+            .filter(|summary| scope.diagram_read || summary.task_type != LEGAL_DIAGRAM_TASK_TYPE)
+            .count();
         Ok(json!({
             "case_id":case_id,
             "approved_material_count":materials.len(),
-            "work_product_count":work_products.len()
+            "work_product_count":work_product_count
         }))
     }
 
@@ -549,6 +616,7 @@ impl ApprovedWorkspaceBackend {
         operation: &ApprovedWorkspaceOperationGuard,
         arguments: &JsonObject,
         now_unix: u64,
+        scope: ApprovedCallScope,
     ) -> Result<Value, &'static str> {
         let case_id = parse_case_id(arguments)?;
         let summaries = self
@@ -558,6 +626,7 @@ impl ApprovedWorkspaceBackend {
             .map_err(work_product_error_code)?;
         let values = summaries
             .into_iter()
+            .filter(|summary| scope.diagram_read || summary.task_type != LEGAL_DIAGRAM_TASK_TYPE)
             .map(|summary| {
                 json!({
                     "case_id":summary.case_id,
@@ -586,6 +655,7 @@ impl ApprovedWorkspaceBackend {
         operation: &ApprovedWorkspaceOperationGuard,
         arguments: &JsonObject,
         now_unix: u64,
+        scope: ApprovedCallScope,
     ) -> Result<Value, &'static str> {
         let case_id = parse_case_id(arguments)?;
         let work_product_id = parse_work_product_id(arguments)?;
@@ -602,6 +672,9 @@ impl ApprovedWorkspaceBackend {
                 now_unix,
             )
             .map_err(work_product_error_code)?;
+        if verified.manifest().claims.task_type == LEGAL_DIAGRAM_TASK_TYPE && !scope.diagram_read {
+            return Err("DIAGRAM_READ_GRANT_REQUIRED");
+        }
         let content =
             std::str::from_utf8(verified.content()).map_err(|_| "WORK_PRODUCT_CONTENT_INVALID")?;
         let claims = &verified.manifest().claims;
@@ -646,6 +719,7 @@ impl ApprovedWorkspaceBackend {
             status: string_argument(arguments, "status")?.to_owned(),
             source_approved_refs: sources,
             content_media_type: string_argument(arguments, "content_media_type")?.to_owned(),
+            diagram_spec_sha256: None,
             placeholder_policy_version: PLACEHOLDER_POLICY_VERSION.to_owned(),
             author_tool: "case_write_work_product".to_owned(),
             author_tool_version: AUTHOR_TOOL_VERSION.to_owned(),
@@ -688,12 +762,16 @@ impl ApprovedWorkspaceBackend {
                 now_unix,
             )
             .map_err(work_product_error_code)?;
+        if prior.manifest().claims.task_type == LEGAL_DIAGRAM_TASK_TYPE {
+            return Err("DIAGRAM_SPECIALIZED_UPDATE_REQUIRED");
+        }
         let sources = self.resolve_sources(operation, arguments, &case_id, now_unix)?;
         let request = WorkProductWriteV1 {
             task_type: prior.manifest().claims.task_type.clone(),
             status: string_argument(arguments, "status")?.to_owned(),
             source_approved_refs: sources,
             content_media_type: string_argument(arguments, "content_media_type")?.to_owned(),
+            diagram_spec_sha256: None,
             placeholder_policy_version: PLACEHOLDER_POLICY_VERSION.to_owned(),
             author_tool: "case_update_work_product".to_owned(),
             author_tool_version: AUTHOR_TOOL_VERSION.to_owned(),
@@ -722,6 +800,7 @@ impl ApprovedWorkspaceBackend {
         operation: &ApprovedWorkspaceOperationGuard,
         arguments: &JsonObject,
         now_unix: u64,
+        scope: ApprovedCallScope,
     ) -> Result<Value, &'static str> {
         let case_id = parse_case_id(arguments)?;
         let work_product_id = parse_work_product_id(arguments)?;
@@ -738,6 +817,9 @@ impl ApprovedWorkspaceBackend {
                 now_unix,
             )
             .map_err(work_product_error_code)?;
+        if manifest.claims.task_type == LEGAL_DIAGRAM_TASK_TYPE && !scope.diagram_read {
+            return Err("DIAGRAM_READ_GRANT_REQUIRED");
+        }
         let canonical =
             canonical_json_v1(&manifest).map_err(|_| "WORK_PRODUCT_MANIFEST_INVALID")?;
         Ok(json!({
@@ -747,6 +829,324 @@ impl ApprovedWorkspaceBackend {
             "manifest_sha256":sha256_hex(&canonical),
             "manifest":manifest
         }))
+    }
+
+    fn diagram_static(
+        &self,
+        tool_name: &str,
+        arguments: &JsonObject,
+    ) -> Result<Value, &'static str> {
+        diagram_mcp::approved_static_response(tool_name, arguments).map_err(diagram_error_code)
+    }
+
+    fn diagram_validate(
+        &self,
+        operation: &ApprovedWorkspaceOperationGuard,
+        arguments: &JsonObject,
+        now_unix: u64,
+    ) -> Result<Value, &'static str> {
+        let case_id = parse_case_id(arguments)?;
+        let sources = self.resolve_sources(operation, arguments, &case_id, now_unix)?;
+        let spec = self.approved_diagram_spec(arguments, "spec", &sources)?;
+        let validation = diagram_mcp::validate_approved_spec(&spec).map_err(diagram_error_code)?;
+        diagram_mcp::sanitized_validation_value(&validation).map_err(diagram_error_code)
+    }
+
+    fn diagram_render(
+        &self,
+        operation: &ApprovedWorkspaceOperationGuard,
+        arguments: &JsonObject,
+        now_unix: u64,
+    ) -> Result<Value, &'static str> {
+        let case_id = parse_case_id(arguments)?;
+        let sources = self.resolve_sources(operation, arguments, &case_id, now_unix)?;
+        let spec = self.approved_diagram_spec(arguments, "spec", &sources)?;
+        let validation = diagram_mcp::validate_approved_spec(&spec).map_err(diagram_error_code)?;
+        if !validation.valid {
+            return diagram_mcp::sanitized_validation_value(&validation)
+                .map_err(diagram_error_code);
+        }
+        let rendered = diagram_mcp::render_approved_spec(&spec).map_err(diagram_error_code)?;
+        let spec_hash = rendered
+            .validation
+            .spec_hash
+            .clone()
+            .ok_or("DIAGRAM_SERIALIZATION_FAILED")?;
+        let diagram_spec_sha256 = parse_diagram_spec_sha256(&spec_hash)?;
+        let request = WorkProductWriteV1 {
+            task_type: LEGAL_DIAGRAM_TASK_TYPE.to_owned(),
+            status: string_argument(arguments, "status")?.to_owned(),
+            source_approved_refs: sources,
+            content_media_type: LEGAL_DIAGRAM_MEDIA_TYPE.to_owned(),
+            diagram_spec_sha256: Some(diagram_spec_sha256),
+            placeholder_policy_version: PLACEHOLDER_POLICY_VERSION.to_owned(),
+            author_tool: "diagram.render".to_owned(),
+            author_tool_version: AUTHOR_TOOL_VERSION.to_owned(),
+            idempotency_key: string_argument(arguments, "idempotency_key")?.to_owned(),
+        };
+        let published = self
+            .inner
+            .work_product_publisher
+            .create_locked(
+                operation,
+                &case_id,
+                request,
+                &rendered.html,
+                &self.inner.approved,
+                now_unix,
+            )
+            .map_err(work_product_error_code)?;
+        let validation = diagram_mcp::sanitized_validation_value(&rendered.validation)
+            .map_err(diagram_error_code)?;
+        Ok(json!({
+            "artifact":published_json(published),
+            "mime_type":LEGAL_DIAGRAM_MEDIA_TYPE,
+            "byte_len":rendered.html.len(),
+            "spec_hash":spec_hash,
+            "html_sha256":rendered.html_sha256,
+            "validation":validation
+        }))
+    }
+
+    fn diagram_update(
+        &self,
+        operation: &ApprovedWorkspaceOperationGuard,
+        arguments: &JsonObject,
+        now_unix: u64,
+    ) -> Result<Value, &'static str> {
+        let case_id = parse_case_id(arguments)?;
+        let work_product_id = parse_work_product_id(arguments)?;
+        let expected_parent_version = u64_argument(arguments, "expected_parent_version")?;
+        let prior = self.read_diagram_work_product_locked(
+            operation,
+            &case_id,
+            &work_product_id,
+            expected_parent_version,
+            now_unix,
+        )?;
+        let expected_spec_hash = string_argument(arguments, "expected_spec_hash")?;
+        let expected_spec_sha256 = parse_diagram_spec_sha256(expected_spec_hash)?;
+        if prior.manifest().claims.diagram_spec_sha256.as_ref() != Some(&expected_spec_sha256) {
+            return Err("DIAGRAM_PARENT_SPEC_MISMATCH");
+        }
+        let sources = self.resolve_sources(operation, arguments, &case_id, now_unix)?;
+        let base_spec = self.approved_diagram_spec_subset(arguments, "base_spec", &sources)?;
+        let base_rendered =
+            diagram_mcp::render_approved_spec(&base_spec).map_err(diagram_error_code)?;
+        if base_rendered.validation.spec_hash.as_deref() != Some(expected_spec_hash) {
+            return Err("DIAGRAM_PARENT_SPEC_MISMATCH");
+        }
+        if prior.content() != base_rendered.html.as_slice() {
+            return Err("DIAGRAM_PARENT_CONTENT_MISMATCH");
+        }
+        let patch =
+            diagram_mcp::approved_patch_from_arguments(arguments).map_err(diagram_error_code)?;
+        let updated_spec = apply_update_to_spec(base_spec, expected_spec_hash, patch)
+            .map_err(|error| diagram_service_error_code(error.code()))?;
+        self.validate_approved_diagram_spec_subset(&updated_spec, &sources)?;
+        self.require_diagram_source_lineage(&prior, &sources, &updated_spec)?;
+        let rendered =
+            diagram_mcp::render_approved_spec(&updated_spec).map_err(diagram_error_code)?;
+        let spec_hash = rendered
+            .validation
+            .spec_hash
+            .clone()
+            .ok_or("DIAGRAM_SERIALIZATION_FAILED")?;
+        let diagram_spec_sha256 = parse_diagram_spec_sha256(&spec_hash)?;
+        let request = WorkProductWriteV1 {
+            task_type: LEGAL_DIAGRAM_TASK_TYPE.to_owned(),
+            status: string_argument(arguments, "status")?.to_owned(),
+            source_approved_refs: sources,
+            content_media_type: LEGAL_DIAGRAM_MEDIA_TYPE.to_owned(),
+            diagram_spec_sha256: Some(diagram_spec_sha256),
+            placeholder_policy_version: PLACEHOLDER_POLICY_VERSION.to_owned(),
+            author_tool: "diagram.update".to_owned(),
+            author_tool_version: AUTHOR_TOOL_VERSION.to_owned(),
+            idempotency_key: string_argument(arguments, "idempotency_key")?.to_owned(),
+        };
+        let published = self
+            .inner
+            .work_product_publisher
+            .update_locked(
+                operation,
+                &case_id,
+                &work_product_id,
+                expected_parent_version,
+                request,
+                &rendered.html,
+                &self.inner.approved,
+                now_unix,
+            )
+            .map_err(work_product_error_code)?;
+        let validation = diagram_mcp::sanitized_validation_value(&rendered.validation)
+            .map_err(diagram_error_code)?;
+        Ok(json!({
+            "artifact":published_json(published),
+            "mime_type":LEGAL_DIAGRAM_MEDIA_TYPE,
+            "byte_len":rendered.html.len(),
+            "spec_hash":spec_hash,
+            "html_sha256":rendered.html_sha256,
+            "validation":validation
+        }))
+    }
+
+    fn diagram_export(
+        &self,
+        operation: &ApprovedWorkspaceOperationGuard,
+        arguments: &JsonObject,
+        now_unix: u64,
+    ) -> Result<Value, &'static str> {
+        let case_id = parse_case_id(arguments)?;
+        let work_product_id = parse_work_product_id(arguments)?;
+        let version = u64_argument(arguments, "version")?;
+        let verified = self.read_diagram_work_product_locked(
+            operation,
+            &case_id,
+            &work_product_id,
+            version,
+            now_unix,
+        )?;
+        let claims = &verified.manifest().claims;
+        Ok(json!({
+            "case_id":case_id,
+            "work_product_id":work_product_id,
+            "version":version,
+            "format":"html",
+            "mime_type":LEGAL_DIAGRAM_MEDIA_TYPE,
+            "byte_len":claims.content_bytes,
+            "html_sha256":format!("sha256:{}", claims.content_sha256.as_str()),
+            "manifest_sha256":verified.manifest_sha256()
+        }))
+    }
+
+    fn approved_diagram_spec(
+        &self,
+        arguments: &JsonObject,
+        field: &str,
+        sources: &[ApprovedMaterialRefV1],
+    ) -> Result<diagrams::DiagramSpec, &'static str> {
+        let spec = diagram_mcp::approved_spec_from_arguments(arguments, field)
+            .map_err(diagram_error_code)?;
+        self.validate_approved_diagram_spec(&spec, sources)?;
+        Ok(spec)
+    }
+
+    fn approved_diagram_spec_subset(
+        &self,
+        arguments: &JsonObject,
+        field: &str,
+        sources: &[ApprovedMaterialRefV1],
+    ) -> Result<diagrams::DiagramSpec, &'static str> {
+        let spec = diagram_mcp::approved_spec_from_arguments(arguments, field)
+            .map_err(diagram_error_code)?;
+        self.validate_approved_diagram_spec_subset(&spec, sources)?;
+        Ok(spec)
+    }
+
+    fn validate_approved_diagram_spec(
+        &self,
+        spec: &diagrams::DiagramSpec,
+        sources: &[ApprovedMaterialRefV1],
+    ) -> Result<(), &'static str> {
+        let publication_ids = sources
+            .iter()
+            .map(|source| source.publication_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        if !diagram_mcp::approved_spec_sources_are_bound(spec, &publication_ids) {
+            return Err("DIAGRAM_SOURCE_BINDING_MISMATCH");
+        }
+        self.validate_approved_diagram_residual(spec)
+    }
+
+    fn validate_approved_diagram_spec_subset(
+        &self,
+        spec: &diagrams::DiagramSpec,
+        sources: &[ApprovedMaterialRefV1],
+    ) -> Result<(), &'static str> {
+        let publication_ids = sources
+            .iter()
+            .map(|source| source.publication_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        if !diagram_mcp::approved_spec_sources_are_subset_bound(spec, &publication_ids) {
+            return Err("DIAGRAM_SOURCE_BINDING_MISMATCH");
+        }
+        self.validate_approved_diagram_residual(spec)
+    }
+
+    fn validate_approved_diagram_residual(
+        &self,
+        spec: &diagrams::DiagramSpec,
+    ) -> Result<(), &'static str> {
+        let canonical = canonical_json_bytes(spec).map_err(|_| "DIAGRAM_SERIALIZATION_FAILED")?;
+        if !matches!(scan_residual(&canonical), Ok(scan) if scan.passed) {
+            return Err("DIAGRAM_RESIDUAL_DETECTED");
+        }
+        Ok(())
+    }
+
+    fn require_diagram_source_lineage(
+        &self,
+        prior: &VerifiedWorkProductV1,
+        sources: &[ApprovedMaterialRefV1],
+        updated_spec: &diagrams::DiagramSpec,
+    ) -> Result<(), &'static str> {
+        let prior_sources = &prior.manifest().claims.source_approved_refs;
+        let envelope_ids = sources
+            .iter()
+            .map(|source| source.publication_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let prior_ids = prior_sources
+            .iter()
+            .map(|source| source.publication_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let updated_ids = updated_spec
+            .sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<BTreeSet<_>>();
+        let required_ids = prior_ids
+            .union(&updated_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        if sources.len() != envelope_ids.len()
+            || prior_sources.len() != prior_ids.len()
+            || !prior_sources.iter().all(|prior| sources.contains(prior))
+            || envelope_ids != required_ids
+        {
+            return Err("DIAGRAM_SOURCE_LINEAGE_MISMATCH");
+        }
+        Ok(())
+    }
+
+    fn read_diagram_work_product_locked(
+        &self,
+        operation: &ApprovedWorkspaceOperationGuard,
+        case_id: &CaseId,
+        work_product_id: &WorkProductId,
+        version: u64,
+        now_unix: u64,
+    ) -> Result<VerifiedWorkProductV1, &'static str> {
+        let verified = self
+            .inner
+            .work_products
+            .read_locked(
+                operation,
+                case_id,
+                work_product_id,
+                version,
+                &self.inner.approved,
+                now_unix,
+            )
+            .map_err(work_product_error_code)?;
+        let claims = &verified.manifest().claims;
+        if claims.task_type != LEGAL_DIAGRAM_TASK_TYPE
+            || claims.content_media_type != LEGAL_DIAGRAM_MEDIA_TYPE
+            || std::str::from_utf8(verified.content()).is_err()
+        {
+            return Err("DIAGRAM_ARTIFACT_INVALID");
+        }
+        Ok(verified)
     }
 
     fn resolve_sources(
@@ -871,7 +1271,7 @@ pub fn make_access_ticket_request(
     expires_at_unix: u64,
 ) -> Result<McpAccessTicketRequestV1, ApprovedBackendInitError> {
     if !valid_session_binding(session_id)
-        || !approved_workspace::request_is_valid(tool_name, business_arguments)
+        || !approved_request_is_valid(tool_name, business_arguments)
     {
         return Err(ApprovedBackendInitError::InvalidBinding);
     }
@@ -901,7 +1301,7 @@ fn bind_business_request(
     tool_name: &str,
     arguments: &JsonObject,
 ) -> Result<BusinessRequestBinding, &'static str> {
-    if !approved_workspace::request_is_valid(tool_name, arguments) {
+    if !approved_request_is_valid(tool_name, arguments) {
         return Err("INVALID_REQUEST");
     }
     let canonical =
@@ -909,7 +1309,10 @@ fn bind_business_request(
     let canonical_request_sha256 =
         Sha256Hex::parse(sha256_hex(&canonical)).map_err(|_| "INVALID_REQUEST")?;
     let mut target = McpAccessTargetV1::default();
-    if tool_name != "case_list" {
+    if !matches!(
+        tool_name,
+        "case_list" | "diagram.list_templates" | "diagram.get_schema"
+    ) {
         target.case_id = Some(parse_case_id(arguments)?);
     }
     match tool_name {
@@ -925,6 +1328,14 @@ fn bind_business_request(
             target.work_product_id = Some(parse_work_product_id(arguments)?);
             target.version = Some(u64_argument(arguments, "expected_parent_version")?);
         }
+        "diagram.update" => {
+            target.work_product_id = Some(parse_work_product_id(arguments)?);
+            target.version = Some(u64_argument(arguments, "expected_parent_version")?);
+        }
+        "diagram.export" => {
+            target.work_product_id = Some(parse_work_product_id(arguments)?);
+            target.version = Some(u64_argument(arguments, "version")?);
+        }
         _ => {}
     }
     Ok(BusinessRequestBinding {
@@ -932,6 +1343,14 @@ fn bind_business_request(
         canonical_request_sha256,
         target,
     })
+}
+
+fn approved_request_is_valid(tool_name: &str, arguments: &JsonObject) -> bool {
+    if approved_workspace::is_approved_workspace_tool(tool_name) {
+        approved_workspace::request_is_valid(tool_name, arguments)
+    } else {
+        diagram_mcp::approved_request_is_valid(tool_name, arguments)
+    }
 }
 
 fn parse_case_id(arguments: &JsonObject) -> Result<CaseId, &'static str> {
@@ -951,6 +1370,15 @@ fn parse_publication_id(arguments: &JsonObject) -> Result<PublicationId, &'stati
 fn parse_work_product_id(arguments: &JsonObject) -> Result<WorkProductId, &'static str> {
     WorkProductId::parse(string_argument(arguments, "work_product_id")?.to_owned())
         .map_err(|_| "INVALID_REQUEST")
+}
+
+fn parse_diagram_spec_sha256(value: &str) -> Result<Sha256Hex, &'static str> {
+    value
+        .strip_prefix("sha256:")
+        .ok_or("DIAGRAM_SPEC_HASH_INVALID")
+        .and_then(|value| {
+            Sha256Hex::parse(value.to_owned()).map_err(|_| "DIAGRAM_SPEC_HASH_INVALID")
+        })
 }
 
 fn string_argument<'a>(arguments: &'a JsonObject, name: &str) -> Result<&'a str, &'static str> {
@@ -1114,6 +1542,23 @@ fn work_product_error_code(error: WorkProductError) -> &'static str {
         | WorkProductError::DatabaseFailed
         | WorkProductError::IoFailed
         | WorkProductError::RecoveryFailed => "WORK_PRODUCT_UNAVAILABLE",
+    }
+}
+
+fn diagram_error_code(error: diagram_mcp::DiagramMcpError) -> &'static str {
+    diagram_service_error_code(error.code())
+}
+
+fn diagram_service_error_code(code: &str) -> &'static str {
+    match code {
+        "invalid_request" => "INVALID_REQUEST",
+        "unsupported_schema_version" => "UNSUPPORTED_SCHEMA_VERSION",
+        "serialization_failed" => "DIAGRAM_SERIALIZATION_FAILED",
+        "diagram_invalid" => "DIAGRAM_INVALID",
+        "artifact_too_large" => "DIAGRAM_ARTIFACT_TOO_LARGE",
+        "stale_spec" => "DIAGRAM_SPEC_STALE",
+        "invalid_patch" => "DIAGRAM_PATCH_INVALID",
+        _ => "DIAGRAM_OPERATION_FAILED",
     }
 }
 
@@ -1329,8 +1774,8 @@ mod tests {
             mcp_binary_sha256: hash(b"synthetic mcp binary"),
             mcp_binary_version: env!("CARGO_PKG_VERSION").to_owned(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            policy_id: "approved-mcp-local-egress-v1".to_owned(),
-            policy_version: 1,
+            policy_id: APPROVED_MCP_POLICY_ID.to_owned(),
+            policy_version: APPROVED_MCP_POLICY_VERSION,
             server_key_id: "ticket-key-v1".to_owned(),
             server_key_version: 1,
             revocation_epoch: 1,
@@ -1557,11 +2002,34 @@ mod tests {
         let request = fixture
             .backend
             .ticket_request(tool_name, &business, now, now + 60)
-            .expect("ticket request");
+            .unwrap_or_else(|error| {
+                panic!("ticket request for {tool_name}: {error:?}; {business:#?}")
+            });
         let ticket = fixture.tickets.issue(request).expect("issue ticket");
         let mut arguments = business;
         arguments.insert("access_ticket".to_owned(), json!(ticket));
         call_prepared(fixture, tool_name, arguments).await
+    }
+
+    fn call_with_diagram_read_scope(
+        fixture: &Fixture,
+        tool_name: &str,
+        business: JsonObject,
+        diagram_read: bool,
+    ) -> Value {
+        let now = now_seconds();
+        let request = fixture
+            .backend
+            .ticket_request(tool_name, &business, now, now + 60)
+            .expect("scoped ticket request");
+        let ticket = fixture.tickets.issue(request).expect("scoped ticket");
+        serde_json::to_value(fixture.backend.call_for_standalone(
+            tool_name,
+            &ticket,
+            business,
+            diagram_read,
+        ))
+        .expect("scoped response")
     }
 
     async fn call_prepared(fixture: &Fixture, tool_name: &str, arguments: JsonObject) -> Value {
@@ -1580,6 +2048,39 @@ mod tests {
             "{response:#}"
         );
         &response["structuredContent"]["data"]
+    }
+
+    fn approved_diagram_spec(publication_id: &str) -> Value {
+        let mut spec: Value = serde_json::from_str(include_str!(
+            "../../diagrams/examples/case_issue_evidence_law_v1.json"
+        ))
+        .expect("approved diagram fixture");
+        spec["title"] = json!("[PERSON_001] approved diagram");
+        spec["summary"] = json!("Approved alias-only synthetic diagram.");
+        spec["sources"] = json!([{
+            "id":publication_id,
+            "kind":"case_record",
+            "title":"Approved source",
+            "locator":"Approved publication",
+            "artifact_id":publication_id,
+            "verification_status":"human_confirmed"
+        }]);
+        for collection in ["nodes", "edges", "groups"] {
+            for item in spec[collection].as_array_mut().expect("diagram collection") {
+                item["source_refs"] = json!([publication_id]);
+                if let Some(metadata) = item
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("metadata"))
+                    .and_then(Value::as_object_mut)
+                {
+                    if metadata.contains_key("official_source") {
+                        metadata.insert("official_source".to_owned(), json!(publication_id));
+                    }
+                }
+            }
+        }
+        spec["provenance"]["source_file_ids"] = json!([publication_id]);
+        spec
     }
 
     fn assert_error_without_content(
@@ -1732,6 +2233,344 @@ mod tests {
         );
         let serialized = serde_json::to_string(&replay).expect("replay JSON");
         assert!(!serialized.contains(&ticket));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn six_approved_diagram_tools_publish_protected_artifacts_and_honor_revoke() {
+        let fixture = fixture(McpTransportBindingV1::Stdio);
+        let case = fixture.case_id.as_str();
+        let material = fixture.material_id.as_str();
+        let publication = fixture.publication_id.as_str();
+        let source_refs = json!([{"material_id":material,"publication_id":publication}]);
+        let mut spec = approved_diagram_spec(publication);
+        spec["display_options"]["show_sources"] = json!(false);
+
+        let listed = call(
+            &fixture,
+            "diagram.list_templates",
+            object(json!({"schema_version":1})),
+        )
+        .await;
+        assert_eq!(data(&listed)["templates"].as_array().map(Vec::len), Some(7));
+        let schema = call(
+            &fixture,
+            "diagram.get_schema",
+            object(json!({"schema_version":1,"template_id":"case_issue_evidence_law_v1"})),
+        )
+        .await;
+        assert!(data(&schema)["diagram_spec_schema"].is_object());
+
+        let validated = call(
+            &fixture,
+            "diagram.validate",
+            object(json!({
+                "schema_version":1,"case_id":case,
+                "source_approved_refs":source_refs,"spec":spec
+            })),
+        )
+        .await;
+        assert_eq!(data(&validated)["valid"], true);
+
+        let missing_ticket = fixture
+            .adapter
+            .call(
+                "diagram.render",
+                Some(object(json!({
+                    "schema_version":1,"case_id":case,
+                    "source_approved_refs":source_refs,"spec":spec,"status":"draft",
+                    "idempotency_key":format!("idem_{}", "D".repeat(32))
+                }))),
+            )
+            .await
+            .expect_err("render without internal ticket fails before execution");
+        let missing_ticket = serde_json::to_value(missing_ticket).expect("missing ticket error");
+        assert_eq!(missing_ticket["code"], -32602);
+        let products_after_rejection = call(
+            &fixture,
+            "case_list_work_products",
+            object(json!({"schema_version":1,"case_id":case})),
+        )
+        .await;
+        assert_eq!(data(&products_after_rejection)["items"], json!([]));
+
+        let rendered = call(
+            &fixture,
+            "diagram.render",
+            object(json!({
+                "schema_version":1,"case_id":case,
+                "source_approved_refs":source_refs,"spec":spec,"status":"draft",
+                "idempotency_key":format!("idem_{}", "D".repeat(32))
+            })),
+        )
+        .await;
+        let artifact_id = data(&rendered)["artifact"]["work_product_id"]
+            .as_str()
+            .expect("opaque diagram work product")
+            .to_owned();
+        assert_eq!(data(&rendered)["artifact"]["version"], 1);
+        let spec_hash = data(&rendered)["spec_hash"]
+            .as_str()
+            .expect("diagram spec hash")
+            .to_owned();
+        let rendered_wire = serde_json::to_string(&rendered).expect("rendered response JSON");
+        for forbidden in [
+            "[PERSON_001] approved diagram",
+            "<html",
+            "artifact_uri",
+            "lawyer-assistance://diagrams/",
+            "C:\\",
+        ] {
+            assert!(!rendered_wire.contains(forbidden), "leaked {forbidden}");
+        }
+
+        let metadata_without_diagram_read = call_with_diagram_read_scope(
+            &fixture,
+            "case_get_public_metadata",
+            object(json!({"schema_version":1,"case_id":case})),
+            false,
+        );
+        assert_eq!(
+            data(&metadata_without_diagram_read)["work_product_count"],
+            0
+        );
+        let list_without_diagram_read = call_with_diagram_read_scope(
+            &fixture,
+            "case_list_work_products",
+            object(json!({"schema_version":1,"case_id":case})),
+            false,
+        );
+        assert_eq!(data(&list_without_diagram_read)["items"], json!([]));
+        for (tool_name, arguments) in [
+            (
+                "case_read_work_product",
+                object(json!({
+                    "schema_version":1,"case_id":case,"work_product_id":artifact_id,"version":1
+                })),
+            ),
+            (
+                "case_export_work_product_manifest",
+                object(json!({
+                    "schema_version":1,"case_id":case,"work_product_id":artifact_id,"version":1
+                })),
+            ),
+        ] {
+            let denied = call_with_diagram_read_scope(&fixture, tool_name, arguments, false);
+            assert_eq!(denied["isError"], true);
+            assert_eq!(
+                denied["structuredContent"]["reason_code"],
+                "DIAGRAM_READ_GRANT_REQUIRED"
+            );
+        }
+        let readable_with_diagram_read = call_with_diagram_read_scope(
+            &fixture,
+            "case_read_work_product",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,"version":1
+            })),
+            true,
+        );
+        assert_eq!(
+            data(&readable_with_diagram_read)["task_type"],
+            LEGAL_DIAGRAM_TASK_TYPE
+        );
+
+        let generic_create = object(json!({
+            "schema_version":1,"case_id":case,"task_type":LEGAL_DIAGRAM_TASK_TYPE,
+            "status":"draft","source_approved_refs":source_refs,
+            "content_media_type":LEGAL_DIAGRAM_MEDIA_TYPE,
+            "content":"<!doctype html><html><body>Synthetic bypass attempt</body></html>",
+            "idempotency_key":format!("idem_{}", "K".repeat(32))
+        }));
+        assert!(
+            matches!(
+                fixture.backend.ticket_request(
+                    "case_write_work_product",
+                    &generic_create,
+                    now_seconds(),
+                    now_seconds() + 60,
+                ),
+                Err(ApprovedBackendInitError::InvalidBinding)
+            ),
+            "the generic write schema must reject legal_diagram before ticket issuance"
+        );
+
+        let generic_update = call(
+            &fixture,
+            "case_update_work_product",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "expected_parent_version":1,"status":"draft",
+                "source_approved_refs":source_refs,"content_media_type":"text/plain",
+                "content":"Synthetic generic overwrite attempt",
+                "idempotency_key":format!("idem_{}", "G".repeat(32))
+            })),
+        )
+        .await;
+        assert_eq!(generic_update["isError"], true);
+        assert_eq!(
+            generic_update["structuredContent"]["reason_code"],
+            "DIAGRAM_SPECIALIZED_UPDATE_REQUIRED"
+        );
+
+        let mut colliding_spec = spec.clone();
+        colliding_spec["sources"][0]["locator"] = json!("Approved publication revision");
+        let original_typed: diagrams::DiagramSpec =
+            serde_json::from_value(spec.clone()).expect("original approved diagram");
+        let colliding_typed: diagrams::DiagramSpec =
+            serde_json::from_value(colliding_spec.clone()).expect("colliding approved diagram");
+        assert_eq!(
+            diagrams::render_html(&original_typed),
+            diagrams::render_html(&colliding_typed),
+            "hidden source metadata demonstrates why HTML equality cannot bind the parent spec"
+        );
+        let colliding_spec_hash =
+            diagrams::spec_hash(&colliding_typed).expect("colliding spec hash");
+        assert_ne!(colliding_spec_hash, spec_hash);
+        let collision_update = call(
+            &fixture,
+            "diagram.update",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "expected_parent_version":1,"source_approved_refs":source_refs,
+                "base_spec":colliding_spec,"expected_spec_hash":colliding_spec_hash,
+                "patch":{"title":"[PERSON_001] collision attempt"},
+                "status":"final","idempotency_key":format!("idem_{}", "H".repeat(32))
+            })),
+        )
+        .await;
+        assert_eq!(collision_update["isError"], true);
+        assert_eq!(
+            collision_update["structuredContent"]["reason_code"],
+            "DIAGRAM_PARENT_SPEC_MISMATCH"
+        );
+
+        let (extra_material_id, extra_publication_id) = publish_native_text_generation(&fixture);
+        let source_refs_with_unrelated_extra = json!([
+            {"material_id":material,"publication_id":publication},
+            {"material_id":extra_material_id,"publication_id":extra_publication_id}
+        ]);
+        let unrelated_extra_update = call(
+            &fixture,
+            "diagram.update",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "expected_parent_version":1,
+                "source_approved_refs":source_refs_with_unrelated_extra,
+                "base_spec":spec,"expected_spec_hash":spec_hash,
+                "patch":{"title":"[PERSON_001] unrelated source attempt"},
+                "status":"final","idempotency_key":format!("idem_{}", "I".repeat(32))
+            })),
+        )
+        .await;
+        assert_eq!(unrelated_extra_update["isError"], true);
+        assert_eq!(
+            unrelated_extra_update["structuredContent"]["reason_code"],
+            "DIAGRAM_SOURCE_LINEAGE_MISMATCH"
+        );
+
+        let revised_spec = {
+            let typed: diagrams::DiagramSpec =
+                serde_json::from_value(spec.clone()).expect("typed approved diagram");
+            let patch: diagrams::DiagramPatch = serde_json::from_value(json!({
+                "title":"[PERSON_001] approved diagram revision"
+            }))
+            .expect("typed approved patch");
+            serde_json::to_value(
+                apply_update_to_spec(typed, &spec_hash, patch).expect("pure approved update"),
+            )
+            .expect("updated diagram JSON")
+        };
+        let updated = call(
+            &fixture,
+            "diagram.update",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "expected_parent_version":1,"source_approved_refs":source_refs,
+                "base_spec":spec,"expected_spec_hash":spec_hash,
+                "patch":{"title":"[PERSON_001] approved diagram revision"},
+                "status":"final","idempotency_key":format!("idem_{}", "E".repeat(32))
+            })),
+        )
+        .await;
+        assert_eq!(data(&updated)["artifact"]["version"], 2);
+        let updated_hash = data(&updated)["spec_hash"].clone();
+
+        let dropped_prior_source = call(
+            &fixture,
+            "diagram.update",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "expected_parent_version":2,
+                "source_approved_refs":[{
+                    "material_id":extra_material_id,
+                    "publication_id":extra_publication_id
+                }],
+                "base_spec":revised_spec,"expected_spec_hash":updated_hash,
+                "patch":{},"status":"final",
+                "idempotency_key":format!("idem_{}", "J".repeat(32))
+            })),
+        )
+        .await;
+        assert_eq!(dropped_prior_source["isError"], true);
+        assert_eq!(
+            dropped_prior_source["structuredContent"]["reason_code"],
+            "DIAGRAM_SOURCE_BINDING_MISMATCH"
+        );
+
+        let exported = call(
+            &fixture,
+            "diagram.export",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "version":2,"format":"html"
+            })),
+        )
+        .await;
+        assert_eq!(data(&exported)["mime_type"], LEGAL_DIAGRAM_MEDIA_TYPE);
+        assert!(data(&exported)["manifest_sha256"].is_string());
+        let export_wire = serde_json::to_string(&exported).expect("export response JSON");
+        assert!(!export_wire.contains("<html"));
+        assert!(!export_wire.contains("artifact_uri"));
+
+        let (prepared_update, _) = wire_arguments(
+            &fixture,
+            "diagram.update",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "expected_parent_version":2,"source_approved_refs":source_refs,
+                "base_spec":revised_spec,"expected_spec_hash":updated_hash,
+                "patch":{},"status":"final",
+                "idempotency_key":format!("idem_{}", "F".repeat(32))
+            })),
+        );
+        let (prepared_export, _) = wire_arguments(
+            &fixture,
+            "diagram.export",
+            object(json!({
+                "schema_version":1,"case_id":case,"work_product_id":artifact_id,
+                "version":2,"format":"html"
+            })),
+        );
+        fixture
+            .approved_control
+            .revoke(
+                &fixture.case_id,
+                &fixture.material_id,
+                1,
+                &fixture.publication_id,
+                now_seconds(),
+            )
+            .expect("revoke approved diagram source");
+        for (tool, prepared) in [
+            ("diagram.update", prepared_update),
+            ("diagram.export", prepared_export),
+        ] {
+            let rejected = call_prepared(&fixture, tool, prepared).await;
+            assert_eq!(rejected["isError"], true, "{tool}: {rejected:#}");
+            let wire = serde_json::to_string(&rejected).expect("rejected diagram response");
+            assert!(!wire.contains("<html"));
+            assert!(!wire.contains("approved diagram"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

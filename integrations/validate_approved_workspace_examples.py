@@ -36,8 +36,26 @@ CASE_TOOLS = (
     "case_update_work_product",
     "case_export_work_product_manifest",
 )
-EXPECTED_TOOLS = PUBLIC_TOOLS + CASE_TOOLS
-WRITE_TOOLS = {"case_write_work_product", "case_update_work_product"}
+DIAGRAM_TOOLS = (
+    "diagram.list_templates",
+    "diagram.get_schema",
+    "diagram.validate",
+    "diagram.render",
+    "diagram.update",
+    "diagram.export",
+)
+EXPECTED_TOOLS = PUBLIC_TOOLS + CASE_TOOLS + DIAGRAM_TOOLS
+CASE_WRITE_TOOLS = (
+    "case_write_work_product",
+    "case_update_work_product",
+)
+CASE_READ_TOOLS = tuple(name for name in CASE_TOOLS if name not in CASE_WRITE_TOOLS)
+DIAGRAM_WRITE_TOOLS = (
+    "diagram.render",
+    "diagram.update",
+)
+DIAGRAM_READ_TOOLS = tuple(name for name in DIAGRAM_TOOLS if name not in DIAGRAM_WRITE_TOOLS)
+WRITE_TOOLS = set(CASE_WRITE_TOOLS + DIAGRAM_WRITE_TOOLS)
 EXPECTED_READ_ANNOTATIONS = {
     "readOnlyHint": True,
     "destructiveHint": False,
@@ -61,6 +79,13 @@ MAX_FILE_BYTES = 1024 * 1024
 SOURCE_INVARIANT = "APPROVED_CONTENT_SOURCE=current_case_read_approved_material_response"
 SINK_INVARIANT = "WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product"
 VERIFY_INVARIANT = "WORK_PRODUCT_VERIFY=current_case_read_work_product_response"
+DIAGRAM_SINK_INVARIANT = "DIAGRAM_WORK_PRODUCT_SINK=diagram.render|diagram.update"
+DIAGRAM_VERIFY_INVARIANT = "DIAGRAM_WORK_PRODUCT_VERIFY=current_case_read_work_product_response"
+DIAGRAM_GRANTS_INVARIANT = "DIAGRAM_GRANTS=diagram_read|diagram_write"
+DIAGRAM_STORAGE_INVARIANT = "DIAGRAM_STORAGE=encrypted_protected_work_product"
+DIAGRAM_EXPORT_INVARIANT = "DIAGRAM_EXPORT=verified_descriptor_metadata_only"
+DIAGRAM_INPUT_INVARIANT = "DIAGRAM_INPUT_FORBIDDEN=path|filename|artifact_uri|attachment"
+DIAGRAM_AUTHORING_INVARIANT = "DIAGRAM_AUTHORING_SCOPE=synthetic_public_only"
 NAVIGATION_INVARIANT = (
     "NAVIGATION_ONLY=case_list|case_get_public_metadata|"
     "case_list_approved_materials|case_search_approved_materials"
@@ -79,6 +104,13 @@ MANDATORY_MARKERS = (
     SINK_INVARIANT,
     NAVIGATION_INVARIANT,
     VERIFY_INVARIANT,
+    DIAGRAM_SINK_INVARIANT,
+    DIAGRAM_VERIFY_INVARIANT,
+    DIAGRAM_GRANTS_INVARIANT,
+    DIAGRAM_STORAGE_INVARIANT,
+    DIAGRAM_EXPORT_INVARIANT,
+    DIAGRAM_INPUT_INVARIANT,
+    DIAGRAM_AUTHORING_INVARIANT,
 )
 FORBIDDEN_CAPABILITY_MARKERS = (
     "attachments",
@@ -260,7 +292,7 @@ def validate_catalog(catalog: Any) -> None:
     if not isinstance(tools, list):
         return
     names = tuple(item.get("name") for item in tools if isinstance(item, dict))
-    check(names == EXPECTED_TOOLS, "approved catalog must contain the exact ordered 15-tool surface")
+    check(names == EXPECTED_TOOLS, "approved catalog must contain the exact ordered 21-tool surface")
     for item in tools:
         if not isinstance(item, dict) or item.get("name") not in EXPECTED_TOOLS:
             continue
@@ -328,7 +360,7 @@ def validate_codex(documents: dict[Path, Any], integrations_root: Path = INTEGRA
     data = documents.get(path)
     if isinstance(data, dict):
         server = data.get("mcp_servers", {}).get("lawyer_assistance", {})
-        check(tuple(server.get("enabled_tools", ())) == EXPECTED_TOOLS, f"{display_path(path)}: exact 15 tools required")
+        check(tuple(server.get("enabled_tools", ())) == EXPECTED_TOOLS, f"{display_path(path)}: exact 21 tools required")
         check(server.get("enabled") is False, f"{display_path(path)}: unqualified example must be disabled")
         check(server.get("required") is True, f"{display_path(path)}: server must fail closed when enabled")
         check(server.get("default_tools_approval_mode") == "writes", f"{display_path(path)}: write approval mode drift")
@@ -356,7 +388,7 @@ def validate_opencode(documents: dict[Path, Any], integrations_root: Path = INTE
         check(server.get("type") == "local", f"{display_path(path)}: transport drift")
         check(server.get("enabled") is False, f"{display_path(path)}: unqualified example must be disabled")
         permissions = data.get("permission", {})
-        check(set(permissions) == expected_permissions, f"{display_path(path)}: exact wildcard plus 15 permissions required")
+        check(set(permissions) == expected_permissions, f"{display_path(path)}: exact wildcard plus 21 permissions required")
         check(permissions.get("lawyer_assistance_*") == "deny", f"{display_path(path)}: wildcard must deny")
         for name in EXPECTED_TOOLS:
             check(permissions.get(f"lawyer_assistance_{name}") == "allow", f"{display_path(path)}: {name} must be allowed")
@@ -507,6 +539,7 @@ def validate_documentation(integrations_root: Path = INTEGRATIONS) -> None:
         text = path.read_text(encoding="utf-8")
         for marker in (
             PROFILE,
+            "21-tool",
             "PROFILE_NOT_QUALIFIED",
             "case_read_approved_material",
             "CASE_REDACTED_APPROVED",
@@ -515,6 +548,7 @@ def validate_documentation(integrations_root: Path = INTEGRATIONS) -> None:
             "opaque",
         ):
             check(marker in text, f"{display_path(path)}: documentation marker missing: {marker}")
+        check("15-tool" not in text, f"{display_path(path)}: stale 15-tool profile description")
 
 
 def validate_text_hygiene(integrations_root: Path = INTEGRATIONS) -> None:
@@ -544,9 +578,13 @@ def validate_text_hygiene(integrations_root: Path = INTEGRATIONS) -> None:
 
 def validate_rust_registry(root: Path = ROOT) -> None:
     approved = root / "crates" / "legal-mcp" / "src" / "approved_workspace.rs"
+    approved_backend = root / "crates" / "legal-mcp" / "src" / "approved_backend.rs"
     registry = root / "crates" / "legal-mcp" / "src" / "registry.rs"
+    standalone = root / "crates" / "legal-mcp" / "src" / "standalone_approved.rs"
     check(approved.is_file(), f"{display_path(approved)}: approved tool source missing")
+    check(approved_backend.is_file(), f"{display_path(approved_backend)}: approved backend source missing")
     check(registry.is_file(), f"{display_path(registry)}: registry source missing")
+    check(standalone.is_file(), f"{display_path(standalone)}: standalone grant source missing")
     if approved.is_file():
         text = approved.read_text(encoding="utf-8")
         match = re.search(
@@ -563,17 +601,60 @@ def validate_rust_registry(root: Path = ROOT) -> None:
         check("ApprovedCaseWorkspace" in text, "Rust registry missing ApprovedCaseWorkspace profile")
         check(PROFILE in text, "Rust registry missing approved_case_workspace parser name")
         match = re.search(
-            r"pub const APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES:\s*\[&str;\s*15\]\s*=\s*\[(.*?)\];",
+            r"pub const APPROVED_CASE_WORKSPACE_PROFILE_TOOL_NAMES:\s*\[&str;\s*21\]\s*=\s*\[(.*?)\];",
             text,
             re.DOTALL,
         )
-        check(match is not None, "Rust registry must declare the exact approved 15-tool profile")
+        check(match is not None, "Rust registry must declare the exact approved 21-tool profile")
         if match:
-            names = tuple(re.findall(r'"([a-z_]+)"', match.group(1)))
+            names = tuple(re.findall(r'"([a-z_.]+)"', match.group(1)))
             check(names == EXPECTED_TOOLS, "Rust approved profile and host catalog differ")
         check(
             "candidates.extend(approved_workspace::build_tools())" in text,
             "Rust registry does not compose approved workspace schemas",
+        )
+        check(
+            "candidates.extend(diagram_mcp::build_approved_tools())" in text,
+            "Rust registry does not compose approved diagram schemas",
+        )
+    if approved_backend.is_file():
+        text = approved_backend.read_text(encoding="utf-8")
+        check(
+            re.search(r'pub const APPROVED_MCP_POLICY_ID:\s*&str\s*=\s*"approved-mcp-local-egress-v1";', text)
+            is not None,
+            "approved MCP policy ID drift",
+        )
+        check(
+            re.search(r"pub const APPROVED_MCP_POLICY_VERSION:\s*u64\s*=\s*2;", text)
+            is not None,
+            "approved MCP policy version must be 2",
+        )
+    if standalone.is_file():
+        text = standalone.read_text(encoding="utf-8")
+        expected_grant_groups = {
+            "READ_GRANT_TOOLS": CASE_READ_TOOLS,
+            "WRITE_GRANT_TOOLS": CASE_WRITE_TOOLS,
+            "DIAGRAM_READ_GRANT_TOOLS": DIAGRAM_READ_TOOLS,
+            "DIAGRAM_WRITE_GRANT_TOOLS": DIAGRAM_WRITE_TOOLS,
+        }
+        parsed_groups: dict[str, tuple[str, ...]] = {}
+        for constant, expected in expected_grant_groups.items():
+            match = re.search(
+                rf"const {constant}:\s*\[&str;\s*{len(expected)}\]\s*=\s*\[(.*?)\];",
+                text,
+                re.DOTALL,
+            )
+            check(match is not None, f"Rust standalone grant group {constant} drift")
+            if match:
+                names = tuple(re.findall(r'"([a-z_.]+)"', match.group(1)))
+                parsed_groups[constant] = names
+                check(names == expected, f"Rust standalone grant group {constant} differs from host contract")
+        flattened = tuple(name for names in parsed_groups.values() for name in names)
+        check(len(flattened) == 16 and len(set(flattened)) == 16, "approved grant groups must be disjoint and total 16")
+        check(
+            not any(name.startswith("diagram.") for name in parsed_groups.get("READ_GRANT_TOOLS", ()))
+            and not any(name.startswith("diagram.") for name in parsed_groups.get("WRITE_GRANT_TOOLS", ())),
+            "legacy read/write grants must not silently gain diagram tools",
         )
 
 

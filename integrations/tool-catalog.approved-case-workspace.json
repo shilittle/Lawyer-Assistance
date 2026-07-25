@@ -19,6 +19,12 @@
     { "name": "case_read_work_product", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
     { "name": "case_write_work_product", "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": true },
     { "name": "case_update_work_product", "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": true },
-    { "name": "case_export_work_product_manifest", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false }
+    { "name": "case_export_work_product_manifest", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
+    { "name": "diagram.list_templates", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
+    { "name": "diagram.get_schema", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
+    { "name": "diagram.validate", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
+    { "name": "diagram.render", "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": true },
+    { "name": "diagram.update", "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": true },
+    { "name": "diagram.export", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false }
   ]
 }

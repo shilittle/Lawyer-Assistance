@@ -18,6 +18,12 @@ permission:
   lawyer_assistance_case_write_work_product: allow
   lawyer_assistance_case_update_work_product: allow
   lawyer_assistance_case_export_work_product_manifest: allow
+  lawyer_assistance_diagram.list_templates: allow
+  lawyer_assistance_diagram.get_schema: allow
+  lawyer_assistance_diagram.validate: allow
+  lawyer_assistance_diagram.render: allow
+  lawyer_assistance_diagram.update: allow
+  lawyer_assistance_diagram.export: allow
 ---
 
 # First and non-overridable clean-task CASE_RAW gate
@@ -43,4 +49,14 @@ Analyze only verified redacted content through the deployment-approved Provider.
 `WORK_PRODUCT_SINK=case_write_work_product|case_update_work_product`
 `WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
 
+`DIAGRAM_WORK_PRODUCT_SINK=diagram.render|diagram.update`
+`DIAGRAM_WORK_PRODUCT_VERIFY=current_case_read_work_product_response`
+`DIAGRAM_GRANTS=diagram_read|diagram_write`
+`DIAGRAM_STORAGE=encrypted_protected_work_product`
+`DIAGRAM_EXPORT=verified_descriptor_metadata_only`
+`DIAGRAM_INPUT_FORBIDDEN=path|filename|artifact_uri|attachment`
+`DIAGRAM_AUTHORING_SCOPE=synthetic_public_only`
+
 Create every substantive result with `case_write_work_product`; revise only with `case_update_work_product` using the expected parent version. Immediately call `case_read_work_product` for the exact returned ID and version and trust only that current-task read-back; stop on version, source-binding, hash, status, or placeholder mismatch. Bind exact approved source references and keep placeholders. Chat may report only opaque IDs, version, status, and safe reason codes. A manifest export is not filesystem export authority.
+
+For a case diagram, require explicit `diagram_read`/`diagram_write` grants, construct the Spec only from current direct approved reads, and bind their exact generations in `source_approved_refs`. Persist only through `diagram.render` or `diagram.update`, then verify the exact returned work-product ID/version through `case_read_work_product`. `diagram.export` returns only verified descriptor metadata bound to the signed work-product manifest; never treat it as HTML, a path, a URI, or filesystem authority. Never use `diagram_authoring` for real case material.

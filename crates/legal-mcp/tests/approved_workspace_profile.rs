@@ -33,7 +33,7 @@ fn object(value: Value) -> JsonObject {
 }
 
 #[test]
-fn approved_profile_is_exactly_public_five_plus_opaque_workspace_ten() {
+fn approved_profile_is_exactly_public_five_plus_workspace_ten_plus_diagram_six() {
     let registry = ToolRegistry::for_profile(PrivacyProfile::ApprovedCaseWorkspace);
     let names = registry
         .list()
@@ -47,13 +47,28 @@ fn approved_profile_is_exactly_public_five_plus_opaque_workspace_ten() {
             .map(|name| (*name).to_owned())
             .collect::<Vec<_>>()
     );
-    assert_eq!(names.len(), TOOL_NAMES.len() + 10);
+    assert_eq!(names.len(), TOOL_NAMES.len() + 10 + 6);
     assert!(!names.iter().any(|name| name == "citation_validate"));
     assert!(!names.iter().any(|name| name == "case_get_state"));
     assert_eq!(
         "approved-case-workspace".parse::<PrivacyProfile>(),
         Ok(PrivacyProfile::ApprovedCaseWorkspace)
     );
+    for name in [
+        "diagram.list_templates",
+        "diagram.get_schema",
+        "diagram.validate",
+        "diagram.render",
+        "diagram.update",
+        "diagram.export",
+    ] {
+        let tool = registry.get(name).expect("approved diagram tool");
+        let schema = serde_json::to_string(&tool.input_schema).expect("diagram schema JSON");
+        assert!(schema.contains("access_ticket"), "{name}");
+        assert!(!schema.contains("artifact_uri"), "{name}");
+        assert!(!schema.contains("file_name"), "{name}");
+        assert!(!schema.contains("\"uri\""), "{name}");
+    }
 
     let default_names = ToolRegistry::new()
         .list()
@@ -67,6 +82,42 @@ fn approved_profile_is_exactly_public_five_plus_opaque_workspace_ten() {
             .map(|name| (*name).to_owned())
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn approved_diagram_calls_fail_closed_and_reject_raw_location_fields() {
+    let (_directory, services) = services();
+    let adapter = ServiceAdapter::for_profile(services, PrivacyProfile::ApprovedCaseWorkspace);
+    let unavailable = adapter
+        .call(
+            "diagram.list_templates",
+            Some(object(json!({"schema_version":1}))),
+        )
+        .await
+        .expect("approved diagram contract is discoverable");
+    let unavailable = serde_json::to_value(unavailable).expect("unavailable result JSON");
+    assert_eq!(
+        unavailable["structuredContent"]["reason_code"],
+        "PROFILE_NOT_QUALIFIED"
+    );
+
+    let error = adapter
+        .call(
+            "diagram.export",
+            Some(object(json!({
+                "schema_version":1,
+                "case_id":format!("case_{}", "a".repeat(32)),
+                "work_product_id":format!("wp_{}", "b".repeat(32)),
+                "version":1,
+                "format":"html",
+                "path":"C:\\private-canary\\diagram.html"
+            }))),
+        )
+        .await
+        .expect_err("raw location is rejected before backend execution");
+    let wire = serde_json::to_string(&error).expect("error JSON");
+    assert!(!wire.contains("private-canary"));
+    assert!(!wire.contains("diagram.html"));
 }
 
 #[tokio::test]

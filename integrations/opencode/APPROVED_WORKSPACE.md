@@ -5,7 +5,7 @@ The `approved_case_workspace` example is separate from the public-only productio
 - Use only `opencode.approved-workspace.local.json` on Windows after qualification.
 - Replace `<APP_ISSUED_SERVER_ID>` with the exact opaque `srv_[0-9a-f]{32}` ID created by the App. Do not add environment variables, database/root/config paths, bearer tokens, bind/origin settings, or remote/HTTP transport.
 - Copy `agents/lawyer-assistance-approved-workspace.md` into `.opencode/agents/` and merge `AGENTS.approved-workspace.md.example` into project rules.
-- Keep sharing disabled, wildcard permissions denied, and require the exact 15-tool catalog.
+- Keep sharing disabled, wildcard permissions denied, and require the exact 21-tool catalog; the App-issued session grant remains the call-time authority.
 
 Begin with a clean task that contains opaque IDs only. Do not attach/paste materials or let OpenCode read a host path. Case content is usable only from a direct current-task `case_read_approved_material` response carrying `CASE_REDACTED_APPROVED`; generated case content is persisted only through `case_write_work_product` or `case_update_work_product` and verified immediately through exact-version `case_read_work_product`.
 

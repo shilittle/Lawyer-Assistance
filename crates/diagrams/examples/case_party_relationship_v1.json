@@ -1,0 +1,18 @@
+{
+  "schema_version":"1.0","diagram_type":"case_party_relationship","template_id":"case_party_relationship_v1","title":"虚构股权控制关系（注册样例）","summary":"演示持股、控制与代表关系，主体均为虚构。",
+  "nodes":[
+    {"id":"cpr_parent","type":"party","label":"甲辰投资有限公司","details":"虚构控股主体。","status":"active","importance":"critical","source_refs":["cpr_src"],"tags":["虚构","股东"],"metadata":{"role":"控股股东","organization_type":"company","ownership_percent":"60.00"}},
+    {"id":"cpr_mid","type":"party","label":"乙巳控股有限公司","details":"虚构中间主体。","status":"active","importance":"high","source_refs":["cpr_src"],"tags":["虚构"],"metadata":{"role":"中间持股主体","organization_type":"company","ownership_percent":"80.00"}},
+    {"id":"cpr_target","type":"party","label":"丙午科技有限公司","details":"虚构目标公司。","status":"active","importance":"high","source_refs":["cpr_src"],"tags":["虚构"],"metadata":{"role":"目标公司","organization_type":"company"}}
+  ],
+  "edges":[
+    {"id":"cpr_edge_owns_1","source":"cpr_parent","target":"cpr_mid","relation":"owns","label":"直接持股60%","strength":"strong","source_refs":["cpr_src"],"metadata":{"ownership_percent":"60.00"}},
+    {"id":"cpr_edge_owns_2","source":"cpr_mid","target":"cpr_target","relation":"owns","label":"直接持股80%","strength":"strong","source_refs":["cpr_src"],"metadata":{"ownership_percent":"80.00"}},
+    {"id":"cpr_edge_control","source":"cpr_parent","target":"cpr_target","relation":"controls","label":"间接控制","strength":"moderate","source_refs":["cpr_src"],"metadata":{"control_basis":"fictional_shareholding_chain"}}
+  ],
+  "groups":[{"id":"cpr_group","label":"股权链","node_ids":["cpr_parent","cpr_mid","cpr_target"],"parent_group_id":null,"collapsed_by_default":false,"source_refs":["cpr_src"]}],
+  "sources":[{"id":"cpr_src","kind":"table","title":"虚构股权登记表","locator":"测试附件 E1，表 1","artifact_id":"fixture_equity_registry","table":"表1","verification_status":"original_material"}],
+  "layout_hints":{"direction":"left_right","preferred_root_ids":["cpr_parent"],"group_by":"party","max_initial_nodes":50,"timeline_lane":"single"},
+  "display_options":{"theme":"light","show_legend":true,"show_sources":true,"hide_weak_edges":false,"collapse_low_importance":false,"print_page_size":"a4_landscape"},
+  "provenance":{"generated_by":"human","generated_at":"2026-07-21T11:15:00+08:00","diagram_spec_version":"1.0","template_version":"1.0.0","source_file_ids":["cpr_src"],"human_confirmed":false,"parent_spec_hash":null,"change_summary":"注册表虚构样例","model_content_scope":"仅整理虚构主体与关系。","deterministic_content_scope":"校验、布局和 HTML 渲染由固定模板完成。"}
+}

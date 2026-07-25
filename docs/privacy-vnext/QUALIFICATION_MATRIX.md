@@ -56,9 +56,10 @@
 | Residual scan | 与主检测独立的规则/版本 | canary、破损 placeholder、双通道差异 | 假阴性抽样 | publication/MCP/write blocked |
 | Publisher | staging/fsync/rename/current/journal/recovery | 每个 crash point、半发布、TOCTOU、replay | 断电/重启演练 | generation quarantined |
 | Manifest verifier | canonical claims、签名、content hash、epoch、scope | 字段重排/重复/未知、签名/正文替换、过期/撤销 | key 生命周期审查 | read blocked |
-| MCP schema | public 五项不变；approved 十项 ID-only；formal App 内置 paired MCP SHA-256 | exact tool sets、deny unknown、禁用字段、fuzz、缺失/畸形/错 hash/same-name substitution | 宿主集成 | profile start/qualification blocked |
+| MCP schema | public 五项不变；`diagram_authoring` 六项仅 synthetic/public 明文 bundle；approved 总计 21 项（public 5 + case 10 + diagram 6）；formal App 内置 paired MCP SHA-256 | exact tool sets、deny unknown、禁用字段、diagram profile 混用、fuzz、缺失/畸形/错 hash/same-name substitution | 宿主集成；最终 21-tool binary stdio/HTTP 复跑 | profile start/qualification blocked |
 | MCP egress | content + structuredContent 独立扫描 | 两通道 canary、错误脱敏、日志扫描 | WorkBuddy 会话抽查 | call blocked |
-| Work products | immutable、OCC、idempotency、source refs、scan；每版本 exact `content.envelope.json` + signed `manifest.json` + `commit.json`；fresh AES-256-GCM key/nonce、DPAPI CurrentUser wrap、完整 AAD；仅 scoped `WorkProductService` 可鉴权解密 | plaintext/legacy `content.bin`、extra/missing file、tamper、cross-object/version swap、hardlink、overwrite/path escape/stale source/injection | 典型任务验收 | read/write/update/export blocked |
+| Approved session policy | v2；16 non-public grants：`read=8`、`write=2`、`diagram_read=4`、`diagram_write=2`；旧 read/write 集合不扩展 | pre-v2 session、重复/未知 group、错 purpose、无 diagram grant、旧 descriptor/credential/replay reuse | revoke/recreate 与 least-privilege canary | session/call blocked |
+| Work products | immutable、OCC、idempotency、source refs、scan；每版本 exact `content.envelope.json` + signed `manifest.json` + `commit.json`；fresh AES-256-GCM key/nonce、DPAPI CurrentUser wrap、完整 AAD；普通成果及 approved diagram HTML 均仅由 scoped `WorkProductService` 鉴权解密；diagram export 仅 metadata | plaintext/legacy `content.bin`、明文 approved diagram bundle、export path/URI/HTML、extra/missing file、tamper、cross-object/version swap、hardlink、overwrite/path escape/stale source/injection | 典型任务验收 | read/write/update/export blocked |
 | Skills/host config | 正向来源与全套禁令跨宿主一致 | WorkBuddy/Codex/OpenCode validator | 新任务干净上下文检查 | 案件 skill blocked |
 | Installer/update | 组件、策略、数据库迁移和回滚 | clean install/upgrade/rollback/uninstall | Authenticode/SmartScreen | release not qualified |
 
@@ -110,5 +111,4 @@ automatic 默认关闭。开放前必须有离线、版本化、可重复的校�
 - `appAutoEnableAuthorized=false`
 - `productionCaseOcrAuthorized=false`
 
-因此不能把组件安装、catalog 验签、direct GPU diagnostic、MCP synthetic E2E 或 Full Access 解释为真实扫描案件 OCR 的生产授权，也不能宣称 automatic approval 已启用。默认 `public_law_only` 始终只有五个公开法律工具；`approved_case_workspace` 虽有十个真实 handler 和实际 binary E2E，仍只在 formal App 的 paired-binary hash、当前 qualification、standalone session 与逐调用 ticket 全部匹配时执行，静态宿主配置保持禁用且不构成生产资格。
-
+因此不能把组件安装、catalog 验签、direct GPU diagnostic、MCP synthetic E2E 或 Full Access 解释为真实扫描案件 OCR 的生产授权，也不能宣称 automatic approval 已启用。默认 `public_law_only` 始终只有五个公开法律工具；`diagram_authoring` 的明文 bundle 永久只处理 synthetic/public 数据；`approved_case_workspace` 的 21-tool 实现仍只在 formal App 的 paired-binary hash、当前 qualification、policy-v2 standalone session grant 与逐调用 ticket 全部匹配时执行，静态宿主配置保持禁用且不构成生产资格。较早 15-tool actual-binary E2E 只作为 baseline；最终 21-tool binary 复跑仍是发布门禁。

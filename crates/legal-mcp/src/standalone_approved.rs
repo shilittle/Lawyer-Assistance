@@ -9,7 +9,8 @@ use crate::{
     approved_backend::{
         approved_broker_error_result, ApprovedBackendInitError, ApprovedMcpQualificationSnapshotV1,
         ApprovedWorkspaceBackend, ApprovedWorkspaceQualificationError,
-        ApprovedWorkspaceQualificationProvider,
+        ApprovedWorkspaceQualificationProvider, APPROVED_MCP_POLICY_ID,
+        APPROVED_MCP_POLICY_VERSION,
     },
     config::{normalize_allowed_origins, BearerSecret, Command, Limits, ResolvedConfig},
     registry::PrivacyProfile,
@@ -86,8 +87,6 @@ const SESSION_SECRET_PREFIX: &str = "approved-mcp-session-secret-v1.";
 const SESSION_SECRET_PROVIDER: &str = "standalone-session";
 const DESCRIPTOR_SCHEMA: &str = "lawyer-assistance-approved-mcp-standalone-session-v2";
 const DESCRIPTOR_DOMAIN: &[u8] = b"lawyer-assistance\0approved-mcp-standalone-session-v2\0";
-const POLICY_ID: &str = "approved-mcp-local-egress-v1";
-const POLICY_VERSION: u64 = 1;
 const KEY_VERSION: u64 = 1;
 const MAX_DESCRIPTOR_BYTES: usize = 256 * 1024;
 const MAX_SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -128,6 +127,8 @@ impl StandaloneApprovedError {
 pub enum ApprovedMcpGrantGroupV1 {
     Read,
     Write,
+    DiagramRead,
+    DiagramWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,20 +149,39 @@ const READ_GRANT_TOOLS: [&str; 8] = [
     "case_export_work_product_manifest",
 ];
 const WRITE_GRANT_TOOLS: [&str; 2] = ["case_write_work_product", "case_update_work_product"];
+const DIAGRAM_READ_GRANT_TOOLS: [&str; 4] = [
+    "diagram.list_templates",
+    "diagram.get_schema",
+    "diagram.validate",
+    "diagram.export",
+];
+const DIAGRAM_WRITE_GRANT_TOOLS: [&str; 2] = ["diagram.render", "diagram.update"];
 
 fn canonical_grants(
     requested: &[ApprovedMcpGrantGroupV1],
 ) -> Result<(Vec<ApprovedMcpGrantGroupV1>, Vec<ApprovedMcpToolGrantV1>), StandaloneApprovedError> {
-    if requested.is_empty() || requested.len() > 2 {
+    if requested.is_empty() || requested.len() > 4 {
         return Err(StandaloneApprovedError::InvalidBinding);
     }
     let read = requested.contains(&ApprovedMcpGrantGroupV1::Read);
     let write = requested.contains(&ApprovedMcpGrantGroupV1::Write);
-    if usize::from(read) + usize::from(write) != requested.len() {
+    let diagram_read = requested.contains(&ApprovedMcpGrantGroupV1::DiagramRead);
+    let diagram_write = requested.contains(&ApprovedMcpGrantGroupV1::DiagramWrite);
+    if usize::from(read)
+        + usize::from(write)
+        + usize::from(diagram_read)
+        + usize::from(diagram_write)
+        != requested.len()
+    {
         return Err(StandaloneApprovedError::InvalidBinding);
     }
     let mut groups = Vec::with_capacity(requested.len());
-    let mut grants = Vec::with_capacity(READ_GRANT_TOOLS.len() + WRITE_GRANT_TOOLS.len());
+    let mut grants = Vec::with_capacity(
+        READ_GRANT_TOOLS.len()
+            + WRITE_GRANT_TOOLS.len()
+            + DIAGRAM_READ_GRANT_TOOLS.len()
+            + DIAGRAM_WRITE_GRANT_TOOLS.len(),
+    );
     if read {
         groups.push(ApprovedMcpGrantGroupV1::Read);
         grants.extend(READ_GRANT_TOOLS.into_iter().map(tool_grant));
@@ -169,6 +189,14 @@ fn canonical_grants(
     if write {
         groups.push(ApprovedMcpGrantGroupV1::Write);
         grants.extend(WRITE_GRANT_TOOLS.into_iter().map(tool_grant));
+    }
+    if diagram_read {
+        groups.push(ApprovedMcpGrantGroupV1::DiagramRead);
+        grants.extend(DIAGRAM_READ_GRANT_TOOLS.into_iter().map(tool_grant));
+    }
+    if diagram_write {
+        groups.push(ApprovedMcpGrantGroupV1::DiagramWrite);
+        grants.extend(DIAGRAM_WRITE_GRANT_TOOLS.into_iter().map(tool_grant));
     }
     Ok((groups, grants))
 }
@@ -434,7 +462,7 @@ impl StandaloneCallBroker {
         call_params: Value,
     ) -> rmcp::model::CallToolResult {
         if !accepted_standalone_call_params(&call_params, tool_name, &arguments)
-            || !crate::approved_workspace::request_is_valid(tool_name, &arguments)
+            || !approved_request_is_valid(tool_name, &arguments)
         {
             return approved_broker_error_result("INVALID_REQUEST");
         }
@@ -473,6 +501,9 @@ impl StandaloneCallBroker {
         if !grant_allows(&claims.grants, tool_name, &ticket_request.purpose) {
             return approved_broker_error_result("STANDALONE_GRANT_DENIED");
         }
+        let diagram_read = claims
+            .grant_groups
+            .contains(&ApprovedMcpGrantGroupV1::DiagramRead);
         let ticket_request_canonical = match replay_ticket_request_canonical(&ticket_request) {
             Ok(value) => value,
             Err(_) => return approved_broker_error_result("STANDALONE_REPLAY_GUARD_UNAVAILABLE"),
@@ -504,7 +535,7 @@ impl StandaloneCallBroker {
             };
         self.inner
             .backend
-            .call(tool_name, &ticket, business_arguments)
+            .call_for_standalone(tool_name, &ticket, business_arguments, diagram_read)
     }
 
     fn reserve_wire_request(
@@ -528,6 +559,14 @@ impl StandaloneCallBroker {
                 ticket_request_canonical,
                 now,
             )
+    }
+}
+
+fn approved_request_is_valid(tool_name: &str, arguments: &Map<String, Value>) -> bool {
+    if crate::approved_workspace::is_approved_workspace_tool(tool_name) {
+        crate::approved_workspace::request_is_valid(tool_name, arguments)
+    } else {
+        crate::diagram_mcp::approved_request_is_valid(tool_name, arguments)
     }
 }
 
@@ -647,8 +686,8 @@ pub fn provision_standalone_session(
             grant_groups,
             grants,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            policy_id: POLICY_ID.to_owned(),
-            policy_version: POLICY_VERSION,
+            policy_id: APPROVED_MCP_POLICY_ID.to_owned(),
+            policy_version: APPROVED_MCP_POLICY_VERSION,
             approved_root,
             work_product_root,
             ticket_root: ticket_root.clone(),
@@ -1029,8 +1068,8 @@ fn validate_claims_layout(
         || claims.grant_groups != expected_groups
         || claims.grants != expected_grants
         || claims.app_version != env!("CARGO_PKG_VERSION")
-        || claims.policy_id != POLICY_ID
-        || claims.policy_version != POLICY_VERSION
+        || claims.policy_id != APPROVED_MCP_POLICY_ID
+        || claims.policy_version != APPROVED_MCP_POLICY_VERSION
         || claims.approved_root != state_root.join("approved-generations")
         || claims.work_product_root != state_root.join("work-products")
         || claims.ticket_root != expected_ticket_root
@@ -1112,8 +1151,8 @@ fn validate_key_binding(
         || !qualification.exact_app_policy_binding
         || !qualification.exact_server_key_binding
         || qualification.app_version != env!("CARGO_PKG_VERSION")
-        || qualification.policy_id != POLICY_ID
-        || qualification.policy_version != POLICY_VERSION
+        || qualification.policy_id != APPROVED_MCP_POLICY_ID
+        || qualification.policy_version != APPROVED_MCP_POLICY_VERSION
     {
         return Err(StandaloneApprovedError::Revoked);
     }
@@ -2623,6 +2662,34 @@ mod tests {
             &grants,
             "case_read_approved_material",
             "mcp.case_read_approved_material.v1"
+        ));
+        assert!(!grant_allows(
+            &grants,
+            "diagram.render",
+            "mcp.diagram.render.v1"
+        ));
+
+        let (groups, grants) = canonical_grants(&[
+            ApprovedMcpGrantGroupV1::DiagramWrite,
+            ApprovedMcpGrantGroupV1::Read,
+            ApprovedMcpGrantGroupV1::DiagramRead,
+            ApprovedMcpGrantGroupV1::Write,
+        ])
+        .expect("all canonical grants");
+        assert_eq!(
+            groups,
+            vec![
+                ApprovedMcpGrantGroupV1::Read,
+                ApprovedMcpGrantGroupV1::Write,
+                ApprovedMcpGrantGroupV1::DiagramRead,
+                ApprovedMcpGrantGroupV1::DiagramWrite,
+            ]
+        );
+        assert_eq!(grants.len(), 16);
+        assert!(grant_allows(
+            &grants,
+            "diagram.render",
+            "mcp.diagram.render.v1"
         ));
         assert!(canonical_grants(&[]).is_err());
         assert!(

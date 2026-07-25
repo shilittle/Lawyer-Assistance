@@ -2,7 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type ApprovedMcpConnectorId = "workbuddy" | "codex" | "opencode";
 export type ApprovedMcpTransport = "stdio" | "streamable_http";
-export type ApprovedMcpGrantGroup = "read" | "write";
+export type ApprovedMcpGrantGroup =
+  | "read"
+  | "write"
+  | "diagram_read"
+  | "diagram_write";
 
 export interface ApprovedPrivacyReviewSelection {
   redactionId: string;

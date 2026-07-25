@@ -390,6 +390,7 @@ ApprovedMaterialManifestV1 unsigned claims：
 - publication_id
 - content_media_type
 - content_sha256
+- diagram_spec_sha256（仅 `legal_diagram`，为 canonical Spec 的 SHA-256）
 - content_bytes
 - source_sha256
 - extraction_sha256
@@ -458,6 +459,8 @@ WorkProductManifestV1：
 
 写入采用 immutable version + optimistic concurrency + idempotency key。
 
+批准图示沿用同一 work-product envelope：`task_type=legal_diagram`、`content_media_type=text/html`，且 manifest 必须包含 canonical Spec 的 `diagram_spec_sha256`，author tool 只能是 `diagram.render` / `diagram.update`。更新同时核对 parent manifest 中的 Spec hash、调用方提供的 base Spec hash、parent HTML、版本和单调来源血缘；仅 HTML 相同不能证明 parent Spec 相同。`diagram.render` / `diagram.update` 只发布加密 protected version；`diagram.export` 只返回绑定 exact case/work-product/version/manifest/hash/length/media type 的 descriptor metadata，不返回正文、path 或 URI。
+
 ## 11. MCP profile
 
 PublicLawOnly：
@@ -476,9 +479,31 @@ ApprovedCaseWorkspace：
 - case_write_work_product
 - case_update_work_product
 - case_export_work_product_manifest
+- diagram.list_templates
+- diagram.get_schema
+- diagram.validate
+- diagram.render
+- diagram.update
+- diagram.export
 - 现有五项公开法律工具
 
-所有 request deny_unknown_fields，且 schema 中不得出现 path、filename、URI、glob、directory、URL、command 或自由 metadata object。
+总 `tools/list` 为 21 项。所有 request deny_unknown_fields，且 schema 中不得出现 path、filename、URI、glob、directory、URL、command 或自由 metadata object。
+
+Standalone approved policy v2：
+
+- 16 个非公开工具授权；五个公开法律工具不计入 grant。
+- `read`：八个既有案件只读工具。
+- `write`：`case_write_work_product`、`case_update_work_product`。
+- `diagram_read`：`diagram.list_templates`、`diagram.get_schema`、`diagram.validate`、`diagram.export`。
+- `diagram_write`：`diagram.render`、`diagram.update`。
+- 旧 `read` / `write` 集合精确保持不变；没有 `diagram_read` 时，通用 metadata/list/read/manifest-export 不得显示或读取 `legal_diagram`，通用 write/update 也不能创建或改写它；未知/重复 group 拒绝。
+- policy v2 之前的 session descriptor、credential 和 replay state 不迁移，必须撤销并重新创建。
+
+DiagramAuthoring：
+
+- 现有五项公开法律工具 + 同名六项 `diagram.*` 工具。
+- 永久仅 synthetic/public；输出是明文本地 HTML bundle / artifact reference。
+- 不接受 approved session，不得承载真实、待复核或批准案件数据。
 
 ## 12. 失效规则
 
@@ -496,4 +521,3 @@ ApprovedCaseWorkspace：
 - manifest/content
 - destination/purpose/workspace instance
 - 人工修改
-
