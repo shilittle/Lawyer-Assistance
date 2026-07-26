@@ -82,6 +82,28 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
+NUGINE_SIMD_MIT = """MIT License
+
+Copyright (c) 2021 Nugine
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE."""
+
 CC0_1_0 = """Creative Commons Legal Code
 
 CC0 1.0 Universal
@@ -462,6 +484,13 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
     )
     if apache is None or mpl is None:
         raise RuntimeError("canonical Apache-2.0 or MPL-2.0 license text is unavailable")
+    jsonschema_licenses = {
+        component.version: body
+        for component in components
+        if component.name == "jsonschema"
+        for _, body in component.texts
+        if component.license_expression == "MIT"
+    }
 
     unic_packages = {
         "unic-char-property",
@@ -504,6 +533,26 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
             # both license files, so use the canonical Apache-2.0 text already
             # present in this exact locked dependency closure.
             texts = (("SPDX-Apache-2.0", apache),)
+        elif (
+            not texts
+            and component.name == "jsonschema-regex"
+            and component.license_expression == "MIT"
+            and component.version in jsonschema_licenses
+        ):
+            # jsonschema-regex is maintained and released from the jsonschema
+            # repository, but its published crate omits the repository-level
+            # MIT license. Reuse the license shipped by the exact-version
+            # jsonschema crate from the same locked release.
+            texts = (("UPSTREAM-LICENSE-MIT", jsonschema_licenses[component.version]),)
+        elif (
+            not texts
+            and component.name in {"uuid-simd", "vsimd"}
+            and component.version == "0.8.0"
+            and component.license_expression == "MIT"
+        ):
+            # Both crates are released from Nugine/simd. Their crate archives
+            # point to the repository-level MIT license but omit that file.
+            texts = (("UPSTREAM-LICENSE-MIT", NUGINE_SIMD_MIT),)
         elif not texts and component.license_expression in {
             "Apache-2.0",
             "Apache-2.0 OR MIT",

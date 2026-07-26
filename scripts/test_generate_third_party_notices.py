@@ -10,6 +10,7 @@ if __package__:
         bundled_asset_components,
         canonical_text_sha256,
         cargo_components,
+        complete_missing_license_texts,
     )
 else:
     # Keep the regression test runnable both as a module (the CI entry point)
@@ -20,6 +21,7 @@ else:
         bundled_asset_components,
         canonical_text_sha256,
         cargo_components,
+        complete_missing_license_texts,
     )
 
 class CanonicalTextSha256Tests(unittest.TestCase):
@@ -60,6 +62,22 @@ class CanonicalTextSha256Tests(unittest.TestCase):
         self.assertIn(("rmcp", "2.2.0"), components)
         self.assertIn(("rmcp-macros", "2.2.0"), components)
         self.assertIn(("signal-hook-registry", "1.4.8"), components)
+
+    def test_jsonschema_regex_uses_same_release_repository_license(self) -> None:
+        components = {
+            (component.name, component.version): component
+            for component in complete_missing_license_texts(cargo_components())
+        }
+        jsonschema = components[("jsonschema", "0.48.2")]
+        regex = components[("jsonschema-regex", "0.48.2")]
+        uuid_simd = components[("uuid-simd", "0.8.0")]
+        vsimd = components[("vsimd", "0.8.0")]
+
+        self.assertEqual(regex.license_expression, "MIT")
+        self.assertEqual(regex.texts[0][0], "UPSTREAM-LICENSE-MIT")
+        self.assertEqual(regex.texts[0][1], jsonschema.texts[0][1])
+        self.assertEqual(uuid_simd.texts, vsimd.texts)
+        self.assertIn("Copyright (c) 2021 Nugine", uuid_simd.texts[0][1])
 
 
 if __name__ == "__main__":
