@@ -51,7 +51,10 @@ python scripts/build_mineru_component_package.py `
 
 桌面 App 只接受通过内置生产 Minisign 公钥验证的 catalog。离线导入会严格拒绝额外文件、缺片、乱序、链接和任何哈希漂移；下载会复用已经完整验证的分片。所有分片验证完成后，App 在固定私有目录以 create-new 方式组装，通过整包与内层 manifest 的再次校验后才原子安装。catalog 或 descriptor 在下载期间发生变化会 fail closed。
 
-`shilittle/Lawyer-Assistance` 实际为 private repository。catalog 中的固定 GitHub asset URL 对未认证客户端不可用，也不证明对应 Release 已发布。推荐先使用已认证的 GitHub browser/CLI 在 App 外下载 catalog、同名 `.minisig`、`.laocrparts` 与全部 part，再走 App 本地导入；App 自动下载只适用于运行环境已经能访问该 private Release 的情况。不得把 GitHub token 写进 catalog、组件配置、案件 metadata 或日志。
+catalog 中的固定 GitHub asset URL 不证明对应 Release 已发布，也不构成完整性证据。
+只能从项目官方 Release 下载 catalog、同名 `.minisig`、`.laocrparts` 与全部 part，
+完成签名与 hash 核验后再走 App 本地导入。不得把 GitHub token 写进 catalog、组件
+配置、案件 metadata 或日志。
 
 断点续传的粒度是“完整分片”，不是单片内部 HTTP Range。网络中断时保留已验证分片供下次复用；成功安装或确定性的完整性失败会精确清理本次 incoming/assembly 状态。
 

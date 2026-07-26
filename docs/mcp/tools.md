@@ -30,7 +30,12 @@ policy v2 的 session grants 精确为 `read` 八项、`write` 两项、`diagram
 
 成功响应使用版本化 envelope；错误和日志不得回显令牌、客户文本、数据库路径或本地文件路径。MCP 的 `content` 与 `structuredContent` 两个结果通道都执行隐私残留检查。
 
-`public_law_only` 与 `approved_case_workspace` 是不同的数据面，不是同一 profile 的“开关强弱”：public 五项不能读取 approved material/work product/Vault；approved 16 项也不能接受任意路径、附件、粘贴原文或 raw OCR。`diagram_authoring` 的明文本地 bundle 契约也不能用作批准案件的降级路径。较早 15-tool actual-binary stdio/HTTP 合成 E2E 只证明当时的 handler/transport/auth chain；2026-07-24 已完成集成后 21-tool debug sibling 的 stdio/HTTP 合成复跑，最终 release sibling 仍须重新测量、签名并复跑。当前机器 OCR 四项资格仍为 `false`，MCP E2E 不等于真实扫描案件获准处理。
+`public_law_only` 与 `approved_case_workspace` 是不同的数据面，不是同一 profile 的
+“开关强弱”：public 五项不能读取 approved material/work product/Vault；approved
+16 项也不能接受任意路径、附件、粘贴原文或 raw OCR。`diagram_authoring` 的明文本地
+bundle 契约也不能用作批准案件的降级路径。集成后的 21-tool debug sibling 已完成
+stdio/HTTP 合成复跑；每个正式 release sibling 仍须重新测量并复跑。MCP E2E 不等于
+真实扫描案件获准处理，OCR 仍要求 App 当前 exact-machine qualification。
 
 ## 六个图示工具的双重契约
 

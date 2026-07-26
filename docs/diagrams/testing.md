@@ -33,33 +33,42 @@
 
 ## 性能目标
 
-规模分级为小型（≤20）、中型（20–100）和大型（>100，硬上限 500）。自动化用 20、100、101、500 节点四档同时执行完整语义校验与 HTML 渲染，并断言 >100 时出现 warning、性能提示、弱边隐藏与低重要性折叠；四档必须在 10 秒宽松防退化门限内完成。2026-07-21 的 release 验收中，四档合计由 Rust test harness 报告为 0.01 秒。该数字是单次功能回归耗时，不等同于统计学 p95 基准；后续若承诺“校验 p95 <100 ms / 100 节点渲染 <250 ms”，仍需独立 benchmark 和环境固化。
+规模分级为小型（≤20）、中型（20–100）和大型（>100，硬上限 500）。自动化用
+20、100、101、500 节点四档同时执行完整语义校验与 HTML 渲染，并断言 >100 时出现
+warning、性能提示、弱边隐藏与低重要性折叠；四档必须在宽松防退化门限内完成。任何
+p95 性能承诺都需要独立 benchmark、固定环境和可复现实验，不能由单次单元测试耗时
+推导。
 
 性能失败不能通过跳过来源、安全或语义校验规避。
 
 ## 建议门禁命令
 
-2026-07-21 第一阶段基线验收执行：
+建议在最终提交上运行：
 
-- `cargo test --workspace`：通过（覆盖 `diagrams` 与 `legal-mcp` 新测试）。
-- `cargo clippy -p diagrams -p legal-mcp --all-targets -- -D warnings`：通过。
-- `cargo fmt --all -- --check`：通过。
-- `cargo test -p diagrams --release --test large_graph -- --nocapture`：通过；20/100/101/500 四档合计 0.01 秒。
-- `python integrations/validate_examples.py`：通过。
-- `python -m unittest integrations.test_validate_examples`：16 tests 通过。
-- `pnpm test`：248 tests 通过。
-- `pnpm lint`：通过。
-- `pnpm build`：通过。
-- `node --check crates/diagrams/src/runtime-enhancements.js`：通过。
+- `cargo test -p diagrams --locked --offline --no-fail-fast`
+- `cargo test -p legal-mcp --locked --offline --no-fail-fast`
+- `cargo test -p diagrams --release --test large_graph -- --nocapture`
+- `cargo clippy -p diagrams -p legal-mcp --all-targets --locked --offline -- -D warnings`
+- `cargo fmt --all -- --check`
+- `python integrations/validate_examples.py`
+- `python -m unittest integrations.test_validate_examples`
+- `pnpm test`
+- `pnpm lint`
+- `pnpm build`
+- `node --check crates/diagrams/src/runtime-enhancements.js`
 
-2026-07-22 的制品完整性加固后，`crates/diagrams/tests` 有 44 个集成测试用例，新图示 MCP 集成文件另有 3 个用例。新增用例覆盖 sibling Spec/HTML 完整性、目录级原子提交、孤儿、双侧篡改、URI/hash 换绑、并发收敛和初始化后 diagram root reparse/junction 替换。实际复跑结果：`cargo test -p diagrams --locked --offline --no-fail-fast` 为 44 passed；`cargo test -p legal-mcp --locked --offline --no-fail-fast` 为 59 passed、1 个正式法律库 opt-in ignored；`cargo clippy -p diagrams -p legal-mcp --all-targets --locked --offline -- -D warnings`、`cargo fmt --all -- --check` 均通过；release 大图测试 1/1 通过（0.01 秒）；integration validator 与其单测分别通过，后者为 17/17（新增图示 Skill 禁令退化测试）。上述自动门禁不访问外网、不读取 Provider 凭据，也不产生计费。
+门禁覆盖 Spec/HTML 完整性、目录级原子提交、孤儿、双侧篡改、URI/hash 换绑、并发
+收敛、reparse/junction 替换、大小上限、来源可见性和 profile 授权。普通自动门禁不
+访问外网、不读取 Provider 凭据，也不产生计费。
 
-## DeepSeek 计费口径
+## 外部 Provider 测试
 
-- 自动测试、确定性布局、本地 Schema/语义校验和 HTML 渲染均不调用、也不依赖 DeepSeek。
-- 2026-07-21 最终 opt-in QA 另行调用官方 `deepseek-v4-flash` 3 次，输入仅为纯合成法律图数据；usage 为 14、3,409、3,560 tokens，合计 6,983。模型输出得到 10 nodes、9 edges、4 sources 的合成 Spec，本地 Schema 与语义诊断均为 0，随后 MCP `validate/render/export/update` 通过。
-- 同日旧应用内两项法律回答和一项案件抽取 ignored 测试在 Provider transport 前被 `CaseRaw` 门禁拒绝，没有网络请求、没有计费，不能算作 DeepSeek 成功调用。
-- 密钥未打印、未写文件、未进入制品或版本控制。逐项记录以 `acceptance-2026-07-21.md` 为准。
+- 自动测试、确定性布局、本地 Schema/语义校验和 HTML 渲染不调用、也不依赖任何
+  外部 Provider。
+- 付费 Provider smoke test 不是普通发布门禁。确需执行时只能使用纯合成图数据，
+  必须显式授权费用，且不得打印、写文件或提交 API 密钥。
+- Provider 生成的 Spec 仍须通过同一套本地 Schema、语义、来源和安全验证；模型输出
+  不能绕过确定性 renderer 或 profile 边界。
 
 ## 验收证据
 

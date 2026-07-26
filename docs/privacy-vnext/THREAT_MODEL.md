@@ -1,5 +1,10 @@
 # 脱敏系统 vNext 威胁模型
 
+> 本文定义资产、信任边界与剩余风险，不单独证明某个环境已 qualified。当前公开状态见
+> [`docs/release-status.md`](../release-status.md)，部署与撤销步骤见
+> [`OPERATIONS.md`](OPERATIONS.md)。同一 Windows 用户下的恶意进程仍是明确剩余风险；
+> 不得把 DPAPI/当前用户 DACL 描述为强服务隔离。
+
 ## 1. 保护资产
 
 - 原始案卷 bytes、原路径、原文件名。
@@ -88,7 +93,8 @@
 - managed cache/temp 全部置于 vault worker root。
 - 启动残留扫描、取消/超时强杀树和删除验证。
 
-当前机器边界：2026-07-22 的 direct GPU diagnostic 未在完整 App Firewall/Job Object chain 中执行；两次 Firewall 提权均被 UAC 取消。组件签名、install/re-measure 或 direct worker 成功不补足 OS 网络隔离证据。
+Direct-worker diagnostics 不在完整 App Firewall/Job Object chain 中执行。组件签名、
+install/re-measure 或 worker 直接运行成功均不能补足 OS 网络隔离证据。
 
 ### 4.3.1 组件供应链与 Windows 路径兼容
 
@@ -100,7 +106,8 @@
 - staging + atomic activation；拒绝额外文件、path traversal、reparse/cloud/hardlink 和未声明 executable。
 - final installed path 按普通 Win32 spelling 计算，任何文件超过 259 UTF-16 code units 时在 extraction 前以 `component_runtime_path_too_long` 阻断。
 - catalog/组件验证状态与 Firewall、model/runtime trust、production authorization 各自独立，不互相推导。
-- 仓库为 private；推荐在 App 外通过 GitHub 认证下载完整 catalog/signature/descriptor/parts 后本地导入。未认证 App 不把 private asset URL 可达性当作安全或可用性事实，也不接收 GitHub token。
+- 组件只从项目官方 Release 下载完整 catalog/signature/descriptor/parts 后本地导入。
+  App 不接收 GitHub token，也不把 URL 可达性当作完整性或资格证据。
 - cryptographic signature 不证明第三方内容可再分发；provenance/licensing audit 未完成的 candidate 禁止发布。
 
 验收边界：历史 v3/v5 candidate 的 install/re-measure 与 synthetic diagnostic 仅作为路径兼容和本地运行诊断，两者永久禁止发布。v4 provenance 源码门禁与 27/27 builder tests 已完成，但最终 clean source commit 后仍须确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 与 App Firewall/Job/canary/restart qualification；当前没有 final v4 artifact/hash。
@@ -210,8 +217,12 @@ panic、Python logging、Rust tracing、frontend console、MCP JSON-RPC、HTTP a
 - 未完成 calibration 时，不声称 automatic approval 已启用。
 - 重建式安全 PDF 不声称保留原始版式、印章、签名或证据外观。
 - Skill 不声称能撤回宿主在加载前已经上传的数据。
-- v3 六分片签名组件、`1/1` install/re-measure、RTX 5090 direct GPU diagnostic 和 catalog 验签均不声称当前机器 production OCR qualified。
-- 历史 v3/v5 candidate 永久禁止发布；v4 在 clean-commit 重建、显式 provenance approval、签名、短根安装/remeasure、GPU probe 与 App qualification 完成前不声称可发布；private catalog URL 不声称对未认证客户端可下载。
-- 当前机器仍为 `networkIsolationEnforced=false`、`modelManifestTrustEstablished=false`、`appAutoEnableAuthorized=false`、`productionCaseOcrAuthorized=false`。
-- 新增 259 UTF-16 路径门禁后的短根完整 v5 重测与 installed-tree synthetic diagnostic 已 `PASS`，但不得引用它们替代 App Firewall/Job production qualification。
-
+- 历史签名组件、install/re-measure、direct GPU diagnostic 和 catalog 验签均不声称
+  当前机器 production OCR qualified。
+- 历史候选永久禁止发布；v4 在固定源码重建、显式 provenance approval、签名、
+  短根安装/remeasure、GPU probe 与 App qualification 完成前不声称可发布。
+- 只有 App 当前验证的 exact-machine evidence 可以使 `networkIsolationEnforced`、
+  `modelManifestTrustEstablished`、`appAutoEnableAuthorized` 与
+  `productionCaseOcrAuthorized` 成立。
+- 259 UTF-16 路径门禁与 installed-tree synthetic diagnostics 不得替代
+  App Firewall/Job production qualification。

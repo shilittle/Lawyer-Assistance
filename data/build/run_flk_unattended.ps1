@@ -9,6 +9,8 @@ param(
   [int]$MaxNetworkRetries = 12,
   [int]$CrashCooldownMs = 1800000,
   [int]$Limit = 0,
+  [string]$NodeExe = $env:LAWYER_ASSISTANCE_NODE_EXE,
+  [string]$NodeModules = $env:LAWYER_ASSISTANCE_NODE_MODULES,
   [switch]$Visible
 )
 
@@ -17,8 +19,37 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $LogDir = Join-Path $Root "data\build\logs"
 $LogFile = Join-Path $LogDir "flk_unattended.log"
-$NodeExe = "<NODE_EXE>"
-$NodeModules = "<NODE_MODULES>"
+
+if ([string]::IsNullOrWhiteSpace($NodeExe)) {
+  $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+  if ($null -eq $nodeCommand) {
+    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+  }
+
+  if ($null -ne $nodeCommand) {
+    $NodeExe = $nodeCommand.Source
+  }
+}
+
+if ([string]::IsNullOrWhiteSpace($NodeExe) -or -not (Test-Path -LiteralPath $NodeExe -PathType Leaf)) {
+  throw "Node.js executable not found. Install Node.js or pass -NodeExe <path>."
+}
+$NodeExe = (Resolve-Path -LiteralPath $NodeExe).Path
+
+if ([string]::IsNullOrWhiteSpace($NodeModules)) {
+  $nodeModulesCandidates = @(
+    (Join-Path (Split-Path $NodeExe -Parent) "node_modules"),
+    (Join-Path $Root "node_modules")
+  )
+  $NodeModules = $nodeModulesCandidates |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_ "playwright") -PathType Container } |
+    Select-Object -First 1
+}
+
+if ([string]::IsNullOrWhiteSpace($NodeModules) -or -not (Test-Path -LiteralPath (Join-Path $NodeModules "playwright") -PathType Container)) {
+  throw "A node_modules directory containing Playwright was not found. Pass -NodeModules <path>."
+}
+$NodeModules = (Resolve-Path -LiteralPath $NodeModules).Path
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Set-Location $Root

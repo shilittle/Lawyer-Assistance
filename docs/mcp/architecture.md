@@ -40,10 +40,18 @@
 
 带可靠文本层的本地 PDF 原生提取；需要视觉解析的页面在当前签名资格有效时由 App 传入受信本地 MinerU runner。完整 worker/config/runtime/model inventory、Windows Firewall ActiveStore、启动前后身份、进程树、页完整性与输出边界均复核。final installed component path 还受 259 UTF-16 code units 上限约束，以避开当前原生依赖的长路径导入缺陷。资格缺失或漂移时扫描/视觉 PDF fail closed；不存在 SSH/云 OCR/模型下载回退。
 
-历史签名六分片 v3 与短根 v5 candidate 的 install/re-measure 和 RTX 5090 synthetic diagnostic 仅保留为工程证据，两者永久禁止发布。v4 provenance 源码门禁与 27/27 builder tests 已完成，但最终 clean source commit 后的确定性重建、显式审批、签名、短根安装/remeasure、GPU probe 及 App Firewall/Job/canary/restart 资格尚未完成，因此不存在 final v4 artifact/hash。两次 UAC 取消意味着四项机器门仍为 `false`；历史 hash 或 Full Access 不能进入“qualified”分支。private Release 对未认证客户端不可达，当前不能声称组件可公开自动下载。
+历史候选组件及 direct-worker synthetic diagnostics 仅是工程证据，永久禁止发布。
+最终 v4 仍须从固定源码确定性重建、显式审批、签名、短根安装/remeasure、GPU probe
+并完成 App Firewall/Job/canary/restart 资格。历史 hash、宿主权限或组件下载均不能
+进入 `qualified` 分支；官方 Release URL 可达也不等于自动下载或生产资格成立。
 
 ## 演进规则
 
-工具名和顺序以 Rust profile 常量与两个 integration catalog 为共同发布门禁。当前 approved path 已完成 App 正向签票、逐字节请求绑定、目的地实例隔离、撤销/过期与防重放；2026-07-24 的集成 debug sibling 已完成 exact 21-tool、六个 diagram 工具、stdio/HTTP case + diagram 正负向 E2E，并验证四组 policy-v2 grants。较早 15-tool E2E 只是历史 baseline；最终签名 release sibling 仍必须重新测量与复跑。后续新增能力同样必须先完成生产 handler、票据、存储、UI、正负向 E2E 和数据保留审计，不能用文档或配置代替。
+工具名和顺序以 Rust profile 常量与两个 integration catalog 为共同发布门禁。approved
+path 已完成 App 正向签票、逐字节请求绑定、目的地实例隔离、撤销/过期与防重放；
+集成 debug sibling 已完成 exact 21-tool、六个 diagram 工具、stdio/HTTP case + diagram
+正负向 E2E，并验证四组 policy-v2 grants。每个正式 release sibling 仍须重新测量与
+复跑。后续新增能力同样必须先完成生产 handler、票据、存储、UI、正负向 E2E 和数据
+保留审计，不能用文档或配置代替。
 
 早期固定 12 工具架构和相关验收是历史记录，已被本 profile 架构取代。

@@ -28,7 +28,7 @@
 | `diagram_authoring` | synthetic/public 本地图示 | 目标支持 | 目标支持 | 明文 bundle，不是批准案件路径 |
 | `approved_case_workspace` | Windows 15-tool baseline actual-binary stdio/HTTP 已测；集成后 21-tool binary 复跑待完成 | fail-closed | fail-closed | 静态宿主只提供 Windows stdio；App broker 的 HTTP 仅用于受控链；不是跨平台已认证声明 |
 | Tauri App | Windows 目标 | 不在当前交付范围 | 不在当前交付范围 | App 本地复核/导出不等于 MCP/Provider 外发授权 |
-| 本地 MinerU GPU OCR | worker/component 与 direct GPU diagnostic 已测；production qualification 未取得 | 未认证 | 未认证 | App 已接入 qualified runner；两次 UAC 取消后四项机器门仍 false，扫描/视觉 PDF fail-closed |
+| 本地 MinerU GPU OCR | worker/component 与 synthetic direct-worker diagnostics 已测；production qualification 未取得 | 未认证 | 未认证 | App 已接入 qualified runner；缺少任一当前机器资格时，扫描/视觉 PDF fail-closed |
 
 “目标支持”只表示代码与 workflow 面向该平台；没有成功的目标平台发布矩阵和真实宿主验收，就不能写成“已认证”。
 

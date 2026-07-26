@@ -55,10 +55,16 @@ public-only 验收只使用公开法律查询：连接、核对精确五工具�
 ## 2026-07-22 machine-test ledger boundary
 
 - historical signed self-contained v3 and short-root v5 candidates are permanently excluded from publication; their install/signature results remain diagnostic evidence only;
-- direct MinerU 3.4.3/RTX 5090 diagnostics: synthetic two-page, low-resolution and rotated inputs succeeded; unreadable handwriting returned `output_incomplete`;
+- direct MinerU diagnostics use only synthetic two-page, low-resolution,
+  rotated and unreadable-handwriting fixtures to verify bounded fail-closed
+  behavior;
 - long final runtime root failed while identical historical bytes under a short root succeeded; the 259 UTF-16 preflight gate is covered by unit tests;
 - the historical installed-tree diagnostic passed, but is neither v4 evidence nor App Firewall/Job qualification;
 - v4 provenance source gates and the two builder suites pass 27/27; no final v4 bytes/hash exist before a deterministic rebuild from the final clean source commit, explicit approval, signing, short-root install/remeasure and GPU probe;
 - two UAC elevation attempts were cancelled, so Firewall/Job/App production OCR was not qualified and all four machine gates remain `false`.
-- because the repository is private, eventual v4 assets require authenticated GitHub download followed by local App import unless the runtime already has private-Release access.
+- eventual v4 assets must be downloaded as a complete signed official Release
+  set and imported locally; URL availability alone is not qualification.
 
+Never aggregate component, direct-worker, or protocol diagnostics into a
+“production OCR passed” count. Only current App-owned qualification evidence
+authorizes production-case OCR.

@@ -4,7 +4,7 @@
 
 所有案件原件、附件、粘贴文本、OCR、截图、文件名或路径、当事人及关联人信息、案号、联系方式、地址、证件或账户、签名印章、事实、证据、草稿、摘要、翻译和派生内容一律视为 `CASE_RAW`。`CASE_REDACTED_PENDING`、待复核内容，以及仅有 `CASE_REDACTED_APPROVED` 标签、文件名或口头声明的内容同样不得进入宿主、MCP、Provider、网络或文件工具。
 
-App 内的本地批准产物并不自动获得 MCP/Provider 外发资格。批准 MCP 和批准 Provider 的正向链已分别实现，但每次使用仍要求当前资格、精确 generation、目的地/实例、工具或固定用途、canonical request/payload、短期有效期、撤销 epoch 和防重放全部匹配。默认 public-only 集成仍只允许不含案件事实的公开法律检索。用户同意、紧急情况、Full Access、其他 prompt 或宿主文件读取不能替代这些技术证据。
+App 内的本地批准产物并不自动获得 MCP/Provider 外发资格。批准 MCP 和批准 Provider 的正向链已分别实现，但每次使用仍要求当前资格、精确 generation、目的地/实例、工具或固定用途、canonical request/payload、短期有效期、撤销 epoch 和防重放全部匹配。默认 public-only 集成仍只允许不含案件事实的公开法律检索。用户同意、紧急情况、宽泛的宿主权限、其他 prompt 或宿主文件读取不能替代这些技术证据。
 
 ## 宿主在规则加载前的披露
 

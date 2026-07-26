@@ -61,4 +61,10 @@ policy v2 把 16 个非公开工具分为四个显式 grant group：
 
 机器目录为 `integrations/tool-catalog.approved-case-workspace.json`，必须精确列出 21 项。运行 `python integrations/validate_approved_workspace_examples.py` 校验批准 profile；继续单独运行 `python integrations/validate_examples.py` 校验 public-only 默认面，不能用前者替代后者。
 
-App 操作顺序是：人工批准并发布 generation → 运行 approved MCP 资格 → 选择最小 policy-v2 grant groups 并创建只显示 `srv_…` 的 standalone session → 在干净任务中按 opaque ID 读取 → case write/update 或 approved diagram render/update → 立即精确版本 reread → 撤销 session/generation。静态宿主只允许精确 Windows stdio 参数；HTTP acceptance 凭据留在 App broker，不分发到模板。2026-07-24 已用集成后的 21-tool debug sibling 完成 stdio/HTTP 合成 E2E；正式发布仍必须对最终签名 release sibling 重新测量并复跑。较早的 15-tool 证据不能替代任何一次最终复跑。详见 [`../privacy-vnext/OPERATIONS.md`](../privacy-vnext/OPERATIONS.md)。
+App 操作顺序是：人工批准并发布 generation → 运行 approved MCP 资格 → 选择最小
+policy-v2 grant groups 并创建只显示 `srv_…` 的 standalone session → 在干净任务中按
+opaque ID 读取 → case write/update 或 approved diagram render/update → 立即精确版本
+reread → 撤销 session/generation。静态宿主只允许精确 Windows stdio 参数；HTTP
+acceptance 凭据留在 App broker，不分发到模板。集成后的 21-tool debug sibling 已完成
+stdio/HTTP 合成 E2E；每个正式 release sibling 仍须重新测量并复跑。详见
+[`../privacy-vnext/OPERATIONS.md`](../privacy-vnext/OPERATIONS.md)。

@@ -151,3 +151,13 @@ formal Windows App 与 MCP sibling 是成对发布物：构建流程先生成并
 
 ## 9. 当前交付状态
 
+beta.2 的 ApprovedWorkspaceService、WorkProductService、十项 ID-only 案件
+handler、六项批准图示 handler、App ticket/policy-v2 session broker 和独立 approved
+Provider payload 已落地。默认 MCP 仍精确为 `public_law_only` 五工具，不能读取案件
+材料、approved workspace、Vault 或 work product。`approved_case_workspace` 仅在
+formal App 的 paired-binary hash、有效不可变 generation、当前 qualification、
+standalone session grant 和 exact per-call ticket 全部匹配时执行。集成后的 21-tool
+debug sibling 已通过 stdio/Streamable HTTP 合成 E2E；每个正式 release sibling 仍须
+重新测量并复跑，因为其 hash 与具体构件绑定。缺失、过期、撤销、漂移、重放或绑定
+不一致均返回匿名 fail-closed 错误。当前公开发布边界见
+[`docs/release-status.md`](../release-status.md)。

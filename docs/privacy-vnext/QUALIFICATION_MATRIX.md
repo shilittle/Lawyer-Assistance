@@ -1,5 +1,8 @@
 # 脱敏系统 vNext 资格与验收矩阵
 
+> 当前公开状态见 [`docs/release-status.md`](../release-status.md)。本文件冻结资格语义、
+> 证据要求和未满足行为；任何能力只有精确当前环境证据仍有效时才是 `qualified`。
+
 ## 1. 状态定义
 
 - `implemented`：代码和自动化测试存在。
@@ -93,22 +96,19 @@ automatic 默认关闭。开放前必须有离线、版本化、可重复的校�
 6. 真实 GPU/OCR、付费 Provider、Authenticode、SmartScreen 等未运行项单列，不得计入普通回归。
 7. 不覆盖或移动 v0.3.1 tag、Release 和资产；新版本使用新 tag 且先发布 prerelease。
 
-## 7. 本机已知资格结论
+## 7. 发布与机器资格边界
 
-截至 2026-07-22 已取得以下工程证据：
-
-- 历史签名、自包含 v3 `.laocrpkg` candidate 为 `11,793,618,181` bytes，共六分片；其 catalog detached Minisign 和首次完整 component install/re-measure（`1 passed` / `1287.01 s`）只作为工程诊断记录。v3 永久禁止发布。
-- MinerU 3.4.3 / PyTorch 2.8.0+cu128 / CUDA 12.8 / RTX 5090 已完成合成两页、低清、旋转 direct-worker diagnostic；不可读手写以 `output_incomplete` 阻断。
-- 长工作树 final runtime path 失败而同字节短路径成功；259 UTF-16 code units 前置门禁已加入。历史短根 v5 install/re-measure 为 `1 passed`、`0 failed`、387 filtered、`1209.75 s`，installed-tree synthetic-only 两页 diagnostic 也通过；v5 同样永久禁止发布。
-- v4 provenance 源码门禁已经实现，相关 builder unit suites 为 `27 passed`。它绑定 clean repository commit、build-script SHA-256、worker source-tree SHA-256、选定 runtime distributions 与 exact model revisions。当前尚未从最终 clean source commit 生成 final v4 artifact，因而不存在可记录的 final v4 hash；必须在该 source commit 后确定性重建、人工显式审批、签名、短根安装/remeasure、GPU probe，并完成 App Firewall/Job/canary/restart 资格链。
-- formal App 对 paired MCP sibling 的 compile-time SHA-256 trust anchor 与真实 stdio/HTTP binary E2E 已通过其代码/传输边界。
-- 项目 GitHub 仓库为 private；catalog asset URL 对未认证客户端不可用。推荐 GitHub 认证下载完整资产集后本地导入，App 自动下载只适用于已能访问 private Release 的环境。
-
-这些证据都不代替 OS 网络隔离和 App exact-machine qualification。Windows Firewall 提权已尝试两次，均在 UAC 被用户取消。因此本机结论保持：
-
-- `networkIsolationEnforced=false`
-- `modelManifestTrustEstablished=false`
-- `appAutoEnableAuthorized=false`
-- `productionCaseOcrAuthorized=false`
-
-因此不能把组件安装、catalog 验签、direct GPU diagnostic、MCP synthetic E2E 或 Full Access 解释为真实扫描案件 OCR 的生产授权，也不能宣称 automatic approval 已启用。默认 `public_law_only` 始终只有五个公开法律工具；`diagram_authoring` 的明文 bundle 永久只处理 synthetic/public 数据；`approved_case_workspace` 的 21-tool 实现仍只在 formal App 的 paired-binary hash、当前 qualification、policy-v2 standalone session grant 与逐调用 ticket 全部匹配时执行，静态宿主配置保持禁用且不构成生产资格。较早 15-tool actual-binary E2E 只作为 baseline；最终 21-tool binary 复跑仍是发布门禁。
+- 最终 MinerU v4 构件必须绑定固定源码、构建脚本、worker 源码树、runtime
+  distributions 与 model revisions，并经过确定性重建、人工审批、签名、短路径安装、
+  remeasure、GPU probe 和完整 App Firewall/Job/canary/restart 资格链。
+- 历史候选构件和 direct-worker diagnostics 永久不能替代正式 v4 provenance 或当前
+  机器资格。
+- 只有 App 当前报告的 exact-machine evidence 可以使
+  `networkIsolationEnforced`、`modelManifestTrustEstablished`、
+  `appAutoEnableAuthorized` 与 `productionCaseOcrAuthorized` 成立。
+- 组件安装、catalog 验签、synthetic E2E 或宿主权限不能解释为真实扫描案件 OCR 的
+  生产授权，也不能启用自动审批。
+- 默认 `public_law_only` 始终只有五个公开法律工具；`diagram_authoring` 的明文 bundle
+  永久只处理 synthetic/public 数据；`approved_case_workspace` 的 21-tool 实现只在
+  formal App paired-binary hash、当前 qualification、policy-v2 standalone session
+  grant 与逐调用 ticket 全部匹配时执行。

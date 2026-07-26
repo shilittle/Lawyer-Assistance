@@ -12,7 +12,7 @@ The privacy workflow separates these states:
 - `CASE_RAW`: source bytes, native extraction, OCR, filenames, paths, private metadata, and any unreviewed derivative. Local App only.
 - `CASE_REDACTED_PENDING`: automatically detected or manually edited text before final residual scan and human approval. Local App only.
 - `CASE_REDACTED_APPROVED`: one immutable approved generation whose content, policy, provenance, purpose, destination, expiry, and revocation epoch are cryptographically bound. It is not a general permission to paste or upload the text.
-- Approved MCP and Provider authorization: a separate, short-lived, exact authorization derived from an active approved generation. It cannot be replaced by a prompt label, consent, Full Access, a filename, or copied text.
+- Approved MCP and Provider authorization: a separate, short-lived, exact authorization derived from an active approved generation. It cannot be replaced by a prompt label, consent, broad host permission, a filename, or copied text.
 
 The frontend exchanges opaque IDs and bounded enums. Rust restores protected content and credentials, verifies every binding immediately before use, and never returns signing keys, session secrets, receipt tokens, database paths, or raw OCR to the browser layer.
 
@@ -20,7 +20,20 @@ The frontend exchanges opaque IDs and bounded enums. Rust restores protected con
 
 ### Prerequisites
 
-For final deployment, use only an App-managed v4 component imported from its explicitly approved and signed offline set. No final v4 set or final v4 hash exists yet: it must be rebuilt deterministically from the final clean source commit, reviewed and explicitly approved, signed, installed under a short root, remeasured and GPU-probed before App qualification. Historical v3 and v5 candidates are permanently excluded from publication and must not be substituted. This repository is private, so the recommended flow after publication is to authenticate to GitHub outside the App, download the complete catalog/signature/descriptor/parts set, and then import locally. Catalog-driven App download is only available when the running environment already has access to the private Release; never place a GitHub token in catalog/config/case metadata. Component download is distinct from OCR: it accepts no case material or arbitrary URL and never sends a case identifier, path or content. The OCR flow itself has no HTTP OCR, SSH OCR, cloud OCR or remote fallback. Worker, tools configuration, runtime executables, model tree and Windows Firewall state must all be ordinary local objects: UNC paths, cloud placeholders, reparse points, symlinks and disallowed hard links fail closed. Because embedded native importers are not reliable beyond the legacy Win32 path budget, every final installed component path must be at most 259 UTF-16 code units.
+For final deployment, use only an App-managed v4 component imported from its
+explicitly approved and signed offline set. No final v4 set or final v4 hash is
+published yet: it must be rebuilt deterministically, reviewed, signed, installed
+under a short root, remeasured and GPU-probed before App qualification.
+Historical candidates are permanently excluded from publication and must not be
+substituted. Download only the complete catalog/signature/descriptor/parts set
+from an official Release and import it locally; never place a GitHub token in
+catalog, configuration, or case metadata. Component download is distinct from
+OCR: it accepts no case material or arbitrary URL and never sends a case
+identifier, path or content. The OCR flow has no HTTP OCR, SSH OCR, cloud OCR or
+remote fallback. Worker, tools configuration, runtime executables, model tree
+and Windows Firewall state must all be ordinary local objects: UNC paths, cloud
+placeholders, reparse points, symlinks and disallowed hard links fail closed.
+Every final installed component path must be at most 259 UTF-16 code units.
 
 ### App sequence
 
@@ -38,11 +51,15 @@ For final deployment, use only an App-managed v4 component imported from its exp
 
 `auto_local` and `force_local` have real ingestion behavior only while the complete qualification remains current. If it is absent or becomes invalid, a PDF that needs visual OCR fails closed; it never silently falls back to native low-quality text or a remote service.
 
-### Current machine evidence (2026-07-22)
+### Release qualification boundary
 
-Historical v3 and short-root v5 candidates passed the component-integrity and synthetic diagnostic boundaries recorded on 2026-07-22. MinerU 3.4.3 on the local RTX 5090 completed synthetic two-page, low-resolution and rotated direct-worker diagnostics; unreadable handwriting stopped with `output_incomplete`. Those candidates are permanently excluded from publication. Their bytes, signatures, install results and hashes are historical diagnostic evidence only and must not be presented as v4 release provenance.
-
-The v4 provenance source gates are implemented and their builder unit suites pass 27/27. Package/catalog provenance binds the clean repository commit, build-script SHA-256, worker-source-tree SHA-256, exact selected runtime distributions and model revisions. A final v4 package has not yet been built from the final clean source commit, so this guide intentionally records no final v4 artifact hash. After that source commit, it still requires deterministic rebuild, explicit provenance approval, signing, short-root installation, installed-tree remeasurement, GPU probe, and the complete App-owned Windows Firewall/Job Object/canary/restart qualification.
+Package/catalog provenance binds the source commit, build-script SHA-256,
+worker-source-tree SHA-256, selected runtime distributions and exact model
+revisions. A final v4 package has not been published, so this guide intentionally
+records no final v4 artifact hash. A release still requires deterministic
+rebuild, explicit provenance approval, signing, short-root installation,
+installed-tree remeasurement, GPU probe, and the complete App-owned Windows
+Firewall/Job Object/canary/restart qualification.
 
 For the final signed-component install/remeasure gate, set the package SHA from
 the independently measured packager result (not by blindly copying an
@@ -64,6 +81,10 @@ hash. It also revalidates the signed catalog, dynamic part inventory, package
 manifest binding, installed tree, and activation state; no historical v3/v5
 hash may be supplied.
 
+Historical diagnostics did not run inside that complete production chain. The
+259 UTF-16 preflight gate rejects an unsafe long-path component layout before
+extraction. Do not process a real scanned case unless the App currently reports
+every required production qualification gate as valid.
 
 ### Automatic invalidation
 
@@ -200,3 +221,9 @@ the executable and installer are `NotSigned`, records `signed=false` and
 `updaterArtifactGenerated=false`, and does not generate `latest.json` or an
 updater `.sig`.
 
+The stable signed-release workflow is documented in
+`docs/development/release-signing.md`; its executable preflight is
+`scripts/release/release_preflight.ps1`. Signing and updater secrets are
+external release credentials and are never stored in the repository. Their
+absence does not block privacy feature development or explicitly unsigned
+technical artifacts.

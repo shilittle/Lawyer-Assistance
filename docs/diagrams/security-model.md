@@ -15,7 +15,9 @@
 
 `approved_case_workspace` 固定为 21 tools，是真实批准案件唯一图示路径。请求必须引用当前可读的 `material_id` / `publication_id`，Spec 来源必须与 publication 精确绑定；仅有文件名、模型声明或旧 receipt 不能扩大 CASE_RAW 范围。
 
-外部模型计费测试只能使用纯虚构 fixtures。确定性渲染和自动回归不调用 Provider。2026-07-21 的历史 DeepSeek opt-in QA 证据保留在 `acceptance-2026-07-21.md`；它不改变当前 profile 边界，也不能被当作真实案件互操作证据。
+外部模型计费测试只能使用纯虚构 fixtures。确定性渲染和自动回归不调用 Provider。
+任何可选 Provider smoke test 都不改变当前 profile 边界，也不能被当作真实案件互操作
+或生产授权证据。
 
 ## 一次性授权与最小权限
 

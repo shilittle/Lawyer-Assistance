@@ -4,8 +4,8 @@
   "runtime_schema_version": "1",
   "source_verification": "trusted_archival_manifest",
   "ci_fixture_allowed": false,
-  "input": "<WORKSPACE>/data\\generated\\legal_core_full.sqlite",
-  "output": "<WORKSPACE>/apps\\desktop\\src-tauri\\resources\\legal_core.sqlite",
+  "input": "data/generated/legal_core_full.sqlite",
+  "output": "apps/desktop/src-tauri/resources/legal_core.sqlite",
   "input_size_bytes": 4512894976,
   "output_size_bytes": 1775419392,
   "reduction_bytes": 2737475584,
@@ -28,7 +28,7 @@
   },
   "source_revalidated_after_compaction": true,
   "archival_manifest": {
-    "path": "<WORKSPACE>/data\\generated\\legal_core_full_manifest.json",
+    "path": "data/generated/legal_core_full_manifest.json",
     "sha256": "f159820e11f8869c2d9355203c7720ef59943cc5645ef46a0591cf8d12bf3f16",
     "filename": "legal_core_full.sqlite"
   },

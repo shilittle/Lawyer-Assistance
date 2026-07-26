@@ -98,14 +98,25 @@ lawyer-assistance-mcp --privacy-profile approved_case_workspace --approved-sessi
 
 旧版新建案件、材料导入、apply/get-state、文书生成或导出安装步骤已经失效；不得沿用旧配置重新开启。
 
-## 本地 MinerU component 与当前机器状态
+## 本地 MinerU component
 
-MinerU component 不随 Git 源码或普通 MCP ZIP 内置。历史 Windows v3 与短根 v5 candidate 永久禁止发布或改名复用。v4 provenance 源码门禁与 27/27 builder tests 已完成，但当前尚无 final v4 package/hash；必须从最终 clean source commit 确定性重建、显式审批、签名、短根安装/remeasure 和 GPU probe 后，才可进入 App Firewall/Job qualification。项目仓库为 private；最终 v4 发布后，推荐先在 App 外通过 GitHub 认证下载 catalog、`.minisig`、descriptor 与全部 parts，再本地导入。App 自动下载只对已能访问该 private Release 的运行环境成立，不得向 App/catalog 注入 GitHub token。必须验证 detached Minisign、每个 part 的 exact size/SHA-256 和 package/manifest/provenance hash，再通过 App component manager 安装。不要手工拼接到任意长目录：final installed tree 中任何路径超过 259 UTF-16 code units 都会以 `component_runtime_path_too_long` fail closed。
+MinerU component 不随 Git 源码或普通 MCP ZIP 内置。历史候选组件永久禁止发布或改名
+复用。最终 v4 必须从固定源码确定性重建、显式审批、签名、短根安装/remeasure 和
+GPU probe 后，才可进入 App Firewall/Job qualification。
 
-历史 v3 首次完整 install/re-measure 与短根 v5 路径门禁复测均已通过其诊断边界；相关 installed-tree synthetic diagnostic 也通过。它们只解释 259 UTF-16 路径门禁的来源，不是 v4 构件证据，且组件安装或 RTX 5090 diagnostic 均不授权真实案件 OCR。
+只能从项目官方 Release 下载完整 catalog、`.minisig`、descriptor 与全部 parts 后
+本地导入；不得向 App/catalog 注入 GitHub token。必须验证 detached Minisign、每个
+part 的 exact size/SHA-256 和 package/manifest/provenance hash，再通过 App
+component manager 安装。final installed tree 中任何路径超过 259 UTF-16 code units
+都会以 `component_runtime_path_too_long` fail closed。
 
-当前机器的 Firewall elevation 两次被 UAC 取消，因此 `networkIsolationEnforced=false`、`modelManifestTrustEstablished=false`、`appAutoEnableAuthorized=false`、`productionCaseOcrAuthorized=false`。在 App 后端四项都变为当前有效之前，只能处理可靠原生文本层；扫描/视觉 PDF 必须阻断，不能转发远程 OCR。
+组件安装或 direct-worker diagnostics 均不授权真实案件 OCR。在 App 后端全部生产
+资格都变为当前有效之前，只能处理可靠原生文本层；扫描/视觉 PDF 必须阻断，不能转发
+远程 OCR。
 
 ## 签名发布状态
 
-Updater private key/password 已存在，detached catalog verification 已成功；final updater `.sig` 与 `latest.json` 仍等待 exact signed installer。当前唯一外部签名 credential blocker 是缺少带可读 private key 的有效 Authenticode certificate。显式 unsigned installer 不能冒充 trusted-publisher build，也不能发布 updater metadata。
+正式签名发布要求外部 Authenticode 证书和 updater 私钥/密码；这些凭据不存储在仓库
+中。缺少任一凭据时只能生成明确命名的 unsigned technical prerelease，不能冒充
+trusted-publisher build，也不能发布 updater metadata。稳定流程见
+[`docs/development/release-signing.md`](../development/release-signing.md)。

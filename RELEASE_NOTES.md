@@ -1,6 +1,6 @@
-# Lawyer Assistance MCP 0.4.0-beta.2
+# Lawyer Assistance 0.4.0-beta.2
 
-> **Privacy vNext functional prerelease.** This release replaces the earlier fail-closed-only privacy skeleton with an implemented local-OCR qualification path, approved MCP, approved Provider, safe derived-file, lifecycle, mapping, and five-component encrypted-backup paths. The development machine is not production-OCR-qualified. The default external surface remains public-law-only. Case workflows become usable only through an exact current App qualification and short-lived authorization; documentation, consent, Full Access, or a host allowlist cannot turn a failed gate into permission.
+> **Privacy vNext functional prerelease.** This release replaces the earlier fail-closed-only privacy skeleton with an implemented local-OCR qualification path, approved MCP, approved Provider, safe derived-file, lifecycle, mapping, and five-component encrypted-backup paths. No production-OCR qualification is shipped with this prerelease. The default external surface remains public-law-only. Case workflows become usable only through an exact current App qualification and short-lived authorization; documentation, consent, broad host permission, or a host allowlist cannot turn a failed gate into permission.
 
 > **Acceptance uses synthetic data only.** Repository tests and machine canaries must never contain real client or case material. Raw or pending material must not enter GitHub, WorkBuddy, Codex, OpenCode, a browser/search engine, remote OCR, cloud storage, another MCP/Skill, memory, subagent, screenshot, terminal output, or log.
 
@@ -10,7 +10,7 @@
 - The App builds and signs a complete worker/tools/runtime/model inventory, installs and remeasures exact Windows Firewall outbound-block rules, runs the fixed synthetic canary, persists qualification, reloads it on restart, and invalidates it on expiry, revocation or environment/hash/version drift.
 - Approved material publication and all 16 non-public `approved_case_workspace` handlers execute against immutable signed generations or fixed public template/schema data. The profile now lists exactly 21 tools: five public-law, ten approved material/work-product, and six approved-diagram tools. Work products use immutable versions, optimistic concurrency, idempotency, journal recovery, exact source binding, and residual scanning.
 - Every work-product version persists exactly `content.envelope.json`, `manifest.json`, and `commit.json`. Content is encrypted with a fresh per-generation AES-256-GCM key and nonce; Windows DPAPI CurrentUser wraps the key, and authenticated data binds workspace/case/work-product/version, signed-manifest hash, content hash/size/media type. Only the scoped `WorkProductService` may authenticate and decrypt it after source, revocation, filesystem, manifest, commit, hash, and residual checks. A legacy plaintext `content.bin` or any extra/missing file fails closed.
-- Formal packaging first builds the paired MCP sibling, measures its SHA-256, and compiles that value into the App. Approved-MCP qualification requires this trust anchor in addition to sibling path/file identity, version and behavior; an unbound development App or substituted same-name binary fails closed. The earlier ten-case-tool sibling process passed its stdio/HTTP approved-flow E2E. The integrated final 21-tool binary must be rerun over both transports before release and is not claimed as passed here.
+- Formal packaging first builds the paired MCP sibling, measures its SHA-256, and compiles that value into the App. Approved-MCP qualification requires this trust anchor in addition to sibling path/file identity, version and behavior; an unbound development App or substituted same-name binary fails closed. The integrated 21-tool debug sibling passed the synthetic stdio/HTTP E2E over both transports. Every packaged release sibling must still be measured and rerun because its hash is artifact-specific.
 - App-issued MCP tickets bind the server instance, transport, tool, schema, purpose, canonical request bytes, destination, target IDs/generation, nonce, expiry and revocation epoch. Consumption is persistent and replay protected.
 - The standalone approved-MCP wire replay journal is now V2. Each reservation persists an authenticated, session/server/epoch-bound pending transition in Windows Credential Manager before the SQLite commit, advances the authenticated head only for the exact expected next tail, and then clears the pending record. Recovery accepts only the exact one-step committed tail; a pre-database crash, missing pending record, multi-step advance, fork, rollback, binding mismatch or tamper remains fail closed and requires revocation plus reprovisioning. The pending record contains hashes/MACs and a nonce, never case text or ticket secrets.
 - Standalone approved hosts receive only an opaque App-issued `srv_…` ID. Session descriptors are DPAPI-protected and session secrets remain in Windows Credential Manager; static host assets contain no database/root/config path, environment secret, bearer or HTTP credential. Approved-MCP policy v2 defines four explicit grant groups: `read` authorizes the original eight read case tools, `write` the original two write case tools, `diagram_read` four diagram read/validate/export tools, and `diagram_write` two diagram render/update tools. The original groups never silently expand, and every pre-v2 session must be revoked and recreated.
@@ -21,6 +21,7 @@
 - `.lavbackup` V3 authenticates and encrypts five components as one DPAPI-current-user set: the `user.sqlite` snapshot, encrypted privacy bundle, ciphertext-only case Vault archive, approved-workspace archive, and encrypted work-products archive. Every component uses independent chunk AAD under the same fresh backup key. Restore is staged, reverified on restart, installed as one transaction and rolls back all five components on any failure. V2 three-component bundles are accepted only for read/restore compatibility; new complete backups are V3. V1 fails closed. `.lavprivacy` remains a privacy-only maintenance format.
 - WorkBuddy, Codex and OpenCode keep separate public and approved packages. Approved packages are Windows stdio only, begin with opaque IDs, stop on contaminated context, and explicitly forbid attachments, paste, host files, browser/search, remote OCR, another MCP/Skill, memory, subagents and unapproved Providers.
 
+The public release status and supported boundaries are maintained in [`docs/release-status.md`](docs/release-status.md). Packaging success does not qualify production OCR, establish a trusted Windows publisher, or replace clean-machine acceptance.
 
 ## Compatibility contract
 
@@ -92,13 +93,13 @@ The App is authoritative for these independent gates:
 
 Every gate has its own evidence, expiry/revocation/invalidation condition and anonymous reason code. Missing or changed evidence fails closed. There is no HTTP/SSH/cloud/remote MinerU or model-download fallback.
 
-### MinerU evidence boundary on the development machine
+### MinerU qualification boundary
 
-- The earlier signed, self-contained v3 Windows x86_64 candidate (`11,793,618,181` bytes, six hash-bound parts) and the later short-root v5 candidate are historical engineering artifacts only. Their install/re-measure and detached-catalog checks remain useful diagnostic evidence, but both candidates are permanently excluded from publication and must not be reused as release assets.
-- These are engineering diagnostics and component-integrity evidence, not production-case OCR qualification. They did not establish the App-owned Windows Firewall/Job Object chain. Both elevation prompts were cancelled, so `networkIsolationEnforced`, `modelManifestTrustEstablished`, `appAutoEnableAuthorized`, and `productionCaseOcrAuthorized` remain `false`.
-- The v4 provenance source gates are implemented and their 16 builder tests pass. The package/catalog provenance binds the clean source commit, build-script SHA-256, worker-source-tree SHA-256, selected runtime distributions, and exact model revisions. There is not yet a final v4 artifact or final v4 hash: after clean commit A, v4 must be rebuilt deterministically, explicitly approved, signed, installed under a short root, remeasured, GPU-probed, and then qualified through the App-owned Firewall/Job/canary/restart path. No historical v3/v5 hash may stand in for that evidence.
-- A long final installation root exposed native dependency incompatibility beyond the legacy Win32 path budget. The identical historical package bytes worked from a shorter root; the installer now rejects any final component file over 259 UTF-16 code units with `component_runtime_path_too_long`. The historical short-root v5 install/re-measure passed `1/1` with 387 filtered in `1209.75 s`, and a synthetic-only diagnostic launched directly from that installed tree also passed. Neither result is App Firewall/Job production qualification or a publishable release artifact.
-- `shilittle/Lawyer-Assistance` is private. Unauthenticated clients cannot rely on candidate catalog GitHub asset URLs. The recommended installation path is to authenticate to GitHub outside the App, download the catalog, detached signature, descriptor and all six parts, then import them locally. App automatic download is conditional on the running environment already being able to access that private Release; never inject a GitHub token or case data into component metadata.
+- Historical component candidates and direct-worker diagnostics are permanently excluded from publication and cannot be reused as release assets.
+- A production component must bind its source commit, build script, worker source tree, selected runtime distributions and exact model revisions. It must be rebuilt deterministically, explicitly approved, signed, installed under a short root, remeasured, GPU-probed and qualified through the App-owned Firewall/Job/canary/restart path.
+- The component installer rejects any final component path over 259 UTF-16 code units with `component_runtime_path_too_long`.
+- Component installation, signature verification or synthetic diagnostics do not authorize production-case OCR. Continue only when the App currently reports every production qualification gate as valid.
+- Download component assets only as a complete signed set from an official Release. URL availability is not integrity or qualification evidence, and GitHub credentials must never enter component or case metadata.
 
 See [`docs/privacy-vnext/OPERATIONS.md`](docs/privacy-vnext/OPERATIONS.md) for the end-user sequence and [`docs/mcp/approved-case-workspace.md`](docs/mcp/approved-case-workspace.md) for the host contract.
 
@@ -150,7 +151,7 @@ Expected unsigned prerelease artifacts from a clean final commit:
 - `lawyer-assistance-mcp-v0.4.0-beta.2-x86_64-pc-windows-msvc.zip`
 - `lawyer-assistance-mcp-v0.4.0-beta.2-x86_64-pc-windows-msvc.zip.sha256`
 
-After the formal Authenticode-signed build succeeds, also expect the signed installer (uploaded as `Lawyer.Assistance_0.4.0-beta.2_x64-setup.exe`), its updater `.sig`, and `latest.json`. The updater private key/password are available and catalog signature verification has succeeded, but the final installer-bound updater artifacts are still pending that clean signed build. Do not publish `latest.json` for the unsigned installer and do not label an unsigned artifact as signed.
+After the formal Authenticode-signed build succeeds, also expect the signed installer (uploaded as `Lawyer.Assistance_0.4.0-beta.2_x64-setup.exe`), its updater `.sig`, and `latest.json`. Those outputs require an external code-signing certificate and updater credentials that are not stored in the repository. Do not publish `latest.json` for the unsigned installer and do not label an unsigned artifact as signed.
 
 Before upload:
 
@@ -163,10 +164,11 @@ Before upload:
 
 MCP archives contain no legal/user/privacy database, case material, exported document, token, Provider credential, App-issued session descriptor, secret, or machine-local configuration.
 
-## External credential blocker
+## External signing requirements
 
-The only currently evidenced external credential gap is that no valid Authenticode code-signing certificate with a readable private key is available to the release identity. The updater private key and password are present; detached Minisign catalog verification has succeeded. Final installer `.sig` and `latest.json` remain pending because they must bind the exact final Authenticode-signed installer, not because the updater credentials are absent.
+This technical prerelease is published without an Authenticode code-signing certificate or updater private key. These secrets are intentionally outside the repository. Final installer `.sig` and `latest.json` remain pending because they must bind the exact final Authenticode-signed installer.
 
+Missing signing credentials block the trusted-publisher installer and installer-bound updater outputs. They do not block privacy functionality, automated tests, portable/MCP archives, or the explicitly named unsigned installer. The stable signing workflow is documented in [`docs/development/release-signing.md`](docs/development/release-signing.md).
 
 ## Known limits
 
@@ -176,4 +178,4 @@ The only currently evidenced external credential gap is that no valid Authentico
 - Qualification is machine/user/install specific. Copying a report, session ID, database or model tree to another environment does not transfer qualification.
 - Public-law host packages remain intentionally case-free even though the separate approved-session implementation exists.
 - Real client material is excluded from release acceptance. Synthetic positive E2E proves the implemented chain, not legal accuracy for every handwriting, stamp, scan quality or jurisdictional document form; low confidence and unsupported cases must fail closed and receive human review.
-- An unsigned installer has no verified Windows publisher identity and may trigger SmartScreen/AV warnings. Authenticode and clean-machine Windows 10/11 reputation qualification are release-operations evidence, not privacy feature claims; updater credentials being available does not confer publisher identity on an unsigned installer.
+- An unsigned installer has no verified Windows publisher identity and may trigger SmartScreen/AV warnings. Authenticode and clean-machine Windows 10/11 reputation qualification are release-operations evidence, not privacy feature claims.

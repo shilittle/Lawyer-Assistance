@@ -15,7 +15,7 @@
     "get_law_relations"
   ],
   "archive": {
-    "path": "<WORKSPACE>/data\\generated\\legal_core_full.sqlite",
+    "path": "data/generated/legal_core_full.sqlite",
     "size_bytes": 4512894976,
     "metrics": {
       "get_article": {
@@ -71,7 +71,7 @@
     "aggregate_query_median_ms": 282.574
   },
   "runtime": {
-    "path": "<WORKSPACE>/apps\\desktop\\src-tauri\\resources\\legal_core.sqlite",
+    "path": "apps/desktop/src-tauri/resources/legal_core.sqlite",
     "size_bytes": 1775419392,
     "metrics": {
       "get_article": {

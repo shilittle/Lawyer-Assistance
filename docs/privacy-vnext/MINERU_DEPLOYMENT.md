@@ -1,5 +1,11 @@
 # 本地 MinerU Worker v1 部署与运维规范
 
+> `auto_local` / `force_local` 仅在签名资格、精确 worker/config/runtime/model
+> inventory、Windows Firewall 复测、固定合成 canary、执行前后 identity 校验和
+> 进程树 containment 全部有效时运行。历史候选构件不得用于生产或发布；最终组件必须
+> 从固定源码确定性重建、审查、签名、短路径安装、复测并由 App 完成资格化。当前公开
+> 发布状态见 [`docs/release-status.md`](../release-status.md)。
+
 ## 1. 目标与边界
 
 本规范只允许在用户设备上运行、使用本地模型且经过精确资格校验的 MinerU OCR。生产案件材料不得发送到 SSH 主机、远程 MinerU、云 OCR、Provider 或任何联网回退路径。
@@ -100,18 +106,22 @@ worker 返回的成功退出码不等于文档完整。后端必须独立验证�
 
 ## 9. 当前交付状态
 
-- Host 侧 worker 协议 client、输出 completeness、页面/顺序/尺寸/bbox/confidence 上限、超时/取消与进程树控制：`CODE_COMPLETE`，合成进程 fixture 已通过。
-- 自包含 worker/component v3 candidate：`BUILT_AND_SIGNED_NOT_PUBLISHABLE`。`.laocrpkg` 精确大小为 `11,793,618,181` bytes，SHA-256 为 `d2ee7db7e116c4782771294fbf4f116d0d2c1833f89b35ecebbe67e9213e8190`，package manifest SHA-256 为 `e62101365a47b22a06e865002c7cc83c0f04144e5b91979851fa77351751e235`，descriptor SHA-256 为 `1c3f51e93c2b700a82a93b5e441e42001f1933106b07316b320560ec4455a79e`。首次完整 install/re-measure 测试结果为 `1 passed`，耗时 `1287.01 s`。provenance/third-party licensing audit 未完成前不得上传 Release。
-- 签名 catalog：catalog SHA-256 为 `1d294b62afb26d0db731e55d0bfe1a0519ada52f4098ca8ad4154808f778869e`，catalog signature SHA-256 为 `69112dfa9d51c408492f8c665d2b86e419aeda91320e4bd170b84b2b0a887995`，detached `.minisig` SHA-256 为 `33d19927ea67bb871f04fea0054c3b8c05e6b18669feed32b738f5f833208b5d`；已使用 vendor verifier 与内置公钥完成离线验证。这证明发布资产签名/完整性，不会自动设置本机 model/runtime/firewall qualification。
-- MinerU 3.4.3 GPU 工程诊断：RTX 5090 上的合成两页、低清、旋转输入已完成；不可读手写输入以 `output_incomplete` 阻断。该诊断没有在 App 持有的 Firewall/Job Object production chain 中运行，结论不是 production qualification。
-- App `auto_local` / `force_local` 接线、签名 qualification 持久化、重启加载、撤销/过期/epoch 和环境漂移失效：`CODE_COMPLETE`。
-- exact worker/config/runtime/model inventory、受信注册与确定性 packager：`CODE_COMPLETE`；大模型/运行时 candidate 采用独立分片管理，不进入 Git 源码历史，provenance/licensing audit 与全部 release gates 通过前不上传 Release。
-- v4 provenance/licensing gate：`CODE_COMPLETE_AWAITING_CLEAN_SOURCE_FREEZE`。生产 builder 从 `mineru[pipeline,vlm]` 解析 86 个运行闭包 distribution，复核最终打包的每个 wheel `RECORD` 文件，保留 MinerU 自定义许可证，固定 torch/torchvision wheel 与两个模型 revision/逐文件 hash；draft 必须由发布负责人显式批准，stage 再要求 clean Git HEAD 并全量重测。旧 v3/v5 安装树不满足该门，不能改名发布。
-- Windows Firewall outbound 规则安装、ActiveStore 验证和 rollback：代码路径 `CODE_COMPLETE`；只有 exact 规则对当前 worker 进程树实际生效时 `networkIsolationEnforced=true`。
-- 当前机器 Windows Firewall 提权尝试：两次均由 UAC 返回用户取消；没有取得 ActiveStore 规则证据，因此 `networkIsolationEnforced=false`、`modelManifestTrustEstablished=false`、`appAutoEnableAuthorized=false`、`productionCaseOcrAuthorized=false`。
-- 路径兼容性：长工作树下的 final runtime path 触发原生依赖导入失败，同字节组件在短路径下成功。安装器已增加 final installed path 上限 259 UTF-16 code units，超限在解包前返回 `component_runtime_path_too_long`。包含该门禁的新短根完整 v5 install/re-measure 已 `PASS`：`1 passed`、`0 failed`、387 filtered、`1209.75 s`；state root 为 `C:\la-mineru-component-state-v5-20260722`。随后从该安装目录启动的 synthetic-only diagnostic 也 `PASS`。
-- 真实扫描案件 OCR：当前机器为 `blocked`；只有 current exact tuple 的 App/Firewall/Job/qualification 全部有效后才可条件启用，组件安装与 synthetic diagnostic 不替代这些门，缺项或漂移立即继续阻断。
-- SSH/远程 MinerU、自动模型下载和联网回退：生产路径永久禁止。
+- Worker 协议、输出 completeness、页面/顺序/尺寸/bbox/confidence 上限、
+  超时/取消与进程树控制已实现，并由合成 fixtures 回归。
+- App `auto_local` / `force_local`、签名 qualification 持久化、重启加载、
+  撤销/过期/epoch 与环境漂移失效已实现。
+- exact worker/config/runtime/model inventory、受信注册、确定性 packager 和
+  provenance/licensing 门禁已实现。
+- 历史候选组件不满足最终 v4 发布门禁，永久不能改名或重新发布。
+- 最终 v4 必须绑定固定依赖闭包、wheel `RECORD`、许可证、模型 revision 和逐文件
+  hash，并经过显式审批与全量重测。
+- Windows Firewall outbound 规则安装、ActiveStore 验证和 rollback 已实现；只有
+  exact 规则对当前 worker 进程树实际生效时 `networkIsolationEnforced=true`。
+- 安装器限制 final installed path 不超过 259 UTF-16 code units，超限在解包前返回
+  `component_runtime_path_too_long`。
+- 真实扫描案件 OCR 只有在 current exact tuple 的 App/Firewall/Job/qualification
+  全部有效后才可条件启用。组件安装与 synthetic diagnostics 不替代这些门。
+- SSH/远程 MinerU、自动模型下载和联网 OCR 回退在生产路径永久禁止。
 
 ### v3 六分片清单
 
