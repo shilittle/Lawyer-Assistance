@@ -6,34 +6,13 @@
 /apikey.txt
 /.release-secrets/
 /.tmp-test-runtime/
-
 /tmp/
 /output/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 *.patch
 *.patch.stderr
 *.orig
 *.rej
-
-
-
-
 
 **/dist/
 **/target/
