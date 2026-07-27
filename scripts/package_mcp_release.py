@@ -338,8 +338,9 @@ def _release_notes_payload(root: Path, version: str) -> Payload:
         text = payload.data.decode("utf-8")
     except UnicodeDecodeError as error:
         raise PackageError("RELEASE_NOTES.md must be valid UTF-8") from error
+    expected_title = f"# Lawyer Assistance {version}"
+    first_line = text.splitlines()[0].strip() if text.splitlines() else ""
     required_markers = (
-        f"# Lawyer Assistance MCP {version}",
         "## Compatibility contract",
         "MCP protocol metadata",
         "Public service schema",
@@ -349,6 +350,8 @@ def _release_notes_payload(root: Path, version: str) -> Payload:
         "## Known limits",
     )
     missing = [marker for marker in required_markers if marker not in text]
+    if first_line != expected_title:
+        missing.insert(0, expected_title)
     if missing:
         raise PackageError(
             "RELEASE_NOTES.md does not describe this version and its compatibility contract: "

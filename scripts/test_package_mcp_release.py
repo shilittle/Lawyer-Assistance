@@ -30,7 +30,7 @@ class McpReleasePackageTests(unittest.TestCase):
         (root / "LICENSE").write_text("test license\n", encoding="utf-8")
         (root / "README.md").write_text("# test\n", encoding="utf-8")
         (root / "RELEASE_NOTES.md").write_text(
-            """# Lawyer Assistance MCP 9.8.7
+            """# Lawyer Assistance 9.8.7
 
 ## Compatibility contract
 
@@ -164,7 +164,7 @@ Fixture limits.
         with tempfile.TemporaryDirectory() as directory:
             root, binary = self.fixture(directory)
             (root / "RELEASE_NOTES.md").write_text(
-                "# Lawyer Assistance MCP 9.8.6\n\n## Known limits\n",
+                "# Lawyer Assistance 9.8.6\n\n## Known limits\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(PackageError, "RELEASE_NOTES"):

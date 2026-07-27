@@ -1,5 +1,15 @@
 # Lawyer Assistance 0.4.0-beta.2
 
+## 中文概览
+
+这是一个面向 Windows x86_64 的隐私功能技术预发行版。默认仅开放只读公共法律检索；案件材料、工作成果、图表和 Provider 调用只有在当前电脑通过精确资格校验并取得短时授权后才可使用。
+
+- 安装包和便携包内置 runtime-slim 法律数据库，可直接完成公共法律检索；完整归档数据库不随桌面发行版分发。
+- 本地 MinerU OCR 已接入资格校验流程，但本版本不声明生产级 OCR 资格。
+- 安装包尚未经过受信任发布者的 Authenticode 签名，Windows 可能显示未知发布者提示；本版本也不发布自动更新签名文件。
+- 仓库验收只使用合成数据。真实或待审核案件材料不得进入 GitHub、浏览器/搜索引擎、远程 OCR、云存储或任何未经批准的 Provider、MCP 与自动化上下文。
+- 请通过发布页提供的 SHA-256 文件核对下载完整性，并阅读 [发布状态](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/release-status.md) 与 [入门指南](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/getting-started.md) 了解支持边界和安装步骤。
+
 > **Privacy vNext functional prerelease.** This release replaces the earlier fail-closed-only privacy skeleton with an implemented local-OCR qualification path, approved MCP, approved Provider, safe derived-file, lifecycle, mapping, and five-component encrypted-backup paths. No production-OCR qualification is shipped with this prerelease. The default external surface remains public-law-only. Case workflows become usable only through an exact current App qualification and short-lived authorization; documentation, consent, broad host permission, or a host allowlist cannot turn a failed gate into permission.
 
 > **Acceptance uses synthetic data only.** Repository tests and machine canaries must never contain real client or case material. Raw or pending material must not enter GitHub, WorkBuddy, Codex, OpenCode, a browser/search engine, remote OCR, cloud storage, another MCP/Skill, memory, subagent, screenshot, terminal output, or log.
@@ -10,7 +20,7 @@
 - The App builds and signs a complete worker/tools/runtime/model inventory, installs and remeasures exact Windows Firewall outbound-block rules, runs the fixed synthetic canary, persists qualification, reloads it on restart, and invalidates it on expiry, revocation or environment/hash/version drift.
 - Approved material publication and all 16 non-public `approved_case_workspace` handlers execute against immutable signed generations or fixed public template/schema data. The profile now lists exactly 21 tools: five public-law, ten approved material/work-product, and six approved-diagram tools. Work products use immutable versions, optimistic concurrency, idempotency, journal recovery, exact source binding, and residual scanning.
 - Every work-product version persists exactly `content.envelope.json`, `manifest.json`, and `commit.json`. Content is encrypted with a fresh per-generation AES-256-GCM key and nonce; Windows DPAPI CurrentUser wraps the key, and authenticated data binds workspace/case/work-product/version, signed-manifest hash, content hash/size/media type. Only the scoped `WorkProductService` may authenticate and decrypt it after source, revocation, filesystem, manifest, commit, hash, and residual checks. A legacy plaintext `content.bin` or any extra/missing file fails closed.
-- Formal packaging first builds the paired MCP sibling, measures its SHA-256, and compiles that value into the App. Approved-MCP qualification requires this trust anchor in addition to sibling path/file identity, version and behavior; an unbound development App or substituted same-name binary fails closed. The integrated 21-tool debug sibling passed the synthetic stdio/HTTP E2E over both transports. Every packaged release sibling must still be measured and rerun because its hash is artifact-specific.
+- Formal packaging first builds the paired MCP sibling, measures its SHA-256, and compiles that value into the App. Approved-MCP qualification requires this trust anchor in addition to sibling path/file identity, version and behavior; an unbound development App or substituted same-name binary fails closed. Every packaged release sibling must still be measured and rerun because its hash is artifact-specific.
 - App-issued MCP tickets bind the server instance, transport, tool, schema, purpose, canonical request bytes, destination, target IDs/generation, nonce, expiry and revocation epoch. Consumption is persistent and replay protected.
 - The standalone approved-MCP wire replay journal is now V2. Each reservation persists an authenticated, session/server/epoch-bound pending transition in Windows Credential Manager before the SQLite commit, advances the authenticated head only for the exact expected next tail, and then clears the pending record. Recovery accepts only the exact one-step committed tail; a pre-database crash, missing pending record, multi-step advance, fork, rollback, binding mismatch or tamper remains fail closed and requires revocation plus reprovisioning. The pending record contains hashes/MACs and a nonce, never case text or ticket secrets.
 - Standalone approved hosts receive only an opaque App-issued `srv_…` ID. Session descriptors are DPAPI-protected and session secrets remain in Windows Credential Manager; static host assets contain no database/root/config path, environment secret, bearer or HTTP credential. Approved-MCP policy v2 defines four explicit grant groups: `read` authorizes the original eight read case tools, `write` the original two write case tools, `diagram_read` four diagram read/validate/export tools, and `diagram_write` two diagram render/update tools. The original groups never silently expand, and every pre-v2 session must be revoked and recreated.
@@ -21,7 +31,7 @@
 - `.lavbackup` V3 authenticates and encrypts five components as one DPAPI-current-user set: the `user.sqlite` snapshot, encrypted privacy bundle, ciphertext-only case Vault archive, approved-workspace archive, and encrypted work-products archive. Every component uses independent chunk AAD under the same fresh backup key. Restore is staged, reverified on restart, installed as one transaction and rolls back all five components on any failure. V2 three-component bundles are accepted only for read/restore compatibility; new complete backups are V3. V1 fails closed. `.lavprivacy` remains a privacy-only maintenance format.
 - WorkBuddy, Codex and OpenCode keep separate public and approved packages. Approved packages are Windows stdio only, begin with opaque IDs, stop on contaminated context, and explicitly forbid attachments, paste, host files, browser/search, remote OCR, another MCP/Skill, memory, subagents and unapproved Providers.
 
-The public release status and supported boundaries are maintained in [`docs/release-status.md`](docs/release-status.md). Packaging success does not qualify production OCR, establish a trusted Windows publisher, or replace clean-machine acceptance.
+The public release status and supported boundaries are maintained in the versioned [release status](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/release-status.md). Packaging success does not qualify production OCR, establish a trusted Windows publisher, or replace clean-machine acceptance.
 
 ## Compatibility contract
 
@@ -101,7 +111,7 @@ Every gate has its own evidence, expiry/revocation/invalidation condition and an
 - Component installation, signature verification or synthetic diagnostics do not authorize production-case OCR. Continue only when the App currently reports every production qualification gate as valid.
 - Download component assets only as a complete signed set from an official Release. URL availability is not integrity or qualification evidence, and GitHub credentials must never enter component or case metadata.
 
-See [`docs/privacy-vnext/OPERATIONS.md`](docs/privacy-vnext/OPERATIONS.md) for the end-user sequence and [`docs/mcp/approved-case-workspace.md`](docs/mcp/approved-case-workspace.md) for the host contract.
+See the versioned [privacy operations guide](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/privacy-vnext/OPERATIONS.md) for the end-user sequence and [`docs/mcp/approved-case-workspace.md`](docs/mcp/approved-case-workspace.md) for the host contract.
 
 ## Install and migration
 
@@ -168,7 +178,7 @@ MCP archives contain no legal/user/privacy database, case material, exported doc
 
 This technical prerelease is published without an Authenticode code-signing certificate or updater private key. These secrets are intentionally outside the repository. Final installer `.sig` and `latest.json` remain pending because they must bind the exact final Authenticode-signed installer.
 
-Missing signing credentials block the trusted-publisher installer and installer-bound updater outputs. They do not block privacy functionality, automated tests, portable/MCP archives, or the explicitly named unsigned installer. The stable signing workflow is documented in [`docs/development/release-signing.md`](docs/development/release-signing.md).
+Missing signing credentials block the trusted-publisher installer and installer-bound updater outputs. They do not block privacy functionality, automated tests, portable/MCP archives, or the explicitly named unsigned installer. The stable signing workflow is documented in the versioned [release-signing guide](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/development/release-signing.md).
 
 ## Known limits
 
