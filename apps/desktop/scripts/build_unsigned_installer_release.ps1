@@ -124,14 +124,7 @@ $env:SOURCE_DATE_EPOCH = $sourceDateEpoch
 $env:CARGO_NET_OFFLINE = "true"
 $buildStartedAt = [DateTimeOffset]::UtcNow
 try {
-  Push-Location $ProjectRoot
-  try {
-    Invoke-Checked "Offline MCP release build" {
-      & cargo build --release --locked --offline --package legal-mcp --bin lawyer-assistance-mcp
-    }
-  } finally {
-    Pop-Location
-  }
+  Invoke-LawyerAssistanceFreshMcpReleaseBuild $ProjectRoot
   ConvertTo-LawyerAssistanceIndependentMcpBinary $expectedMcpExecutable
   $mcpReleaseSha256 = (Get-FileHash -LiteralPath $expectedMcpExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($mcpReleaseSha256 -notmatch '^[0-9a-f]{64}$') { throw "MCP release trust anchor is invalid" }

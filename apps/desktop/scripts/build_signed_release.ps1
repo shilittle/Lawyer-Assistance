@@ -103,13 +103,7 @@ $previousSourceDateEpoch = $env:SOURCE_DATE_EPOCH
 $previousMcpReleaseSha256 = $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256
 $env:SOURCE_DATE_EPOCH = $sourceDateEpoch
 try {
-  Push-Location $ProjectRoot
-  try {
-    & cargo build --release --locked --offline --package legal-mcp --bin lawyer-assistance-mcp
-    if ($LASTEXITCODE -ne 0) { throw "MCP signed release build failed with exit code $LASTEXITCODE" }
-  } finally {
-    Pop-Location
-  }
+  Invoke-LawyerAssistanceFreshMcpReleaseBuild $ProjectRoot
   ConvertTo-LawyerAssistanceIndependentMcpBinary $expectedMcpExecutable
   & $signtool.FullName sign /sha1 $CodeSigningThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $expectedMcpExecutable | Out-Host
   if ($LASTEXITCODE -ne 0) { throw "MCP Authenticode signing failed" }

@@ -9,6 +9,29 @@ function Get-LawyerAssistanceMcpReleasePaths([string]$ProjectRoot) {
   }
 }
 
+function Invoke-LawyerAssistanceFreshMcpReleaseBuild([string]$ProjectRoot) {
+  $root = [IO.Path]::GetFullPath($ProjectRoot)
+  $target = "x86_64-pc-windows-msvc"
+  Push-Location $root
+  try {
+    # Removing only legal-mcp's release artifacts prevents Cargo from
+    # materializing an incremental executable with an earlier timestamp.
+    # The subsequent locked offline build then provides real per-invocation
+    # freshness evidence without discarding the shared dependency cache.
+    & cargo clean --release --locked --offline --target $target --package legal-mcp
+    if ($LASTEXITCODE -ne 0) {
+      throw "MCP release artifact cleanup failed with exit code $LASTEXITCODE"
+    }
+    & cargo build --release --locked --offline --target $target `
+      --package legal-mcp --bin lawyer-assistance-mcp
+    if ($LASTEXITCODE -ne 0) {
+      throw "MCP release build failed with exit code $LASTEXITCODE"
+    }
+  } finally {
+    Pop-Location
+  }
+}
+
 function Assert-LawyerAssistanceMcpReleaseBinary(
   [string]$Path,
   [string]$Version,

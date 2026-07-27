@@ -47,6 +47,7 @@ foreach ($releaseScript in @(
   $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot $releaseScript) -Raw -Encoding UTF8
   foreach ($required in @(
     "lawyer-assistance-mcp",
+    "Invoke-LawyerAssistanceFreshMcpReleaseBuild",
     "Assert-LawyerAssistanceMcpReleaseBinary",
     "LAWYER_ASSISTANCE_MCP_RELEASE_SHA256",
     "compiled-release-sha256",
@@ -56,6 +57,17 @@ foreach ($releaseScript in @(
     if (-not $source.Contains($required)) {
       throw "$releaseScript does not enforce MCP sibling release evidence: $required"
     }
+  }
+}
+$mcpReleaseSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot "mcp_sidecar_release.ps1") -Raw -Encoding UTF8
+foreach ($requiredFreshBuildFragment in @(
+  "cargo clean --release --locked --offline --target",
+  "--package legal-mcp",
+  "cargo build --release --locked --offline --target",
+  "--bin lawyer-assistance-mcp"
+)) {
+  if (-not $mcpReleaseSource.Contains($requiredFreshBuildFragment)) {
+    throw "MCP release build does not enforce fresh package output: $requiredFreshBuildFragment"
   }
 }
 $desktopBuildSource = Get-Content -LiteralPath (Join-Path $ProjectRoot "apps\desktop\src-tauri\build.rs") -Raw -Encoding UTF8

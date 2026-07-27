@@ -103,9 +103,7 @@ if ([string]::IsNullOrWhiteSpace($ExistingBuildProvenancePath)) {
     }
     Push-Location $ProjectRoot
     try {
-      Invoke-Checked "Offline MCP release build" {
-        & cargo build --release --locked --offline --package legal-mcp --bin lawyer-assistance-mcp
-      }
+      Invoke-LawyerAssistanceFreshMcpReleaseBuild $ProjectRoot
       ConvertTo-LawyerAssistanceIndependentMcpBinary $mcpExe
       $compiledMcpTrustAnchor = (Get-FileHash -LiteralPath $mcpExe -Algorithm SHA256).Hash.ToLowerInvariant()
       if ($compiledMcpTrustAnchor -notmatch '^[0-9a-f]{64}$') { throw "MCP release trust anchor is invalid" }
