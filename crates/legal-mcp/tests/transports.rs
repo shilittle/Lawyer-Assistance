@@ -46,6 +46,7 @@ use tokio::io::{
 use tokio_util::sync::CancellationToken;
 
 const STABLE_VERSION: &str = "2025-11-25";
+const UNSUPPORTED_VERSION: &str = "9999-12-31";
 const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const SENSITIVE_RESULT_CANARY: &str = "alice.case@example.com";
 const INPUT_CANARY_PHONE: &str = "13800138000";
@@ -353,7 +354,7 @@ fn run_stdio(paths: FixturePaths) -> StdioResult {
             "id":1,
             "method":"initialize",
             "params":{
-                "protocolVersion":"2026-07-28",
+                "protocolVersion":UNSUPPORTED_VERSION,
                 "capabilities":{},
                 "clientInfo":{"name":"transport-test","version":"1"}
             }
@@ -461,7 +462,7 @@ fn run_stdio(paths: FixturePaths) -> StdioResult {
             assert!(!line.contains(canary), "stdout leaked canary");
         }
     }
-    assert!(!stderr.contains("2026-07-28"));
+    assert!(!stderr.contains(UNSUPPORTED_VERSION));
     assert!(!stderr.contains("system_status\""));
 
     StdioResult {
@@ -1102,7 +1103,7 @@ async fn stdio_and_http_are_protocol_consistent_and_secure() {
     let initialize_body = json!({
         "jsonrpc":"2.0","id":1,"method":"initialize",
         "params":{
-            "protocolVersion":"2026-07-28",
+            "protocolVersion":UNSUPPORTED_VERSION,
             "capabilities":{},
             "clientInfo":{"name":"transport-test","version":"1"}
         }
@@ -1155,7 +1156,7 @@ async fn stdio_and_http_are_protocol_consistent_and_secure() {
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
         Some(TEST_TOKEN),
         Some("https://client.example"),
-        Some("2026-07-28"),
+        Some(UNSUPPORTED_VERSION),
     )
     .await;
     assert_eq!(rc_header.status, 400);
@@ -1978,7 +1979,7 @@ async fn redacted_case_stdio_accepts_exact_receipt_without_echoing_secrets() {
         json!({
             "jsonrpc":"2.0","id":1,"method":"initialize",
             "params":{
-                "protocolVersion":"2026-07-28",
+                "protocolVersion":UNSUPPORTED_VERSION,
                 "capabilities":{},
                 "clientInfo":{"name":"redacted-stdio-test","version":"1"}
             }
