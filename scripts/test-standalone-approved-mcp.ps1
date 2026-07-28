@@ -120,7 +120,19 @@ try {
 
     $env:LAWYER_ASSISTANCE_MCP_E2E_BINARY = $binaryPath
     $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 = $binarySha256
-    Invoke-CargoStep -ResultCode 'MCP_E2E_TEST_FAILED' -Arguments @(
+    $testName = if ($usingExplicitBinary) {
+        'approved_mcp::standalone_binary_tests::explicit_binary_qualification_canary_is_fail_closed'
+    }
+    else {
+        'approved_mcp::standalone_binary_tests::app_approval_to_real_stdio_and_http_binary_is_fail_closed'
+    }
+    $testScope = if ($usingExplicitBinary) {
+        'release-qualification-canary'
+    }
+    else {
+        'full-standalone-session'
+    }
+    $testArguments = @(
         'test',
         '--locked',
         '--offline',
@@ -129,12 +141,29 @@ try {
         '--features',
         'standalone-mcp-e2e',
         '--lib',
-        'app_approval_to_real_stdio_and_http_binary_is_fail_closed',
+        $testName
+    )
+    $listedTests = @(& cargo @testArguments -- --ignored --exact --list)
+    if ($LASTEXITCODE -ne 0) {
+        throw "MCP_E2E_TEST_LIST_FAILED (exit=$LASTEXITCODE)"
+    }
+    $expectedListing = "$testName`: test"
+    $listedTestCases = @(
+        $listedTests |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { $_.EndsWith(': test', [System.StringComparison]::Ordinal) }
+    )
+    if ($listedTestCases.Count -ne 1 -or $listedTestCases[0] -cne $expectedListing) {
+        throw "MCP_E2E_TEST_NOT_EXACT (expected one exact ignored test)"
+    }
+    $runTestArguments = $testArguments + @(
         '--',
         '--ignored',
+        '--exact',
         '--nocapture',
         '--test-threads=1'
     )
+    Invoke-CargoStep -ResultCode 'MCP_E2E_TEST_FAILED' -Arguments $runTestArguments
 
     $binarySha256After = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($binarySha256After -cne $binarySha256) {
@@ -142,6 +171,7 @@ try {
     }
     $stopwatch.Stop()
     Write-Output 'MCP_STANDALONE_APPROVED_E2E=PASS'
+    Write-Output "MCP_STANDALONE_APPROVED_E2E_SCOPE=$testScope"
     Write-Output "MCP_STANDALONE_APPROVED_E2E_SOURCE=$(if ($usingExplicitBinary) { 'explicit' } else { 'default-debug' })"
     Write-Output "MCP_STANDALONE_APPROVED_E2E_BINARY=$binaryPath"
     Write-Output "MCP_STANDALONE_APPROVED_E2E_VERSION=$expectedVersion"

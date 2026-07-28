@@ -56,9 +56,10 @@ type HmacSha256 = Hmac<Sha256>;
 pub const APP_IDENTIFIER: &str = "com.shilittle.lawyer-assistance";
 #[cfg(feature = "standalone-mcp-e2e")]
 pub const APP_IDENTIFIER: &str = "com.shilittle.lawyer-assistance.mcp-e2e";
+const QUALIFICATION_CANARY_APP_IDENTIFIER: &str =
+    "com.shilittle.lawyer-assistance.mcp-qualification-canary";
 pub const APPROVED_MCP_STATE_RELATIVE: &str = "privacy/approved-mcp";
-pub const QUALIFICATION_CANARY_RUNS_RELATIVE: &str =
-    "privacy/approved-mcp/qualification/canary-runs";
+const QUALIFICATION_CANARY_RUNS_DIRECTORY: &str = "canary-runs";
 pub const STANDALONE_DESCRIPTOR_FILE: &str = "standalone-session-v2.dpapi";
 const PROCESS_LOCK_FILE: &str = "standalone-process-lock.sqlite";
 pub const WIRE_REPLAY_DATABASE_FILE: &str = "standalone-wire-replay-v2.sqlite";
@@ -612,23 +613,127 @@ struct LoadedDescriptor {
 pub fn default_app_local_data_directory() -> Result<PathBuf, StandaloneApprovedError> {
     // `dirs` resolves FOLDERID_LocalAppData through SHGetKnownFolderPath on
     // Windows. Host-controlled environment variables are never consulted.
-    let root = dirs::data_local_dir()
-        .filter(|path| path.is_absolute())
-        .ok_or(StandaloneApprovedError::Unavailable)?;
+    let root = known_local_data_directory()?;
     Ok(root.join(APP_IDENTIFIER))
 }
 
-pub fn qualification_canary_app_local_data_directory(
+fn known_local_data_directory() -> Result<PathBuf, StandaloneApprovedError> {
+    dirs::data_local_dir()
+        .filter(|path| path.is_absolute())
+        .ok_or(StandaloneApprovedError::Unavailable)
+}
+
+fn qualification_canary_run_path_at(
+    local_data_directory: &Path,
     canary_id: &str,
 ) -> Result<PathBuf, StandaloneApprovedError> {
     if !opaque_hex(canary_id, "mcpqcanary_", 32) {
         return Err(StandaloneApprovedError::InvalidBinding);
     }
-    let root = default_app_local_data_directory()?
-        .join(QUALIFICATION_CANARY_RUNS_RELATIVE)
-        .join(canary_id)
-        .join("app-local");
-    canonical_directory(&root)
+    Ok(local_data_directory
+        .join(QUALIFICATION_CANARY_APP_IDENTIFIER)
+        .join(QUALIFICATION_CANARY_RUNS_DIRECTORY)
+        .join(canary_id))
+}
+
+fn canonical_exact_directory(path: &Path) -> Result<PathBuf, StandaloneApprovedError> {
+    let canonical = canonical_directory(path)?;
+    if canonical != path {
+        return Err(StandaloneApprovedError::InvalidBinding);
+    }
+    Ok(canonical)
+}
+
+fn ensure_canary_parent_directory(path: &Path) -> Result<(), StandaloneApprovedError> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(StandaloneApprovedError::Unavailable),
+    }
+    canonical_exact_directory(path).map(|_| ())
+}
+
+fn create_qualification_canary_run_directory_at(
+    local_data_directory: &Path,
+    canary_id: &str,
+) -> Result<PathBuf, StandaloneApprovedError> {
+    let local_data_directory = canonical_directory(local_data_directory)?;
+    let path = qualification_canary_run_path_at(&local_data_directory, canary_id)?;
+    let namespace = local_data_directory.join(QUALIFICATION_CANARY_APP_IDENTIFIER);
+    ensure_canary_parent_directory(&namespace)?;
+    let runs = namespace.join(QUALIFICATION_CANARY_RUNS_DIRECTORY);
+    ensure_canary_parent_directory(&runs)?;
+    fs::create_dir(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            StandaloneApprovedError::InvalidBinding
+        } else {
+            StandaloneApprovedError::Unavailable
+        }
+    })?;
+    canonical_exact_directory(&path)
+}
+
+pub fn create_qualification_canary_run_directory(
+    canary_id: &str,
+) -> Result<PathBuf, StandaloneApprovedError> {
+    create_qualification_canary_run_directory_at(&known_local_data_directory()?, canary_id)
+}
+
+fn qualification_canary_app_local_data_directory_at(
+    local_data_directory: &Path,
+    canary_id: &str,
+) -> Result<PathBuf, StandaloneApprovedError> {
+    let local_data_directory = canonical_directory(local_data_directory)?;
+    let run = qualification_canary_run_path_at(&local_data_directory, canary_id)?;
+    let run = canonical_exact_directory(&run)?;
+    let app_local = run.join("app-local");
+    canonical_exact_directory(&app_local)
+}
+
+pub fn qualification_canary_app_local_data_directory(
+    canary_id: &str,
+) -> Result<PathBuf, StandaloneApprovedError> {
+    qualification_canary_app_local_data_directory_at(&known_local_data_directory()?, canary_id)
+}
+
+fn validate_canary_cleanup_tree(path: &Path) -> Result<(), StandaloneApprovedError> {
+    validate_fixed_local_directory(path).map_err(|_| StandaloneApprovedError::Unavailable)?;
+    for entry in fs::read_dir(path).map_err(|_| StandaloneApprovedError::Unavailable)? {
+        let entry = entry.map_err(|_| StandaloneApprovedError::Unavailable)?;
+        let child = entry.path();
+        let metadata =
+            fs::symlink_metadata(&child).map_err(|_| StandaloneApprovedError::Unavailable)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            validate_canary_cleanup_tree(&child)?;
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            validate_fixed_local_regular_file(&child)
+                .map_err(|_| StandaloneApprovedError::Unavailable)?;
+        } else {
+            return Err(StandaloneApprovedError::Unavailable);
+        }
+    }
+    Ok(())
+}
+
+fn remove_qualification_canary_run_directory_at(
+    local_data_directory: &Path,
+    canary_id: &str,
+) -> Result<(), StandaloneApprovedError> {
+    let local_data_directory = canonical_directory(local_data_directory)?;
+    let path = qualification_canary_run_path_at(&local_data_directory, canary_id)?;
+    canonical_exact_directory(&path)?;
+    validate_canary_cleanup_tree(&path)?;
+    fs::remove_dir_all(&path).map_err(|_| StandaloneApprovedError::Unavailable)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(StandaloneApprovedError::Unavailable),
+    }
+}
+
+pub fn remove_qualification_canary_run_directory(
+    canary_id: &str,
+) -> Result<(), StandaloneApprovedError> {
+    remove_qualification_canary_run_directory_at(&known_local_data_directory()?, canary_id)
 }
 
 pub fn provision_standalone_session(
@@ -2607,6 +2712,90 @@ fn zeroize(bytes: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualification_canary_namespace_is_feature_independent_and_leaf_scoped() {
+        let local_data = tempfile::tempdir().expect("temporary local data root");
+        let local_data =
+            fs::canonicalize(local_data.path()).expect("canonical temporary local data root");
+        let canary_id = format!("mcpqcanary_{}", "a".repeat(32));
+        let run = create_qualification_canary_run_directory_at(&local_data, &canary_id)
+            .expect("create isolated qualification canary leaf");
+        assert_eq!(
+            run,
+            local_data
+                .join(QUALIFICATION_CANARY_APP_IDENTIFIER)
+                .join(QUALIFICATION_CANARY_RUNS_DIRECTORY)
+                .join(&canary_id)
+        );
+        assert_eq!(
+            QUALIFICATION_CANARY_APP_IDENTIFIER,
+            "com.shilittle.lawyer-assistance.mcp-qualification-canary"
+        );
+        assert_ne!(QUALIFICATION_CANARY_APP_IDENTIFIER, APP_IDENTIFIER);
+
+        let app_local = run.join("app-local");
+        fs::create_dir(&app_local).expect("create canary app-local leaf");
+        assert_eq!(
+            qualification_canary_app_local_data_directory_at(&local_data, &canary_id)
+                .expect("resolve exact canary app-local leaf"),
+            app_local
+        );
+        assert_eq!(
+            create_qualification_canary_run_directory_at(&local_data, &canary_id)
+                .expect_err("pre-existing canary leaf is rejected"),
+            StandaloneApprovedError::InvalidBinding
+        );
+        for invalid in [
+            "mcpqcanary_",
+            "mcpqcanary_../escape",
+            "mcpqcanary_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "mcpqcanary_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert_eq!(
+                create_qualification_canary_run_directory_at(&local_data, invalid)
+                    .expect_err("invalid canary id is rejected"),
+                StandaloneApprovedError::InvalidBinding
+            );
+        }
+
+        remove_qualification_canary_run_directory_at(&local_data, &canary_id)
+            .expect("remove exact qualification canary leaf");
+        assert!(!run.exists());
+        assert!(local_data
+            .join(QUALIFICATION_CANARY_APP_IDENTIFIER)
+            .join(QUALIFICATION_CANARY_RUNS_DIRECTORY)
+            .is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn qualification_canary_reparse_leaf_is_rejected_without_following_it() {
+        use std::os::windows::fs::symlink_dir;
+
+        let local_data = tempfile::tempdir().expect("temporary local data root");
+        let local_data =
+            fs::canonicalize(local_data.path()).expect("canonical temporary local data root");
+        let canary_id = format!("mcpqcanary_{}", "b".repeat(32));
+        let run = create_qualification_canary_run_directory_at(&local_data, &canary_id)
+            .expect("initialize qualification canary parents");
+        remove_qualification_canary_run_directory_at(&local_data, &canary_id)
+            .expect("remove initial ordinary canary leaf");
+
+        let target = local_data.join("reparse-target");
+        fs::create_dir(&target).expect("create reparse target");
+        fs::create_dir(target.join("app-local")).expect("create target app-local");
+        if symlink_dir(&target, &run).is_err() {
+            return;
+        }
+
+        assert!(qualification_canary_app_local_data_directory_at(&local_data, &canary_id).is_err());
+        assert!(create_qualification_canary_run_directory_at(&local_data, &canary_id).is_err());
+        assert!(remove_qualification_canary_run_directory_at(&local_data, &canary_id).is_err());
+        assert!(target.join("app-local").is_dir());
+        fs::remove_dir(&run).expect("remove reparse leaf without following target");
+        assert!(target.is_dir());
+    }
 
     fn sample_metadata(transport: McpTransportBindingV1) -> StandaloneSessionMetadataV1 {
         StandaloneSessionMetadataV1 {

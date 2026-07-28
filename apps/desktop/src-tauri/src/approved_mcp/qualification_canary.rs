@@ -104,18 +104,34 @@ impl ApprovedWorkspaceQualificationProvider for CanaryQualificationProvider {
 
 struct CanaryRoot {
     path: PathBuf,
+    external_canary_id: Option<String>,
+}
+
+impl CanaryRoot {
+    fn cleanup_external(&mut self) -> Result<(), ApprovedMcpError> {
+        let Some(canary_id) = self.external_canary_id.as_deref() else {
+            return Ok(());
+        };
+        legal_mcp::standalone_approved::remove_qualification_canary_run_directory(canary_id)
+            .map_err(|_| canary_error())?;
+        self.external_canary_id = None;
+        Ok(())
+    }
 }
 
 impl Drop for CanaryRoot {
     fn drop(&mut self) {
+        if let Some(canary_id) = self.external_canary_id.as_deref() {
+            let _ = legal_mcp::standalone_approved::remove_qualification_canary_run_directory(
+                canary_id,
+            );
+            return;
+        }
         let valid_name = self
             .path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                (name.starts_with("mcpq-canary-") && name.len() == 45)
-                    || (name.starts_with("mcpqcanary_") && name.len() == 43)
-            });
+            .is_some_and(|name| name.starts_with("mcpq-canary-") && name.len() == 45);
         let valid_parent = self
             .path
             .parent()
@@ -240,9 +256,15 @@ pub(super) async fn run(
 
     let now_unix = now_seconds()?;
     let canary_id = format!("mcpqcanary_{}", Uuid::new_v4().simple());
-    let root = create_external_canary_root(production, &canary_id)?;
+    let mut root = create_external_canary_root(&canary_id)?;
     let app_local = root.path.join("app-local");
     fs::create_dir(&app_local).map_err(|_| canary_error())?;
+    let resolved =
+        legal_mcp::standalone_approved::qualification_canary_app_local_data_directory(&canary_id)
+            .map_err(|_| canary_error())?;
+    if resolved != app_local {
+        return Err(canary_error());
+    }
     let candidate_control = super::qualification::DesktopApprovedMcpQualificationProvider::new(
         app_local
             .join("privacy")
@@ -343,25 +365,19 @@ pub(super) async fn run(
     )
     .await?;
     canary_workspace.revoke_standalone_session(&http_server_id)?;
+    drop(canary_workspace);
+    root.cleanup_external()?;
     Ok(())
 }
 
-fn create_external_canary_root(
-    production: &ApprovedMcpWorkspace,
-    canary_id: &str,
-) -> Result<CanaryRoot, ApprovedMcpError> {
-    let parent = production
-        .inner
-        .app_local_data_directory
-        .join(legal_mcp::standalone_approved::QUALIFICATION_CANARY_RUNS_RELATIVE);
-    fs::create_dir_all(&parent).map_err(|_| canary_error())?;
-    let metadata = fs::symlink_metadata(&parent).map_err(|_| canary_error())?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(canary_error());
-    }
-    let path = parent.join(canary_id);
-    fs::create_dir(&path).map_err(|_| canary_error())?;
-    Ok(CanaryRoot { path })
+fn create_external_canary_root(canary_id: &str) -> Result<CanaryRoot, ApprovedMcpError> {
+    let path = legal_mcp::standalone_approved::create_qualification_canary_run_directory(canary_id)
+        .map_err(|_| canary_error())?;
+    let root = CanaryRoot {
+        path,
+        external_canary_id: Some(canary_id.to_owned()),
+    };
+    Ok(root)
 }
 
 fn external_command(
@@ -907,7 +923,10 @@ fn create_canary_root(production: &ApprovedMcpWorkspace) -> Result<CanaryRoot, A
     }
     let path = parent.join(format!("mcpq-canary-{}", Uuid::new_v4().simple()));
     fs::create_dir(&path).map_err(|_| canary_error())?;
-    Ok(CanaryRoot { path })
+    Ok(CanaryRoot {
+        path,
+        external_canary_id: None,
+    })
 }
 
 fn seed_approved_material(

@@ -360,6 +360,52 @@ impl Drop for HttpHarness {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "pass an exact release binary through scripts/test-standalone-approved-mcp.ps1 -Binary"]
+async fn explicit_binary_qualification_canary_is_fail_closed() {
+    let built_binary = binary_path();
+    assert!(
+        built_binary.is_file(),
+        "standalone MCP executable must be built"
+    );
+    let expected_sha256 =
+        std::env::var("LAWYER_ASSISTANCE_MCP_RELEASE_SHA256").expect("release binary SHA-256");
+    assert!(
+        expected_sha256.len() == 64
+            && expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "release binary SHA-256 is canonical"
+    );
+
+    let directory = tempfile::tempdir().expect("create qualification fixture parent");
+    let e2e_app_root = E2eAppRoot::create();
+    let binary_directory = directory.path().join("fixed-install");
+    fs::create_dir(&binary_directory).expect("create fixed MCP install directory");
+    let binary = binary_directory.join(legal_mcp::release_binary::binary_file_name());
+    fs::copy(&built_binary, &binary).expect("install exact MCP release binary");
+
+    let workspace =
+        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(e2e_app_root.path.clone(), binary);
+    let qualification = workspace
+        .run_qualification(10 * 60)
+        .await
+        .expect("qualify exact release binary through isolated canary namespace");
+    assert!(qualification.qualified);
+    assert!(qualification.stdio_canary_passed);
+    assert!(qualification.streamable_http_canary_passed);
+    assert!(qualification.exact_app_policy_binding);
+    assert!(qualification.exact_server_key_binding);
+    assert_eq!(
+        qualification.mcp_binary_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        qualification.mcp_binary_sha256.as_deref(),
+        Some(expected_sha256.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "build lawyer-assistance-mcp first; exercised by scripts/test-standalone-approved-mcp.ps1"]
 async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
     let built_binary = binary_path();
