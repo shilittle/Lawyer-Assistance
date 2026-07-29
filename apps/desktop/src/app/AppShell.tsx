@@ -1,6 +1,11 @@
 import type { ReactNode } from "react";
 
-import { VIEW_METADATA, VIEW_NAVIGATION, type ViewMode } from "./views";
+import {
+  defaultRouteForArea,
+  legacyViewFromRoute,
+  type AppRoute,
+} from "./routes";
+import { VIEW_METADATA, VIEW_NAVIGATION } from "./views";
 
 export interface AppShellStatus {
   kind: "loading" | "ready" | "error";
@@ -8,19 +13,25 @@ export interface AppShellStatus {
 }
 
 export interface AppShellProps {
-  activeView: ViewMode;
   children: ReactNode;
   status: AppShellStatus;
-  onNavigate: (view: ViewMode) => void;
+  route: AppRoute;
+  onNavigate: (route: AppRoute) => void;
 }
 
 export function AppShell({
-  activeView,
   children,
   status,
+  route,
   onNavigate,
 }: AppShellProps) {
+  const activeView = legacyViewFromRoute(route);
   const activeMetadata = VIEW_METADATA[activeView];
+  const activeArea = route.area;
+
+  const navigateToArea = (view: (typeof VIEW_NAVIGATION)[number]) => {
+    onNavigate(defaultRouteForArea(view.futureArea));
+  };
 
   return (
     <main className="app-shell">
@@ -34,16 +45,14 @@ export function AppShell({
             {VIEW_NAVIGATION.map((view) => (
               <button
                 aria-current={
-                  activeMetadata.futureArea === view.futureArea
-                    ? "page"
-                    : undefined
+                  activeArea === view.futureArea ? "page" : undefined
                 }
                 className={
-                  activeMetadata.futureArea === view.futureArea ? "is-active" : ""
+                  activeArea === view.futureArea ? "is-active" : ""
                 }
                 key={view.id}
                 type="button"
-                onClick={() => onNavigate(view.id)}
+                onClick={() => navigateToArea(view)}
               >
                 {view.navigationLabel}
               </button>

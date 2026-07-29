@@ -56,14 +56,14 @@ export const VIEW_METADATA: Readonly<Record<ViewMode, ViewMetadata>> = {
     id: "cases",
     eyebrow: "案件与证据",
     title: "案件工作台 β",
-    navigationLabel: "案件工作台 β",
+    navigationLabel: "案件工作台",
     futureArea: "cases",
   },
   providers: {
     id: "providers",
     eyebrow: "BYOK Provider",
     title: "设置与维护",
-    navigationLabel: "设置与维护",
+    navigationLabel: "设置",
     futureArea: "settings",
   },
   privacy: {

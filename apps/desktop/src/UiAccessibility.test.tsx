@@ -59,9 +59,9 @@ describe("workspace accessibility and Chinese rendering", () => {
     );
     for (const label of [
       "助理",
-      "案件工作台 β",
+      "案件工作台",
       "法律库",
-      "设置与维护",
+      "设置",
     ]) {
       expect(mainNavigation).toContain(label);
     }

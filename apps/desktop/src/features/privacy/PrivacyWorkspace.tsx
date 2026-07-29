@@ -14,7 +14,6 @@ import {
 } from "../../ipc/privacy/client";
 import {
   PRIVACY_CONFIG_SCHEMA_VERSION,
-  type ApprovedProviderTask,
   type LocalMineruDiscoveryResult,
   type PrivacyConfig,
   type PrivacyConfigDraft,
@@ -23,7 +22,10 @@ import {
 import "./privacy.css";
 import { ApprovedMcpPanel } from "./ApprovedMcpPanel";
 import { MineruComponentManagerPanel } from "./MineruComponentManagerPanel";
-import { ProviderApprovalPanel } from "./ProviderApprovalPanel";
+import {
+  ProviderApprovalPanel,
+  type ProviderTaskRequest,
+} from "./ProviderApprovalPanel";
 import { PrivacyLifecyclePanel } from "./PrivacyLifecyclePanel";
 import { PrivacyQualificationControls } from "./PrivacyQualificationControls";
 import { PrivacyReviewWorkbench } from "./PrivacyReviewWorkbench";
@@ -31,11 +33,10 @@ import { PrivacyReviewWorkbench } from "./PrivacyReviewWorkbench";
 type PrivacyOperation = "loading" | "idle" | "discovering" | "saving" | "refreshing";
 
 export interface PrivacyWorkspaceProps {
-  providerTaskRequest?: {
-    task: ApprovedProviderTask;
-    notice: string;
-    requestId: number;
-  } | null;
+  providerTaskRequest?: ProviderTaskRequest | null;
+  onProviderTaskRequestConsumed?: (
+    request: ProviderTaskRequest,
+  ) => void;
   onDraftDirtyChange?: (dirty: boolean) => void;
   onMutationActivityChange?: (active: boolean) => void;
 }
@@ -579,6 +580,7 @@ export function PrivacyWorkspaceView({
 
 export function PrivacyWorkspace({
   providerTaskRequest = null,
+  onProviderTaskRequestConsumed,
   onDraftDirtyChange,
   onMutationActivityChange,
 }: PrivacyWorkspaceProps) {
@@ -770,6 +772,7 @@ export function PrivacyWorkspace({
       />
       <ProviderApprovalPanel
         taskRequest={providerTaskRequest}
+        onTaskRequestConsumed={onProviderTaskRequestConsumed}
         disabled={!configResponse.configValid || dirty || operation !== "idle" || workflowActive || lifecycleActive || approvedMcpActive || componentActive || qualificationActive}
         onActivityChange={setProviderActive}
       />

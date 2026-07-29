@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { listProviderProfiles } from "../../ipc/provider/client";
 import type { ProviderProfile } from "../../ipc/provider/types";
@@ -75,12 +81,15 @@ export const APPROVED_PROVIDER_TASK_OPTIONS: readonly ApprovedProviderTaskOption
 
 export interface ProviderApprovalPanelProps {
   disabled?: boolean;
-  taskRequest?: {
-    task: ApprovedProviderTask;
-    notice: string;
-    requestId: number;
-  } | null;
+  taskRequest?: ProviderTaskRequest | null;
+  onTaskRequestConsumed?: (request: ProviderTaskRequest) => void;
   onActivityChange?: (active: boolean) => void;
+}
+
+export interface ProviderTaskRequest {
+  task: ApprovedProviderTask;
+  notice: string;
+  requestId: number;
 }
 
 export interface ProviderApprovalPanelViewProps {
@@ -724,6 +733,7 @@ export function ProviderApprovalPanelView({
 export function ProviderApprovalPanel({
   disabled = false,
   taskRequest = null,
+  onTaskRequestConsumed,
   onActivityChange,
 }: ProviderApprovalPanelProps) {
   const [operation, setOperation] = useState<ProviderOperation>("loading");
@@ -750,6 +760,7 @@ export function ProviderApprovalPanel({
     useState<ApprovedProviderOutput | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const handledTaskRequestId = useRef<number | null>(null);
 
   const invalidateBoundState = useCallback(() => {
     setApproval(null);
@@ -761,18 +772,26 @@ export function ProviderApprovalPanel({
 
   useEffect(() => {
     if (!taskRequest) return;
+    if (
+      handledTaskRequestId.current !== null &&
+      taskRequest.requestId <= handledTaskRequestId.current
+    ) {
+      return;
+    }
+    handledTaskRequestId.current = taskRequest.requestId;
     setTask(taskRequest.task);
     setInstruction("");
     setPriorOutputId("");
     setNotice(taskRequest.notice);
     setError("");
     invalidateBoundState();
+    onTaskRequestConsumed?.(taskRequest);
     globalThis.requestAnimationFrame?.(() => {
       document
         .getElementById("privacy-approved-provider")
         ?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
-  }, [invalidateBoundState, taskRequest]);
+  }, [invalidateBoundState, onTaskRequestConsumed, taskRequest]);
 
   const installSnapshot = useCallback(
     (snapshot: PanelSnapshot) => {

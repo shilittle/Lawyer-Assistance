@@ -1,57 +1,63 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  providerNavigationHasUnsavedChanges,
+  providerApiKeyDeletionConfirmation,
+  providerApiKeyOverwriteConfirmation,
+  providerDeletionConfirmation,
+  runConfirmedDestructiveAction,
+} from "./features/settings/providers/policies";
+import {
+  assistantWritesBlockClose,
+  canBypassDirtyDraftsForWorkspaceRecovery,
+  decideMcpRouteNavigation,
+  decideWorkspaceClose,
+  workspaceCloseWasApproved,
+} from "./app/navigationGuards";
+import {
   advanceCaseWorkspaceEpoch,
   advanceRequestEpoch,
-  assistantWritesBlockClose,
-  articleMatchesDocumentCitation,
   blockingDirtyCaseDrafts,
-  caseGraphNodeDomId,
-  canBypassDirtyDraftsForWorkspaceRecovery,
   caseEntityDeletionConfirmation,
+  caseEntityEditorAllows,
+  caseEntityEditorMatches,
+  caseGraphNodeDomId,
   caseProjectDeletionConfirmation,
   caseProjectPageForId,
   caseProjectToLoadAfterRefresh,
-  caseEntityEditorAllows,
-  caseEntityEditorMatches,
   caseWorkspaceWritesAreSafe,
-  citationHasTrustedSource,
   copyCaseEntityForEditing,
-  currentLawSearchCriteria,
   detectDirtyCaseDrafts,
-  decideMcpWorkspaceNavigation,
-  decideWorkspaceClose,
   extractionReviewDiscardConfirmation,
-  exactLawDocumentMatchesRequest,
-  formatCitationValidationSummary,
   graphNodeDestination,
   isCurrentCaseWorkspaceEpoch,
   isCurrentRequestEpoch,
   isPersistedCaseWorkspace,
+  paginateCaseProjects,
+  pendingReviewFilesStillExist,
+  publicCaseBusinessText,
+  publicEvidenceNumber,
+  releaseCaseMutation,
+  tryAcquireCaseMutation,
+  unrestorableExtractionDiscardConfirmation,
+  validateFactIssueLinkSelection,
+  type CaseDraftComparisonState,
+} from "./features/cases/model";
+import {
+  articleMatchesDocumentCitation,
+  citationHasTrustedSource,
+  currentLawSearchCriteria,
+  exactLawDocumentMatchesRequest,
+  formatCitationValidationSummary,
   legalAnswerContextFromRecord,
   legalAnswerHistoryBelongsToProject,
   legalAnswerPreviewStillOwnsCurrentScope,
   legalAnswerRequestStillOwnsCurrentCase,
   mergeLegalAnswerHistory,
-  paginateCaseProjects,
-  pendingReviewFilesStillExist,
-  providerNavigationHasUnsavedChanges,
-  providerApiKeyDeletionConfirmation,
-  providerApiKeyOverwriteConfirmation,
-  providerDeletionConfirmation,
-  publicCaseBusinessText,
-  publicEvidenceNumber,
   qaFormDraftFromLegalAnswerRecord,
-  releaseCaseMutation,
   resolveLegalAnswerQuestion,
   resolveSelectedQaSource,
-  runConfirmedDestructiveAction,
-  tryAcquireCaseMutation,
-  unrestorableExtractionDiscardConfirmation,
-  validateFactIssueLinkSelection,
-  workspaceCloseWasApproved,
-  type CaseDraftComparisonState,
-} from "./App";
+} from "./features/legal-library/model";
 import type { GraphNode } from "./ipc/graph/types";
 import type {
   CaseFact,
@@ -674,12 +680,17 @@ describe("App case workspace state helpers", () => {
 
   it("guards every shell navigation while MCP state is unresolved", () => {
     expect(
-      decideMcpWorkspaceNavigation("mcp", "mcp", true, true),
+      decideMcpRouteNavigation(
+        { area: "settings", page: "mcp" },
+        { area: "settings", page: "mcp" },
+        true,
+        true,
+      ),
     ).toEqual({ kind: "proceed" });
 
-    const activeMutation = decideMcpWorkspaceNavigation(
-      "mcp",
-      "providers",
+    const activeMutation = decideMcpRouteNavigation(
+      { area: "settings", page: "mcp" },
+      { area: "settings", page: "providers" },
       true,
       true,
     );
@@ -688,9 +699,9 @@ describe("App case workspace state helpers", () => {
       "message" in activeMutation ? activeMutation.message : "",
     ).toContain("阻止切换");
 
-    const pendingBearer = decideMcpWorkspaceNavigation(
-      "mcp",
-      "release",
+    const pendingBearer = decideMcpRouteNavigation(
+      { area: "settings", page: "mcp" },
+      { area: "settings", page: "maintenance" },
       false,
       true,
     );
@@ -700,7 +711,12 @@ describe("App case workspace state helpers", () => {
     ).toContain("Bearer Token");
 
     expect(
-      decideMcpWorkspaceNavigation("mcp", "assistant", false, false),
+      decideMcpRouteNavigation(
+        { area: "settings", page: "mcp" },
+        { area: "assistant", page: "chat" },
+        false,
+        false,
+      ),
     ).toEqual({ kind: "proceed" });
   });
 
