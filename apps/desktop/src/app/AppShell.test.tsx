@@ -19,9 +19,9 @@ describe("AppShell", () => {
     ]);
     expect(VIEW_NAVIGATION.map((view) => view.navigationLabel)).toEqual([
       "助理",
-      "案件工作台 β",
+      "案件工作台",
       "法律库",
-      "设置与维护",
+      "设置",
     ]);
   });
 

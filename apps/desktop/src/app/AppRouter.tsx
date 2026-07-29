@@ -1,10 +1,11 @@
-import { useRef, type ReactNode } from "react";
+import type { ReactNode } from "react";
 
 import {
   CaseNavigation,
   type CaseSection,
 } from "../features/cases/CaseNavigation";
 import { AppErrorBoundary } from "./AppErrorBoundary";
+import { routeLocationKey } from "./routes";
 import type {
   AppRoute,
   AssistantRoute,
@@ -112,13 +113,6 @@ const SETTINGS_NAVIGATION = [
   { page: "maintenance", label: "版本、备份与诊断" },
 ] as const;
 
-function routeLocationKey(route: AppRoute): string {
-  if (route.area === "cases" && route.page === "outputs") {
-    return `${route.area}:${route.page}:${route.output}`;
-  }
-  return `${route.area}:${route.page}`;
-}
-
 function isAssistantChatRoute(
   route: AppRoute,
 ): route is AssistantChatRoute {
@@ -213,7 +207,7 @@ function renderSubnavigation(
 interface AssistantWorkspaceSlotProps {
   readonly active: boolean;
   readonly render: WorkspaceRenderer<AssistantChatRoute>;
-  readonly route: AssistantChatRoute | null;
+  readonly route: AssistantChatRoute;
 }
 
 function AssistantWorkspaceSlot({
@@ -221,14 +215,7 @@ function AssistantWorkspaceSlot({
   render,
   route,
 }: AssistantWorkspaceSlotProps) {
-  const latestRoute = useRef<AssistantChatRoute>({
-    area: "assistant",
-    page: "chat",
-  });
-  if (route) {
-    latestRoute.current = route;
-  }
-  return render({ route: latestRoute.current, active });
+  return render({ route, active });
 }
 
 interface ActiveWorkspaceSlotProps {
@@ -300,6 +287,9 @@ export function AppRouter({
   onNavigate,
 }: AppRouterProps) {
   const assistantActive = isAssistantChatRoute(route);
+  const assistantRoute: AssistantChatRoute = assistantActive
+    ? route
+    : { area: "assistant", page: "chat" };
 
   return (
     <section className="app-router" data-route-location={routeLocationKey(route)}>
@@ -314,7 +304,7 @@ export function AppRouter({
           <AssistantWorkspaceSlot
             active={assistantActive}
             render={slots.assistant}
-            route={assistantActive ? route : null}
+            route={assistantRoute}
           />
         </AppErrorBoundary>
       </div>

@@ -162,7 +162,7 @@ export function defaultRouteForArea<Area extends ProductArea>(
   return DEFAULT_ROUTE_BY_AREA[area];
 }
 
-function routeLocationKey(route: AppRoute): string {
+export function routeLocationKey(route: AppRoute): string {
   if (route.area === "cases" && route.page === "outputs") {
     return `${route.area}:${route.page}:${route.output}`;
   }
