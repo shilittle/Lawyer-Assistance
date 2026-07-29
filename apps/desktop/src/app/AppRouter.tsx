@@ -92,6 +92,7 @@ export interface AppRouterSlots {
 
 export interface AppRouterProps {
   readonly route: AppRoute;
+  readonly assistantHostRoute: AssistantChatRoute;
   readonly slots: AppRouterSlots;
   readonly onNavigate: (route: AppRoute) => void;
 }
@@ -283,13 +284,11 @@ function ActiveWorkspaceSlot({
 
 export function AppRouter({
   route,
+  assistantHostRoute,
   slots,
   onNavigate,
 }: AppRouterProps) {
   const assistantActive = isAssistantChatRoute(route);
-  const assistantRoute: AssistantChatRoute = assistantActive
-    ? route
-    : { area: "assistant", page: "chat" };
 
   return (
     <section className="app-router" data-route-location={routeLocationKey(route)}>
@@ -304,7 +303,7 @@ export function AppRouter({
           <AssistantWorkspaceSlot
             active={assistantActive}
             render={slots.assistant}
-            route={assistantRoute}
+            route={assistantHostRoute}
           />
         </AppErrorBoundary>
       </div>

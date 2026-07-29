@@ -21,6 +21,11 @@ import {
 import type { AppRoute } from "./routes";
 import type { ViewMode } from "./views";
 
+const DEFAULT_ASSISTANT_HOST_ROUTE = {
+  area: "assistant",
+  page: "chat",
+} as const;
+
 const LEGACY_ROUTES: Readonly<Record<ViewMode, AppRoute>> = {
   assistant: { area: "assistant", page: "chat" },
   qa: { area: "assistant", page: "legacy-qa" },
@@ -80,7 +85,12 @@ function routerTree(
 ) {
   return {
     onNavigate,
-    tree: AppRouter({ route, slots: slotSpies(), onNavigate }),
+    tree: AppRouter({
+      route,
+      assistantHostRoute: DEFAULT_ASSISTANT_HOST_ROUTE,
+      slots: slotSpies(),
+      onNavigate,
+    }),
   };
 }
 
@@ -90,7 +100,16 @@ describe("AppRouter workspace ownership", () => {
     (destination, route) => {
       const slots = slotSpies();
       const markup = renderToStaticMarkup(
-        <AppRouter route={route} slots={slots} onNavigate={vi.fn()} />,
+        <AppRouter
+          route={route}
+          assistantHostRoute={
+            route.area === "assistant" && route.page === "chat"
+              ? route
+              : DEFAULT_ASSISTANT_HOST_ROUTE
+          }
+          slots={slots}
+          onNavigate={vi.fn()}
+        />,
       );
 
       expect(slots.assistant).toHaveBeenCalledTimes(1);
@@ -138,13 +157,49 @@ describe("AppRouter workspace ownership", () => {
     } as const satisfies AppRoute;
 
     renderToStaticMarkup(
-      <AppRouter route={route} slots={slots} onNavigate={vi.fn()} />,
+      <AppRouter
+        route={route}
+        assistantHostRoute={route}
+        slots={slots}
+        onNavigate={vi.fn()}
+      />,
     );
 
     expect(slots.assistant).toHaveBeenCalledWith({
       route,
       active: true,
     });
+  });
+
+  it("keeps the retained Assistant handoff route while its host is hidden", () => {
+    const slots = slotSpies();
+    const assistantHostRoute = {
+      area: "assistant",
+      page: "chat",
+      state: {
+        kind: "assistant-case-handoff",
+        request: {
+          projectId: "case-hidden",
+          title: "隐藏期间仍处理",
+          requestId: 9,
+        },
+      },
+    } as const;
+
+    renderToStaticMarkup(
+      <AppRouter
+        route={{ area: "cases", page: "overview" }}
+        assistantHostRoute={assistantHostRoute}
+        slots={slots}
+        onNavigate={vi.fn()}
+      />,
+    );
+
+    expect(slots.assistant).toHaveBeenCalledWith({
+      route: assistantHostRoute,
+      active: false,
+    });
+    expect(slots.cases).toHaveBeenCalledTimes(1);
   });
 
   it("isolates the always-mounted Assistant and active workspace by location", () => {
@@ -176,7 +231,12 @@ describe("AppRouter typed subnavigation", () => {
           ? { area: "cases", page, output: "documents" }
           : { area: "cases", page };
       const markup = renderToStaticMarkup(
-        <AppRouter route={route} slots={slotSpies()} onNavigate={vi.fn()} />,
+        <AppRouter
+          route={route}
+          assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
+          slots={slotSpies()}
+          onNavigate={vi.fn()}
+        />,
       );
 
       for (const label of ["概览", "材料与脱敏", "案件工作", "成果"]) {
@@ -312,6 +372,7 @@ describe("AppRouter typed subnavigation", () => {
     const markup = renderToStaticMarkup(
       <AppRouter
         route={{ area: "legal-library", page: "library" }}
+        assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
         slots={slotSpies()}
         onNavigate={vi.fn()}
       />,
