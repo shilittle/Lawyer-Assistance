@@ -1,16 +1,30 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  providerNavigationHasUnsavedChanges,
+  providerApiKeyDeletionConfirmation,
+  providerApiKeyOverwriteConfirmation,
+  providerDeletionConfirmation,
+  runConfirmedDestructiveAction,
+} from "./App";
+import {
+  assistantWritesBlockClose,
+  canBypassDirtyDraftsForWorkspaceRecovery,
+  decideMcpWorkspaceNavigation,
+  decideWorkspaceClose,
+  workspaceCloseWasApproved,
+} from "./app/navigationGuards";
+import {
   advanceCaseWorkspaceEpoch,
   advanceRequestEpoch,
   blockingDirtyCaseDrafts,
-  caseGraphNodeDomId,
   caseEntityDeletionConfirmation,
+  caseEntityEditorAllows,
+  caseEntityEditorMatches,
+  caseGraphNodeDomId,
   caseProjectDeletionConfirmation,
   caseProjectPageForId,
   caseProjectToLoadAfterRefresh,
-  caseEntityEditorAllows,
-  caseEntityEditorMatches,
   caseWorkspaceWritesAreSafe,
   copyCaseEntityForEditing,
   detectDirtyCaseDrafts,
@@ -21,26 +35,14 @@ import {
   isPersistedCaseWorkspace,
   paginateCaseProjects,
   pendingReviewFilesStillExist,
-  providerNavigationHasUnsavedChanges,
-  providerApiKeyDeletionConfirmation,
-  providerApiKeyOverwriteConfirmation,
-  providerDeletionConfirmation,
   publicCaseBusinessText,
   publicEvidenceNumber,
   releaseCaseMutation,
-  runConfirmedDestructiveAction,
   tryAcquireCaseMutation,
   unrestorableExtractionDiscardConfirmation,
   validateFactIssueLinkSelection,
   type CaseDraftComparisonState,
-} from "./App";
-import {
-  assistantWritesBlockClose,
-  canBypassDirtyDraftsForWorkspaceRecovery,
-  decideMcpWorkspaceNavigation,
-  decideWorkspaceClose,
-  workspaceCloseWasApproved,
-} from "./app/navigationGuards";
+} from "./features/cases/model";
 import {
   articleMatchesDocumentCitation,
   citationHasTrustedSource,
