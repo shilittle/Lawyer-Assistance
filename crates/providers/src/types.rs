@@ -629,6 +629,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unapproved_case_for_rejection_retains_approved_authority_and_classification() {
+        let request = ChatRequest::unapproved_case_for_rejection(Vec::new(), false, None, None);
+
+        assert_eq!(request.authority, ChatRequestAuthority::ApprovedCase);
+        assert_eq!(
+            request.data_classification(),
+            privacy::DataClassification::CaseRedactedApproved
+        );
+    }
+
+    #[test]
     fn provider_kind_serde_wire_contract_is_stable_and_unknown_values_fail_closed() {
         let cases = [
             (ProviderKind::DeepSeek, "deep_seek"),

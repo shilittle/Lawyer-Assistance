@@ -52,6 +52,15 @@ describe("privacy IPC client", () => {
     expect(invoke).toHaveBeenNthCalledWith(2, "get_local_ocr_status");
   });
 
+  it("prepares privacy material without sending a case id", async () => {
+    await preparePrivacyMaterial({ customTerms: ["内部代号"] });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("prepare_privacy_material", {
+      request: { customTerms: ["内部代号"] },
+    });
+  });
+
   it("discovers local MinerU through a parameter-free command", async () => {
     await discoverLocalMineru();
 

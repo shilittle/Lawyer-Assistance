@@ -4476,6 +4476,19 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_chat_request_currently_uses_approved_case_classification() {
+        let request = ordinary_chat_request(
+            "Answer a general legal question.",
+            "What are the usual conditions for terminating a contract?".to_owned(),
+        );
+
+        assert_eq!(
+            request.data_classification(),
+            privacy::DataClassification::CaseRedactedApproved
+        );
+    }
+
+    #[test]
     fn assistant_production_boundary_rejects_all_user_free_text_even_without_pii_or_case_binding() {
         let fixture = TestFixture::new(false, false, false);
         let public = run_request(
