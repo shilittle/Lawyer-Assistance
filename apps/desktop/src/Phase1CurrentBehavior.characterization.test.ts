@@ -14,10 +14,10 @@ describe("Phase 1 current application workflow characterization", () => {
       /if \(!independentPublicLegalShell && onOpenApprovedProvider\) \{[\s\S]*?onOpenApprovedProvider\([\s\S]*?approvedProviderTaskForAssistantIntent\(intent\)[\s\S]*?return;/u,
     );
     expect(appSource).toMatch(
-      /function redirectLegacyEgressToApprovedProvider\([\s\S]*?navigateFromShell\("privacy"\);[\s\S]*?\}/u,
+      /function redirectLegacyEgressToApprovedProvider\([\s\S]*?navigation\.handoffApprovedProvider\(\{ task, notice \}\)[\s\S]*?\}/u,
     );
     expect(appSource).toMatch(
-      /<AssistantWorkspace[\s\S]*?onOpenApprovedProvider=\{\(task, notice\) =>[\s\S]*?redirectLegacyEgressToApprovedProvider\(task, notice\)/u,
+      /<AssistantWorkspace[\s\S]*?onOpenApprovedProvider=\{[\s\S]*?redirectLegacyEgressToApprovedProvider[\s\S]*?\}/u,
     );
   });
 

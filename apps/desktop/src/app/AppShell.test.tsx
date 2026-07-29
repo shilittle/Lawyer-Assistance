@@ -147,7 +147,7 @@ describe("AppShell", () => {
     (activeView) => {
       const markup = renderToStaticMarkup(
         <AppShell
-          activeView={activeView}
+          route={routeFromLegacyView(activeView)}
           status={{ kind: "ready", text: "Rust command 正常" }}
           onNavigate={vi.fn()}
         >

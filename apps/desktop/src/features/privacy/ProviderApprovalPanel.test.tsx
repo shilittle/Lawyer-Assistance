@@ -18,6 +18,7 @@ import {
   providerApprovalUiBindingKey,
   providerTaskRequiresPriorOutput,
 } from "./ProviderApprovalPanel";
+import providerApprovalPanelSource from "./ProviderApprovalPanel.tsx?raw";
 
 const profile: ProviderProfile = {
   id: "provider-main",
@@ -409,6 +410,15 @@ describe("Provider approved task contract", () => {
       kind: "volcengine_ark",
       options: { endpointId: "ep-bound-model" },
     })).toBe("ep-bound-model");
+  });
+
+  it("copies a typed task request before acknowledging route state", () => {
+    expect(providerApprovalPanelSource).toMatch(
+      /setTask\(taskRequest\.task\);[\s\S]*setNotice\(taskRequest\.notice\);[\s\S]*onTaskRequestConsumed\?\.\(taskRequest\);/u,
+    );
+    expect(providerApprovalPanelSource).toMatch(
+      /taskRequest\.requestId <= handledTaskRequestId\.current[\s\S]*handledTaskRequestId\.current = taskRequest\.requestId/u,
+    );
   });
 });
 

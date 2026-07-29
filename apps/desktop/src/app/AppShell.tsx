@@ -5,54 +5,32 @@ import {
   legacyViewFromRoute,
   type AppRoute,
 } from "./routes";
-import { VIEW_METADATA, VIEW_NAVIGATION, type ViewMode } from "./views";
+import { VIEW_METADATA, VIEW_NAVIGATION } from "./views";
 
 export interface AppShellStatus {
   kind: "loading" | "ready" | "error";
   text: string;
 }
 
-interface AppShellCommonProps {
+export interface AppShellProps {
   children: ReactNode;
   status: AppShellStatus;
-}
-
-export interface TypedAppShellProps extends AppShellCommonProps {
   route: AppRoute;
-  activeView?: never;
   onNavigate: (route: AppRoute) => void;
 }
 
-export interface LegacyAppShellProps extends AppShellCommonProps {
-  activeView: ViewMode;
-  route?: never;
-  onNavigate: (view: ViewMode) => void;
-}
-
-export type AppShellProps = TypedAppShellProps | LegacyAppShellProps;
-
-function isTypedAppShellProps(
-  props: AppShellProps,
-): props is TypedAppShellProps {
-  return props.route !== undefined;
-}
-
-export function AppShell(props: AppShellProps) {
-  const { children, status } = props;
-  const activeView = isTypedAppShellProps(props)
-    ? legacyViewFromRoute(props.route)
-    : props.activeView;
+export function AppShell({
+  children,
+  status,
+  route,
+  onNavigate,
+}: AppShellProps) {
+  const activeView = legacyViewFromRoute(route);
   const activeMetadata = VIEW_METADATA[activeView];
-  const activeArea = isTypedAppShellProps(props)
-    ? props.route.area
-    : activeMetadata.futureArea;
+  const activeArea = route.area;
 
   const navigateToArea = (view: (typeof VIEW_NAVIGATION)[number]) => {
-    if (isTypedAppShellProps(props)) {
-      props.onNavigate(defaultRouteForArea(view.futureArea));
-      return;
-    }
-    props.onNavigate(view.id);
+    onNavigate(defaultRouteForArea(view.futureArea));
   };
 
   return (

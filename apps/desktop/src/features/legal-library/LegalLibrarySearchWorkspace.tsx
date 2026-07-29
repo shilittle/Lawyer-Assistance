@@ -1,3 +1,6 @@
+import { useEffect, useRef } from "react";
+
+import type { LegalCitationRequest } from "../../app/routes";
 import {
   formatArticleLabel,
   formatEffectiveWindow,
@@ -13,11 +16,39 @@ import type { LegalLibraryController } from "./useLegalLibraryController";
 
 export interface LegalLibrarySearchWorkspaceProps {
   controller: LegalLibraryController;
+  citationRequest?: LegalCitationRequest | null;
+  onCitationRequestConsumed?: (request: LegalCitationRequest) => void;
 }
 
 export function LegalLibrarySearchWorkspace({
   controller,
+  citationRequest = null,
+  onCitationRequestConsumed,
 }: LegalLibrarySearchWorkspaceProps) {
+  const consumeDocumentCitation =
+    controller.consumeDocumentCitation;
+  const handledCitationKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!citationRequest) {
+      handledCitationKey.current = null;
+      return;
+    }
+    const requestKey = [
+      citationRequest.sourceId,
+      citationRequest.documentId,
+      citationRequest.versionId,
+      citationRequest.articleId,
+    ].join("\u0000");
+    if (handledCitationKey.current === requestKey) return;
+    handledCitationKey.current = requestKey;
+    void consumeDocumentCitation(citationRequest);
+    onCitationRequestConsumed?.(citationRequest);
+  }, [
+    citationRequest,
+    consumeDocumentCitation,
+    onCitationRequestConsumed,
+  ]);
+
   const {
     query,
     setQuery,

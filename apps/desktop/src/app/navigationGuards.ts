@@ -1,5 +1,4 @@
 import { sameRouteLocation, type AppRoute } from "./routes";
-import type { ViewMode } from "./views";
 
 export type CaseDraftKind =
   | "project"
@@ -97,18 +96,6 @@ export function decideWorkspaceClose(
   return { kind: "proceed" };
 }
 
-export function decideMcpWorkspaceNavigation(
-  currentView: ViewMode,
-  nextView: ViewMode,
-  mutationInFlight: boolean,
-  draftDirty: boolean,
-): WorkspaceCloseDecision {
-  if (currentView === nextView) {
-    return { kind: "proceed" };
-  }
-  return decideChangedMcpWorkspaceNavigation(mutationInFlight, draftDirty);
-}
-
 function decideChangedMcpWorkspaceNavigation(
   mutationInFlight: boolean,
   draftDirty: boolean,
@@ -140,24 +127,6 @@ export function decideMcpRouteNavigation(
     return { kind: "proceed" };
   }
   return decideChangedMcpWorkspaceNavigation(mutationInFlight, draftDirty);
-}
-
-export function decidePrivacyWorkspaceNavigation(
-  currentView: ViewMode,
-  nextView: ViewMode,
-  mutationInFlight: boolean,
-  draftDirty: boolean,
-): WorkspaceCloseDecision {
-  if (currentView === nextView) {
-    return { kind: "proceed" };
-  }
-  if (currentView !== "privacy") {
-    return { kind: "proceed" };
-  }
-  return decideChangedPrivacyWorkspaceNavigation(
-    mutationInFlight,
-    draftDirty,
-  );
 }
 
 function decideChangedPrivacyWorkspaceNavigation(

@@ -24,6 +24,10 @@ describe("CaseWorkspaceCompatibilityOutlet source boundary", () => {
     expect(caseFeatureSource).toContain('className="extraction-review"');
     expect(caseFeatureSource).toContain("extraction-review-title");
     expect(caseFeatureSource).toContain("confirmExtractionReview");
+    expect(outletSource).toMatch(
+      /setActiveGraphTarget\(graphTarget\);[\s\S]*onGraphTargetConsumed\(graphTarget\);/u,
+    );
+    expect(outletSource).toContain("}, 4000)");
   });
 
   it("leaves App as assembly without case forms or draft setters", () => {

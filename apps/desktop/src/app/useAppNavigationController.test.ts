@@ -470,4 +470,35 @@ describe("useAppNavigationController", () => {
     expect(controller.consumeRouteState(assistantRoute)).toBe(false);
     expect(renderController(options).route).toEqual(assistantRoute);
   });
+
+  it("rejects a stale Provider acknowledgement after a newer request replaces it", () => {
+    const options = controllerOptions();
+    let controller = renderController(options);
+
+    expect(
+      controller.handoffApprovedProvider({
+        task: "case_legal_qa",
+        notice: "第一次批准",
+      }),
+    ).toBe(true);
+    controller = renderController(options);
+    const firstRoute = controller.route;
+
+    expect(
+      controller.handoffApprovedProvider({
+        task: "document_generation",
+        notice: "第二次批准",
+      }),
+    ).toBe(true);
+    controller = renderController(options);
+    const secondRoute = controller.route;
+
+    expect(controller.consumeRouteState(firstRoute)).toBe(false);
+    expect(renderController(options).route).toEqual(secondRoute);
+    expect(controller.consumeRouteState(secondRoute)).toBe(true);
+    expect(renderController(options).route).toEqual({
+      area: "settings",
+      page: "privacy",
+    });
+  });
 });

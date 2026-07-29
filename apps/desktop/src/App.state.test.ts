@@ -10,7 +10,7 @@ import {
 import {
   assistantWritesBlockClose,
   canBypassDirtyDraftsForWorkspaceRecovery,
-  decideMcpWorkspaceNavigation,
+  decideMcpRouteNavigation,
   decideWorkspaceClose,
   workspaceCloseWasApproved,
 } from "./app/navigationGuards";
@@ -680,12 +680,17 @@ describe("App case workspace state helpers", () => {
 
   it("guards every shell navigation while MCP state is unresolved", () => {
     expect(
-      decideMcpWorkspaceNavigation("mcp", "mcp", true, true),
+      decideMcpRouteNavigation(
+        { area: "settings", page: "mcp" },
+        { area: "settings", page: "mcp" },
+        true,
+        true,
+      ),
     ).toEqual({ kind: "proceed" });
 
-    const activeMutation = decideMcpWorkspaceNavigation(
-      "mcp",
-      "providers",
+    const activeMutation = decideMcpRouteNavigation(
+      { area: "settings", page: "mcp" },
+      { area: "settings", page: "providers" },
       true,
       true,
     );
@@ -694,9 +699,9 @@ describe("App case workspace state helpers", () => {
       "message" in activeMutation ? activeMutation.message : "",
     ).toContain("阻止切换");
 
-    const pendingBearer = decideMcpWorkspaceNavigation(
-      "mcp",
-      "release",
+    const pendingBearer = decideMcpRouteNavigation(
+      { area: "settings", page: "mcp" },
+      { area: "settings", page: "maintenance" },
       false,
       true,
     );
@@ -706,7 +711,12 @@ describe("App case workspace state helpers", () => {
     ).toContain("Bearer Token");
 
     expect(
-      decideMcpWorkspaceNavigation("mcp", "assistant", false, false),
+      decideMcpRouteNavigation(
+        { area: "settings", page: "mcp" },
+        { area: "assistant", page: "chat" },
+        false,
+        false,
+      ),
     ).toEqual({ kind: "proceed" });
   });
 

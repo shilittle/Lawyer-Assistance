@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import {
-  decidePrivacyWorkspaceNavigation,
+  decidePrivacyRouteNavigation,
   decideWorkspaceClose,
 } from "../../app/navigationGuards";
 import { VIEW_METADATA, VIEW_MODES } from "../../app/views";
@@ -49,17 +49,36 @@ describe("privacy settings integration", () => {
 
   it("guards only navigation away from the privacy workspace", () => {
     expect(
-      decidePrivacyWorkspaceNavigation("privacy", "privacy", true, true),
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "privacy" },
+        { area: "settings", page: "privacy" },
+        true,
+        true,
+      ),
     ).toEqual({ kind: "proceed" });
     expect(
-      decidePrivacyWorkspaceNavigation("providers", "assistant", true, true),
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "providers" },
+        { area: "assistant", page: "chat" },
+        true,
+        true,
+      ),
     ).toEqual({ kind: "proceed" });
     expect(
-      decidePrivacyWorkspaceNavigation("privacy", "mcp", true, false).kind,
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "privacy" },
+        { area: "settings", page: "mcp" },
+        true,
+        false,
+      ).kind,
     ).toBe("block");
     expect(
-      decidePrivacyWorkspaceNavigation("privacy", "release", false, true)
-        .kind,
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "privacy" },
+        { area: "settings", page: "maintenance" },
+        false,
+        true,
+      ).kind,
     ).toBe("confirm_discard");
   });
 });

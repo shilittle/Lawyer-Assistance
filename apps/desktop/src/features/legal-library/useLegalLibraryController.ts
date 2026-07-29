@@ -63,6 +63,11 @@ import {
   type QaFormDraft,
 } from "./model";
 
+export type LegalCitationTarget = Pick<
+  DocumentCitation,
+  "articleId" | "documentId" | "versionId" | "sourceId"
+>;
+
 export type LegalLibraryLoadState =
   | { kind: "idle" }
   | { kind: "loading" }
@@ -455,8 +460,11 @@ export function useLegalLibraryController(
     documentId: string,
     label: string,
     articleId?: string,
+    navigate = true,
   ) {
-    options.onNavigateToSearch();
+    if (navigate) {
+      options.onNavigateToSearch();
+    }
     setQuery(label);
     queryRef.current = label;
 
@@ -527,11 +535,16 @@ export function useLegalLibraryController(
     await openLocalLawRecord(node.sourceId, node.label);
   }
 
-  async function openDocumentCitation(citation: DocumentCitation) {
+  async function resolveDocumentCitation(
+    citation: LegalCitationTarget,
+    navigate: boolean,
+  ) {
     const lookupEpoch = advanceRequestEpoch(documentContextRequestEpoch);
     advanceRequestEpoch(searchRequestEpoch);
     advanceRequestEpoch(articleDetailRequestEpoch);
-    options.onNavigateToSearch();
+    if (navigate) {
+      options.onNavigateToSearch();
+    }
     setDocumentState({ kind: "loading" });
     setDetailState({ kind: "loading" });
     try {
@@ -552,6 +565,7 @@ export function useLegalLibraryController(
         article.documentId,
         article.documentTitle,
         article.articleId,
+        navigate,
       );
     } catch (error: unknown) {
       if (!isCurrentRequestEpoch(documentContextRequestEpoch, lookupEpoch)) {
@@ -561,6 +575,14 @@ export function useLegalLibraryController(
       setDocumentState({ kind: "error", message });
       setDetailState({ kind: "error", message });
     }
+  }
+
+  async function openDocumentCitation(citation: LegalCitationTarget) {
+    await resolveDocumentCitation(citation, true);
+  }
+
+  async function consumeDocumentCitation(citation: LegalCitationTarget) {
+    await resolveDocumentCitation(citation, false);
   }
 
   function createCandidateRequest() {
@@ -1004,6 +1026,7 @@ export function useLegalLibraryController(
     bridgeMutationInFlightRef,
     providerBridge,
     openDocumentCitation,
+    consumeDocumentCitation,
     openLawDocumentFromGraph,
   };
 }

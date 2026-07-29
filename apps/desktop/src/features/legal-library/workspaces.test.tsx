@@ -13,7 +13,9 @@ import type {
 import { createProviderProfileDraft } from "../../ipc/provider/catalog";
 import { LegacyQaWorkspace } from "./LegacyQaWorkspace";
 import { LegalLibrarySearchWorkspace } from "./LegalLibrarySearchWorkspace";
+import searchWorkspaceSource from "./LegalLibrarySearchWorkspace.tsx?raw";
 import type { LegalLibraryController } from "./useLegalLibraryController";
+import legalControllerSource from "./useLegalLibraryController.ts?raw";
 
 function legalSource(): LegalSource {
   return {
@@ -211,11 +213,21 @@ function controllerFor(patch: ControllerPatch = {}): LegalLibraryController {
       handleProviderDeleted: vi.fn(),
     },
     openDocumentCitation: vi.fn(async () => undefined),
+    consumeDocumentCitation: vi.fn(async () => undefined),
     openLawDocumentFromGraph: vi.fn(async () => undefined),
   };
 }
 
 describe("LegalLibrarySearchWorkspace", () => {
+  it("copies a typed citation into the controller before acknowledging route state", () => {
+    expect(searchWorkspaceSource).toMatch(
+      /void consumeDocumentCitation\(citationRequest\);[\s\S]*onCitationRequestConsumed\?\.\(citationRequest\);/u,
+    );
+    expect(legalControllerSource).toMatch(
+      /async function consumeDocumentCitation[\s\S]*resolveDocumentCitation\(citation, false\)/u,
+    );
+  });
+
   it("renders local legal detail and keeps the mismatched-case assistant warning", () => {
     const selectedDocument = lawDocument();
     const selectedArticle = articleDetail();
