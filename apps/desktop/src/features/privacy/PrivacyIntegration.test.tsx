@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   decidePrivacyWorkspaceNavigation,
   decideWorkspaceClose,
-} from "../../App";
+} from "../../app/navigationGuards";
 import { VIEW_METADATA, VIEW_MODES } from "../../app/views";
 import { SettingsWorkspace } from "../settings/SettingsWorkspace";
 

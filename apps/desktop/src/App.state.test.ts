@@ -3,11 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   advanceCaseWorkspaceEpoch,
   advanceRequestEpoch,
-  assistantWritesBlockClose,
   articleMatchesDocumentCitation,
   blockingDirtyCaseDrafts,
   caseGraphNodeDomId,
-  canBypassDirtyDraftsForWorkspaceRecovery,
   caseEntityDeletionConfirmation,
   caseProjectDeletionConfirmation,
   caseProjectPageForId,
@@ -19,8 +17,6 @@ import {
   copyCaseEntityForEditing,
   currentLawSearchCriteria,
   detectDirtyCaseDrafts,
-  decideMcpWorkspaceNavigation,
-  decideWorkspaceClose,
   extractionReviewDiscardConfirmation,
   exactLawDocumentMatchesRequest,
   formatCitationValidationSummary,
@@ -49,9 +45,15 @@ import {
   tryAcquireCaseMutation,
   unrestorableExtractionDiscardConfirmation,
   validateFactIssueLinkSelection,
-  workspaceCloseWasApproved,
   type CaseDraftComparisonState,
 } from "./App";
+import {
+  assistantWritesBlockClose,
+  canBypassDirtyDraftsForWorkspaceRecovery,
+  decideMcpWorkspaceNavigation,
+  decideWorkspaceClose,
+  workspaceCloseWasApproved,
+} from "./app/navigationGuards";
 import type { GraphNode } from "./ipc/graph/types";
 import type {
   CaseFact,

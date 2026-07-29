@@ -125,49 +125,27 @@ import {
 import type { AssistantConversation } from "./ipc/assistant/types";
 import type { ApprovedProviderTask } from "./ipc/privacy/types";
 import {
-  deleteProviderApiKey,
-  deleteProviderProfile,
-  getProviderApiKeyStatus,
-  listProviderProfiles,
-  testProviderConnection,
-  upsertProviderProfile,
-  writeProviderApiKey,
-} from "./ipc/provider/client";
-import {
-  createProviderProfileDraft,
-  DEFAULT_PROVIDER_KIND,
-  defaultProviderOptions,
-  providerCapabilities,
-  providerDefaults,
-  SELECTABLE_PROVIDER_KINDS,
-} from "./ipc/provider/catalog";
-import { ProviderCreateMenu } from "./ipc/provider/ProviderCreateMenu";
-import {
-  formatConnectionResult,
-  formatHttpStatus,
-  formatKeyStatus,
-  formatLatency,
-  formatProviderKind,
-} from "./ipc/provider/format";
-import {
-  loadProviderKeyStatusesSettled,
   normalizeProviderProfile,
-  providerKeyStatusForSavedDraft,
   providerProfilesEqual,
 } from "./ipc/provider/profile";
-import type {
-  ConnectionTest,
-  ProviderApiKeyStatus,
-  ProviderKind,
-  ProviderOptions,
-  ProviderProfile,
-  ReasoningEffort,
-} from "./ipc/provider/types";
+import type { ProviderProfile } from "./ipc/provider/types";
 import { AppShell } from "./app/AppShell";
+import {
+  assistantWritesBlockClose,
+  canBypassDirtyDraftsForWorkspaceRecovery,
+  CASE_DRAFT_LABELS,
+  decideMcpWorkspaceNavigation,
+  decidePrivacyWorkspaceNavigation,
+  decideWorkspaceClose,
+  workspaceCloseWasApproved,
+  type CaseDraftKind,
+} from "./app/navigationGuards";
 import { VIEW_METADATA, type ViewMode } from "./app/views";
 import { AssistantWorkspace } from "./features/assistant/AssistantWorkspace";
 import { CasesWorkspace } from "./features/cases/CasesWorkspace";
 import { LegalLibraryWorkspace } from "./features/legal-library/LegalLibraryWorkspace";
+import { ProviderSettingsWorkspace } from "./features/settings/providers/ProviderSettingsWorkspace";
+import { useProviderSettingsController } from "./features/settings/providers/useProviderSettingsController";
 import { SettingsWorkspace } from "./features/settings/SettingsWorkspace";
 import {
   publicContentSummary,
@@ -356,17 +334,6 @@ export function citationHasTrustedSource(
 } {
   return citation.status === "valid" && citation.source != null;
 }
-
-export type CaseDraftKind =
-  | "project"
-  | "file"
-  | "party"
-  | "fact"
-  | "evidence"
-  | "legal_issue"
-  | "evidence_link"
-  | "fact_issue_link"
-  | "legal_basis";
 
 export type CaseDraftDirtyState = Record<CaseDraftKind, boolean>;
 
@@ -774,185 +741,6 @@ export function formatCitationValidationSummary(
     : `${report.validCount} 条法条依据`;
 }
 
-const CASE_DRAFT_LABELS: Record<CaseDraftKind, string> = {
-  project: "案件基本信息",
-  file: "案件材料",
-  party: "当事人",
-  fact: "事实",
-  evidence: "证据",
-  legal_issue: "争点",
-  evidence_link: "事实—证据关联",
-  fact_issue_link: "事实—争点关联",
-  legal_basis: "法律依据",
-};
-
-export interface WorkspaceCloseProtectionState {
-  dirtyCaseDrafts: readonly CaseDraftKind[];
-  providerDraftDirty: boolean;
-  caseMutationInFlight: boolean;
-  providerMutationInFlight: boolean;
-  extractionMutationInFlight: boolean;
-  assistantRunActive?: boolean;
-  assistantMutationInFlight?: boolean;
-  assistantDraftDirty?: boolean;
-  mcpMutationInFlight?: boolean;
-  mcpDraftDirty?: boolean;
-  privacyMutationInFlight?: boolean;
-  privacyDraftDirty?: boolean;
-}
-
-export type WorkspaceCloseDecision =
-  | { kind: "proceed" }
-  | { kind: "block"; message: string }
-  | { kind: "confirm_discard"; message: string };
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function decideWorkspaceClose(
-  state: WorkspaceCloseProtectionState,
-): WorkspaceCloseDecision {
-  if (state.assistantRunActive) {
-    return {
-      kind: "block",
-      message:
-        "助理任务仍在运行。请先等待完成或在助理工作区取消，再关闭窗口。",
-    };
-  }
-
-  const activeWrites = [
-    state.caseMutationInFlight ? "案件数据写入" : null,
-    state.providerMutationInFlight ? "Provider 或 API Key 写入" : null,
-    state.extractionMutationInFlight ? "材料审阅保存" : null,
-    state.assistantMutationInFlight
-      ? "助理保存、导入、导出、法律库桥接或已确认建议写入"
-      : null,
-    state.mcpMutationInFlight ? "MCP 服务配置或生命周期变更" : null,
-    state.privacyMutationInFlight ? "隐私与本地处理配置写入" : null,
-  ].filter((item): item is string => item !== null);
-  if (activeWrites.length > 0) {
-    return {
-      kind: "block",
-      message: `${activeWrites.join("、")}尚未完成；为避免结果不明，已阻止关闭窗口。请等待当前操作完成后重试。`,
-    };
-  }
-
-  const unsaved = state.dirtyCaseDrafts.map(
-    (kind) => CASE_DRAFT_LABELS[kind],
-  );
-  if (state.providerDraftDirty) {
-    unsaved.push("Provider Profile 或 API Key 输入");
-  }
-  if (state.assistantDraftDirty) {
-    unsaved.push("助理中未发送的任务草稿");
-  }
-  if (state.mcpDraftDirty) {
-    unsaved.push("MCP 服务配置或待写入 Bearer Token");
-  }
-  if (state.privacyDraftDirty) {
-    unsaved.push("隐私与本地 OCR 配置");
-  }
-  if (unsaved.length > 0) {
-    return {
-      kind: "confirm_discard",
-      message: `关闭窗口将永久丢弃这些未保存内容：${unsaved.join("、")}。确定继续关闭吗？`,
-    };
-  }
-
-  return { kind: "proceed" };
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function decideMcpWorkspaceNavigation(
-  currentView: ViewMode,
-  nextView: ViewMode,
-  mutationInFlight: boolean,
-  draftDirty: boolean,
-): WorkspaceCloseDecision {
-  if (currentView === nextView) {
-    return { kind: "proceed" };
-  }
-  if (mutationInFlight) {
-    return {
-      kind: "block",
-      message:
-        "MCP 服务配置或生命周期变更尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
-    };
-  }
-  if (draftDirty) {
-    return {
-      kind: "confirm_discard",
-      message:
-        "切换工作区将永久丢弃未保存的 MCP 服务配置或待写入 Bearer Token。确定继续吗？",
-    };
-  }
-  return { kind: "proceed" };
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function decidePrivacyWorkspaceNavigation(
-  currentView: ViewMode,
-  nextView: ViewMode,
-  mutationInFlight: boolean,
-  draftDirty: boolean,
-): WorkspaceCloseDecision {
-  if (currentView === nextView) {
-    return { kind: "proceed" };
-  }
-  if (currentView !== "privacy") {
-    return { kind: "proceed" };
-  }
-  if (mutationInFlight) {
-    return {
-      kind: "block",
-      message:
-        "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
-    };
-  }
-  if (draftDirty) {
-    return {
-      kind: "confirm_discard",
-      message:
-        "切换工作区将永久丢弃未保存的隐私与本地 OCR 配置。确定继续吗？",
-    };
-  }
-  return { kind: "proceed" };
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function assistantWritesBlockClose(
-  workspaceMutationActive: boolean,
-  legalSourceBridgeMutationActive: boolean,
-): boolean {
-  return workspaceMutationActive || legalSourceBridgeMutationActive;
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function workspaceCloseWasApproved(
-  decision: WorkspaceCloseDecision,
-  confirmDiscard: (message: string) => boolean,
-): boolean {
-  if (decision.kind === "proceed") {
-    return true;
-  }
-  return (
-    decision.kind === "confirm_discard" &&
-    confirmDiscard(decision.message)
-  );
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function canBypassDirtyDraftsForWorkspaceRecovery(
-  targetProjectId: string,
-  selectedProjectId: string | null,
-  workspaceWriteBlocked: boolean,
-  persistedMutationRecoveryProjectId: string | null,
-): boolean {
-  return (
-    workspaceWriteBlocked &&
-    targetProjectId === selectedProjectId &&
-    targetProjectId === persistedMutationRecoveryProjectId
-  );
-}
-
 export type EditableCaseEntityType =
   | "file"
   | "party"
@@ -1039,10 +827,6 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random()
     .toString(36)
     .slice(2, 7)}`;
-}
-
-function createProviderProfile(kind: ProviderKind): ProviderProfile {
-  return createProviderProfileDraft(kind, createId(kind));
 }
 
 function createCaseProject(): CaseProject {
@@ -1427,32 +1211,6 @@ export function App() {
     null,
   );
 
-  const [providerState, setProviderState] = useState<LoadState>({
-    kind: "idle",
-  });
-  const [providerProfiles, setProviderProfiles] = useState<ProviderProfile[]>(
-    [],
-  );
-  const [providerDraft, setProviderDraft] = useState<ProviderProfile>(() =>
-    createProviderProfile(DEFAULT_PROVIDER_KIND),
-  );
-  const providerDraftRef = useRef(providerDraft);
-  providerDraftRef.current = providerDraft;
-  const providerDraftBaseline = useRef(providerDraft);
-  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(
-    null,
-  );
-  const [apiKeyInput, setApiKeyInput] = useState("");
-  const apiKeyInputRef = useRef(apiKeyInput);
-  apiKeyInputRef.current = apiKeyInput;
-  const providerMutationInFlight = useRef(false);
-  const [keyStatuses, setKeyStatuses] = useState<
-    Record<string, ProviderApiKeyStatus>
-  >({});
-  const [connectionResults, setConnectionResults] = useState<
-    Record<string, ConnectionTest>
-  >({});
-
   const [caseState, setCaseState] = useState<LoadState>({ kind: "idle" });
   const [caseProjects, setCaseProjects] = useState<CaseProject[]>([]);
   const [caseProjectPage, setCaseProjectPage] = useState(1);
@@ -1542,6 +1300,51 @@ export function App() {
   const extractionReviewRef = useRef<HTMLDivElement | null>(null);
   const extractionReviewReturnFocusRef = useRef<HTMLElement | null>(null);
   const extractionSourcesLocked = extractionLocksSources(extractionState);
+  const handleInitialProviderSelected = useCallback((providerId: string) => {
+    setQaProviderId(providerId);
+    setExtractionProviderId(providerId);
+  }, []);
+  const handleProviderSaved = useCallback((providerId: string) => {
+    setExtractionProviderId((current) => current || providerId);
+  }, []);
+  const handleProviderDeleted = useCallback(
+    (deletedProviderId: string, fallbackProviderId: string | null) => {
+      setQaProviderId((current) =>
+        current === deletedProviderId ? (fallbackProviderId ?? "") : current,
+      );
+      if (fallbackProviderId) {
+        setExtractionProviderId((current) =>
+          current === deletedProviderId ? fallbackProviderId : current,
+        );
+      } else {
+        setExtractionProviderId("");
+      }
+    },
+    [],
+  );
+  const confirmProviderAction = useCallback(
+    (message: string) => window.confirm(message),
+    [],
+  );
+  const providerDeletionBlockedProviderId =
+    extractionSourcesLocked && "context" in extractionState
+      ? extractionState.context.providerId
+      : null;
+  const providerSettings = useProviderSettingsController({
+    policies: {
+      hasUnsavedChanges: providerNavigationHasUnsavedChanges,
+      providerDeletionConfirmation,
+      apiKeyDeletionConfirmation: providerApiKeyDeletionConfirmation,
+      apiKeyOverwriteConfirmation: providerApiKeyOverwriteConfirmation,
+      runConfirmedDestructiveAction,
+      confirmAction: confirmProviderAction,
+    },
+    deletionBlockedProviderId: providerDeletionBlockedProviderId,
+    onInitialProviderSelected: handleInitialProviderSelected,
+    onProviderSaved: handleProviderSaved,
+    onProviderDeleted: handleProviderDeleted,
+  });
+  const providerProfiles = providerSettings.profiles;
 
   function beginCaseMutation(allowDuringExtraction = false): number | null {
     if (
@@ -2062,13 +1865,11 @@ export function App() {
     const currentCloseDecision = () => {
       return decideWorkspaceClose({
         dirtyCaseDrafts: dirtyCaseDraftsForClose.current,
-        providerDraftDirty: providerNavigationHasUnsavedChanges(
-          providerDraftBaseline.current,
-          providerDraftRef.current,
-          apiKeyInputRef.current,
-        ),
+        providerDraftDirty:
+          providerSettings.hasUnsavedChangesRef.current,
         caseMutationInFlight: caseMutationLock.current,
-        providerMutationInFlight: providerMutationInFlight.current,
+        providerMutationInFlight:
+          providerSettings.mutationInFlightRef.current,
         extractionMutationInFlight: extractionMutationBlocksClose(
           extractionConfirmInFlight.current,
           extractionDiscardInFlight.current,
@@ -2238,72 +2039,6 @@ export function App() {
     // live values intentionally are not dependencies of this transition.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedCaseProjectId]);
-
-  const refreshKeyStatus = useCallback(async (profile: ProviderProfile) => {
-    const response = await getProviderApiKeyStatus({
-      providerId: profile.id,
-      accountId: profile.credentialAccountId,
-    });
-
-    setKeyStatuses((current) => ({
-      ...current,
-      [profile.id]: response.status,
-    }));
-  }, []);
-
-  useEffect(() => {
-    let isMounted = true;
-    setProviderState({ kind: "loading" });
-
-    listProviderProfiles()
-      .then(async (response) => {
-        if (!isMounted) {
-          return;
-        }
-
-        setProviderProfiles(response.profiles);
-        if (response.profiles.length > 0) {
-          setSelectedProviderId(response.profiles[0].id);
-          setQaProviderId(response.profiles[0].id);
-          setExtractionProviderId(response.profiles[0].id);
-          setProviderDraft(response.profiles[0]);
-          providerDraftBaseline.current = response.profiles[0];
-        }
-
-        const statusResult = await loadProviderKeyStatusesSettled(
-          response.profiles,
-          async (profile) => {
-            const statusResponse = await getProviderApiKeyStatus({
-              providerId: profile.id,
-              accountId: profile.credentialAccountId,
-            });
-
-            return statusResponse.status;
-          },
-        );
-
-        if (isMounted) {
-          setKeyStatuses(statusResult.statuses);
-          if (statusResult.failedCount > 0) {
-            setProviderState({
-              kind: "error",
-              message: `${statusResult.failedCount} 个 Provider 的凭据状态读取失败，可重试对应操作。`,
-            });
-          } else {
-            setProviderState({ kind: "idle" });
-          }
-        }
-      })
-      .catch((error: unknown) => {
-        if (isMounted) {
-          setProviderState({ kind: "error", message: errorMessage(error) });
-        }
-      });
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
 
   function applyCaseWorkspace(workspace: CaseWorkspace) {
     setActiveCaseEntityEditor(null);
@@ -4111,307 +3846,6 @@ export function App() {
     }
   }
 
-  function providerNavigationHasDirtyDraft(): boolean {
-    return providerNavigationHasUnsavedChanges(
-      providerDraftBaseline.current,
-      providerDraft,
-      apiKeyInput,
-    );
-  }
-
-  function blockProviderNavigationForDirtyDraft(action: string): boolean {
-    if (!providerNavigationHasDirtyDraft()) {
-      return false;
-    }
-    setProviderState({
-      kind: "error",
-      message: `${action}会丢弃未保存的 Profile 或 API Key 输入。请先保存，或手动还原当前草稿。`,
-    });
-    return true;
-  }
-
-  function discardProviderDraftChanges() {
-    setProviderDraft(providerDraftBaseline.current);
-    setApiKeyInput("");
-    setProviderState({ kind: "idle" });
-  }
-
-  function applyNewProviderDraft(kind: ProviderKind) {
-    const profile = createProviderProfile(kind);
-    setSelectedProviderId(null);
-    setProviderDraft(profile);
-    providerDraftBaseline.current = profile;
-    setApiKeyInput("");
-    setProviderState({ kind: "idle" });
-  }
-
-  function startNewProvider(kind: ProviderKind) {
-    if (blockProviderNavigationForDirtyDraft("新建 Provider")) {
-      return;
-    }
-    applyNewProviderDraft(kind);
-  }
-
-  function selectProvider(profile: ProviderProfile) {
-    if (profile.id === selectedProviderId) {
-      return;
-    }
-    if (blockProviderNavigationForDirtyDraft("切换 Provider")) {
-      return;
-    }
-    setSelectedProviderId(profile.id);
-    setProviderDraft(profile);
-    providerDraftBaseline.current = profile;
-    setApiKeyInput("");
-    setProviderState({ kind: "idle" });
-  }
-
-  function updateProviderKind(kind: ProviderKind) {
-    const defaults = providerDefaults(kind);
-    setProviderDraft((current) => ({
-      ...current,
-      kind,
-      displayName: defaults.displayName,
-      modelId: defaults.modelId,
-      baseUrl: defaults.baseUrl,
-      capabilities: providerCapabilities(kind),
-      options: defaultProviderOptions(kind),
-    }));
-  }
-
-  function updateOptions(patch: Partial<ProviderOptions>) {
-    setProviderDraft((current) => ({
-      ...current,
-      options: {
-        ...current.options,
-        ...patch,
-      },
-    }));
-  }
-
-  function clearProviderConnectionResult(profileId: string) {
-    setConnectionResults((current) => {
-      if (!(profileId in current)) {
-        return current;
-      }
-
-      const next = { ...current };
-      delete next[profileId];
-      return next;
-    });
-  }
-
-  async function saveProvider(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (providerMutationInFlight.current) {
-      return;
-    }
-    const profile = normalizeProviderProfile(providerDraft);
-
-    providerMutationInFlight.current = true;
-    setProviderState({ kind: "loading" });
-
-    try {
-      const response = await upsertProviderProfile({ profile });
-      setProviderProfiles((current) => {
-        const others = current.filter((item) => item.id !== response.profile.id);
-        return [response.profile, ...others];
-      });
-      setProviderDraft(response.profile);
-      providerDraftBaseline.current = response.profile;
-      setSelectedProviderId(response.profile.id);
-      setExtractionProviderId((current) => current || response.profile.id);
-      clearProviderConnectionResult(response.profile.id);
-      await refreshKeyStatus(response.profile);
-      setProviderState({ kind: "idle" });
-    } catch (error: unknown) {
-      setProviderState({ kind: "error", message: errorMessage(error) });
-    } finally {
-      providerMutationInFlight.current = false;
-    }
-  }
-
-  async function saveApiKey() {
-    const profile = normalizeProviderProfile(providerDraft);
-    const apiKey = apiKeyInput.trim();
-
-    if (!apiKey) {
-      return;
-    }
-
-    const save = async () => {
-      if (providerMutationInFlight.current) {
-        return;
-      }
-      providerMutationInFlight.current = true;
-      setProviderState({ kind: "loading" });
-      try {
-        const response = await writeProviderApiKey({
-          providerId: profile.id,
-          accountId: profile.credentialAccountId,
-          apiKey,
-        });
-        setKeyStatuses((current) => ({
-          ...current,
-          [profile.id]: response.status,
-        }));
-        clearProviderConnectionResult(profile.id);
-        setApiKeyInput("");
-        setProviderState({ kind: "idle" });
-      } catch (error: unknown) {
-        setProviderState({ kind: "error", message: errorMessage(error) });
-      } finally {
-        providerMutationInFlight.current = false;
-      }
-    };
-    const savedProfile = providerProfiles.find((item) => item.id === profile.id);
-    const keyStatus = providerKeyStatusForSavedDraft(
-      savedProfile,
-      profile,
-      keyStatuses[profile.id],
-    );
-    if (!keyStatus) {
-      setProviderState({
-        kind: "error",
-        message:
-          "尚未可靠读取当前凭据状态，已阻止写入以免无提示覆盖旧 Key。请先重新保存 Profile 刷新状态。",
-      });
-      return;
-    }
-    if (keyStatus.configured) {
-      await runConfirmedDestructiveAction(
-        providerApiKeyOverwriteConfirmation(
-          profile.displayName,
-          profile.credentialAccountId,
-        ),
-        (message) => window.confirm(message),
-        save,
-      );
-    } else {
-      await save();
-    }
-  }
-
-  async function removeApiKey() {
-    const profile = normalizeProviderProfile(providerDraft);
-    await runConfirmedDestructiveAction(
-      providerApiKeyDeletionConfirmation(
-        profile.displayName,
-        profile.credentialAccountId,
-      ),
-      (message) => window.confirm(message),
-      async () => {
-        if (providerMutationInFlight.current) {
-          return;
-        }
-        providerMutationInFlight.current = true;
-        setProviderState({ kind: "loading" });
-        try {
-          const response = await deleteProviderApiKey({
-            providerId: profile.id,
-            accountId: profile.credentialAccountId,
-          });
-          setKeyStatuses((current) => ({
-            ...current,
-            [profile.id]: response.status,
-          }));
-          clearProviderConnectionResult(profile.id);
-          setProviderState({ kind: "idle" });
-        } catch (error: unknown) {
-          setProviderState({ kind: "error", message: errorMessage(error) });
-        } finally {
-          providerMutationInFlight.current = false;
-        }
-      },
-    );
-  }
-
-  async function removeProvider() {
-    if (blockProviderNavigationForDirtyDraft("删除 Provider")) {
-      return;
-    }
-    const profileId = providerDraft.id;
-    if (
-      extractionSourcesLocked &&
-      "context" in extractionState &&
-      extractionState.context.providerId === profileId
-    ) {
-      setProviderState({
-        kind: "error",
-        message: "请先取消当前案件抽取审阅，再删除本轮使用的 Provider。",
-      });
-      return;
-    }
-    await runConfirmedDestructiveAction(
-      providerDeletionConfirmation(
-        providerDraft.displayName,
-        providerDraft.credentialAccountId,
-      ),
-      (message) => window.confirm(message),
-      async () => {
-        if (providerMutationInFlight.current) {
-          return;
-        }
-        providerMutationInFlight.current = true;
-        setProviderState({ kind: "loading" });
-        try {
-          await deleteProviderProfile({ providerId: profileId });
-          const remaining = providerProfiles.filter(
-            (profile) => profile.id !== profileId,
-          );
-          setProviderProfiles(remaining);
-          setKeyStatuses((current) => {
-            const next = { ...current };
-            delete next[profileId];
-            return next;
-          });
-          setConnectionResults((current) => {
-            const next = { ...current };
-            delete next[profileId];
-            return next;
-          });
-          setQaProviderId((current) =>
-            current === profileId ? (remaining[0]?.id ?? "") : current,
-          );
-
-          if (remaining[0]) {
-            setSelectedProviderId(remaining[0].id);
-            setProviderDraft(remaining[0]);
-            providerDraftBaseline.current = remaining[0];
-            setExtractionProviderId((current) =>
-              current === profileId ? remaining[0].id : current,
-            );
-          } else {
-            setExtractionProviderId("");
-            applyNewProviderDraft("deep_seek");
-          }
-
-          setProviderState({ kind: "idle" });
-        } catch (error: unknown) {
-          setProviderState({ kind: "error", message: errorMessage(error) });
-        } finally {
-          providerMutationInFlight.current = false;
-        }
-      },
-    );
-  }
-
-  async function runProviderConnectionTest() {
-    const profile = normalizeProviderProfile(providerDraft);
-    setProviderState({ kind: "loading" });
-
-    try {
-      const response = await testProviderConnection({ providerId: profile.id });
-      setConnectionResults((current) => ({
-        ...current,
-        [profile.id]: response.result,
-      }));
-      setProviderState({ kind: "idle" });
-    } catch (error: unknown) {
-      setProviderState({ kind: "error", message: errorMessage(error) });
-    }
-  }
-
   useEffect(() => {
     if (viewMode !== "cases" || !graphCaseTarget) return;
     const targetId = caseGraphNodeDomId(
@@ -4436,24 +3870,6 @@ export function App() {
       : health.kind === "error"
         ? health.message
         : "正在检查本地服务…";
-  const normalizedProviderDraft = normalizeProviderProfile(providerDraft);
-  const savedProviderProfile = providerProfiles.find(
-    (profile) => profile.id === normalizedProviderDraft.id,
-  );
-  const providerIsSaved = savedProviderProfile !== undefined;
-  const providerDraftIsDirty =
-    savedProviderProfile !== undefined &&
-    !providerProfilesEqual(savedProviderProfile, normalizedProviderDraft);
-  const providerBusy = providerState.kind === "loading";
-  const currentKeyStatus = providerKeyStatusForSavedDraft(
-    savedProviderProfile,
-    normalizedProviderDraft,
-    keyStatuses[normalizedProviderDraft.id],
-  );
-  const currentConnectionResult = providerDraftIsDirty
-    ? undefined
-    : connectionResults[providerDraft.id];
-  const providerHasKey = currentKeyStatus?.configured ?? false;
   const caseNavigationLocked =
     extractionSourcesLocked ||
     extractionDiscarding ||
@@ -7657,405 +7073,7 @@ export function App() {
           </aside>
         </CasesWorkspace>
       ) : (
-        <SettingsWorkspace mode="providers" busy={providerBusy}>
-          <aside className="panel provider-list-panel" aria-labelledby="provider-list-title">
-            <div className="panel-heading">
-              <h2 id="provider-list-title">Profiles</h2>
-              <span>{providerProfiles.length}</span>
-            </div>
-            <ProviderCreateMenu
-              disabled={providerBusy}
-              onCreate={startNewProvider}
-            />
-            <div className="provider-list">
-              {providerProfiles.map((profile) => (
-                <button
-                  className={`provider-item ${
-                    selectedProviderId === profile.id ? "is-selected" : ""
-                  }`}
-                  disabled={providerBusy}
-                  key={profile.id}
-                  type="button"
-                  onClick={() => selectProvider(profile)}
-                >
-                  <span className="item-title">{profile.displayName}</span>
-                  <span className="item-meta">
-                    {formatProviderKind(profile.kind)} · {profile.modelId}
-                  </span>
-                  <span className="item-summary">
-                    {formatKeyStatus(keyStatuses[profile.id])}
-                  </span>
-                </button>
-              ))}
-              {providerProfiles.length === 0 ? (
-                <p className="empty-state">暂无 Provider profile</p>
-              ) : null}
-            </div>
-          </aside>
-
-          <section className="panel provider-editor-panel" aria-labelledby="provider-editor-title">
-            <div className="panel-heading">
-              <h2 id="provider-editor-title">Profile</h2>
-              <span>{providerState.kind === "loading" ? "处理中" : "本地"}</span>
-            </div>
-            {providerState.kind === "error" ? (
-              <p className="error-text" role="alert">
-                {providerState.message}
-              </p>
-            ) : null}
-
-            <form className="provider-form" onSubmit={saveProvider}>
-              <fieldset
-                className="provider-profile-fields"
-                disabled={providerBusy}
-              >
-                <legend className="sr-only">Provider Profile 配置</legend>
-              {providerDraft.kind === "custom" ? (
-                <p className="provider-custom-hint">
-                  自定义提供商使用通用 OpenAI Chat Completions 协议。请填写 HTTPS
-                  Base URL 和模型 ID；地址可以是 API 根路径，也可以直接以
-                  /chat/completions 结尾。
-                </p>
-              ) : null}
-              <div className="form-grid">
-                <label>
-                  <span>名称</span>
-                  <input
-                    placeholder={
-                      providerDraft.kind === "custom"
-                        ? "例如：公司模型网关"
-                        : undefined
-                    }
-                    required
-                    value={providerDraft.displayName}
-                    onChange={(event) =>
-                      setProviderDraft((current) => ({
-                        ...current,
-                        displayName: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Provider</span>
-                  <select
-                    value={providerDraft.kind}
-                    onChange={(event) =>
-                      updateProviderKind(event.target.value as ProviderKind)
-                    }
-                  >
-                    {SELECTABLE_PROVIDER_KINDS.map((kind) => (
-                      <option key={kind} value={kind}>
-                        {formatProviderKind(kind)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  <span>模型 ID</span>
-                  <input
-                    placeholder={
-                      providerDraft.kind === "custom"
-                        ? "例如：my-chat-model"
-                        : undefined
-                    }
-                    required
-                    value={providerDraft.modelId}
-                    onChange={(event) =>
-                      setProviderDraft((current) => ({
-                        ...current,
-                        modelId: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Base URL</span>
-                  <input
-                    placeholder={
-                      providerDraft.kind === "custom"
-                        ? "https://api.example.com/v1"
-                        : undefined
-                    }
-                    required
-                    value={providerDraft.baseUrl}
-                    onChange={(event) =>
-                      setProviderDraft((current) => ({
-                        ...current,
-                        baseUrl: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <label>
-                  <span>凭据账户</span>
-                  <input
-                    required
-                    value={providerDraft.credentialAccountId}
-                    onChange={(event) =>
-                      setProviderDraft((current) => ({
-                        ...current,
-                        credentialAccountId: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                {providerDraft.kind === "volcengine_ark" ? (
-                  <label>
-                    <span>Endpoint ID（可覆盖模型 ID）</span>
-                    <input
-                      value={providerDraft.options.endpointId ?? ""}
-                      onChange={(event) =>
-                        updateOptions({ endpointId: event.target.value })
-                      }
-                    />
-                  </label>
-                ) : null}
-                {providerDraft.kind === "qwen" ? (
-                  <label>
-                    <span>Workspace ID（用于 Base URL 占位符）</span>
-                    <input
-                      value={providerDraft.options.workspaceId ?? ""}
-                      onChange={(event) =>
-                        updateOptions({ workspaceId: event.target.value })
-                      }
-                    />
-                  </label>
-                ) : null}
-                {providerDraft.kind === "deep_seek" ||
-                providerDraft.kind === "volcengine_ark" ? (
-                  <label>
-                    <span>Reasoning effort</span>
-                    <select
-                      value={
-                        providerDraft.kind === "deep_seek" &&
-                        (providerDraft.options.reasoningEffort === "low" ||
-                          providerDraft.options.reasoningEffort === "medium")
-                          ? "high"
-                          : (providerDraft.options.reasoningEffort ?? "")
-                      }
-                      onChange={(event) =>
-                        updateOptions({
-                          reasoningEffort:
-                            event.target.value === ""
-                              ? null
-                              : (event.target.value as ReasoningEffort),
-                        })
-                      }
-                    >
-                      <option value="">未设置</option>
-                      {providerDraft.kind === "volcengine_ark" ? (
-                        <>
-                          <option value="low">low</option>
-                          <option value="medium">medium</option>
-                        </>
-                      ) : null}
-                      <option value="high">high</option>
-                      {providerDraft.kind === "deep_seek" ? (
-                        <option value="max">max</option>
-                      ) : null}
-                    </select>
-                  </label>
-                ) : null}
-                {providerDraft.kind === "qwen" ||
-                providerDraft.kind === "silicon_flow" ? (
-                  <label>
-                    <span>Thinking budget</span>
-                    <input
-                      min={providerDraft.kind === "silicon_flow" ? 128 : 1}
-                      max={
-                        providerDraft.kind === "silicon_flow"
-                          ? 32768
-                          : undefined
-                      }
-                      type="number"
-                      value={providerDraft.options.thinkingBudget ?? ""}
-                      onChange={(event) =>
-                        updateOptions({
-                          thinkingBudget:
-                            event.target.value === ""
-                              ? null
-                              : Number(event.target.value),
-                        })
-                      }
-                    />
-                  </label>
-                ) : null}
-              </div>
-
-              <div className="toggle-row">
-                {providerDraft.kind === "custom" ? (
-                  <label className="provider-private-network-toggle">
-                    <input
-                      checked={
-                        providerDraft.options.allowPrivateNetwork ?? false
-                      }
-                      type="checkbox"
-                      onChange={(event) =>
-                        updateOptions({
-                          allowPrivateNetwork: event.target.checked,
-                        })
-                      }
-                    />
-                    <span>
-                      我确认允许访问 localhost、私网或链路本地地址（高风险）
-                    </span>
-                  </label>
-                ) : null}
-                {providerDraft.kind === "qwen" ||
-                providerDraft.kind === "silicon_flow" ? (
-                  <label>
-                    <input
-                      checked={providerDraft.options.enableThinking ?? false}
-                      type="checkbox"
-                      onChange={(event) =>
-                        updateOptions({ enableThinking: event.target.checked })
-                      }
-                    />
-                    <span>enable_thinking</span>
-                  </label>
-                ) : null}
-                {providerDraft.kind === "deep_seek" ||
-                providerDraft.kind === "volcengine_ark" ? (
-                  <label>
-                    <input
-                      checked={providerDraft.options.thinking ?? false}
-                      type="checkbox"
-                      onChange={(event) =>
-                        updateOptions({ thinking: event.target.checked })
-                      }
-                    />
-                    <span>thinking</span>
-                  </label>
-                ) : null}
-              </div>
-              {providerDraft.kind === "custom" &&
-              providerDraft.options.allowPrivateNetwork ? (
-                <p className="provider-risk-warning" role="alert">
-                  高风险：该 Provider 可访问本机及内网服务。仅在你信任目标地址并确认不会形成服务端请求伪造通道时启用。
-                </p>
-              ) : null}
-              </fieldset>
-
-              <div className="command-row">
-                <button disabled={providerBusy} type="submit">
-                  保存 Profile
-                </button>
-                <button
-                  disabled={providerBusy || !providerIsSaved}
-                  type="button"
-                  onClick={() => void removeProvider()}
-                >
-                  删除 Profile
-                </button>
-                <button
-                  disabled={providerBusy || !providerNavigationHasDirtyDraft()}
-                  type="button"
-                  onClick={discardProviderDraftChanges}
-                >
-                  放弃未保存修改
-                </button>
-              </div>
-            </form>
-          </section>
-
-          <aside className="panel provider-status-panel" aria-labelledby="provider-status-title">
-            <div className="panel-heading">
-              <h2 id="provider-status-title">凭据与连接</h2>
-              <span>{formatKeyStatus(currentKeyStatus)}</span>
-            </div>
-            <section className="provider-subsection">
-              <h3>API Key</h3>
-              <label>
-                <span>Key</span>
-                <input
-                  autoComplete="off"
-                  disabled={providerBusy}
-                  type="password"
-                  value={apiKeyInput}
-                  onChange={(event) => setApiKeyInput(event.target.value)}
-                  placeholder="API Key"
-                />
-              </label>
-              <div className="command-row">
-                <button
-                  disabled={
-                    providerBusy ||
-                    !providerIsSaved ||
-                    providerDraftIsDirty ||
-                    currentKeyStatus === undefined ||
-                    apiKeyInput.trim().length === 0
-                  }
-                  type="button"
-                  onClick={() => void saveApiKey()}
-                >
-                  保存 Key
-                </button>
-                <button
-                  disabled={
-                    providerBusy || providerDraftIsDirty || !providerHasKey
-                  }
-                  type="button"
-                  onClick={() => void removeApiKey()}
-                >
-                  删除 Key
-                </button>
-              </div>
-            </section>
-
-            <section className="provider-subsection">
-              <h3>测试连接</h3>
-              <div className="connection-summary">
-                <span
-                  className={`status-dot status-dot--${
-                    currentConnectionResult?.status ?? "idle"
-                  }`}
-                />
-                <strong>{formatConnectionResult(currentConnectionResult)}</strong>
-              </div>
-              <dl className="meta-grid">
-                <div>
-                  <dt>HTTP</dt>
-                  <dd>{formatHttpStatus(currentConnectionResult?.httpStatus)}</dd>
-                </div>
-                <div>
-                  <dt>模型</dt>
-                  <dd>{currentConnectionResult?.model ?? "未返回"}</dd>
-                </div>
-                <div>
-                  <dt title="从发起请求到首个非空 SSE 内容或 reasoning token 到达；不按响应头、keep-alive 或空 delta 计时">
-                    首个响应 token
-                  </dt>
-                  <dd>
-                    {formatLatency(
-                      currentConnectionResult?.firstTokenLatencyMs,
-                    )}
-                  </dd>
-                </div>
-                <div>
-                  <dt>总耗时</dt>
-                  <dd>{formatLatency(currentConnectionResult?.totalLatencyMs)}</dd>
-                </div>
-                <div>
-                  <dt>错误类型</dt>
-                  <dd>{currentConnectionResult?.errorType ?? "无"}</dd>
-                </div>
-              </dl>
-              <button
-                disabled={
-                  providerBusy ||
-                  !providerIsSaved ||
-                  providerDraftIsDirty ||
-                  !providerHasKey
-                }
-                type="button"
-                onClick={() => void runProviderConnectionTest()}
-              >
-                测试连接
-              </button>
-            </section>
-          </aside>
-        </SettingsWorkspace>
+        <ProviderSettingsWorkspace controller={providerSettings} />
       )}
     </AppShell>
   );
