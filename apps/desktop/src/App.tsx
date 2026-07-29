@@ -70,54 +70,11 @@ import { formatHealthCheck } from "./ipc/health/format";
 import { healthCheck } from "./ipc/health/client";
 import type { HealthCheckResponse } from "./ipc/health/types";
 import {
-  cancelLegalAnswer,
-  findLegalAnswerCandidates,
-  getArticle,
-  getLawDocument,
-  getLawRelations,
-  getLawVersions,
-  listLegalAnswerRecords,
-  searchArticles,
-  searchLaws,
-} from "./ipc/legal/client";
-import {
-  formatArticleLabel,
-  formatCitationInvalidReason,
   formatEffectiveWindow,
-  formatLegalContextWarning,
   formatLegalSourceLabel,
   formatStatus,
-  segmentLegalAnswer,
 } from "./ipc/legal/format";
-import {
-  buildLegalAnswerCandidateRequest as createLegalAnswerCandidateRequest,
-  EFFECTIVENESS_LEVEL_OPTIONS,
-} from "./ipc/legal/query";
-import {
-  formatLegalAnswerStreamStatus,
-  INITIAL_LEGAL_ANSWER_STREAM_STATE,
-  isLegalAnswerStreamActive,
-  isLegalAnswerStreamCancellable,
-  markLegalAnswerCancelling,
-  restoreLegalAnswerAfterRejectedCancellation,
-  settleLegalAnswerCancellation,
-  shouldCancelLegalAnswerOnPageLeave,
-} from "./ipc/legal/stream";
-import type {
-  ArticleSearchResult,
-  CitationValidationReport,
-  LawArticleDetail,
-  LawRelationInfo,
-  LawSearchResult,
-  LawVersionInfo,
-  LegalAnswerContext,
-  LegalAnswerRecord,
-  LegalAnswerResponse,
-  LegalSource,
-  ValidatedCitation,
-} from "./ipc/legal/types";
 import type { GraphMode, GraphNode } from "./ipc/graph/types";
-import type { DocumentCitation } from "./ipc/document/types";
 import {
   addAssistantLegalSource,
   proposeAssistantLegalBasis,
@@ -143,7 +100,9 @@ import {
 import { VIEW_METADATA, type ViewMode } from "./app/views";
 import { AssistantWorkspace } from "./features/assistant/AssistantWorkspace";
 import { CasesWorkspace } from "./features/cases/CasesWorkspace";
-import { LegalLibraryWorkspace } from "./features/legal-library/LegalLibraryWorkspace";
+import { LegacyQaWorkspace } from "./features/legal-library/LegacyQaWorkspace";
+import { LegalLibrarySearchWorkspace } from "./features/legal-library/LegalLibrarySearchWorkspace";
+import { useLegalLibraryController } from "./features/legal-library/useLegalLibraryController";
 import { ProviderSettingsWorkspace } from "./features/settings/providers/ProviderSettingsWorkspace";
 import { useProviderSettingsController } from "./features/settings/providers/useProviderSettingsController";
 import { SettingsWorkspace } from "./features/settings/SettingsWorkspace";
@@ -177,16 +136,6 @@ type ExtractionDraftSaveState =
   | { kind: "saved"; expiresAt: string }
   | { kind: "conflict"; message: string };
 
-interface QaFormDraft {
-  question: string;
-  lawName: string;
-  articleNumber: string;
-  keywords: string;
-  caseDate: string;
-  effectivenessLevels: string[];
-  includeExpired: boolean;
-}
-
 interface PendingReviewRecoveryBlock {
   reviewId: string;
   projectId: string;
@@ -202,10 +151,6 @@ interface QueuedExtractionDraftSave {
 
 interface MutableEpoch {
   current: number;
-}
-
-interface MutableValue<T> {
-  current: T;
 }
 
 interface MutableLock {
@@ -235,17 +180,6 @@ export function isCurrentRequestEpoch(
   requestEpoch: number,
 ): boolean {
   return epoch.current === requestEpoch;
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function currentLawSearchCriteria(
-  query: MutableValue<string>,
-  caseDate: MutableValue<string>,
-): { query: string; caseDate: string | null } {
-  return {
-    query: query.current.trim(),
-    caseDate: caseDate.current || null,
-  };
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -290,49 +224,6 @@ export function isPersistedCaseWorkspace(
     selectedProjectId === draftProjectId &&
     workspace.project.projectId === draftProjectId
   );
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function resolveSelectedQaSource(
-  context: LegalAnswerContext | null,
-  selectedSourceId: string | null,
-): LegalSource | null {
-  if (!context) {
-    return null;
-  }
-
-  if (selectedSourceId === null) {
-    return context.sources[0] ?? null;
-  }
-
-  return (
-    context.sources.find((source) => source.sourceId === selectedSourceId) ??
-    null
-  );
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function resolveLegalAnswerQuestion(
-  context: LegalAnswerContext | null,
-  submittedQuestion: string | null,
-): string | null {
-  const contextQuestion = context?.query.legalIssue.trim();
-  if (contextQuestion) {
-    return contextQuestion;
-  }
-
-  const normalizedSubmittedQuestion = submittedQuestion?.trim();
-  return normalizedSubmittedQuestion || null;
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function citationHasTrustedSource(
-  citation: ValidatedCitation,
-): citation is ValidatedCitation & {
-  status: "valid";
-  source: LegalSource;
-} {
-  return citation.status === "valid" && citation.source != null;
 }
 
 export type CaseDraftDirtyState = Record<CaseDraftKind, boolean>;
@@ -470,37 +361,6 @@ export function caseGraphNodeDomId(sourceKind: string, sourceId: string): string
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
-export function articleMatchesDocumentCitation(
-  article: Pick<
-    LawArticleDetail,
-    "articleId" | "documentId" | "versionId" | "citationId"
-  > | null | undefined,
-  citation: Pick<
-    DocumentCitation,
-    "articleId" | "documentId" | "versionId" | "sourceId"
-  >,
-): article is Pick<
-  LawArticleDetail,
-  "articleId" | "documentId" | "versionId" | "citationId"
-> {
-  return (
-    article != null &&
-    article.articleId === citation.articleId &&
-    article.documentId === citation.documentId &&
-    article.versionId === citation.versionId &&
-    article.citationId === citation.sourceId
-  );
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function exactLawDocumentMatchesRequest(
-  document: LawSearchResult | null | undefined,
-  requestedDocumentId: string,
-): document is LawSearchResult {
-  return document != null && document.documentId === requestedDocumentId;
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
 export function caseWorkspaceWritesAreSafe(
   workspace: CaseWorkspace | null,
   selectedProjectId: string | null,
@@ -549,52 +409,6 @@ export function validateFactIssueLinkSelection(
     };
   }
   return { valid: true };
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function legalAnswerContextFromRecord(
-  record: LegalAnswerRecord,
-): LegalAnswerContext {
-  return {
-    query: {
-      ...record.query,
-      lawNames: [...record.query.lawNames],
-      articleNumbers: [...record.query.articleNumbers],
-      keywords: [...record.query.keywords],
-      effectivenessLevels: [...record.query.effectivenessLevels],
-    },
-    sources: record.sources.map((source) => ({ ...source })),
-    prompt: "",
-    warnings: [
-      "这是已保存的历史回答；已恢复当时的检索条件、候选来源和法条依据。",
-      ...(record.missingSourceIds.length > 0
-        ? [
-            `当前本地法律库有 ${record.missingSourceIds.length} 项历史来源暂不可用；回答已保留，引用需重新核对。`,
-          ]
-        : []),
-    ],
-  };
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function qaFormDraftFromLegalAnswerRecord(
-  record: LegalAnswerRecord,
-): QaFormDraft {
-  const { query } = record;
-  return {
-    question: query.legalIssue,
-    // The request form is single-valued for these explicit filters. When an
-    // old query inferred multiple values from its question, leave the explicit
-    // field empty so replay re-parses the original question instead of joining
-    // independent values into a new, invalid hard filter.
-    lawName: query.lawNames.length === 1 ? query.lawNames[0] : "",
-    articleNumber:
-      query.articleNumbers.length === 1 ? query.articleNumbers[0] : "",
-    keywords: query.keywords.join("、"),
-    caseDate: query.caseDate ?? "",
-    effectivenessLevels: [...query.effectivenessLevels],
-    includeExpired: query.includeExpired,
-  };
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -670,38 +484,6 @@ export function caseProjectToLoadAfterRefresh(
   );
 }
 
-export const LEGAL_ANSWER_HISTORY_PAGE_SIZE = 25;
-
-const DEFAULT_QA_FORM_DRAFT: Readonly<QaFormDraft> = {
-  question: "",
-  lawName: "",
-  articleNumber: "",
-  keywords: "",
-  caseDate: "",
-  effectivenessLevels: [],
-  includeExpired: false,
-};
-
-function copyQaFormDraft(draft: Readonly<QaFormDraft>): QaFormDraft {
-  return { ...draft, effectivenessLevels: [...draft.effectivenessLevels] };
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function legalAnswerRequestStillOwnsCurrentCase(
-  requestProjectId: string | null,
-  selectedProjectId: string | null,
-): boolean {
-  return requestProjectId !== null && requestProjectId === selectedProjectId;
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function legalAnswerPreviewStillOwnsCurrentScope(
-  requestProjectId: string | null,
-  selectedProjectId: string | null,
-): boolean {
-  return requestProjectId === selectedProjectId;
-}
-
 // eslint-disable-next-line react-refresh/only-export-components
 export function pendingReviewFilesStillExist(
   workspaceFileIds: readonly string[],
@@ -709,36 +491,6 @@ export function pendingReviewFilesStillExist(
 ): boolean {
   const available = new Set(workspaceFileIds);
   return pendingFileIds.every((fileId) => available.has(fileId));
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function mergeLegalAnswerHistory(
-  current: readonly LegalAnswerRecord[],
-  incoming: readonly LegalAnswerRecord[],
-): LegalAnswerRecord[] {
-  const records = new Map(current.map((record) => [record.recordId, record]));
-  incoming.forEach((record) => records.set(record.recordId, record));
-  return [...records.values()];
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function legalAnswerHistoryBelongsToProject(
-  records: readonly LegalAnswerRecord[],
-  projectId: string,
-): boolean {
-  return records.every((record) => record.projectId === projectId);
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function formatCitationValidationSummary(
-  report: CitationValidationReport,
-): string {
-  if (report.citations.length === 0 || report.validCount + report.invalidCount === 0) {
-    return "未列出法条依据";
-  }
-  return report.invalidCount > 0
-    ? `${report.invalidCount} 条依据需要核对`
-    : `${report.validCount} 条法条依据`;
 }
 
 export type EditableCaseEntityType =
@@ -820,8 +572,6 @@ export function publicEvidenceNumber(
   const publicValue = sanitizePublicGeneratedText(normalized, "").trim();
   return publicTitle(publicValue, fallback);
 }
-
-const INITIAL_QUERY = "合同";
 
 function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random()
@@ -1100,11 +850,6 @@ export function App() {
   const mcpMutationActive = useRef(false);
   const privacyDraftDirty = useRef(false);
   const privacyMutationActive = useRef(false);
-  const legalSourceBridgeMutationActive = useRef(false);
-  const [legalSourceBridgeState, setLegalSourceBridgeState] = useState<
-    | { kind: "idle" | "loading" }
-    | { kind: "success" | "error"; message: string }
-  >({ kind: "idle" });
   const handleAssistantConversationChange = useCallback(
     (conversation: AssistantConversation | null) => {
       setAssistantConversation(conversation);
@@ -1132,84 +877,11 @@ export function App() {
   const handlePrivacyMutationActivityChange = useCallback((active: boolean) => {
     privacyMutationActive.current = active;
   }, []);
-  const [query, setQuery] = useState(INITIAL_QUERY);
-  const [caseDate, setCaseDate] = useState("");
-  const queryRef = useRef(query);
-  queryRef.current = query;
-  const caseDateRef = useRef(caseDate);
-  caseDateRef.current = caseDate;
-  const [searchState, setSearchState] = useState<LoadState>({ kind: "idle" });
-  const [detailState, setDetailState] = useState<LoadState>({ kind: "idle" });
-  const [documentState, setDocumentState] = useState<LoadState>({
-    kind: "idle",
-  });
-  const [laws, setLaws] = useState<LawSearchResult[]>([]);
-  const [articles, setArticles] = useState<ArticleSearchResult[]>([]);
-  const searchRequestEpoch = useRef(0);
-  const articleDetailRequestEpoch = useRef(0);
-  const documentContextRequestEpoch = useRef(0);
-  const [selectedDocument, setSelectedDocument] =
-    useState<LawSearchResult | null>(null);
-  const selectedDocumentIdRef = useRef<string | null>(null);
-  selectedDocumentIdRef.current = selectedDocument?.documentId ?? null;
-  const [versions, setVersions] = useState<LawVersionInfo[]>([]);
-  const [relations, setRelations] = useState<LawRelationInfo[]>([]);
-  const [selectedArticleId, setSelectedArticleId] = useState<string | null>(
-    null,
-  );
-  const [selectedArticle, setSelectedArticle] =
-    useState<LawArticleDetail | null>(null);
-  useEffect(() => {
-    setLegalSourceBridgeState({ kind: "idle" });
-  }, [selectedArticleId]);
   const [graphMode, setGraphMode] = useState<GraphMode>("case");
-  const [graphDocumentId, setGraphDocumentId] = useState<string | null>(null);
   const [graphCaseTarget, setGraphCaseTarget] = useState<{
     sourceKind: string;
     sourceId: string;
   } | null>(null);
-
-  const [qaState, setQaState] = useState<LoadState>({ kind: "idle" });
-  const [qaQuestion, setQaQuestion] = useState(DEFAULT_QA_FORM_DRAFT.question);
-  const [qaLawName, setQaLawName] = useState(DEFAULT_QA_FORM_DRAFT.lawName);
-  const [qaArticleNumber, setQaArticleNumber] = useState(
-    DEFAULT_QA_FORM_DRAFT.articleNumber,
-  );
-  const [qaKeywords, setQaKeywords] = useState(DEFAULT_QA_FORM_DRAFT.keywords);
-  const [qaCaseDate, setQaCaseDate] = useState(DEFAULT_QA_FORM_DRAFT.caseDate);
-  const [qaEffectivenessLevels, setQaEffectivenessLevels] = useState<string[]>(
-    [...DEFAULT_QA_FORM_DRAFT.effectivenessLevels],
-  );
-  const [qaIncludeExpired, setQaIncludeExpired] = useState(
-    DEFAULT_QA_FORM_DRAFT.includeExpired,
-  );
-  const [qaProviderId, setQaProviderId] = useState("");
-  const [qaContext, setQaContext] = useState<LegalAnswerContext | null>(null);
-  const [qaAnswer, setQaAnswer] = useState<LegalAnswerResponse | null>(null);
-  const [qaHistoryState, setQaHistoryState] = useState<LoadState>({
-    kind: "idle",
-  });
-  const [qaHistoryRecords, setQaHistoryRecords] = useState<
-    LegalAnswerRecord[]
-  >([]);
-  const [qaHistoryHasMore, setQaHistoryHasMore] = useState(false);
-  const qaDraftsByProject = useRef(new Map<string, QaFormDraft>());
-  const qaDraftProjectId = useRef<string | null>(null);
-  const [qaSubmittedQuestion, setQaSubmittedQuestion] = useState<string | null>(
-    null,
-  );
-  const [qaStream, setQaStream] = useState(
-    INITIAL_LEGAL_ANSWER_STREAM_STATE,
-  );
-  const activeQaRequestId = useRef<string | null>(null);
-  const activeQaRequestProjectId = useRef<string | null>(null);
-  const qaPreviewEpoch = useRef(0);
-  const qaStreamRef = useRef(qaStream);
-  qaStreamRef.current = qaStream;
-  const qaLeaveCancellationRequestId = useRef<string | null>(null);
-  const [selectedQaSourceId, setSelectedQaSourceId] = useState<string | null>(
-    null,
-  );
 
   const [caseState, setCaseState] = useState<LoadState>({ kind: "idle" });
   const [caseProjects, setCaseProjects] = useState<CaseProject[]>([]);
@@ -1219,7 +891,6 @@ export function App() {
   >(null);
   const selectedCaseProjectIdRef = useRef<string | null>(null);
   selectedCaseProjectIdRef.current = selectedCaseProjectId;
-  const qaHistoryLoadEpoch = useRef(0);
   const [caseWorkspace, setCaseWorkspace] = useState<CaseWorkspace | null>(
     null,
   );
@@ -1300,17 +971,42 @@ export function App() {
   const extractionReviewRef = useRef<HTMLDivElement | null>(null);
   const extractionReviewReturnFocusRef = useRef<HTMLElement | null>(null);
   const extractionSourcesLocked = extractionLocksSources(extractionState);
-  const handleInitialProviderSelected = useCallback((providerId: string) => {
-    setQaProviderId(providerId);
-    setExtractionProviderId(providerId);
-  }, []);
+  const assistantActiveProject = selectedCaseProjectId
+    ? caseProjects.find(
+        (project) => project.projectId === selectedCaseProjectId,
+      ) ?? null
+    : null;
+  const legalLibrary = useLegalLibraryController({
+    qaActive: viewMode === "qa",
+    selectedCaseProjectId,
+    assistantConversation,
+    assistantActiveProject,
+    onNavigateToSearch: () => setViewMode("search"),
+    onOpenLawGraph: () => {
+      setGraphMode("law");
+      setViewMode("graph");
+    },
+    onContinueInAssistant: continueSelectedCaseInAssistant,
+    onOpenAssistant: () => setViewMode("assistant"),
+    onLegacyApprovedProviderRequest: redirectLegacyEgressToApprovedProvider,
+    onAddAssistantLegalSource: addLegalSourceToAssistant,
+    onProposeAssistantLegalBasis: proposeAssistantLegalBasisForCase,
+  });
+  const handleInitialProviderSelected = useCallback(
+    (providerId: string) => {
+      legalLibrary.providerBridge.selectInitialProvider(providerId);
+      setExtractionProviderId(providerId);
+    },
+    [legalLibrary.providerBridge],
+  );
   const handleProviderSaved = useCallback((providerId: string) => {
     setExtractionProviderId((current) => current || providerId);
   }, []);
   const handleProviderDeleted = useCallback(
     (deletedProviderId: string, fallbackProviderId: string | null) => {
-      setQaProviderId((current) =>
-        current === deletedProviderId ? (fallbackProviderId ?? "") : current,
+      legalLibrary.providerBridge.handleProviderDeleted(
+        deletedProviderId,
+        fallbackProviderId,
       );
       if (fallbackProviderId) {
         setExtractionProviderId((current) =>
@@ -1320,7 +1016,7 @@ export function App() {
         setExtractionProviderId("");
       }
     },
-    [],
+    [legalLibrary.providerBridge],
   );
   const confirmProviderAction = useCallback(
     (message: string) => window.confirm(message),
@@ -1391,86 +1087,6 @@ export function App() {
 
   function clearCaseValidationError() {
     setCaseValidationTargetId(null);
-  }
-
-  function currentQaFormDraft(): QaFormDraft {
-    return {
-      question: qaQuestion,
-      lawName: qaLawName,
-      articleNumber: qaArticleNumber,
-      keywords: qaKeywords,
-      caseDate: qaCaseDate,
-      effectivenessLevels: [...qaEffectivenessLevels],
-      includeExpired: qaIncludeExpired,
-    };
-  }
-
-  function applyQaFormDraft(draft: Readonly<QaFormDraft>) {
-    setQaQuestion(draft.question);
-    setQaLawName(draft.lawName);
-    setQaArticleNumber(draft.articleNumber);
-    setQaKeywords(draft.keywords);
-    setQaCaseDate(draft.caseDate);
-    setQaEffectivenessLevels([...draft.effectivenessLevels]);
-    setQaIncludeExpired(draft.includeExpired);
-  }
-
-  function qaDraftStorageKey(projectId: string | null): string {
-    return projectId ?? "__unassigned__";
-  }
-
-  async function refreshLegalAnswerHistory(
-    projectId: string,
-    append = false,
-  ) {
-    const requestEpoch = ++qaHistoryLoadEpoch.current;
-    const cursor = append ? qaHistoryRecords.at(-1) : undefined;
-    if (!append) {
-      setQaHistoryRecords([]);
-      setQaHistoryHasMore(false);
-    }
-    setQaHistoryState({ kind: "loading" });
-    try {
-      const response = await listLegalAnswerRecords({
-        projectId,
-        limit: LEGAL_ANSWER_HISTORY_PAGE_SIZE,
-        beforeCreatedAt: cursor?.createdAt ?? null,
-        beforeRecordId: cursor?.recordId ?? null,
-      });
-      if (
-        qaHistoryLoadEpoch.current !== requestEpoch ||
-        selectedCaseProjectIdRef.current !== projectId
-      ) {
-        return;
-      }
-      if (!legalAnswerHistoryBelongsToProject(response.records, projectId)) {
-        setQaHistoryRecords([]);
-        setQaHistoryHasMore(false);
-        setQaHistoryState({
-          kind: "error",
-          message: "历史回答归属校验失败，已拒绝显示。",
-        });
-        return;
-      }
-      setQaHistoryRecords((current) =>
-        append
-          ? mergeLegalAnswerHistory(current, response.records)
-          : response.records,
-      );
-      setQaHistoryHasMore(response.hasMore);
-      setQaHistoryState({ kind: "idle" });
-    } catch (error: unknown) {
-      if (
-        qaHistoryLoadEpoch.current === requestEpoch &&
-        selectedCaseProjectIdRef.current === projectId
-      ) {
-        if (!append) {
-          setQaHistoryRecords([]);
-          setQaHistoryHasMore(false);
-        }
-        setQaHistoryState({ kind: "error", message: errorMessage(error) });
-      }
-    }
   }
 
   function clearExtractionDraftSaveTimer() {
@@ -1766,90 +1382,10 @@ export function App() {
         }
       });
 
-    void runSearch(null);
-
     return () => {
       isMounted = false;
-      advanceRequestEpoch(searchRequestEpoch);
-      advanceRequestEpoch(articleDetailRequestEpoch);
-      advanceRequestEpoch(documentContextRequestEpoch);
     };
-    // The initial search is deliberately issued once per mount. Subsequent
-    // searches invalidate it through request epochs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    const requestId = activeQaRequestId.current;
-    const stream = qaStreamRef.current;
-    if (
-      viewMode === "qa" ||
-      !requestId ||
-      !shouldCancelLegalAnswerOnPageLeave(stream, requestId) ||
-      qaLeaveCancellationRequestId.current === requestId
-    ) {
-      return;
-    }
-
-    const previousStatus = stream.status === "streaming" ? "streaming" : "connecting";
-    qaLeaveCancellationRequestId.current = requestId;
-    setQaStream((current) => markLegalAnswerCancelling(current));
-    void cancelLegalAnswer({ requestId })
-      .then((response) => {
-        if (qaLeaveCancellationRequestId.current === requestId) {
-          qaLeaveCancellationRequestId.current = null;
-        }
-        if (activeQaRequestId.current !== requestId) {
-          return;
-        }
-        if (response.cancelled) {
-          activeQaRequestId.current = null;
-          activeQaRequestProjectId.current = null;
-          setQaStream((current) =>
-            settleLegalAnswerCancellation(
-              current,
-              requestId,
-              true,
-              "离开问答页面，生成已取消",
-            ),
-          );
-          setQaState({ kind: "idle" });
-          return;
-        }
-
-        setQaStream((current) =>
-          restoreLegalAnswerAfterRejectedCancellation(
-            current,
-            requestId,
-            previousStatus,
-          ),
-        );
-      })
-      .catch(() => {
-        if (qaLeaveCancellationRequestId.current === requestId) {
-          qaLeaveCancellationRequestId.current = null;
-        }
-        setQaStream((current) =>
-          restoreLegalAnswerAfterRejectedCancellation(
-            current,
-            requestId,
-            previousStatus,
-          ),
-        );
-      });
-  }, [viewMode]);
-
-  useEffect(
-    () => () => {
-      const requestId = activeQaRequestId.current;
-      if (requestId) {
-        activeQaRequestId.current = null;
-        activeQaRequestProjectId.current = null;
-        void cancelLegalAnswer({ requestId });
-      }
-    },
-    [],
-  );
 
   useEffect(() => {
     let disposed = false;
@@ -1877,7 +1413,7 @@ export function App() {
         assistantRunActive: assistantRunActive.current,
         assistantMutationInFlight: assistantWritesBlockClose(
           assistantMutationActive.current,
-          legalSourceBridgeMutationActive.current,
+          legalLibrary.bridgeMutationInFlightRef.current,
         ),
         assistantDraftDirty: assistantDraftDirty.current,
         mcpMutationInFlight: mcpMutationActive.current,
@@ -1989,56 +1525,6 @@ export function App() {
     const frame = requestAnimationFrame(() => extractionReviewRef.current?.focus());
     return () => cancelAnimationFrame(frame);
   }, [extractionState.kind]);
-
-  useEffect(() => {
-    qaPreviewEpoch.current += 1;
-    const previousProjectId = qaDraftProjectId.current;
-    qaDraftsByProject.current.set(
-      qaDraftStorageKey(previousProjectId),
-      currentQaFormDraft(),
-    );
-    qaDraftProjectId.current = selectedCaseProjectId;
-    applyQaFormDraft(
-      copyQaFormDraft(
-        qaDraftsByProject.current.get(
-          qaDraftStorageKey(selectedCaseProjectId),
-        ) ?? DEFAULT_QA_FORM_DRAFT,
-      ),
-    );
-
-    const activeRequestId = activeQaRequestId.current;
-    if (
-      activeRequestId &&
-      !legalAnswerRequestStillOwnsCurrentCase(
-        activeQaRequestProjectId.current,
-        selectedCaseProjectId,
-      )
-    ) {
-      activeQaRequestId.current = null;
-      activeQaRequestProjectId.current = null;
-      qaLeaveCancellationRequestId.current = null;
-      void cancelLegalAnswer({ requestId: activeRequestId });
-    }
-
-    qaHistoryLoadEpoch.current += 1;
-    setQaHistoryRecords([]);
-    setQaHistoryHasMore(false);
-    setQaHistoryState({ kind: "idle" });
-    setQaAnswer(null);
-    setQaContext(null);
-    setQaState({ kind: "idle" });
-    setQaSubmittedQuestion(null);
-    setSelectedQaSourceId(null);
-    setQaStream(INITIAL_LEGAL_ANSWER_STREAM_STATE);
-
-    if (!selectedCaseProjectId) {
-      return;
-    }
-    void refreshLegalAnswerHistory(selectedCaseProjectId);
-    // Only a project transition may snapshot/restore these form fields. Their
-    // live values intentionally are not dependencies of this transition.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCaseProjectId]);
 
   function applyCaseWorkspace(workspace: CaseWorkspace) {
     setActiveCaseEntityEditor(null);
@@ -2359,278 +1845,16 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function runSearch(
-    documentId: string | null,
-    requiredDocumentEpoch?: number,
-  ) {
-    const requestEpoch = advanceRequestEpoch(searchRequestEpoch);
-    advanceRequestEpoch(articleDetailRequestEpoch);
-    const criteria = currentLawSearchCriteria(queryRef, caseDateRef);
-
-    setSearchState({ kind: "loading" });
-    setSelectedArticleId(null);
-    setSelectedArticle(null);
-    setDetailState({ kind: "idle" });
-
-    try {
-      const [lawResponse, articleResponse] = await Promise.all([
-        searchLaws({ query: criteria.query, limit: 12 }),
-        searchArticles({
-          query: criteria.query,
-          documentId,
-          caseDate: criteria.caseDate,
-          limit: 24,
-        }),
-      ]);
-
-      if (
-        !isCurrentRequestEpoch(searchRequestEpoch, requestEpoch) ||
-        selectedDocumentIdRef.current !== documentId ||
-        (requiredDocumentEpoch !== undefined &&
-          !isCurrentRequestEpoch(
-            documentContextRequestEpoch,
-            requiredDocumentEpoch,
-          ))
-      ) {
-        return;
-      }
-
-      setLaws(lawResponse.results);
-      setArticles(articleResponse.results);
-      setSearchState({ kind: "idle" });
-
-      if (articleResponse.results[0]) {
-        await loadArticleDetail(
-          articleResponse.results[0].articleId,
-          requestEpoch,
-        );
-      } else {
-        setSelectedArticleId(null);
-        setSelectedArticle(null);
-      }
-    } catch (error: unknown) {
-      if (
-        isCurrentRequestEpoch(searchRequestEpoch, requestEpoch) &&
-        selectedDocumentIdRef.current === documentId &&
-        (requiredDocumentEpoch === undefined ||
-          isCurrentRequestEpoch(
-            documentContextRequestEpoch,
-            requiredDocumentEpoch,
-          ))
-      ) {
-        setSearchState({ kind: "error", message: errorMessage(error) });
-      }
-    }
-  }
-
-  async function loadArticleDetail(
-    articleId: string,
-    owningSearchEpoch?: number,
-  ) {
-    const requestEpoch = advanceRequestEpoch(articleDetailRequestEpoch);
-    const documentId = selectedDocumentIdRef.current;
-    setSelectedArticleId(articleId);
-    setDetailState({ kind: "loading" });
-
-    try {
-      const response = await getArticle({ articleId });
-      if (
-        !isCurrentRequestEpoch(articleDetailRequestEpoch, requestEpoch) ||
-        selectedDocumentIdRef.current !== documentId ||
-        (owningSearchEpoch !== undefined &&
-          !isCurrentRequestEpoch(searchRequestEpoch, owningSearchEpoch))
-      ) {
-        return;
-      }
-      setSelectedArticle(response.article ?? null);
-      setDetailState({ kind: "idle" });
-    } catch (error: unknown) {
-      if (
-        isCurrentRequestEpoch(articleDetailRequestEpoch, requestEpoch) &&
-        selectedDocumentIdRef.current === documentId &&
-        (owningSearchEpoch === undefined ||
-          isCurrentRequestEpoch(searchRequestEpoch, owningSearchEpoch))
-      ) {
-        setDetailState({ kind: "error", message: errorMessage(error) });
-      }
-    }
-  }
-
-  async function loadDocumentContext(document: LawSearchResult) {
-    const requestEpoch = advanceRequestEpoch(documentContextRequestEpoch);
-    advanceRequestEpoch(searchRequestEpoch);
-    advanceRequestEpoch(articleDetailRequestEpoch);
-    selectedDocumentIdRef.current = document.documentId;
-    setSelectedDocument(document);
-    setGraphDocumentId(document.documentId);
-    setVersions([]);
-    setRelations([]);
-    setArticles([]);
-    setSelectedArticleId(null);
-    setSelectedArticle(null);
-    setDocumentState({ kind: "loading" });
-
-    try {
-      const [versionResponse, relationResponse] = await Promise.all([
-        getLawVersions({ documentId: document.documentId }),
-        getLawRelations({ documentId: document.documentId, direction: "both" }),
-      ]);
-
-      if (
-        !isCurrentRequestEpoch(documentContextRequestEpoch, requestEpoch) ||
-        selectedDocumentIdRef.current !== document.documentId
-      ) {
-        return;
-      }
-
-      setVersions(versionResponse.versions);
-      setRelations(relationResponse.relations);
-      setDocumentState({ kind: "idle" });
-      await runSearch(document.documentId, requestEpoch);
-    } catch (error: unknown) {
-      if (
-        isCurrentRequestEpoch(documentContextRequestEpoch, requestEpoch) &&
-        selectedDocumentIdRef.current === document.documentId
-      ) {
-        setDocumentState({ kind: "error", message: errorMessage(error) });
-        setSearchState({ kind: "idle" });
-      }
-    }
-  }
-
-  async function clearDocumentFilter() {
-    const requestEpoch = advanceRequestEpoch(documentContextRequestEpoch);
-    selectedDocumentIdRef.current = null;
-    setSelectedDocument(null);
-    setVersions([]);
-    setRelations([]);
-    setDocumentState({ kind: "idle" });
-    await runSearch(null, requestEpoch);
-  }
-
-  function submitSearch(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    void runSearch(selectedDocument?.documentId ?? null);
-  }
-
   function openCaseGraph() {
     if (!selectedCaseProjectIdRef.current) return;
     setGraphMode("case");
     setViewMode("graph");
   }
 
-  function openLawGraph(documentId: string) {
-    setGraphDocumentId(documentId);
-    setGraphMode("law");
-    setViewMode("graph");
-  }
-
-  async function openLocalLawRecord(
-    documentId: string,
-    label: string,
-    articleId?: string,
-  ) {
-    setViewMode("search");
-    setQuery(label);
-    queryRef.current = label;
-
-    const loaded = laws.find((law) => law.documentId === documentId);
-    if (loaded) {
-      await loadDocumentContext(loaded);
-      if (articleId && selectedDocumentIdRef.current === documentId) {
-        await loadArticleDetail(articleId);
-      }
-      return;
-    }
-
-    const lookupEpoch = advanceRequestEpoch(documentContextRequestEpoch);
-    advanceRequestEpoch(searchRequestEpoch);
-    advanceRequestEpoch(articleDetailRequestEpoch);
-    selectedDocumentIdRef.current = null;
-    setSelectedDocument(null);
-    setVersions([]);
-    setRelations([]);
-    setArticles([]);
-    setSelectedArticle(null);
-    setSelectedArticleId(null);
-    setSearchState({ kind: "loading" });
-    setDocumentState({ kind: "loading" });
-    try {
-      const response = await getLawDocument({ documentId });
-      if (!isCurrentRequestEpoch(documentContextRequestEpoch, lookupEpoch)) return;
-      const target = response.document;
-      if (!target) {
-        setSearchState({
-          kind: "error",
-          message: "当前本地法律库中没有找到对应法律文件。",
-        });
-        setDocumentState({ kind: "idle" });
-        return;
-      }
-      if (!exactLawDocumentMatchesRequest(target, documentId)) {
-        setSearchState({
-          kind: "error",
-          message: "法律文件校验未通过，已停止跳转，请重新检索。",
-        });
-        setDocumentState({ kind: "idle" });
-        return;
-      }
-      setLaws((current) =>
-        current.some((law) => law.documentId === documentId)
-          ? current
-          : [target, ...current],
-      );
-      await loadDocumentContext(target);
-      if (articleId && selectedDocumentIdRef.current === documentId) {
-        await loadArticleDetail(articleId);
-      }
-    } catch (error: unknown) {
-      if (!isCurrentRequestEpoch(documentContextRequestEpoch, lookupEpoch)) return;
-      setSearchState({ kind: "error", message: errorMessage(error) });
-      setDocumentState({ kind: "idle" });
-    }
-  }
-
-  async function openLawDocumentFromGraph(node: GraphNode) {
-    await openLocalLawRecord(node.sourceId, node.label);
-  }
-
-  async function openDocumentCitation(citation: DocumentCitation) {
-    const lookupEpoch = advanceRequestEpoch(documentContextRequestEpoch);
-    advanceRequestEpoch(searchRequestEpoch);
-    advanceRequestEpoch(articleDetailRequestEpoch);
-    setViewMode("search");
-    setDocumentState({ kind: "loading" });
-    setDetailState({ kind: "loading" });
-    try {
-      const response = await getArticle({ articleId: citation.articleId });
-      if (!isCurrentRequestEpoch(documentContextRequestEpoch, lookupEpoch)) return;
-      const article = response.article;
-      if (!articleMatchesDocumentCitation(article, citation)) {
-        setDocumentState({
-          kind: "error",
-          message: "该文书引用无法映射到当前正式本地法律库，已拒绝跳转。",
-        });
-        setDetailState({ kind: "idle" });
-        return;
-      }
-      await openLocalLawRecord(
-        article.documentId,
-        article.documentTitle,
-        article.articleId,
-      );
-    } catch (error: unknown) {
-      if (!isCurrentRequestEpoch(documentContextRequestEpoch, lookupEpoch)) return;
-      const message = errorMessage(error);
-      setDocumentState({ kind: "error", message });
-      setDetailState({ kind: "error", message });
-    }
-  }
-
   function openGraphNode(node: GraphNode) {
     const destination = graphNodeDestination(node);
     if (destination === "law") {
-      void openLawDocumentFromGraph(node);
+      void legalLibrary.openLawDocumentFromGraph(node);
       return;
     }
     if (destination === "case") {
@@ -2647,154 +1871,6 @@ export function App() {
       kind: "error",
       message: "暂不支持打开该项内容。",
     });
-  }
-
-  function buildLegalAnswerCandidateRequest() {
-    return createLegalAnswerCandidateRequest({
-      question: qaQuestion,
-      lawName: qaLawName,
-      articleNumber: qaArticleNumber,
-      keywords: qaKeywords,
-      caseDate: qaCaseDate,
-      effectivenessLevels: qaEffectivenessLevels,
-      includeExpired: qaIncludeExpired,
-      limit: 8,
-    });
-  }
-
-  async function previewLegalAnswerContext(event?: FormEvent<HTMLFormElement>) {
-    event?.preventDefault();
-    const request = buildLegalAnswerCandidateRequest();
-    if (!request.question) {
-      setQaState({ kind: "error", message: "请输入法律问题" });
-      return;
-    }
-    const previewEpoch = ++qaPreviewEpoch.current;
-    const previewProjectId = selectedCaseProjectIdRef.current;
-
-    setQaState({ kind: "loading" });
-    setQaAnswer(null);
-    setQaStream(INITIAL_LEGAL_ANSWER_STREAM_STATE);
-
-    try {
-      const response = await findLegalAnswerCandidates(request);
-      if (
-        qaPreviewEpoch.current !== previewEpoch ||
-        !legalAnswerPreviewStillOwnsCurrentScope(
-          previewProjectId,
-          selectedCaseProjectIdRef.current,
-        )
-      ) {
-        return;
-      }
-      setQaContext(response.context);
-      setSelectedQaSourceId(response.context.sources[0]?.sourceId ?? null);
-      setQaState({ kind: "idle" });
-    } catch (error: unknown) {
-      if (
-        qaPreviewEpoch.current !== previewEpoch ||
-        !legalAnswerPreviewStillOwnsCurrentScope(
-          previewProjectId,
-          selectedCaseProjectIdRef.current,
-        )
-      ) {
-        return;
-      }
-      setQaState({ kind: "error", message: errorMessage(error) });
-    }
-  }
-
-  function submitLegalAnswer(event?: FormEvent<HTMLFormElement>) {
-    event?.preventDefault();
-    redirectLegacyEgressToApprovedProvider(
-      "case_legal_qa",
-      "案件法律问答必须先完成本地脱敏和人工批准；已为你切换到 Approved Provider 的固定任务“案件法律问答”。",
-    );
-  }
-
-  async function cancelCurrentLegalAnswer() {
-    const requestId = activeQaRequestId.current;
-    const stream = qaStreamRef.current;
-    if (
-      !requestId ||
-      !shouldCancelLegalAnswerOnPageLeave(stream, requestId)
-    ) {
-      return;
-    }
-
-    const previousStatus = stream.status === "streaming" ? "streaming" : "connecting";
-    setQaStream((current) => markLegalAnswerCancelling(current));
-    try {
-      const response = await cancelLegalAnswer({ requestId });
-      if (activeQaRequestId.current !== requestId) {
-        return;
-      }
-      if (response.cancelled) {
-        activeQaRequestId.current = null;
-        activeQaRequestProjectId.current = null;
-        setQaStream((current) =>
-          settleLegalAnswerCancellation(current, requestId, true),
-        );
-        setQaState({ kind: "idle" });
-      } else {
-        setQaStream((current) =>
-          restoreLegalAnswerAfterRejectedCancellation(
-            current,
-            requestId,
-            previousStatus,
-          ),
-        );
-      }
-    } catch (error: unknown) {
-      setQaStream((current) => {
-        const restored = restoreLegalAnswerAfterRejectedCancellation(
-          current,
-          requestId,
-          previousStatus,
-        );
-        return restored === current
-          ? current
-          : {
-              ...restored,
-              message: `取消请求失败：${errorMessage(error)}；等待当前请求结束`,
-            };
-      });
-    }
-  }
-
-  function selectQaSource(source: LegalSource) {
-    setSelectedQaSourceId(source.sourceId);
-  }
-
-  function restoreLegalAnswerRecord(record: LegalAnswerRecord) {
-    if (record.projectId !== selectedCaseProjectId) {
-      setQaHistoryState({
-        kind: "error",
-        message: "该历史回答不属于当前案件，已拒绝恢复。",
-      });
-      return;
-    }
-    const context = legalAnswerContextFromRecord(record);
-    const formDraft = qaFormDraftFromLegalAnswerRecord(record);
-    setQaAnswer({
-      providerId: record.providerId,
-      answer: record.answer,
-      context,
-      citationReport: record.citationReport,
-      recordId: record.recordId,
-    });
-    setQaContext(context);
-    setQaSubmittedQuestion(formDraft.question);
-    setQaQuestion(formDraft.question);
-    setQaLawName(formDraft.lawName);
-    setQaArticleNumber(formDraft.articleNumber);
-    setQaKeywords(formDraft.keywords);
-    setQaCaseDate(formDraft.caseDate);
-    setQaEffectivenessLevels(formDraft.effectivenessLevels);
-    setQaIncludeExpired(formDraft.includeExpired);
-    setSelectedQaSourceId(context.sources[0]?.sourceId ?? null);
-    setQaStream(INITIAL_LEGAL_ANSWER_STREAM_STATE);
-    setQaState({ kind: "idle" });
   }
 
   function resetAllCaseEntityDrafts(
@@ -3898,48 +2974,10 @@ export function App() {
     activeCaseEntityEditor,
     "legal_issue",
   );
-  const activeQaContext = qaAnswer?.context ?? qaContext;
-  const selectedQaSource = resolveSelectedQaSource(
-    activeQaContext,
-    selectedQaSourceId,
-  );
-  const answeredQaQuestion = resolveLegalAnswerQuestion(
-    qaAnswer?.context ?? null,
-    qaSubmittedQuestion,
-  );
-  const answeredQaScope = qaAnswer
-    ? [
-        qaAnswer.context.query.lawNames.length > 0
-          ? `法律：${qaAnswer.context.query.lawNames.join("、")}`
-          : null,
-        qaAnswer.context.query.articleNumbers.length > 0
-          ? `条号：${qaAnswer.context.query.articleNumbers.join("、")}`
-          : null,
-        qaAnswer.context.query.keywords.length > 0
-          ? `关键词：${qaAnswer.context.query.keywords.join("、")}`
-          : null,
-        qaAnswer.context.query.caseDate
-          ? `案件日期：${qaAnswer.context.query.caseDate}`
-          : null,
-        qaAnswer.context.query.effectivenessLevels.length > 0
-          ? `效力层级：${qaAnswer.context.query.effectivenessLevels.join("、")}`
-          : null,
-        qaAnswer.context.query.includeExpired ? "包含失效版本" : null,
-      ]
-        .filter((item): item is string => item !== null)
-        .join("；")
-    : "";
-  const qaRequestLocked =
-    qaState.kind === "loading" || isLegalAnswerStreamActive(qaStream);
   const paginatedCaseProjects = paginateCaseProjects(
     caseProjects,
     caseProjectPage,
   );
-  const assistantActiveProject = selectedCaseProjectId
-    ? caseProjects.find(
-        (project) => project.projectId === selectedCaseProjectId,
-      ) ?? null
-    : null;
   const assistantProposalApplyBlockedReason =
     dirtyCaseDraftsForClose.current.length > 0
       ? "案件工作台仍有未保存草稿。请先保存或清空草稿，再确认写入助理建议。"
@@ -3967,67 +3005,31 @@ export function App() {
     setViewMode("assistant");
   }
 
-  async function addSelectedArticleToAssistant() {
-    if (
-      !selectedArticle ||
-      !assistantConversation ||
-      legalSourceBridgeMutationActive.current
-    ) {
-      return;
+  async function addLegalSourceToAssistant(sourceId: string) {
+    if (!assistantConversation) {
+      throw new Error("当前没有可接收法律来源的助理会话");
     }
-    legalSourceBridgeMutationActive.current = true;
-    setLegalSourceBridgeState({ kind: "loading" });
-    try {
-      await addAssistantLegalSource({
-        conversationId: assistantConversation.conversationId,
-        sourceId: selectedArticle.citationId,
-      });
-      setAssistantRefreshKey((current) => current + 1);
-      setLegalSourceBridgeState({
-        kind: "success",
-        message: `已加入助理会话“${publicTitle(assistantConversation.title, "助理会话")}”。`,
-      });
-    } catch (error: unknown) {
-      setLegalSourceBridgeState({
-        kind: "error",
-        message: `加入助理会话失败：${errorMessage(error)}`,
-      });
-    } finally {
-      legalSourceBridgeMutationActive.current = false;
-    }
+    await addAssistantLegalSource({
+      conversationId: assistantConversation.conversationId,
+      sourceId,
+    });
+    setAssistantRefreshKey((current) => current + 1);
   }
 
-  async function proposeSelectedArticleForCase() {
+  async function proposeAssistantLegalBasisForCase(sourceId: string) {
     if (
-      !selectedArticle ||
       !assistantConversation ||
       !selectedCaseProjectId ||
-      assistantConversation.projectId !== selectedCaseProjectId ||
-      legalSourceBridgeMutationActive.current
+      assistantConversation.projectId !== selectedCaseProjectId
     ) {
-      return;
+      throw new Error("当前助理会话未绑定所选案件");
     }
-    legalSourceBridgeMutationActive.current = true;
-    setLegalSourceBridgeState({ kind: "loading" });
-    try {
-      await proposeAssistantLegalBasis({
-        conversationId: assistantConversation.conversationId,
-        projectId: selectedCaseProjectId,
-        sourceId: selectedArticle.citationId,
-      });
-      setAssistantRefreshKey((current) => current + 1);
-      setLegalSourceBridgeState({
-        kind: "success",
-        message: `已为案件“${assistantActiveProject?.title ?? "当前案件"}”生成待确认法律依据；请到助理右侧审阅，尚未写入案件。`,
-      });
-    } catch (error: unknown) {
-      setLegalSourceBridgeState({
-        kind: "error",
-        message: `生成待确认法律依据失败：${errorMessage(error)}`,
-      });
-    } finally {
-      legalSourceBridgeMutationActive.current = false;
-    }
+    await proposeAssistantLegalBasis({
+      conversationId: assistantConversation.conversationId,
+      projectId: selectedCaseProjectId,
+      sourceId,
+    });
+    setAssistantRefreshKey((current) => current + 1);
   }
 
   function redirectLegacyEgressToApprovedProvider(
@@ -4090,8 +3092,7 @@ export function App() {
     setCloseProtectionMessage(null);
     if (nextView === "graph") {
       if (selectedCaseProjectId) setGraphMode("case");
-      else if (selectedDocument) {
-        setGraphDocumentId(selectedDocument.documentId);
+      else if (legalLibrary.search.selectedDocument) {
         setGraphMode("law");
       }
     }
@@ -4212,752 +3213,30 @@ export function App() {
       </div>
 
       {viewMode === "assistant" ? null : viewMode === "search" ? (
-        <LegalLibraryWorkspace>
-          <section className="query-band" aria-label="检索条件">
-            <form className="search-form" onSubmit={submitSearch}>
-              <label>
-                <span>关键词</span>
-                <input
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="法律名称、条文关键词"
-                />
-              </label>
-              <label>
-                <span>案件日期</span>
-                <input
-                  type="date"
-                  value={caseDate}
-                  onChange={(event) => setCaseDate(event.target.value)}
-                />
-              </label>
-              <button type="submit">检索</button>
-            </form>
-
-            <div className="filter-row">
-              <span>
-                {selectedDocument
-                  ? `当前法律：${selectedDocument.title}`
-                  : "全部法律"}
-              </span>
-              {selectedDocument ? (
-                <div className="command-row">
-                  <button
-                    type="button"
-                    onClick={() => openLawGraph(selectedDocument.documentId)}
-                  >
-                    查看法律关系图
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void clearDocumentFilter()}
-                  >
-                    清除筛选
-                  </button>
-                </div>
-              ) : null}
-            </div>
-          </section>
-
-          <section className="workspace-grid">
-            <aside
-              className="panel law-panel"
-              aria-labelledby="law-panel-title"
-            >
-              <div className="panel-heading">
-                <h2 id="law-panel-title">法律</h2>
-                <span>{laws.length}</span>
-              </div>
-              {searchState.kind === "error" ? (
-                <p className="error-text">{searchState.message}</p>
-              ) : null}
-              <div className="result-list">
-                {laws.map((law) => (
-                  <button
-                    className={`law-item ${
-                      selectedDocument?.documentId === law.documentId
-                        ? "is-selected"
-                        : ""
-                    }`}
-                    key={law.documentId}
-                    type="button"
-                    onClick={() => void loadDocumentContext(law)}
-                  >
-                    <span className="item-title">
-                      {publicTitle(
-                        law.title,
-                        `${publicTitle(law.authorityName, "发布机关")}发布的${publicTitle(law.documentType, "法律文件")}`,
-                      )}
-                    </span>
-                    <span className="item-meta">
-                      {formatStatus(law.status)} · {law.authorityName}
-                    </span>
-                    <span className="item-summary">
-                      内容摘要：{publicContentSummary(law.summary)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </aside>
-
-            <section
-              className="panel article-panel"
-              aria-labelledby="article-title"
-            >
-              <div className="panel-heading">
-                <h2 id="article-title">法条</h2>
-                <span>
-                  {searchState.kind === "loading" ? "检索中" : articles.length}
-                </span>
-              </div>
-              <div className="article-list">
-                {articles.map((article) => (
-                  <button
-                    className={`article-item ${
-                      selectedArticleId === article.articleId
-                        ? "is-selected"
-                        : ""
-                    }`}
-                    key={article.articleId}
-                    type="button"
-                    onClick={() => void loadArticleDetail(article.articleId)}
-                  >
-                    <span className="item-title">
-                      {formatArticleLabel(article)}
-                    </span>
-                    <span className="item-meta">
-                      {formatStatus(article.versionStatus)} ·{" "}
-                      {formatEffectiveWindow(
-                        article.effectiveFrom,
-                        article.effectiveTo,
-                      )}
-                    </span>
-                    <span className="item-summary">
-                      内容摘要：{publicContentSummary(article.snippet)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </section>
-
-            <aside
-              className="panel detail-panel"
-              aria-labelledby="detail-title"
-            >
-              <div className="panel-heading">
-                <h2 id="detail-title">详情</h2>
-                <span>{detailState.kind === "loading" ? "读取中" : "本地"}</span>
-              </div>
-
-              {detailState.kind === "error" ? (
-                <p className="error-text">{detailState.message}</p>
-              ) : null}
-
-              {selectedArticle ? (
-                <article className="article-detail">
-                  <p className="detail-kicker">
-                    {selectedArticle.canonicalLabel}
-                  </p>
-                  <h3>{formatArticleLabel(selectedArticle)}</h3>
-                  <p className="article-content">{selectedArticle.content}</p>
-                  <div className="command-row">
-                    <button
-                      disabled={
-                        !assistantConversation ||
-                        legalSourceBridgeState.kind === "loading"
-                      }
-                      type="button"
-                      onClick={() => void addSelectedArticleToAssistant()}
-                    >
-                      {legalSourceBridgeState.kind === "loading"
-                        ? "正在加入…"
-                        : "加入当前助理会话"}
-                    </button>
-                    <button
-                      disabled={
-                        !assistantConversation ||
-                        !selectedCaseProjectId ||
-                        assistantConversation.projectId !== selectedCaseProjectId ||
-                        legalSourceBridgeState.kind === "loading"
-                      }
-                      type="button"
-                      onClick={() => void proposeSelectedArticleForCase()}
-                    >
-                      加入当前案件（待确认）
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        assistantActiveProject
-                          ? continueSelectedCaseInAssistant()
-                          : navigateFromShell("assistant")
-                      }
-                    >
-                      {assistantActiveProject ? "在案件助理中继续" : "打开助理"}
-                    </button>
-                  </div>
-                  <p
-                    className={
-                      legalSourceBridgeState.kind === "error"
-                        ? "error-text"
-                        : "privacy-note"
-                    }
-                    role={
-                      legalSourceBridgeState.kind === "error"
-                        ? "alert"
-                        : "status"
-                    }
-                  >
-                    {legalSourceBridgeState.kind === "success" ||
-                    legalSourceBridgeState.kind === "error"
-                      ? legalSourceBridgeState.message
-                      : assistantConversation
-                        ? assistantActiveProject &&
-                          assistantConversation.projectId !==
-                            assistantActiveProject.projectId
-                          ? `当前助理会话“${publicTitle(assistantConversation.title, "助理会话")}”未绑定所选案件；请先点“在案件助理中继续”，再返回生成待确认法律依据。`
-                          : `目标会话：${publicTitle(assistantConversation.title, "助理会话")}`
-                        : "请先在助理中创建或选择一个会话。"}
-                  </p>
-                  <dl className="meta-grid">
-                    <div>
-                      <dt>效力期间</dt>
-                      <dd>
-                        {formatEffectiveWindow(
-                          selectedArticle.effectiveFrom,
-                          selectedArticle.effectiveTo,
-                        )}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>主题</dt>
-                      <dd>
-                        {selectedArticle.topics.length > 0
-                          ? selectedArticle.topics.join("、")
-                          : "未标注"}
-                      </dd>
-                    </div>
-                  </dl>
-                </article>
-              ) : (
-                <p className="empty-state">暂无法条详情</p>
-              )}
-
-              <section className="detail-section" aria-labelledby="version-title">
-                <div className="section-heading">
-                  <h3 id="version-title">版本</h3>
-                  <span>
-                    {documentState.kind === "loading"
-                      ? "读取中"
-                      : versions.length}
-                  </span>
-                </div>
-                {documentState.kind === "error" ? (
-                  <p className="error-text" role="alert">
-                    法律版本或关系上下文加载失败：{documentState.message}
-                  </p>
-                ) : null}
-                <div className="compact-list">
-                  {versions.map((version) => (
-                    <div className="compact-row" key={version.versionId}>
-                      <strong>{version.versionLabel}</strong>
-                      <span>
-                        {formatStatus(version.status)} ·{" "}
-                        {formatEffectiveWindow(
-                          version.effectiveFrom,
-                          version.effectiveTo,
-                        )}
-                      </span>
-                      <span>{version.articleCount} 条</span>
-                    </div>
-                  ))}
-                </div>
-              </section>
-
-              <section className="detail-section" aria-labelledby="relation-title">
-                <div className="section-heading">
-                  <h3 id="relation-title">关系</h3>
-                  <span>{relations.length}</span>
-                </div>
-                <div className="compact-list">
-                  {relations.map((relation) => (
-                    <div className="compact-row" key={relation.relationId}>
-                      <strong>
-                        {formatStatus(relation.relationType)} ·{" "}
-                        {relation.toTitle}
-                      </strong>
-                      <span>
-                        {sanitizePublicGeneratedText(
-                          relation.description,
-                          "关系说明暂不可用。",
-                        )}
-                      </span>
-                      {relation.sourceReference ? <span>官方来源记录已保留</span> : null}
-                    </div>
-                  ))}
-                </div>
-              </section>
-            </aside>
-          </section>
-        </LegalLibraryWorkspace>
+        <LegalLibrarySearchWorkspace controller={legalLibrary} />
       ) : viewMode === "qa" ? (
-        <section className="qa-layout">
-          <aside className="panel qa-control-panel" aria-labelledby="qa-control-title">
-            <div className="panel-heading">
-              <h2 id="qa-control-title">问题</h2>
-              <span>{formatLegalAnswerStreamStatus(qaStream)}</span>
-            </div>
-            <form className="qa-form" onSubmit={submitLegalAnswer}>
-              <p className="privacy-note">
-                回答归属：
-                {caseWorkspace && selectedCaseProjectId
-                  ? publicTitle(caseWorkspace.project.title, "当前案件")
-                  : "未选择已保存案件；可检索来源，但不能生成或保存回答"}
-              </p>
-              <fieldset
-                className="qa-request-fields"
-                disabled={qaRequestLocked}
-              >
-              <label>
-                <span>法律问题</span>
-                <textarea
-                  value={qaQuestion}
-                  onChange={(event) => setQaQuestion(event.target.value)}
-                  placeholder="输入需要检索和回答的法律问题"
-                />
-              </label>
-              <div className="form-grid">
-                <label>
-                  <span>法律名称</span>
-                  <input
-                    value={qaLawName}
-                    onChange={(event) => setQaLawName(event.target.value)}
-                    placeholder="如：民法典"
-                  />
-                </label>
-                <label>
-                  <span>条号</span>
-                  <input
-                    value={qaArticleNumber}
-                    onChange={(event) => setQaArticleNumber(event.target.value)}
-                    placeholder="如：第五百七十七条"
-                  />
-                </label>
-              </div>
-              <label>
-                <span>关键词</span>
-                <input
-                  value={qaKeywords}
-                  onChange={(event) => setQaKeywords(event.target.value)}
-                  placeholder="空格、逗号或顿号分隔"
-                />
-              </label>
-              <div className="form-grid">
-                <label>
-                  <span>案件日期</span>
-                  <input
-                    type="date"
-                    value={qaCaseDate}
-                    onChange={(event) => setQaCaseDate(event.target.value)}
-                  />
-                  <small>
-                    留空按当前有效性检索；不会以立案/接案日期代替案件事实日期。
-                  </small>
-                </label>
-                <label>
-                  <span>Provider</span>
-                  <select
-                    value={qaProviderId}
-                    onChange={(event) => setQaProviderId(event.target.value)}
-                  >
-                    <option value="">选择 Provider</option>
-                    {providerProfiles.map((profile) => (
-                      <option key={profile.id} value={profile.id}>
-                        {profile.displayName}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <fieldset className="qa-effectiveness-filter">
-                <legend>效力层级（可多选）</legend>
-                <div className="toggle-row">
-                  {EFFECTIVENESS_LEVEL_OPTIONS.map(([value, label]) => (
-                    <label key={value}>
-                      <input
-                        type="checkbox"
-                        checked={qaEffectivenessLevels.includes(value)}
-                        onChange={(event) =>
-                          setQaEffectivenessLevels((current) =>
-                            event.target.checked
-                              ? [...current, value]
-                              : current.filter((level) => level !== value),
-                          )
-                        }
-                      />
-                      <span>{label}</span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-              <label className="inline-check">
-                <input
-                  type="checkbox"
-                  checked={qaIncludeExpired}
-                  onChange={(event) =>
-                    setQaIncludeExpired(event.target.checked)
-                  }
-                />
-                <span>包含失效版本</span>
-              </label>
-              </fieldset>
-              <div className="command-row">
-                <button
-                  type="button"
-                  disabled={qaRequestLocked}
-                  onClick={() => void previewLegalAnswerContext()}
-                >
-                  本地检索来源
-                </button>
-                <button
-                  type="submit"
-                  disabled={qaRequestLocked}
-                >
-                  转到脱敏批准后问答
-                </button>
-                {isLegalAnswerStreamCancellable(qaStream) ? (
-                  <button
-                    type="button"
-                    onClick={() => void cancelCurrentLegalAnswer()}
-                  >
-                    取消生成
-                  </button>
-                ) : null}
-              </div>
-            </form>
-            {qaState.kind === "error" ? (
-              <p className="error-text" role="alert">
-                {qaState.message}
-              </p>
-            ) : null}
-            {activeQaContext && activeQaContext.warnings.length > 0 ? (
-              <div
-                className="context-warning-list"
-                role="status"
-                aria-label="法律检索风险提示"
-              >
-                {activeQaContext.warnings.map((warning, index) => (
-                  <p key={`${index}-${warning}`}>
-                    {formatLegalContextWarning(warning)}
-                  </p>
-                ))}
-              </div>
-            ) : null}
-            <section
-              className="detail-section"
-              aria-labelledby="qa-history-title"
-            >
-              <div className="section-heading">
-                <h3 id="qa-history-title">当前案件问答历史</h3>
-                <span>
-                  {qaHistoryState.kind === "loading"
-                    ? "读取中"
-                    : qaHistoryRecords.length}
-                </span>
-              </div>
-              {qaHistoryState.kind === "error" ? (
-                <p className="error-text" role="alert">
-                  历史回答读取失败：{qaHistoryState.message}
-                </p>
-              ) : null}
-              <div className="qa-history-list">
-                {qaHistoryRecords.map((record) => (
-                  <button
-                    className="qa-history-item"
-                    disabled={qaRequestLocked}
-                    key={record.recordId}
-                    type="button"
-                    aria-label={`恢复历史回答：${record.question}`}
-                    onClick={() => restoreLegalAnswerRecord(record)}
-                  >
-                    <strong>{record.question}</strong>
-                    <span>
-                      保存于 {record.createdAt.replace("T", " ").replace("Z", "")}
-                    </span>
-                    <span>
-                      {record.citationReport.validCount} 条法条依据
-                      {record.citationReport.invalidCount > 0
-                        ? ` · ${record.citationReport.invalidCount} 条需要核对`
-                        : ""}
-                    </span>
-                  </button>
-                ))}
-                {selectedCaseProjectId &&
-                qaHistoryState.kind !== "loading" &&
-                qaHistoryRecords.length === 0 ? (
-                  <p className="empty-state">当前案件暂无已保存回答</p>
-                ) : null}
-                {selectedCaseProjectId && qaHistoryHasMore ? (
-                  <button
-                    className="secondary-action"
-                    disabled={
-                      qaRequestLocked || qaHistoryState.kind === "loading"
-                    }
-                    type="button"
-                    onClick={() =>
-                      void refreshLegalAnswerHistory(
-                        selectedCaseProjectId,
-                        true,
-                      )
-                    }
-                  >
-                    {qaHistoryState.kind === "loading"
-                      ? "正在读取…"
-                      : "加载更早回答"}
-                  </button>
-                ) : null}
-                {!selectedCaseProjectId ? (
-                  <p className="empty-state">请先在案件工作台选择案件</p>
-                ) : null}
-              </div>
-            </section>
-            <section className="detail-section" aria-labelledby="qa-source-title">
-              <div className="section-heading">
-                <h3 id="qa-source-title">候选来源</h3>
-                <span>{activeQaContext?.sources.length ?? 0}</span>
-              </div>
-              <div className="source-list">
-                {activeQaContext?.sources.map((source) => (
-                  <button
-                    className={`source-item ${
-                      selectedQaSource?.sourceId === source.sourceId
-                        ? "is-selected"
-                        : ""
-                    }`}
-                    key={source.sourceId}
-                    type="button"
-                    onClick={() => selectQaSource(source)}
-                  >
-                    <span className="item-title">
-                      {formatLegalSourceLabel(source)}
-                    </span>
-                    <span className="item-meta">
-                      {formatStatus(source.versionStatus)} ·{" "}
-                      {formatEffectiveWindow(
-                        source.effectiveFrom,
-                        source.effectiveTo,
-                      )}
-                    </span>
-                    <span className="item-summary">
-                      内容摘要：{publicContentSummary(source.snippet)}
-                    </span>
-                  </button>
-                ))}
-                {activeQaContext && activeQaContext.sources.length === 0 ? (
-                  <p className="empty-state">未找到本地候选来源</p>
-                ) : null}
-              </div>
-            </section>
-          </aside>
-
-          <section className="panel qa-answer-panel" aria-labelledby="qa-answer-title">
-            <div className="panel-heading">
-              <h2 id="qa-answer-title">回答</h2>
-              <span>
-                {qaAnswer
-                  ? `${qaAnswer.citationReport.validCount} 条法条依据`
-                  : formatLegalAnswerStreamStatus(qaStream)}
-              </span>
-            </div>
-            {answeredQaQuestion ? (
-              <p className="answer-query" role="status">
-                <strong>本次回答对应问题</strong>
-                <span>{answeredQaQuestion}</span>
-                {answeredQaScope ? (
-                  <span className="answer-query-meta">{answeredQaScope}</span>
-                ) : null}
-              </p>
-            ) : null}
-            {qaStream.status === "error" || qaStream.status === "cancelled" ? (
-              <p className="error-text">
-                {qaStream.status === "cancelled"
-                  ? "回答生成已取消。"
-                  : publicErrorMessage(
-                      qaStream.message,
-                      "回答生成未完成，请重试。",
-                    )}
-              </p>
-            ) : null}
-            {qaAnswer ? (
-              <>
-                {qaAnswer.citationReport.unsupportedLegalConclusion ? (
-                  <p className="risk-banner">
-                    部分法律结论缺少可核对的法条依据，请补充依据后再使用。
-                  </p>
-                ) : !qaAnswer.citationReport.semanticSupportVerified ? (
-                  <p className="risk-banner">
-                    本回答依据本地法律资料生成，请结合案件事实逐条核对并由律师审定。
-                  </p>
-                ) : null}
-                <article className="answer-box">
-                  <p>
-                    {segmentLegalAnswer(
-                      qaAnswer.answer,
-                      qaAnswer.citationReport.citations,
-                    ).map((segment) =>
-                      segment.kind === "text" ? (
-                        <span key={segment.key}>
-                          {sanitizePublicGeneratedText(segment.text, "")}
-                        </span>
-                      ) : citationHasTrustedSource(segment.citation) ? (
-                        <button
-                          className="answer-citation answer-citation--valid"
-                          key={segment.key}
-                          type="button"
-                          title="打开本地法条原文"
-                          onClick={() =>
-                            setSelectedQaSourceId(
-                              segment.citation.source!.sourceId,
-                            )
-                          }
-                        >
-                          {segment.text}
-                        </button>
-                      ) : (
-                        <span
-                          className="answer-citation answer-citation--invalid"
-                          key={segment.key}
-                          title={formatCitationInvalidReason(
-                            segment.citation.reason,
-                          )}
-                        >
-                          {segment.text}
-                        </span>
-                      ),
-                    )}
-                  </p>
-                </article>
-                <div className="answer-meta-row">
-                  <span>{qaAnswer.recordId ? "回答已保存" : "本次回答尚未保存"}</span>
-                </div>
-                <section className="detail-section" aria-labelledby="qa-citation-title">
-                  <div className="section-heading">
-                    <h3 id="qa-citation-title">法律依据与案例引用表</h3>
-                    <span>{formatCitationValidationSummary(qaAnswer.citationReport)}</span>
-                  </div>
-                  <p className="validation-scope-note">
-                    以下列明本回答采用的法律依据；适用结论仍应结合案件事实由律师审定。
-                  </p>
-                  <div className="citation-list">
-                    {qaAnswer.citationReport.citations.map((citation, index) => {
-                      const key = `${citation.rawMarker}-${citation.sourceId}-${index}`;
-                      const content = (
-                        <>
-                          <strong>
-                            {citation.source
-                              ? formatLegalSourceLabel(citation.source)
-                              : `第 ${index + 1} 条依据`}
-                          </strong>
-                          <span>
-                            {citation.status === "valid"
-                              ? "查看法条原文"
-                              : formatCitationInvalidReason(citation.reason)}
-                          </span>
-                        </>
-                      );
-
-                      return citationHasTrustedSource(citation) ? (
-                        <button
-                          className="citation-item citation-item--valid"
-                          key={key}
-                          type="button"
-                          onClick={() =>
-                            setSelectedQaSourceId(citation.source.sourceId)
-                          }
-                        >
-                          {content}
-                        </button>
-                      ) : (
-                        <div
-                          className="citation-item citation-item--invalid"
-                          key={key}
-                        >
-                          {content}
-                        </div>
-                      );
-                    })}
-                    {qaAnswer.citationReport.citations.length === 0 ? (
-                      <p className="empty-state">本回答未列出法条或案例依据</p>
-                    ) : null}
-                  </div>
-                </section>
-              </>
-            ) : qaStream.answer ? (
-              <>
-                <p className="risk-banner">
-                  {qaStream.status === "finalizing"
-                    ? "回答已保存，正在载入法条依据。"
-                    : "回答正在生成，完成后将在此显示。"}
-                </p>
-              </>
-            ) : (
-              <p className="empty-state">
-                先检索本地法律资料；完成模型服务和访问凭据设置后再生成回答。
-              </p>
-            )}
-          </section>
-
-          <aside className="panel qa-source-detail" aria-labelledby="qa-detail-title">
-            <div className="panel-heading">
-              <h2 id="qa-detail-title">本地原文</h2>
-              <span>{selectedQaSource ? "可追溯" : "未选择"}</span>
-            </div>
-            {selectedQaSource ? (
-              <article className="article-detail">
-                <h3>{formatLegalSourceLabel(selectedQaSource)}</h3>
-                <p className="article-content">{selectedQaSource.content}</p>
-                <dl className="meta-grid">
-                  <div>
-                    <dt>版本</dt>
-                    <dd>{selectedQaSource.versionLabel}</dd>
-                  </div>
-                  <div>
-                    <dt>效力期间</dt>
-                    <dd>
-                      {formatEffectiveWindow(
-                        selectedQaSource.effectiveFrom,
-                        selectedQaSource.effectiveTo,
-                      )}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>状态</dt>
-                    <dd>{formatStatus(selectedQaSource.versionStatus)}</dd>
-                  </div>
-                </dl>
-                <button
-                  type="button"
-                  onClick={() => openLawGraph(selectedQaSource.documentId)}
-                >
-                  查看该法律关系图
-                </button>
-              </article>
-            ) : (
-              <p className="empty-state">选择候选来源或有效引用查看原文</p>
-            )}
-          </aside>
-        </section>
+        <LegacyQaWorkspace
+          caseWorkspace={caseWorkspace}
+          controller={legalLibrary}
+          providerProfiles={providerProfiles}
+        />
       ) : viewMode === "documents" ? (
         <Suspense fallback={<p className="empty-state">正在加载文书工作台…</p>}>
           <DocumentWorkspace
             projectId={selectedCaseProjectId}
-            onOpenCitation={(citation) => void openDocumentCitation(citation)}
+            onOpenCitation={(citation) =>
+              void legalLibrary.openDocumentCitation(citation)
+            }
           />
         </Suspense>
       ) : viewMode === "graph" ? (
         <Suspense fallback={<p className="empty-state">正在加载关系图…</p>}>
           <GraphWorkspace
-            documentId={graphDocumentId ?? selectedDocument?.documentId ?? null}
+            documentId={
+              legalLibrary.graphDocumentId ??
+              legalLibrary.search.selectedDocument?.documentId ??
+              null
+            }
             mode={graphMode}
             projectId={selectedCaseProjectId}
             onModeChange={setGraphMode}
@@ -6206,7 +4485,7 @@ export function App() {
                         onChange={(event) => setBasisSourceId(event.target.value)}
                       >
                         <option value="">请选择已检索的法律来源</option>
-                        {(activeQaContext?.sources ?? []).map((source) => (
+                        {legalLibrary.activeSources.map((source) => (
                           <option key={source.sourceId} value={source.sourceId}>
                             {formatLegalSourceLabel(source)}
                           </option>
