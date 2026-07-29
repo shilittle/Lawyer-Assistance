@@ -6,7 +6,7 @@ import {
   providerApiKeyOverwriteConfirmation,
   providerDeletionConfirmation,
   runConfirmedDestructiveAction,
-} from "./App";
+} from "./features/settings/providers/policies";
 import {
   assistantWritesBlockClose,
   canBypassDirtyDraftsForWorkspaceRecovery,

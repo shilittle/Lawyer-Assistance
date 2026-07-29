@@ -1,3 +1,4 @@
+import { sameRouteLocation, type AppRoute } from "./routes";
 import type { ViewMode } from "./views";
 
 export type CaseDraftKind =
@@ -105,6 +106,13 @@ export function decideMcpWorkspaceNavigation(
   if (currentView === nextView) {
     return { kind: "proceed" };
   }
+  return decideChangedMcpWorkspaceNavigation(mutationInFlight, draftDirty);
+}
+
+function decideChangedMcpWorkspaceNavigation(
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
   if (mutationInFlight) {
     return {
       kind: "block",
@@ -122,6 +130,18 @@ export function decideMcpWorkspaceNavigation(
   return { kind: "proceed" };
 }
 
+export function decideMcpRouteNavigation(
+  currentRoute: AppRoute,
+  nextRoute: AppRoute,
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
+  if (sameRouteLocation(currentRoute, nextRoute)) {
+    return { kind: "proceed" };
+  }
+  return decideChangedMcpWorkspaceNavigation(mutationInFlight, draftDirty);
+}
+
 export function decidePrivacyWorkspaceNavigation(
   currentView: ViewMode,
   nextView: ViewMode,
@@ -134,6 +154,16 @@ export function decidePrivacyWorkspaceNavigation(
   if (currentView !== "privacy") {
     return { kind: "proceed" };
   }
+  return decideChangedPrivacyWorkspaceNavigation(
+    mutationInFlight,
+    draftDirty,
+  );
+}
+
+function decideChangedPrivacyWorkspaceNavigation(
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
   if (mutationInFlight) {
     return {
       kind: "block",
@@ -149,6 +179,27 @@ export function decidePrivacyWorkspaceNavigation(
     };
   }
   return { kind: "proceed" };
+}
+
+export function decidePrivacyRouteNavigation(
+  currentRoute: AppRoute,
+  nextRoute: AppRoute,
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
+  if (sameRouteLocation(currentRoute, nextRoute)) {
+    return { kind: "proceed" };
+  }
+  if (
+    currentRoute.area !== "settings" ||
+    currentRoute.page !== "privacy"
+  ) {
+    return { kind: "proceed" };
+  }
+  return decideChangedPrivacyWorkspaceNavigation(
+    mutationInFlight,
+    draftDirty,
+  );
 }
 
 export function assistantWritesBlockClose(

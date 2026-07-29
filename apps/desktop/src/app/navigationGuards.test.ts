@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   assistantWritesBlockClose,
   canBypassDirtyDraftsForWorkspaceRecovery,
+  decideMcpRouteNavigation,
   decideMcpWorkspaceNavigation,
+  decidePrivacyRouteNavigation,
   decidePrivacyWorkspaceNavigation,
   decideWorkspaceClose,
   workspaceCloseWasApproved,
@@ -107,6 +109,87 @@ describe("navigation guards", () => {
     ).toEqual({ kind: "proceed" });
   });
 
+  it("treats route-state changes at one location as non-navigation", () => {
+    const currentPrivacyRoute = {
+      area: "settings",
+      page: "privacy",
+      state: {
+        kind: "approved-provider-task",
+        request: {
+          task: "case_legal_qa",
+          notice: "第一次请求",
+          requestId: 1,
+        },
+      },
+    } as const;
+    const nextPrivacyRoute = {
+      area: "settings",
+      page: "privacy",
+      state: {
+        kind: "approved-provider-task",
+        request: {
+          task: "document_generation",
+          notice: "第二次请求",
+          requestId: 2,
+        },
+      },
+    } as const;
+
+    expect(
+      decideMcpRouteNavigation(
+        currentPrivacyRoute,
+        nextPrivacyRoute,
+        true,
+        true,
+      ),
+    ).toEqual({ kind: "proceed" });
+    expect(
+      decidePrivacyRouteNavigation(
+        currentPrivacyRoute,
+        nextPrivacyRoute,
+        true,
+        true,
+      ),
+    ).toEqual({ kind: "proceed" });
+  });
+
+  it("preserves MCP protection for every different typed location", () => {
+    expect(
+      decideMcpRouteNavigation(
+        { area: "assistant", page: "chat" },
+        { area: "cases", page: "overview" },
+        true,
+        true,
+      ),
+    ).toEqual({
+      kind: "block",
+      message:
+        "MCP 服务配置或生命周期变更尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
+    });
+
+    expect(
+      decideMcpRouteNavigation(
+        { area: "cases", page: "overview" },
+        { area: "cases", page: "work" },
+        false,
+        true,
+      ),
+    ).toEqual({
+      kind: "confirm_discard",
+      message:
+        "切换工作区将永久丢弃未保存的 MCP 服务配置或待写入 Bearer Token。确定继续吗？",
+    });
+
+    expect(
+      decideMcpRouteNavigation(
+        { area: "settings", page: "mcp" },
+        { area: "assistant", page: "chat" },
+        false,
+        false,
+      ),
+    ).toEqual({ kind: "proceed" });
+  });
+
   it("preserves privacy protection only when leaving the privacy view", () => {
     expect(
       decidePrivacyWorkspaceNavigation("privacy", "privacy", true, true),
@@ -130,6 +213,52 @@ describe("navigation guards", () => {
     });
     expect(
       decidePrivacyWorkspaceNavigation("privacy", "assistant", false, false),
+    ).toEqual({ kind: "proceed" });
+  });
+
+  it("protects typed navigation only when leaving settings/privacy", () => {
+    expect(
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "providers" },
+        { area: "assistant", page: "chat" },
+        true,
+        true,
+      ),
+    ).toEqual({ kind: "proceed" });
+
+    expect(
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "privacy" },
+        { area: "settings", page: "mcp" },
+        true,
+        true,
+      ),
+    ).toEqual({
+      kind: "block",
+      message:
+        "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
+    });
+
+    expect(
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "privacy" },
+        { area: "settings", page: "maintenance" },
+        false,
+        true,
+      ),
+    ).toEqual({
+      kind: "confirm_discard",
+      message:
+        "切换工作区将永久丢弃未保存的隐私与本地 OCR 配置。确定继续吗？",
+    });
+
+    expect(
+      decidePrivacyRouteNavigation(
+        { area: "settings", page: "privacy" },
+        { area: "assistant", page: "chat" },
+        false,
+        false,
+      ),
     ).toEqual({ kind: "proceed" });
   });
 

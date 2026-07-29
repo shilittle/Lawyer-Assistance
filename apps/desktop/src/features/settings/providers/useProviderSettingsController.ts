@@ -36,21 +36,12 @@ import type {
   ProviderProfile,
 } from "../../../ipc/provider/types";
 import { publicErrorMessage } from "../../../publicOutput";
+import type { RunConfirmedDestructiveAction } from "./policies";
 
 export type ProviderSettingsLoadState =
   | { kind: "idle" }
   | { kind: "loading" }
   | { kind: "error"; message: string };
-
-type ConfirmedDestructiveActionResult<T> =
-  | { executed: false }
-  | { executed: true; value: T };
-
-type RunConfirmedDestructiveAction = <T>(
-  message: string,
-  confirmAction: (message: string) => boolean,
-  action: () => Promise<T>,
-) => Promise<ConfirmedDestructiveActionResult<T>>;
 
 export interface ProviderSettingsPolicies {
   hasUnsavedChanges: (

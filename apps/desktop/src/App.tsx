@@ -1,34 +1,13 @@
 import {
-  FormEvent,
   lazy,
   Suspense,
   useCallback,
   useEffect,
-  useReducer,
   useRef,
   useState,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import {
-  addCaseLegalBasis,
-  confirmStructuredCaseExtraction,
-  discardStructuredCaseExtraction,
-  deleteCaseEntity,
-  deleteCaseProject,
-  getPendingStructuredCaseExtraction,
-  getCaseWorkspace,
-  listCaseProjects,
-  updatePendingStructuredCaseExtraction,
-  upsertCaseFile,
-  upsertCaseFact,
-  upsertCaseParty,
-  upsertCaseProject,
-  upsertEvidenceItem,
-  upsertEvidenceLink,
-  upsertFactIssueLink,
-  upsertLegalIssue,
-} from "./ipc/case/client";
 import {
   formatConfirmationStatus,
   formatGapKind,
@@ -39,34 +18,13 @@ import {
   formatPartyRole,
 } from "./ipc/case/format";
 import {
-  buildConfirmationRequest,
-  createExtractionContext,
-  drainPendingExtractionSaves,
-  extractionMutationBlocksClose,
-  extractionReviewNeedsCloseFlush,
   extractionLocksSources,
-  extractionReducer,
-  guardExtractionClose,
-  pendingExtractionUpdateAtRevision,
-  structuredCaseExtractionIsPublic,
 } from "./ipc/case/extractionReview";
-import type { PendingExtractionDraftSaveRequest } from "./ipc/case/extractionReview";
 import type {
-  CaseFact,
-  CaseFile,
-  CaseParty,
-  CaseProject,
-  CaseWorkspace,
   ConfirmationStatus,
-  EvidenceItem,
-  LegalIssue,
   LegalIssueStatus,
   PartyRole,
-  StructuredCaseExtraction,
 } from "./ipc/case/types";
-import { formatHealthCheck } from "./ipc/health/format";
-import { healthCheck } from "./ipc/health/client";
-import type { HealthCheckResponse } from "./ipc/health/types";
 import { formatLegalSourceLabel, formatStatus } from "./ipc/legal/format";
 import type { GraphMode, GraphNode } from "./ipc/graph/types";
 import {
@@ -76,68 +34,36 @@ import {
 import type { AssistantConversation } from "./ipc/assistant/types";
 import type { ApprovedProviderTask } from "./ipc/privacy/types";
 import {
-  normalizeProviderProfile,
-  providerProfilesEqual,
-} from "./ipc/provider/profile";
-import type { ProviderProfile } from "./ipc/provider/types";
+  providerApiKeyDeletionConfirmation,
+  providerApiKeyOverwriteConfirmation,
+  providerDeletionConfirmation,
+  providerNavigationHasUnsavedChanges,
+  runConfirmedDestructiveAction,
+} from "./features/settings/providers/policies";
 import { AppShell } from "./app/AppShell";
 import {
   assistantWritesBlockClose,
-  canBypassDirtyDraftsForWorkspaceRecovery,
-  CASE_DRAFT_LABELS,
   decideMcpWorkspaceNavigation,
   decidePrivacyWorkspaceNavigation,
   decideWorkspaceClose,
   workspaceCloseWasApproved,
-  type CaseDraftKind,
 } from "./app/navigationGuards";
 import { VIEW_METADATA, type ViewMode } from "./app/views";
+import { useHealthStatus } from "./app/useHealthStatus";
 import { AssistantWorkspace } from "./features/assistant/AssistantWorkspace";
 import { CasesWorkspace } from "./features/cases/CasesWorkspace";
 import {
-  advanceCaseWorkspaceEpoch,
-  blockingDirtyCaseDrafts,
-  caseEntityDeletionConfirmation,
-  caseEntityDeletionDisplayName,
   caseEntityEditorAllows,
   caseEntityEditorMatches,
   caseGraphNodeDomId,
-  caseProjectDeletionConfirmation,
-  caseProjectPageForId,
-  caseProjectToLoadAfterRefresh,
-  caseWorkspaceWritesAreSafe,
   clampCaseProjectPage,
-  copyCaseEntityForEditing,
-  createCaseFile,
-  createCaseProject,
-  createEvidence,
-  createFact,
-  createIssue,
-  createId,
-  createParty,
-  detectDirtyCaseDrafts,
-  extractionReviewDiscardConfirmation,
   formatLegalBasisTitle,
   formatLegalBasisWindow,
   graphNodeDestination,
-  isCurrentCaseWorkspaceEpoch,
-  paginateCaseProjects,
-  pendingReviewFilesStillExist,
   publicCaseBusinessText,
   publicEvidenceNumber,
-  releaseCaseMutation,
-  tryAcquireCaseMutation,
-  unrestorableExtractionDiscardConfirmation,
-  validateFactIssueLinkSelection,
-  type ActiveCaseEntityEditor,
-  type CaseDraftDirtyState,
-  type CaseEntityEditTarget,
-  type DeletableCaseEntityType,
-  type EditableCaseEntityType,
-  type ExtractionDraftSaveState,
-  type PendingReviewRecoveryBlock,
-  type QueuedExtractionDraftSave,
 } from "./features/cases/model";
+import { useCaseWorkspaceController } from "./features/cases/useCaseWorkspaceController";
 import { LegacyQaWorkspace } from "./features/legal-library/LegacyQaWorkspace";
 import { LegalLibrarySearchWorkspace } from "./features/legal-library/LegalLibrarySearchWorkspace";
 import { useLegalLibraryController } from "./features/legal-library/useLegalLibraryController";
@@ -157,78 +83,13 @@ const McpWorkspace = lazy(() => import("./features/mcp/McpWorkspace").then((modu
 const PrivacyWorkspace = lazy(() => import("./features/privacy/PrivacyWorkspace").then((module) => ({ default: module.PrivacyWorkspace })));
 const ReleaseWorkspace = lazy(() => import("./ReleaseWorkspace").then((module) => ({ default: module.ReleaseWorkspace })));
 
-type HealthState =
-  | { kind: "loading" }
-  | { kind: "ready"; response: HealthCheckResponse }
-  | { kind: "error"; message: string };
-
-type LoadState =
-  | { kind: "idle" }
-  | { kind: "loading" }
-  | { kind: "error"; message: string };
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function providerNavigationHasUnsavedChanges(
-  baseline: ProviderProfile,
-  draft: ProviderProfile,
-  apiKeyInput: string,
-): boolean {
-  return (
-    !providerProfilesEqual(baseline, normalizeProviderProfile(draft)) ||
-    apiKeyInput.trim().length > 0
-  );
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function providerDeletionConfirmation(
-  displayName: string,
-  accountId: string,
-): string {
-  void accountId;
-  return `确定永久删除 Provider“${displayName}”吗？对应配置和已保存的访问凭据会一并删除；既有结果不受影响。`;
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function providerApiKeyDeletionConfirmation(
-  displayName: string,
-  accountId: string,
-): string {
-  void accountId;
-  return `确定删除 Provider“${displayName}”的访问凭据吗？删除后需重新录入才能调用该服务。`;
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function providerApiKeyOverwriteConfirmation(
-  displayName: string,
-  accountId: string,
-): string {
-  void accountId;
-  return `Provider“${displayName}”已经保存访问凭据。确定用当前输入覆盖旧凭据吗？旧凭据无法恢复。`;
-}
-
-export type ConfirmedDestructiveActionResult<T> =
-  | { executed: false }
-  | { executed: true; value: T };
-
-// eslint-disable-next-line react-refresh/only-export-components
-export async function runConfirmedDestructiveAction<T>(
-  message: string,
-  confirmAction: (message: string) => boolean,
-  action: () => Promise<T>,
-): Promise<ConfirmedDestructiveActionResult<T>> {
-  if (!confirmAction(message)) {
-    return { executed: false };
-  }
-  return { executed: true, value: await action() };
-}
-
 function errorMessage(error: unknown): string {
   return publicErrorMessage(error);
 }
 
 export function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("assistant");
-  const [health, setHealth] = useState<HealthState>({ kind: "loading" });
+  const health = useHealthStatus();
   const [closeProtectionMessage, setCloseProtectionMessage] = useState<
     string | null
   >(null);
@@ -285,99 +146,107 @@ export function App() {
     sourceId: string;
   } | null>(null);
 
-  const [caseState, setCaseState] = useState<LoadState>({ kind: "idle" });
-  const [caseProjects, setCaseProjects] = useState<CaseProject[]>([]);
-  const [caseProjectPage, setCaseProjectPage] = useState(1);
-  const [selectedCaseProjectId, setSelectedCaseProjectId] = useState<
-    string | null
-  >(null);
-  const selectedCaseProjectIdRef = useRef<string | null>(null);
-  selectedCaseProjectIdRef.current = selectedCaseProjectId;
-  const [caseWorkspace, setCaseWorkspace] = useState<CaseWorkspace | null>(
-    null,
-  );
-  const [caseWorkspaceWriteBlocked, setCaseWorkspaceWriteBlocked] =
-    useState(false);
-  const persistedMutationRecoveryProjectId = useRef<string | null>(null);
-  const dirtyCaseDraftsForClose = useRef<CaseDraftKind[]>([]);
-  const [caseValidationTargetId, setCaseValidationTargetId] = useState<
-    string | null
-  >(null);
-  const caseWorkspaceEpoch = useRef(0);
-  const caseMutationLock = useRef(false);
-  const [caseMutationInFlight, setCaseMutationInFlight] = useState(false);
-  const extractionLifecycleLock = useRef(false);
-  const [activeCaseEntityEditor, setActiveCaseEntityEditor] =
-    useState<ActiveCaseEntityEditor | null>(null);
-  const [caseProjectDraft, setCaseProjectDraft] = useState<CaseProject>(() =>
-    createCaseProject(),
-  );
-  const caseProjectDraftBaseline = useRef(caseProjectDraft);
-  const [fileDraft, setFileDraft] = useState<CaseFile>(() =>
-    createCaseFile(caseProjectDraft.projectId),
-  );
-  const [partyDraft, setPartyDraft] = useState<CaseParty>(() =>
-    createParty(caseProjectDraft.projectId),
-  );
-  const [factDraft, setFactDraft] = useState<CaseFact>(() =>
-    createFact(caseProjectDraft.projectId),
-  );
-  const [evidenceDraft, setEvidenceDraft] = useState<EvidenceItem>(() =>
-    createEvidence(caseProjectDraft.projectId, 1),
-  );
-  const [issueDraft, setIssueDraft] = useState<LegalIssue>(() =>
-    createIssue(caseProjectDraft.projectId),
-  );
-  const [basisSourceId, setBasisSourceId] = useState("");
-  const [basisIssueId, setBasisIssueId] = useState("");
-  const [basisCaseDate, setBasisCaseDate] = useState("");
-  const [basisIncludeExpired, setBasisIncludeExpired] = useState(false);
-  const [basisNote, setBasisNote] = useState("");
-  const [linkFactId, setLinkFactId] = useState("");
-  const [linkEvidenceId, setLinkEvidenceId] = useState("");
-  const [factIssueFactId, setFactIssueFactId] = useState("");
-  const [factIssueIssueId, setFactIssueIssueId] = useState("");
-  const [extractionProviderId, setExtractionProviderId] = useState("");
-  const [extractionFileIds, setExtractionFileIds] = useState<string[]>([]);
-  const [extractionState, dispatchExtraction] = useReducer(extractionReducer, {
-    kind: "idle",
-  });
-  const extractionStateRef = useRef(extractionState);
-  extractionStateRef.current = extractionState;
-  const [extractionConfirmPreparing, setExtractionConfirmPreparing] =
-    useState(false);
-  const extractionConfirmInFlight = useRef(false);
-  const [extractionDiscarding, setExtractionDiscarding] = useState(false);
-  const extractionDiscardInFlight = useRef(false);
-  const [extractionDiscardError, setExtractionDiscardError] = useState<
-    string | null
-  >(null);
-  const [extractionDraftSaveState, setExtractionDraftSaveState] =
-    useState<ExtractionDraftSaveState>({ kind: "idle" });
-  const pendingExtractionDraftSave =
-    useRef<QueuedExtractionDraftSave | null>(null);
-  const extractionDraftSaveTimer = useRef<number | null>(null);
-  const extractionDraftSavePromise = useRef<Promise<boolean>>(
-    Promise.resolve(true),
-  );
-  const extractionDraftSaveSession = useRef(0);
-  const extractionDraftSaveSequence = useRef(0);
-  const extractionDraftSavedSequence = useRef(0);
-  const extractionServerRevision = useRef<number | null>(null);
-  const extractionReviewReloadRequired = useRef(false);
-  const extractionCloseInProgress = useRef(false);
   const controlledCloseApproved = useRef(false);
-  const [extractionClosePreparing, setExtractionClosePreparing] = useState(false);
-  const [pendingReviewRecoveryBlock, setPendingReviewRecoveryBlock] =
-    useState<PendingReviewRecoveryBlock | null>(null);
-  const extractionReviewRef = useRef<HTMLDivElement | null>(null);
-  const extractionReviewReturnFocusRef = useRef<HTMLElement | null>(null);
-  const extractionSourcesLocked = extractionLocksSources(extractionState);
-  const assistantActiveProject = selectedCaseProjectId
-    ? caseProjects.find(
-        (project) => project.projectId === selectedCaseProjectId,
-      ) ?? null
-    : null;
+  const caseController = useCaseWorkspaceController({
+    onLegacyApprovedProviderRequest: redirectLegacyEgressToApprovedProvider,
+  });
+  const {
+    caseState,
+    caseProjects,
+    setCaseProjectPage,
+    selectedCaseProjectId,
+    caseWorkspace,
+    caseValidationTargetId,
+    caseMutationInFlight,
+    activeCaseEntityEditor,
+    caseProjectDraft,
+    setCaseProjectDraft,
+    fileDraft,
+    setFileDraft,
+    partyDraft,
+    setPartyDraft,
+    factDraft,
+    setFactDraft,
+    evidenceDraft,
+    setEvidenceDraft,
+    issueDraft,
+    setIssueDraft,
+    basisSourceId,
+    setBasisSourceId,
+    basisIssueId,
+    setBasisIssueId,
+    basisCaseDate,
+    setBasisCaseDate,
+    basisIncludeExpired,
+    setBasisIncludeExpired,
+    basisNote,
+    setBasisNote,
+    linkFactId,
+    setLinkFactId,
+    linkEvidenceId,
+    setLinkEvidenceId,
+    factIssueFactId,
+    setFactIssueFactId,
+    factIssueIssueId,
+    setFactIssueIssueId,
+    caseNavigationLocked,
+    caseProjectMutationLocked,
+    caseChildrenReady,
+    editingFile,
+    editingParty,
+    editingFact,
+    editingEvidence,
+    editingIssue,
+    paginatedCaseProjects,
+    assistantActiveProject,
+    assistantProposalApplyBlockedReason,
+    startCaseEntityEdit,
+    cancelCaseEntityEdit,
+    startNewCaseProject,
+    selectCaseProject,
+    saveCaseProject,
+    removeCaseProject,
+    saveParty,
+    saveFile,
+    saveFact,
+    saveEvidence,
+    saveIssue,
+    saveLegalBasis,
+    linkEvidenceToFact,
+    linkFactToIssue,
+    removeCaseEntity,
+    refreshCaseAfterAssistantProposal,
+    reportCaseError,
+    setUnsupportedGraphNodeStatus,
+  } = caseController;
+  const {
+    providerId: extractionProviderId,
+    setProviderId: setExtractionProviderId,
+    fileIds: extractionFileIds,
+    setFileIds: setExtractionFileIds,
+    state: extractionState,
+    confirmPreparing: extractionConfirmPreparing,
+    discarding: extractionDiscarding,
+    discardError: extractionDiscardError,
+    draftSaveState: extractionDraftSaveState,
+    reviewReloadRequired: extractionReviewReloadRequired,
+    closePreparing: extractionClosePreparing,
+    pendingReviewRecoveryBlock,
+    reviewRef: extractionReviewRef,
+    sourcesLocked: extractionSourcesLocked,
+    deletionBlockedProviderId: providerDeletionBlockedProviderId,
+    closeGuard: caseCloseGuard,
+    runStructuredExtraction,
+    updateDraft: updateExtractionDraft,
+    cancelReview: cancelExtractionReview,
+    discardUnrestorablePendingReview,
+    reloadServerDraft: reloadServerExtractionDraft,
+    resetResult: resetExtractionResult,
+    confirmReview: confirmExtractionReview,
+    selectInitialProvider: selectInitialExtractionProvider,
+    handleProviderSaved: handleExtractionProviderSaved,
+    handleProviderDeleted: handleExtractionProviderDeleted,
+  } = caseController.extraction;
   const legalLibrary = useLegalLibraryController({
     qaActive: viewMode === "qa",
     selectedCaseProjectId,
@@ -397,37 +266,27 @@ export function App() {
   const handleInitialProviderSelected = useCallback(
     (providerId: string) => {
       legalLibrary.providerBridge.selectInitialProvider(providerId);
-      setExtractionProviderId(providerId);
+      selectInitialExtractionProvider(providerId);
     },
-    [legalLibrary.providerBridge],
+    [legalLibrary.providerBridge, selectInitialExtractionProvider],
   );
   const handleProviderSaved = useCallback((providerId: string) => {
-    setExtractionProviderId((current) => current || providerId);
-  }, []);
+    handleExtractionProviderSaved(providerId);
+  }, [handleExtractionProviderSaved]);
   const handleProviderDeleted = useCallback(
     (deletedProviderId: string, fallbackProviderId: string | null) => {
       legalLibrary.providerBridge.handleProviderDeleted(
         deletedProviderId,
         fallbackProviderId,
       );
-      if (fallbackProviderId) {
-        setExtractionProviderId((current) =>
-          current === deletedProviderId ? fallbackProviderId : current,
-        );
-      } else {
-        setExtractionProviderId("");
-      }
+      handleExtractionProviderDeleted(deletedProviderId, fallbackProviderId);
     },
-    [legalLibrary.providerBridge],
+    [handleExtractionProviderDeleted, legalLibrary.providerBridge],
   );
   const confirmProviderAction = useCallback(
     (message: string) => window.confirm(message),
     [],
   );
-  const providerDeletionBlockedProviderId =
-    extractionSourcesLocked && "context" in extractionState
-      ? extractionState.context.providerId
-      : null;
   const providerSettings = useProviderSettingsController({
     policies: {
       hasUnsavedChanges: providerNavigationHasUnsavedChanges,
@@ -444,374 +303,21 @@ export function App() {
   });
   const providerProfiles = providerSettings.profiles;
 
-  function beginCaseMutation(allowDuringExtraction = false): number | null {
-    if (
-      (!allowDuringExtraction && extractionLifecycleLock.current) ||
-      extractionDiscardInFlight.current
-    ) {
-      return null;
-    }
-
-    const requestEpoch = tryAcquireCaseMutation(
-      caseMutationLock,
-      caseWorkspaceEpoch,
-    );
-    if (requestEpoch !== null) {
-      setCaseMutationInFlight(true);
-    }
-    return requestEpoch;
-  }
-
-  function finishCaseMutation() {
-    releaseCaseMutation(caseMutationLock);
-    setCaseMutationInFlight(false);
-  }
-
-  function caseInteractionIsLocked(): boolean {
-    return (
-      caseMutationLock.current ||
-      extractionLifecycleLock.current ||
-      extractionDiscardInFlight.current
-    );
-  }
-
-  function focusElement(elementId: string) {
-    requestAnimationFrame(() => {
-      document.getElementById(elementId)?.focus();
-    });
-  }
-
-  function showCaseValidationError(message: string, elementId: string) {
-    setCaseValidationTargetId(elementId);
-    setCaseState({ kind: "error", message });
-    focusElement(elementId);
-  }
-
-  function clearCaseValidationError() {
-    setCaseValidationTargetId(null);
-  }
-
-  function clearExtractionDraftSaveTimer() {
-    if (extractionDraftSaveTimer.current !== null) {
-      window.clearTimeout(extractionDraftSaveTimer.current);
-      extractionDraftSaveTimer.current = null;
-    }
-  }
-
-  function beginExtractionDraftSaveSession(
-    initial: ExtractionDraftSaveState = { kind: "idle" },
-    serverRevision: number | null = null,
-  ) {
-    extractionDraftSaveSession.current += 1;
-    extractionDraftSaveSequence.current = 0;
-    extractionDraftSavedSequence.current = 0;
-    extractionServerRevision.current = serverRevision;
-    extractionReviewReloadRequired.current = false;
-    clearExtractionDraftSaveTimer();
-    pendingExtractionDraftSave.current = null;
-    extractionDraftSavePromise.current = Promise.resolve(true);
-    setExtractionDraftSaveState(initial);
-  }
-
-  function lockExtractionReviewForServerReload(message: string) {
-    extractionReviewReloadRequired.current = true;
-    clearExtractionDraftSaveTimer();
-    pendingExtractionDraftSave.current = null;
-    setExtractionDraftSaveState({
-      kind: "conflict",
-      message: `${message} 已锁定本窗口的编辑、确认和取消操作；请重新加载最新草稿后核对。`,
-    });
-  }
-
-  async function persistExtractionDraft(
-    queued: QueuedExtractionDraftSave,
-    session: number,
-  ): Promise<boolean> {
-    if (extractionDraftSaveSession.current !== session) {
-      return false;
-    }
-    if (extractionReviewReloadRequired.current) {
-      return false;
-    }
-    const expectedRevision = extractionServerRevision.current;
-    if (expectedRevision === null) {
-      if (extractionDraftSaveSession.current === session) {
-        lockExtractionReviewForServerReload("待审阅草稿缺少可核对的版本信息。");
-      }
-      return false;
-    }
-    try {
-      const response = await updatePendingStructuredCaseExtraction(
-        pendingExtractionUpdateAtRevision(queued.request, expectedRevision),
-      );
-      if (
-        !response.updated ||
-        !Number.isSafeInteger(response.revision) ||
-        response.revision !== expectedRevision + 1
-      ) {
-        throw new Error("审阅草稿的保存结果不连续");
-      }
-      if (extractionDraftSaveSession.current === session) {
-        extractionDraftSavedSequence.current = Math.max(
-          extractionDraftSavedSequence.current,
-          queued.sequence,
-        );
-        extractionServerRevision.current = response.revision;
-        dispatchExtraction({
-          type: "saved",
-          reviewId: queued.request.reviewId,
-          revision: response.revision,
-          expiresAt: response.expiresAt,
-        });
-        if (pendingExtractionDraftSave.current) {
-          setExtractionDraftSaveState({ kind: "pending" });
-        } else if (
-          queued.sequence === extractionDraftSaveSequence.current
-        ) {
-          setExtractionDraftSaveState({
-            kind: "saved",
-            expiresAt: response.expiresAt,
-          });
-        }
-      }
-      return true;
-    } catch (error: unknown) {
-      if (extractionDraftSaveSession.current === session) {
-        lockExtractionReviewForServerReload(
-          `审阅修改的保存结果无法安全确认：${errorMessage(error)}`,
-        );
-      }
-      return false;
-    }
-  }
-
-  function enqueueExtractionDraftSave(
-    queued: QueuedExtractionDraftSave,
-  ): Promise<boolean> {
-    const session = extractionDraftSaveSession.current;
-    const operation = extractionDraftSavePromise.current.then(() =>
-      persistExtractionDraft(queued, session),
-    );
-    extractionDraftSavePromise.current = operation;
-    return operation;
-  }
-
-  async function flushPendingExtractionDraftSave(): Promise<boolean> {
-    if (extractionReviewReloadRequired.current) {
-      return false;
-    }
-    clearExtractionDraftSaveTimer();
-    return drainPendingExtractionSaves({
-      targetSequence: () => extractionDraftSaveSequence.current,
-      isBlocked: () => extractionReviewReloadRequired.current,
-      savedSequence: () => extractionDraftSavedSequence.current,
-      hasPending: () => pendingExtractionDraftSave.current !== null,
-      takePending: () => {
-        clearExtractionDraftSaveTimer();
-        const queued = pendingExtractionDraftSave.current;
-        pendingExtractionDraftSave.current = null;
-        return queued;
-      },
-      waitForCurrent: () => extractionDraftSavePromise.current,
-      enqueue: (queued) => {
-        setExtractionDraftSaveState({ kind: "saving" });
-        return enqueueExtractionDraftSave(queued);
-      },
-    });
-  }
-
-  function scheduleExtractionDraftSave(
-    request: PendingExtractionDraftSaveRequest,
-  ) {
-    if (
-      extractionReviewReloadRequired.current ||
-      extractionCloseInProgress.current ||
-      extractionConfirmInFlight.current ||
-      extractionDiscardInFlight.current
-    ) {
-      return;
-    }
-    extractionDraftSaveSequence.current += 1;
-    pendingExtractionDraftSave.current = {
-      request,
-      sequence: extractionDraftSaveSequence.current,
-    };
-    clearExtractionDraftSaveTimer();
-    setExtractionDraftSaveState({ kind: "pending" });
-    extractionDraftSaveTimer.current = window.setTimeout(() => {
-      extractionDraftSaveTimer.current = null;
-      void flushPendingExtractionDraftSave();
-    }, 400);
-  }
-
-  function currentCaseDraftDirtyState(): CaseDraftDirtyState {
-    const projectId = caseProjectDraft.projectId;
-    const editingFileBaseline = caseEntityEditorMatches(
-      activeCaseEntityEditor,
-      "file",
-    )
-      ? caseWorkspace?.files.find(
-          (item) => item.fileId === activeCaseEntityEditor?.entityId,
-        )
-      : undefined;
-    const editingPartyBaseline = caseEntityEditorMatches(
-      activeCaseEntityEditor,
-      "party",
-    )
-      ? caseWorkspace?.parties.find(
-          (item) => item.partyId === activeCaseEntityEditor?.entityId,
-        )
-      : undefined;
-    const editingFactBaseline = caseEntityEditorMatches(
-      activeCaseEntityEditor,
-      "fact",
-    )
-      ? caseWorkspace?.facts.find(
-          (item) => item.factId === activeCaseEntityEditor?.entityId,
-        )
-      : undefined;
-    const editingEvidenceBaseline = caseEntityEditorMatches(
-      activeCaseEntityEditor,
-      "evidence",
-    )
-      ? caseWorkspace?.evidence.find(
-          (item) => item.evidenceId === activeCaseEntityEditor?.entityId,
-        )
-      : undefined;
-    const editingIssueBaseline = caseEntityEditorMatches(
-      activeCaseEntityEditor,
-      "legal_issue",
-    )
-      ? caseWorkspace?.legalIssues.find(
-          (item) => item.issueId === activeCaseEntityEditor?.entityId,
-        )
-      : undefined;
-    const baselineFactId = caseWorkspace?.facts[0]?.factId ?? "";
-    const baselineEvidenceId =
-      caseWorkspace?.evidence[0]?.evidenceId ?? "";
-    const baselineIssueId = caseWorkspace?.legalIssues[0]?.issueId ?? "";
-    const baselineCaseDate = "";
-
-    return detectDirtyCaseDrafts({
-      project: {
-        draft: caseProjectDraft,
-        baseline: caseWorkspace?.project ?? caseProjectDraftBaseline.current,
-      },
-      file: {
-        draft: fileDraft,
-        baseline: editingFileBaseline ?? createCaseFile(projectId),
-      },
-      party: {
-        draft: partyDraft,
-        baseline: editingPartyBaseline ?? createParty(projectId),
-      },
-      fact: {
-        draft: factDraft,
-        baseline: editingFactBaseline ?? createFact(projectId),
-      },
-      evidence: {
-        draft: evidenceDraft,
-        baseline:
-          editingEvidenceBaseline ??
-          createEvidence(projectId, (caseWorkspace?.evidence.length ?? 0) + 1),
-      },
-      legalIssue: {
-        draft: issueDraft,
-        baseline: editingIssueBaseline ?? createIssue(projectId),
-      },
-      evidenceLink: {
-        factId: linkFactId,
-        evidenceId: linkEvidenceId,
-        baselineFactId,
-        baselineEvidenceId,
-      },
-      factIssueLink: {
-        factId: factIssueFactId,
-        issueId: factIssueIssueId,
-        baselineFactId,
-        baselineIssueId,
-      },
-      legalBasis: {
-        sourceId: basisSourceId,
-        issueId: basisIssueId,
-        caseDate: basisCaseDate,
-        includeExpired: basisIncludeExpired,
-        note: basisNote,
-        baselineIssueId,
-        baselineCaseDate,
-      },
-    });
-  }
-
-  dirtyCaseDraftsForClose.current = blockingDirtyCaseDrafts(
-    currentCaseDraftDirtyState(),
-    [],
-  );
-
-  function blockWorkspaceReloadForDirtyDrafts(
-    allowed: readonly CaseDraftKind[],
-    action: string,
-  ): boolean {
-    const blocking = blockingDirtyCaseDrafts(
-      currentCaseDraftDirtyState(),
-      allowed,
-    );
-    if (blocking.length === 0) {
-      return false;
-    }
-
-    setCaseState({
-      kind: "error",
-      message: `${action}会刷新案件工作区。请先保存或清空这些未保存内容：${blocking
-        .map((kind) => CASE_DRAFT_LABELS[kind])
-        .join("、")}。`,
-    });
-    return true;
-  }
-
-  useEffect(() => {
-    let isMounted = true;
-
-    healthCheck()
-      .then((response) => {
-        if (isMounted) {
-          setHealth({ kind: "ready", response });
-        }
-      })
-      .catch((error: unknown) => {
-        if (isMounted) {
-          setHealth({ kind: "error", message: errorMessage(error) });
-        }
-      });
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
   useEffect(() => {
     let disposed = false;
     let unlistenCloseRequested: (() => void) | undefined;
 
-    const needsCloseFlush = () =>
-      extractionReviewNeedsCloseFlush(
-        extractionStateRef.current,
-        extractionDraftSavedSequence.current,
-        extractionDraftSaveSequence.current,
-        pendingExtractionDraftSave.current !== null,
-      );
     const currentCloseDecision = () => {
+      const caseCloseSnapshot = caseCloseGuard.read();
       return decideWorkspaceClose({
-        dirtyCaseDrafts: dirtyCaseDraftsForClose.current,
+        dirtyCaseDrafts: caseCloseSnapshot.dirtyDrafts,
         providerDraftDirty:
           providerSettings.hasUnsavedChangesRef.current,
-        caseMutationInFlight: caseMutationLock.current,
+        caseMutationInFlight: caseCloseSnapshot.caseMutationInFlight,
         providerMutationInFlight:
           providerSettings.mutationInFlightRef.current,
-        extractionMutationInFlight: extractionMutationBlocksClose(
-          extractionConfirmInFlight.current,
-          extractionDiscardInFlight.current,
-        ),
+        extractionMutationInFlight:
+          caseCloseSnapshot.extractionMutationInFlight,
         assistantRunActive: assistantRunActive.current,
         assistantMutationInFlight: assistantWritesBlockClose(
           assistantMutationActive.current,
@@ -828,8 +334,9 @@ export function App() {
       if (controlledCloseApproved.current) {
         return;
       }
+      const caseCloseSnapshot = caseCloseGuard.read();
       if (
-        !needsCloseFlush() &&
+        !caseCloseSnapshot.extractionNeedsFlush &&
         currentCloseDecision().kind === "proceed"
       ) {
         return;
@@ -843,7 +350,7 @@ export function App() {
       const appWindow = getCurrentWindow();
       void appWindow
         .onCloseRequested(async (event) => {
-          if (extractionCloseInProgress.current) {
+          if (caseCloseGuard.read().extractionCloseInProgress) {
             event.preventDefault();
             return;
           }
@@ -870,27 +377,23 @@ export function App() {
             controlledCloseApproved.current = true;
           }
 
-          const needsFlush = needsCloseFlush();
-          if (needsFlush || forceControlledClose) {
-            extractionCloseInProgress.current = true;
-            setExtractionClosePreparing(needsFlush);
+          if (
+            caseCloseGuard.read().extractionNeedsFlush ||
+            forceControlledClose
+          ) {
             setCloseProtectionMessage(null);
           }
-          const result = await guardExtractionClose({
-            needsFlush,
+          const result = await caseCloseGuard.requestControlledClose({
             forceControlledClose,
             preventDefault: () => event.preventDefault(),
-            flush: flushPendingExtractionDraftSave,
             destroyWindow: () => appWindow.destroy(),
             onBlocked: (message) => {
-              setCaseState({ kind: "error", message });
+              reportCaseError(message);
               setCloseProtectionMessage(message);
             },
           });
           if (result === "blocked") {
-            extractionCloseInProgress.current = false;
             controlledCloseApproved.current = false;
-            setExtractionClosePreparing(false);
           }
         })
         .then((unlisten) => {
@@ -913,342 +416,14 @@ export function App() {
       disposed = true;
       window.removeEventListener("beforeunload", blockBrowserUnload);
       unlistenCloseRequested?.();
-      clearExtractionDraftSaveTimer();
     };
     // The handler intentionally reads mutable refs so it always protects the
     // latest workspace and review without re-registering the native listener.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    if (extractionState.kind !== "reviewing") {
-      return;
-    }
-    const frame = requestAnimationFrame(() => extractionReviewRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [extractionState.kind]);
-
-  function applyCaseWorkspace(workspace: CaseWorkspace) {
-    setActiveCaseEntityEditor(null);
-    setCaseWorkspace(workspace);
-    setCaseWorkspaceWriteBlocked(false);
-    persistedMutationRecoveryProjectId.current = null;
-    clearCaseValidationError();
-    setSelectedCaseProjectId(workspace.project.projectId);
-    setCaseProjectDraft(workspace.project);
-    caseProjectDraftBaseline.current = workspace.project;
-    setFileDraft(createCaseFile(workspace.project.projectId));
-    setPartyDraft(createParty(workspace.project.projectId));
-    setFactDraft(createFact(workspace.project.projectId));
-    setEvidenceDraft(
-      createEvidence(workspace.project.projectId, workspace.evidence.length + 1),
-    );
-    setIssueDraft(createIssue(workspace.project.projectId));
-    setBasisSourceId("");
-    setBasisIssueId(workspace.legalIssues[0]?.issueId ?? "");
-    setBasisCaseDate("");
-    setBasisIncludeExpired(false);
-    setBasisNote("");
-    setLinkFactId(workspace.facts[0]?.factId ?? "");
-    setLinkEvidenceId(workspace.evidence[0]?.evidenceId ?? "");
-    setFactIssueFactId(workspace.facts[0]?.factId ?? "");
-    setFactIssueIssueId(workspace.legalIssues[0]?.issueId ?? "");
-    const availableFileIds = new Set(workspace.files.map((file) => file.fileId));
-    setExtractionFileIds((current) =>
-      current.filter((fileId) => availableFileIds.has(fileId)),
-    );
-  }
-
-  async function restorePendingExtractionReview(
-    workspace: CaseWorkspace,
-    requestEpoch: number,
-  ): Promise<string | null> {
-    setPendingReviewRecoveryBlock(null);
-    const active = extractionStateRef.current;
-    if (
-      (active.kind === "generating" ||
-        active.kind === "reviewing" ||
-        active.kind === "committing") &&
-      active.context.projectId === workspace.project.projectId
-    ) {
-      return null;
-    }
-
-    extractionLifecycleLock.current = false;
-    setExtractionDiscardError(null);
-    dispatchExtraction({ type: "reset" });
-    beginExtractionDraftSaveSession();
-    try {
-      const response = await getPendingStructuredCaseExtraction({
-        projectId: workspace.project.projectId,
-      });
-      if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        return null;
-      }
-      const pending = response.pending ?? null;
-      if (!pending) {
-        return null;
-      }
-      if (pending.projectId !== workspace.project.projectId) {
-        return "待恢复抽取审阅的案件归属不匹配，已拒绝载入。";
-      }
-      if (!Number.isSafeInteger(pending.revision) || pending.revision < 0) {
-        return "待恢复草稿缺少有效的版本信息，已拒绝载入。";
-      }
-      if (!pending.providerSnapshot) {
-        setPendingReviewRecoveryBlock({
-          reviewId: pending.reviewId,
-          projectId: pending.projectId,
-          revision: pending.revision,
-          message:
-            "待恢复抽取审阅缺少可信的生成配置快照，只能永久放弃，不能确认写入。",
-        });
-        return "待恢复抽取审阅缺少可信的生成配置快照，已拒绝载入。";
-      }
-      if (!structuredCaseExtractionIsPublic(pending.extraction)) {
-        setPendingReviewRecoveryBlock({
-          reviewId: pending.reviewId,
-          projectId: pending.projectId,
-          revision: pending.revision,
-          message: "待恢复内容未通过安全检查，只能放弃后重新整理。",
-        });
-        return "待恢复内容未通过安全检查，已拒绝载入。";
-      }
-
-      const workspaceFileIds = workspace.files.map((file) => file.fileId);
-      if (!pendingReviewFilesStillExist(workspaceFileIds, pending.fileIds)) {
-        setPendingReviewRecoveryBlock({
-          reviewId: pending.reviewId,
-          projectId: pending.projectId,
-          revision: pending.revision,
-          message: "待恢复抽取审阅引用的案件材料已变化，不能安全确认。",
-        });
-        return "待恢复抽取审阅引用的案件材料已变化，已拒绝自动载入。";
-      }
-      const restorableFileIds = [...pending.fileIds];
-
-      const context = createExtractionContext(
-        createId("extraction-restore"),
-        pending.projectId,
-        pending.providerId,
-        restorableFileIds,
-        pending.providerSnapshot,
-      );
-      setExtractionProviderId(pending.providerId);
-      setExtractionFileIds(restorableFileIds);
-      extractionLifecycleLock.current = true;
-      beginExtractionDraftSaveSession({
-        kind: "saved",
-        expiresAt: pending.expiresAt,
-      }, pending.revision);
-      dispatchExtraction({
-        type: "restore",
-        context,
-        reviewId: pending.reviewId,
-        draft: pending.extraction,
-        revision: pending.revision,
-        createdAt: pending.createdAt,
-        expiresAt: pending.expiresAt,
-      });
-      return null;
-    } catch (error: unknown) {
-      return `未能恢复待审阅的材料整理结果：${errorMessage(error)}`;
-    }
-  }
-
-  async function loadCaseWorkspace(
-    projectId: string,
-    requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch),
-    recoverAfterPersistedMutation = false,
-  ): Promise<boolean> {
-    if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-      return false;
-    }
-    setCaseState({ kind: "loading" });
-
-    try {
-      const response = await getCaseWorkspace({ projectId });
-      if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        return false;
-      }
-
-      const workspace = response.workspace ?? null;
-      if (!workspace || workspace.project.projectId !== projectId) {
-        if (recoverAfterPersistedMutation) {
-          persistedMutationRecoveryProjectId.current = projectId;
-        }
-        setCaseWorkspaceWriteBlocked(true);
-        setCaseState({
-          kind: "error",
-          message:
-            "目标案件未返回有效工作区；已保留原案件与草稿并锁定写操作。请重试加载案件后再继续编辑。",
-        });
-        return false;
-      }
-      applyCaseWorkspace(workspace);
-      const extractionRestoreError =
-        await restorePendingExtractionReview(workspace, requestEpoch);
-      if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        return false;
-      }
-      if (extractionRestoreError) {
-        if (recoverAfterPersistedMutation) {
-          persistedMutationRecoveryProjectId.current = projectId;
-        }
-        setCaseWorkspaceWriteBlocked(true);
-      }
-      setCaseState(
-        extractionRestoreError
-          ? {
-              kind: "error",
-              message: `${extractionRestoreError} 写操作已锁定；请点击当前案件重试完整加载。`,
-            }
-          : { kind: "idle" },
-      );
-      return extractionRestoreError === null;
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        if (recoverAfterPersistedMutation) {
-          persistedMutationRecoveryProjectId.current = projectId;
-        }
-        setCaseWorkspaceWriteBlocked(true);
-        setCaseState({
-          kind: "error",
-          message: `案件加载失败；已保留原案件与草稿并锁定写操作。请重试：${errorMessage(error)}`,
-        });
-      }
-      return false;
-    }
-  }
-
-  async function refreshCaseProjects(
-    preferredProjectId: string | undefined,
-    requestEpoch: number,
-    recoverAfterPersistedMutation = false,
-  ) {
-    try {
-      const response = await listCaseProjects();
-      if (!isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        return response.projects;
-      }
-      setCaseProjects(response.projects);
-
-      // After a successful write, never fall back to some other case merely
-      // because a stale list response omitted the saved project. The exact
-      // persisted id remains authoritative and can still be loaded directly.
-      const nextProject = caseProjectToLoadAfterRefresh(
-        response.projects,
-        preferredProjectId,
-        recoverAfterPersistedMutation,
-      );
-
-      if (nextProject) {
-        setCaseProjectPage(
-          caseProjectPageForId(response.projects, nextProject.projectId),
-        );
-        const workspaceLoaded = await loadCaseWorkspace(
-          nextProject.projectId,
-          requestEpoch,
-          recoverAfterPersistedMutation,
-        );
-        if (!workspaceLoaded) {
-          return undefined;
-        }
-      } else if (recoverAfterPersistedMutation && preferredProjectId) {
-        const workspaceLoaded = await loadCaseWorkspace(
-          preferredProjectId,
-          requestEpoch,
-          true,
-        );
-        if (!workspaceLoaded) {
-          return undefined;
-        }
-        if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-          setCaseState({
-            kind: "error",
-            message:
-              "案件已保存并安全加载，但案件列表未返回该案件；当前编辑可继续，重启应用后列表会重新读取。",
-          });
-        }
-      } else {
-        setActiveCaseEntityEditor(null);
-        setSelectedCaseProjectId(null);
-        setCaseWorkspace(null);
-        setCaseWorkspaceWriteBlocked(false);
-        persistedMutationRecoveryProjectId.current = null;
-        setCaseProjectPage(1);
-        setCaseState({ kind: "idle" });
-      }
-      return response.projects;
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        if (recoverAfterPersistedMutation && preferredProjectId) {
-          const workspaceLoaded = await loadCaseWorkspace(
-            preferredProjectId,
-            requestEpoch,
-            true,
-          );
-          if (workspaceLoaded) {
-            if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-              setCaseState({
-                kind: "error",
-                message: `案件已保存并安全加载，但案件列表刷新失败；当前编辑可继续：${errorMessage(error)}`,
-              });
-            }
-            return caseProjects;
-          }
-        } else {
-          setCaseState({ kind: "error", message: errorMessage(error) });
-        }
-      }
-      return undefined;
-    }
-  }
-
-  useEffect(() => {
-    let isMounted = true;
-    const requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
-
-    listCaseProjects()
-      .then(async (response) => {
-        if (
-          !isMounted ||
-          !isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)
-        ) {
-          return;
-        }
-
-        setCaseProjects(response.projects);
-        const firstProject = response.projects[0];
-        if (firstProject) {
-          setCaseProjectPage(1);
-          await loadCaseWorkspace(firstProject.projectId, requestEpoch);
-        } else {
-          setCaseState({ kind: "idle" });
-        }
-      })
-      .catch((error: unknown) => {
-        if (
-          isMounted &&
-          isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)
-        ) {
-          setCaseState({ kind: "error", message: errorMessage(error) });
-        }
-      });
-
-    return () => {
-      isMounted = false;
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
-      }
-    };
-    // This mount request deliberately owns one fixed epoch; later navigation
-    // invalidates it instead of recreating the loader closure.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   function openCaseGraph() {
-    if (!selectedCaseProjectIdRef.current) return;
+    if (!selectedCaseProjectId) return;
     setGraphMode("case");
     setViewMode("graph");
   }
@@ -1269,1059 +444,7 @@ export function App() {
 
   function setStatusForUnsupportedGraphNode(node: GraphNode) {
     void node;
-    setCaseState({
-      kind: "error",
-      message: "暂不支持打开该项内容。",
-    });
-  }
-
-  function resetAllCaseEntityDrafts(
-    projectId = caseProjectDraft.projectId,
-    nextEvidenceNumber = (caseWorkspace?.evidence.length ?? 0) + 1,
-  ) {
-    setFileDraft(createCaseFile(projectId));
-    setPartyDraft(createParty(projectId));
-    setFactDraft(createFact(projectId));
-    setEvidenceDraft(createEvidence(projectId, nextEvidenceNumber));
-    setIssueDraft(createIssue(projectId));
-  }
-
-  function startCaseEntityEdit(target: CaseEntityEditTarget) {
-    if (
-      !caseChildrenReady ||
-      caseNavigationLocked ||
-      caseInteractionIsLocked() ||
-      activeCaseEntityEditor !== null
-    ) {
-      return;
-    }
-    if (blockWorkspaceReloadForDirtyDrafts([], "开始编辑")) {
-      return;
-    }
-
-    resetAllCaseEntityDrafts(target.entity.projectId);
-    switch (target.entityType) {
-      case "file": {
-        const draft = copyCaseEntityForEditing(target.entity);
-        setFileDraft({
-          ...draft,
-          summary: publicCaseBusinessText(draft.summary),
-        });
-        setActiveCaseEntityEditor({
-          entityType: "file",
-          entityId: target.entity.fileId,
-        });
-        break;
-      }
-      case "party": {
-        const draft = copyCaseEntityForEditing(target.entity);
-        setPartyDraft({
-          ...draft,
-          name: publicTitle(draft.name, ""),
-          normalizedName: publicCaseBusinessText(draft.normalizedName),
-          contact: publicCaseBusinessText(draft.contact),
-          notes: publicCaseBusinessText(draft.notes),
-        });
-        setActiveCaseEntityEditor({
-          entityType: "party",
-          entityId: target.entity.partyId,
-        });
-        break;
-      }
-      case "fact": {
-        const draft = copyCaseEntityForEditing(target.entity);
-        setFactDraft({
-          ...draft,
-          description: publicCaseBusinessText(draft.description),
-          source: publicCaseBusinessText(draft.source),
-        });
-        setActiveCaseEntityEditor({
-          entityType: "fact",
-          entityId: target.entity.factId,
-        });
-        break;
-      }
-      case "evidence": {
-        const draft = copyCaseEntityForEditing(target.entity);
-        setEvidenceDraft({
-          ...draft,
-          evidenceNumber: publicEvidenceNumber(draft.evidenceNumber, ""),
-          source: publicCaseBusinessText(draft.source),
-          summary: publicCaseBusinessText(draft.summary),
-        });
-        setActiveCaseEntityEditor({
-          entityType: "evidence",
-          entityId: target.entity.evidenceId,
-        });
-        break;
-      }
-      case "legal_issue": {
-        const draft = copyCaseEntityForEditing(target.entity);
-        setIssueDraft({
-          ...draft,
-          title: publicTitle(draft.title, ""),
-          description: publicCaseBusinessText(draft.description),
-          claim: publicCaseBusinessText(draft.claim),
-        });
-        setActiveCaseEntityEditor({
-          entityType: "legal_issue",
-          entityId: target.entity.issueId,
-        });
-        break;
-      }
-    }
-    setCaseState({ kind: "idle" });
-  }
-
-  function cancelCaseEntityEdit() {
-    if (caseMutationLock.current) {
-      return;
-    }
-    const editor = activeCaseEntityEditor;
-    if (!editor) {
-      return;
-    }
-
-    switch (editor.entityType) {
-      case "file":
-        setFileDraft(createCaseFile(caseProjectDraft.projectId));
-        break;
-      case "party":
-        setPartyDraft(createParty(caseProjectDraft.projectId));
-        break;
-      case "fact":
-        setFactDraft(createFact(caseProjectDraft.projectId));
-        break;
-      case "evidence":
-        setEvidenceDraft(
-          createEvidence(
-            caseProjectDraft.projectId,
-            (caseWorkspace?.evidence.length ?? 0) + 1,
-          ),
-        );
-        break;
-      case "legal_issue":
-        setIssueDraft(createIssue(caseProjectDraft.projectId));
-        break;
-    }
-    setActiveCaseEntityEditor(null);
-  }
-
-  function startNewCaseProject() {
-    if (caseInteractionIsLocked()) {
-      return;
-    }
-    if (blockWorkspaceReloadForDirtyDrafts([], "新建案件")) {
-      return;
-    }
-    advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
-    setActiveCaseEntityEditor(null);
-    const project = createCaseProject();
-    setSelectedCaseProjectId(null);
-    setCaseWorkspace(null);
-    setCaseWorkspaceWriteBlocked(false);
-    clearCaseValidationError();
-    setCaseProjectDraft(project);
-    caseProjectDraftBaseline.current = project;
-    setFileDraft(createCaseFile(project.projectId));
-    setPartyDraft(createParty(project.projectId));
-    setFactDraft(createFact(project.projectId));
-    setEvidenceDraft(createEvidence(project.projectId, 1));
-    setIssueDraft(createIssue(project.projectId));
-    setBasisSourceId("");
-    setBasisIssueId("");
-    setBasisCaseDate("");
-    setBasisIncludeExpired(false);
-    setBasisNote("");
-    setLinkFactId("");
-    setLinkEvidenceId("");
-    setFactIssueFactId("");
-    setFactIssueIssueId("");
-    setExtractionFileIds([]);
-    setExtractionDiscardError(null);
-    extractionLifecycleLock.current = false;
-    beginExtractionDraftSaveSession();
-    dispatchExtraction({ type: "reset" });
-    setCaseState({ kind: "idle" });
-  }
-
-  function selectCaseProject(project: CaseProject) {
-    if (caseInteractionIsLocked()) {
-      return;
-    }
-    if (
-      project.projectId === selectedCaseProjectId &&
-      !caseWorkspaceWriteBlocked
-    ) {
-      return;
-    }
-    const retriesPersistedMutationReload =
-      canBypassDirtyDraftsForWorkspaceRecovery(
-        project.projectId,
-        selectedCaseProjectId,
-        caseWorkspaceWriteBlocked,
-        persistedMutationRecoveryProjectId.current,
-      );
-    if (
-      !retriesPersistedMutationReload &&
-      blockWorkspaceReloadForDirtyDrafts([], "切换案件")
-    ) {
-      return;
-    }
-    const requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
-    void loadCaseWorkspace(project.projectId, requestEpoch).then((loaded) => {
-      if (!loaded || !isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        return;
-      }
-      setCaseProjectPage(caseProjectPageForId(caseProjects, project.projectId));
-    });
-  }
-
-  async function saveCaseProject(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (
-      caseNavigationLocked ||
-      caseInteractionIsLocked() ||
-      activeCaseEntityEditor !== null
-    ) {
-      setCaseState({
-        kind: "error",
-        message: "请先完成或取消当前子项编辑，再保存案件。",
-      });
-      return;
-    }
-    const project = {
-      ...caseProjectDraft,
-      title: caseProjectDraft.title.trim() || "未命名案件",
-      caseType: caseProjectDraft.caseType.trim(),
-      summary: caseProjectDraft.summary.trim(),
-      openedOn: caseProjectDraft.openedOn || null,
-    };
-    if (blockWorkspaceReloadForDirtyDrafts(["project"], "保存案件")) {
-      return;
-    }
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    setCaseState({ kind: "loading" });
-
-    try {
-      const response = await upsertCaseProject({ project });
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseProjectDraft(response.project);
-        caseProjectDraftBaseline.current = response.project;
-        setBasisCaseDate("");
-      }
-      await refreshCaseProjects(response.project.projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function removeCaseProject() {
-    if (
-      !selectedCaseProjectId ||
-      caseNavigationLocked ||
-      caseInteractionIsLocked() ||
-      activeCaseEntityEditor !== null
-    ) {
-      return;
-    }
-
-    const projectId = selectedCaseProjectId;
-    if (blockWorkspaceReloadForDirtyDrafts([], "删除案件")) {
-      return;
-    }
-    const projectTitle =
-      caseProjects.find((project) => project.projectId === projectId)?.title ||
-      caseProjectDraft.title ||
-      "当前案件";
-    await runConfirmedDestructiveAction(
-      caseProjectDeletionConfirmation(projectTitle),
-      (message) => window.confirm(message),
-      async () => {
-        const requestEpoch = beginCaseMutation();
-        if (requestEpoch === null) {
-          return;
-        }
-        let startBlankProject = false;
-        setCaseState({ kind: "loading" });
-
-        try {
-          await deleteCaseProject({ projectId });
-          if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-            setSelectedCaseProjectId(null);
-            setCaseWorkspace(null);
-          }
-          const projects = await refreshCaseProjects(undefined, requestEpoch);
-          if (
-            isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch) &&
-            projects?.length === 0
-          ) {
-            startBlankProject = true;
-          }
-        } catch (error: unknown) {
-          if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-            setCaseState({ kind: "error", message: errorMessage(error) });
-          }
-        } finally {
-          finishCaseMutation();
-        }
-
-        if (
-          startBlankProject &&
-          isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)
-        ) {
-          startNewCaseProject();
-        }
-      },
-    );
-  }
-
-  function requirePersistedCaseWorkspace(
-    entityType?: EditableCaseEntityType,
-    entityId?: string,
-  ): boolean {
-    if (caseMutationLock.current) {
-      setCaseState({
-        kind: "error",
-        message: "案件数据正在写入，请等待当前操作完成。",
-      });
-      return false;
-    }
-
-    if (caseWorkspaceWriteBlocked) {
-      setCaseState({
-        kind: "error",
-        message:
-          "案件加载失败后写操作仍处于锁定状态。请点击案件列表中的案件重新加载，成功后再继续。",
-      });
-      return false;
-    }
-
-    if (!caseChildrenReady) {
-      setCaseState({
-        kind: "error",
-        message: "请先保存案件，再操作案件子项。",
-      });
-      return false;
-    }
-
-    if (caseNavigationLocked || extractionLifecycleLock.current) {
-      setCaseState({
-        kind: "error",
-        message: "材料信息整理进行中，请先完成或放弃当前任务。",
-      });
-      return false;
-    }
-
-    if (
-      activeCaseEntityEditor !== null &&
-      (entityType === undefined ||
-        !caseEntityEditorMatches(
-          activeCaseEntityEditor,
-          entityType,
-          entityId,
-        ))
-    ) {
-      setCaseState({
-        kind: "error",
-        message: "请先完成或取消当前子项编辑。",
-      });
-      return false;
-    }
-
-    return true;
-  }
-
-  async function saveParty(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    if (!requirePersistedCaseWorkspace("party")) {
-      return;
-    }
-
-    const party = {
-      ...partyDraft,
-      projectId: caseProjectDraft.projectId,
-      name: partyDraft.name.trim(),
-      normalizedName: partyDraft.normalizedName.trim(),
-    };
-
-    if (!party.name) {
-      showCaseValidationError("请输入当事人名称。", "case-party-name");
-      return;
-    }
-    clearCaseValidationError();
-    if (blockWorkspaceReloadForDirtyDrafts(["party"], "保存当事人")) {
-      return;
-    }
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await upsertCaseParty({ party });
-      await loadCaseWorkspace(party.projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function saveFile(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!requirePersistedCaseWorkspace("file")) {
-      return;
-    }
-    const file = {
-      ...fileDraft,
-      projectId: caseProjectDraft.projectId,
-      title: fileDraft.title.trim(),
-      fileType: fileDraft.fileType.trim(),
-      storageReference: fileDraft.storageReference.trim(),
-      summary: fileDraft.summary.trim(),
-    };
-
-    if (!file.title) {
-      showCaseValidationError("请输入案件材料标题。", "case-file-title");
-      return;
-    }
-    clearCaseValidationError();
-    if (blockWorkspaceReloadForDirtyDrafts(["file"], "保存案件材料")) {
-      return;
-    }
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await upsertCaseFile({ file });
-      await loadCaseWorkspace(file.projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function saveFact(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!requirePersistedCaseWorkspace("fact")) {
-      return;
-    }
-    const fact = {
-      ...factDraft,
-      projectId: caseProjectDraft.projectId,
-      title: factDraft.title.trim(),
-      occurredOn: factDraft.occurredOn || null,
-    };
-
-    if (!fact.title) {
-      showCaseValidationError("请输入事实标题。", "case-fact-title");
-      return;
-    }
-    clearCaseValidationError();
-    if (blockWorkspaceReloadForDirtyDrafts(["fact"], "保存事实")) {
-      return;
-    }
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await upsertCaseFact({ fact });
-      await loadCaseWorkspace(fact.projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function saveEvidence(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!requirePersistedCaseWorkspace("evidence")) {
-      return;
-    }
-    const evidence = {
-      ...evidenceDraft,
-      projectId: caseProjectDraft.projectId,
-      evidenceNumber: evidenceDraft.evidenceNumber.trim(),
-      title: evidenceDraft.title.trim(),
-      formedOn: evidenceDraft.formedOn || null,
-    };
-
-    if (!evidence.evidenceNumber || !evidence.title) {
-      showCaseValidationError(
-        evidence.evidenceNumber
-          ? "请输入证据标题。"
-          : "请输入证据编号。",
-        evidence.evidenceNumber
-          ? "case-evidence-title"
-          : "case-evidence-number",
-      );
-      return;
-    }
-    clearCaseValidationError();
-    if (blockWorkspaceReloadForDirtyDrafts(["evidence"], "保存证据")) {
-      return;
-    }
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await upsertEvidenceItem({ evidence });
-      await loadCaseWorkspace(evidence.projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function saveIssue(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!requirePersistedCaseWorkspace("legal_issue")) {
-      return;
-    }
-    const issue = {
-      ...issueDraft,
-      projectId: caseProjectDraft.projectId,
-      title: issueDraft.title.trim(),
-    };
-
-    if (!issue.title) {
-      showCaseValidationError("请输入争点标题。", "case-issue-title");
-      return;
-    }
-    clearCaseValidationError();
-    if (blockWorkspaceReloadForDirtyDrafts(["legal_issue"], "保存争点")) {
-      return;
-    }
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await upsertLegalIssue({ issue });
-      await loadCaseWorkspace(issue.projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function saveLegalBasis(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    if (!requirePersistedCaseWorkspace()) {
-      return;
-    }
-    if (!basisSourceId.trim()) {
-      showCaseValidationError("请选择本地法律来源。", "case-basis-source-id");
-      return;
-    }
-    clearCaseValidationError();
-    if (
-      blockWorkspaceReloadForDirtyDrafts(["legal_basis"], "添加法律依据")
-    ) {
-      return;
-    }
-    const projectId = caseProjectDraft.projectId;
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await addCaseLegalBasis({
-        projectId,
-        issueId: basisIssueId || null,
-        sourceId: basisSourceId.trim(),
-        caseDate: basisCaseDate || null,
-        includeExpired: basisIncludeExpired,
-        note: basisNote.trim(),
-      });
-      await loadCaseWorkspace(projectId, requestEpoch, true);
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setBasisSourceId("");
-        setBasisNote("");
-      }
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function linkEvidenceToFact() {
-    if (!requirePersistedCaseWorkspace()) {
-      return;
-    }
-    if (!linkFactId || !linkEvidenceId) {
-      showCaseValidationError(
-        linkFactId ? "请选择要关联的证据。" : "请选择要关联的事实。",
-        linkFactId ? "case-link-evidence" : "case-link-fact",
-      );
-      return;
-    }
-    clearCaseValidationError();
-    if (
-      blockWorkspaceReloadForDirtyDrafts(
-        ["evidence_link"],
-        "保存事实—证据关联",
-      )
-    ) {
-      return;
-    }
-    const projectId = caseProjectDraft.projectId;
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await upsertEvidenceLink({
-        link: {
-          linkId: createId("link"),
-          projectId,
-          factId: linkFactId,
-          evidenceId: linkEvidenceId,
-        },
-      });
-      await loadCaseWorkspace(projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function linkFactToIssue() {
-    if (!requirePersistedCaseWorkspace()) {
-      return;
-    }
-    const validation = validateFactIssueLinkSelection(
-      factIssueFactId,
-      factIssueIssueId,
-      caseWorkspace?.factIssueLinks ?? [],
-    );
-    if (!validation.valid) {
-      showCaseValidationError(validation.message, validation.targetId);
-      return;
-    }
-    clearCaseValidationError();
-    if (
-      blockWorkspaceReloadForDirtyDrafts(
-        ["fact_issue_link"],
-        "保存事实—争点关联",
-      )
-    ) {
-      return;
-    }
-    const projectId = caseProjectDraft.projectId;
-    const requestEpoch = beginCaseMutation();
-    if (requestEpoch === null) {
-      return;
-    }
-
-    try {
-      await upsertFactIssueLink({
-        link: {
-          linkId: createId("fact-issue-link"),
-          projectId,
-          factId: factIssueFactId,
-          issueId: factIssueIssueId,
-        },
-      });
-      await loadCaseWorkspace(projectId, requestEpoch, true);
-    } catch (error: unknown) {
-      if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-        setCaseState({ kind: "error", message: errorMessage(error) });
-      }
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  async function removeCaseEntity(
-    entityType: DeletableCaseEntityType,
-    id: string,
-  ) {
-    const editableEntityType =
-      entityType === "file" ||
-      entityType === "party" ||
-      entityType === "fact" ||
-      entityType === "evidence" ||
-      entityType === "legal_issue"
-        ? entityType
-        : undefined;
-    if (!requirePersistedCaseWorkspace(editableEntityType, id)) {
-      return;
-    }
-    if (blockWorkspaceReloadForDirtyDrafts([], "删除案件子项")) {
-      return;
-    }
-    if (!caseWorkspace) {
-      return;
-    }
-    await runConfirmedDestructiveAction(
-      caseEntityDeletionConfirmation(
-        entityType,
-        caseEntityDeletionDisplayName(caseWorkspace, entityType, id),
-      ),
-      (message) => window.confirm(message),
-      async () => {
-        const projectId = caseProjectDraft.projectId;
-        const requestEpoch = beginCaseMutation();
-        if (requestEpoch === null) {
-          return;
-        }
-        try {
-          await deleteCaseEntity({ projectId, entityType, id });
-          await loadCaseWorkspace(projectId, requestEpoch, true);
-        } catch (error: unknown) {
-          if (isCurrentCaseWorkspaceEpoch(caseWorkspaceEpoch, requestEpoch)) {
-            setCaseState({ kind: "error", message: errorMessage(error) });
-          }
-        } finally {
-          finishCaseMutation();
-        }
-      },
-    );
-  }
-
-  function runStructuredExtraction() {
-    redirectLegacyEgressToApprovedProvider(
-      "structured_extraction",
-      "案件材料整理不得从旧入口发送原文；已为你切换到 Approved Provider 的固定任务“结构化提取”。",
-    );
-  }
-
-  function updateExtractionDraft(
-    update: (draft: StructuredCaseExtraction) => StructuredCaseExtraction,
-  ) {
-    if (
-      extractionState.kind === "reviewing" &&
-      !extractionReviewReloadRequired.current &&
-      !extractionCloseInProgress.current &&
-      !extractionConfirmInFlight.current &&
-      !extractionDiscardInFlight.current
-    ) {
-      const draft = update(extractionState.draft);
-      if (!structuredCaseExtractionIsPublic(draft)) {
-        setCaseState({
-          kind: "error",
-          message: "该内容不适合写入案件业务字段，请删除其中的系统信息后重试。",
-        });
-        return;
-      }
-      dispatchExtraction({
-        type: "edit",
-        draft,
-      });
-      scheduleExtractionDraftSave({
-        reviewId: extractionState.reviewId,
-        projectId: extractionState.context.projectId,
-        providerId: extractionState.context.providerId,
-        fileIds: [...extractionState.context.sourceFileIds],
-        extraction: draft,
-      });
-    }
-  }
-
-  async function cancelExtractionReview() {
-    if (
-      extractionState.kind !== "reviewing" ||
-      extractionConfirmPreparing ||
-      extractionConfirmInFlight.current ||
-      extractionDiscardInFlight.current ||
-      extractionCloseInProgress.current ||
-      caseMutationLock.current ||
-      extractionReviewReloadRequired.current
-    ) {
-      return;
-    }
-
-    const reviewId = extractionState.reviewId;
-    const permission = await runConfirmedDestructiveAction(
-      extractionReviewDiscardConfirmation(),
-      (message) => window.confirm(message),
-      async () => {
-        if (
-          extractionDiscardInFlight.current ||
-          extractionConfirmInFlight.current ||
-          extractionCloseInProgress.current
-        ) {
-          return false;
-        }
-        extractionDiscardInFlight.current = true;
-        setExtractionDiscarding(true);
-        setExtractionDiscardError(null);
-        return true;
-      },
-    );
-    if (!permission.executed || !permission.value) {
-      return;
-    }
-    try {
-      clearExtractionDraftSaveTimer();
-      pendingExtractionDraftSave.current = null;
-      await extractionDraftSavePromise.current;
-      if (extractionReviewReloadRequired.current) {
-        return;
-      }
-      const expectedRevision = extractionServerRevision.current;
-      if (expectedRevision === null) {
-        lockExtractionReviewForServerReload(
-          "取消前无法确认待审草稿的最新状态。",
-        );
-        return;
-      }
-      const response = await discardStructuredCaseExtraction({
-        reviewId,
-        projectId: extractionState.context.projectId,
-        expectedRevision,
-      });
-      if (!response.discarded) {
-        lockExtractionReviewForServerReload(
-          "草稿已被其他窗口更新或处理，取消结果未生效。",
-        );
-        return;
-      }
-      extractionLifecycleLock.current = false;
-      beginExtractionDraftSaveSession();
-      dispatchExtraction({ type: "cancel" });
-      requestAnimationFrame(() => extractionReviewReturnFocusRef.current?.focus());
-    } catch (error: unknown) {
-      const message = errorMessage(error);
-      lockExtractionReviewForServerReload(
-        `取消请求的结果无法安全确认：${message}`,
-      );
-      setExtractionDiscardError(
-        `取消结果不明确，不能继续操作该草稿：${message}`,
-      );
-      setCaseState({ kind: "error", message });
-    } finally {
-      extractionDiscardInFlight.current = false;
-      setExtractionDiscarding(false);
-    }
-  }
-
-  async function discardUnrestorablePendingReview() {
-    const blocked = pendingReviewRecoveryBlock;
-    if (!blocked || extractionDiscardInFlight.current) {
-      return;
-    }
-    const permission = await runConfirmedDestructiveAction(
-      unrestorableExtractionDiscardConfirmation(),
-      (message) => window.confirm(message),
-      async () => {
-        if (
-          extractionDiscardInFlight.current ||
-          extractionConfirmInFlight.current ||
-          extractionCloseInProgress.current
-        ) {
-          return false;
-        }
-        extractionDiscardInFlight.current = true;
-        setExtractionDiscarding(true);
-        return true;
-      },
-    );
-    if (!permission.executed || !permission.value) {
-      return;
-    }
-    try {
-      const response = await discardStructuredCaseExtraction({
-        reviewId: blocked.reviewId,
-        projectId: blocked.projectId,
-        expectedRevision: blocked.revision,
-      });
-      if (!response.discarded) {
-        setPendingReviewRecoveryBlock({
-          ...blocked,
-          reloadRequired: true,
-          message:
-            "草稿已被其他窗口更新或处理，本窗口不能按旧内容放弃。",
-        });
-        return;
-      }
-      if (selectedCaseProjectIdRef.current === blocked.projectId) {
-        setPendingReviewRecoveryBlock(null);
-        setCaseWorkspaceWriteBlocked(false);
-        setCaseState({ kind: "idle" });
-      }
-    } catch (error: unknown) {
-      setPendingReviewRecoveryBlock({
-        ...blocked,
-        reloadRequired: true,
-        message: `放弃请求的结果无法安全确认：${errorMessage(error)}`,
-      });
-      setCaseState({
-        kind: "error",
-        message: `无法放弃不兼容的抽取审阅：${errorMessage(error)}`,
-      });
-    } finally {
-      extractionDiscardInFlight.current = false;
-      setExtractionDiscarding(false);
-    }
-  }
-
-  async function reloadServerExtractionDraft(projectId: string) {
-    if (
-      selectedCaseProjectIdRef.current !== projectId ||
-      extractionDiscardInFlight.current ||
-      extractionConfirmInFlight.current ||
-      extractionConfirmPreparing
-    ) {
-      return;
-    }
-    const requestEpoch = beginCaseMutation(true);
-    if (requestEpoch === null) {
-      return;
-    }
-
-    extractionLifecycleLock.current = false;
-    setExtractionDiscardError(null);
-    setPendingReviewRecoveryBlock(null);
-    beginExtractionDraftSaveSession();
-    dispatchExtraction({ type: "reset" });
-    try {
-      await loadCaseWorkspace(projectId, requestEpoch);
-    } finally {
-      finishCaseMutation();
-    }
-  }
-
-  function resetExtractionResult() {
-    if (
-      extractionState.kind === "failed" ||
-      extractionState.kind === "committed"
-    ) {
-      extractionLifecycleLock.current = false;
-      setExtractionDiscardError(null);
-      beginExtractionDraftSaveSession();
-      dispatchExtraction({ type: "reset" });
-    }
-  }
-
-  async function confirmExtractionReview() {
-    if (
-      extractionConfirmPreparing ||
-      extractionConfirmInFlight.current ||
-      buildConfirmationRequest(extractionState) === null ||
-      extractionDiscardInFlight.current ||
-      extractionCloseInProgress.current ||
-      extractionReviewReloadRequired.current
-    ) {
-      return;
-    }
-    if (blockWorkspaceReloadForDirtyDrafts([], "确认材料整理结果")) {
-      return;
-    }
-    extractionConfirmInFlight.current = true;
-    setExtractionConfirmPreparing(true);
-    let mutationStarted = false;
-    try {
-      if (!(await flushPendingExtractionDraftSave())) {
-        setCaseState({
-          kind: "error",
-          message:
-            "审阅修改尚未安全保存，已阻止确认写入。请重试自动保存后再确认。",
-        });
-        return;
-      }
-      const confirmation = buildConfirmationRequest(extractionStateRef.current);
-      if (!confirmation) {
-        return;
-      }
-      const expectedRevision = extractionServerRevision.current;
-      if (expectedRevision === null) {
-        lockExtractionReviewForServerReload(
-          "确认前无法确认待审草稿的最新状态。",
-        );
-        return;
-      }
-      confirmation.expectedRevision = expectedRevision;
-      const requestEpoch = beginCaseMutation(true);
-      if (requestEpoch === null) {
-        return;
-      }
-      mutationStarted = true;
-      setExtractionDiscardError(null);
-      dispatchExtraction({ type: "begin_commit" });
-      let response: Awaited<
-        ReturnType<typeof confirmStructuredCaseExtraction>
-      >;
-      try {
-        response = await confirmStructuredCaseExtraction(confirmation);
-      } catch (error: unknown) {
-        const message = errorMessage(error);
-        dispatchExtraction({ type: "commit_failed", message });
-        lockExtractionReviewForServerReload(
-          `确认请求的结果无法安全确认：${message}`,
-        );
-        setCaseState({ kind: "error", message });
-        return;
-      }
-      if (!response.applied) {
-        const message = "当前无法确认写入结果。";
-        dispatchExtraction({ type: "commit_failed", message });
-        lockExtractionReviewForServerReload(message);
-        return;
-      }
-
-      extractionLifecycleLock.current = false;
-      beginExtractionDraftSaveSession();
-      const workspaceReloaded = await loadCaseWorkspace(
-        confirmation.projectId,
-        requestEpoch,
-        true,
-      );
-      dispatchExtraction({
-        type: "committed",
-        message: workspaceReloaded
-          ? `已保存 ${response.counts.facts} 项事实、${response.counts.evidence} 项证据和 ${response.counts.uncertainties} 项待核实事项。`
-          : "审阅结果已保存，但案件内容暂未刷新。为避免重复保存，确认按钮已停用，请重新加载当前案件。",
-      });
-      requestAnimationFrame(() => extractionReviewReturnFocusRef.current?.focus());
-    } finally {
-      if (mutationStarted) {
-        finishCaseMutation();
-      }
-      extractionConfirmInFlight.current = false;
-      setExtractionConfirmPreparing(false);
-    }
+    setUnsupportedGraphNodeStatus();
   }
 
   useEffect(() => {
@@ -2342,59 +465,7 @@ export function App() {
     };
   }, [graphCaseTarget, viewMode]);
 
-  const healthText =
-    health.kind === "ready"
-      ? formatHealthCheck(health.response)
-      : health.kind === "error"
-        ? health.message
-        : "正在检查本地服务…";
-  const caseNavigationLocked =
-    extractionSourcesLocked ||
-    extractionDiscarding ||
-    caseMutationInFlight ||
-    caseState.kind === "loading";
-  const caseProjectMutationLocked =
-    caseNavigationLocked ||
-    caseWorkspaceWriteBlocked ||
-    activeCaseEntityEditor !== null;
-  const caseChildrenReady =
-    caseState.kind !== "loading" &&
-    caseWorkspaceWritesAreSafe(
-      caseWorkspace,
-      selectedCaseProjectId,
-      caseProjectDraft.projectId,
-      caseWorkspaceWriteBlocked,
-    );
-  const editingFile = caseEntityEditorMatches(activeCaseEntityEditor, "file");
-  const editingParty = caseEntityEditorMatches(activeCaseEntityEditor, "party");
-  const editingFact = caseEntityEditorMatches(activeCaseEntityEditor, "fact");
-  const editingEvidence = caseEntityEditorMatches(
-    activeCaseEntityEditor,
-    "evidence",
-  );
-  const editingIssue = caseEntityEditorMatches(
-    activeCaseEntityEditor,
-    "legal_issue",
-  );
-  const paginatedCaseProjects = paginateCaseProjects(
-    caseProjects,
-    caseProjectPage,
-  );
-  const assistantProposalApplyBlockedReason =
-    dirtyCaseDraftsForClose.current.length > 0
-      ? "案件工作台仍有未保存草稿。请先保存或清空草稿，再确认写入助理建议。"
-      : caseNavigationLocked || caseWorkspaceWriteBlocked
-        ? "案件工作台正在处理其他操作或处于只读保护状态，请恢复后再确认写入。"
-        : caseWorkspace?.project.projectId !== selectedCaseProjectId
-          ? "当前案件工作区尚未完整加载，不能确认写入助理建议。"
-          : null;
   const activeProductArea = VIEW_METADATA[viewMode].futureArea;
-
-  function refreshCaseAfterAssistantProposal(projectId: string) {
-    if (selectedCaseProjectIdRef.current !== projectId) return;
-    const requestEpoch = advanceCaseWorkspaceEpoch(caseWorkspaceEpoch);
-    void loadCaseWorkspace(projectId, requestEpoch, true);
-  }
 
   function continueSelectedCaseInAssistant() {
     if (!assistantActiveProject) return;
@@ -2507,7 +578,7 @@ export function App() {
   return (
     <AppShell
       activeView={viewMode}
-      status={{ kind: health.kind, text: healthText }}
+      status={{ kind: health.state.kind, text: health.text }}
       onNavigate={navigateFromShell}
     >
 
