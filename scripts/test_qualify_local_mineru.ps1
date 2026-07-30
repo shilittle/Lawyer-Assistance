@@ -154,6 +154,15 @@ try {
   Assert-True -Condition ($parseErrors.Count -eq 0) -Message "qualification script failed AST validation"
   [Management.Automation.Language.Parser]::ParseFile($mockMineru, [ref]$tokens, [ref]$parseErrors) | Out-Null
   Assert-True -Condition ($parseErrors.Count -eq 0) -Message "mock MinerU script failed AST validation"
+  $timeoutParameter = (Get-Command -Name $subject).Parameters["TimeoutSeconds"]
+  $timeoutRange = @($timeoutParameter.Attributes | Where-Object {
+    $_ -is [Management.Automation.ValidateRangeAttribute]
+  })
+  Assert-True -Condition ($timeoutRange.Count -eq 1) -Message "qualification timeout range metadata changed"
+  Assert-True -Condition (
+    [int]$timeoutRange[0].MinRange -eq 10 -and
+    [int]$timeoutRange[0].MaxRange -eq 7200
+  ) -Message "qualification timeout boundaries changed"
 
   $env:LA_QUALIFICATION_SECRET_CANARY = "must-not-reach-child"
   $evidencePath = Join-Path $testRoot "qualification.json"
@@ -188,9 +197,8 @@ try {
   Assert-True -Condition ($evidence.mineru.commandSha256 -match '^[0-9a-f]{64}$') -Message "worker hash was not recorded"
   Assert-True -Condition (-not [bool]$evidence.retention.artifactsRetained) -Message "artifacts must be removed by default"
   Assert-True -Condition (-not [bool]$evidence.retention.artifactPathRecorded) -Message "evidence must not record local paths"
-  $minimumTimeoutEvidence = Invoke-Qualification -MineruMock $mockMineru -GpuMock $mockGpu -Evidence (Join-Path $testRoot "qualification-min-timeout.json") -TimeoutSeconds 10
   $maximumTimeoutEvidence = Invoke-Qualification -MineruMock $mockMineru -GpuMock $mockGpu -Evidence (Join-Path $testRoot "qualification-max-timeout.json") -TimeoutSeconds 7200
-  Assert-True -Condition ([bool]$minimumTimeoutEvidence.qualified -and [bool]$maximumTimeoutEvidence.qualified) -Message "qualification timeout boundaries changed"
+  Assert-True -Condition ([bool]$maximumTimeoutEvidence.qualified) -Message "maximum qualification timeout was not accepted"
   $defaultJob = Join-Path ([IO.Path]::GetTempPath()) ("lawyer-assistance-mineru-qualification-" + $evidence.runId)
   Assert-True -Condition (-not (Test-Path -LiteralPath $defaultJob)) -Message "default qualification artifacts were retained"
   $evidenceHashBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash

@@ -2713,6 +2713,7 @@ fn zeroize(bytes: &mut [u8]) {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn qualification_canary_namespace_is_feature_independent_and_leaf_scoped() {
         let local_data = tempfile::tempdir().expect("temporary local data root");
@@ -2766,6 +2767,24 @@ mod tests {
             .join(QUALIFICATION_CANARY_APP_IDENTIFIER)
             .join(QUALIFICATION_CANARY_RUNS_DIRECTORY)
             .is_dir());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn qualification_canary_namespace_fails_closed_without_fixed_local_boundary() {
+        let local_data = tempfile::tempdir().expect("temporary local data root");
+        let local_data =
+            fs::canonicalize(local_data.path()).expect("canonical temporary local data root");
+        let canary_id = format!("mcpqcanary_{}", "a".repeat(32));
+
+        assert_eq!(
+            create_qualification_canary_run_directory_at(&local_data, &canary_id)
+                .expect_err("non-Windows fixed local boundary is unavailable"),
+            StandaloneApprovedError::Unavailable
+        );
+        assert!(!local_data
+            .join(QUALIFICATION_CANARY_APP_IDENTIFIER)
+            .exists());
     }
 
     #[cfg(windows)]
