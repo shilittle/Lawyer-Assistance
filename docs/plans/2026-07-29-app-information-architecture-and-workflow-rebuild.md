@@ -492,6 +492,85 @@ Tauri commands 只做 typed IPC 转换。
 * 案件分析、文书和图示成果回写前继续要求用户确认。
 * 撤销 generation 后，新的案件请求不得继续使用。
 
+#### Phase 5 实施澄清（2026-07-31）
+
+本节固定 Phase 5 的实现契约；不得复用普通 Assistant、旧多意图
+`start_assistant_run` 或 approved automation/MCP 的授权语义来缩短实现：
+
+* Case Assistant 只嵌入“案件工作”，使用独立 `case_work` 会话范围。既有会话全部
+  迁移为普通 `assistant` 范围，不根据历史 `projectId`、intent、artifact 或
+  publication 推断为可信案件助手会话。普通会话和案件会话必须由后端分别创建、
+  列出和读取，不能只依赖前端过滤。
+* `start_case_assistant_run` 使用 `deny_unknown_fields` 的闭合 IPC：
+  `runId`、`conversationId`、`projectId`、`providerId`、`prompt`、显式
+  `redactionGenerationIds`、`outputKind`（`case_analysis`、`case_document` 或
+  `case_diagram`）和可选 `budget`。请求拒绝 `caseId`、`privacyCaseId`、客户端
+  声明的 hash/status/risk/generation number、普通附件、路径、Vault object、
+  receipt、authority、classification、MCP、artifact 自动应用和
+  `userConfirmed` 字段。
+* 固定 purpose 为 `interactive_case_work`，authority 为 `ApprovedCase`，
+  classification 为 `CaseRedactedApproved`。案件助手不得加载普通聊天附件、普通
+  `interactive_chat` 历史、旧多意图历史、Provider Approval Panel、MCP profile、
+  grant、ticket 或 publication。Phase 4 的案件到普通助理 handoff 停止运行时使用，
+  其兼容 route/type 在 Phase 7 物理删除。
+* 每次请求只使用本次显式给出的 generation IDs。发送动作在 Privacy 写锁事务中把
+  这些显式选择追加记录为 `CaseMaterialSelection`；同一目标重试为幂等，替换时
+  先 deselect 旧行再插入新行，绝不覆盖或删除历史。已有 active selection 只能用于
+  恢复 UI 勾选状态，后端不得把请求未列出的历史选择自动加入 Provider envelope。
+* 在 Privacy operation gate 和项目只读 guard 内，后端必须验证项目存在且未退休，
+  并通过 ADR-0001 精确解析 `ProjectId ↔ PrivacyCaseId` 绑定。每个 generation
+  必须属于当前项目和唯一 material，处于 current/approved/ready 状态，批准 payload
+  hash、generation number、risk revision/head 均精确匹配，P0/P1 为零，且 material
+  与 generation 均未 stale、blocked、revoked、deleted 或重新归属。同一请求不能
+  为一个 material 选择多个 generation。Provider socket write 前在同一 operation
+  gate 内再次完成这些验证，消除撤销或删除的 TOCTOU。
+* 前端永远不得接收、推导或缓存权威 `PrivacyCaseId`。请求、响应和普通日志也不得
+  暴露该值；只有受控 Privacy/Vault 审计可以保存身份对。
+* 现有 `protected_review_blob` 同时包含 original pages 和 redacted pages，禁止作为
+  Case Assistant 运行时来源。Phase 5 必须先完成 Privacy schema v5→v6 的
+  approved-only 受保护投影迁移；投影仍是现有 `RedactionGeneration` 的列扩展，
+  只含 canonical approved payload、必要版本和 risk head，不含原文、文件名、路径、
+  locator、span、canary、`PrivacyCaseId`、Vault/attachment 标识。新批准在同一
+  事务写入完整 review blob、approved-only 投影、批准状态和 risk revision/head。
+  历史批准仅由受备份保护的迁移器一次性解密旧 blob 并 backfill；案件助手专用
+  loader 的 SQL 不得选择旧 blob，缺失、损坏或迁移失败时一律不可用，禁止 fallback。
+* Provider 可见的最小案件上下文采用闭合白名单：已确认 facts/evidence（evidence
+  排除 `storage_reference`）、两端均已确认的事实—证据与事实—争点关联、已确认
+  issues、绑定已确认 issue 且仍 valid 的本地 legal basis、已确认 uncertainties。
+  排除项目 ID/标题/摘要/状态、全部 `case_files`、没有确认状态的 parties、内部
+  storage/Vault/attachment 标识、路径、原文件名、model-suggested 数据、旧
+  artifacts/proposals 和全库自动搜索结果。模型可见引用使用本次请求内的中性序号；
+  内部 ID 只进入受控 lineage/audit。最终完整出站 envelope 再做 residual scan，
+  命中时 transport 前失败，不自动脱敏或降级为 `InteractiveUserProvided`。
+* 对排序后的精确 generation snapshot 计算域隔离 aggregate identity/hash。用户的
+  显式“选择并发送”生成短 TTL、单次 dispatch 的 Case Assistant aggregate approval，
+  精确绑定项目 binding snapshot、generation/version/payload/risk、最小上下文、
+  prompt/history、provider/model/origin、purpose 和 budget；完整 canonical Provider
+  envelope 再派生一次性 transport receipt。provider/model/origin/body 漂移或重放
+  必须失败。该授权不弹 task-specific Provider Approval Panel，也不复用 MCP
+  receipt/grant/ticket。
+* 自动历史只包含同一 project、同一 `case_work` conversation、成功的
+  `interactive_case_work` 纯文本轮次；不得重发旧 source body，也不得读取普通聊天、
+  旧 case intent、artifact/proposal 或 automation lineage。每一轮都必须重新显式
+  给出并验证 generations。已撤销来源的旧回答可以留作历史显示，但不能成为新来源，
+  也不能再确认其 pending output。
+* Provider 响应先完整有界缓冲并执行 residual scan，扫描通过后才一次性交付前端和
+  保存成功历史；未扫描 SSE chunk 不得展示。取消、超限、扫描命中或 Provider 错误
+  不得产生成功 assistant message、pending output 或案件写回。
+* `case_analysis`、`case_document` 和 `case_diagram` 响应先保存为带不可变 source
+  snapshots、output hash/version、conversation/run/project 归属和 workspace base
+  digest 的 pending output。未确认时不得进入“成果”、不得绑定 project artifact、
+  不得修改案件数据。独立确认命令只接受 `projectId`、pending output ID、expected
+  version/hash、expected workspace digest 和字面量 `userConfirmed=true`；后端再次
+  验证输出归属/CAS 及全部 generation/selection 仍 current、approved、active、
+  未撤销，成功后才在 user database 事务中应用分析 proposal 或绑定文书/图示
+  artifact。双击确认、跨案件、stale digest、输出漂移或来源撤销均 fail closed，
+  pending 历史保留且不得静默删除。
+* 新增的会话范围、pending output 与 source lineage 是 user database 的 schema
+  migration；现有行和主键原样保留。approved-only 投影与 selection 是 Privacy
+  database 的 schema migration。任一新 lineage 产生后只支持五组件一致性备份/恢复，
+  不支持单库回滚、down-migrate、删除旧 protected blob 或从 MCP/旧历史反推选择。
+
 ### Phase 6：自动化边界归位
 
 * Provider Approval Panel 改名并迁入“自动化出站批准”。

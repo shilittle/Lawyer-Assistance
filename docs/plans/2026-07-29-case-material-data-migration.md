@@ -79,7 +79,7 @@ legacy reference，不能猜测为路径、Vault object 或 approved generation�
 <app_local_data_dir>/privacy/privacy-workflow.sqlite
 ```
 
-`crates/privacy/src/store.rs` 的当前 `PRIVACY_STORE_SCHEMA_VERSION` 为 `4`。
+`crates/privacy/src/store.rs` 的当前 `PRIVACY_STORE_SCHEMA_VERSION` 为 `5`。
 主要迁移输入如下：
 
 ```text
@@ -91,10 +91,13 @@ privacy_materials(
 
 privacy_redactions(
   redaction_id, material_id,
+  generation_number, generation_status,
   extraction_sha256, redacted_content_sha256,
   approved_payload_sha256,
   policy_id, policy_version, detector_version,
   unresolved_high_risk_count, review_state,
+  risk_revision, approved_at, revocation_state, revoked_at,
+  row_version,
   protected_review_blob, protection_scheme,
   reviewed_by_sha256, created_at, reviewed_at
 )
@@ -104,6 +107,14 @@ privacy_risk_review_revisions(
   hard_gate_sha256, action_code, reason_codes_json,
   protected_state_blob, protection_scheme,
   previous_revision_hash, revision_hash, created_at
+)
+
+case_material_selections(
+  selection_id, project_id, material_id, redaction_id, purpose,
+  selected_by_user, selected_at,
+  selected_generation_number, selected_approved_payload_sha256,
+  selected_risk_revision, deselected_at, invalidated_at,
+  invalidation_reason, row_version
 )
 ```
 
@@ -412,6 +423,109 @@ rowVersion
 每个 `(projectId, materialId, purpose)` 最多一个 active selection。替换选择时先将
 旧行写为 deselected，再插入新行，不覆盖历史。generation 撤销、材料删除或重新归属
 只会使 selection invalid，不会删除 selection。
+
+### 4.4 Phase 5 approved-only 投影与案件助手 lineage
+
+Privacy schema v5 已建立 unified generation、selection、binding 和迁移 ledger，
+但现有 `protected_review_blob` 同时包含原文与建议脱敏文。它不能作为案件助手的
+运行时批准正文来源。Phase 5 将 Privacy schema 升级为 v6，并在现有
+`privacy_redactions` 上增加以下列：
+
+```text
+approved_payload_schema_version       nullable
+protected_approved_payload_blob       nullable
+approved_payload_protection_scheme    nullable
+approved_risk_revision_hash           nullable
+```
+
+这些列是 `RedactionGeneration` 的 approved-only 受保护投影，不是第三套材料表。
+投影明文是 canonical `ApprovedPayload` v1：
+
+```text
+{
+  schemaVersion,
+  sourceSha256,
+  extractionSha256,
+  mediaType,
+  pages: [{ pageNumber, text }]
+}
+```
+
+投影不得包含 original text、文件名、locator、span、canary、案件身份、Vault 或
+attachment ID、路径。继续复用 `approved_payload_sha256` 校验 canonical 明文字节，
+`approved_risk_revision_hash` 精确绑定生成批准时已完整验证的 risk chain head。
+四列必须全空或全完整；`review_state='approved'` 且 `generation_status='ready'` 的
+行必须具有完整投影、`risk_revision > 0`、零 high-risk finding 和合法 chain head。
+历史损坏行保留全部源数据但标为 blocked，不得伪造投影。
+
+新批准必须在同一事务内写入完整 review blob、approved-only 投影、批准状态、
+risk revision/head 和 row version。批准后投影、批准 hash 和 risk head 不可原地
+改写。安全关键 trigger 必须阻止 UPDATE、DELETE 及 `INSERT OR REPLACE`/upsert
+冲突算法绕过；risk revision 和 selection 的 append-preserving 触发器同样必须覆盖
+delete/replace。可写连接应比较 canonical trigger SQL、foreign keys 和
+`recursive_triggers` 配置，不只检查对象同名存在。
+
+新增专用 approved-only loader，其 SQL 只能选择投影与必要公开索引列，不能选择
+`protected_review_blob`。loader 必须严格解析并 canonical 重编码，逐字节核对 payload、
+source/extraction/redacted hashes、media/page、generation、完整 risk chain/head、
+project binding 和 revocation 状态。使用合法投影但旧 full blob 已损坏时仍应成功，
+用于证明运行时未读取原文；投影缺失或损坏时禁止 fallback 到旧 blob。
+
+Phase 5 同时把 user database 升级为下一 canonical schema：
+
+- `conversations` 增加后端权威的 `assistant | case_work` 范围；所有既有会话迁移为
+  `assistant`，不得按历史 `project_id` 或 intent 推断；
+- 新增 append-preserving `case_assistant_pending_outputs` 与精确 source snapshot
+  lineage，保存 opaque project/conversation/run/generation 标识、版本/hash、
+  output kind/hash/version、workspace base digest、状态与确认审计，不保存
+  `PrivacyCaseId`、原文、路径或 Provider 正文副本；
+- 未确认 output 不绑定案件 artifact、不进入 Case Outputs。确认在 user database
+  事务中执行 workspace CAS 和一次性状态转换；Privacy generation/selection 在进入
+  事务前及应用前分别重新验证。
+
+`CaseMaterialSelection` 的固定 purpose 为 `interactive_case_work`。每次
+`start_case_assistant_run` 只处理请求显式列出的 generation IDs，并在写锁事务内
+幂等追加/替换对应选择；其他 active selection 只用于 UI 恢复，不自动扩大本次来源。
+selection 创建、批准正文读取、Provider socket write 和 pending output 确认四个时点
+都必须重新验证当前项目绑定、generation snapshot、risk head 与撤销状态。
+
+#### v5→v6 受控 backfill
+
+使用固定 migration id `approved-case-projection-v1`，复用现有 append-preserving
+migration ledger/events，执行顺序固定为：
+
+1. 在 operation gate 下只读预检 Privacy v5 schema、完整 risk chains、源 manifest
+   和 projection source fingerprint。
+2. 创建并验证包含 user database、Privacy database、Vault、approved generations
+   和 work-products 的五组件一致性备份；在首次 schema 写入前再次比较 fingerprint。
+3. 只增加 nullable projection 列和临时批准阻断 trigger。v1–v4 输入必须先明确升级
+   到中间版本 v5，不能因全局版本常量变为 6 而提前写 v6 metadata。
+4. 对每个 ready approved generation，仅在迁移进程内解密旧 full blob，验证
+   material/redaction/project/Vault 身份、所有公开 hash、page count、canary/residual
+   和完整 risk chain；从 `suggested_redacted_text` 构造 canonical approved payload，
+   核对既有 approved hash 后以 DPAPI 写入安全投影和精确 risk head，并在同一事务
+   写完成 ledger。
+5. 无效行保留旧 blob、主键和全部 provenance，追加 blocked result 并使 active
+   selection invalid；pending、stale、revoked、non-approved 行不生成投影。
+6. 所有 ready approved 行均已验证或稳定 blocked 后，安装最终安全 trigger、验证
+   schema/manifest，再写 Privacy schema version 6 并清除 upgrade-required 状态。
+
+fingerprint 排除本迁移自身写入的投影/status/row-version 列，并通过持久化源 manifest
+支持 schema-prep、单行 backfill、finalize 任一崩溃点幂等恢复。迁移不得改写
+`user.sqlite`、旧 `protected_review_blob`、源主键或 Vault/approved/work-product
+内容。
+
+approved-only 投影会扩大 Privacy database。v5 迁移源继续受 96 MiB 旧上限约束；
+Phase 5 将 raw Privacy database、portable/envelope、application backup 和 restore
+的相关上限成套提升到 256 MiB，并在任何 schema 写入前预估迁移后文件大小。单个
+canonical approved payload 继续受 16 MiB 上限约束；预计超过 256 MiB 时稳定阻断并
+保留五组件备份和源库，不允许产生无法被应用备份覆盖的部分 v6 状态。
+
+投影仍位于 Privacy database，因此备份格式保持五组件 V3，不增加第六组件。
+application backup 必须按 migration id 路由独立的 source fingerprint，允许
+`approved-case-projection-v1`，并支持恢复 Privacy v5 后重新执行受备份保护的迁移。
+任一 projection、selection 或 pending-output lineage 存在后，三组件或单数据库恢复
+必须在暂存前和首次组件替换前再次 fail closed。
 
 ## 5. 源数据映射
 
