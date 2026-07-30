@@ -6,7 +6,10 @@ use privacy::vnext::{CaseId, MaterialId};
 use privacy::{
     protect_local, sha256_hex, unprotect_local, BackupExportRequestV1, BackupVerificationContextV1,
     CleanupReportV1, EncryptedPrivacyBackupStore, LifecycleError, MappingAccessContextV1,
-    PrivacyLifecycle, RetentionPolicyV1, VerifiedBackupV1, LOGICAL_ERASURE_DISCLOSURE,
+    PreMigrationBackupExportContextV1, PreMigrationBackupVerificationContextV1, PrivacyCaseId,
+    PrivacyLifecycle, PrivacyStore, PrivacyStoreSchemaStatus, ProjectId,
+    ProjectPrivacyCaseBindingStore, RetentionPolicyV1, VerifiedBackupV1,
+    LOGICAL_ERASURE_DISCLOSURE,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -40,8 +43,6 @@ const INVALIDATE_REASON_MAPPING_REVOKED: &str = "privacy_mapping_revoked";
 const INVALIDATE_REASON_MAPPING_KEY_ROTATED: &str = "privacy_mapping_key_rotated";
 const INVALIDATE_REASON_MAPPING_KEY_DESTROYED: &str = "privacy_mapping_key_destroyed";
 const INVALIDATE_REASON_RETENTION_SWEEP: &str = "privacy_retention_sweep";
-const INVALIDATE_REASON_PRIVACY_RESTORE_STAGED: &str = "privacy_restore_staged";
-const INVALIDATE_REASON_APPLICATION_RESTORE_STAGED: &str = "application_privacy_restore_staged";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PublicationInvalidationTargets {
@@ -300,6 +301,17 @@ struct PrivacyRestorePaths {
     rollback: PathBuf,
 }
 
+pub(crate) struct StagedApplicationPrivacyComponent {
+    pub verified: VerifiedBackupView,
+    pub privacy_store_schema_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplicationPrivacyRestoreMode {
+    Current,
+    CoordinatedPreMigration,
+}
+
 fn publication_scope_error() -> PrivacyWorkflowError {
     PrivacyWorkflowError::new(
         "privacy_publication_invalidation_scope_unavailable",
@@ -308,27 +320,17 @@ fn publication_scope_error() -> PrivacyWorkflowError {
 }
 
 fn parse_publication_target(
-    project_case_id: Option<String>,
+    connection: &Connection,
+    project_id: Option<String>,
     vault_case_id: Option<String>,
     material_id: Option<String>,
 ) -> Result<(CaseId, MaterialId), ()> {
-    let project_case_id = project_case_id
-        .map(CaseId::parse)
-        .transpose()
+    let project_id = ProjectId::parse(project_id.ok_or(())?).map_err(|_| ())?;
+    let vault_case_id = PrivacyCaseId::parse(vault_case_id.ok_or(())?).map_err(|_| ())?;
+    ProjectPrivacyCaseBindingStore::validate_pair(connection, &project_id, &vault_case_id)
         .map_err(|_| ())?;
-    let vault_case_id = vault_case_id
-        .map(CaseId::parse)
-        .transpose()
-        .map_err(|_| ())?;
-    let case_id = match (project_case_id, vault_case_id) {
-        (Some(project), Some(vault)) if project == vault => project,
-        (Some(_), Some(_)) => return Err(()),
-        (Some(project), None) => project,
-        (None, Some(vault)) => vault,
-        (None, None) => return Err(()),
-    };
     let material_id = MaterialId::parse(material_id.ok_or(())?).map_err(|_| ())?;
-    Ok((case_id, material_id))
+    Ok((vault_case_id.into_case_id(), material_id))
 }
 
 fn mapping_publication_targets(
@@ -355,7 +357,7 @@ fn mapping_publication_targets(
         .optional()
         .map_err(|_| publication_scope_error())?;
     Ok(target.map(|(project_case_id, vault_case_id, material_id)| {
-        parse_publication_target(project_case_id, vault_case_id, material_id)
+        parse_publication_target(connection, project_case_id, vault_case_id, material_id)
             .map_or(PublicationInvalidationTargets::All, |target| {
                 PublicationInvalidationTargets::Exact(BTreeSet::from([target]))
             })
@@ -411,6 +413,7 @@ fn mapping_key_publication_targets(
     let mut targets = BTreeSet::new();
     while let Some(row) = rows.next().map_err(|_| publication_scope_error())? {
         let target = parse_publication_target(
+            connection,
             row.get::<_, Option<String>>(0)
                 .map_err(|_| publication_scope_error())?,
             row.get::<_, Option<String>>(1)
@@ -785,22 +788,31 @@ impl PrivacyWorkflowManager {
         &self,
         _guard: &ApplicationBackupPrivacyGuard<'_>,
     ) -> Result<VerifiedBackupView, PrivacyWorkflowError> {
-        let mut connection = self.open_connection()?;
+        let mut connection = self.open_raw_connection()?;
         let lifecycle = self.privacy_lifecycle(&connection)?;
         let store = self.backup_store()?;
         let now = self.current_unix()?;
-        store
-            .export_database(
-                &mut connection,
-                &lifecycle,
-                &BackupExportRequestV1 {
-                    backup_id: &format!("bkp_{}", Uuid::new_v4().simple()),
-                    created_at_unix: now,
-                    expires_at_unix: None,
-                },
-            )
-            .map(VerifiedBackupView::from)
-            .map_err(PrivacyWorkflowError::lifecycle)
+        let backup_id = format!("bkp_{}", Uuid::new_v4().simple());
+        let request = BackupExportRequestV1 {
+            backup_id: &backup_id,
+            created_at_unix: now,
+            expires_at_unix: None,
+        };
+        let verified =
+            if let Some(schema_version) = self.pre_migration_backup_schema_version(&connection)? {
+                store.export_pre_migration_database(
+                    &mut connection,
+                    &lifecycle,
+                    &request,
+                    &PreMigrationBackupExportContextV1 {
+                        expected_privacy_store_schema_version: schema_version,
+                    },
+                )
+            } else {
+                store.export_database(&mut connection, &lifecycle, &request)
+            }
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+        Ok(VerifiedBackupView::from(verified))
     }
 
     pub fn verify_privacy_backup(
@@ -830,12 +842,21 @@ impl PrivacyWorkflowManager {
         _guard: &ApplicationBackupPrivacyGuard<'_>,
         backup_id: &str,
     ) -> Result<Vec<u8>, PrivacyWorkflowError> {
-        let connection = self.open_connection()?;
+        let connection = self.open_raw_connection()?;
         let lifecycle = self.privacy_lifecycle(&connection)?;
-        let context = self.backup_context(&connection, &lifecycle)?;
-        self.backup_store()?
-            .export_portable_bundle(backup_id, &context)
-            .map_err(PrivacyWorkflowError::lifecycle)
+        let store = self.backup_store()?;
+        if let Some(schema_version) = self.pre_migration_backup_schema_version(&connection)? {
+            let context =
+                self.pre_migration_backup_context(&connection, &lifecycle, schema_version)?;
+            store
+                .export_pre_migration_portable_bundle(backup_id, &context)
+                .map_err(PrivacyWorkflowError::lifecycle)
+        } else {
+            let context = self.backup_context(&connection, &lifecycle)?;
+            store
+                .export_portable_bundle(backup_id, &context)
+                .map_err(PrivacyWorkflowError::lifecycle)
+        }
     }
 
     pub fn import_privacy_backup_bundle(
@@ -862,7 +883,7 @@ impl PrivacyWorkflowManager {
         _guard: &ApplicationBackupPrivacyGuard<'_>,
         backup_id: &str,
     ) -> Result<(), PrivacyWorkflowError> {
-        let connection = self.open_connection()?;
+        let connection = self.open_raw_connection()?;
         self.backup_store()?
             .revoke_backup(&connection, backup_id, self.current_unix()?)
             .map_err(PrivacyWorkflowError::lifecycle)
@@ -883,7 +904,6 @@ impl PrivacyWorkflowManager {
             .map_err(PrivacyWorkflowError::lifecycle)?;
         let paths = privacy_restore_paths(&self.shared.database_path)?;
         ensure_restore_slot_empty(&paths)?;
-        self.invalidate_all_publications(INVALIDATE_REASON_PRIVACY_RESTORE_STAGED)?;
         let result = (|| {
             let mut destination = Connection::open(&paths.incoming).map_err(|_| {
                 PrivacyWorkflowError::new("privacy_restore_io", "隐私备份恢复暂存数据库无法创建。")
@@ -931,22 +951,97 @@ impl PrivacyWorkflowManager {
         expected_backup_id: &str,
         portable_bundle: &[u8],
     ) -> Result<VerifiedBackupView, PrivacyWorkflowError> {
+        self.stage_application_privacy_component_internal(
+            expected_backup_id,
+            portable_bundle,
+            ApplicationPrivacyRestoreMode::Current,
+            None,
+        )
+        .map(|staged| staged.verified)
+    }
+
+    /// Stages the Privacy component from the coordinated five-component migration backup only.
+    ///
+    /// This separate entry point is what permits an authenticated v1-v4 snapshot. It never upgrades
+    /// the restored database and is intentionally unavailable to standalone Privacy restore or the
+    /// historical three-component application restore protocol.
+    pub(crate) fn stage_pre_migration_application_privacy_component(
+        &self,
+        expected_backup_id: &str,
+        portable_bundle: &[u8],
+    ) -> Result<StagedApplicationPrivacyComponent, PrivacyWorkflowError> {
+        self.stage_application_privacy_component_internal(
+            expected_backup_id,
+            portable_bundle,
+            ApplicationPrivacyRestoreMode::CoordinatedPreMigration,
+            None,
+        )
+    }
+
+    /// Migration-only recovery path for an authenticated five-component rollback point whose
+    /// original retention window has elapsed. The caller must authenticate the enclosing
+    /// application backup and its DPAPI-bound migration identity before using the recorded
+    /// creation instant here.
+    pub(crate) fn stage_pre_migration_application_privacy_component_for_migration_recovery(
+        &self,
+        expected_backup_id: &str,
+        portable_bundle: &[u8],
+        authenticated_created_at_unix: u64,
+    ) -> Result<StagedApplicationPrivacyComponent, PrivacyWorkflowError> {
+        if authenticated_created_at_unix == 0 {
+            return Err(PrivacyWorkflowError::new(
+                "application_backup_component_mismatch",
+                "The authenticated migration backup creation instant is invalid.",
+            ));
+        }
+        self.stage_application_privacy_component_internal(
+            expected_backup_id,
+            portable_bundle,
+            ApplicationPrivacyRestoreMode::CoordinatedPreMigration,
+            Some(authenticated_created_at_unix),
+        )
+    }
+
+    fn stage_application_privacy_component_internal(
+        &self,
+        expected_backup_id: &str,
+        portable_bundle: &[u8],
+        mode: ApplicationPrivacyRestoreMode,
+        authenticated_verification_unix: Option<u64>,
+    ) -> Result<StagedApplicationPrivacyComponent, PrivacyWorkflowError> {
         let _gate = self.gate();
         let connection = self.open_connection()?;
         let lifecycle = self.privacy_lifecycle(&connection)?;
-        let context = self.backup_context(&connection, &lifecycle)?;
+        let mut context = self.backup_context(&connection, &lifecycle)?;
+        if let Some(verification_unix) = authenticated_verification_unix {
+            context.now_unix = verification_unix;
+        }
         let store = self.backup_store()?;
-        let verified = match store.import_portable_bundle(portable_bundle, &context) {
-            Ok(verified) => verified,
-            Err(import_error) => {
-                let existing = store.export_portable_bundle(expected_backup_id, &context);
-                match existing {
-                    Ok(existing) if sha256_hex(&existing) == sha256_hex(portable_bundle) => store
-                        .verify_detached_backup(expected_backup_id, &context)
-                        .map_err(PrivacyWorkflowError::lifecycle)?,
-                    _ => return Err(PrivacyWorkflowError::lifecycle(import_error)),
+        let verified = match mode {
+            ApplicationPrivacyRestoreMode::Current => {
+                match store.import_portable_bundle(portable_bundle, &context) {
+                    Ok(verified) => verified,
+                    Err(import_error) => {
+                        let existing = store.export_portable_bundle(expected_backup_id, &context);
+                        match existing {
+                            Ok(existing)
+                                if sha256_hex(&existing) == sha256_hex(portable_bundle) =>
+                            {
+                                store
+                                    .verify_detached_backup(expected_backup_id, &context)
+                                    .map_err(PrivacyWorkflowError::lifecycle)?
+                            }
+                            _ => return Err(PrivacyWorkflowError::lifecycle(import_error)),
+                        }
+                    }
                 }
             }
+            ApplicationPrivacyRestoreMode::CoordinatedPreMigration => store
+                .import_portable_bundle_for_coordinated_pre_migration_restore(
+                    portable_bundle,
+                    &context,
+                )
+                .map_err(PrivacyWorkflowError::lifecycle)?,
         };
         if verified.backup_id != expected_backup_id {
             return Err(PrivacyWorkflowError::new(
@@ -964,7 +1059,6 @@ impl PrivacyWorkflowManager {
                 "已有组合恢复隐私暂存文件。",
             ));
         }
-        self.invalidate_all_publications(INVALIDATE_REASON_APPLICATION_RESTORE_STAGED)?;
         let result = (|| {
             let mut destination = Connection::open(&incoming).map_err(|_| {
                 PrivacyWorkflowError::new(
@@ -972,13 +1066,23 @@ impl PrivacyWorkflowManager {
                     "组合恢复隐私暂存数据库无法创建。",
                 )
             })?;
-            store
-                .restore_detached_into_empty_database(
-                    &mut destination,
-                    expected_backup_id,
-                    &context,
-                )
-                .map_err(PrivacyWorkflowError::lifecycle)?;
+            match mode {
+                ApplicationPrivacyRestoreMode::Current => store
+                    .restore_detached_into_empty_database(
+                        &mut destination,
+                        expected_backup_id,
+                        &context,
+                    )
+                    .map_err(PrivacyWorkflowError::lifecycle)?,
+                ApplicationPrivacyRestoreMode::CoordinatedPreMigration => store
+                    .restore_detached_for_coordinated_pre_migration_restore(
+                        &mut destination,
+                        expected_backup_id,
+                        verified.privacy_store_schema_version,
+                        &context,
+                    )
+                    .map_err(PrivacyWorkflowError::lifecycle)?,
+            };
             drop(destination);
             validate_restore_database(
                 &incoming,
@@ -988,7 +1092,11 @@ impl PrivacyWorkflowManager {
             )
         })();
         finish_application_privacy_restore_stage(&incoming, result)?;
-        Ok(VerifiedBackupView::from(verified))
+        let privacy_store_schema_version = verified.privacy_store_schema_version;
+        Ok(StagedApplicationPrivacyComponent {
+            verified: VerifiedBackupView::from(verified),
+            privacy_store_schema_version,
+        })
     }
 
     fn backup_store(&self) -> Result<EncryptedPrivacyBackupStore, PrivacyWorkflowError> {
@@ -997,6 +1105,40 @@ impl PrivacyWorkflowManager {
         })?;
         EncryptedPrivacyBackupStore::initialize(directory.join(BACKUP_ROOT_NAME))
             .map_err(PrivacyWorkflowError::lifecycle)
+    }
+
+    fn pre_migration_backup_schema_version(
+        &self,
+        connection: &Connection,
+    ) -> Result<Option<i64>, PrivacyWorkflowError> {
+        if !self.privacy_store_schema_upgrade_required() {
+            return Ok(None);
+        }
+        match PrivacyStore::preflight_schema(connection).map_err(PrivacyWorkflowError::store)? {
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version } => Ok(Some(found_version)),
+            PrivacyStoreSchemaStatus::Empty | PrivacyStoreSchemaStatus::Current => {
+                Err(PrivacyWorkflowError::new(
+                    "privacy_store_schema_state_changed",
+                    "The privacy store schema changed while the pre-migration backup gate was active.",
+                ))
+            }
+        }
+    }
+
+    fn pre_migration_backup_context<'a>(
+        &self,
+        connection: &Connection,
+        lifecycle: &'a PrivacyLifecycle,
+        schema_version: i64,
+    ) -> Result<PreMigrationBackupVerificationContextV1<'a>, PrivacyWorkflowError> {
+        Ok(PreMigrationBackupVerificationContextV1 {
+            expected_workspace_instance_id: lifecycle.workspace_instance_id(),
+            expected_key_epoch: lifecycle
+                .current_key_epoch(connection)
+                .map_err(PrivacyWorkflowError::lifecycle)?,
+            expected_privacy_store_schema_version: schema_version,
+            now_unix: self.current_unix()?,
+        })
     }
 
     fn backup_context<'a>(
@@ -1018,10 +1160,14 @@ pub(crate) fn application_privacy_restore_incoming(privacy_directory: &Path) -> 
     privacy_directory.join("privacy-workflow.sqlite.application-restore-incoming")
 }
 
-pub(super) fn apply_pending_privacy_restore(
+pub(super) fn apply_pending_privacy_restore<BeforeApply>(
     privacy_directory: &Path,
     workspace_instance_id: &str,
-) -> Result<(), PrivacyWorkflowError> {
+    before_apply: BeforeApply,
+) -> Result<(), PrivacyWorkflowError>
+where
+    BeforeApply: FnOnce() -> Result<(), PrivacyWorkflowError>,
+{
     validate_ordinary_directory(privacy_directory)?;
     let paths = privacy_restore_paths(&privacy_directory.join(super::PRIVACY_DATABASE_NAME))?;
     recover_stale_restore_files(&paths, workspace_instance_id)?;
@@ -1041,7 +1187,8 @@ pub(super) fn apply_pending_privacy_restore(
             "The pending privacy restore marker does not match the current workspace.",
         ));
     }
-    if restore_path_is_present(&paths.incoming)? {
+    let incoming_present = restore_path_is_present(&paths.incoming)?;
+    if incoming_present {
         if restore_path_is_present(&paths.rollback)? {
             return Err(PrivacyWorkflowError::new(
                 "privacy_restore_conflict",
@@ -1062,6 +1209,23 @@ pub(super) fn apply_pending_privacy_restore(
         if let Err(error) = preparation {
             return finish_privacy_restore_stage(&paths, Err(error));
         }
+    } else if let Err(error) = validate_restore_database(
+        &paths.active,
+        workspace_instance_id,
+        marker.key_epoch,
+        &marker.incoming_sha256,
+    ) {
+        rollback_privacy_restore(&paths)?;
+        return Err(error);
+    }
+
+    // Only a DPAPI-authenticated marker whose exact incoming (or already
+    // installed active) database has passed the workspace/key/hash checks may
+    // revoke existing publications. Stray filenames and malformed markers
+    // cannot cross this business-state boundary.
+    before_apply()?;
+
+    if incoming_present {
         if let Err(error) = fs::rename(&paths.active, &paths.rollback) {
             let original = PrivacyWorkflowError::new(
                 "privacy_restore_io",
@@ -1603,6 +1767,7 @@ mod tests {
         Arc, Mutex,
     };
 
+    const TEST_PROJECT_ID: &str = "case-lifecycle-project";
     const TEST_CASE_ID: &str = "case_11111111111111111111111111111111";
     const TEST_MATERIAL_ID: &str = "mat_22222222222222222222222222222222";
     const TEST_MAPPING_ID: &str = "map_44444444444444444444444444444444";
@@ -1706,26 +1871,55 @@ mod tests {
     }
 
     fn install_mapping_fixture(manager: &PrivacyWorkflowManager) {
-        let connection = manager.open_connection().expect("privacy connection");
+        let mut connection = manager.open_connection().expect("privacy connection");
+        let project_id = ProjectId::parse(TEST_PROJECT_ID).expect("fixture project id");
+        let privacy_case_id = PrivacyCaseId::parse(TEST_CASE_ID).expect("fixture privacy case id");
+        let binding_context = privacy::BindingLifecycleContext::new(
+            privacy::BindingCreationSource::LegacyMigration,
+            "audit-lifecycle-fixture-binding",
+            Some("project-privacy-case-binding-v1".to_owned()),
+        )
+        .expect("fixture binding context");
+        ProjectPrivacyCaseBindingStore::bind_existing_for_migration(
+            &mut connection,
+            &project_id,
+            &privacy_case_id,
+            &binding_context,
+        )
+        .expect("fixture project/privacy binding");
         connection
             .execute_batch(
                 "INSERT INTO privacy_materials(
                      material_id,project_id,attachment_id,source_sha256,source_name_sha256,
-                     media_type,page_count,state
+                     media_type,page_count,source_kind,extraction_status,migration_status,state
                  ) VALUES(
                      'mat_22222222222222222222222222222222',
-                     'case_11111111111111111111111111111111',NULL,
+                     'case-lifecycle-project',NULL,
                      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                      'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                     'text/plain',1,'approved'
+                     'text/plain',1,'vault','ready','ready','approved'
+                 );
+                 INSERT INTO privacy_vault_material_refs(
+                     material_id,case_id,object_id,object_version,source_sha256,envelope_sha256,
+                     content_bytes,retention_expires_at_unix,retention_policy_revision,
+                     bound_at_unix,import_state
+                 ) VALUES(
+                     'mat_22222222222222222222222222222222',
+                     'case_11111111111111111111111111111111',
+                     'obj_22222222222222222222222222222222',1,
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'abababababababababababababababababababababababababababababababab',
+                     1,2100000000,1,1500000000,'review_ready'
                  );
                  INSERT INTO privacy_redactions(
-                     redaction_id,material_id,extraction_sha256,redacted_content_sha256,
+                     redaction_id,material_id,generation_number,
+                     extraction_sha256,redacted_content_sha256,
                      approved_payload_sha256,policy_id,policy_version,detector_version,
                      unresolved_high_risk_count,review_state,protected_review_blob,protection_scheme
                  ) VALUES(
                      'red_33333333333333333333333333333333',
                      'mat_22222222222222222222222222222222',
+                     1,
                      'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
                      'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
                      'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
@@ -1753,25 +1947,44 @@ mod tests {
             .execute_batch(
                 "INSERT INTO privacy_materials(
                      material_id,project_id,attachment_id,source_sha256,source_name_sha256,
-                     media_type,page_count,state
+                     media_type,page_count,source_kind,extraction_status,migration_status,state
                  ) VALUES
                  ('mat_55555555555555555555555555555555',
-                  'case_11111111111111111111111111111111',NULL,
+                  'case-lifecycle-project',NULL,
                   '1515151515151515151515151515151515151515151515151515151515151515',
                   '2525252525252525252525252525252525252525252525252525252525252525',
-                  'text/plain',1,'approved'),
+                  'text/plain',1,'vault','ready','ready','approved'),
                  ('mat_66666666666666666666666666666666',
-                  'case_11111111111111111111111111111111',NULL,
+                  'case-lifecycle-project',NULL,
                   '1616161616161616161616161616161616161616161616161616161616161616',
                   '2626262626262626262626262626262626262626262626262626262626262626',
-                  'text/plain',1,'approved');
+                  'text/plain',1,'vault','ready','ready','approved');
+                 INSERT INTO privacy_vault_material_refs(
+                     material_id,case_id,object_id,object_version,source_sha256,envelope_sha256,
+                     content_bytes,retention_expires_at_unix,retention_policy_revision,
+                     bound_at_unix,import_state
+                 ) VALUES
+                 ('mat_55555555555555555555555555555555',
+                  'case_11111111111111111111111111111111',
+                  'obj_55555555555555555555555555555555',1,
+                  '1515151515151515151515151515151515151515151515151515151515151515',
+                  '5555555555555555555555555555555555555555555555555555555555555555',
+                  1,2100000000,1,1500000000,'review_ready'),
+                 ('mat_66666666666666666666666666666666',
+                  'case_11111111111111111111111111111111',
+                  'obj_66666666666666666666666666666666',1,
+                  '1616161616161616161616161616161616161616161616161616161616161616',
+                  '6666666666666666666666666666666666666666666666666666666666666666',
+                  1,2100000000,1,1500000000,'review_ready');
                  INSERT INTO privacy_redactions(
-                     redaction_id,material_id,extraction_sha256,redacted_content_sha256,
+                     redaction_id,material_id,generation_number,
+                     extraction_sha256,redacted_content_sha256,
                      approved_payload_sha256,policy_id,policy_version,detector_version,
                      unresolved_high_risk_count,review_state,protected_review_blob,protection_scheme
                  ) VALUES
                  ('red_55555555555555555555555555555555',
                   'mat_55555555555555555555555555555555',
+                  1,
                   '3535353535353535353535353535353535353535353535353535353535353535',
                   '4545454545454545454545454545454545454545454545454545454545454545',
                   '5555555555555555555555555555555555555555555555555555555555555555',
@@ -1779,6 +1992,7 @@ mod tests {
                   'windows_dpapi_current_user_v1'),
                  ('red_66666666666666666666666666666666',
                   'mat_66666666666666666666666666666666',
+                  1,
                   '3636363636363636363636363636363636363636363636363636363636363636',
                   '4646464646464646464646464646464646464646464646464646464646464646',
                   '5656565656565656565656565656565656565656565656565656565656565656',
@@ -1802,6 +2016,151 @@ mod tests {
             receipt_grace_seconds: 3_600,
             backup_retention_seconds: 7 * 86_400,
         }
+    }
+
+    #[test]
+    fn publication_target_requires_the_persisted_project_privacy_binding() {
+        let mut connection = Connection::open_in_memory().expect("in-memory privacy store");
+        privacy::PrivacyStore::initialize(&connection).expect("privacy schema");
+        ProjectPrivacyCaseBindingStore::initialize(&mut connection).expect("binding schema");
+        let project_id = ProjectId::parse("case-lifecycle-project").expect("project id");
+        let privacy_case_id = PrivacyCaseId::parse(TEST_CASE_ID).expect("privacy case id");
+        let context = privacy::BindingLifecycleContext::new(
+            privacy::BindingCreationSource::LegacyMigration,
+            "audit-lifecycle-binding",
+            Some("project-privacy-case-binding-v1".to_owned()),
+        )
+        .expect("binding context");
+        ProjectPrivacyCaseBindingStore::bind_existing_for_migration(
+            &mut connection,
+            &project_id,
+            &privacy_case_id,
+            &context,
+        )
+        .expect("exact migrated binding");
+
+        let (case_id, material_id) = parse_publication_target(
+            &connection,
+            Some(project_id.as_str().to_owned()),
+            Some(privacy_case_id.as_str().to_owned()),
+            Some(TEST_MATERIAL_ID.to_owned()),
+        )
+        .expect("bound target");
+        assert_eq!(case_id.as_str(), TEST_CASE_ID);
+        assert_eq!(material_id.as_str(), TEST_MATERIAL_ID);
+
+        assert!(parse_publication_target(
+            &connection,
+            Some("case-unbound".to_owned()),
+            Some(TEST_CASE_ID.to_owned()),
+            Some(TEST_MATERIAL_ID.to_owned()),
+        )
+        .is_err());
+        assert!(parse_publication_target(
+            &connection,
+            Some(project_id.as_str().to_owned()),
+            Some("case_99999999999999999999999999999999".to_owned()),
+            Some(TEST_MATERIAL_ID.to_owned()),
+        )
+        .is_err());
+        assert!(parse_publication_target(
+            &connection,
+            None,
+            Some(TEST_CASE_ID.to_owned()),
+            Some(TEST_MATERIAL_ID.to_owned()),
+        )
+        .is_err());
+        assert!(parse_publication_target(
+            &connection,
+            Some(project_id.as_str().to_owned()),
+            None,
+            Some(TEST_MATERIAL_ID.to_owned()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pre_migration_backup_gate_exports_legacy_schema_without_upgrading_it() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let initialized = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("initialize current privacy store");
+        drop(initialized);
+
+        let database_path = directory
+            .path()
+            .join(super::super::PRIVACY_DIRECTORY_NAME)
+            .join(super::super::PRIVACY_DATABASE_NAME);
+        let connection = Connection::open(&database_path).expect("privacy database");
+        connection
+            .execute(
+                "UPDATE privacy_schema_metadata SET value='4' WHERE key='schema_version'",
+                [],
+            )
+            .expect("mark synthetic legacy schema");
+        let schema_before: String = connection
+            .query_row(
+                "SELECT group_concat(name || ':' || COALESCE(sql,''), '|')
+                 FROM (
+                    SELECT type,name,sql FROM sqlite_master
+                    WHERE type IN ('table','index','trigger')
+                    ORDER BY type,name
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema manifest");
+        drop(connection);
+
+        let pending = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("open legacy store in backup-only mode");
+        assert!(pending.privacy_store_schema_upgrade_required());
+        assert_eq!(
+            pending
+                .open_connection()
+                .expect_err("ordinary access must remain closed before backup")
+                .code(),
+            "privacy_store_backup_required"
+        );
+
+        let backup = pending
+            .create_privacy_backup()
+            .expect("create authenticated legacy backup");
+        let portable = pending
+            .export_privacy_backup_bundle(&backup.backup_id)
+            .expect("export authenticated legacy bundle");
+        assert!(!portable.is_empty());
+
+        let connection = pending
+            .open_raw_connection()
+            .expect("raw pre-migration inspection");
+        assert_eq!(
+            PrivacyStore::preflight_schema(&connection).expect("legacy preflight"),
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 4 }
+        );
+        let schema_after: String = connection
+            .query_row(
+                "SELECT group_concat(name || ':' || COALESCE(sql,''), '|')
+                 FROM (
+                    SELECT type,name,sql FROM sqlite_master
+                    WHERE type IN ('table','index','trigger')
+                    ORDER BY type,name
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema manifest after backup");
+        assert_eq!(schema_after, schema_before);
+        drop(connection);
+
+        pending
+            .revoke_privacy_backup(&backup.backup_id)
+            .expect("revoke legacy backup through the backup-only path");
     }
 
     #[test]
@@ -2111,6 +2470,14 @@ mod tests {
             })
             .expect_err("failed invalidation leaves a durable prepared sweep");
         failing.take_calls();
+        let connection = manager.open_connection().expect("privacy connection");
+        connection
+            .execute(
+                "DELETE FROM privacy_vault_material_refs WHERE material_id=?1",
+                [TEST_MATERIAL_ID],
+            )
+            .expect("detach the synthetic lifecycle-only fixture from the absent test Vault");
+        drop(connection);
         manager
             .set_redaction_legal_hold(SetLegalHoldRequest {
                 redaction_id: TEST_REDACTION_ID.to_owned(),
@@ -2159,7 +2526,52 @@ mod tests {
     }
 
     #[test]
-    fn restore_staging_invalidation_failure_writes_no_incoming_database() {
+    fn restore_staging_never_invalidates_before_the_protected_marker_is_durable() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let invalidator = Arc::new(RecordingInvalidator::default());
+        let manager = manager_with_invalidator(&directory, invalidator.clone());
+        let backup = manager.create_privacy_backup().expect("privacy backup");
+        manager
+            .set_retention_policy(one_day_policy())
+            .expect("mutate active Privacy state after backup");
+        invalidator.set_fail(true);
+        manager
+            .stage_privacy_restore(StagePrivacyRestoreRequest {
+                backup_id: backup.backup_id.clone(),
+                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
+            })
+            .expect("staging must not cross the publication invalidation boundary");
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+        assert!(paths.incoming.exists());
+        assert!(paths.marker.exists());
+        assert!(invalidator.take_calls().is_empty());
+        let active_before_apply =
+            fs::read(&paths.active).expect("active Privacy before committed apply");
+        drop(manager);
+
+        let error =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                invalidator.clone(),
+            )
+            .expect_err("post-marker publication invalidation failure must stop the swap");
+        assert_eq!(error.code(), SYNTHETIC_INVALIDATION_FAILURE);
+        assert_eq!(
+            invalidator.take_calls(),
+            vec![InvalidationCall::All("privacy_restore_startup_recovery")]
+        );
+        assert_eq!(
+            fs::read(&paths.active).expect("active Privacy after refused apply"),
+            active_before_apply
+        );
+        assert!(paths.incoming.exists());
+        assert!(paths.marker.exists());
+        assert!(!paths.rollback.exists());
+    }
+
+    #[test]
+    fn application_privacy_component_staging_has_no_pre_marker_invalidation_side_effect() {
         let directory = tempfile::tempdir().expect("app directory");
         let invalidator = Arc::new(RecordingInvalidator::default());
         let manager = manager_with_invalidator(&directory, invalidator.clone());
@@ -2167,29 +2579,11 @@ mod tests {
         let bundle = manager
             .export_privacy_backup_bundle(&backup.backup_id)
             .expect("portable privacy backup");
-
         invalidator.set_fail(true);
-        let error = manager
-            .stage_privacy_restore(StagePrivacyRestoreRequest {
-                backup_id: backup.backup_id.clone(),
-                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
-            })
-            .expect_err("publication invalidation failure must stop restore staging");
-        assert_eq!(error.code(), SYNTHETIC_INVALIDATION_FAILURE);
-        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
-        assert!(!paths.incoming.exists());
-        assert!(!paths.marker.exists());
-        assert_eq!(
-            invalidator.take_calls(),
-            vec![InvalidationCall::All(
-                INVALIDATE_REASON_PRIVACY_RESTORE_STAGED
-            )]
-        );
 
-        let error = manager
+        manager
             .stage_application_privacy_component(&backup.backup_id, &bundle)
-            .expect_err("publication invalidation failure must stop paired restore staging");
-        assert_eq!(error.code(), SYNTHETIC_INVALIDATION_FAILURE);
+            .expect("component staging must not invalidate before its coordinator marker");
         let incoming = application_privacy_restore_incoming(
             manager
                 .shared
@@ -2197,13 +2591,130 @@ mod tests {
                 .parent()
                 .expect("privacy directory"),
         );
-        assert!(!incoming.exists());
+        assert!(incoming.exists());
+        assert!(invalidator.take_calls().is_empty());
+        remove_restore_database_files(&incoming).expect("remove synthetic paired incoming");
+    }
+
+    #[test]
+    fn startup_cleans_unmarked_incoming_without_publication_invalidation() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let invalidator = Arc::new(RecordingInvalidator::default());
+        let manager = manager_with_invalidator(&directory, invalidator.clone());
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+        drop(manager);
+        invalidator.take_calls();
+        let active_before = fs::read(&paths.active).expect("active Privacy before residue");
+        fs::write(&paths.incoming, b"unmarked synthetic restore residue")
+            .expect("write unmarked incoming residue");
+
+        let restarted =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                invalidator.clone(),
+            )
+            .expect("unmarked residue is cleaned without changing business state");
+
+        assert!(invalidator.take_calls().is_empty());
+        assert!(!paths.incoming.exists());
+        assert!(!paths.marker.exists());
+        assert!(!paths.rollback.exists());
+        assert_eq!(
+            fs::read(&paths.active).expect("active Privacy after residue cleanup"),
+            active_before
+        );
+        drop(restarted);
+    }
+
+    #[test]
+    fn authenticated_committed_restore_invalidates_then_applies_on_startup() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let invalidator = Arc::new(RecordingInvalidator::default());
+        let manager = manager_with_invalidator(&directory, invalidator.clone());
+        let backup = manager.create_privacy_backup().expect("privacy backup");
+        let changed = manager
+            .set_retention_policy(one_day_policy())
+            .expect("change active policy");
+        assert_eq!(changed.revision, 2);
+        manager
+            .stage_privacy_restore(StagePrivacyRestoreRequest {
+                backup_id: backup.backup_id,
+                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
+            })
+            .expect("stage authenticated committed restore");
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+        assert!(paths.incoming.exists());
+        assert!(paths.marker.exists());
+        invalidator.take_calls();
+        drop(manager);
+
+        let restarted =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                invalidator.clone(),
+            )
+            .expect("authenticated restore applies");
+
         assert_eq!(
             invalidator.take_calls(),
-            vec![InvalidationCall::All(
-                INVALIDATE_REASON_APPLICATION_RESTORE_STAGED
-            )]
+            vec![InvalidationCall::All("privacy_restore_startup_recovery")]
         );
+        assert_eq!(
+            restarted
+                .lifecycle_status(LifecycleStatusRequest { redaction_id: None })
+                .expect("restored lifecycle status")
+                .retention_policy
+                .revision,
+            1
+        );
+        assert!(!paths.incoming.exists());
+        assert!(!paths.marker.exists());
+        assert!(!paths.rollback.exists());
+    }
+
+    #[test]
+    fn tampered_restore_marker_fails_closed_without_business_state_mutation() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let invalidator = Arc::new(RecordingInvalidator::default());
+        let manager = manager_with_invalidator(&directory, invalidator.clone());
+        let backup = manager.create_privacy_backup().expect("privacy backup");
+        manager
+            .set_retention_policy(one_day_policy())
+            .expect("change active policy");
+        manager
+            .stage_privacy_restore(StagePrivacyRestoreRequest {
+                backup_id: backup.backup_id,
+                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
+            })
+            .expect("stage restore before marker tamper");
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+        invalidator.take_calls();
+        drop(manager);
+        let active_before = fs::read(&paths.active).expect("active Privacy before marker tamper");
+        let mut marker = fs::read(&paths.marker).expect("protected restore marker");
+        let last = marker.last_mut().expect("non-empty protected marker");
+        *last ^= 0x01;
+        fs::write(&paths.marker, marker).expect("tamper protected restore marker");
+
+        let error =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                invalidator.clone(),
+            )
+            .expect_err("tampered marker must fail closed");
+
+        assert_eq!(error.code(), "privacy_restore_invalid");
+        assert!(invalidator.take_calls().is_empty());
+        assert_eq!(
+            fs::read(&paths.active).expect("active Privacy after marker rejection"),
+            active_before
+        );
+        assert!(paths.incoming.exists());
+        assert!(paths.marker.exists());
+        assert!(!paths.rollback.exists());
     }
 
     #[test]

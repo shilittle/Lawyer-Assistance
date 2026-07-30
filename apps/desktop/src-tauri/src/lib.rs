@@ -252,9 +252,17 @@ pub fn run() {
             })?;
             let approved_mcp_workspace =
                 approved_mcp::ApprovedMcpWorkspace::new(app_local_data_dir.clone());
+            let workspace_identity_preflight = approved_mcp_workspace
+                .preflight_startup_workspace_identity()
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to preflight the private workspace identity: {}",
+                        error.message()
+                    ))
+                })?;
             let workspace_instance_id =
                 approved_mcp_workspace
-                    .workspace_instance_id()
+                    .workspace_instance_id_after_startup_preflight(workspace_identity_preflight)
                     .map_err(|error| {
                         std::io::Error::other(format!(
                             "failed to initialize the private workspace identity: {}",
@@ -280,31 +288,21 @@ pub fn run() {
                     ))
                 },
             )?;
-            let user_database_path = database::ensure_user_database(&app_local_data_dir)?;
-            commands::assistant_run::recover_interrupted_assistant_runs(&user_database_path)
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "failed to recover interrupted assistant runs: {}",
-                        error.message
-                    ))
-                })?;
-            commands::assistant::recover_pending_assistant_artifact_exports(&app_local_data_dir)
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "failed to recover pending assistant artifact export: {}",
-                        error.message
-                    ))
-                })?;
-            commands::document::recover_pending_document_exports(
-                &app_local_data_dir,
-                &user_database_path,
-            )
-            .map_err(|error| {
-                std::io::Error::other(format!(
-                    "failed to recover pending document export: {}",
-                    error.message
-                ))
-            })?;
+            let user_database_path = database::user_database_path(&app_local_data_dir);
+            let user_database_existed = match std::fs::symlink_metadata(&user_database_path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+                Ok(_) => {
+                    return Err(std::io::Error::other(
+                        "the canonical user database path is not an ordinary file",
+                    )
+                    .into())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if user_database_existed {
+                database::validate_user_database_read_only(&user_database_path)?;
+            }
             let legal_core_path = resolve_legal_core_resource(app)?;
             let privacy_manager =
                 privacy_manager::PrivacyManager::new_with_ocr_qualification_invalidator(
@@ -341,13 +339,143 @@ pub fn run() {
                     })?;
             }
             let privacy_workflow =
-                privacy_workflow::PrivacyWorkflowManager::new_with_approved_publication_invalidator(
-                app_local_data_dir.clone(),
-                workspace_instance_id,
-                Arc::new(approved_mcp_workspace.clone()),
+                privacy_workflow::PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                    app_local_data_dir.clone(),
+                    workspace_instance_id,
+                    Arc::new(approved_mcp_workspace.clone()),
             )
             .map_err(|error| {
                 std::io::Error::other(format!("failed to initialize privacy workflow: {error}"))
+            })?;
+            if !user_database_existed {
+                privacy_workflow
+                    .preflight_fresh_user_database_initialization()
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to authorize a fresh user database: {error}"
+                        ))
+                    })?;
+                let initialized = database::ensure_user_database(&app_local_data_dir)?;
+                if initialized != user_database_path {
+                    return Err(std::io::Error::other(
+                        "fresh user database initialization changed the canonical path",
+                    )
+                    .into());
+                }
+            }
+            let app_state =
+                state::AppState::new(legal_core_path.clone(), user_database_path.clone());
+            let case_material_migration_required = privacy_workflow
+                .case_material_migration_required()
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to preflight the case-material migration: {error}"
+                    ))
+                })?;
+            let case_material_source_fingerprint = if case_material_migration_required {
+                Some(
+                    privacy_workflow
+                        .case_material_migration_source_fingerprint()
+                        .map_err(|error| {
+                            std::io::Error::other(format!(
+                                "failed to fingerprint the case-material migration source: {error}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+            privacy_workflow
+                .prepare_startup_storage_after_preflight()
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to prepare the pre-migration backup sources: {error}"
+                    ))
+                })?;
+            if case_material_migration_required {
+                let source_fingerprint =
+                    case_material_source_fingerprint.as_deref().ok_or_else(|| {
+                        std::io::Error::other(
+                            "required case-material migration has no verified source fingerprint",
+                        )
+                    })?;
+                for migration_id in [
+                    commands::application_backup::PROJECT_PRIVACY_CASE_BINDING_MIGRATION_ID,
+                    commands::application_backup::CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+                ] {
+                    let backup =
+                        commands::application_backup::ensure_pre_migration_application_backup(
+                        &app_local_data_dir,
+                        &app_state,
+                        &privacy_workflow,
+                            &approved_mcp_workspace,
+                            migration_id,
+                            source_fingerprint,
+                        )
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to establish the five-component migration backup gate: {}",
+                            error.message
+                        ))
+                    })?;
+                    let _verified_migration_backup = (
+                        &backup.path,
+                        &backup.metadata.bundle_sha256,
+                        backup.created,
+                    );
+                }
+                privacy_workflow
+                    .upgrade_privacy_store_schema_after_backup()
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to upgrade the backed-up privacy and Vault stores: {error}"
+                        ))
+                    })?;
+                privacy_workflow
+                    .run_case_material_migration_after_backup_for_source(source_fingerprint)
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to migrate the unified case-material model: {error}"
+                        ))
+                    })?;
+            }
+            privacy_workflow
+                .complete_application_startup_maintenance()
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to complete privacy startup maintenance: {error}"
+                    ))
+                })?;
+            let maintained_user_database = database::ensure_user_database(&app_local_data_dir)?;
+            if maintained_user_database != user_database_path {
+                return Err(std::io::Error::other(
+                    "user database maintenance changed the canonical path",
+                )
+                .into());
+            }
+            commands::assistant_run::recover_interrupted_assistant_runs(&user_database_path)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to recover interrupted assistant runs: {}",
+                        error.message
+                    ))
+                })?;
+            commands::assistant::recover_pending_assistant_artifact_exports(&app_local_data_dir)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to recover pending assistant artifact export: {}",
+                        error.message
+                    ))
+                })?;
+            commands::document::recover_pending_document_exports(
+                &app_local_data_dir,
+                &user_database_path,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to recover pending document export: {}",
+                    error.message
+                ))
             })?;
             let mcp_manager = mcp_manager::McpManager::new_with_approved_workspace(
                 app_local_data_dir.clone(),
@@ -358,7 +486,7 @@ pub fn run() {
             .map_err(|error| {
                 std::io::Error::other(format!("failed to initialize MCP settings: {error}"))
             })?;
-            app.manage(state::AppState::new(legal_core_path, user_database_path));
+            app.manage(app_state);
             app.manage(mcp_manager.clone());
             app.manage(privacy_manager);
             app.manage(mineru_components);
@@ -465,17 +593,20 @@ pub fn run() {
             commands::mineru_components::download_install_mineru_package,
             commands::mineru_components::rollback_mineru_component,
             commands::mineru_components::uninstall_mineru_component,
-            commands::privacy_workflow::delete_privacy_review,
             commands::provider::list_provider_profiles,
             commands::privacy_workflow::prepare_privacy_material,
-            commands::privacy_workflow::load_privacy_review,
-            commands::privacy_workflow::load_latest_privacy_review,
-            commands::privacy_workflow::load_privacy_risk_review,
-            commands::privacy_workflow::apply_privacy_risk_review_action,
-            commands::privacy_workflow::undo_privacy_risk_review,
-            commands::privacy_workflow::redo_privacy_risk_review,
-            commands::privacy_workflow::approve_privacy_review,
-            commands::privacy_export::export_approved_privacy_review,
+            commands::privacy_workflow::prepare_case_material,
+            commands::privacy_workflow::list_case_materials,
+            commands::privacy_workflow::list_unassigned_case_materials,
+            commands::privacy_workflow::assign_unassigned_case_material,
+            commands::privacy_workflow::list_case_redaction_generations,
+            commands::privacy_workflow::load_case_redaction_review,
+            commands::privacy_workflow::apply_case_redaction_risk_review_action,
+            commands::privacy_workflow::undo_case_redaction_risk_review,
+            commands::privacy_workflow::redo_case_redaction_risk_review,
+            commands::privacy_workflow::approve_case_redaction_review,
+            commands::privacy_workflow::delete_case_redaction_review,
+            commands::privacy_export::export_approved_case_redaction,
             commands::privacy_lifecycle::get_privacy_lifecycle_status,
             commands::privacy_lifecycle::set_privacy_retention_policy,
             commands::privacy_lifecycle::set_privacy_legal_hold,
@@ -583,6 +714,99 @@ mod tests {
         assert_eq!(response.status, HealthStatus::Ok);
         assert_eq!(response.app_name, "Lawyer Assistance");
         assert_eq!(response.architecture, "x86_64");
+    }
+
+    #[test]
+    fn renderer_registers_only_project_scoped_review_commands() {
+        let source = include_str!("lib.rs");
+        let registrations = source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .and_then(|value| value.split("])").next())
+            .expect("Tauri invoke registration list");
+
+        for scoped in [
+            "commands::privacy_workflow::list_unassigned_case_materials,",
+            "commands::privacy_workflow::assign_unassigned_case_material,",
+            "commands::privacy_workflow::load_case_redaction_review,",
+            "commands::privacy_workflow::apply_case_redaction_risk_review_action,",
+            "commands::privacy_workflow::undo_case_redaction_risk_review,",
+            "commands::privacy_workflow::redo_case_redaction_risk_review,",
+            "commands::privacy_workflow::approve_case_redaction_review,",
+            "commands::privacy_workflow::delete_case_redaction_review,",
+            "commands::privacy_export::export_approved_case_redaction,",
+        ] {
+            assert!(
+                registrations.contains(scoped),
+                "missing case-scoped renderer command {scoped}"
+            );
+        }
+        for unscoped in [
+            "commands::privacy_workflow::load_privacy_review,",
+            "commands::privacy_workflow::load_latest_privacy_review,",
+            "commands::privacy_workflow::load_privacy_risk_review,",
+            "commands::privacy_workflow::apply_privacy_risk_review_action,",
+            "commands::privacy_workflow::undo_privacy_risk_review,",
+            "commands::privacy_workflow::redo_privacy_risk_review,",
+            "commands::privacy_workflow::approve_privacy_review,",
+            "commands::privacy_workflow::delete_privacy_review,",
+            "commands::privacy_export::export_approved_privacy_review,",
+        ] {
+            assert!(
+                !registrations.contains(unscoped),
+                "unscoped legacy review command remains renderer-callable: {unscoped}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_defers_user_database_writes_until_case_material_gate_finishes() {
+        let source = include_str!("lib.rs");
+        let setup = source
+            .split(".setup(move |app| {")
+            .nth(1)
+            .and_then(|value| value.split(".invoke_handler").next())
+            .expect("desktop setup source");
+        let existing_read_only = setup
+            .find("database::validate_user_database_read_only(&user_database_path)")
+            .expect("existing user database read-only preflight");
+        let identity_read_only = setup
+            .find(".preflight_startup_workspace_identity()")
+            .expect("approved MCP identity read-only preflight");
+        let identity_initialization = setup
+            .find(".workspace_instance_id_after_startup_preflight")
+            .expect("fresh-only approved MCP identity initialization");
+        let fresh_authorization = setup
+            .find(".preflight_fresh_user_database_initialization()")
+            .expect("fresh user database authorization");
+        let fresh_initialization = setup
+            .find("let initialized = database::ensure_user_database")
+            .expect("fresh user database initialization");
+        let migration_probe = setup
+            .find(".case_material_migration_required()")
+            .expect("case-material migration probe");
+        let migration_run = setup
+            .find(".run_case_material_migration_after_backup_for_source")
+            .expect("source-bound case-material migration");
+        let user_maintenance = setup
+            .find("let maintained_user_database = database::ensure_user_database")
+            .expect("deferred user database maintenance");
+        let assistant_recovery = setup
+            .find("recover_interrupted_assistant_runs")
+            .expect("deferred assistant recovery");
+        let document_recovery = setup
+            .find("recover_pending_document_exports")
+            .expect("deferred document recovery");
+
+        assert!(identity_read_only < identity_initialization);
+        assert!(!setup.contains(".workspace_instance_id()"));
+        assert!(existing_read_only < migration_probe);
+        assert!(fresh_authorization < fresh_initialization);
+        assert!(fresh_initialization < migration_probe);
+        assert!(migration_probe < migration_run);
+        assert!(migration_run < user_maintenance);
+        assert!(user_maintenance < assistant_recovery);
+        assert!(user_maintenance < document_recovery);
     }
 
     #[test]

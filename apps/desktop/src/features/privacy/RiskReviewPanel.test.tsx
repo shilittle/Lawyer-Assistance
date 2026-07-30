@@ -96,5 +96,33 @@ describe("RiskReviewPanel", () => {
     expect(markup).toContain("is-uncertain");
     expect(markup).not.toContain("privateValue");
     expect(markup).not.toContain("originalText");
+    expect(markup).not.toContain(state.caseId);
+  });
+
+  it("disables only undo and redo for an outer workbench draft", () => {
+    const markup = renderToStaticMarkup(
+      <RiskReviewPanel
+        state={{ ...state, canRedo: true }}
+        busy={false}
+        historyActionsDisabled
+        onAction={vi.fn(async () => true)}
+        onUndo={vi.fn()}
+        onRedo={vi.fn()}
+        onManualApprove={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain(
+      '<button type="button" disabled="">撤销</button>',
+    );
+    expect(markup).toContain(
+      '<button type="button" disabled="">重做</button>',
+    );
+    expect(markup).toContain(
+      '<button type="button">接受替换</button>',
+    );
+    expect(markup).toContain(
+      '<button type="button">保存当前编辑并重跑残留扫描</button>',
+    );
   });
 });

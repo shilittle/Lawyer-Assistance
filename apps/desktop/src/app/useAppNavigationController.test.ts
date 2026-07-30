@@ -124,6 +124,7 @@ function controllerOptions(
   return {
     mcp: protectionChannel(),
     privacy: protectionChannel(),
+    caseMaterials: protectionChannel(),
     confirmDiscard: vi.fn(() => true),
     ...patch,
   };
@@ -154,12 +155,15 @@ describe("useAppNavigationController", () => {
       handoffGraphTarget: initial.handoffGraphTarget,
       handoffLegalCitation: initial.handoffLegalCitation,
       consumeRouteState: initial.consumeRouteState,
+      guardCaseMaterialContextChange:
+        initial.guardCaseMaterialContextChange,
     };
     latestMcpMutation.current = true;
     const latestOptions: UseAppNavigationControllerOptions = {
       ...initialOptions,
       mcp: { ...initialOptions.mcp },
       privacy: { ...initialOptions.privacy },
+      caseMaterials: { ...initialOptions.caseMaterials },
     };
     const rerendered = renderController(latestOptions);
 
@@ -291,6 +295,43 @@ describe("useAppNavigationController", () => {
     expect(privacy.protectionMessage).toBe(
       "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
     );
+  });
+
+  it("blocks active case-material work and remount-discards confirmed drafts", () => {
+    const mutation = booleanRef(true);
+    const draft = booleanRef(false);
+    const discardDraft = vi.fn(() => {
+      draft.current = false;
+    });
+    const confirmDiscard = vi.fn(() => false);
+    const options = controllerOptions({
+      initialRoute: { area: "cases", page: "materials" },
+      caseMaterials: {
+        readMutationInFlight: () => mutation.current,
+        readDraftDirty: () => draft.current,
+        discardDraft,
+      },
+      confirmDiscard,
+    });
+    let controller = renderController(options);
+
+    expect(
+      controller.navigate({ area: "cases", page: "work" }),
+    ).toBe(false);
+    controller = renderController(options);
+    expect(controller.protectionMessage).toContain(
+      "案件材料脱敏操作尚未完成",
+    );
+
+    mutation.current = false;
+    draft.current = true;
+    expect(controller.guardCaseMaterialContextChange()).toBe(false);
+    expect(discardDraft).not.toHaveBeenCalled();
+
+    confirmDiscard.mockReturnValue(true);
+    expect(controller.guardCaseMaterialContextChange()).toBe(true);
+    expect(discardDraft).toHaveBeenCalledTimes(1);
+    expect(draft.current).toBe(false);
   });
 
   it("creates monotonic Assistant handoffs and retains the host route while hidden", () => {

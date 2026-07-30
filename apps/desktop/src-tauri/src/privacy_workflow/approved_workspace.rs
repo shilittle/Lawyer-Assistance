@@ -82,11 +82,22 @@ impl PrivacyWorkflowManager {
         F: FnOnce(ApprovedGenerationSource) -> Result<T, E>,
     {
         let _gate = self.gate();
+        let (_authorization, project_guard) =
+            self.begin_live_case_redaction_authorization(redaction_id, true)?;
         let source = self.load_approved_generation_source_unlocked(
             redaction_id,
             expected_approved_payload_sha256,
         )?;
-        Ok(publish(source))
+        match publish(source) {
+            Ok(value) => {
+                project_guard.commit()?;
+                Ok(Ok(value))
+            }
+            Err(error) => {
+                project_guard.rollback();
+                Ok(Err(error))
+            }
+        }
     }
 
     #[cfg(test)]
@@ -96,10 +107,14 @@ impl PrivacyWorkflowManager {
         expected_approved_payload_sha256: &str,
     ) -> Result<ApprovedGenerationSource, PrivacyWorkflowError> {
         let _gate = self.gate();
-        self.load_approved_generation_source_unlocked(
+        let (_authorization, project_guard) =
+            self.begin_live_case_redaction_authorization(redaction_id, true)?;
+        let source = self.load_approved_generation_source_unlocked(
             redaction_id,
             expected_approved_payload_sha256,
-        )
+        )?;
+        project_guard.commit()?;
+        Ok(source)
     }
 
     fn load_approved_generation_source_unlocked(

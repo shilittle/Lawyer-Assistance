@@ -23,6 +23,12 @@ struct PortableBackupBundleV1 {
     protected_state_base64: String,
 }
 
+struct DecodedPortableBackupBundleV1 {
+    backup_id: String,
+    envelope: Vec<u8>,
+    protected_state: Vec<u8>,
+}
+
 const PROTECTED_BACKUP_STATE_VERSION: &str = "protected-backup-state-v1";
 const MAX_PROTECTED_BACKUP_STATE_BYTES: usize = 64 * 1024;
 
@@ -54,6 +60,71 @@ impl ProtectedBackupStateV1 {
     }
 }
 
+fn decode_portable_bundle(
+    bundle_bytes: &[u8],
+    context: &BackupVerificationContextV1<'_>,
+) -> Result<DecodedPortableBackupBundleV1, LifecycleError> {
+    if bundle_bytes.is_empty() || bundle_bytes.len() > MAX_PORTABLE_BACKUP_BYTES {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    let bundle: PortableBackupBundleV1 =
+        strict_json_v1_from_slice(bundle_bytes).map_err(|_| LifecycleError::BackupInvalid)?;
+    valid_opaque_id(&bundle.backup_id, "bkp_")?;
+    valid_hash(&bundle.envelope_sha256)?;
+    valid_hash(&bundle.protected_state_sha256)?;
+    if bundle.schema_version != PORTABLE_BACKUP_SCHEMA_VERSION {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    let envelope = BASE64_STANDARD
+        .decode(bundle.envelope_base64.as_bytes())
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    let protected_state = BASE64_STANDARD
+        .decode(bundle.protected_state_base64.as_bytes())
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    if envelope.is_empty()
+        || envelope.len() > MAX_BACKUP_ENVELOPE_BYTES
+        || protected_state.is_empty()
+        || protected_state.len() > MAX_PROTECTED_BACKUP_STATE_BYTES
+        || sha256_hex(&envelope) != bundle.envelope_sha256
+        || sha256_hex(&protected_state) != bundle.protected_state_sha256
+    {
+        return Err(LifecycleError::BackupTampered);
+    }
+
+    let plaintext = ZeroizingBytes::new(
+        unprotect_local(&protected_state).map_err(|_| LifecycleError::ProtectedBlob)?,
+    );
+    let state: ProtectedBackupStateV1 =
+        strict_json_v1_from_slice(&plaintext).map_err(|_| LifecycleError::BackupInvalid)?;
+    state.validate()?;
+    if state.backup_id != bundle.backup_id
+        || state.workspace_instance_id != *context.expected_workspace_instance_id
+        || state.key_epoch != context.expected_key_epoch
+        || state.envelope_sha256 != bundle.envelope_sha256
+        || state.state != "active"
+        || state.revoked_at_unix.is_some()
+        || context.now_unix < state.created_at_unix
+        || context.now_unix >= state.expires_at_unix
+    {
+        return Err(LifecycleError::EnvironmentMismatch);
+    }
+    drop(plaintext);
+
+    Ok(DecodedPortableBackupBundleV1 {
+        backup_id: bundle.backup_id,
+        envelope,
+        protected_state,
+    })
+}
+
+fn controlled_path_is_present(path: &Path) -> Result<bool, LifecycleError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(LifecycleError::Io),
+    }
+}
+
 impl EncryptedPrivacyBackupStore {
     /// Verifies a backup without requiring the source privacy database. Trust and revocation state
     /// come from a separately DPAPI-protected companion record in the fixed backup root.
@@ -65,6 +136,20 @@ impl EncryptedPrivacyBackupStore {
         let state = self.load_backup_state(backup_id)?;
         let registry = detached_registry_connection(&state)?;
         self.verify_backup(&registry, backup_id, context)
+    }
+
+    /// Detached verification for a fixed pre-migration rollback backup.
+    ///
+    /// This remains separate from normal detached verification so a current binary never treats a
+    /// legacy snapshot as a current-schema backup by fallback.
+    pub fn verify_detached_pre_migration_backup(
+        &self,
+        backup_id: &str,
+        context: &PreMigrationBackupVerificationContextV1<'_>,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        let state = self.load_backup_state(backup_id)?;
+        let registry = detached_registry_connection(&state)?;
+        self.verify_pre_migration_backup(&registry, backup_id, context)
     }
 
     /// Restores only after detached state, DPAPI key unwrap, AEAD authentication, SQLite
@@ -80,6 +165,41 @@ impl EncryptedPrivacyBackupStore {
         self.restore_into_empty_database(&registry, destination, backup_id, context)
     }
 
+    /// Restores the Privacy component of a coordinated pre-migration application backup.
+    ///
+    /// This API is intentionally not used by standalone Privacy restore. It accepts only the
+    /// current schema or an exact authenticated v1-v4 schema and restores the snapshot unchanged,
+    /// leaving any legacy-to-current upgrade to the post-backup startup gate.
+    pub fn restore_detached_for_coordinated_pre_migration_restore(
+        &self,
+        destination: &mut Connection,
+        backup_id: &str,
+        expected_privacy_store_schema_version: i64,
+        context: &BackupVerificationContextV1<'_>,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        let state = self.load_backup_state(backup_id)?;
+        let registry = detached_registry_connection(&state)?;
+        match expected_privacy_store_schema_version {
+            PRIVACY_STORE_SCHEMA_VERSION => {
+                self.restore_into_empty_database(&registry, destination, backup_id, context)
+            }
+            MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+                ..=MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION => self
+                .restore_pre_migration_into_empty_database(
+                    &registry,
+                    destination,
+                    backup_id,
+                    &PreMigrationBackupVerificationContextV1 {
+                        expected_workspace_instance_id: context.expected_workspace_instance_id,
+                        expected_key_epoch: context.expected_key_epoch,
+                        expected_privacy_store_schema_version,
+                        now_unix: context.now_unix,
+                    },
+                ),
+            _ => Err(LifecycleError::UnsupportedSchema),
+        }
+    }
+
     /// Produces one self-contained, deterministic transfer file. Both the database data key and
     /// the companion trust record remain bound to Windows DPAPI CurrentUser; exporting the bundle
     /// does not make it portable to a different OS account and never exposes plaintext SQLite.
@@ -89,6 +209,25 @@ impl EncryptedPrivacyBackupStore {
         context: &BackupVerificationContextV1<'_>,
     ) -> Result<Vec<u8>, LifecycleError> {
         let verified = self.verify_detached_backup(backup_id, context)?;
+        self.export_portable_bundle_from_verified(backup_id, verified)
+    }
+
+    /// Produces the portable inner bundle used by the coordinated five-component migration
+    /// backup. The exact expected v1-v4 schema is re-verified before any bytes are returned.
+    pub fn export_pre_migration_portable_bundle(
+        &self,
+        backup_id: &str,
+        context: &PreMigrationBackupVerificationContextV1<'_>,
+    ) -> Result<Vec<u8>, LifecycleError> {
+        let verified = self.verify_detached_pre_migration_backup(backup_id, context)?;
+        self.export_portable_bundle_from_verified(backup_id, verified)
+    }
+
+    fn export_portable_bundle_from_verified(
+        &self,
+        backup_id: &str,
+        verified: VerifiedBackupV1,
+    ) -> Result<Vec<u8>, LifecycleError> {
         let envelope_path = self.backup_path(backup_id)?;
         let state_path = self.backup_state_path(backup_id)?;
         let envelope = read_safe_file(&envelope_path, MAX_BACKUP_ENVELOPE_BYTES)?;
@@ -119,78 +258,134 @@ impl EncryptedPrivacyBackupStore {
         bundle_bytes: &[u8],
         context: &BackupVerificationContextV1<'_>,
     ) -> Result<VerifiedBackupV1, LifecycleError> {
-        if bundle_bytes.is_empty() || bundle_bytes.len() > MAX_PORTABLE_BACKUP_BYTES {
-            return Err(LifecycleError::BackupInvalid);
-        }
-        let bundle: PortableBackupBundleV1 =
-            strict_json_v1_from_slice(bundle_bytes).map_err(|_| LifecycleError::BackupInvalid)?;
-        valid_opaque_id(&bundle.backup_id, "bkp_")?;
-        valid_hash(&bundle.envelope_sha256)?;
-        valid_hash(&bundle.protected_state_sha256)?;
-        if bundle.schema_version != PORTABLE_BACKUP_SCHEMA_VERSION {
-            return Err(LifecycleError::BackupInvalid);
-        }
-        let envelope = BASE64_STANDARD
-            .decode(bundle.envelope_base64.as_bytes())
-            .map_err(|_| LifecycleError::BackupInvalid)?;
-        let protected_state = BASE64_STANDARD
-            .decode(bundle.protected_state_base64.as_bytes())
-            .map_err(|_| LifecycleError::BackupInvalid)?;
-        if envelope.is_empty()
-            || envelope.len() > MAX_BACKUP_ENVELOPE_BYTES
-            || protected_state.is_empty()
-            || protected_state.len() > MAX_PROTECTED_BACKUP_STATE_BYTES
-            || sha256_hex(&envelope) != bundle.envelope_sha256
-            || sha256_hex(&protected_state) != bundle.protected_state_sha256
-        {
-            return Err(LifecycleError::BackupTampered);
-        }
-
-        let plaintext = ZeroizingBytes::new(
-            unprotect_local(&protected_state).map_err(|_| LifecycleError::ProtectedBlob)?,
-        );
-        let state: ProtectedBackupStateV1 =
-            strict_json_v1_from_slice(&plaintext).map_err(|_| LifecycleError::BackupInvalid)?;
-        state.validate()?;
-        if state.backup_id != bundle.backup_id
-            || state.workspace_instance_id != *context.expected_workspace_instance_id
-            || state.key_epoch != context.expected_key_epoch
-            || state.envelope_sha256 != bundle.envelope_sha256
-            || state.state != "active"
-            || state.revoked_at_unix.is_some()
-            || context.now_unix < state.created_at_unix
-            || context.now_unix >= state.expires_at_unix
-        {
-            return Err(LifecycleError::EnvironmentMismatch);
-        }
-        drop(plaintext);
-
-        let envelope_path = self.backup_path(&bundle.backup_id)?;
-        let state_path = self.backup_state_path(&bundle.backup_id)?;
+        let decoded = decode_portable_bundle(bundle_bytes, context)?;
+        let envelope_path = self.backup_path(&decoded.backup_id)?;
+        let state_path = self.backup_state_path(&decoded.backup_id)?;
         write_atomic_new_file(
             self.root.canonical_root(),
             &self.root,
             &envelope_path,
-            &envelope,
-            &bundle.backup_id,
+            &decoded.envelope,
+            &decoded.backup_id,
         )?;
         if let Err(error) = write_atomic_new_file(
             self.root.canonical_root(),
             &self.root,
             &state_path,
-            &protected_state,
-            &bundle.backup_id,
+            &decoded.protected_state,
+            &decoded.backup_id,
         ) {
             let _ = fs::remove_file(&envelope_path);
             return Err(error);
         }
-        match self.verify_detached_backup(&bundle.backup_id, context) {
+        match self.verify_detached_backup(&decoded.backup_id, context) {
             Ok(verified) => Ok(verified),
             Err(error) => {
                 let _ = fs::remove_file(envelope_path);
                 let _ = fs::remove_file(state_path);
                 Err(error)
             }
+        }
+    }
+
+    /// Imports the Privacy component of a coordinated five-component migration rollback.
+    ///
+    /// Unlike normal portable import, this narrow path may authenticate an exact v1-v4 snapshot.
+    /// It also accepts the current schema so the V3 application restore coordinator has one
+    /// deterministic path. Future schemas are rejected, and existing IDs are accepted only when
+    /// both encrypted files are byte-for-byte identical. Standalone Privacy restore must continue
+    /// to call `import_portable_bundle`, which remains current-schema-only.
+    pub fn import_portable_bundle_for_coordinated_pre_migration_restore(
+        &self,
+        bundle_bytes: &[u8],
+        context: &BackupVerificationContextV1<'_>,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        let decoded = decode_portable_bundle(bundle_bytes, context)?;
+        let envelope: BackupEnvelopeV1 = strict_json_v1_from_slice(&decoded.envelope)
+            .map_err(|_| LifecycleError::BackupInvalid)?;
+        let schema_version = envelope.privacy_store_schema_version;
+        if !matches!(
+            schema_version,
+            MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+                ..=MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+        ) && schema_version != PRIVACY_STORE_SCHEMA_VERSION
+        {
+            return Err(LifecycleError::UnsupportedSchema);
+        }
+
+        let envelope_path = self.backup_path(&decoded.backup_id)?;
+        let state_path = self.backup_state_path(&decoded.backup_id)?;
+        let envelope_present = controlled_path_is_present(&envelope_path)?;
+        let state_present = controlled_path_is_present(&state_path)?;
+        let installed_new = match (envelope_present, state_present) {
+            (false, false) => {
+                write_atomic_new_file(
+                    self.root.canonical_root(),
+                    &self.root,
+                    &envelope_path,
+                    &decoded.envelope,
+                    &decoded.backup_id,
+                )?;
+                if let Err(error) = write_atomic_new_file(
+                    self.root.canonical_root(),
+                    &self.root,
+                    &state_path,
+                    &decoded.protected_state,
+                    &decoded.backup_id,
+                ) {
+                    let _ = fs::remove_file(&envelope_path);
+                    return Err(error);
+                }
+                true
+            }
+            (true, true)
+                if read_safe_file(&envelope_path, MAX_BACKUP_ENVELOPE_BYTES)?
+                    == decoded.envelope
+                    && read_safe_file(&state_path, MAX_PROTECTED_BACKUP_STATE_BYTES)?
+                        == decoded.protected_state =>
+            {
+                false
+            }
+            _ => return Err(LifecycleError::Conflict),
+        };
+
+        let verification = self.verify_detached_for_coordinated_pre_migration_restore(
+            &decoded.backup_id,
+            schema_version,
+            context,
+        );
+        match verification {
+            Ok(verified) => Ok(verified),
+            Err(error) => {
+                if installed_new {
+                    let _ = fs::remove_file(envelope_path);
+                    let _ = fs::remove_file(state_path);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn verify_detached_for_coordinated_pre_migration_restore(
+        &self,
+        backup_id: &str,
+        expected_privacy_store_schema_version: i64,
+        context: &BackupVerificationContextV1<'_>,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        match expected_privacy_store_schema_version {
+            PRIVACY_STORE_SCHEMA_VERSION => self.verify_detached_backup(backup_id, context),
+            MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+                ..=MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION => self
+                .verify_detached_pre_migration_backup(
+                    backup_id,
+                    &PreMigrationBackupVerificationContextV1 {
+                        expected_workspace_instance_id: context.expected_workspace_instance_id,
+                        expected_key_epoch: context.expected_key_epoch,
+                        expected_privacy_store_schema_version,
+                        now_unix: context.now_unix,
+                    },
+                ),
+            _ => Err(LifecycleError::UnsupportedSchema),
         }
     }
 
@@ -273,10 +468,7 @@ impl EncryptedPrivacyBackupStore {
         validate_open_file_identity(&destination)
     }
 
-    fn load_backup_state(
-        &self,
-        backup_id: &str,
-    ) -> Result<ProtectedBackupStateV1, LifecycleError> {
+    fn load_backup_state(&self, backup_id: &str) -> Result<ProtectedBackupStateV1, LifecycleError> {
         let path = self.backup_state_path(backup_id)?;
         let protected = read_safe_file(&path, MAX_PROTECTED_BACKUP_STATE_BYTES)?;
         let plaintext = ZeroizingBytes::new(

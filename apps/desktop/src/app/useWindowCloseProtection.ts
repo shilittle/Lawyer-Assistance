@@ -21,6 +21,7 @@ export interface WindowCloseProtectionOptions {
   readonly provider: BooleanActivityReader;
   readonly mcp: BooleanActivityReader;
   readonly privacy: BooleanActivityReader;
+  readonly caseMaterials: BooleanActivityReader;
   readonly readLegalBridgeMutationInFlight: () => boolean;
   readonly onCaseCloseBlocked: (message: string) => void;
 }
@@ -36,6 +37,7 @@ export function useWindowCloseProtection({
   provider,
   mcp,
   privacy,
+  caseMaterials,
   readLegalBridgeMutationInFlight,
   onCaseCloseBlocked,
 }: WindowCloseProtectionOptions): WindowCloseProtection {
@@ -49,6 +51,7 @@ export function useWindowCloseProtection({
     provider,
     mcp,
     privacy,
+    caseMaterials,
     readLegalBridgeMutationInFlight,
     onCaseCloseBlocked,
   });
@@ -60,6 +63,7 @@ export function useWindowCloseProtection({
       provider,
       mcp,
       privacy,
+      caseMaterials,
       readLegalBridgeMutationInFlight,
       onCaseCloseBlocked,
     };
@@ -69,6 +73,7 @@ export function useWindowCloseProtection({
     mcp,
     onCaseCloseBlocked,
     privacy,
+    caseMaterials,
     provider,
     readLegalBridgeMutationInFlight,
   ]);
@@ -104,6 +109,10 @@ export function useWindowCloseProtection({
         privacyMutationInFlight:
           current.privacy.readMutationInFlight(),
         privacyDraftDirty: current.privacy.readDraftDirty(),
+        caseMaterialMutationInFlight:
+          current.caseMaterials.readMutationInFlight(),
+        caseMaterialDraftDirty:
+          current.caseMaterials.readDraftDirty(),
       });
     };
 

@@ -532,6 +532,22 @@ mat_ + first_32_hex(
 - crash 在 target commit 前：无完成 ledger，安全重跑；
 - crash 在 target commit 后：同事务内已有完成 ledger，安全 no-op。
 
+迁移完成后的受控生命周期操作不得破坏上述幂等协议：
+
+- migration ledger 与 resolution event 永不因 retention cleanup、项目删除或用户
+  删除材料而删除或改写；
+- retention cleanup 物理移除某个 redaction 后，target invariant 只有在同一
+  `redaction_id` 的 cleanup candidate 已为 `removed`、父 cleanup journal 已为
+  `committed`，且 journal 哈希链、候选计数和完成计数全部验证通过时，才可把该
+  target 缺失解释为受控终态；证据缺失、被替换或被篡改仍须
+  `case_material_migration_target_mismatch`；
+- 被 source ledger 引用的 material identity 必须保留为已撤销/已删除 tombstone，
+  同时清除到期的受保护展示元数据；不得依赖外键 cascade 删除 provenance；
+- 项目删除完成后，迁移器必须验证 completed deletion journal、精确 scope、
+  material/generation tombstone、Vault ref 撤销和原绑定。验证通过的记录保持原
+  `projectId`、`PrivacyCaseId`、`sourceKind` 与 Vault 四元组并 no-op；不得因
+  `user.sqlite` 中项目已删除而把历史记录重新投影成未归属或覆盖 provenance。
+
 `user.sqlite` 与 `privacy-workflow.sqlite` 是不同数据库。迁移在 App operation gate 下
 以只读 snapshot 打开 `user.sqlite`，只在隐私库写 target + ledger。因为源记录不被
 修改，不需要伪造跨库原子提交；若 snapshot 结束前源 fingerprint 改变，本批次回滚。

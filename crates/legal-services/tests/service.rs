@@ -1727,11 +1727,15 @@ fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
         Err(symlink_error) => {
             // Directory junctions do not require Windows Developer Mode. Keep
             // this fallback inside the test helper so production code never
-            // invokes a shell, and suppress the transient console window.
+            // invokes a shell.
+            // Rebuilding from components also normalizes mixed `/` separators:
+            // cmd.exe otherwise parses the suffix after `/` as another switch.
+            let normalized_link = link.components().collect::<std::path::PathBuf>();
+            let normalized_target = target.components().collect::<std::path::PathBuf>();
             let status = Command::new("cmd.exe")
-                .args(["/D", "/C", "mklink", "/J"])
-                .arg(link)
-                .arg(target)
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(normalized_link)
+                .arg(normalized_target)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

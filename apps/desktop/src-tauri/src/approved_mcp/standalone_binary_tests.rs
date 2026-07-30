@@ -482,7 +482,26 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
     let fixture = ServiceFixture::create(&directory.path().join("legal-services"));
     let source_path = fixture.material_root.join("synthetic-case.txt");
     let source_text = format!("Client: {RAW_PARTY}; phone: {RAW_PHONE}.");
-    let case_id = format!("case_{}", uuid::Uuid::new_v4().simple());
+    let project_id = format!("case-e2e-{}", uuid::Uuid::new_v4().simple());
+    let user_database_path =
+        database::ensure_user_database(&app_directory).expect("create App user database");
+    let user_connection =
+        database::open_user_database(&user_database_path).expect("open App user database");
+    database::upsert_case_project(
+        &user_connection,
+        &database::CaseProjectRow {
+            project_id: project_id.clone(),
+            title: "Standalone MCP synthetic case".to_owned(),
+            case_type: "civil".to_owned(),
+            status: "active".to_owned(),
+            opened_on: None,
+            summary: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        },
+    )
+    .expect("insert standalone MCP case");
+    drop(user_connection);
     fs::write(&source_path, source_text.as_bytes()).expect("write synthetic source");
     let workflow = PrivacyWorkflowManager::new(
         app_directory.clone(),
@@ -492,15 +511,22 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
     )
     .expect("create App privacy workflow");
     let review = workflow
-        .prepare_selected_material(
+        .prepare_case_selected_material_with_qualification(
             &source_path,
             &PrivacyConfig::default(),
             &disabled_ocr_status(),
-            None,
-            Some(case_id.clone()),
+            crate::privacy_workflow::LocalOcrExecutionContext {
+                mineru_config: None,
+                qualification: None,
+            },
+            project_id,
             vec![RAW_PARTY.to_owned()],
         )
         .expect("locally redact synthetic material");
+    let privacy_case_id = review
+        .case_id
+        .clone()
+        .expect("case-scoped review has a Privacy CaseId");
     for page in &review.pages {
         assert_no_sensitive(&page.redacted_text, &[RAW_PARTY, RAW_PHONE]);
     }
@@ -539,9 +565,9 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
         .load_approved_generation_source(&review.redaction_id, &approval.approved_payload_sha256)
         .expect("load receipt-bound approved payload");
     let published = workspace
-        .publish(&case_id, source)
+        .publish(&privacy_case_id, source)
         .expect("publish exact App-approved payload");
-    assert_eq!(published.case_id, case_id);
+    assert_eq!(published.case_id, privacy_case_id);
     assert_eq!(published.material_id, review.material_id);
 
     let mut reaper = SessionReaper::new(workspace.clone());

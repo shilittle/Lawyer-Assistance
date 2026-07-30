@@ -187,6 +187,7 @@ function options(
     provider: activityReader(),
     mcp: activityReader(),
     privacy: activityReader(),
+    caseMaterials: activityReader(),
     readLegalBridgeMutationInFlight: () => false,
     onCaseCloseBlocked: vi.fn(),
     ...patch,
@@ -275,6 +276,29 @@ describe("useWindowCloseProtection", () => {
     listener?.(event);
     expect(event.preventDefault).toHaveBeenCalledTimes(1);
     expect(event.returnValue).toBe("");
+  });
+
+  it("protects browser unload for case-material edits and operations", () => {
+    const hookOptions = options({
+      caseMaterials: activityReader(true),
+    });
+    hookHarness.render(() =>
+      useWindowCloseProtection(hookOptions),
+    );
+
+    const event = beforeUnloadEvent();
+    listener?.(event);
+    expect(event.preventDefault).toHaveBeenCalledTimes(1);
+
+    hookHarness.render(() =>
+      useWindowCloseProtection({
+        ...hookOptions,
+        caseMaterials: activityReader(false, true),
+      }),
+    );
+    const activeEvent = beforeUnloadEvent();
+    listener?.(activeEvent);
+    expect(activeEvent.preventDefault).toHaveBeenCalledTimes(1);
   });
 
   it("removes the registered browser listener on cleanup", () => {

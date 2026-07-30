@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import "./risk-review.css";
 
@@ -8,20 +8,32 @@ import type {
   PrivacyFindingSeverity,
   PrivacyFindingView,
   PrivacyRiskReviewAction,
-  PrivacyRiskReviewState,
   PrivacyVisualRiskDecision,
 } from "../../ipc/privacy/risk-types";
+import type { PrivacyRiskReviewDisplayState } from "./reviewDisplay";
+import {
+  allowRiskFindingSwitch,
+  cloneRiskReviewDraftSnapshot,
+  riskReviewActionSucceeded,
+  riskReviewDraftIsDirty,
+  type RiskReviewDraftSnapshot,
+} from "./riskReviewDraftState";
 
 export type RiskPageSort = "risk" | "page";
 export type RiskPageFilter = "all" | "unresolved" | "p0" | "ocr" | "visual";
 
 export interface RiskReviewPanelProps {
-  state: PrivacyRiskReviewState;
+  state: PrivacyRiskReviewDisplayState;
+  projectId?: string;
   busy: boolean;
-  onAction: (action: PrivacyRiskReviewAction) => void;
+  historyActionsDisabled?: boolean;
+  onAction: (
+    action: PrivacyRiskReviewAction,
+  ) => boolean | void | Promise<boolean | void>;
   onUndo: () => void;
   onRedo: () => void;
   onManualApprove: () => void;
+  onDraftDirtyChange?: (dirty: boolean) => void;
 }
 
 const ENTITY_LABELS: Record<PrivacyEntityType, string> = {
@@ -108,7 +120,7 @@ function uncertain(finding: PrivacyFindingView): boolean {
 }
 
 function pageMatches(
-  page: PrivacyRiskReviewState["documentRisk"]["pageRisks"][number],
+  page: PrivacyRiskReviewDisplayState["documentRisk"]["pageRisks"][number],
   filter: RiskPageFilter,
 ): boolean {
   if (filter === "all") return true;
@@ -132,26 +144,55 @@ function visualKey(pageIndex: number, riskCode: string): string {
   return `${pageIndex}:${riskCode}`;
 }
 
+function initialDraft(
+  finding: PrivacyFindingView | null,
+): RiskReviewDraftSnapshot {
+  return {
+    entityType: finding?.entityType ?? "custom",
+    replacement: finding?.proposedReplacement ?? "",
+    dictionaryCategory: "custom",
+    dictionaryRequired: false,
+    mergeTarget: "",
+    visualReasons: {},
+  };
+}
+
 export function RiskReviewPanel({
   state,
+  projectId,
   busy,
+  historyActionsDisabled = false,
   onAction,
   onUndo,
   onRedo,
   onManualApprove,
+  onDraftDirtyChange,
 }: RiskReviewPanelProps) {
+  const initialFinding =
+    state.findings.find(unresolved) ?? state.findings[0] ?? null;
+  const initial = initialDraft(initialFinding);
   const [sort, setSort] = useState<RiskPageSort>("risk");
   const [filter, setFilter] = useState<RiskPageFilter>("unresolved");
   const [selectedFindingId, setSelectedFindingId] = useState<string | null>(
-    state.findings.find(unresolved)?.findingId ?? state.findings[0]?.findingId ?? null,
+    initialFinding?.findingId ?? null,
   );
-  const [entityType, setEntityType] = useState<PrivacyEntityType>("custom");
-  const [replacement, setReplacement] = useState("");
+  const [entityType, setEntityType] = useState<PrivacyEntityType>(
+    initial.entityType,
+  );
+  const [replacement, setReplacement] = useState(initial.replacement);
   const [dictionaryCategory, setDictionaryCategory] =
-    useState<PrivacyDictionaryCategory>("custom");
-  const [dictionaryRequired, setDictionaryRequired] = useState(false);
-  const [mergeTarget, setMergeTarget] = useState("");
-  const [visualReasons, setVisualReasons] = useState<Record<string, string>>({});
+    useState<PrivacyDictionaryCategory>(initial.dictionaryCategory);
+  const [dictionaryRequired, setDictionaryRequired] = useState(
+    initial.dictionaryRequired,
+  );
+  const [mergeTarget, setMergeTarget] = useState(initial.mergeTarget);
+  const [visualReasons, setVisualReasons] = useState<
+    Record<string, string>
+  >({ ...initial.visualReasons });
+  const [draftBaseline, setDraftBaseline] =
+    useState<RiskReviewDraftSnapshot>(() =>
+      cloneRiskReviewDraftSnapshot(initial),
+    );
 
   const selected = state.findings.find((finding) => finding.findingId === selectedFindingId) ?? null;
   const selectedCluster = selected?.clusterId ?? null;
@@ -187,14 +228,115 @@ export function RiskReviewPanel({
   const manualBlockers = state.hardGates.filter(
     (gate) => gate.blocking && !gate.passed && !AUTOMATIC_ONLY_GATES.has(gate.gateId),
   );
+  const draft = useMemo<RiskReviewDraftSnapshot>(
+    () => ({
+      entityType,
+      replacement,
+      dictionaryCategory,
+      dictionaryRequired,
+      mergeTarget,
+      visualReasons,
+    }),
+    [
+      dictionaryCategory,
+      dictionaryRequired,
+      entityType,
+      mergeTarget,
+      replacement,
+      visualReasons,
+    ],
+  );
+  const draftDirty = useMemo(
+    () => riskReviewDraftIsDirty(draftBaseline, draft),
+    [draft, draftBaseline],
+  );
   const manualApprovalDisabled =
-    busy || state.rejected || !state.detectorRunCompleted || manualBlockers.length > 0;
+    busy ||
+    draftDirty ||
+    state.rejected ||
+    !state.detectorRunCompleted ||
+    manualBlockers.length > 0;
+
+  useEffect(() => {
+    onDraftDirtyChange?.(draftDirty);
+  }, [draftDirty, onDraftDirtyChange]);
+
+  useEffect(
+    () => () => {
+      onDraftDirtyChange?.(false);
+    },
+    [onDraftDirtyChange],
+  );
 
   const moveRisk = (delta: number) => {
     if (visibleFindings.length === 0) return;
     const current = visibleFindings.findIndex((finding) => finding.findingId === selectedFindingId);
     const next = (Math.max(current, 0) + delta + visibleFindings.length) % visibleFindings.length;
-    setSelectedFindingId(visibleFindings[next].findingId);
+    selectFinding(visibleFindings[next]);
+  };
+
+  const commitSuccessfulDraft = (
+    action: PrivacyRiskReviewAction,
+  ) => {
+    switch (action.kind) {
+      case "change_entity_type":
+        setEntityType(action.entityType);
+        setDraftBaseline((current) => ({
+          ...current,
+          entityType: action.entityType,
+        }));
+        break;
+      case "change_placeholder":
+        setReplacement(action.replacement);
+        setDraftBaseline((current) => ({
+          ...current,
+          replacement: action.replacement,
+        }));
+        break;
+      case "add_to_dictionary":
+        setDictionaryCategory(action.category);
+        setDictionaryRequired(action.required);
+        setDraftBaseline((current) => ({
+          ...current,
+          dictionaryCategory: action.category,
+          dictionaryRequired: action.required,
+        }));
+        break;
+      case "merge_clusters":
+        setMergeTarget(action.clusterIds[1] ?? "");
+        setDraftBaseline((current) => ({
+          ...current,
+          mergeTarget: action.clusterIds[1] ?? "",
+        }));
+        break;
+      case "resolve_visual_risk": {
+        const key = visualKey(action.pageIndex, action.riskCode);
+        setVisualReasons((current) => ({ ...current, [key]: "" }));
+        setDraftBaseline((current) => ({
+          ...current,
+          visualReasons: {
+            ...current.visualReasons,
+            [key]: "",
+          },
+        }));
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  const submitRiskAction = async (
+    action: PrivacyRiskReviewAction,
+  ) => {
+    let accepted: boolean | void;
+    try {
+      accepted = await onAction(action);
+    } catch {
+      return;
+    }
+    if (!riskReviewActionSucceeded(accepted)) return;
+    commitSuccessfulDraft(action);
   };
 
   const resolveVisualRisk = (
@@ -204,7 +346,35 @@ export function RiskReviewPanel({
   ) => {
     const reason = (visualReasons[visualKey(pageIndex, riskCode)] ?? "").trim();
     if (!reason) return;
-    onAction({ kind: "resolve_visual_risk", pageIndex, riskCode, decision, reason });
+    void submitRiskAction({
+      kind: "resolve_visual_risk",
+      pageIndex,
+      riskCode,
+      decision,
+      reason,
+    });
+  };
+
+  const selectFinding = (finding: PrivacyFindingView) => {
+    if (finding.findingId === selectedFindingId) return;
+    if (
+      !allowRiskFindingSwitch(draftDirty, () =>
+        window.confirm(
+          "切换风险项将丢弃当前尚未提交的风险审阅草稿。确定继续吗？",
+        ),
+      )
+    ) {
+      return;
+    }
+    const nextDraft = initialDraft(finding);
+    setSelectedFindingId(finding.findingId);
+    setEntityType(nextDraft.entityType);
+    setReplacement(nextDraft.replacement);
+    setDictionaryCategory(nextDraft.dictionaryCategory);
+    setDictionaryRequired(nextDraft.dictionaryRequired);
+    setMergeTarget(nextDraft.mergeTarget);
+    setVisualReasons({ ...nextDraft.visualReasons });
+    setDraftBaseline(cloneRiskReviewDraftSnapshot(nextDraft));
   };
 
   const risk = state.documentRisk;
@@ -217,7 +387,10 @@ export function RiskReviewPanel({
           <p>
             revision {state.revision} · {risk.route} · 策略 {risk.autoApprovalPolicyMode}
           </p>
-          <code>{state.caseId} / {state.materialId} / document v{state.documentVersion}</code>
+          <code>
+            {projectId ? `${projectId} / ` : ""}
+            {state.materialId} / document v{state.documentVersion}
+          </code>
         </div>
         <div className="privacy-readiness" aria-label={`风险就绪度 ${risk.readinessScore} 分`}>
           <strong>{risk.readinessScore}</strong><span>/100 readiness</span>
@@ -265,8 +438,8 @@ export function RiskReviewPanel({
             <option value="visual">仅视觉风险</option>
           </select>
         </label>
-        <button type="button" disabled={busy || !state.canUndo} onClick={onUndo}>撤销</button>
-        <button type="button" disabled={busy || !state.canRedo} onClick={onRedo}>重做</button>
+        <button type="button" disabled={busy || historyActionsDisabled || draftDirty || !state.canUndo} onClick={onUndo}>撤销</button>
+        <button type="button" disabled={busy || historyActionsDisabled || draftDirty || !state.canRedo} onClick={onRedo}>重做</button>
       </div>
 
       <div className="privacy-risk-layout">
@@ -292,11 +465,7 @@ export function RiskReviewPanel({
                 className={findingClassName(finding, selectedCluster)}
                 aria-label={`${severity.label}，第 ${finding.pageIndex + 1} 页，${ENTITY_LABELS[finding.entityType]}`}
                 aria-pressed={finding.findingId === selectedFindingId}
-                onClick={() => {
-                  setSelectedFindingId(finding.findingId);
-                  setEntityType(finding.entityType);
-                  setReplacement(finding.proposedReplacement);
-                }}
+                onClick={() => selectFinding(finding)}
               >
                 <span className="risk-icon" aria-hidden="true">{severity.icon}</span>
                 <strong>{severity.label}</strong>
@@ -324,6 +493,7 @@ export function RiskReviewPanel({
                   <label>确认理由
                     <input
                       autoComplete="off"
+                      disabled={busy}
                       value={visualReasons[key] ?? ""}
                       onChange={(event) => setVisualReasons((current) => ({ ...current, [key]: event.target.value }))}
                     />
@@ -353,21 +523,21 @@ export function RiskReviewPanel({
             <div><dt>同一 cluster</dt><dd>{selected.clusterId ?? "无"} · {selected.clusterOccurrenceCount} 处</dd></div>
           </dl>
           <div className="privacy-risk-actions">
-            <button type="button" disabled={busy} onClick={() => onAction({ kind: "accept_replacement", findingId: selected.findingId, applyCluster: false })}>接受替换</button>
-            <button type="button" disabled={busy || !selected.clusterId} onClick={() => onAction({ kind: "accept_replacement", findingId: selected.findingId, applyCluster: true })}>整个 cluster 接受替换</button>
-            <button type="button" disabled={busy} onClick={() => onAction({ kind: "mark_not_sensitive", findingId: selected.findingId })}>标记为不敏感</button>
-            <button type="button" disabled={busy || !selected.clusterId} onClick={() => onAction({ kind: "split_cluster", findingId: selected.findingId })}>拆分 cluster</button>
+            <button type="button" disabled={busy} onClick={() => void submitRiskAction({ kind: "accept_replacement", findingId: selected.findingId, applyCluster: false })}>接受替换</button>
+            <button type="button" disabled={busy || !selected.clusterId} onClick={() => void submitRiskAction({ kind: "accept_replacement", findingId: selected.findingId, applyCluster: true })}>整个 cluster 接受替换</button>
+            <button type="button" disabled={busy} onClick={() => void submitRiskAction({ kind: "mark_not_sensitive", findingId: selected.findingId })}>标记为不敏感</button>
+            <button type="button" disabled={busy || !selected.clusterId} onClick={() => void submitRiskAction({ kind: "split_cluster", findingId: selected.findingId })}>拆分 cluster</button>
           </div>
           <div className="privacy-risk-edit-grid">
-            <label>修改实体类别<select value={entityType} onChange={(event) => setEntityType(event.target.value as PrivacyEntityType)}>{Object.entries(ENTITY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-            <button type="button" disabled={busy} onClick={() => onAction({ kind: "change_entity_type", findingId: selected.findingId, entityType })}>提交类别</button>
-            <label>修改占位符<input autoComplete="off" value={replacement} onChange={(event) => setReplacement(event.target.value)} /></label>
-            <button type="button" disabled={busy || !replacement.trim()} onClick={() => onAction({ kind: "change_placeholder", findingId: selected.findingId, replacement: replacement.trim(), applyCluster: false })}>提交占位符</button>
-            <label>加入案件词典<select value={dictionaryCategory} onChange={(event) => setDictionaryCategory(event.target.value as PrivacyDictionaryCategory)}>{Object.entries(DICTIONARY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-            <label><input type="checkbox" checked={dictionaryRequired} onChange={(event) => setDictionaryRequired(event.target.checked)} />设为必需实体</label>
-            <button type="button" disabled={busy} onClick={() => onAction({ kind: "add_to_dictionary", findingId: selected.findingId, category: dictionaryCategory, required: dictionaryRequired })}>加入词典</button>
-            <label>合并到 cluster<select value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}><option value="">请选择</option>{clusters.filter((cluster) => cluster !== selected.clusterId).map((cluster) => <option key={cluster} value={cluster}>{cluster}</option>)}</select></label>
-            <button type="button" disabled={busy || !selected.clusterId || !mergeTarget} onClick={() => onAction({ kind: "merge_clusters", clusterIds: [selected.clusterId ?? "", mergeTarget] })}>合并 cluster</button>
+            <label>修改实体类别<select disabled={busy} value={entityType} onChange={(event) => setEntityType(event.target.value as PrivacyEntityType)}>{Object.entries(ENTITY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <button type="button" disabled={busy} onClick={() => void submitRiskAction({ kind: "change_entity_type", findingId: selected.findingId, entityType })}>提交类别</button>
+            <label>修改占位符<input autoComplete="off" disabled={busy} value={replacement} onChange={(event) => setReplacement(event.target.value)} /></label>
+            <button type="button" disabled={busy || !replacement.trim()} onClick={() => void submitRiskAction({ kind: "change_placeholder", findingId: selected.findingId, replacement: replacement.trim(), applyCluster: false })}>提交占位符</button>
+            <label>加入案件词典<select disabled={busy} value={dictionaryCategory} onChange={(event) => setDictionaryCategory(event.target.value as PrivacyDictionaryCategory)}>{Object.entries(DICTIONARY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label><input type="checkbox" disabled={busy} checked={dictionaryRequired} onChange={(event) => setDictionaryRequired(event.target.checked)} />设为必需实体</label>
+            <button type="button" disabled={busy} onClick={() => void submitRiskAction({ kind: "add_to_dictionary", findingId: selected.findingId, category: dictionaryCategory, required: dictionaryRequired })}>加入词典</button>
+            <label>合并到 cluster<select disabled={busy} value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}><option value="">请选择</option>{clusters.filter((cluster) => cluster !== selected.clusterId).map((cluster) => <option key={cluster} value={cluster}>{cluster}</option>)}</select></label>
+            <button type="button" disabled={busy || !selected.clusterId || !mergeTarget} onClick={() => void submitRiskAction({ kind: "merge_clusters", clusterIds: [selected.clusterId ?? "", mergeTarget] })}>合并 cluster</button>
           </div>
         </section>
       ) : null}
@@ -379,10 +549,10 @@ export function RiskReviewPanel({
         <p className="privacy-risk-blocker">人工批准仍被阻断：{manualBlockers.map((gate) => gate.gateId).join("、")}</p>
       ) : null}
       <footer className="privacy-risk-footer">
-        <button type="button" disabled={busy} onClick={() => onAction({ kind: "confirm_edited_output" })}>保存当前编辑并重跑残留扫描</button>
-        <button type="button" disabled={busy} onClick={() => onAction({ kind: "batch_accept_p3" })}>批量接受 P3</button>
+        <button type="button" disabled={busy} onClick={() => void submitRiskAction({ kind: "confirm_edited_output" })}>保存当前编辑并重跑残留扫描</button>
+        <button type="button" disabled={busy} onClick={() => void submitRiskAction({ kind: "batch_accept_p3" })}>批量接受 P3</button>
         <button type="button" disabled={manualApprovalDisabled} onClick={onManualApprove}>进入人工批准</button>
-        <button className="is-danger" type="button" disabled={busy || state.rejected} onClick={() => onAction({ kind: "reject_publication" })}>拒绝发布</button>
+        <button className="is-danger" type="button" disabled={busy || state.rejected} onClick={() => void submitRiskAction({ kind: "reject_publication" })}>拒绝发布</button>
       </footer>
     </section>
   );

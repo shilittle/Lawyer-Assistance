@@ -28,7 +28,6 @@ import {
 } from "./ProviderApprovalPanel";
 import { PrivacyLifecyclePanel } from "./PrivacyLifecyclePanel";
 import { PrivacyQualificationControls } from "./PrivacyQualificationControls";
-import { PrivacyReviewWorkbench } from "./PrivacyReviewWorkbench";
 
 type PrivacyOperation = "loading" | "idle" | "discovering" | "saving" | "refreshing";
 
@@ -590,7 +589,6 @@ export function PrivacyWorkspace({
   const [operation, setOperation] = useState<PrivacyOperation>("loading");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [workflowActive, setWorkflowActive] = useState(false);
   const [lifecycleActive, setLifecycleActive] = useState(false);
   const [providerActive, setProviderActive] = useState(false);
   const [approvedMcpActive, setApprovedMcpActive] = useState(false);
@@ -632,7 +630,6 @@ export function PrivacyWorkspace({
   const mutationActive =
     operation === "discovering" ||
     operation === "saving" ||
-    workflowActive ||
     lifecycleActive ||
     providerActive ||
     approvedMcpActive ||
@@ -744,7 +741,6 @@ export function PrivacyWorkspace({
         disabled={
           dirty ||
           operation !== "idle" ||
-          workflowActive ||
           lifecycleActive ||
           providerActive ||
           approvedMcpActive ||
@@ -766,18 +762,14 @@ export function PrivacyWorkspace({
         disabled={dirty || operation !== "idle" || providerActive || approvedMcpActive || componentActive || qualificationActive}
         onActivityChange={setLifecycleActive}
       />
-      <PrivacyReviewWorkbench
-        disabled={!configResponse.configValid || dirty || operation !== "idle" || providerActive || approvedMcpActive || componentActive || qualificationActive}
-        onActivityChange={setWorkflowActive}
-      />
       <ProviderApprovalPanel
         taskRequest={providerTaskRequest}
         onTaskRequestConsumed={onProviderTaskRequestConsumed}
-        disabled={!configResponse.configValid || dirty || operation !== "idle" || workflowActive || lifecycleActive || approvedMcpActive || componentActive || qualificationActive}
+        disabled={!configResponse.configValid || dirty || operation !== "idle" || lifecycleActive || approvedMcpActive || componentActive || qualificationActive}
         onActivityChange={setProviderActive}
       />
       <ApprovedMcpPanel
-        disabled={!configResponse.configValid || dirty || operation !== "idle" || workflowActive || lifecycleActive || providerActive || componentActive || qualificationActive}
+        disabled={!configResponse.configValid || dirty || operation !== "idle" || lifecycleActive || providerActive || componentActive || qualificationActive}
         onActivityChange={setApprovedMcpActive}
       />
     </>

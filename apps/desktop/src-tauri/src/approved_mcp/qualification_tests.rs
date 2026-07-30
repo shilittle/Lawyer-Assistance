@@ -1,5 +1,21 @@
 use super::{qualification::DesktopApprovedMcpQualificationProvider, *};
-use std::sync::Arc;
+use crate::{
+    commands::approved_mcp::{publish_approved_generation_inner, PublishApprovedGenerationRequest},
+    privacy_manager::{LocalOcrStatus, LocalOcrStatusCode, PrivacyConfig},
+    privacy_workflow::{
+        test_workspace_instance_id, ApplyCaseRedactionRiskReviewActionRequest,
+        ApproveCaseRedactionReviewRequest, ApproveReviewForApprovedWorkspaceRequest,
+        CaseRedactionReviewView, DeleteCaseRedactionReviewRequest, EditedRedactedPage,
+        LocalOcrExecutionContext, PrivacyWorkflowManager, ReceiptDestinationInput,
+    },
+};
+use privacy::{DestinationKind, ReceiptSigner, ReviewActionV1};
+use rusqlite::Connection;
+use std::collections::BTreeMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    Arc,
+};
 
 struct TestKeys {
     epoch: Mutex<[u8; 32]>,
@@ -34,6 +50,86 @@ impl ApprovedMcpKeyProvider for TestKeys {
         let mut key = self.epoch.lock().map_err(|_| key_store_error())?;
         key[0] = key[0].wrapping_add(1);
         Ok(*key)
+    }
+}
+
+struct StartupTestKeys {
+    manifest: Mutex<Option<[u8; 32]>>,
+    load_or_create_calls: AtomicUsize,
+    mutations: AtomicUsize,
+}
+
+impl StartupTestKeys {
+    fn missing() -> Self {
+        Self {
+            manifest: Mutex::new(None),
+            load_or_create_calls: AtomicUsize::new(0),
+            mutations: AtomicUsize::new(0),
+        }
+    }
+
+    fn existing() -> Self {
+        Self {
+            manifest: Mutex::new(Some([0x66; 32])),
+            load_or_create_calls: AtomicUsize::new(0),
+            mutations: AtomicUsize::new(0),
+        }
+    }
+
+    fn load_or_create_calls(&self) -> usize {
+        self.load_or_create_calls.load(AtomicOrdering::SeqCst)
+    }
+
+    fn mutations(&self) -> usize {
+        self.mutations.load(AtomicOrdering::SeqCst)
+    }
+}
+
+impl ApprovedMcpKeyProvider for StartupTestKeys {
+    fn load_existing(&self, role: KeyRole) -> Result<Option<[u8; 32]>, ApprovedMcpError> {
+        if !matches!(role, KeyRole::ApprovedManifest) {
+            return Ok(None);
+        }
+        self.manifest
+            .lock()
+            .map(|key| *key)
+            .map_err(|_| key_store_error())
+    }
+
+    fn load_or_create(&self, role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+        if !matches!(role, KeyRole::ApprovedManifest) {
+            return Err(key_store_error());
+        }
+        self.load_or_create_calls
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        let mut key = self.manifest.lock().map_err(|_| key_store_error())?;
+        if key.is_none() {
+            *key = Some([0x66; 32]);
+            self.mutations.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        key.ok_or_else(key_store_error)
+    }
+
+    fn rotate(&self, _role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+        self.mutations.fetch_add(1, AtomicOrdering::SeqCst);
+        Err(key_store_error())
+    }
+}
+
+fn startup_workspace(root: PathBuf, test_keys: Arc<StartupTestKeys>) -> ApprovedMcpWorkspace {
+    let keys: Arc<dyn ApprovedMcpKeyProvider> = test_keys;
+    let qualification: Arc<dyn ApprovedWorkspaceQualificationProvider> = Arc::new(AlwaysQualified);
+    ApprovedMcpWorkspace::from_parts(root, qualification, keys, None)
+}
+
+fn install_startup_history(root: &Path, relative: &str, directory: bool) {
+    let path = root.join(relative);
+    if directory {
+        std::fs::create_dir_all(path).expect("create startup history directory");
+    } else {
+        std::fs::create_dir_all(path.parent().expect("startup history parent"))
+            .expect("create startup history parent");
+        std::fs::write(path, b"existing-state").expect("write startup history file");
     }
 }
 
@@ -155,6 +251,497 @@ impl ApprovedWorkspaceQualificationProvider for AlwaysQualified {
             revoked: false,
         })
     }
+}
+
+struct PublishCommandFixture {
+    directory: tempfile::TempDir,
+    workflow: PrivacyWorkflowManager,
+    workspace: ApprovedMcpWorkspace,
+    project_id: String,
+    privacy_case_id: String,
+    redaction_id: String,
+    material_id: String,
+    source_sha256: String,
+    extraction_sha256: String,
+    approved_payload_sha256: String,
+}
+
+impl PublishCommandFixture {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().expect("approved publish integration root");
+        let user_database_path =
+            database::ensure_user_database(directory.path()).expect("canonical user database");
+        let project_id = format!("case-publish-{}", Uuid::new_v4().simple());
+        let user_connection =
+            database::open_user_database(&user_database_path).expect("user database");
+        database::upsert_case_project(
+            &user_connection,
+            &database::CaseProjectRow {
+                project_id: project_id.clone(),
+                title: "Approved publication integration case".to_owned(),
+                case_type: "civil".to_owned(),
+                status: "active".to_owned(),
+                opened_on: None,
+                summary: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .expect("insert integration project");
+        drop(user_connection);
+
+        let keys: Arc<dyn ApprovedMcpKeyProvider> = Arc::new(TestKeys::new());
+        let qualification: Arc<dyn ApprovedWorkspaceQualificationProvider> =
+            Arc::new(AlwaysQualified);
+        let workspace = ApprovedMcpWorkspace::from_parts(
+            directory.path().to_path_buf(),
+            qualification,
+            keys,
+            None,
+        );
+        let workflow = PrivacyWorkflowManager::new_with_approved_publication_invalidator(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+            Arc::new(workspace.clone()),
+        )
+        .expect("privacy workflow with real approved workspace invalidator");
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        workflow.set_test_runtime(
+            ReceiptSigner::new([0x71; 32]).expect("test receipt signer"),
+            now_unix,
+        );
+
+        let source_path = directory.path().join("approved-publish-integration.txt");
+        fs::write(
+            &source_path,
+            b"Synthetic client 13800138000 submitted contract performance evidence.",
+        )
+        .expect("write integration source");
+        let prepared = workflow
+            .prepare_case_selected_material_with_qualification(
+                &source_path,
+                &PrivacyConfig::default(),
+                &disabled_local_ocr_status(),
+                LocalOcrExecutionContext {
+                    mineru_config: None,
+                    qualification: None,
+                },
+                project_id.clone(),
+                Vec::new(),
+            )
+            .expect("prepare real Vault-backed case material");
+        let prepared = workflow
+            .case_redaction_review_view(project_id.clone(), prepared)
+            .expect("project-scoped prepared review");
+        let reviewed = confirm_case_review(&workflow, prepared);
+        let risk_revision = reviewed
+            .risk_review
+            .as_ref()
+            .expect("confirmed risk revision")
+            .revision;
+        let approval = workflow
+            .approve_case_redaction_review(ApproveCaseRedactionReviewRequest {
+                project_id: project_id.clone(),
+                redaction_id: reviewed.redaction_id.clone(),
+                expected_risk_revision: Some(risk_revision),
+                expected_suggested_redacted_sha256: reviewed
+                    .suggested_redacted_content_sha256
+                    .clone(),
+                edited_pages: edited_pages(&reviewed),
+                reviewer: "approved-publish-integration-reviewer".to_owned(),
+                destination: ReceiptDestinationInput {
+                    kind: DestinationKind::VerifiedLocalProvider,
+                    identifier: "local-safe-pdf-export-v1".to_owned(),
+                },
+                purpose: "local_safe_pdf_export".to_owned(),
+                ttl_seconds: 3_600,
+            })
+            .expect("approve exact case generation");
+        let dedicated = workflow
+            .approve_review_for_approved_workspace(ApproveReviewForApprovedWorkspaceRequest {
+                redaction_id: reviewed.redaction_id.clone(),
+                expected_approved_payload_sha256: approval.approved_payload_sha256,
+                reviewer: "approved-mcp-integration-reviewer".to_owned(),
+                ttl_seconds: 3_600,
+                confirmed: true,
+            })
+            .expect("issue dedicated approved workspace authorization");
+        let privacy_case_id = workflow
+            .list_approved_review_selections()
+            .expect("list exact approved selection")
+            .into_iter()
+            .find(|selection| selection.redaction_id == reviewed.redaction_id)
+            .expect("integration selection")
+            .case_id;
+        assert!(
+            workspace
+                .list(Some(&privacy_case_id))
+                .expect("initialize empty approved workspace")
+                .is_empty(),
+            "fixture must begin without a publication"
+        );
+
+        Self {
+            directory,
+            workflow,
+            workspace,
+            project_id,
+            privacy_case_id,
+            redaction_id: reviewed.redaction_id,
+            material_id: reviewed.material_id,
+            source_sha256: reviewed.source_sha256,
+            extraction_sha256: reviewed.extraction_sha256,
+            approved_payload_sha256: dedicated.approved_payload_sha256,
+        }
+    }
+
+    fn request(&self) -> PublishApprovedGenerationRequest {
+        PublishApprovedGenerationRequest {
+            redaction_id: self.redaction_id.clone(),
+            case_id: self.privacy_case_id.clone(),
+            expected_approved_payload_sha256: self.approved_payload_sha256.clone(),
+        }
+    }
+
+    fn approved_root(&self) -> PathBuf {
+        self.directory
+            .path()
+            .join("privacy")
+            .join("approved-mcp")
+            .join(APPROVED_ROOT_NAME)
+    }
+}
+
+fn disabled_local_ocr_status() -> LocalOcrStatus {
+    LocalOcrStatus {
+        code: LocalOcrStatusCode::Disabled,
+        message: "test".to_owned(),
+        worker_version: None,
+        model_version: None,
+        worker_sha256: None,
+        model_manifest_sha256: None,
+        worker_present: false,
+        model_directory_present: false,
+        integrity_verified: false,
+        network_isolation_verified: false,
+        worker_protocol_version: None,
+        worker_protocol_identity_sha256: None,
+        worker_health_evidence_sha256: None,
+        python_version: None,
+        mineru_version: None,
+        pytorch_version: None,
+        cuda_runtime_version: None,
+        gpu_driver_version: None,
+    }
+}
+
+fn edited_pages(review: &CaseRedactionReviewView) -> Vec<EditedRedactedPage> {
+    review
+        .pages
+        .iter()
+        .map(|page| EditedRedactedPage {
+            page_number: page.page_number,
+            redacted_text: page.redacted_text.clone(),
+        })
+        .collect()
+}
+
+fn confirm_case_review(
+    workflow: &PrivacyWorkflowManager,
+    mut review: CaseRedactionReviewView,
+) -> CaseRedactionReviewView {
+    let target_pages = edited_pages(&review);
+    let finding_ids = review
+        .risk_review
+        .as_ref()
+        .expect("initial risk revision")
+        .findings
+        .iter()
+        .map(|finding| finding.finding_id.clone())
+        .collect::<Vec<_>>();
+    for finding_id in finding_ids {
+        let revision = review
+            .risk_review
+            .as_ref()
+            .expect("current finding revision")
+            .revision;
+        review = workflow
+            .apply_case_redaction_risk_review_action(ApplyCaseRedactionRiskReviewActionRequest {
+                project_id: review.project_id.clone(),
+                redaction_id: review.redaction_id.clone(),
+                expected_revision: revision,
+                actor: "approved-publish-integration-reviewer".to_owned(),
+                edited_pages: target_pages.clone(),
+                action: ReviewActionV1::AcceptReplacement {
+                    finding_id,
+                    apply_cluster: false,
+                },
+            })
+            .expect("accept detected replacement");
+    }
+    let revision = review
+        .risk_review
+        .as_ref()
+        .expect("resolved risk revision")
+        .revision;
+    workflow
+        .apply_case_redaction_risk_review_action(ApplyCaseRedactionRiskReviewActionRequest {
+            project_id: review.project_id.clone(),
+            redaction_id: review.redaction_id.clone(),
+            expected_revision: revision,
+            actor: "approved-publish-integration-reviewer".to_owned(),
+            edited_pages: target_pages,
+            action: ReviewActionV1::ConfirmEditedOutput,
+        })
+        .expect("confirm exact reviewed output")
+}
+
+fn approved_tree_hashes(root: &Path) -> BTreeMap<String, String> {
+    fn visit(base: &Path, directory: &Path, output: &mut BTreeMap<String, String>) {
+        for entry in fs::read_dir(directory).expect("read approved workspace tree") {
+            let entry = entry.expect("approved workspace entry");
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).expect("approved workspace metadata");
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                visit(base, &path, output);
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(base)
+                    .expect("relative approved workspace path")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                output.insert(
+                    relative,
+                    sha256_hex(&fs::read(path).expect("read approved workspace file")),
+                );
+            }
+        }
+    }
+
+    let mut output = BTreeMap::new();
+    if root.exists() {
+        visit(root, root, &mut output);
+    }
+    output
+}
+
+fn assert_publish_rejected_without_workspace_write(fixture: &PublishCommandFixture) {
+    let before = approved_tree_hashes(&fixture.approved_root());
+    let error =
+        publish_approved_generation_inner(&fixture.workflow, &fixture.workspace, fixture.request())
+            .expect_err("invalidated source must fail before approved workspace commit");
+    assert!(
+        !error.error_type.is_empty(),
+        "publish failure must retain a structured error"
+    );
+    assert_eq!(
+        approved_tree_hashes(&fixture.approved_root()),
+        before,
+        "rejected publication changed approved workspace state"
+    );
+    assert!(
+        fixture
+            .workspace
+            .list(Some(&fixture.privacy_case_id))
+            .expect("list history after rejected publication")
+            .is_empty(),
+        "rejected publication created history"
+    );
+}
+
+#[test]
+fn command_publish_commits_a_real_binding_authorized_generation() {
+    let fixture = PublishCommandFixture::new();
+    let published =
+        publish_approved_generation_inner(&fixture.workflow, &fixture.workspace, fixture.request())
+            .expect("publish through the command service boundary");
+    assert_eq!(published.case_id, fixture.privacy_case_id);
+    assert_eq!(published.material_id, fixture.material_id);
+    let history = fixture
+        .workspace
+        .list(Some(&fixture.privacy_case_id))
+        .expect("list committed publication");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].publication_id, published.publication_id);
+}
+
+#[test]
+fn command_publish_rejects_binding_tamper_without_workspace_write() {
+    let fixture = PublishCommandFixture::new();
+    let privacy_database = fixture
+        .directory
+        .path()
+        .join("privacy")
+        .join("privacy-workflow.sqlite");
+    let connection = Connection::open(privacy_database).expect("privacy database");
+    let trigger_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type='trigger' AND name='trg_project_privacy_case_binding_no_update'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("canonical binding update guard");
+    connection
+        .execute_batch("DROP TRIGGER trg_project_privacy_case_binding_no_update;")
+        .expect("open a test-only corruption window");
+    connection
+        .execute(
+            "UPDATE project_privacy_case_bindings
+             SET privacy_case_id=?2
+             WHERE project_id=?1",
+            rusqlite::params![fixture.project_id, format!("case_{}", "f".repeat(32))],
+        )
+        .expect("inject audited binding mismatch");
+    connection
+        .execute_batch(&format!("{trigger_sql};"))
+        .expect("restore canonical binding guard");
+    drop(connection);
+
+    assert_publish_rejected_without_workspace_write(&fixture);
+}
+
+#[test]
+fn command_publish_rejects_completed_project_deletion_without_workspace_write() {
+    let fixture = PublishCommandFixture::new();
+    let user_database_path = database::user_database_path(fixture.directory.path());
+    let mut user_connection =
+        database::open_user_database(&user_database_path).expect("user database");
+    assert!(fixture
+        .workflow
+        .delete_case_project_lifecycle(&mut user_connection, &fixture.project_id)
+        .expect("complete project deletion"));
+    drop(user_connection);
+
+    assert_publish_rejected_without_workspace_write(&fixture);
+}
+
+#[test]
+fn command_publish_rejects_material_generation_revocation_without_workspace_write() {
+    let fixture = PublishCommandFixture::new();
+    let deleted = fixture
+        .workflow
+        .delete_case_redaction_review(DeleteCaseRedactionReviewRequest {
+            project_id: fixture.project_id.clone(),
+            redaction_id: fixture.redaction_id.clone(),
+            expected_source_sha256: fixture.source_sha256.clone(),
+            expected_extraction_sha256: fixture.extraction_sha256.clone(),
+        })
+        .expect("revoke material and generation before publication");
+    assert!(deleted.deleted);
+
+    assert_publish_rejected_without_workspace_write(&fixture);
+}
+
+#[test]
+fn startup_identity_preflight_never_mutates_a_missing_provider_when_history_exists() {
+    for (index, relative) in STARTUP_IDENTITY_PRIMARY_HISTORY_PATHS.iter().enumerate() {
+        let root = tempfile::tempdir().expect("startup identity root");
+        install_startup_history(root.path(), relative, index >= 2);
+        let keys = Arc::new(StartupTestKeys::missing());
+        let workspace = startup_workspace(root.path().to_path_buf(), Arc::clone(&keys));
+
+        let error = match workspace.preflight_startup_workspace_identity() {
+            Ok(_) => panic!("existing component history without its identity must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.code(),
+            "approved_mcp_identity_missing_for_existing_state",
+            "history path {relative}"
+        );
+        assert_eq!(
+            keys.load_or_create_calls(),
+            0,
+            "preflight called load_or_create for {relative}"
+        );
+        assert_eq!(
+            keys.mutations(),
+            0,
+            "preflight mutated the key provider for {relative}"
+        );
+    }
+}
+
+#[test]
+fn startup_identity_is_created_only_after_a_fresh_read_only_preflight() {
+    let root = tempfile::tempdir().expect("startup identity root");
+    let keys = Arc::new(StartupTestKeys::missing());
+    let workspace = startup_workspace(root.path().to_path_buf(), Arc::clone(&keys));
+
+    let preflight = workspace
+        .preflight_startup_workspace_identity()
+        .expect("fresh storage read-only preflight");
+    assert_eq!(keys.load_or_create_calls(), 0);
+    assert_eq!(keys.mutations(), 0);
+
+    let first_identity = workspace
+        .workspace_instance_id_after_startup_preflight(preflight)
+        .expect("fresh identity initialization");
+    assert_eq!(keys.load_or_create_calls(), 1);
+    assert_eq!(keys.mutations(), 1);
+
+    let existing_preflight = workspace
+        .preflight_startup_workspace_identity()
+        .expect("existing identity read-only preflight");
+    let second_identity = workspace
+        .workspace_instance_id_after_startup_preflight(existing_preflight)
+        .expect("reuse existing identity");
+    assert_eq!(second_identity, first_identity);
+    assert_eq!(keys.load_or_create_calls(), 1);
+    assert_eq!(keys.mutations(), 1);
+}
+
+#[test]
+fn startup_identity_fresh_authorization_is_invalidated_by_new_history_without_mutation() {
+    let root = tempfile::tempdir().expect("startup identity root");
+    let keys = Arc::new(StartupTestKeys::missing());
+    let workspace = startup_workspace(root.path().to_path_buf(), Arc::clone(&keys));
+    let preflight = workspace
+        .preflight_startup_workspace_identity()
+        .expect("fresh storage read-only preflight");
+    install_startup_history(
+        root.path(),
+        STARTUP_IDENTITY_PRIMARY_HISTORY_PATHS[0],
+        false,
+    );
+
+    let error = workspace
+        .workspace_instance_id_after_startup_preflight(preflight)
+        .expect_err("history created after preflight invalidates fresh authorization");
+
+    assert_eq!(error.code(), "approved_mcp_identity_preflight_failed");
+    assert_eq!(keys.load_or_create_calls(), 0);
+    assert_eq!(keys.mutations(), 0);
+}
+
+#[test]
+fn startup_existing_identity_with_history_is_loaded_without_provider_mutation() {
+    let root = tempfile::tempdir().expect("startup identity root");
+    for (index, relative) in STARTUP_IDENTITY_PRIMARY_HISTORY_PATHS.iter().enumerate() {
+        install_startup_history(root.path(), relative, index >= 2);
+    }
+    let keys = Arc::new(StartupTestKeys::existing());
+    let workspace = startup_workspace(root.path().to_path_buf(), Arc::clone(&keys));
+
+    let preflight = workspace
+        .preflight_startup_workspace_identity()
+        .expect("existing identity read-only preflight");
+    let identity = workspace
+        .workspace_instance_id_after_startup_preflight(preflight)
+        .expect("existing identity");
+
+    assert_eq!(
+        identity,
+        workspace_instance_id(&[0x66; 32]).expect("expected workspace identity")
+    );
+    assert_eq!(keys.load_or_create_calls(), 0);
+    assert_eq!(keys.mutations(), 0);
 }
 
 fn approved_source(case_id: Option<&str>, now_unix: u64) -> ApprovedGenerationSource {

@@ -50,7 +50,12 @@ mod vault_lifecycle_tests {
             })
             .expect("retention");
         let held = "cln_77777777777777777777777777777777";
-        assert_eq!(store.prepare_expired_object_cleanup(held, 130).expect("held"), 0);
+        assert_eq!(
+            store
+                .prepare_expired_object_cleanup(held, 130)
+                .expect("held"),
+            0
+        );
         let report = store
             .commit_expired_object_cleanup(held, 131)
             .expect("empty cleanup");
@@ -234,7 +239,7 @@ mod vault_lifecycle_tests {
     fn vault_v1_migrates_to_v2_but_future_schema_is_not_mutated() {
         let directory = tempfile::tempdir().expect("directory");
         let root = directory.path().join("vault");
-        VaultStore::initialize(&root, workspace()).expect("initial store");
+        let legacy_probe = VaultStore::initialize(&root, workspace()).expect("initial store");
         let database = root.join("vault-state.sqlite");
         let db = Connection::open(&database).expect("database");
         db.execute_batch(
@@ -246,12 +251,58 @@ mod vault_lifecycle_tests {
         )
         .expect("make v1 fixture");
         drop(db);
+        let before_probe = fs::read(&database).expect("v1 database before probe");
+        let before_probe_modified = fs::metadata(&database)
+            .expect("v1 database metadata before probe")
+            .modified()
+            .expect("v1 database mtime before probe");
+        assert_eq!(
+            legacy_probe
+                .inspect_cleanup_status_read_only()
+                .expect("authenticated v1 read-only probe"),
+            VaultCleanupPendingStatusV1 {
+                prepared_count: 0,
+                committed_count: 0,
+                purged_count: 0,
+            }
+        );
+        assert_eq!(
+            fs::read(&database).expect("v1 database after probe"),
+            before_probe
+        );
+        assert_eq!(
+            fs::metadata(&database)
+                .expect("v1 database metadata after probe")
+                .modified()
+                .expect("v1 database mtime after probe"),
+            before_probe_modified
+        );
+        let partial = Connection::open(&database).expect("partial lifecycle fixture");
+        partial
+            .execute_batch(
+                "CREATE TABLE vault_lifecycle_meta(
+                   singleton INTEGER PRIMARY KEY,
+                   schema_version INTEGER NOT NULL
+                 );",
+            )
+            .expect("create partial lifecycle state");
+        drop(partial);
+        assert_eq!(
+            legacy_probe.inspect_cleanup_status_read_only(),
+            Err(VaultStoreError::ContentCorrupt)
+        );
+        Connection::open(&database)
+            .expect("remove partial lifecycle fixture")
+            .execute("DROP TABLE vault_lifecycle_meta", [])
+            .expect("drop partial lifecycle state");
         VaultStore::initialize(&root, workspace()).expect("migrate v1");
         let db = Connection::open(&database).expect("migrated database");
         let version: u32 = db
-            .query_row("SELECT schema_version FROM vault_meta WHERE singleton=1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT schema_version FROM vault_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
             .expect("version");
         assert_eq!(version, VAULT_STORE_SCHEMA_VERSION);
         db.execute_batch(
@@ -284,6 +335,82 @@ mod vault_lifecycle_tests {
         assert_eq!(
             valid_vault_cleanup_id("cln_../../escape"),
             Err(VaultStoreError::InvalidInput)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_cleanup_probe_is_strictly_read_only_for_prepared_and_committed_states() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("vault");
+        let store = VaultStore::initialize(&root, workspace()).expect("store");
+        store
+            .prepare_expired_object_cleanup("cln_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 100)
+            .expect("prepare empty cleanup");
+        store
+            .prepare_encrypted_backup_snapshot()
+            .expect("checkpoint prepared state before proof");
+        let database = root.join("vault-state.sqlite");
+        let prepared_bytes = fs::read(&database).expect("prepared database bytes");
+        let prepared_modified = fs::metadata(&database)
+            .expect("prepared database metadata")
+            .modified()
+            .expect("prepared database mtime");
+
+        let prepared = store
+            .inspect_cleanup_status_read_only()
+            .expect("read prepared status");
+        assert_eq!(prepared.prepared_count, 1);
+        assert_eq!(prepared.committed_count, 0);
+        assert!(prepared.has_unfinished_cleanup());
+        assert_eq!(
+            fs::read(&database).expect("database after prepared probe"),
+            prepared_bytes
+        );
+        assert_eq!(
+            fs::metadata(&database)
+                .expect("metadata after prepared probe")
+                .modified()
+                .expect("mtime after prepared probe"),
+            prepared_modified
+        );
+
+        let connection = open_database(&store.root).expect("write committed fixture state");
+        connection
+            .execute(
+                "UPDATE vault_cleanup_journal
+                 SET state='committed',completed_at_unix=101
+                 WHERE cleanup_id='cln_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                   AND state='prepared'",
+                [],
+            )
+            .expect("mark fixture committed");
+        drop(connection);
+        store
+            .prepare_encrypted_backup_snapshot()
+            .expect("checkpoint committed state before proof");
+        let committed_bytes = fs::read(&database).expect("committed database bytes");
+        let committed_modified = fs::metadata(&database)
+            .expect("committed database metadata")
+            .modified()
+            .expect("committed database mtime");
+
+        let committed = store
+            .inspect_cleanup_status_read_only()
+            .expect("read committed status");
+        assert_eq!(committed.prepared_count, 0);
+        assert_eq!(committed.committed_count, 1);
+        assert!(committed.has_unfinished_cleanup());
+        assert_eq!(
+            fs::read(&database).expect("database after committed probe"),
+            committed_bytes
+        );
+        assert_eq!(
+            fs::metadata(&database)
+                .expect("metadata after committed probe")
+                .modified()
+                .expect("mtime after committed probe"),
+            committed_modified
         );
     }
 }

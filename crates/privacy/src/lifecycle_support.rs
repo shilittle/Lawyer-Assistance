@@ -33,8 +33,13 @@ fn load_retention_policy(connection: &Connection) -> Result<RetentionPolicyV1, L
             [],
             |row| {
                 Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                    row.get(5)?, row.get(6)?,
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
@@ -94,9 +99,7 @@ fn ensure_redaction_exists(
     }
 }
 
-fn load_active_mapping_key(
-    connection: &Connection,
-) -> Result<(u64, SecretKey32), LifecycleError> {
+fn load_active_mapping_key(connection: &Connection) -> Result<(u64, SecretKey32), LifecycleError> {
     let active: i64 = connection
         .query_row(
             "SELECT active_mapping_key_version FROM privacy_lifecycle_meta WHERE singleton=1",
@@ -248,6 +251,190 @@ struct CleanupCandidate {
     expected_sha256: String,
 }
 
+fn cleanup_evidence_manifest(
+    connection: &Connection,
+    cleanup_id: &str,
+) -> Result<String, LifecycleError> {
+    let candidates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT target_kind,target_id,expected_sha256,state
+                 FROM privacy_cleanup_candidates
+                 WHERE cleanup_id=?1
+                 ORDER BY target_kind,target_id",
+            )
+            .map_err(|_| LifecycleError::Database)?;
+        let rows = statement
+            .query_map([cleanup_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|_| LifecycleError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| LifecycleError::Database)?;
+        rows
+    };
+    let redaction_evidence = {
+        let mut statement = connection
+            .prepare(
+                "SELECT redaction_id,material_id,generation_number,expected_sha256,
+                        material_provenance_sha256,material_tombstoned
+                 FROM privacy_cleanup_redaction_evidence
+                 WHERE cleanup_id=?1
+                 ORDER BY redaction_id",
+            )
+            .map_err(|_| LifecycleError::Database)?;
+        let rows = statement
+            .query_map([cleanup_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .map_err(|_| LifecycleError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| LifecycleError::Database)?;
+        rows
+    };
+    let canonical = canonical_json_v1(&serde_json::json!({
+        "candidates": candidates,
+        "redactionEvidence": redaction_evidence,
+    }))
+    .map_err(|_| LifecycleError::CleanupIntegrity)?;
+    Ok(sha256_hex(&canonical))
+}
+
+fn cleanup_event_hash_with_evidence(
+    row: &CleanupJournalRow,
+    evidence_manifest_sha256: &str,
+) -> Result<String, LifecycleError> {
+    if evidence_manifest_sha256.len() != 64 {
+        return Err(LifecycleError::CleanupIntegrity);
+    }
+    let legacy_event_hash = cleanup_event_hash(row)?;
+    Ok(sha256_hex(
+        format!("privacy-cleanup-event-v2\0{legacy_event_hash}\0{evidence_manifest_sha256}")
+            .as_bytes(),
+    ))
+}
+
+fn cleanup_chain_tail(connection: &Connection) -> Result<String, LifecycleError> {
+    let tails = {
+        let mut statement = connection
+            .prepare(
+                "SELECT journal.event_hash
+                 FROM privacy_cleanup_journal AS journal
+                 WHERE journal.state IN('committed','failed')
+                   AND NOT EXISTS(
+                     SELECT 1 FROM privacy_cleanup_journal AS child
+                     WHERE child.state IN('committed','failed')
+                       AND child.previous_event_hash=journal.event_hash
+                   )
+                 ORDER BY journal.rowid",
+            )
+            .map_err(|_| LifecycleError::Database)?;
+        let values = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| LifecycleError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| LifecycleError::Database)?;
+        values
+    };
+    match tails.as_slice() {
+        [] => Ok(String::new()),
+        [tail] if tail.len() == 64 => Ok(tail.clone()),
+        _ => Err(LifecycleError::CleanupIntegrity),
+    }
+}
+
+fn retention_material_provenance_sha256(
+    connection: &Connection,
+    material_id: &str,
+) -> Result<String, LifecycleError> {
+    let material = connection
+        .query_row(
+            "SELECT project_id,legacy_case_id,attachment_id,source_sha256,
+                    source_name_sha256,media_type,page_count,source_kind,
+                    extraction_status,migration_status,created_at
+             FROM privacy_materials WHERE material_id=?1",
+            [material_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .map_err(|_| LifecycleError::CleanupIntegrity)?;
+    let vault_table_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type='table' AND name='privacy_vault_material_refs'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| LifecycleError::Database)?;
+    let vault = if vault_table_exists {
+        connection
+            .query_row(
+                "SELECT case_id,object_id,object_version,source_sha256,
+                        envelope_sha256,content_bytes
+                 FROM privacy_vault_material_refs WHERE material_id=?1",
+                [material_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| LifecycleError::Database)?
+    } else {
+        None
+    };
+    let canonical = canonical_json_v1(&serde_json::json!({
+        "materialId": material_id,
+        "projectId": material.0,
+        "legacyCaseId": material.1,
+        "attachmentId": material.2,
+        "sourceSha256": material.3,
+        "sourceNameSha256": material.4,
+        "mediaType": material.5,
+        "pageCount": material.6,
+        "sourceKind": material.7,
+        "extractionStatus": material.8,
+        "migrationStatus": material.9,
+        "createdAt": material.10,
+        "vaultIdentity": vault,
+    }))
+    .map_err(|_| LifecycleError::CleanupIntegrity)?;
+    Ok(sha256_hex(&canonical))
+}
+
 fn preflight_cleanup_invalidation(
     connection: &mut Connection,
     cleanup_id: &str,
@@ -301,10 +488,98 @@ fn preflight_cleanup_invalidation(
         .filter(|candidate| candidate.target_kind == "redaction")
         .map(|candidate| candidate.target_id.clone())
         .collect();
-    transaction
-        .commit()
-        .map_err(|_| LifecycleError::Database)?;
+    transaction.commit().map_err(|_| LifecycleError::Database)?;
     Ok(bindings)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RetentionProjectDeletionScopeV1 {
+    schema_version: String,
+    project_id: String,
+    privacy_case_id: Option<String>,
+    material_ids: Vec<String>,
+    generation_ids: Vec<String>,
+}
+
+fn completed_project_deletion_contains_material(
+    connection: &Connection,
+    material_id: &str,
+) -> Result<bool, LifecycleError> {
+    let journal_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type='table' AND name='project_deletion_journal'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| LifecycleError::Database)?;
+    if !journal_exists {
+        return Ok(false);
+    }
+    let row: Option<(String, Option<String>, String, String, String)> = connection
+        .query_row(
+            "SELECT journal.project_id,journal.privacy_case_id,
+                    journal.scope_json,journal.scope_sha256,journal.state
+             FROM privacy_materials AS material
+             JOIN project_deletion_journal AS journal
+               ON journal.project_id=material.project_id
+             WHERE material.material_id=?1
+               AND material.state='revoked'
+               AND material.deleted_at IS NOT NULL",
+            [material_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| LifecycleError::Database)?;
+    let Some((project_id, privacy_case_id, scope_json, scope_sha256, state)) = row else {
+        return Ok(false);
+    };
+    if state != "completed" {
+        return Err(LifecycleError::CleanupIntegrity);
+    }
+    let scope: RetentionProjectDeletionScopeV1 =
+        serde_json::from_str(&scope_json).map_err(|_| LifecycleError::CleanupIntegrity)?;
+    let identifiers_valid = scope
+        .material_ids
+        .iter()
+        .chain(scope.generation_ids.iter())
+        .all(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+        });
+    let strictly_sorted = |values: &[String]| {
+        values
+            .windows(2)
+            .all(|pair| pair[0].as_str() < pair[1].as_str())
+    };
+    let canonical = serde_json::to_vec(&scope).map_err(|_| LifecycleError::CleanupIntegrity)?;
+    if scope.schema_version != "project-deletion-journal-v1"
+        || scope.project_id != project_id
+        || scope.privacy_case_id != privacy_case_id
+        || !identifiers_valid
+        || !strictly_sorted(&scope.material_ids)
+        || !strictly_sorted(&scope.generation_ids)
+        || sha256_hex(&canonical) != scope_sha256
+    {
+        return Err(LifecycleError::CleanupIntegrity);
+    }
+    Ok(scope
+        .material_ids
+        .binary_search_by(|value| value.as_str().cmp(material_id))
+        .is_ok())
 }
 
 fn commit_cleanup_transaction(
@@ -312,7 +587,9 @@ fn commit_cleanup_transaction(
     cleanup_id: &str,
     completed_at_unix: u64,
 ) -> Result<CleanupReportV1, LifecycleError> {
-    let transaction = connection.transaction().map_err(|_| LifecycleError::Database)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| LifecycleError::Database)?;
     let (state, started_at, candidate_count): (String, i64, i64) = transaction
         .query_row(
             "SELECT state,started_at_unix,candidate_count FROM privacy_cleanup_journal
@@ -353,17 +630,89 @@ fn commit_cleanup_transaction(
     for candidate in &candidates {
         validate_cleanup_candidate(&transaction, candidate, completed_at_unix)?;
     }
+    let migration_ledger_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type='table' AND name='case_material_migration_ledger'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| LifecycleError::Database)?;
+    let vault_ref_table_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type='table' AND name='privacy_vault_material_refs'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| LifecycleError::Database)?;
     let mut removed = 0_u64;
     for candidate in &candidates {
         match candidate.target_kind.as_str() {
             "redaction" => {
-                let material_id: String = transaction
+                let (material_id, generation_number): (String, i64) = transaction
                     .query_row(
-                        "SELECT material_id FROM privacy_redactions WHERE redaction_id=?1",
+                        "SELECT material_id,generation_number
+                         FROM privacy_redactions WHERE redaction_id=?1",
                         [candidate.target_id.as_str()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .map_err(|_| LifecycleError::CleanupIntegrity)?;
+                let material_provenance_sha256 =
+                    retention_material_provenance_sha256(&transaction, &material_id)?;
+                let final_material_generation: bool = !transaction
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM privacy_redactions
+                            WHERE material_id=?1 AND redaction_id<>?2
+                         )",
+                        params![material_id, candidate.target_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| LifecycleError::Database)?;
+                let retain_migrated_identity =
+                    if final_material_generation && migration_ledger_exists {
+                        transaction
+                            .query_row(
+                                "SELECT EXISTS(
+                                    SELECT 1 FROM case_material_migration_ledger
+                                    WHERE target_material_id=?1
+                                 )",
+                                [&material_id],
+                                |row| row.get::<_, bool>(0),
+                            )
+                            .map_err(|_| LifecycleError::Database)?
+                    } else {
+                        false
+                    };
+                let retain_project_deletion_identity = if final_material_generation {
+                    completed_project_deletion_contains_material(&transaction, &material_id)?
+                } else {
+                    false
+                };
+                let material_tombstoned =
+                    retain_migrated_identity || retain_project_deletion_identity;
+                transaction
+                    .execute(
+                        "INSERT INTO privacy_cleanup_redaction_evidence(
+                            cleanup_id,redaction_id,material_id,generation_number,
+                            expected_sha256,material_provenance_sha256,material_tombstoned
+                         ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            cleanup_id,
+                            candidate.target_id,
+                            material_id,
+                            generation_number,
+                            candidate.expected_sha256,
+                            material_provenance_sha256,
+                            material_tombstoned,
+                        ],
+                    )
+                    .map_err(|_| LifecycleError::Database)?;
                 transaction
                     .execute(
                         "UPDATE privacy_receipts SET revoked_at_unix=COALESCE(revoked_at_unix,?1)
@@ -381,16 +730,59 @@ fn commit_cleanup_transaction(
                     return Err(LifecycleError::CleanupIntegrity);
                 }
                 // A material can own multiple redaction generations. Never cascade-delete a
-                // retained or legally held sibling merely because one generation expired.
-                transaction
-                    .execute(
-                        "DELETE FROM privacy_materials WHERE material_id=?1
-                         AND NOT EXISTS(
-                           SELECT 1 FROM privacy_redactions WHERE material_id=?1
+                // retained or legally held sibling merely because one generation expired. Once
+                // the final generation is erased, keep only an explicit non-sensitive tombstone
+                // when an append-only migration ledger or completed project deletion still needs
+                // this material identity as durable provenance.
+                let remaining_generations: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM privacy_redactions WHERE material_id=?1
                          )",
-                        [material_id],
+                        [&material_id],
+                        |row| row.get(0),
                     )
                     .map_err(|_| LifecycleError::Database)?;
+                if !remaining_generations {
+                    if retain_migrated_identity || retain_project_deletion_identity {
+                        if vault_ref_table_exists {
+                            transaction
+                                .execute(
+                                    "UPDATE privacy_vault_material_refs
+                                     SET import_state='revoked',
+                                         failure_code='retention_expired',
+                                         updated_at=CURRENT_TIMESTAMP
+                                     WHERE material_id=?1",
+                                    [&material_id],
+                                )
+                                .map_err(|_| LifecycleError::Database)?;
+                        }
+                        let changed = transaction
+                            .execute(
+                                "UPDATE privacy_materials
+                                 SET protected_display_name=NULL,
+                                     display_name_sha256=NULL,
+                                     display_name_protection_scheme=NULL,
+                                     state='revoked',
+                                     deleted_at=COALESCE(deleted_at,CURRENT_TIMESTAMP),
+                                     updated_at=CURRENT_TIMESTAMP,
+                                     row_version=row_version+1
+                                 WHERE material_id=?1",
+                                [&material_id],
+                            )
+                            .map_err(|_| LifecycleError::Database)?;
+                        if changed != 1 {
+                            return Err(LifecycleError::CleanupIntegrity);
+                        }
+                    } else {
+                        transaction
+                            .execute(
+                                "DELETE FROM privacy_materials WHERE material_id=?1",
+                                [&material_id],
+                            )
+                            .map_err(|_| LifecycleError::Database)?;
+                    }
+                }
             }
             "mapping" => {
                 transaction
@@ -442,16 +834,7 @@ fn commit_cleanup_transaction(
             [sql_i64(completed_at_unix)?],
         )
         .map_err(|_| LifecycleError::Database)?;
-    let previous = transaction
-        .query_row(
-            "SELECT event_hash FROM privacy_cleanup_journal
-             WHERE state IN('committed','failed') ORDER BY rowid DESC LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|_| LifecycleError::Database)?
-        .unwrap_or_default();
+    let previous = cleanup_chain_tail(&transaction)?;
     let row = CleanupJournalRow {
         cleanup_id: cleanup_id.to_owned(),
         state: "committed".to_owned(),
@@ -466,14 +849,14 @@ fn commit_cleanup_transaction(
         completed_at_unix: Some(sql_i64(completed_at_unix)?),
         candidate_count,
         removed_count: i64::try_from(removed).map_err(|_| LifecycleError::InvalidInput)?,
-        keys_destroyed: i64::try_from(keys_destroyed)
-            .map_err(|_| LifecycleError::InvalidInput)?,
+        keys_destroyed: i64::try_from(keys_destroyed).map_err(|_| LifecycleError::InvalidInput)?,
         error_code: None,
         previous_event_hash: previous,
         event_hash: String::new(),
         erasure_disclosure: LOGICAL_ERASURE_DISCLOSURE.to_owned(),
     };
-    let event_hash = cleanup_event_hash(&row)?;
+    let evidence_manifest_sha256 = cleanup_evidence_manifest(&transaction, cleanup_id)?;
+    let event_hash = cleanup_event_hash_with_evidence(&row, &evidence_manifest_sha256)?;
     transaction
         .execute(
             "UPDATE privacy_cleanup_journal SET
@@ -594,16 +977,7 @@ fn mark_cleanup_failed(
     let Some((policy_revision, started_at_unix, candidate_count)) = row else {
         return Ok(());
     };
-    let previous = connection
-        .query_row(
-            "SELECT event_hash FROM privacy_cleanup_journal
-             WHERE state IN('committed','failed') ORDER BY rowid DESC LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|_| LifecycleError::Database)?
-        .unwrap_or_default();
+    let previous = cleanup_chain_tail(connection)?;
     let row = CleanupJournalRow {
         cleanup_id: cleanup_id.to_owned(),
         state: "failed".to_owned(),
@@ -618,7 +992,8 @@ fn mark_cleanup_failed(
         event_hash: String::new(),
         erasure_disclosure: LOGICAL_ERASURE_DISCLOSURE.to_owned(),
     };
-    let event_hash = cleanup_event_hash(&row)?;
+    let evidence_manifest_sha256 = cleanup_evidence_manifest(connection, cleanup_id)?;
+    let event_hash = cleanup_event_hash_with_evidence(&row, &evidence_manifest_sha256)?;
     connection
         .execute(
             "UPDATE privacy_cleanup_journal SET
@@ -675,6 +1050,7 @@ fn cleanup_event_hash(row: &CleanupJournalRow) -> Result<String, LifecycleError>
 fn backup_aad(
     backup_id: &str,
     workspace: &WorkspaceInstanceId,
+    privacy_store_schema_version: i64,
     key_epoch: u64,
     created_at_unix: u64,
     expires_at_unix: u64,
@@ -688,7 +1064,7 @@ fn backup_aad(
         crypto_suite: BACKUP_CRYPTO_SUITE,
         backup_id,
         workspace_instance_id: workspace,
-        privacy_store_schema_version: PRIVACY_STORE_SCHEMA_VERSION,
+        privacy_store_schema_version,
         lifecycle_schema_version: PRIVACY_LIFECYCLE_SCHEMA_VERSION,
         key_epoch,
         created_at_unix,
@@ -703,14 +1079,14 @@ fn backup_aad(
 fn validate_backup_envelope(
     envelope: &BackupEnvelopeV1,
     backup_id: &str,
-    context: &BackupVerificationContextV1<'_>,
+    context: &BackupVerificationExpectation<'_>,
     registry: &(String, i64, i64, i64, String),
 ) -> Result<(), LifecycleError> {
     if envelope.schema_version != ENCRYPTED_BACKUP_SCHEMA_VERSION
         || envelope.crypto_suite != BACKUP_CRYPTO_SUITE
         || envelope.backup_id != backup_id
         || envelope.workspace_instance_id != *context.expected_workspace_instance_id
-        || envelope.privacy_store_schema_version != PRIVACY_STORE_SCHEMA_VERSION
+        || envelope.privacy_store_schema_version != context.expected_privacy_store_schema_version
         || envelope.lifecycle_schema_version != PRIVACY_LIFECYCLE_SCHEMA_VERSION
         || envelope.key_epoch != context.expected_key_epoch
         || envelope.key_epoch != sql_u64(registry.3)?
@@ -755,6 +1131,7 @@ fn verify_sqlite_snapshot_bytes(
     bytes: &[u8],
     workspace: &WorkspaceInstanceId,
     key_epoch: u64,
+    expected_privacy_store_schema_version: i64,
     root: &FixedLocalStorageRoot,
     backup_id: &str,
 ) -> Result<(), LifecycleError> {
@@ -763,15 +1140,20 @@ fn verify_sqlite_snapshot_bytes(
     }
     let mut random = [0_u8; 8];
     crate::vault_crypto::fill_random(&mut random).map_err(map_crypto_error)?;
-    let path = root.canonical_root().join(".staging").join(format!(
-        "{backup_id}-verify-{}.sqlite",
-        hex_lower(&random)
-    ));
+    let path = root
+        .canonical_root()
+        .join(".staging")
+        .join(format!("{backup_id}-verify-{}.sqlite", hex_lower(&random)));
     write_new_safe_file(&path, bytes)?;
     let verification = (|| {
         let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|_| LifecycleError::BackupInvalid)?;
-        validate_sqlite_connection(&connection, workspace, key_epoch)
+        validate_sqlite_connection(
+            &connection,
+            workspace,
+            key_epoch,
+            expected_privacy_store_schema_version,
+        )
     })();
     finish_sensitive_temporary(&path, root.canonical_root(), verification)
 }
@@ -780,6 +1162,7 @@ fn validate_sqlite_connection(
     connection: &Connection,
     workspace: &WorkspaceInstanceId,
     key_epoch: u64,
+    expected_privacy_store_schema_version: i64,
 ) -> Result<(), LifecycleError> {
     let integrity: String = connection
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -788,24 +1171,14 @@ fn validate_sqlite_connection(
         return Err(LifecycleError::BackupTampered);
     }
     let foreign_key_violations: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_foreign_key_check",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
         .map_err(|_| LifecycleError::BackupInvalid)?;
     if foreign_key_violations != 0 {
         return Err(LifecycleError::BackupTampered);
     }
-    let privacy_version: Option<String> = connection
-        .query_row(
-            "SELECT value FROM privacy_schema_metadata WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| LifecycleError::BackupInvalid)?;
-    if privacy_version.as_deref() != Some(&PRIVACY_STORE_SCHEMA_VERSION.to_string()) {
+    if read_privacy_store_schema_version(connection)? != expected_privacy_store_schema_version {
         return Err(LifecycleError::UnsupportedSchema);
     }
     let meta: Option<(i64, String, i64)> = connection
@@ -839,6 +1212,34 @@ fn validate_sqlite_connection(
     Ok(())
 }
 
+fn read_privacy_store_schema_version(connection: &Connection) -> Result<i64, LifecycleError> {
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT value FROM privacy_schema_metadata WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| LifecycleError::UnsupportedSchema)?;
+    let raw = raw.ok_or(LifecycleError::UnsupportedSchema)?;
+    let version = raw
+        .parse::<i64>()
+        .map_err(|_| LifecycleError::UnsupportedSchema)?;
+    if version.to_string() != raw {
+        return Err(LifecycleError::UnsupportedSchema);
+    }
+    let preflight_version =
+        match PrivacyStore::preflight_schema(connection).map_err(map_store_error)? {
+            PrivacyStoreSchemaStatus::Empty => return Err(LifecycleError::UnsupportedSchema),
+            PrivacyStoreSchemaStatus::Current => PRIVACY_STORE_SCHEMA_VERSION,
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version } => found_version,
+        };
+    if version != preflight_version {
+        return Err(LifecycleError::UnsupportedSchema);
+    }
+    Ok(preflight_version)
+}
+
 fn ensure_empty_database(connection: &Connection) -> Result<(), LifecycleError> {
     let count: i64 = connection
         .query_row(
@@ -869,17 +1270,12 @@ fn write_atomic_new_file(
         .map_err(map_vault_error)?;
     let mut random = [0_u8; 8];
     crate::vault_crypto::fill_random(&mut random).map_err(map_crypto_error)?;
-    let temporary = canonical_root.join(".staging").join(format!(
-        "{backup_id}-write-{}.tmp",
-        hex_lower(&random)
-    ));
+    let temporary = canonical_root
+        .join(".staging")
+        .join(format!("{backup_id}-write-{}.tmp", hex_lower(&random)));
     write_new_safe_file(&temporary, bytes)?;
     if fs::rename(&temporary, final_path).is_err() {
-        return finish_sensitive_temporary(
-            &temporary,
-            canonical_root,
-            Err(LifecycleError::Io),
-        );
+        return finish_sensitive_temporary(&temporary, canonical_root, Err(LifecycleError::Io));
     }
     validate_open_file_identity(final_path)?;
     Ok(())
@@ -1015,9 +1411,7 @@ fn is_exact_backup_staging_name(file_name: &str) -> bool {
         return false;
     }
     if let Some(value) = tail.strip_prefix('-') {
-        if has_random_suffix(value, "-sqlite")
-            || has_random_suffix(value, "-restore.sqlite")
-        {
+        if has_random_suffix(value, "-sqlite") || has_random_suffix(value, "-restore.sqlite") {
             return true;
         }
     }
