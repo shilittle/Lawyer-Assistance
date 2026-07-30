@@ -9,14 +9,18 @@ use crate::{
 };
 use privacy::vault_store::VaultStore;
 use privacy::{
-    open_application_backup, protect_local, seal_application_backup, seal_application_backup_v3,
-    sha256_hex, stage_encrypted_vault_backup, unprotect_local, ApplicationBackupCreateRequest,
-    ApplicationBackupCreateRequestV3, ApplicationBackupMetadata, ApplicationBackupOpenContext,
-    PrivacyLifecycle, MAX_APPLICATION_BACKUP_BYTES, MAX_USER_DATABASE_BACKUP_BYTES,
+    open_application_backup, open_application_backup_for_migration_recovery, protect_local,
+    seal_application_backup, seal_application_backup_v3, sha256_hex, stage_encrypted_vault_backup,
+    unprotect_local, ApplicationBackupCreateRequest, ApplicationBackupCreateRequestV3,
+    ApplicationBackupMetadata, ApplicationBackupOpenContext, MigrationApplicationBackupOpenContext,
+    PrivacyLifecycle, PrivacyStore, PrivacyStoreSchemaStatus, MAX_APPLICATION_BACKUP_BYTES,
+    MAX_USER_DATABASE_BACKUP_BYTES, PRIVACY_STORE_SCHEMA_VERSION,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::windows::{
@@ -50,8 +54,19 @@ const PRIVACY_INCOMING_RELATIVE: &str =
 const VAULT_DIRECTORY_NAME: &str = "case-vault-v2";
 const APPROVED_DIRECTORY_NAME: &str = "approved-generations";
 const WORK_PRODUCTS_DIRECTORY_NAME: &str = "work-products";
+const APPROVED_DATABASE_FILE_NAME: &str = "workspace-state.sqlite";
+const WORK_PRODUCTS_DATABASE_FILE_NAME: &str = "work-products.sqlite";
 const APPROVED_DIRECTORY_RELATIVE: &str = "privacy/approved-mcp/approved-generations";
 const WORK_PRODUCTS_DIRECTORY_RELATIVE: &str = "privacy/approved-mcp/work-products";
+const MIGRATION_BACKUP_DIRECTORY_NAME: &str = "migration-backups";
+const MIGRATION_BACKUP_IDENTITY_SUFFIX: &str = ".identity.dpapi";
+const MIGRATION_BACKUP_IDENTITY_SCHEMA_VERSION: &str =
+    "lawyer-assistance-migration-backup-identity-v1";
+const MAX_MIGRATION_BACKUP_IDENTITY_BYTES: usize = 128 * 1024;
+const MAX_MIGRATION_BACKUP_CANDIDATES: usize = 64;
+pub(crate) const CASE_MATERIAL_UNIFICATION_MIGRATION_ID: &str = "case-material-unification-v1";
+pub(crate) const PROJECT_PRIVACY_CASE_BINDING_MIGRATION_ID: &str =
+    "project-privacy-case-binding-v1";
 pub const FULL_RESTORE_CONFIRMATION: &str = "恢复完整应用备份";
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +76,73 @@ pub struct ApplicationBackupResponse {
     pub file_name: Option<String>,
     pub metadata: Option<ApplicationBackupMetadata>,
     pub restart_required: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationApplicationBackup {
+    pub path: PathBuf,
+    pub metadata: ApplicationBackupMetadata,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MigrationComponentIdentityV1 {
+    user_database_sha256: String,
+    privacy_store_schema_version: i64,
+    privacy_store_manifest_sha256: String,
+    privacy_database_sha256: String,
+    encrypted_privacy_bundle_sha256: String,
+    vault_store_schema_version: u32,
+    vault_content_manifest_sha256: String,
+    vault_manifest_sha256: String,
+    encrypted_vault_bundle_sha256: String,
+    approved_workspace_manifest_sha256: String,
+    approved_workspace_bundle_sha256: String,
+    work_products_manifest_sha256: String,
+    work_products_bundle_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CurrentMigrationComponentIdentity {
+    user_database_sha256: String,
+    privacy_store_schema_version: i64,
+    privacy_store_manifest_sha256: String,
+    vault_store_schema_version: u32,
+    vault_content_manifest_sha256: String,
+    vault_manifest_sha256: String,
+    approved_workspace_manifest_sha256: String,
+    work_products_manifest_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct BuiltMigrationComponentIdentity {
+    current: CurrentMigrationComponentIdentity,
+    privacy_database_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MigrationBackupIdentityV1 {
+    schema_version: String,
+    migration_id: String,
+    source_fingerprint: String,
+    workspace_instance_id: String,
+    backup_file_name: String,
+    backup_bundle_sha256: String,
+    backup_id: String,
+    privacy_backup_id: String,
+    app_version: String,
+    user_schema_version: i64,
+    created_at_unix: u64,
+    expires_at_unix: u64,
+    components: MigrationComponentIdentityV1,
+}
+
+struct VerifiedMigrationBackupCandidate {
+    path: PathBuf,
+    identity: MigrationBackupIdentityV1,
+    metadata: ApplicationBackupMetadata,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,6 +176,8 @@ struct PendingApplicationRestoreV3 {
     workspace_instance_id: String,
     app_version: String,
     user_schema_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    privacy_store_schema_version: Option<i64>,
     user_database_sha256: String,
     privacy_database_sha256: String,
     privacy_key_epoch: u64,
@@ -278,11 +362,12 @@ pub async fn stage_application_restore(
         .map_err(|_| ipc_error("application_restore_io", "无法定位固定的本机应用数据目录。"))?;
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = read_local_file(&source, MAX_APPLICATION_BACKUP_BYTES)?;
-        let metadata = stage_application_restore_bytes_with_approved(
+        let metadata = stage_selected_application_restore_with_approved(
             &app_local_data_dir,
             state.user_database_path(),
             &workflow,
             &approved_workspace,
+            &source,
             &bytes,
         )?;
         Ok(ApplicationBackupResponse {
@@ -311,13 +396,1605 @@ fn build_application_backup_v3(
     workflow: &PrivacyWorkflowManager,
     approved_workspace: &ApprovedMcpWorkspace,
 ) -> Result<(Vec<u8>, ApplicationBackupMetadata, String), IpcError> {
-    build_application_backup_internal(
+    let (bytes, metadata, privacy_backup_id, _) = build_application_backup_internal(
         app_local_data_dir,
         state,
         workflow,
         Some(approved_workspace),
         || {},
+    )?;
+    Ok((bytes, metadata, privacy_backup_id))
+}
+
+pub(crate) fn ensure_pre_migration_application_backup(
+    app_local_data_dir: &Path,
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+    migration_id: &str,
+    source_fingerprint: &str,
+) -> Result<MigrationApplicationBackup, IpcError> {
+    ensure_pre_migration_application_backup_internal(
+        app_local_data_dir,
+        state,
+        workflow,
+        approved_workspace,
+        migration_id,
+        source_fingerprint,
+        atomic_install_new_migration_backup,
     )
+}
+
+#[cfg(test)]
+fn ensure_pre_migration_application_backup_with_install_hook<Install>(
+    app_local_data_dir: &Path,
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+    migration_id: &str,
+    source_fingerprint: &str,
+    install: Install,
+) -> Result<MigrationApplicationBackup, IpcError>
+where
+    Install: FnOnce(&Path, &Path) -> Result<(), IpcError>,
+{
+    ensure_pre_migration_application_backup_internal(
+        app_local_data_dir,
+        state,
+        workflow,
+        approved_workspace,
+        migration_id,
+        source_fingerprint,
+        install,
+    )
+}
+
+fn ensure_pre_migration_application_backup_internal<Install>(
+    app_local_data_dir: &Path,
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+    migration_id: &str,
+    source_fingerprint: &str,
+    install: Install,
+) -> Result<MigrationApplicationBackup, IpcError>
+where
+    Install: FnOnce(&Path, &Path) -> Result<(), IpcError>,
+{
+    let canonical_file_name = migration_backup_file_name(migration_id, source_fingerprint)?;
+    verify_current_migration_source_fingerprint(workflow, source_fingerprint)?;
+    let directory = ensure_migration_backup_directory(app_local_data_dir)?;
+    // Recover a bundle whose authenticated identity was already installed before treating
+    // remaining dot-files as pre-commit staging. The durable identity is the commit record for
+    // this no-replacement install; cleaning first would misclassify its staged bundle as orphaned.
+    let candidates =
+        load_migration_backup_candidates(&directory, workflow, migration_id, source_fingerprint)?;
+    cleanup_orphaned_migration_backup_staging(
+        &directory,
+        workflow,
+        migration_id,
+        source_fingerprint,
+    )?;
+    if !candidates.is_empty() {
+        let current = capture_current_migration_components(
+            app_local_data_dir,
+            state,
+            workflow,
+            approved_workspace,
+        )?;
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| identity_matches_current(&candidate.identity.components, &current))
+            .or_else(|| {
+                candidates.iter().find(|candidate| {
+                    identity_is_recovery_compatible(&candidate.identity.components, &current)
+                })
+            })
+        {
+            verify_current_migration_source_fingerprint(workflow, source_fingerprint)?;
+            return Ok(MigrationApplicationBackup {
+                path: candidate.path.clone(),
+                metadata: candidate.metadata.clone(),
+                created: false,
+            });
+        }
+    }
+
+    let (bytes, expected_metadata, privacy_backup_id, built_identity) =
+        build_application_backup_internal(
+            app_local_data_dir,
+            state,
+            workflow,
+            Some(approved_workspace),
+            || {},
+        )?;
+    let built_identity = built_identity.ok_or_else(five_component_backup_error)?;
+    let expected_bundle_sha256 = sha256_hex(&bytes);
+    if let Err(error) = verify_current_migration_source_fingerprint(workflow, source_fingerprint) {
+        return Err(abort_built_migration_backup(
+            workflow,
+            &privacy_backup_id,
+            None,
+            None,
+            error,
+        ));
+    }
+    if let Err(error) =
+        validate_five_component_application_backup(&bytes, workflow, &expected_metadata)
+    {
+        return Err(abort_built_migration_backup(
+            workflow,
+            &privacy_backup_id,
+            None,
+            None,
+            error,
+        ));
+    }
+    let identity = match migration_backup_identity(
+        migration_id,
+        source_fingerprint,
+        &canonical_file_name,
+        workflow,
+        &expected_metadata,
+        &built_identity,
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(abort_built_migration_backup(
+                workflow,
+                &privacy_backup_id,
+                None,
+                None,
+                error,
+            ));
+        }
+    };
+    let identity_fingerprint = migration_component_fingerprint(&built_identity.current);
+    let file_name = if candidates.is_empty() {
+        canonical_file_name
+    } else {
+        migration_backup_file_name_for_components(
+            migration_id,
+            source_fingerprint,
+            &identity_fingerprint,
+        )?
+    };
+    let destination = directory.join(&file_name);
+    let identity_destination = migration_backup_identity_path(&destination)?;
+    let identity = MigrationBackupIdentityV1 {
+        backup_file_name: file_name,
+        ..identity
+    };
+    if destination.parent() != Some(directory.as_path())
+        || identity_destination.parent() != Some(directory.as_path())
+    {
+        return Err(abort_built_migration_backup(
+            workflow,
+            &privacy_backup_id,
+            None,
+            None,
+            ipc_error(
+                "migration_backup_unsafe_path",
+                "The fixed migration backup pair escaped its controlled application directory.",
+            ),
+        ));
+    }
+    if path_is_present(&destination)? || path_is_present(&identity_destination)? {
+        return Err(abort_built_migration_backup(
+            workflow,
+            &privacy_backup_id,
+            None,
+            None,
+            ipc_error(
+                "migration_backup_install_conflict",
+                "A migration backup identity destination already exists and was not replaced.",
+            ),
+        ));
+    }
+
+    let staging = directory.join(format!(
+        ".{migration_id}-{source_fingerprint}-{}.staged.{FULL_BACKUP_EXTENSION}",
+        Uuid::new_v4().simple()
+    ));
+    let identity_staging = directory.join(format!(
+        ".{migration_id}-{source_fingerprint}-{}.staged.identity.dpapi",
+        Uuid::new_v4().simple()
+    ));
+    if staging.parent() != Some(directory.as_path())
+        || identity_staging.parent() != Some(directory.as_path())
+    {
+        return Err(abort_built_migration_backup(
+            workflow,
+            &privacy_backup_id,
+            None,
+            None,
+            ipc_error(
+                "migration_backup_unsafe_path",
+                "The migration backup staging path escaped its controlled directory.",
+            ),
+        ));
+    }
+    if let Err(error) = stage_migration_backup_pair(
+        &staging,
+        &identity_staging,
+        &bytes,
+        &identity,
+        workflow,
+        &expected_metadata,
+    ) {
+        return Err(abort_built_migration_backup(
+            workflow,
+            &privacy_backup_id,
+            Some(&staging),
+            None,
+            match remove_migration_backup_file_if_exists(&identity_staging) {
+                Ok(()) => error,
+                Err(cleanup_error) => cleanup_error,
+            },
+        ));
+    }
+
+    if let Err(error) = atomic_install_new_migration_file(&identity_staging, &identity_destination)
+    {
+        return Err(abort_built_migration_backup(
+            workflow,
+            &privacy_backup_id,
+            Some(&staging),
+            None,
+            match remove_migration_backup_file_if_exists(&identity_staging) {
+                Ok(()) => error,
+                Err(cleanup_error) => cleanup_error,
+            },
+        ));
+    }
+    if let Err(_install_error) = install(&staging, &destination) {
+        // The authenticated identity is installed first. Preserve both it and the staged bundle:
+        // the next startup can finish this exact no-replacement install by hash.
+        return Err(ipc_error(
+            "migration_backup_install_incomplete",
+            "The migration backup identity is durable, but its matching bundle install is incomplete; no valid rollback point was overwritten or deleted.",
+        ));
+    }
+
+    let installed = match verify_migration_backup_pair(
+        &destination,
+        &identity_destination,
+        workflow,
+        Some(&expected_bundle_sha256),
+        Some((&identity, &expected_metadata)),
+    ) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            // Installed rollback artifacts are append-only forensic/recovery evidence.
+            return Err(error);
+        }
+    };
+    // The pair is already durably installed and may be the only coherent rollback point for
+    // the old source. Preserve its active Privacy backup state; only block this migration run.
+    verify_current_migration_source_fingerprint(workflow, source_fingerprint)?;
+    Ok(MigrationApplicationBackup {
+        path: destination,
+        metadata: installed.metadata,
+        created: true,
+    })
+}
+
+fn cleanup_orphaned_migration_backup_staging(
+    directory: &Path,
+    workflow: &PrivacyWorkflowManager,
+    migration_id: &str,
+    source_fingerprint: &str,
+) -> Result<(), IpcError> {
+    let prefix = format!(".{migration_id}-{source_fingerprint}-");
+    let backup_suffix = format!(".staged.{FULL_BACKUP_EXTENSION}");
+    let identity_suffix = ".staged.identity.dpapi";
+    let mut staged_backups = Vec::new();
+    let mut staged_identities = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|_| {
+        ipc_error(
+            "migration_backup_io",
+            "Migration backup staging could not be enumerated.",
+        )
+    })? {
+        let entry = entry.map_err(|_| {
+            ipc_error(
+                "migration_backup_io",
+                "A migration backup staging entry could not be inspected.",
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if name.ends_with(identity_suffix) {
+            staged_identities.push(entry.path());
+        } else if name.ends_with(&backup_suffix) {
+            staged_backups.push(entry.path());
+        }
+    }
+    if staged_backups.len() > MAX_MIGRATION_BACKUP_CANDIDATES
+        || staged_identities.len() > MAX_MIGRATION_BACKUP_CANDIDATES
+    {
+        return Err(ipc_error(
+            "migration_backup_candidate_limit",
+            "Too many incomplete migration backup artifacts require manual inspection.",
+        ));
+    }
+    let mut retained = BTreeSet::new();
+    let mut consumed = BTreeSet::new();
+    for identity_path in staged_identities {
+        let identity = read_migration_backup_identity(&identity_path)?;
+        validate_migration_backup_identity(&identity, workflow, migration_id, source_fingerprint)?;
+        let final_backup = directory.join(&identity.backup_file_name);
+        let final_identity = migration_backup_identity_path(&final_backup)?;
+        let mut matching = Vec::new();
+        for path in &staged_backups {
+            let bytes = SensitiveBytes(read_local_file(path, MAX_APPLICATION_BACKUP_BYTES)?);
+            if sha256_hex(bytes.as_slice()) == identity.backup_bundle_sha256 {
+                matching.push(path.clone());
+            }
+        }
+        if path_is_present(&final_identity)? {
+            if matching.len() == 1 {
+                retained.insert(matching[0].clone());
+                continue;
+            }
+            return Err(ipc_error(
+                "migration_backup_install_incomplete",
+                "A durable migration identity does not have exactly one recoverable staged bundle.",
+            ));
+        }
+        if matching.len() != 1 {
+            return Err(ipc_error(
+                "migration_backup_install_incomplete",
+                "An orphaned staged migration identity does not have exactly one authenticated bundle.",
+            ));
+        }
+        let matching_backup = &matching[0];
+        let bytes = SensitiveBytes(read_local_file(
+            matching_backup,
+            MAX_APPLICATION_BACKUP_BYTES,
+        )?);
+        let opened = open_application_backup_for_migration_recovery(
+            bytes.as_slice(),
+            &MigrationApplicationBackupOpenContext {
+                expected_workspace_instance_id: &workflow.workspace_instance_id(),
+                expected_user_schema_version: identity.user_schema_version,
+                expected_backup_id: &identity.backup_id,
+                expected_privacy_backup_id: &identity.privacy_backup_id,
+                expected_app_version: &identity.app_version,
+                expected_created_at_unix: identity.created_at_unix,
+                expected_expires_at_unix: identity.expires_at_unix,
+                expected_bundle_sha256: &identity.backup_bundle_sha256,
+            },
+        )
+        .map_err(application_backup_error)?;
+        drop(opened);
+        remove_migration_backup_file_if_exists(matching_backup)?;
+        remove_migration_backup_file_if_exists(&identity_path)?;
+        workflow
+            .revoke_privacy_backup(&identity.privacy_backup_id)
+            .map_err(workflow_error)?;
+        consumed.insert(matching_backup.clone());
+    }
+    for backup_path in staged_backups {
+        if retained.contains(&backup_path) || consumed.contains(&backup_path) {
+            continue;
+        }
+        let bytes = SensitiveBytes(read_local_file(&backup_path, MAX_APPLICATION_BACKUP_BYTES)?);
+        let opened = open_current_application_backup(bytes.as_slice(), workflow)?;
+        let metadata = validate_opened_five_component_backup(bytes.as_slice(), opened)?;
+        remove_migration_backup_file_if_exists(&backup_path)?;
+        workflow
+            .revoke_privacy_backup(&metadata.privacy_backup_id)
+            .map_err(workflow_error)?;
+    }
+    Ok(())
+}
+
+fn migration_backup_identity(
+    migration_id: &str,
+    source_fingerprint: &str,
+    backup_file_name: &str,
+    workflow: &PrivacyWorkflowManager,
+    metadata: &ApplicationBackupMetadata,
+    built: &BuiltMigrationComponentIdentity,
+) -> Result<MigrationBackupIdentityV1, IpcError> {
+    let approved_bundle_sha256 = metadata
+        .approved_workspace_bundle_sha256
+        .clone()
+        .ok_or_else(five_component_backup_error)?;
+    let approved_manifest_sha256 = metadata
+        .approved_workspace_manifest_sha256
+        .clone()
+        .ok_or_else(five_component_backup_error)?;
+    let work_products_bundle_sha256 = metadata
+        .work_products_bundle_sha256
+        .clone()
+        .ok_or_else(five_component_backup_error)?;
+    let work_products_manifest_sha256 = metadata
+        .work_products_manifest_sha256
+        .clone()
+        .ok_or_else(five_component_backup_error)?;
+    if metadata.user_database_sha256 != built.current.user_database_sha256
+        || metadata.vault_manifest_sha256 != built.current.vault_manifest_sha256
+        || approved_manifest_sha256 != built.current.approved_workspace_manifest_sha256
+        || work_products_manifest_sha256 != built.current.work_products_manifest_sha256
+    {
+        return Err(five_component_backup_error());
+    }
+    let identity = MigrationBackupIdentityV1 {
+        schema_version: MIGRATION_BACKUP_IDENTITY_SCHEMA_VERSION.to_owned(),
+        migration_id: migration_id.to_owned(),
+        source_fingerprint: source_fingerprint.to_owned(),
+        workspace_instance_id: workflow.workspace_instance_id().as_str().to_owned(),
+        backup_file_name: backup_file_name.to_owned(),
+        backup_bundle_sha256: metadata.bundle_sha256.clone(),
+        backup_id: metadata.backup_id.clone(),
+        privacy_backup_id: metadata.privacy_backup_id.clone(),
+        app_version: metadata.app_version.clone(),
+        user_schema_version: metadata.user_schema_version,
+        created_at_unix: metadata.created_at_unix,
+        expires_at_unix: metadata.expires_at_unix,
+        components: MigrationComponentIdentityV1 {
+            user_database_sha256: built.current.user_database_sha256.clone(),
+            privacy_store_schema_version: built.current.privacy_store_schema_version,
+            privacy_store_manifest_sha256: built.current.privacy_store_manifest_sha256.clone(),
+            privacy_database_sha256: built.privacy_database_sha256.clone(),
+            encrypted_privacy_bundle_sha256: metadata.encrypted_privacy_bundle_sha256.clone(),
+            vault_store_schema_version: built.current.vault_store_schema_version,
+            vault_content_manifest_sha256: built.current.vault_content_manifest_sha256.clone(),
+            vault_manifest_sha256: built.current.vault_manifest_sha256.clone(),
+            encrypted_vault_bundle_sha256: metadata.encrypted_vault_bundle_sha256.clone(),
+            approved_workspace_manifest_sha256: approved_manifest_sha256,
+            approved_workspace_bundle_sha256: approved_bundle_sha256,
+            work_products_manifest_sha256,
+            work_products_bundle_sha256,
+        },
+    };
+    validate_migration_backup_identity(&identity, workflow, migration_id, source_fingerprint)?;
+    Ok(identity)
+}
+
+fn validate_migration_backup_identity(
+    identity: &MigrationBackupIdentityV1,
+    workflow: &PrivacyWorkflowManager,
+    migration_id: &str,
+    source_fingerprint: &str,
+) -> Result<(), IpcError> {
+    migration_backup_file_name(migration_id, source_fingerprint)?;
+    let component_hashes = [
+        identity.backup_bundle_sha256.as_str(),
+        identity.components.user_database_sha256.as_str(),
+        identity.components.privacy_store_manifest_sha256.as_str(),
+        identity.components.privacy_database_sha256.as_str(),
+        identity.components.encrypted_privacy_bundle_sha256.as_str(),
+        identity.components.vault_content_manifest_sha256.as_str(),
+        identity.components.vault_manifest_sha256.as_str(),
+        identity.components.encrypted_vault_bundle_sha256.as_str(),
+        identity
+            .components
+            .approved_workspace_manifest_sha256
+            .as_str(),
+        identity
+            .components
+            .approved_workspace_bundle_sha256
+            .as_str(),
+        identity.components.work_products_manifest_sha256.as_str(),
+        identity.components.work_products_bundle_sha256.as_str(),
+    ];
+    if identity.schema_version != MIGRATION_BACKUP_IDENTITY_SCHEMA_VERSION
+        || identity.migration_id != migration_id
+        || identity.source_fingerprint != source_fingerprint
+        || identity.workspace_instance_id != workflow.workspace_instance_id().as_str()
+        || identity.user_schema_version != database::USER_SCHEMA_VERSION
+        || identity.created_at_unix == 0
+        || identity.created_at_unix >= identity.expires_at_unix
+        || !(1..=PRIVACY_STORE_SCHEMA_VERSION)
+            .contains(&identity.components.privacy_store_schema_version)
+        || !(1..=privacy::vault_store::VAULT_STORE_SCHEMA_VERSION)
+            .contains(&identity.components.vault_store_schema_version)
+        || !identity.backup_id.starts_with("appbkp_")
+        || !identity.privacy_backup_id.starts_with("bkp_")
+        || identity.backup_file_name.is_empty()
+        || identity.backup_file_name.len() > 240
+        || !identity.backup_file_name.is_ascii()
+        || identity.backup_file_name.contains(['/', '\\'])
+        || !identity
+            .backup_file_name
+            .ends_with(&format!(".{FULL_BACKUP_EXTENSION}"))
+        || component_hashes.iter().any(|value| !is_hash(value))
+    {
+        return Err(ipc_error(
+            "migration_backup_identity_invalid",
+            "The authenticated migration-backup identity manifest is invalid.",
+        ));
+    }
+    Ok(())
+}
+
+fn migration_backup_file_name_for_components(
+    migration_id: &str,
+    source_fingerprint: &str,
+    component_fingerprint: &str,
+) -> Result<String, IpcError> {
+    let canonical = migration_backup_file_name(migration_id, source_fingerprint)?;
+    if !is_hash(component_fingerprint) {
+        return Err(ipc_error(
+            "migration_backup_component_mismatch",
+            "The migration component identity is not a canonical SHA-256 value.",
+        ));
+    }
+    let stem = canonical
+        .strip_suffix(&format!(".{FULL_BACKUP_EXTENSION}"))
+        .ok_or_else(five_component_backup_error)?;
+    Ok(format!(
+        "{stem}-{}.{FULL_BACKUP_EXTENSION}",
+        &component_fingerprint[..24]
+    ))
+}
+
+fn migration_backup_identity_path(backup: &Path) -> Result<PathBuf, IpcError> {
+    let file_name = backup
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            ipc_error(
+                "migration_backup_unsafe_path",
+                "The migration backup file name is not canonical local text.",
+            )
+        })?;
+    if !file_name.is_ascii() || !file_name.ends_with(&format!(".{FULL_BACKUP_EXTENSION}")) {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration backup file name is not canonical.",
+        ));
+    }
+    Ok(backup.with_file_name(format!("{file_name}{MIGRATION_BACKUP_IDENTITY_SUFFIX}")))
+}
+
+fn migration_component_fingerprint(identity: &CurrentMigrationComponentIdentity) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"migration-five-component-identity-v1\0");
+    for value in [
+        identity.user_database_sha256.as_str(),
+        &identity.privacy_store_schema_version.to_string(),
+        identity.privacy_store_manifest_sha256.as_str(),
+        &identity.vault_store_schema_version.to_string(),
+        identity.vault_content_manifest_sha256.as_str(),
+        identity.vault_manifest_sha256.as_str(),
+        identity.approved_workspace_manifest_sha256.as_str(),
+        identity.work_products_manifest_sha256.as_str(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn identity_matches_current(
+    stored: &MigrationComponentIdentityV1,
+    current: &CurrentMigrationComponentIdentity,
+) -> bool {
+    stored.user_database_sha256 == current.user_database_sha256
+        && stored.privacy_store_schema_version == current.privacy_store_schema_version
+        && stored.privacy_store_manifest_sha256 == current.privacy_store_manifest_sha256
+        && stored.vault_store_schema_version == current.vault_store_schema_version
+        && stored.vault_content_manifest_sha256 == current.vault_content_manifest_sha256
+        && stored.vault_manifest_sha256 == current.vault_manifest_sha256
+        && stored.approved_workspace_manifest_sha256 == current.approved_workspace_manifest_sha256
+        && stored.work_products_manifest_sha256 == current.work_products_manifest_sha256
+}
+
+fn identity_is_recovery_compatible(
+    stored: &MigrationComponentIdentityV1,
+    current: &CurrentMigrationComponentIdentity,
+) -> bool {
+    let privacy_is_exact = stored.privacy_store_schema_version
+        == current.privacy_store_schema_version
+        && stored.privacy_store_manifest_sha256 == current.privacy_store_manifest_sha256;
+    let privacy_is_owned_upgrade = (1..PRIVACY_STORE_SCHEMA_VERSION)
+        .contains(&stored.privacy_store_schema_version)
+        && current.privacy_store_schema_version == PRIVACY_STORE_SCHEMA_VERSION;
+    let vault_is_exact = stored.vault_store_schema_version == current.vault_store_schema_version
+        && stored.vault_manifest_sha256 == current.vault_manifest_sha256
+        && stored.vault_content_manifest_sha256 == current.vault_content_manifest_sha256;
+    let vault_is_owned_upgrade = stored.vault_store_schema_version == 1
+        && current.vault_store_schema_version == privacy::vault_store::VAULT_STORE_SCHEMA_VERSION
+        && stored.vault_content_manifest_sha256 == current.vault_content_manifest_sha256;
+    stored.user_database_sha256 == current.user_database_sha256
+        && stored.approved_workspace_manifest_sha256 == current.approved_workspace_manifest_sha256
+        && stored.work_products_manifest_sha256 == current.work_products_manifest_sha256
+        && (privacy_is_exact || privacy_is_owned_upgrade)
+        && (vault_is_exact || vault_is_owned_upgrade)
+}
+
+fn stage_migration_backup_pair(
+    backup_staging: &Path,
+    identity_staging: &Path,
+    bytes: &[u8],
+    identity: &MigrationBackupIdentityV1,
+    workflow: &PrivacyWorkflowManager,
+    expected_metadata: &ApplicationBackupMetadata,
+) -> Result<(), IpcError> {
+    validate_new_local_file(backup_staging)?;
+    validate_new_migration_identity_file(identity_staging)?;
+    write_new_file(backup_staging, bytes)?;
+    let staged_metadata = verify_migration_application_backup(
+        backup_staging,
+        workflow,
+        Some(&identity.backup_bundle_sha256),
+    )?;
+    if staged_metadata != *expected_metadata {
+        return Err(five_component_backup_error());
+    }
+    let plaintext =
+        privacy::vnext::canonical_json_v1(identity).map_err(|_| five_component_backup_error())?;
+    let protected = protect_local(&plaintext).map_err(|_| {
+        ipc_error(
+            "migration_backup_identity_protection_failed",
+            "The migration-backup identity manifest could not be protected for this Windows user.",
+        )
+    })?;
+    if protected.is_empty() || protected.len() > MAX_MIGRATION_BACKUP_IDENTITY_BYTES {
+        return Err(five_component_backup_error());
+    }
+    write_new_file(identity_staging, &protected)?;
+    let staged_identity = read_migration_backup_identity(identity_staging)?;
+    if staged_identity != *identity {
+        return Err(ipc_error(
+            "migration_backup_identity_tampered",
+            "The staged migration-backup identity changed before install.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_new_migration_identity_file(path: &Path) -> Result<(), IpcError> {
+    let file_name = path.file_name().and_then(|value| value.to_str());
+    if !privacy_manager::is_normal_local_absolute(path)
+        || !privacy_manager::local_path_chain_is_ordinary(path)
+        || path.parent().is_none_or(|parent| !parent.is_dir())
+        || path.exists()
+        || file_name.is_none_or(|name| {
+            !name.is_ascii()
+                || !(name.ends_with(MIGRATION_BACKUP_IDENTITY_SUFFIX)
+                    || name.ends_with(".staged.identity.dpapi"))
+        })
+    {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration-backup identity destination is not a new controlled local file.",
+        ));
+    }
+    Ok(())
+}
+
+fn read_migration_backup_identity(path: &Path) -> Result<MigrationBackupIdentityV1, IpcError> {
+    if !ordinary_single_link_file(path) {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration-backup identity is not an ordinary single-link fixed-local file.",
+        ));
+    }
+    let protected = SensitiveBytes(read_local_file(path, MAX_MIGRATION_BACKUP_IDENTITY_BYTES)?);
+    let plaintext = SensitiveBytes(unprotect_local(protected.as_slice()).map_err(|_| {
+        ipc_error(
+            "migration_backup_identity_tampered",
+            "The migration-backup identity could not be authenticated for this Windows user.",
+        )
+    })?);
+    let identity: MigrationBackupIdentityV1 =
+        privacy::vnext::strict_json_v1_from_slice(plaintext.as_slice()).map_err(|_| {
+            ipc_error(
+                "migration_backup_identity_tampered",
+                "The authenticated migration-backup identity has an invalid schema.",
+            )
+        })?;
+    let canonical =
+        privacy::vnext::canonical_json_v1(&identity).map_err(|_| five_component_backup_error())?;
+    if canonical != plaintext.as_slice() {
+        return Err(ipc_error(
+            "migration_backup_identity_tampered",
+            "The authenticated migration-backup identity is not canonically encoded.",
+        ));
+    }
+    Ok(identity)
+}
+
+fn verify_migration_backup_pair(
+    backup_path: &Path,
+    identity_path: &Path,
+    workflow: &PrivacyWorkflowManager,
+    expected_bundle_sha256: Option<&str>,
+    expected: Option<(&MigrationBackupIdentityV1, &ApplicationBackupMetadata)>,
+) -> Result<VerifiedMigrationBackupCandidate, IpcError> {
+    if !ordinary_single_link_file(backup_path) || !ordinary_single_link_file(identity_path) {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration backup pair is not ordinary single-link fixed-local files.",
+        ));
+    }
+    let identity = read_migration_backup_identity(identity_path)?;
+    let bytes = SensitiveBytes(read_local_file(backup_path, MAX_APPLICATION_BACKUP_BYTES)?);
+    if expected_bundle_sha256
+        .is_some_and(|expected_hash| sha256_hex(bytes.as_slice()) != expected_hash)
+        || sha256_hex(bytes.as_slice()) != identity.backup_bundle_sha256
+    {
+        return Err(ipc_error(
+            "migration_backup_tampered",
+            "The migration backup no longer matches its authenticated identity.",
+        ));
+    }
+    let opened = open_application_backup_for_migration_recovery(
+        bytes.as_slice(),
+        &MigrationApplicationBackupOpenContext {
+            expected_workspace_instance_id: &workflow.workspace_instance_id(),
+            expected_user_schema_version: identity.user_schema_version,
+            expected_backup_id: &identity.backup_id,
+            expected_privacy_backup_id: &identity.privacy_backup_id,
+            expected_app_version: &identity.app_version,
+            expected_created_at_unix: identity.created_at_unix,
+            expected_expires_at_unix: identity.expires_at_unix,
+            expected_bundle_sha256: &identity.backup_bundle_sha256,
+        },
+    )
+    .map_err(application_backup_error)?;
+    let metadata = validate_opened_five_component_backup(bytes.as_slice(), opened)?;
+    if metadata.user_database_sha256 != identity.components.user_database_sha256
+        || metadata.encrypted_privacy_bundle_sha256
+            != identity.components.encrypted_privacy_bundle_sha256
+        || metadata.vault_manifest_sha256 != identity.components.vault_manifest_sha256
+        || metadata.encrypted_vault_bundle_sha256
+            != identity.components.encrypted_vault_bundle_sha256
+        || metadata.approved_workspace_manifest_sha256.as_deref()
+            != Some(
+                identity
+                    .components
+                    .approved_workspace_manifest_sha256
+                    .as_str(),
+            )
+        || metadata.approved_workspace_bundle_sha256.as_deref()
+            != Some(
+                identity
+                    .components
+                    .approved_workspace_bundle_sha256
+                    .as_str(),
+            )
+        || metadata.work_products_manifest_sha256.as_deref()
+            != Some(identity.components.work_products_manifest_sha256.as_str())
+        || metadata.work_products_bundle_sha256.as_deref()
+            != Some(identity.components.work_products_bundle_sha256.as_str())
+    {
+        return Err(five_component_backup_error());
+    }
+    if let Some((expected_identity, expected_metadata)) = expected {
+        if identity != *expected_identity || metadata != *expected_metadata {
+            return Err(five_component_backup_error());
+        }
+    }
+    Ok(VerifiedMigrationBackupCandidate {
+        path: backup_path.to_path_buf(),
+        identity,
+        metadata,
+    })
+}
+
+fn load_migration_backup_candidates(
+    directory: &Path,
+    workflow: &PrivacyWorkflowManager,
+    migration_id: &str,
+    source_fingerprint: &str,
+) -> Result<Vec<VerifiedMigrationBackupCandidate>, IpcError> {
+    let canonical = migration_backup_file_name(migration_id, source_fingerprint)?;
+    let prefix = canonical
+        .strip_suffix(&format!(".{FULL_BACKUP_EXTENSION}"))
+        .ok_or_else(five_component_backup_error)?;
+    let mut identity_paths = Vec::new();
+    let mut backup_paths = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|_| {
+        ipc_error(
+            "migration_backup_io",
+            "The migration backup directory could not be enumerated.",
+        )
+    })? {
+        let entry = entry.map_err(|_| {
+            ipc_error(
+                "migration_backup_io",
+                "A migration backup directory entry could not be inspected.",
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(prefix) || name.starts_with('.') {
+            continue;
+        }
+        if name.ends_with(&format!(
+            ".{FULL_BACKUP_EXTENSION}{MIGRATION_BACKUP_IDENTITY_SUFFIX}"
+        )) {
+            identity_paths.push(entry.path());
+        } else if name.ends_with(&format!(".{FULL_BACKUP_EXTENSION}")) {
+            backup_paths.push(entry.path());
+        }
+    }
+    if identity_paths.len() > MAX_MIGRATION_BACKUP_CANDIDATES
+        || backup_paths.len() > MAX_MIGRATION_BACKUP_CANDIDATES
+    {
+        return Err(ipc_error(
+            "migration_backup_candidate_limit",
+            "Too many fixed migration backup candidates require manual inspection.",
+        ));
+    }
+    identity_paths.sort();
+    backup_paths.sort();
+    let mut candidates = Vec::with_capacity(identity_paths.len());
+    for identity_path in identity_paths {
+        let identity = read_migration_backup_identity(&identity_path)?;
+        validate_migration_backup_identity(&identity, workflow, migration_id, source_fingerprint)?;
+        let backup_path = directory.join(&identity.backup_file_name);
+        if migration_backup_identity_path(&backup_path)? != identity_path {
+            return Err(ipc_error(
+                "migration_backup_identity_invalid",
+                "The migration-backup identity does not name its exact sibling bundle.",
+            ));
+        }
+        if !path_is_present(&backup_path)? {
+            recover_incomplete_migration_backup_install(
+                directory,
+                migration_id,
+                source_fingerprint,
+                &identity,
+                &backup_path,
+            )?;
+        }
+        candidates.push(verify_migration_backup_pair(
+            &backup_path,
+            &identity_path,
+            workflow,
+            None,
+            None,
+        )?);
+    }
+    for backup_path in backup_paths {
+        if !path_is_present(&migration_backup_identity_path(&backup_path)?)? {
+            return Err(ipc_error(
+                "migration_backup_identity_missing",
+                "A fixed migration backup has no authenticated component identity; it was preserved and not overwritten.",
+            ));
+        }
+    }
+    Ok(candidates)
+}
+
+fn recover_incomplete_migration_backup_install(
+    directory: &Path,
+    migration_id: &str,
+    source_fingerprint: &str,
+    identity: &MigrationBackupIdentityV1,
+    destination: &Path,
+) -> Result<(), IpcError> {
+    let staging_prefix = format!(".{migration_id}-{source_fingerprint}-");
+    let staging_suffix = format!(".staged.{FULL_BACKUP_EXTENSION}");
+    let mut matching = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|_| {
+        ipc_error(
+            "migration_backup_io",
+            "Incomplete migration backup staging could not be enumerated.",
+        )
+    })? {
+        let entry = entry.map_err(|_| {
+            ipc_error(
+                "migration_backup_io",
+                "An incomplete migration backup staging entry could not be inspected.",
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(&staging_prefix) && name.ends_with(&staging_suffix) {
+            let path = entry.path();
+            if !ordinary_single_link_file(&path) {
+                return Err(ipc_error(
+                    "migration_backup_unsafe_path",
+                    "An incomplete migration backup staging file is unsafe.",
+                ));
+            }
+            let bytes = SensitiveBytes(read_local_file(&path, MAX_APPLICATION_BACKUP_BYTES)?);
+            if sha256_hex(bytes.as_slice()) == identity.backup_bundle_sha256 {
+                matching.push(path);
+            }
+        }
+    }
+    if matching.len() != 1 {
+        return Err(ipc_error(
+            "migration_backup_install_incomplete",
+            "The authenticated migration backup identity was preserved, but its exact staged bundle could not be recovered automatically.",
+        ));
+    }
+    atomic_install_new_migration_backup(&matching[0], destination)
+}
+
+fn capture_current_migration_components(
+    app_local_data_dir: &Path,
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+) -> Result<CurrentMigrationComponentIdentity, IpcError> {
+    let guard = workflow.begin_application_backup_pair();
+    let (user_connection, mut user_file) =
+        open_coherent_user_snapshot(app_local_data_dir, state.user_database_path())?;
+    let result = (|| {
+        let approved = approved_workspace
+            .snapshot_for_application_backup()
+            .map_err(approved_mcp_error)?;
+        let (privacy_store_schema_version, privacy_store_manifest_sha256) =
+            privacy_store_identity(app_local_data_dir, workflow)?;
+        let (vault_bundle, vault_summary) = workflow
+            .export_encrypted_vault_backup_locked(&guard)
+            .map_err(vault_backup_error)?;
+        drop(vault_bundle);
+        let (vault_store_schema_version, vault_content_manifest_sha256) =
+            vault_content_identity(app_local_data_dir, workflow)?;
+        let user_database = snapshot_user_database(
+            app_local_data_dir,
+            state.user_database_path(),
+            &mut user_file,
+        )?;
+        Ok(CurrentMigrationComponentIdentity {
+            user_database_sha256: sha256_hex(user_database.as_slice()),
+            privacy_store_schema_version,
+            privacy_store_manifest_sha256,
+            vault_store_schema_version,
+            vault_content_manifest_sha256,
+            vault_manifest_sha256: vault_summary.manifest_sha256.as_str().to_owned(),
+            approved_workspace_manifest_sha256: approved.approved_workspace_manifest_sha256,
+            work_products_manifest_sha256: approved.work_products_manifest_sha256,
+        })
+    })();
+    let rollback = rollback_user_snapshot(&user_connection);
+    drop(user_connection);
+    drop(user_file);
+    drop(guard);
+    rollback?;
+    result
+}
+
+fn privacy_store_identity(
+    app_local_data_dir: &Path,
+    workflow: &PrivacyWorkflowManager,
+) -> Result<(i64, String), IpcError> {
+    let path = app_local_data_dir.join(PRIVACY_DATABASE_RELATIVE);
+    let connection = open_read_only_identity_database(&path)?;
+    connection.execute_batch("BEGIN DEFERRED").map_err(|_| {
+        ipc_error(
+            "migration_backup_component_invalid",
+            "The Privacy store identity snapshot could not begin.",
+        )
+    })?;
+    let result = (|| {
+        validate_identity_database(&connection)?;
+        let schema_version = match PrivacyStore::preflight_schema(&connection)
+            .map_err(|_| five_component_backup_error())?
+        {
+            PrivacyStoreSchemaStatus::Current => PRIVACY_STORE_SCHEMA_VERSION,
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version } => found_version,
+            PrivacyStoreSchemaStatus::Empty => return Err(five_component_backup_error()),
+        };
+        let workspace: String = connection
+            .query_row(
+                "SELECT workspace_instance_id FROM privacy_lifecycle_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| five_component_backup_error())?;
+        if workspace != workflow.workspace_instance_id().as_str() {
+            return Err(five_component_backup_error());
+        }
+        let excluded = BTreeSet::from(["privacy_backup_registry"]);
+        let manifest = logical_database_manifest(&connection, &excluded)?;
+        Ok((schema_version, manifest))
+    })();
+    let rollback = connection.execute_batch("ROLLBACK").map_err(|_| {
+        ipc_error(
+            "migration_backup_component_invalid",
+            "The Privacy store identity snapshot could not be closed.",
+        )
+    });
+    rollback?;
+    result
+}
+
+fn vault_content_identity(
+    app_local_data_dir: &Path,
+    workflow: &PrivacyWorkflowManager,
+) -> Result<(u32, String), IpcError> {
+    let root = app_local_data_dir.join(VAULT_DIRECTORY_NAME);
+    let database_path = root.join("vault-state.sqlite");
+    let connection = open_read_only_identity_database(&database_path)?;
+    connection.execute_batch("BEGIN DEFERRED").map_err(|_| {
+        ipc_error(
+            "migration_backup_component_invalid",
+            "The Vault identity snapshot could not begin.",
+        )
+    })?;
+    let result = (|| {
+        validate_identity_database(&connection)?;
+        let (schema_version, workspace): (u32, String) = connection
+            .query_row(
+                "SELECT schema_version,workspace_instance_id FROM vault_meta WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| five_component_backup_error())?;
+        if !matches!(
+            schema_version,
+            1 | privacy::vault_store::VAULT_STORE_SCHEMA_VERSION
+        ) || workspace != workflow.workspace_instance_id().as_str()
+        {
+            return Err(five_component_backup_error());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"vault-content-manifest-v1\0");
+        for table in ["object_journal", "nonce_reservations"] {
+            digest.update(table.as_bytes());
+            digest.update(table_rows_manifest(&connection, table)?.as_bytes());
+        }
+        for (relative, hash) in vault_non_database_file_manifest(&root)? {
+            digest.update((relative.len() as u64).to_be_bytes());
+            digest.update(relative.as_bytes());
+            digest.update(hash.as_bytes());
+        }
+        Ok((schema_version, format!("{:x}", digest.finalize())))
+    })();
+    let rollback = connection.execute_batch("ROLLBACK").map_err(|_| {
+        ipc_error(
+            "migration_backup_component_invalid",
+            "The Vault identity snapshot could not be closed.",
+        )
+    });
+    rollback?;
+    result
+}
+
+fn open_read_only_identity_database(path: &Path) -> Result<Connection, IpcError> {
+    if !ordinary_single_link_file(path) {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "A migration backup component database is not an ordinary single-link local file.",
+        ));
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| five_component_backup_error())?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| five_component_backup_error())?;
+    connection
+        .execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA foreign_keys=ON;
+             PRAGMA trusted_schema=OFF;",
+        )
+        .map_err(|_| five_component_backup_error())?;
+    Ok(connection)
+}
+
+fn validate_identity_database(connection: &Connection) -> Result<(), IpcError> {
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|_| five_component_backup_error())?;
+    if integrity != "ok" {
+        return Err(five_component_backup_error());
+    }
+    let mut foreign_keys = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|_| five_component_backup_error())?;
+    let mut rows = foreign_keys
+        .query([])
+        .map_err(|_| five_component_backup_error())?;
+    let has_foreign_key_error = rows
+        .next()
+        .map_err(|_| five_component_backup_error())?
+        .is_some();
+    if has_foreign_key_error {
+        return Err(five_component_backup_error());
+    }
+    Ok(())
+}
+
+fn logical_database_manifest(
+    connection: &Connection,
+    excluded_data_tables: &BTreeSet<&str>,
+) -> Result<String, IpcError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type,name,COALESCE(sql,'')
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type,name",
+        )
+        .map_err(|_| five_component_backup_error())?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| five_component_backup_error())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| five_component_backup_error())?;
+    drop(statement);
+    let mut digest = Sha256::new();
+    digest.update(b"sqlite-logical-manifest-v1\0");
+    for (object_type, name, sql) in objects {
+        for value in [&object_type, &name, &sql] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        if object_type == "table" && !excluded_data_tables.contains(name.as_str()) {
+            digest.update(table_rows_manifest(connection, &name)?.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn table_rows_manifest(connection: &Connection, table: &str) -> Result<String, IpcError> {
+    let quoted = table.replace('"', "\"\"");
+    let mut statement = connection
+        .prepare(&format!("SELECT * FROM \"{quoted}\""))
+        .map_err(|_| five_component_backup_error())?;
+    let column_count = statement.column_count();
+    let mut rows = statement
+        .query([])
+        .map_err(|_| five_component_backup_error())?;
+    let mut row_hashes = Vec::new();
+    while let Some(row) = rows.next().map_err(|_| five_component_backup_error())? {
+        let mut digest = Sha256::new();
+        digest.update(b"sqlite-row-v1\0");
+        for index in 0..column_count {
+            match row
+                .get_ref(index)
+                .map_err(|_| five_component_backup_error())?
+            {
+                ValueRef::Null => digest.update([0]),
+                ValueRef::Integer(value) => {
+                    digest.update([1]);
+                    digest.update(value.to_be_bytes());
+                }
+                ValueRef::Real(value) => {
+                    digest.update([2]);
+                    digest.update(value.to_bits().to_be_bytes());
+                }
+                ValueRef::Text(value) => {
+                    digest.update([3]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value);
+                }
+                ValueRef::Blob(value) => {
+                    digest.update([4]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value);
+                }
+            }
+        }
+        row_hashes.push(digest.finalize().to_vec());
+    }
+    row_hashes.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"sqlite-table-rows-v1\0");
+    digest.update((row_hashes.len() as u64).to_be_bytes());
+    for hash in row_hashes {
+        digest.update(hash);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn vault_non_database_file_manifest(root: &Path) -> Result<Vec<(String, String)>, IpcError> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        output: &mut Vec<(String, String)>,
+    ) -> Result<(), IpcError> {
+        let metadata = fs::symlink_metadata(current).map_err(|_| five_component_backup_error())?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !privacy_manager::local_path_chain_is_ordinary(current)
+        {
+            return Err(ipc_error(
+                "migration_backup_unsafe_path",
+                "The Vault component identity encountered an unsafe path.",
+            ));
+        }
+        if metadata.is_dir() {
+            let mut entries = fs::read_dir(current)
+                .map_err(|_| five_component_backup_error())?
+                .map(|entry| entry.map(|value| value.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| five_component_backup_error())?;
+            entries.sort();
+            for path in entries {
+                visit(root, &path, output)?;
+            }
+            return Ok(());
+        }
+        if !metadata.is_file() || !ordinary_single_link_file(current) {
+            return Err(five_component_backup_error());
+        }
+        let relative = current
+            .strip_prefix(root)
+            .map_err(|_| five_component_backup_error())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if matches!(
+            relative.as_str(),
+            "vault-state.sqlite"
+                | "vault-state.sqlite-wal"
+                | "vault-state.sqlite-shm"
+                | "vault-state.sqlite-journal"
+        ) {
+            return Ok(());
+        }
+        output.push((relative, stream_sha256(current)?));
+        Ok(())
+    }
+    let mut output = Vec::new();
+    visit(root, root, &mut output)?;
+    output.sort();
+    Ok(output)
+}
+
+fn stream_sha256(path: &Path) -> Result<String, IpcError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| five_component_backup_error())?;
+    if !ordinary_single_link_handle(&file) {
+        return Err(five_component_backup_error());
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| five_component_backup_error())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    if !ordinary_single_link_handle(&file) {
+        return Err(five_component_backup_error());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn verify_current_migration_source_fingerprint(
+    workflow: &PrivacyWorkflowManager,
+    expected: &str,
+) -> Result<(), IpcError> {
+    let current = workflow
+        .case_material_migration_source_fingerprint()
+        .map_err(workflow_error)?;
+    if current != expected {
+        return Err(ipc_error(
+            "migration_backup_source_changed",
+            "The user-database migration source changed outside the source-bound backup window.",
+        ));
+    }
+    Ok(())
+}
+
+fn migration_backup_file_name(
+    migration_id: &str,
+    source_fingerprint: &str,
+) -> Result<String, IpcError> {
+    if !is_hash(source_fingerprint) {
+        return Err(ipc_error(
+            "migration_backup_invalid_source_fingerprint",
+            "The migration backup source fingerprint is not a canonical SHA-256 value.",
+        ));
+    }
+    let stem = match migration_id {
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID => "case-material-unification-v1",
+        PROJECT_PRIVACY_CASE_BINDING_MIGRATION_ID => "project-privacy-case-binding-v1",
+        _ => {
+            return Err(ipc_error(
+                "migration_backup_invalid_id",
+                "The migration backup identifier is not in the fixed application allowlist.",
+            ))
+        }
+    };
+    Ok(format!(
+        "{stem}-{source_fingerprint}.{FULL_BACKUP_EXTENSION}"
+    ))
+}
+
+fn ensure_migration_backup_directory(app_local_data_dir: &Path) -> Result<PathBuf, IpcError> {
+    validate_migration_backup_directory(app_local_data_dir)?;
+    let directory = app_local_data_dir.join(MIGRATION_BACKUP_DIRECTORY_NAME);
+    if directory.parent() != Some(app_local_data_dir) {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration backup directory escaped App LocalData.",
+        ));
+    }
+    match fs::create_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            return Err(ipc_error(
+                "migration_backup_io",
+                "The controlled migration backup directory could not be created.",
+            ));
+        }
+    }
+    validate_migration_backup_directory(&directory)?;
+    Ok(directory)
+}
+
+fn validate_migration_backup_directory(path: &Path) -> Result<(), IpcError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration backup directory could not be inspected.",
+        )
+    })?;
+    if !privacy_manager::is_normal_local_absolute(path)
+        || !privacy_manager::local_path_chain_is_ordinary(path)
+        || !metadata.is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || privacy_manager::has_cloud_recall_attributes(&metadata)
+    {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration backup directory is not an ordinary fixed-local directory.",
+        ));
+    }
+    Ok(())
+}
+
+fn path_is_present(path: &Path) -> Result<bool, IpcError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ipc_error(
+            "migration_backup_io",
+            "A fixed migration backup path could not be inspected.",
+        )),
+    }
+}
+
+fn atomic_install_new_migration_backup(staging: &Path, destination: &Path) -> Result<(), IpcError> {
+    atomic_install_new_migration_file(staging, destination)
+}
+
+fn atomic_install_new_migration_file(staging: &Path, destination: &Path) -> Result<(), IpcError> {
+    let parent = destination.parent().ok_or_else(|| {
+        ipc_error(
+            "migration_backup_unsafe_path",
+            "The fixed migration backup destination has no controlled parent.",
+        )
+    })?;
+    if staging.parent() != Some(parent)
+        || !ordinary_single_link_file(staging)
+        || path_is_present(destination)?
+    {
+        return Err(ipc_error(
+            "migration_backup_install_conflict",
+            "The fixed migration backup could not be atomically installed without replacement.",
+        ));
+    }
+    fs::rename(staging, destination).map_err(|_| {
+        ipc_error(
+            "migration_backup_install_failed",
+            "The staged migration backup could not be atomically installed.",
+        )
+    })
+}
+
+fn verify_migration_application_backup(
+    path: &Path,
+    workflow: &PrivacyWorkflowManager,
+    expected_bundle_sha256: Option<&str>,
+) -> Result<ApplicationBackupMetadata, IpcError> {
+    if !ordinary_single_link_file(path) {
+        return Err(ipc_error(
+            "migration_backup_unsafe_path",
+            "The migration backup is not an ordinary single-link fixed-local file.",
+        ));
+    }
+    let bytes = SensitiveBytes(read_local_file(path, MAX_APPLICATION_BACKUP_BYTES)?);
+    if expected_bundle_sha256.is_some_and(|expected| sha256_hex(bytes.as_slice()) != expected) {
+        return Err(ipc_error(
+            "migration_backup_tampered",
+            "The installed migration backup hash does not match the staged backup.",
+        ));
+    }
+    let opened = open_current_application_backup(bytes.as_slice(), workflow)?;
+    validate_opened_five_component_backup(bytes.as_slice(), opened)
+}
+
+fn validate_five_component_application_backup(
+    bytes: &[u8],
+    workflow: &PrivacyWorkflowManager,
+    expected_metadata: &ApplicationBackupMetadata,
+) -> Result<(), IpcError> {
+    let opened = open_current_application_backup(bytes, workflow)?;
+    let metadata = validate_opened_five_component_backup(bytes, opened)?;
+    if metadata != *expected_metadata {
+        return Err(ipc_error(
+            "migration_backup_component_mismatch",
+            "The newly built migration backup metadata is inconsistent.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_opened_five_component_backup(
+    bytes: &[u8],
+    mut opened: privacy::OpenedApplicationBackup,
+) -> Result<ApplicationBackupMetadata, IpcError> {
+    let validation = (|| {
+        let metadata = &opened.metadata;
+        let approved = opened
+            .approved_workspace_bundle
+            .as_ref()
+            .ok_or_else(five_component_backup_error)?;
+        let work_products = opened
+            .work_products_bundle
+            .as_ref()
+            .ok_or_else(five_component_backup_error)?;
+        let approved_bytes = metadata
+            .approved_workspace_bundle_bytes
+            .ok_or_else(five_component_backup_error)?;
+        let approved_sha256 = metadata
+            .approved_workspace_bundle_sha256
+            .as_deref()
+            .ok_or_else(five_component_backup_error)?;
+        let approved_chunks = metadata
+            .approved_workspace_bundle_chunk_count
+            .ok_or_else(five_component_backup_error)?;
+        let work_products_bytes = metadata
+            .work_products_bundle_bytes
+            .ok_or_else(five_component_backup_error)?;
+        let work_products_sha256 = metadata
+            .work_products_bundle_sha256
+            .as_deref()
+            .ok_or_else(five_component_backup_error)?;
+        let work_products_chunks = metadata
+            .work_products_bundle_chunk_count
+            .ok_or_else(five_component_backup_error)?;
+        let expected_chunks = metadata
+            .user_database_chunk_count
+            .checked_add(metadata.privacy_bundle_chunk_count)
+            .and_then(|count| count.checked_add(metadata.vault_bundle_chunk_count))
+            .and_then(|count| count.checked_add(approved_chunks))
+            .and_then(|count| count.checked_add(work_products_chunks))
+            .ok_or_else(five_component_backup_error)?;
+        if metadata.bundle_sha256 != sha256_hex(bytes)
+            || metadata.chunk_count != expected_chunks
+            || [
+                metadata.user_database_chunk_count,
+                metadata.privacy_bundle_chunk_count,
+                metadata.vault_bundle_chunk_count,
+                approved_chunks,
+                work_products_chunks,
+            ]
+            .contains(&0)
+            || !component_matches(
+                &opened.user_database,
+                metadata.user_database_bytes,
+                &metadata.user_database_sha256,
+            )
+            || !component_matches(
+                &opened.encrypted_privacy_bundle,
+                metadata.encrypted_privacy_bundle_bytes,
+                &metadata.encrypted_privacy_bundle_sha256,
+            )
+            || !component_matches(
+                &opened.encrypted_vault_bundle,
+                metadata.encrypted_vault_bundle_bytes,
+                &metadata.encrypted_vault_bundle_sha256,
+            )
+            || !component_matches(approved, approved_bytes, approved_sha256)
+            || !component_matches(work_products, work_products_bytes, work_products_sha256)
+        {
+            return Err(five_component_backup_error());
+        }
+        Ok(metadata.clone())
+    })();
+    opened.user_database.fill(0);
+    opened.encrypted_privacy_bundle.fill(0);
+    opened.encrypted_vault_bundle.fill(0);
+    if let Some(bytes) = opened.approved_workspace_bundle.as_mut() {
+        bytes.fill(0);
+    }
+    if let Some(bytes) = opened.work_products_bundle.as_mut() {
+        bytes.fill(0);
+    }
+    validation
+}
+
+fn component_matches(bytes: &[u8], expected_bytes: u64, expected_sha256: &str) -> bool {
+    u64::try_from(bytes.len()).ok() == Some(expected_bytes) && sha256_hex(bytes) == expected_sha256
+}
+
+fn five_component_backup_error() -> IpcError {
+    ipc_error(
+        "migration_backup_component_mismatch",
+        "The migration gate requires one authenticated five-component V3 application backup.",
+    )
+}
+
+fn abort_built_migration_backup(
+    workflow: &PrivacyWorkflowManager,
+    privacy_backup_id: &str,
+    staging: Option<&Path>,
+    destination: Option<&Path>,
+    original: IpcError,
+) -> IpcError {
+    let mut result = original;
+    if let Some(staging) = staging {
+        if let Err(error) = remove_migration_backup_file_if_exists(staging) {
+            result = error;
+        }
+    }
+    if let Some(destination) = destination {
+        if let Err(error) = remove_migration_backup_file_if_exists(destination) {
+            result = error;
+        }
+    }
+    if let Err(error) = workflow.revoke_privacy_backup(privacy_backup_id) {
+        result = workflow_error(error);
+    }
+    result
+}
+
+fn remove_migration_backup_file_if_exists(path: &Path) -> Result<(), IpcError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(ipc_error(
+                "migration_backup_cleanup_failed",
+                "A migration backup transaction file could not be inspected for cleanup.",
+            ));
+        }
+    };
+    if !privacy_manager::is_normal_local_absolute(path)
+        || !privacy_manager::local_path_chain_is_ordinary(path)
+        || !metadata.is_file()
+        || !ordinary_single_link_file(path)
+    {
+        return Err(ipc_error(
+            "migration_backup_unsafe_cleanup",
+            "Cleanup refused a migration backup path that is not an ordinary single-link file.",
+        ));
+    }
+    fs::remove_file(path).map_err(|_| {
+        ipc_error(
+            "migration_backup_cleanup_failed",
+            "A failed migration backup transaction file could not be removed.",
+        )
+    })?;
+    if path_is_present(path)? {
+        return Err(ipc_error(
+            "migration_backup_cleanup_failed",
+            "A failed migration backup transaction file remains after cleanup.",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -330,7 +2007,9 @@ fn build_application_backup_with_lock_hook<Hook>(
 where
     Hook: FnOnce(),
 {
-    build_application_backup_internal(app_local_data_dir, state, workflow, None, lock_hook)
+    let (bytes, metadata, privacy_backup_id, _) =
+        build_application_backup_internal(app_local_data_dir, state, workflow, None, lock_hook)?;
+    Ok((bytes, metadata, privacy_backup_id))
 }
 
 fn build_application_backup_internal<Hook>(
@@ -339,7 +2018,15 @@ fn build_application_backup_internal<Hook>(
     workflow: &PrivacyWorkflowManager,
     approved_workspace: Option<&ApprovedMcpWorkspace>,
     lock_hook: Hook,
-) -> Result<(Vec<u8>, ApplicationBackupMetadata, String), IpcError>
+) -> Result<
+    (
+        Vec<u8>,
+        ApplicationBackupMetadata,
+        String,
+        Option<BuiltMigrationComponentIdentity>,
+    ),
+    IpcError,
+>
 where
     Hook: FnOnce(),
 {
@@ -364,6 +2051,10 @@ where
         None => None,
     };
 
+    let privacy_store_identity = match approved_workspace {
+        Some(_) => Some(privacy_store_identity(app_local_data_dir, workflow)?),
+        None => None,
+    };
     let privacy_backup = match workflow.create_privacy_backup_locked(&guard) {
         Ok(backup) => backup,
         Err(error) => {
@@ -401,6 +2092,21 @@ where
                 vault_backup_error(error),
             ));
         }
+    };
+    let vault_content_identity = match approved_workspace {
+        Some(_) => match vault_content_identity(app_local_data_dir, workflow) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                return Err(abort_application_backup_pair(
+                    &user_connection,
+                    workflow,
+                    &guard,
+                    Some(&privacy_backup.backup_id),
+                    error,
+                ));
+            }
+        },
+        None => None,
     };
     let user_database = match snapshot_user_database(
         app_local_data_dir,
@@ -446,7 +2152,7 @@ where
 
     let backup_id = format!("appbkp_{}", Uuid::new_v4().simple());
     let workspace_instance_id = workflow.workspace_instance_id();
-    let result = match approved_snapshot {
+    let result = match approved_snapshot.as_ref() {
         Some(snapshot) => seal_application_backup_v3(&ApplicationBackupCreateRequestV3 {
             backup_id: &backup_id,
             privacy_backup_id: &privacy_backup.backup_id,
@@ -480,7 +2186,50 @@ where
     }
     .map_err(application_backup_error);
     match result {
-        Ok((bytes, metadata)) => Ok((bytes, metadata, privacy_backup.backup_id)),
+        Ok((bytes, metadata)) => {
+            let migration_identity = match (
+                approved_snapshot.as_ref(),
+                privacy_store_identity,
+                vault_content_identity,
+            ) {
+                (
+                    Some(snapshot),
+                    Some((privacy_store_schema_version, privacy_store_manifest_sha256)),
+                    Some((vault_store_schema_version, vault_content_manifest_sha256)),
+                ) => Some(BuiltMigrationComponentIdentity {
+                    current: CurrentMigrationComponentIdentity {
+                        user_database_sha256: metadata.user_database_sha256.clone(),
+                        privacy_store_schema_version,
+                        privacy_store_manifest_sha256,
+                        vault_store_schema_version,
+                        vault_content_manifest_sha256,
+                        vault_manifest_sha256: vault_summary.manifest_sha256.as_str().to_owned(),
+                        approved_workspace_manifest_sha256: snapshot
+                            .approved_workspace_manifest_sha256
+                            .clone(),
+                        work_products_manifest_sha256: snapshot
+                            .work_products_manifest_sha256
+                            .clone(),
+                    },
+                    privacy_database_sha256: privacy_backup.database_sha256.clone(),
+                }),
+                (None, None, None) => None,
+                _ => {
+                    if let Err(revoke_error) =
+                        workflow.revoke_privacy_backup(&privacy_backup.backup_id)
+                    {
+                        return Err(workflow_error(revoke_error));
+                    }
+                    return Err(five_component_backup_error());
+                }
+            };
+            Ok((
+                bytes,
+                metadata,
+                privacy_backup.backup_id,
+                migration_identity,
+            ))
+        }
         Err(error) => {
             if let Err(revoke_error) = workflow.revoke_privacy_backup(&privacy_backup.backup_id) {
                 return Err(workflow_error(revoke_error));
@@ -520,10 +2269,10 @@ fn open_coherent_user_snapshot(
             "The fixed user database is not an ordinary single-link local file.",
         ));
     }
-    let connection = database::open_existing_user_database(source_path).map_err(|_| {
+    let connection = database::open_user_database_read_only(source_path).map_err(|_| {
         ipc_error(
             "application_backup_invalid",
-            "The fixed user database could not be opened without creating a replacement.",
+            "The fixed user database could not be opened with read-only query authority.",
         )
     })?;
     let journal_mode = connection
@@ -540,10 +2289,10 @@ fn open_coherent_user_snapshot(
             "Coherent backup requires the canonical DELETE rollback-journal mode.",
         ));
     }
-    connection.execute_batch("BEGIN IMMEDIATE").map_err(|_| {
+    connection.execute_batch("BEGIN DEFERRED").map_err(|_| {
         ipc_error(
             "application_backup_busy",
-            "The user database could not enter the coherent backup window.",
+            "The user database could not enter the read-only coherent backup window.",
         )
     })?;
     let locked_journal_mode = connection
@@ -557,7 +2306,7 @@ fn open_coherent_user_snapshot(
     if !locked_journal_mode.eq_ignore_ascii_case("delete") {
         let original = ipc_error(
             "application_backup_environment_mismatch",
-            "The user database left canonical DELETE journal mode before the coherent lock.",
+            "The user database left canonical DELETE journal mode before the coherent read snapshot.",
         );
         return match rollback_user_snapshot(&connection) {
             Ok(()) => Err(original),
@@ -567,7 +2316,7 @@ fn open_coherent_user_snapshot(
     database::validate_open_user_database(&connection).map_err(|_| {
         ipc_error(
             "application_backup_invalid",
-            "The locked user database failed canonical schema and integrity validation.",
+            "The read-only user database snapshot failed canonical schema and integrity validation.",
         )
     })?;
     if !ordinary_single_link_handle(&source_file) {
@@ -621,6 +2370,100 @@ fn stage_application_restore_bytes(
     )
 }
 
+fn stage_selected_application_restore_with_approved(
+    app_local_data_dir: &Path,
+    expected_user_database_path: &Path,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+    source: &Path,
+    bytes: &[u8],
+) -> Result<ApplicationBackupMetadata, IpcError> {
+    match open_current_application_backup(bytes, workflow) {
+        Ok(_) => stage_application_restore_bytes_with_approved(
+            app_local_data_dir,
+            expected_user_database_path,
+            workflow,
+            approved_workspace,
+            bytes,
+        ),
+        Err(normal_error) => {
+            let identity_path = migration_backup_identity_path(source)?;
+            if !path_is_present(&identity_path)? {
+                return Err(normal_error);
+            }
+            stage_migration_application_restore_with_approved(
+                app_local_data_dir,
+                expected_user_database_path,
+                workflow,
+                approved_workspace,
+                source,
+                &identity_path,
+                bytes,
+            )
+        }
+    }
+}
+
+fn stage_migration_application_restore_with_approved(
+    app_local_data_dir: &Path,
+    expected_user_database_path: &Path,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+    source: &Path,
+    identity_path: &Path,
+    bytes: &[u8],
+) -> Result<ApplicationBackupMetadata, IpcError> {
+    let identity = read_migration_backup_identity(identity_path)?;
+    validate_migration_backup_identity(
+        &identity,
+        workflow,
+        &identity.migration_id,
+        &identity.source_fingerprint,
+    )?;
+    verify_current_migration_source_fingerprint(workflow, &identity.source_fingerprint)?;
+    let candidate = verify_migration_backup_pair(source, identity_path, workflow, None, None)?;
+    let current = capture_current_migration_components(
+        app_local_data_dir,
+        &AppState::new(
+            app_local_data_dir.join("migration-restore-unused-legal.sqlite"),
+            expected_user_database_path.to_path_buf(),
+        ),
+        workflow,
+        approved_workspace,
+    )?;
+    if !identity_matches_current(&candidate.identity.components, &current)
+        && !identity_is_recovery_compatible(&candidate.identity.components, &current)
+    {
+        return Err(ipc_error(
+            "migration_backup_component_mismatch",
+            "The selected migration rollback point is not bound to the current five-component lineage.",
+        ));
+    }
+    let opened = open_application_backup_for_migration_recovery(
+        bytes,
+        &MigrationApplicationBackupOpenContext {
+            expected_workspace_instance_id: &workflow.workspace_instance_id(),
+            expected_user_schema_version: identity.user_schema_version,
+            expected_backup_id: &identity.backup_id,
+            expected_privacy_backup_id: &identity.privacy_backup_id,
+            expected_app_version: &identity.app_version,
+            expected_created_at_unix: identity.created_at_unix,
+            expected_expires_at_unix: identity.expires_at_unix,
+            expected_bundle_sha256: &identity.backup_bundle_sha256,
+        },
+    )
+    .map_err(application_backup_error)?;
+    stage_application_restore_opened_with_hook(
+        app_local_data_dir,
+        expected_user_database_path,
+        workflow,
+        Some(approved_workspace),
+        opened,
+        Some(identity.created_at_unix),
+        |_| Ok(()),
+    )
+}
+
 fn stage_application_restore_bytes_with_approved(
     app_local_data_dir: &Path,
     expected_user_database_path: &Path,
@@ -656,6 +2499,8 @@ fn stage_application_restore_bytes_internal(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplicationRestoreStagePoint {
+    VaultStaging,
+    ApprovedAndWorkProductsStaging,
     BeforeProtectedMarker,
 }
 
@@ -665,12 +2510,35 @@ fn stage_application_restore_bytes_with_hook<Hook>(
     workflow: &PrivacyWorkflowManager,
     approved_workspace: Option<&ApprovedMcpWorkspace>,
     bytes: &[u8],
-    mut hook: Hook,
+    hook: Hook,
 ) -> Result<ApplicationBackupMetadata, IpcError>
 where
     Hook: FnMut(ApplicationRestoreStagePoint) -> Result<(), IpcError>,
 {
     let opened = open_current_application_backup(bytes, workflow)?;
+    stage_application_restore_opened_with_hook(
+        app_local_data_dir,
+        expected_user_database_path,
+        workflow,
+        approved_workspace,
+        opened,
+        None,
+        hook,
+    )
+}
+
+fn stage_application_restore_opened_with_hook<Hook>(
+    app_local_data_dir: &Path,
+    expected_user_database_path: &Path,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: Option<&ApprovedMcpWorkspace>,
+    opened: privacy::OpenedApplicationBackup,
+    migration_recovery_created_at_unix: Option<u64>,
+    mut hook: Hook,
+) -> Result<ApplicationBackupMetadata, IpcError>
+where
+    Hook: FnMut(ApplicationRestoreStagePoint) -> Result<(), IpcError>,
+{
     let paths = application_restore_paths(app_local_data_dir);
     if paths.user_active != expected_user_database_path {
         return Err(ipc_error(
@@ -679,15 +2547,55 @@ where
         ));
     }
     ensure_pair_restore_slot_empty(&paths)?;
+    let coordinated_pre_migration_restore = match (
+        opened.approved_workspace_bundle.as_ref(),
+        opened.work_products_bundle.as_ref(),
+        opened.metadata.approved_workspace_bundle_sha256.as_ref(),
+        opened.metadata.approved_workspace_manifest_sha256.as_ref(),
+        opened.metadata.work_products_bundle_sha256.as_ref(),
+        opened.metadata.work_products_manifest_sha256.as_ref(),
+    ) {
+        (Some(_), Some(_), Some(_), Some(_), Some(_), Some(_)) => true,
+        (None, None, None, None, None, None) => false,
+        _ => {
+            return Err(ipc_error(
+                "application_backup_component_mismatch",
+                "The authenticated application backup has an incomplete workspace component set.",
+            ));
+        }
+    };
+    if !coordinated_pre_migration_restore {
+        ensure_legacy_three_component_restore_is_lineage_safe(&paths)?;
+    }
     let result = (|| {
         write_sensitive_new_file(&paths.user_incoming, &opened.user_database)?;
         validate_user_component(&paths.user_incoming, &opened.metadata.user_database_sha256)?;
-        let privacy = workflow
-            .stage_application_privacy_component(
-                &opened.metadata.privacy_backup_id,
-                &opened.encrypted_privacy_bundle,
-            )
+        let (privacy, privacy_store_schema_version) = if coordinated_pre_migration_restore {
+            let staged = match migration_recovery_created_at_unix {
+                Some(created_at_unix) => workflow
+                    .stage_pre_migration_application_privacy_component_for_migration_recovery(
+                        &opened.metadata.privacy_backup_id,
+                        &opened.encrypted_privacy_bundle,
+                        created_at_unix,
+                    ),
+                None => workflow.stage_pre_migration_application_privacy_component(
+                    &opened.metadata.privacy_backup_id,
+                    &opened.encrypted_privacy_bundle,
+                ),
+            }
             .map_err(workflow_error)?;
+            (staged.verified, Some(staged.privacy_store_schema_version))
+        } else {
+            (
+                workflow
+                    .stage_application_privacy_component(
+                        &opened.metadata.privacy_backup_id,
+                        &opened.encrypted_privacy_bundle,
+                    )
+                    .map_err(workflow_error)?,
+                None,
+            )
+        };
         if privacy.database_sha256.is_empty()
             || privacy.workspace_instance_id != opened.metadata.workspace_instance_id.as_str()
         {
@@ -696,6 +2604,7 @@ where
                 "隐私备份组件与完整备份清单不一致。",
             ));
         }
+        hook(ApplicationRestoreStagePoint::VaultStaging)?;
         let vault = stage_encrypted_vault_backup(
             &opened.encrypted_vault_bundle,
             &opened.metadata.workspace_instance_id,
@@ -735,6 +2644,7 @@ where
                         "The approved workspace restore manager is unavailable.",
                     )
                 })?;
+                hook(ApplicationRestoreStagePoint::ApprovedAndWorkProductsStaging)?;
                 approved_workspace
                     .stage_application_backup_components(
                         approved_bundle,
@@ -754,8 +2664,11 @@ where
                         .workspace_instance_id
                         .as_str()
                         .to_owned(),
-                    app_version: opened.metadata.app_version.clone(),
+                    app_version: migration_recovery_created_at_unix
+                        .map(|_| env!("CARGO_PKG_VERSION").to_owned())
+                        .unwrap_or_else(|| opened.metadata.app_version.clone()),
                     user_schema_version: opened.metadata.user_schema_version,
+                    privacy_store_schema_version,
                     user_database_sha256: opened.metadata.user_database_sha256.clone(),
                     privacy_database_sha256: privacy.database_sha256,
                     privacy_key_epoch: privacy.key_epoch,
@@ -777,7 +2690,9 @@ where
                         .workspace_instance_id
                         .as_str()
                         .to_owned(),
-                    app_version: opened.metadata.app_version.clone(),
+                    app_version: migration_recovery_created_at_unix
+                        .map(|_| env!("CARGO_PKG_VERSION").to_owned())
+                        .unwrap_or_else(|| opened.metadata.app_version.clone()),
                     user_schema_version: opened.metadata.user_schema_version,
                     user_database_sha256: opened.metadata.user_database_sha256.clone(),
                     privacy_database_sha256: privacy.database_sha256,
@@ -860,10 +2775,14 @@ where
     ensure_no_legacy_user_restore(&paths)?;
     let marker = read_pair_marker(&paths.marker)?;
     validate_pair_marker(&marker, workspace_instance_id)?;
+    if matches!(marker, PendingApplicationRestore::V2(_)) {
+        ensure_legacy_three_component_restore_is_lineage_safe(&paths)?;
+    }
     let (
         user_database_sha256,
         privacy_database_sha256,
         privacy_key_epoch,
+        privacy_store_schema_version,
         vault_manifest_sha256,
         vault_archive_sha256,
     ) = match &marker {
@@ -871,6 +2790,7 @@ where
             marker.user_database_sha256.as_str(),
             marker.privacy_database_sha256.as_str(),
             marker.privacy_key_epoch,
+            PRIVACY_STORE_SCHEMA_VERSION,
             marker.vault_manifest_sha256.as_str(),
             marker.vault_archive_sha256.as_str(),
         ),
@@ -878,6 +2798,9 @@ where
             marker.user_database_sha256.as_str(),
             marker.privacy_database_sha256.as_str(),
             marker.privacy_key_epoch,
+            marker
+                .privacy_store_schema_version
+                .unwrap_or(PRIVACY_STORE_SCHEMA_VERSION),
             marker.vault_manifest_sha256.as_str(),
             marker.vault_archive_sha256.as_str(),
         ),
@@ -927,6 +2850,7 @@ where
                     path,
                     workspace_instance_id,
                     privacy_key_epoch,
+                    privacy_store_schema_version,
                     privacy_database_sha256,
                 )
             },
@@ -986,6 +2910,7 @@ where
             &paths.privacy_active,
             workspace_instance_id,
             privacy_key_epoch,
+            privacy_store_schema_version,
             privacy_database_sha256,
         )?;
         validate_vault_component(
@@ -1270,6 +3195,198 @@ fn application_restore_paths(app_local_data_dir: &Path) -> ApplicationRestorePat
     }
 }
 
+fn ensure_legacy_three_component_restore_is_lineage_safe(
+    paths: &ApplicationRestorePaths,
+) -> Result<(), IpcError> {
+    const UNIFIED_PRIVACY_STATE_TABLES: &[&str] = &[
+        "privacy_materials",
+        "privacy_redactions",
+        "privacy_vault_material_refs",
+        "case_material_selections",
+        "case_material_migration_ledger",
+        "case_material_migration_events",
+        "case_material_legacy_references",
+        "project_privacy_case_bindings",
+        "project_privacy_case_binding_audit",
+        "project_deletion_journal",
+        "case_material_assignment_audit",
+    ];
+    let unified_state =
+        restore_database_has_rows(&paths.privacy_active, UNIFIED_PRIVACY_STATE_TABLES, false)?;
+    let approved_state = restore_workspace_component_has_state(
+        &paths.approved_active,
+        APPROVED_DATABASE_FILE_NAME,
+        "publication_journal",
+    )?;
+    let work_product_state = restore_workspace_component_has_state(
+        &paths.work_products_active,
+        WORK_PRODUCTS_DATABASE_FILE_NAME,
+        "work_product_versions",
+    )?;
+    if unified_state || approved_state || work_product_state {
+        return Err(ipc_error(
+            "application_restore_requires_five_components",
+            "A legacy three-component backup cannot replace a workspace that already has unified case-material, approved-generation, or work-product state. Restore an authenticated five-component backup instead.",
+        ));
+    }
+    Ok(())
+}
+
+fn restore_workspace_component_has_state(
+    root: &Path,
+    database_file_name: &str,
+    state_table: &str,
+) -> Result<bool, IpcError> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => validate_restore_directory_identity(root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err(ipc_error(
+                "application_restore_lineage_unverifiable",
+                "The current application workspace lineage could not be inspected.",
+            ));
+        }
+    }
+    let database_path = root.join(database_file_name);
+    if !restore_path_is_present(&database_path)? {
+        let is_empty = fs::read_dir(root)
+            .map_err(|_| {
+                ipc_error(
+                    "application_restore_lineage_unverifiable",
+                    "The current application workspace lineage could not be enumerated.",
+                )
+            })?
+            .next()
+            .is_none();
+        return if is_empty {
+            Ok(false)
+        } else {
+            Err(ipc_error(
+                "application_restore_lineage_unverifiable",
+                "The current application workspace has state but no verifiable lineage database.",
+            ))
+        };
+    }
+    if restore_database_has_rows(&database_path, &[state_table], true)? {
+        return Ok(true);
+    }
+    let database_sidecars = [
+        database_file_name.to_owned(),
+        format!("{database_file_name}-journal"),
+        format!("{database_file_name}-wal"),
+        format!("{database_file_name}-shm"),
+    ];
+    for entry in fs::read_dir(root).map_err(|_| {
+        ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The current application workspace lineage could not be enumerated.",
+        )
+    })? {
+        let entry = entry.map_err(|_| {
+            ipc_error(
+                "application_restore_lineage_unverifiable",
+                "The current application workspace lineage contains an unreadable entry.",
+            )
+        })?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !database_sidecars
+            .iter()
+            .any(|candidate| candidate == &file_name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn restore_database_has_rows(
+    path: &Path,
+    tables: &[&str],
+    require_tables: bool,
+) -> Result<bool, IpcError> {
+    if !ordinary_single_link_file(path) {
+        return Err(ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The current application lineage database is not an ordinary single-link local file.",
+        ));
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| {
+        ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The current application lineage database could not be opened read-only.",
+        )
+    })?;
+    connection
+        .execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA trusted_schema=OFF;
+             BEGIN DEFERRED;",
+        )
+        .map_err(|_| {
+            ipc_error(
+                "application_restore_lineage_unverifiable",
+                "The current application lineage snapshot could not begin.",
+            )
+        })?;
+    let result = (|| {
+        for table in tables {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type='table' AND name=?1
+                     )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ipc_error(
+                        "application_restore_lineage_unverifiable",
+                        "The current application lineage schema could not be inspected.",
+                    )
+                })?;
+            if exists == 0 {
+                if require_tables {
+                    return Err(ipc_error(
+                        "application_restore_lineage_unverifiable",
+                        "The current application lineage database is missing a required state table.",
+                    ));
+                }
+                continue;
+            }
+            let quoted = table.replace('"', "\"\"");
+            let has_rows: i64 = connection
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM \"{quoted}\" LIMIT 1)"),
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ipc_error(
+                        "application_restore_lineage_unverifiable",
+                        "The current application lineage state could not be inspected.",
+                    )
+                })?;
+            if has_rows != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
+    let rollback = connection.execute_batch("ROLLBACK").map_err(|_| {
+        ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The current application lineage snapshot could not be closed.",
+        )
+    });
+    rollback?;
+    result
+}
+
 fn sibling_restore_path(active: &Path, suffix: &str) -> PathBuf {
     let mut value = active.as_os_str().to_os_string();
     value.push(format!(".application-restore-{suffix}"));
@@ -1281,7 +3398,9 @@ fn vault_component_summary(
     workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
 ) -> Result<privacy::VaultBackupSummaryV1, IpcError> {
     validate_restore_directory_identity(path)?;
-    let store = VaultStore::open(path, workspace_instance_id.clone()).map_err(vault_store_error)?;
+    let (store, _schema_upgrade_required) =
+        VaultStore::open_for_application_startup(path, workspace_instance_id.clone())
+            .map_err(vault_store_error)?;
     let isolation = store.isolation_status().map_err(vault_store_error)?;
     if !isolation.private_acl_enforced
         || !isolation.content_indexing_disabled
@@ -1791,6 +3910,9 @@ fn validate_pair_marker(
                     &marker.vault_archive_sha256,
                     workspace_instance_id,
                 )
+                && marker
+                    .privacy_store_schema_version
+                    .is_none_or(supported_restored_privacy_schema)
                 && is_hash(&marker.approved_workspace_bundle_sha256)
                 && is_hash(&marker.approved_workspace_manifest_sha256)
                 && is_hash(&marker.work_products_bundle_sha256)
@@ -1804,6 +3926,10 @@ fn validate_pair_marker(
         ));
     }
     Ok(())
+}
+
+fn supported_restored_privacy_schema(schema_version: i64) -> bool {
+    (1..=4).contains(&schema_version) || schema_version == PRIVACY_STORE_SCHEMA_VERSION
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1892,6 +4018,7 @@ fn validate_privacy_component(
     path: &Path,
     workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
     expected_key_epoch: u64,
+    expected_privacy_store_schema_version: i64,
     expected_sha256: &str,
 ) -> Result<(), IpcError> {
     if file_sha256(path, 96 * 1024 * 1024)? != expected_sha256 {
@@ -1922,8 +4049,19 @@ fn validate_privacy_component(
                 "隐私恢复组件工作区绑定无效。",
             )
         })?;
+    let schema_matches = match PrivacyStore::preflight_schema(&connection) {
+        Ok(PrivacyStoreSchemaStatus::Current) => {
+            expected_privacy_store_schema_version == PRIVACY_STORE_SCHEMA_VERSION
+        }
+        Ok(PrivacyStoreSchemaStatus::UpgradeRequired { found_version }) => {
+            supported_restored_privacy_schema(found_version)
+                && found_version == expected_privacy_store_schema_version
+        }
+        Ok(PrivacyStoreSchemaStatus::Empty) | Err(_) => false,
+    };
     if integrity != "ok"
         || foreign_keys != 0
+        || !schema_matches
         || lifecycle
             .current_key_epoch(&connection)
             .map_err(|_| ipc_error("application_restore_invalid", "隐私恢复组件 epoch 无效。"))?

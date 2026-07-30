@@ -85,6 +85,26 @@ fn provider_profile(base_url: &str) -> ProviderProfile {
 
 fn approved_fixture(base_url: &str) -> Fixture {
     let directory = tempfile::tempdir().expect("temporary privacy directory");
+    let project_id = format!("case-provider-{}", Uuid::new_v4().simple());
+    let user_database_path =
+        database::ensure_user_database(directory.path()).expect("user database");
+    let user_connection =
+        database::open_user_database(&user_database_path).expect("open user database");
+    database::upsert_case_project(
+        &user_connection,
+        &database::CaseProjectRow {
+            project_id: project_id.clone(),
+            title: "Approved Provider synthetic case".to_owned(),
+            case_type: "civil".to_owned(),
+            status: "active".to_owned(),
+            opened_on: None,
+            summary: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        },
+    )
+    .expect("insert synthetic Provider case");
+    drop(user_connection);
     let manager = PrivacyWorkflowManager::new(
         directory.path().to_path_buf(),
         crate::privacy_workflow::test_workspace_instance_id(),
@@ -116,7 +136,7 @@ fn approved_fixture(base_url: &str) -> Fixture {
     let source_file =
         SyntheticProviderCanaryFile::create(&manager, source.as_bytes()).expect("synthetic source");
     let review = manager
-        .prepare_selected_material_with_qualification(
+        .prepare_case_selected_material_with_qualification(
             source_file.path(),
             &PrivacyConfig::default(),
             &disabled_ocr_status(),
@@ -124,7 +144,7 @@ fn approved_fixture(base_url: &str) -> Fixture {
                 mineru_config: None,
                 qualification: None,
             },
-            Some(format!("case_{}", Uuid::new_v4().simple())),
+            project_id,
             vec![RAW_CANARY.to_owned()],
         )
         .expect("prepare case-bound synthetic review through Vault");
@@ -321,6 +341,108 @@ impl ChatTransport for CapturingTransport {
             total_latency_ms: 1,
         })
     }
+}
+
+#[test]
+fn blocked_material_and_revoked_generation_are_rejected_before_provider_transport() {
+    let blocked = approved_fixture("https://example.com/v1");
+    let connection = blocked.manager.open_connection().expect("privacy store");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE privacy_materials
+                 SET migration_status='blocked',state='blocked',row_version=row_version+1
+                 WHERE material_id=?1",
+                [&blocked.review.material_id],
+            )
+            .expect("block approved material"),
+        1
+    );
+    drop(connection);
+
+    let approval_error = blocked
+        .manager
+        .approve_approved_provider_task(
+            &blocked.profile,
+            ApproveApprovedProviderTaskRequest {
+                redaction_id: blocked.review.redaction_id.clone(),
+                expected_risk_revision: blocked
+                    .review
+                    .risk_review
+                    .as_ref()
+                    .map(|risk| risk.revision),
+                expected_suggested_redacted_sha256: blocked
+                    .review
+                    .suggested_redacted_content_sha256
+                    .clone(),
+                edited_pages: blocked
+                    .review
+                    .pages
+                    .iter()
+                    .map(|page| EditedRedactedPage {
+                        page_number: page.page_number,
+                        redacted_text: page.redacted_text.clone(),
+                    })
+                    .collect(),
+                reviewer: "local-reviewer".to_owned(),
+                provider_id: blocked.profile.id.clone(),
+                task: ApprovedProviderTask::Summary,
+                instruction: TEST_TASK_INSTRUCTION.to_owned(),
+                prior_output: None,
+                max_tokens: 512,
+                ttl_seconds: 3_600,
+                confirmed: true,
+            },
+        )
+        .expect_err("blocked unified material cannot receive a Provider approval");
+    assert_eq!(approval_error.code(), "case_material_unavailable");
+
+    let blocked_transport = CapturingTransport::successful(
+        "must never be sent",
+        &profile_model_binding(&blocked.profile),
+    );
+    let dispatch_error = blocked
+        .manager
+        .dispatch_approved_provider(
+            blocked_transport.clone(),
+            blocked.profile.clone(),
+            ApiSecret::new("synthetic-provider-secret"),
+            dispatch_request(&blocked),
+        )
+        .expect_err("blocked unified material fails before Provider transport");
+    assert_eq!(dispatch_error.code(), "case_material_unavailable");
+    assert!(blocked_transport.request_bodies().is_empty());
+
+    let revoked = approved_fixture("https://example.com/v1");
+    let connection = revoked.manager.open_connection().expect("privacy store");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE privacy_redactions
+                 SET revocation_state='revoked',revoked_at=CURRENT_TIMESTAMP,
+                     row_version=row_version+1
+                 WHERE redaction_id=?1",
+                [&revoked.review.redaction_id],
+            )
+            .expect("revoke approved generation"),
+        1
+    );
+    drop(connection);
+    let revoked_transport = CapturingTransport::successful(
+        "must never be sent",
+        &profile_model_binding(&revoked.profile),
+    );
+    let revoked_error = revoked
+        .manager
+        .dispatch_approved_provider(
+            revoked_transport.clone(),
+            revoked.profile.clone(),
+            ApiSecret::new("synthetic-provider-secret"),
+            dispatch_request(&revoked),
+        )
+        .expect_err("revoked generation fails before Provider transport");
+    assert_eq!(revoked_error.code(), "case_material_unavailable");
+    assert!(revoked_transport.request_bodies().is_empty());
 }
 
 #[test]

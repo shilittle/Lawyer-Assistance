@@ -4,6 +4,12 @@
 pub const VAULT_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 pub const VAULT_LOGICAL_ERASURE_DISCLOSURE: &str =
     "vault_logical_cleanup_only_not_forensic_media_wipe";
+const VAULT_LIFECYCLE_TABLES: [&str; 4] = [
+    "vault_lifecycle_meta",
+    "vault_object_retention",
+    "vault_cleanup_journal",
+    "vault_cleanup_candidates",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultRetentionBindingV1 {
@@ -28,6 +34,19 @@ pub struct VaultCleanupReportV1 {
     pub completed_at_unix: u64,
     pub event_hash: String,
     pub erasure_disclosure: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultCleanupPendingStatusV1 {
+    pub prepared_count: u64,
+    pub committed_count: u64,
+    pub purged_count: u64,
+}
+
+impl VaultCleanupPendingStatusV1 {
+    pub fn has_unfinished_cleanup(self) -> bool {
+        self.prepared_count != 0 || self.committed_count != 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -153,7 +172,11 @@ impl VaultStore {
                    cleanup_id,state,started_at_unix,candidate_count,removed_count,
                    key_records_destroyed,previous_event_hash,event_hash,erasure_disclosure
                  ) VALUES(?1,'prepared',?2,0,0,0,'','',?3)",
-                params![cleanup_id, sql_i64(now_unix)?, VAULT_LOGICAL_ERASURE_DISCLOSURE],
+                params![
+                    cleanup_id,
+                    sql_i64(now_unix)?,
+                    VAULT_LOGICAL_ERASURE_DISCLOSURE
+                ],
             )
             .map_err(|_| VaultStoreError::AlreadyExists)?;
         let candidates = {
@@ -234,7 +257,9 @@ impl VaultStore {
             .map_err(|_| VaultStoreError::DatabaseFailed)?
             .ok_or(VaultStoreError::ObjectNotAvailable)?;
         if !matches!(state.as_str(), "prepared" | "committed")
-            || u64::try_from(started_at).ok().is_none_or(|started| started > completed_at_unix)
+            || u64::try_from(started_at)
+                .ok()
+                .is_none_or(|started| started > completed_at_unix)
         {
             return Err(VaultStoreError::InvalidInput);
         }
@@ -243,7 +268,10 @@ impl VaultStore {
             return Err(VaultStoreError::ContentCorrupt);
         }
         if state == "prepared" {
-            if candidates.iter().any(|candidate| candidate.state != "pending") {
+            if candidates
+                .iter()
+                .any(|candidate| candidate.state != "pending")
+            {
                 return Err(VaultStoreError::ContentCorrupt);
             }
             // Acquire the write lock before the final legal-hold/expiry check. This prevents a
@@ -280,7 +308,11 @@ impl VaultStore {
                     .execute(
                         "UPDATE vault_cleanup_candidates SET state='quarantined'
                          WHERE cleanup_id=?1 AND object_id=?2 AND version=?3 AND state='pending'",
-                        params![cleanup_id, candidate.object_id.as_str(), sql_i64(candidate.version)?],
+                        params![
+                            cleanup_id,
+                            candidate.object_id.as_str(),
+                            sql_i64(candidate.version)?
+                        ],
                     )
                     .map_err(|_| VaultStoreError::DatabaseFailed)?;
                 if changed != 1 {
@@ -355,10 +387,7 @@ impl VaultStore {
         };
         let mut reports = Vec::with_capacity(cleanup_ids.len());
         for cleanup_id in cleanup_ids {
-            reports.push(self.commit_expired_object_cleanup(
-                &cleanup_id,
-                recovered_at_unix,
-            )?);
+            reports.push(self.commit_expired_object_cleanup(&cleanup_id, recovered_at_unix)?);
         }
         Ok(reports)
     }
@@ -366,6 +395,162 @@ impl VaultStore {
     pub fn verify_vault_cleanup_journal(&self) -> Result<u64, VaultStoreError> {
         let db = open_database(&self.root)?;
         initialize_vault_lifecycle_schema(&db)?;
+        Self::verify_vault_cleanup_journal_connection(&db)
+    }
+
+    /// Inspects cleanup state without initializing schema, checkpointing WAL, recovering a
+    /// cleanup, or opening the Vault database for writes. Migration preflight uses this boundary
+    /// to fail closed while a prepared or committed cleanup is still pending.
+    pub fn inspect_cleanup_status_read_only(
+        &self,
+    ) -> Result<VaultCleanupPendingStatusV1, VaultStoreError> {
+        with_database_read_only_snapshot(&self.root, |db| {
+            validate_database_integrity(db)?;
+            let (store_version, workspace): (u32, String) = db
+                .query_row(
+                    "SELECT schema_version,workspace_instance_id
+                 FROM vault_meta WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            if workspace != self.workspace_instance_id.as_str() {
+                return Err(VaultStoreError::ContentCorrupt);
+            }
+            let lifecycle_table_count = vault_lifecycle_table_count(db)?;
+            if store_version == 1 {
+                if lifecycle_table_count != 0 {
+                    return Err(VaultStoreError::ContentCorrupt);
+                }
+                return Ok(VaultCleanupPendingStatusV1 {
+                    prepared_count: 0,
+                    committed_count: 0,
+                    purged_count: 0,
+                });
+            }
+            if store_version != VAULT_STORE_SCHEMA_VERSION
+                || lifecycle_table_count
+                    != u8::try_from(VAULT_LIFECYCLE_TABLES.len()).unwrap_or(u8::MAX)
+            {
+                return Err(VaultStoreError::ContentCorrupt);
+            }
+            let lifecycle_version: u32 = db
+                .query_row(
+                    "SELECT schema_version FROM vault_lifecycle_meta WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            if lifecycle_version != VAULT_LIFECYCLE_SCHEMA_VERSION {
+                return Err(VaultStoreError::ContentCorrupt);
+            }
+            let mut prepared_count = 0_u64;
+            let mut committed_count = 0_u64;
+            let mut purged_count = 0_u64;
+            let mut statement = db
+                .prepare(
+                    "SELECT cleanup_id,state,started_at_unix,completed_at_unix,candidate_count,
+                        removed_count,key_records_destroyed,previous_event_hash,event_hash,
+                        erasure_disclosure
+                 FROM vault_cleanup_journal ORDER BY rowid",
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                })
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            for row in rows {
+                let row = row.map_err(|_| VaultStoreError::DatabaseFailed)?;
+                valid_vault_cleanup_id(&row.0)?;
+                let candidate_counts: (i64, i64, i64, i64) = db
+                    .query_row(
+                        "SELECT COUNT(*),
+                            COALESCE(SUM(state='pending'),0),
+                            COALESCE(SUM(state='quarantined'),0),
+                            COALESCE(SUM(state='purged'),0)
+                     FROM vault_cleanup_candidates WHERE cleanup_id=?1",
+                        [&row.0],
+                        |candidate| {
+                            Ok((
+                                candidate.get(0)?,
+                                candidate.get(1)?,
+                                candidate.get(2)?,
+                                candidate.get(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(|_| VaultStoreError::DatabaseFailed)?;
+                if row.2 <= 0
+                    || row.4 < 0
+                    || row.5 < 0
+                    || row.6 < 0
+                    || candidate_counts.0 != row.4
+                    || row.9 != VAULT_LOGICAL_ERASURE_DISCLOSURE
+                {
+                    return Err(VaultStoreError::ContentCorrupt);
+                }
+                match row.1.as_str() {
+                    "prepared"
+                        if row.3.is_none()
+                            && row.5 == 0
+                            && row.6 == 0
+                            && row.7.is_empty()
+                            && row.8.is_empty()
+                            && candidate_counts.1 == row.4
+                            && candidate_counts.2 == 0
+                            && candidate_counts.3 == 0 =>
+                    {
+                        prepared_count = prepared_count.saturating_add(1);
+                    }
+                    "committed"
+                        if row.3.is_some_and(|completed| completed >= row.2)
+                            && row.5 == row.4
+                            && row.6 == 0
+                            && row.7.is_empty()
+                            && row.8.is_empty()
+                            && candidate_counts.1 == 0
+                            && candidate_counts.2 == row.4
+                            && candidate_counts.3 == 0 =>
+                    {
+                        committed_count = committed_count.saturating_add(1);
+                    }
+                    "purged"
+                        if row.3.is_some_and(|completed| completed >= row.2)
+                            && row.5 == row.4
+                            && candidate_counts.1 == 0
+                            && candidate_counts.2 == 0
+                            && candidate_counts.3 == row.4 =>
+                    {
+                        purged_count = purged_count.saturating_add(1);
+                    }
+                    _ => return Err(VaultStoreError::ContentCorrupt),
+                }
+            }
+            drop(statement);
+            if Self::verify_vault_cleanup_journal_connection(db)? != purged_count {
+                return Err(VaultStoreError::ContentCorrupt);
+            }
+            Ok(VaultCleanupPendingStatusV1 {
+                prepared_count,
+                committed_count,
+                purged_count,
+            })
+        })
+    }
+
+    fn verify_vault_cleanup_journal_connection(db: &Connection) -> Result<u64, VaultStoreError> {
         let mut statement = db
             .prepare(
                 "SELECT cleanup_id,started_at_unix,completed_at_unix,candidate_count,
@@ -396,10 +581,7 @@ impl VaultStore {
             let expected = vault_cleanup_event_hash(
                 &row.0, row.1, row.2, row.3, row.4, row.5, &row.6, &row.8,
             )?;
-            if row.6 != previous
-                || row.7 != expected
-                || row.8 != VAULT_LOGICAL_ERASURE_DISCLOSURE
-            {
+            if row.6 != previous || row.7 != expected || row.8 != VAULT_LOGICAL_ERASURE_DISCLOSURE {
                 return Err(VaultStoreError::ContentCorrupt);
             }
             previous = row.7;
@@ -416,11 +598,8 @@ impl VaultStore {
         if candidate.state != "pending" {
             return Err(VaultStoreError::ContentCorrupt);
         }
-        let source = self.object_directory(
-            &candidate.case_id,
-            &candidate.object_id,
-            candidate.version,
-        );
+        let source =
+            self.object_directory(&candidate.case_id, &candidate.object_id, candidate.version);
         let quarantine = vault_cleanup_quarantine_path(
             &self.root,
             cleanup_id,
@@ -571,6 +750,24 @@ impl VaultStore {
             erasure_disclosure: VAULT_LOGICAL_ERASURE_DISCLOSURE,
         })
     }
+}
+
+fn vault_lifecycle_table_count(db: &Connection) -> Result<u8, VaultStoreError> {
+    let mut count = 0_u8;
+    for table in VAULT_LIFECYCLE_TABLES {
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_schema
+                   WHERE type='table' AND name=?1
+                 )",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        count = count.saturating_add(u8::from(exists));
+    }
+    Ok(count)
 }
 
 fn initialize_vault_lifecycle_schema(db: &Connection) -> Result<(), VaultStoreError> {

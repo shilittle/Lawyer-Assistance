@@ -14,7 +14,6 @@ import {
   getProviderQualificationStatus,
   listApprovedProviderOutputs,
   loadApprovedProviderOutput,
-  loadLatestPrivacyReview,
   revokeApprovedProviderOutput,
   revokeProviderQualification,
   runProviderQualification,
@@ -352,29 +351,21 @@ function displayError(error: unknown): string {
 }
 
 async function readPanelSnapshot(preferredProviderId: string): Promise<PanelSnapshot> {
-  const [providerResponse, review] = await Promise.all([
-    listProviderProfiles(),
-    loadLatestPrivacyReview(),
-  ]);
+  const providerResponse = await listProviderProfiles();
   const providerId = providerResponse.profiles.some(
     (profile) => profile.id === preferredProviderId,
   )
     ? preferredProviderId
     : (providerResponse.profiles[0]?.id ?? "");
-  const [qualification, outputs] = await Promise.all([
-    providerId
-      ? getProviderQualificationStatus({ providerId })
-      : Promise.resolve(null),
-    review && providerId
-      ? listApprovedProviderOutputs({ redactionId: review.redactionId, providerId })
-      : Promise.resolve([]),
-  ]);
+  const qualification = providerId
+    ? await getProviderQualificationStatus({ providerId })
+    : null;
   return {
     providers: providerResponse.profiles,
-    review,
+    review: null,
     providerId,
     qualification,
-    outputs,
+    outputs: [],
   };
 }
 
@@ -518,6 +509,12 @@ export function ProviderApprovalPanelView({
           <small>{approvedGenerationReady ? "已人工批准" : "必须先完成双栏人工批准"}</small>
         </div>
       </div>
+      {!review ? (
+        <p className="privacy-risk-blocker" role="status">
+          设置页不再自动读取未限定案件的“最近一次”脱敏记录。请从案件工作台的“材料与脱敏”
+          进入已批准 generation；案件限定的 Provider 入口将在该工作流中提供。
+        </p>
+      ) : null}
 
       <section className="privacy-provider-qualification" aria-label="Provider 资格状态">
         <div className="panel-heading">
@@ -887,7 +884,7 @@ export function ProviderApprovalPanel({
     try {
       installSnapshot(await readPanelSnapshot(providerId));
       setNotice(
-        "已重新载入 Provider profile、最新批准 generation、资格证据和输出索引；旧批准已失效。",
+        "已重新载入 Provider profile 与资格证据；设置页不会读取未限定案件的脱敏 generation。",
       );
     } catch (reason: unknown) {
       setError(displayError(reason));

@@ -1,8 +1,9 @@
 use privacy::{
     sha256_hex,
     vault_store::{
-        DecryptedVaultObjectV1, VaultIsolationStatusV1, VaultObjectKind,
-        VaultPrivateMetadataInputV1, VaultRetentionBindingV1, VaultStore, VaultStoreError,
+        DecryptedVaultObjectV1, VaultCleanupPendingStatusV1, VaultIsolationStatusV1,
+        VaultObjectKind, VaultPrivateMetadataInputV1, VaultReadOnlyInventoryV1,
+        VaultRetentionBindingV1, VaultStore, VaultStoreError,
     },
     vnext::{CaseId, MaterialId, ObjectId, PrivateValueRefV1, Sha256Hex, WorkspaceInstanceId},
 };
@@ -11,8 +12,11 @@ use serde::Serialize;
 use std::{
     fmt,
     ops::Deref,
-    path::Path,
-    sync::atomic::{compiler_fence, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{compiler_fence, AtomicBool, Ordering},
+        Mutex,
+    },
 };
 
 pub(super) const VAULT_ROOT_DIRECTORY: &str = "case-vault-v2";
@@ -155,7 +159,8 @@ pub(super) fn complete_vault_material_processing(
     let changed = transaction
         .execute(
             "UPDATE privacy_materials
-             SET media_type=?2,page_count=?3,updated_at=CURRENT_TIMESTAMP
+             SET media_type=?2,page_count=?3,updated_at=CURRENT_TIMESTAMP,
+                 row_version=row_version+1
              WHERE material_id=?1 AND source_sha256=?4 AND state IN('registered','failed')",
             params![
                 binding.material_id.as_str(),
@@ -210,7 +215,8 @@ pub(super) fn mark_vault_processing_failed(
         .map_err(|_| VaultStoreError::DatabaseFailed)?;
     connection
         .execute(
-            "UPDATE privacy_materials SET state='failed',updated_at=CURRENT_TIMESTAMP
+            "UPDATE privacy_materials
+             SET state='failed',updated_at=CURRENT_TIMESTAMP,row_version=row_version+1
              WHERE material_id=?1 AND state='registered'",
             [material_id.as_str()],
         )
@@ -415,11 +421,29 @@ pub(super) trait VaultBroker: Send + Sync {
 
     fn recover_cleanups(&self, now_unix: u64) -> Result<(), VaultStoreError>;
 
+    fn inspect_cleanup_status_read_only(
+        &self,
+    ) -> Result<VaultCleanupPendingStatusV1, VaultStoreError>;
+
+    fn inspect_inventory_read_only(&self) -> Result<VaultReadOnlyInventoryV1, VaultStoreError>;
+
     fn isolation_status(&self) -> Result<VaultIsolationStatusV1, VaultStoreError>;
+
+    fn startup_vault_present(&self) -> bool;
+
+    fn startup_write_required(&self) -> bool;
+
+    fn prepare_for_migration_backup_after_preflight(&self) -> Result<(), VaultStoreError>;
+
+    fn upgrade_schema_after_backup(&self) -> Result<(), VaultStoreError>;
 }
 
 pub(super) struct LocalEncryptedVaultBroker {
-    store: VaultStore,
+    root: PathBuf,
+    workspace_instance_id: WorkspaceInstanceId,
+    store: Mutex<Option<VaultStore>>,
+    initialization_required: AtomicBool,
+    schema_upgrade_required: AtomicBool,
 }
 
 impl fmt::Debug for LocalEncryptedVaultBroker {
@@ -440,8 +464,57 @@ impl LocalEncryptedVaultBroker {
             return Err(VaultStoreError::InvalidRoot);
         }
         let root = app_local_data_directory.join(VAULT_ROOT_DIRECTORY);
-        let store = VaultStore::initialize(root, workspace_instance_id)?;
-        Ok(Self { store })
+        let store = VaultStore::initialize(&root, workspace_instance_id.clone())?;
+        Ok(Self {
+            root,
+            workspace_instance_id,
+            store: Mutex::new(Some(store)),
+            initialization_required: AtomicBool::new(false),
+            schema_upgrade_required: AtomicBool::new(false),
+        })
+    }
+
+    /// Opens existing Vault state without creating or upgrading anything. A
+    /// missing Vault remains deferred until the complete read-only migration
+    /// preflight has succeeded.
+    pub fn open_for_application_startup(
+        app_local_data_directory: &Path,
+        workspace_instance_id: WorkspaceInstanceId,
+    ) -> Result<Self, VaultStoreError> {
+        if !app_local_data_directory.is_absolute() {
+            return Err(VaultStoreError::InvalidRoot);
+        }
+        let root = app_local_data_directory.join(VAULT_ROOT_DIRECTORY);
+        let (store, initialization_required, schema_upgrade_required) =
+            match std::fs::symlink_metadata(&root) {
+                Ok(_) => {
+                    let (store, upgrade_required) = VaultStore::open_for_application_startup(
+                        &root,
+                        workspace_instance_id.clone(),
+                    )?;
+                    (Some(store), false, upgrade_required)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, true, false),
+                Err(_) => return Err(VaultStoreError::IoFailed),
+            };
+        Ok(Self {
+            root,
+            workspace_instance_id,
+            store: Mutex::new(store),
+            initialization_required: AtomicBool::new(initialization_required),
+            schema_upgrade_required: AtomicBool::new(schema_upgrade_required),
+        })
+    }
+
+    fn with_store<T>(
+        &self,
+        operation: impl FnOnce(&VaultStore) -> Result<T, VaultStoreError>,
+    ) -> Result<T, VaultStoreError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        operation(store.as_ref().ok_or(VaultStoreError::ObjectNotAvailable)?)
     }
 }
 
@@ -449,7 +522,13 @@ impl VaultBroker for LocalEncryptedVaultBroker {
     fn export_encrypted_backup(
         &self,
     ) -> Result<(Vec<u8>, privacy::VaultBackupSummaryV1), privacy::VaultBackupError> {
-        privacy::export_encrypted_vault_backup(&self.store)
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| privacy::VaultBackupError::Store(VaultStoreError::DatabaseFailed))?;
+        privacy::export_encrypted_vault_backup(store.as_ref().ok_or(
+            privacy::VaultBackupError::Store(VaultStoreError::ObjectNotAvailable),
+        )?)
     }
 
     fn import_source(
@@ -461,23 +540,25 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         }
         let source_sha256 = Sha256Hex::parse(sha256_hex(request.content))
             .map_err(|_| VaultStoreError::InvalidInput)?;
-        let summary = self.store.create_source_object(
-            request.case_id,
-            VaultPrivateMetadataInputV1 {
-                original_file_name: request.original_file_name.to_owned(),
-                original_source_path: Some(
-                    request
-                        .original_source_path
-                        .as_os_str()
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                original_media_type: request.original_media_type.to_owned(),
-                imported_at_unix: request.imported_at_unix,
-            },
-            request.content,
-            request.imported_at_unix,
-        )?;
+        let summary = self.with_store(|store| {
+            store.create_source_object(
+                request.case_id,
+                VaultPrivateMetadataInputV1 {
+                    original_file_name: request.original_file_name.to_owned(),
+                    original_source_path: Some(
+                        request
+                            .original_source_path
+                            .as_os_str()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    original_media_type: request.original_media_type.to_owned(),
+                    imported_at_unix: request.imported_at_unix,
+                },
+                request.content,
+                request.imported_at_unix,
+            )
+        })?;
         if summary.object_kind != VaultObjectKind::SourceMaterial
             || summary.case_id != *request.case_id
             || summary.content_bytes
@@ -501,9 +582,9 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         &self,
         binding: &VaultImportBinding,
     ) -> Result<VaultSourceLease, VaultStoreError> {
-        let decrypted =
-            self.store
-                .read_object(&binding.case_id, &binding.object_id, binding.object_version)?;
+        let decrypted = self.with_store(|store| {
+            store.read_object(&binding.case_id, &binding.object_id, binding.object_version)
+        })?;
         if decrypted.object_kind != VaultObjectKind::SourceMaterial
             || decrypted.private_metadata.source_sha256 != binding.source_sha256
             || decrypted.private_metadata.source_bytes != binding.content_bytes
@@ -543,18 +624,20 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         let plaintext = ZeroizingBytes::new(
             serde_json::to_vec(&payload).map_err(|_| VaultStoreError::InvalidInput)?,
         );
-        let summary = self.store.create_object(
-            case_id,
-            VaultObjectKind::ReviewDraft,
-            VaultPrivateMetadataInputV1 {
-                original_file_name: PRIVATE_VALUE_OBJECT_NAME.to_owned(),
-                original_source_path: None,
-                original_media_type: PRIVATE_VALUE_MEDIA_TYPE.to_owned(),
-                imported_at_unix: created_at_unix,
-            },
-            &plaintext,
-            created_at_unix,
-        )?;
+        let summary = self.with_store(|store| {
+            store.create_object(
+                case_id,
+                VaultObjectKind::ReviewDraft,
+                VaultPrivateMetadataInputV1 {
+                    original_file_name: PRIVATE_VALUE_OBJECT_NAME.to_owned(),
+                    original_source_path: None,
+                    original_media_type: PRIVATE_VALUE_MEDIA_TYPE.to_owned(),
+                    imported_at_unix: created_at_unix,
+                },
+                &plaintext,
+                created_at_unix,
+            )
+        })?;
         let content_sha256 =
             Sha256Hex::parse(sha256_hex(&plaintext)).map_err(|_| VaultStoreError::InvalidInput)?;
         let references = values
@@ -595,18 +678,20 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         {
             return Err(VaultStoreError::InvalidInput);
         }
-        let summary = self.store.create_object(
-            case_id,
-            VaultObjectKind::ReviewDraft,
-            VaultPrivateMetadataInputV1 {
-                original_file_name: format!("encrypted-{payload_kind}"),
-                original_source_path: None,
-                original_media_type: format!("{AUX_PAYLOAD_MEDIA_PREFIX}{payload_kind}+json"),
-                imported_at_unix: created_at_unix,
-            },
-            content,
-            created_at_unix,
-        )?;
+        let summary = self.with_store(|store| {
+            store.create_object(
+                case_id,
+                VaultObjectKind::ReviewDraft,
+                VaultPrivateMetadataInputV1 {
+                    original_file_name: format!("encrypted-{payload_kind}"),
+                    original_source_path: None,
+                    original_media_type: format!("{AUX_PAYLOAD_MEDIA_PREFIX}{payload_kind}+json"),
+                    imported_at_unix: created_at_unix,
+                },
+                content,
+                created_at_unix,
+            )
+        })?;
         Ok(VaultAuxBinding {
             case_id: case_id.clone(),
             object_id: summary.object_id,
@@ -622,9 +707,9 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         &self,
         binding: &VaultAuxBinding,
     ) -> Result<VaultAuxLease, VaultStoreError> {
-        let decrypted =
-            self.store
-                .read_object(&binding.case_id, &binding.object_id, binding.object_version)?;
+        let decrypted = self.with_store(|store| {
+            store.read_object(&binding.case_id, &binding.object_id, binding.object_version)
+        })?;
         if decrypted.object_kind != VaultObjectKind::ReviewDraft
             || decrypted.private_metadata.source_sha256 != binding.content_sha256
             || decrypted.private_metadata.source_bytes != binding.content_bytes
@@ -643,14 +728,16 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         policy_revision: u64,
         bound_at_unix: u64,
     ) -> Result<(), VaultStoreError> {
-        self.store.set_object_retention(&VaultRetentionBindingV1 {
-            case_id: binding.case_id.clone(),
-            object_id: binding.object_id.clone(),
-            version: binding.object_version,
-            expires_at_unix,
-            legal_hold,
-            policy_revision,
-            bound_at_unix,
+        self.with_store(|store| {
+            store.set_object_retention(&VaultRetentionBindingV1 {
+                case_id: binding.case_id.clone(),
+                object_id: binding.object_id.clone(),
+                version: binding.object_version,
+                expires_at_unix,
+                legal_hold,
+                policy_revision,
+                bound_at_unix,
+            })
         })
     }
 
@@ -662,14 +749,16 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         policy_revision: u64,
         bound_at_unix: u64,
     ) -> Result<(), VaultStoreError> {
-        self.store.set_object_retention(&VaultRetentionBindingV1 {
-            case_id: binding.case_id.clone(),
-            object_id: binding.object_id.clone(),
-            version: binding.object_version,
-            expires_at_unix,
-            legal_hold,
-            policy_revision,
-            bound_at_unix,
+        self.with_store(|store| {
+            store.set_object_retention(&VaultRetentionBindingV1 {
+                case_id: binding.case_id.clone(),
+                object_id: binding.object_id.clone(),
+                version: binding.object_version,
+                expires_at_unix,
+                legal_hold,
+                policy_revision,
+                bound_at_unix,
+            })
         })
     }
 
@@ -679,27 +768,92 @@ impl VaultBroker for LocalEncryptedVaultBroker {
         enabled: bool,
         changed_at_unix: u64,
     ) -> Result<(), VaultStoreError> {
-        self.store.set_object_legal_hold(
-            &binding.case_id,
-            &binding.object_id,
-            binding.object_version,
-            enabled,
-            changed_at_unix,
-        )
+        self.with_store(|store| {
+            store.set_object_legal_hold(
+                &binding.case_id,
+                &binding.object_id,
+                binding.object_version,
+                enabled,
+                changed_at_unix,
+            )
+        })
     }
 
     fn run_expired_cleanup(&self, cleanup_id: &str, now_unix: u64) -> Result<(), VaultStoreError> {
-        self.store
-            .run_expired_object_cleanup(cleanup_id, now_unix)
-            .map(|_| ())
+        self.with_store(|store| {
+            store
+                .run_expired_object_cleanup(cleanup_id, now_unix)
+                .map(|_| ())
+        })
     }
 
     fn recover_cleanups(&self, now_unix: u64) -> Result<(), VaultStoreError> {
-        self.store.recover_object_cleanups(now_unix).map(|_| ())
+        self.with_store(|store| store.recover_object_cleanups(now_unix).map(|_| ()))
+    }
+
+    fn inspect_cleanup_status_read_only(
+        &self,
+    ) -> Result<VaultCleanupPendingStatusV1, VaultStoreError> {
+        if self.initialization_required.load(Ordering::Acquire) {
+            return Ok(VaultCleanupPendingStatusV1 {
+                prepared_count: 0,
+                committed_count: 0,
+                purged_count: 0,
+            });
+        }
+        self.with_store(VaultStore::inspect_cleanup_status_read_only)
+    }
+
+    fn inspect_inventory_read_only(&self) -> Result<VaultReadOnlyInventoryV1, VaultStoreError> {
+        if self.initialization_required.load(Ordering::Acquire) {
+            return Ok(VaultReadOnlyInventoryV1 {
+                journal_row_count: 0,
+                committed_object_count: 0,
+                key_record_count: 0,
+                object_root_entry_count: 0,
+            });
+        }
+        self.with_store(VaultStore::inspect_inventory_read_only)
     }
 
     fn isolation_status(&self) -> Result<VaultIsolationStatusV1, VaultStoreError> {
-        self.store.isolation_status()
+        self.with_store(VaultStore::isolation_status)
+    }
+
+    fn startup_write_required(&self) -> bool {
+        self.initialization_required.load(Ordering::Acquire)
+            || self.schema_upgrade_required.load(Ordering::Acquire)
+    }
+
+    fn startup_vault_present(&self) -> bool {
+        !self.initialization_required.load(Ordering::Acquire)
+    }
+
+    fn prepare_for_migration_backup_after_preflight(&self) -> Result<(), VaultStoreError> {
+        if !self.initialization_required.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        if store.is_none() {
+            *store = Some(VaultStore::initialize(
+                &self.root,
+                self.workspace_instance_id.clone(),
+            )?);
+        }
+        self.initialization_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn upgrade_schema_after_backup(&self) -> Result<(), VaultStoreError> {
+        if !self.schema_upgrade_required.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.with_store(VaultStore::upgrade_schema_after_backup)?;
+        self.schema_upgrade_required.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -809,6 +963,32 @@ mod tests {
             broker.read_source(&binding),
             Err(VaultStoreError::ObjectNotAvailable)
         ));
+        std::fs::remove_dir_all(app_root).expect("cleanup root");
+    }
+
+    #[test]
+    fn application_startup_defers_missing_vault_until_read_only_preflight_succeeds() {
+        let app_root = root();
+        std::fs::create_dir_all(&app_root).expect("app root");
+        let vault_root = app_root.join(VAULT_ROOT_DIRECTORY);
+        let broker =
+            LocalEncryptedVaultBroker::open_for_application_startup(&app_root, workspace())
+                .expect("deferred startup broker");
+
+        assert!(broker.startup_write_required());
+        assert!(!vault_root.exists());
+        assert!(matches!(
+            broker.isolation_status(),
+            Err(VaultStoreError::ObjectNotAvailable)
+        ));
+        assert!(!vault_root.exists());
+
+        broker
+            .prepare_for_migration_backup_after_preflight()
+            .expect("initialize empty backup baseline");
+        assert!(!broker.startup_write_required());
+        assert!(vault_root.is_dir());
+        broker.isolation_status().expect("initialized isolation");
         std::fs::remove_dir_all(app_root).expect("cleanup root");
     }
 

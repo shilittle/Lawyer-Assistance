@@ -197,7 +197,7 @@ privacy_redactions.redaction_id` 验证发布物来源，但：
 
 这四种版本/撤销状态不得相互覆盖或推断。
 
-## 3. 当前身份不一致必须显式处理
+## 3. 当前身份不一致与正式决策
 
 当前案件 UI 在 `apps/desktop/src/App.tsx` 使用
 `case-<base36 time>-<random>` 形式创建 `projectId`。
@@ -209,18 +209,36 @@ privacy_redactions.redaction_id` 验证发布物来源，但：
 `prepare_selected_material_with_qualification` 会为缺失值生成新的
 `case_<32 hex>`，而不是查找当前 `projects` 行。
 
-由此必须区分三类输入：
+2026-07-30 已正式选择方案 B，详见
+[`ADR-0001：ProjectId 与 PrivacyCaseId 的持久化一对一绑定`](../adr/0001-project-privacy-case-binding.md)。
+后续实现必须把两种身份视为不同类型：
+
+1. `ProjectId` 保留 `case-...`，是 `user.sqlite`、案件归属、CaseMaterial 和前端
+   工作流的身份；迁移不得修改该值或任何源表。
+2. `PrivacyCaseId` 保留 `case_<32 lowercase hex>`，是 Privacy、Vault、签名、
+   approved workspace 和 MCP 隐私边界的身份；不得放宽其格式。
+3. 两者只能通过 Privacy 可写库内审计型、一对一、默认不可变的持久化绑定关联。
+   禁止依赖字符串相等、临时字符串转换、哈希截断或可预测计数器。
+
+历史迁移必须区分：
 
 1. `StoredReviewPayload.case_id = null`：历史未归属本地材料。
-2. `case_id` 非空且在 `user.sqlite.projects.project_id` 中精确存在：
-   可迁移为已归属材料。
-3. `case_id` 非空但没有精确匹配项目：包括当前 UI 产生的匿名
+2. `case_id` 非空且可通过既有绑定或可信跨库 provenance 无歧义恢复唯一
+   `ProjectId`：保留该 `PrivacyCaseId` 并幂等建立绑定。
+3. `case_id` 非空但不能唯一恢复项目：包括当前旧 UI 产生的匿名
    `case_<32 hex>`；必须迁移为“未归属”，同时保留 `legacyCaseId`，
-   不能创建幽灵案件，也不能按标题、哈希或字符串相似度自动绑定。
+   不能创建幽灵案件，也不能按标题、排列顺序或字符串相似度自动绑定。
+4. 项目尚无任何 Privacy/Vault 状态且没有绑定：可以在事务内用安全随机源生成
+   新的 `PrivacyCaseId` 并创建唯一绑定。
 
 用户后续手动归入案件时，服务必须执行一次明确的归属操作并记录审计；不能改写
 Vault 内既有 `case_id`。如果归属涉及 Vault case identity 变化，应创建新的受控
 Vault revision/binding，而不是只更新数据库字符串。
+
+归属命令必须由后端重新验证目标项目仍存在且未退休、现有双向绑定、材料与所有
+generation 的身份一致性，以及任何 Vault 四元组。操作需要事务性或 journaled，
+同一请求重试只能得到同一结果，并发归属到不同项目必须 fail closed；前端只提交
+用户选择的 `ProjectId`，不得提交或生成权威 `PrivacyCaseId`。
 
 ## 4. 目标逻辑模型与物理落盘原则
 
@@ -231,9 +249,45 @@ Vault revision/binding，而不是只更新数据库字符串。
 `CaseMaterial` / `RedactionGeneration`；物理表是否在最终清理阶段改名，
 不影响本迁移契约。
 
-只有 `CaseMaterialSelection` 和迁移 ledger/legacy-reference 辅助表是新增数据。
+只有 `CaseMaterialSelection`、ADR-0001 身份绑定及其审计表，以及迁移
+ledger/legacy-reference 辅助表是新增数据。
 `user.sqlite.case_files` 在兼容期保留为源与旧 UI 投影，不能继续成为第二个材料
 真实性来源。
+
+### 4.0 `ProjectPrivacyCaseBinding`
+
+绑定物理落盘在 `privacy-workflow.sqlite`，不写入迁移源 `user.sqlite`。逻辑字段
+至少包括：
+
+```text
+projectId
+privacyCaseId
+bindingVersion
+creationSource
+creationAuditId
+migrationId              nullable
+createdAt
+updatedAt
+```
+
+数据库必须分别唯一约束 `projectId` 与 `privacyCaseId`，并校验非空、
+`bindingVersion > 0` 和严格的 Privacy CaseId 格式。绑定身份列在 v1 中不可更新；
+任何未来重绑都必须是独立、显式、受控且可审计的迁移，不得使用普通 UPDATE。
+
+绑定服务必须提供以下唯一解析边界：
+
+* 由 `ProjectId` 查询现有 `PrivacyCaseId`；
+* 在明确允许初始化的生命周期点，以 `BEGIN IMMEDIATE` 等等价写锁事务执行
+  “查询或安全随机创建”；
+* 由 `PrivacyCaseId` 反查 `ProjectId`；
+* 校验给定身份对是否为当前合法绑定；
+* 以稳定错误区分 `unbound`、`invalid_project_id`、`invalid_privacy_case_id`、
+  `binding_conflict`、`ambiguous_legacy_binding` 和 `binding_store_failed`。
+
+新 `PrivacyCaseId` 必须由操作系统安全随机源生成并满足
+`case_[0-9a-f]{32}`；不得使用 `ProjectId` 的哈希截断、字符串替换或计数器。
+同一项目的并发首次创建只能提交一个绑定；竞争者必须读取并返回已提交的同一
+绑定，不能生成第二套 Vault。
 
 ### 4.1 `CaseMaterial`
 
@@ -382,8 +436,10 @@ rowVersion
 
 Vault-backed material 还必须同时满足：
 
-- payload、`privacy_materials.project_id`、
-  `privacy_vault_material_refs.case_id` 三者非空值一致；
+- payload `case_id` 与 `privacy_vault_material_refs.case_id` 一致且均为合法
+  `PrivacyCaseId`；
+- `privacy_materials.project_id` 为逻辑 `ProjectId`，其持久化绑定解析结果必须与
+  上述 `PrivacyCaseId` 一致；不得再比较两种 ID 的字符串；
 - object id/version 与 payload 一致；
 - source/envelope hashes、content length 合法；
 - Vault `object_journal` 中精确对象是 committed 且 case identity 一致；
@@ -402,8 +458,9 @@ Vault-backed material 还必须同时满足：
 - 不创建 selection；
 - 不得出现在任何案件助手、approved automation 或 MCP source list。
 
-非空但找不到 `projects.project_id` 的 `caseId` 使用同一规则，并额外保存
-`legacyCaseId`。只有 exact project match 才可自动归属。
+非空但无法通过既有绑定或可信 provenance 唯一恢复 `ProjectId` 的 `caseId`
+使用同一规则，并额外保存 `legacyCaseId`。只有绑定验证或无歧义可信恢复通过时
+才可自动归属；名称、顺序、字符串相似度和单独文件名/hash 均不足以建立绑定。
 
 ### 5.3 `CaseFile`
 
@@ -475,9 +532,44 @@ mat_ + first_32_hex(
 - crash 在 target commit 前：无完成 ledger，安全重跑；
 - crash 在 target commit 后：同事务内已有完成 ledger，安全 no-op。
 
+迁移完成后的受控生命周期操作不得破坏上述幂等协议：
+
+- migration ledger 与 resolution event 永不因 retention cleanup、项目删除或用户
+  删除材料而删除或改写；
+- retention cleanup 物理移除某个 redaction 后，target invariant 只有在同一
+  `redaction_id` 的 cleanup candidate 已为 `removed`、父 cleanup journal 已为
+  `committed`，且 journal 哈希链、候选计数和完成计数全部验证通过时，才可把该
+  target 缺失解释为受控终态；证据缺失、被替换或被篡改仍须
+  `case_material_migration_target_mismatch`；
+- 被 source ledger 引用的 material identity 必须保留为已撤销/已删除 tombstone，
+  同时清除到期的受保护展示元数据；不得依赖外键 cascade 删除 provenance；
+- 项目删除完成后，迁移器必须验证 completed deletion journal、精确 scope、
+  material/generation tombstone、Vault ref 撤销和原绑定。验证通过的记录保持原
+  `projectId`、`PrivacyCaseId`、`sourceKind` 与 Vault 四元组并 no-op；不得因
+  `user.sqlite` 中项目已删除而把历史记录重新投影成未归属或覆盖 provenance。
+
 `user.sqlite` 与 `privacy-workflow.sqlite` 是不同数据库。迁移在 App operation gate 下
 以只读 snapshot 打开 `user.sqlite`，只在隐私库写 target + ledger。因为源记录不被
 修改，不需要伪造跨库原子提交；若 snapshot 结束前源 fingerprint 改变，本批次回滚。
+
+只读 snapshot 必须使用操作系统/SQLite 只读打开方式并启用 `query_only`，在同一
+deferred read transaction 中固定 schema、project manifest 和逻辑内容。不能只依赖
+调用约定；测试注入写 SQL 必须得到 `SQLITE_READONLY`，且迁移前后源文件 bytes、
+schema version 与逻辑 manifest 均保持一致。
+
+身份绑定 backfill 使用独立固定 migration id
+`project-privacy-case-binding-v1`，并遵循：
+
+1. 读取已存在绑定并验证双向唯一性。
+2. 只读扫描项目、CaseFile/attachment provenance 与 Privacy/Vault 精确元数据。
+3. 所有可信候选一致指向同一身份对时，保留原 `PrivacyCaseId` 并在同一事务写入
+   绑定、创建审计事件和完成 ledger。
+4. 项目无任何 Privacy/Vault 状态时，可安全随机创建新 `PrivacyCaseId`。
+5. 任一端出现多个候选、Vault 四元组冲突或来源不完整时，写结构化 blocked
+   migration result；不得创建替代绑定掩盖问题。
+6. fingerprint 相同的重复运行为 no-op；中断后重跑从未完成 ledger 继续。
+7. 迁移前后比较 `user.sqlite` 文件 hash、schema、项目主键 manifest 和
+   `PRAGMA data_version`，任何源写入迹象都使迁移失败。
 
 ## 7. 分阶段上线与读兼容
 
@@ -525,7 +617,9 @@ mat_ + first_32_hex(
 
 `CaseMaterialSelection` 只能创建或使用于同时满足以下条件的记录：
 
-1. `CaseMaterial.projectId == request.projectId`，且项目仍存在。
+1. `CaseMaterial.projectId == request.projectId`，且项目仍存在；需要 Vault 的操作
+   还必须验证
+   `binding(request.projectId).privacyCaseId == vaultRef.caseId`。
 2. material 未 deleted/revoked/blocked，source identity 完整。
 3. generation 属于该 material，`reviewState == approved`。
 4. `approvedPayloadSha256` 存在且与受保护 payload 重算值一致。
@@ -569,6 +663,11 @@ table 或复制单个数据库“回滚”。
 `user.sqlite` 或 `privacy-workflow.sqlite`，否则 Vault、approved publication 与
 work-product revocation 状态可能分叉。
 
+同样地，旧三组件备份只对尚无 unified material/binding、approved publication 和
+work-product lineage 的切换前状态保持读兼容。一旦任一 lineage 存在，恢复服务
+必须在暂存前以及首次组件替换前各检查一次并拒绝三组件恢复，防止检查与应用之间
+新增状态造成部分回滚。
+
 恢复前后都必须保留迁移报告。恢复动作不得删除用户原始外部文件；现有
 `delete_review` 的显式、hash-checked、legal-hold-aware 删除流程不属于迁移回滚。
 
@@ -609,15 +708,47 @@ WHERE v.source_sha256 <> m.source_sha256
 ### 隐私 case 是否对应真实项目
 
 ```sql
-SELECT m.material_id, m.project_id AS legacy_case_id
+SELECT m.material_id, m.project_id, v.case_id AS privacy_case_id
 FROM privacydb.privacy_materials m
 LEFT JOIN userdb.projects p ON p.project_id = m.project_id
+LEFT JOIN privacydb.project_privacy_case_bindings b
+  ON b.project_id = m.project_id
+LEFT JOIN privacydb.privacy_vault_material_refs v
+  ON v.material_id = m.material_id
 WHERE m.project_id IS NOT NULL
-  AND p.project_id IS NULL;
+  AND (
+    p.project_id IS NULL
+    OR b.project_id IS NULL
+    OR b.privacy_case_id <> v.case_id
+  );
 ```
 
-这些行不是可自动归属案件；迁移后必须是 `projectId=null` 且保留
-`legacyCaseId`。
+预期：无行。无法通过绑定恢复的历史行不是可自动归属案件；迁移后必须是
+`projectId=null` 且保留 `legacyCaseId`。
+
+### 身份绑定是一对一且格式严格
+
+```sql
+SELECT project_id
+FROM privacydb.project_privacy_case_bindings
+GROUP BY project_id
+HAVING COUNT(*) <> 1;
+
+SELECT privacy_case_id
+FROM privacydb.project_privacy_case_bindings
+GROUP BY privacy_case_id
+HAVING COUNT(*) <> 1;
+
+SELECT project_id, privacy_case_id
+FROM privacydb.project_privacy_case_bindings
+WHERE length(project_id) = 0
+   OR length(privacy_case_id) <> 37
+   OR substr(privacy_case_id, 1, 5) <> 'case_'
+   OR substr(privacy_case_id, 6) GLOB '*[^0-9a-f]*';
+```
+
+预期：均无行。应用层还必须用 `PrivacyCaseId` parser 复核格式，SQL 约束不能代替
+强类型边界。
 
 ### CaseFile 引用覆盖
 
@@ -681,6 +812,8 @@ WHERE r.material_id <> s.material_id
 本文档完成后，Phase 1 对数据迁移的结论是：
 
 - 当前 schema 与存储路径已明确；
+- `ProjectId` 与 `PrivacyCaseId` 通过 ADR-0001 的持久化一对一绑定解析，不再假设
+  字符串相等；
 - `caseId=null`、匿名非空 case、CaseFile legacy reference 均有无损去向；
 - ID、generation、hash、risk revision、Vault version 和 publication version
   的语义互不混用；

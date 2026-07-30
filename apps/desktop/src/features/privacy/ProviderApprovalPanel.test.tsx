@@ -420,6 +420,18 @@ describe("Provider approved task contract", () => {
       /taskRequest\.requestId <= handledTaskRequestId\.current[\s\S]*handledTaskRequestId\.current = taskRequest\.requestId/u,
     );
   });
+
+  it("never loads an unscoped latest review and explains the case-scoped handoff", () => {
+    expect(providerApprovalPanelSource).not.toContain(
+      "loadLatestPrivacyReview",
+    );
+    expect(providerApprovalPanelSource).toContain(
+      "设置页不再自动读取未限定案件的“最近一次”脱敏记录",
+    );
+    expect(providerApprovalPanelSource).toContain(
+      "请从案件工作台的“材料与脱敏”",
+    );
+  });
 });
 
 describe("ProviderApprovalPanelView", () => {

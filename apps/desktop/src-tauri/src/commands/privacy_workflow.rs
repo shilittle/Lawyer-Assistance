@@ -1,12 +1,19 @@
 use crate::{
     privacy_manager::{OcrMode, PrivacyManager, PrivacyManagerError},
     privacy_workflow::{
-        ApplyPrivacyRiskReviewActionRequest, ApprovePrivacyReviewRequest,
-        ApprovePrivacyReviewResponse, BuiltSafePdf, DeletePrivacyReviewRequest,
-        DeletePrivacyReviewResponse, ExportApprovedReviewPdfRequest, LoadPrivacyReviewRequest,
-        LocalOcrExecutionContext, PreparePrivacyMaterialRequest, PreparePrivacyMaterialResponse,
+        ApplyCaseRedactionRiskReviewActionRequest, ApplyPrivacyRiskReviewActionRequest,
+        ApproveCaseRedactionReviewRequest, ApprovePrivacyReviewRequest,
+        ApprovePrivacyReviewResponse, AssignUnassignedCaseMaterialRequest,
+        AssignUnassignedCaseMaterialResponse, BuiltSafePdf, CaseMaterialSummary,
+        CaseRedactionGenerationSummary, CaseRedactionReviewView,
+        CaseRedactionRiskReviewRevisionRequest, DeleteCaseRedactionReviewRequest,
+        DeletePrivacyReviewRequest, DeletePrivacyReviewResponse, ExportApprovedReviewPdfRequest,
+        ListCaseMaterialsRequest, ListCaseRedactionGenerationsRequest,
+        ListUnassignedCaseMaterialsRequest, LoadCaseRedactionReviewRequest,
+        LoadPrivacyReviewRequest, LocalOcrExecutionContext, PrepareCaseMaterialRequest,
+        PrepareCaseMaterialResponse, PreparePrivacyMaterialRequest, PreparePrivacyMaterialResponse,
         PrivacyReviewView, PrivacyRiskReviewRevisionRequest, PrivacyWorkflowError,
-        PrivacyWorkflowManager,
+        PrivacyWorkflowManager, UnassignedCaseMaterialSummary,
     },
 };
 use serde::Serialize;
@@ -97,7 +104,8 @@ pub async fn prepare_privacy_material(
             .map(|_| configuration.local_ocr_qualification_snapshot())
             .transpose()
             .map_err(IpcError::from)?;
-        let review = match workflow.prepare_selected_material_with_qualification(
+        let project_id = request.project_id;
+        let review = match workflow.prepare_case_selected_material_with_qualification(
             &path,
             &config,
             &ocr_status,
@@ -105,7 +113,7 @@ pub async fn prepare_privacy_material(
                 mineru_config: mineru_config.as_ref(),
                 qualification: ocr_qualification.as_ref(),
             },
-            request.case_id,
+            project_id.clone(),
             request.custom_terms,
         ) {
             Ok(review) => review,
@@ -118,6 +126,9 @@ pub async fn prepare_privacy_material(
                 return Err(error.into());
             }
         };
+        let review = workflow
+            .case_redaction_review_view(project_id, review)
+            .map_err(IpcError::from)?;
         Ok(PreparePrivacyMaterialResponse {
             cancelled: false,
             review: Some(review),
@@ -128,6 +139,168 @@ pub async fn prepare_privacy_material(
         error_type: "runtime_failure".to_owned(),
         message: "本地材料处理任务未完成。".to_owned(),
     })?
+}
+
+#[tauri::command]
+pub async fn prepare_case_material(
+    app: tauri::AppHandle,
+    configuration: State<'_, PrivacyManager>,
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: PrepareCaseMaterialRequest,
+) -> Result<PrepareCaseMaterialResponse, IpcError> {
+    prepare_privacy_material(app, configuration, workflow, request).await
+}
+
+#[tauri::command]
+pub async fn list_case_materials(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: ListCaseMaterialsRequest,
+) -> Result<Vec<CaseMaterialSummary>, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.list_case_materials(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "案件材料目录读取任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn list_unassigned_case_materials(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: ListUnassignedCaseMaterialsRequest,
+) -> Result<Vec<UnassignedCaseMaterialSummary>, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.list_unassigned_case_materials(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "未归属材料目录读取任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn assign_unassigned_case_material(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: AssignUnassignedCaseMaterialRequest,
+) -> Result<AssignUnassignedCaseMaterialResponse, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.assign_unassigned_case_material(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "未归属材料归入任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn list_case_redaction_generations(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: ListCaseRedactionGenerationsRequest,
+) -> Result<Vec<CaseRedactionGenerationSummary>, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.list_case_redaction_generations(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "案件脱敏代次目录读取任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn load_case_redaction_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: LoadCaseRedactionReviewRequest,
+) -> Result<CaseRedactionReviewView, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.load_case_redaction_review(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "案件脱敏审阅读取任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn apply_case_redaction_risk_review_action(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: ApplyCaseRedactionRiskReviewActionRequest,
+) -> Result<CaseRedactionReviewView, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        workflow.apply_case_redaction_risk_review_action(request)
+    })
+    .await
+    .map_err(|_| IpcError {
+        error_type: "runtime_failure".to_owned(),
+        message: "案件脱敏风险审阅任务未完成。".to_owned(),
+    })?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn undo_case_redaction_risk_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: CaseRedactionRiskReviewRevisionRequest,
+) -> Result<CaseRedactionReviewView, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.undo_case_redaction_risk_review(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "案件脱敏风险审阅撤销任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn redo_case_redaction_risk_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: CaseRedactionRiskReviewRevisionRequest,
+) -> Result<CaseRedactionReviewView, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.redo_case_redaction_risk_review(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "案件脱敏风险审阅重做任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn approve_case_redaction_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: ApproveCaseRedactionReviewRequest,
+) -> Result<ApprovePrivacyReviewResponse, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.approve_case_redaction_review(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "案件脱敏批准任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn delete_case_redaction_review(
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: DeleteCaseRedactionReviewRequest,
+) -> Result<DeletePrivacyReviewResponse, IpcError> {
+    let workflow = workflow.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workflow.delete_case_redaction_review(request))
+        .await
+        .map_err(|_| IpcError {
+            error_type: "runtime_failure".to_owned(),
+            message: "案件脱敏审阅删除任务未完成。".to_owned(),
+        })?
+        .map_err(Into::into)
 }
 
 fn local_ocr_error_revokes_qualification(code: &str) -> bool {
@@ -146,6 +319,9 @@ fn local_ocr_error_revokes_qualification(code: &str) -> bool {
     )
 }
 
+// Phase 3 retains the unscoped adapters for compatibility qualification only. The renderer
+// registration is intentionally limited to the project-scoped commands above.
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn load_privacy_review(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -161,6 +337,7 @@ pub async fn load_privacy_review(
         .map_err(Into::into)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn load_latest_privacy_review(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -175,6 +352,7 @@ pub async fn load_latest_privacy_review(
         .map_err(Into::into)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn load_privacy_risk_review(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -190,6 +368,7 @@ pub async fn load_privacy_risk_review(
         .map_err(Into::into)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn apply_privacy_risk_review_action(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -205,6 +384,7 @@ pub async fn apply_privacy_risk_review_action(
         .map_err(Into::into)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn undo_privacy_risk_review(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -220,6 +400,7 @@ pub async fn undo_privacy_risk_review(
         .map_err(Into::into)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn redo_privacy_risk_review(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -234,6 +415,7 @@ pub async fn redo_privacy_risk_review(
         })?
         .map_err(Into::into)
 }
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn delete_privacy_review(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -249,6 +431,7 @@ pub async fn delete_privacy_review(
         .map_err(Into::into)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn approve_privacy_review(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -498,15 +681,121 @@ where
 mod tests {
     use super::*;
 
+    fn assert_project_scoped_contract<T>(valid: serde_json::Value)
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        assert!(
+            serde_json::from_value::<T>(valid.clone()).is_ok(),
+            "valid project-scoped request must deserialize"
+        );
+
+        let mut missing_project_id = valid.clone();
+        missing_project_id
+            .as_object_mut()
+            .expect("request object")
+            .remove("projectId");
+        assert!(
+            serde_json::from_value::<T>(missing_project_id).is_err(),
+            "projectId must be required"
+        );
+
+        for private_or_unknown_key in ["caseId", "privacyCaseId", "unexpected"] {
+            let mut with_unknown = valid.clone();
+            with_unknown
+                .as_object_mut()
+                .expect("request object")
+                .insert(
+                    private_or_unknown_key.to_owned(),
+                    serde_json::Value::String("case_99999999999999999999999999999999".to_owned()),
+                );
+            assert!(
+                serde_json::from_value::<T>(with_unknown).is_err(),
+                "request must deny unknown field {private_or_unknown_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_case_material_workflow_request_requires_project_id_and_denies_unknown_fields() {
+        assert_project_scoped_contract::<PrepareCaseMaterialRequest>(serde_json::json!({
+            "projectId": "case-request-contract",
+            "customTerms": []
+        }));
+        assert_project_scoped_contract::<ListCaseMaterialsRequest>(serde_json::json!({
+            "projectId": "case-request-contract"
+        }));
+        assert_project_scoped_contract::<ListUnassignedCaseMaterialsRequest>(serde_json::json!({
+            "projectId": "case-request-contract"
+        }));
+        assert_project_scoped_contract::<AssignUnassignedCaseMaterialRequest>(serde_json::json!({
+            "projectId": "case-request-contract",
+            "materialId": "mat_request_contract",
+            "expectedRowVersion": 2,
+            "actor": "local-reviewer"
+        }));
+        assert_project_scoped_contract::<ListCaseRedactionGenerationsRequest>(serde_json::json!({
+            "projectId": "case-request-contract",
+            "materialId": "mat_request_contract"
+        }));
+        assert_project_scoped_contract::<LoadCaseRedactionReviewRequest>(serde_json::json!({
+            "projectId": "case-request-contract",
+            "redactionId": "red_request_contract"
+        }));
+        assert_project_scoped_contract::<ApplyCaseRedactionRiskReviewActionRequest>(
+            serde_json::json!({
+                "projectId": "case-request-contract",
+                "redactionId": "red_request_contract",
+                "expectedRevision": 1,
+                "actor": "local-reviewer",
+                "editedPages": [],
+                "action": {
+                    "kind": "confirm_edited_output"
+                }
+            }),
+        );
+        assert_project_scoped_contract::<CaseRedactionRiskReviewRevisionRequest>(
+            serde_json::json!({
+                "projectId": "case-request-contract",
+                "redactionId": "red_request_contract",
+                "expectedRevision": 1
+            }),
+        );
+        assert_project_scoped_contract::<ApproveCaseRedactionReviewRequest>(serde_json::json!({
+            "projectId": "case-request-contract",
+            "redactionId": "red_request_contract",
+            "expectedRiskRevision": 1,
+            "expectedSuggestedRedactedSha256": "a".repeat(64),
+            "editedPages": [],
+            "reviewer": "local-reviewer",
+            "destination": {
+                "kind": "verified_local_provider",
+                "identifier": "local-safe-pdf-export-v1"
+            },
+            "purpose": "local_safe_pdf_export",
+            "ttlSeconds": 600
+        }));
+        assert_project_scoped_contract::<DeleteCaseRedactionReviewRequest>(serde_json::json!({
+            "projectId": "case-request-contract",
+            "redactionId": "red_request_contract",
+            "expectedSourceSha256": "b".repeat(64),
+            "expectedExtractionSha256": "c".repeat(64)
+        }));
+    }
+
     #[test]
     fn prepare_request_has_no_path_field() {
-        let request: PreparePrivacyMaterialRequest =
-            serde_json::from_value(serde_json::json!({"customTerms": ["内部代号"]}))
-                .expect("custom terms parse");
+        let request: PreparePrivacyMaterialRequest = serde_json::from_value(serde_json::json!({
+            "projectId": "case-privacy-command-test",
+            "customTerms": ["内部代号"]
+        }))
+        .expect("custom terms parse");
+        assert_eq!(request.project_id, "case-privacy-command-test");
         assert_eq!(request.custom_terms, ["内部代号"]);
 
         assert!(
             serde_json::from_value::<PreparePrivacyMaterialRequest>(serde_json::json!({
+                "projectId": "case-privacy-command-test",
                 "customTerms": [],
                 "path": "C:/case/raw.pdf"
             }))

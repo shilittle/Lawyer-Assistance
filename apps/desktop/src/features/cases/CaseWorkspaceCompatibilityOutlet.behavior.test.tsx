@@ -127,6 +127,7 @@ function props(
   ) => void = vi.fn(),
 ): CaseWorkspaceCompatibilityOutletProps {
   return {
+    section: "work",
     controller: CONTROLLER,
     providerProfiles: [],
     legalSources: [],
@@ -134,6 +135,10 @@ function props(
     onGraphTargetConsumed,
     onContinueInAssistant: vi.fn(),
     onOpenCaseGraph: vi.fn(),
+    caseMaterialResetKey: 0,
+    onCaseMaterialDraftDirtyChange: vi.fn(),
+    onCaseMaterialMutationActivityChange: vi.fn(),
+    onBeforeCaseMaterialProjectChange: vi.fn(() => true),
   };
 }
 

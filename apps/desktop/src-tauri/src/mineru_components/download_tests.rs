@@ -64,34 +64,11 @@ fn spawn_local_https_once(root: &Path, body: &[u8]) -> LocalHttpsServer {
     let port_file = root.join("port.txt");
     fs::write(&body_file, body).unwrap();
 
-    let generated = Command::new("openssl")
-        .arg("req")
-        .arg("-x509")
-        .arg("-newkey")
-        .arg("rsa:2048")
-        .arg("-config")
-        .arg("NUL")
-        .arg("-sha256")
-        .arg("-days")
-        .arg("1")
-        .arg("-nodes")
-        .arg("-subj")
-        .arg("/CN=127.0.0.1")
-        .arg("-addext")
-        .arg("subjectAltName=IP:127.0.0.1")
-        .arg("-keyout")
-        .arg(&key)
-        .arg("-out")
-        .arg(&certificate)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("OpenSSL must be available for the real local HTTPS test");
-    assert!(
-        generated.success(),
-        "failed to generate the ephemeral TLS keypair"
-    );
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()])
+            .expect("generate the ephemeral local HTTPS certificate");
+    fs::write(&certificate, cert.pem()).expect("write the local HTTPS certificate");
+    fs::write(&key, signing_key.serialize_pem()).expect("write the local HTTPS private key");
 
     let child = Command::new("python")
         .arg("-c")

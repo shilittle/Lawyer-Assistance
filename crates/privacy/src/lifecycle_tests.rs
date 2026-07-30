@@ -3,8 +3,8 @@ mod lifecycle_tests {
     use super::*;
     use crate::{
         DestinationKind, DestinationScope, PrivacyStore, ReceiptSigner, RedactionReceiptClaims,
-        RegisterPrivacyMaterial, ReviewState, SaveReviewDraft, PRIVACY_STORE_SCHEMA_VERSION,
-        REDACTION_VERSION,
+        RegisterPrivacyMaterial, ReviewState, SaveReviewDraft, LOCAL_PROTECTION_SCHEME,
+        PRIVACY_STORE_SCHEMA_VERSION, REDACTION_VERSION,
     };
     use std::fs;
 
@@ -75,6 +75,16 @@ mod lifecycle_tests {
         (connection, lifecycle)
     }
 
+    fn set_privacy_store_schema_version(connection: &Connection, version: i64) {
+        let changed = connection
+            .execute(
+                "UPDATE privacy_schema_metadata SET value=?1 WHERE key='schema_version'",
+                [version.to_string()],
+            )
+            .expect("set synthetic privacy schema version");
+        assert_eq!(changed, 1);
+    }
+
     fn approve_and_receipt(connection: &mut Connection) -> String {
         let approved = b"synthetic approved source";
         PrivacyStore::approve_review(
@@ -125,18 +135,10 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn privacy_store_v1_migrates_through_lifecycle_risk_and_consumption_schema_v4_and_rejects_future_schema() {
+    fn fresh_privacy_store_initializes_lifecycle_risk_and_consumption_schema_and_rejects_future_schema(
+    ) {
         let connection = Connection::open_in_memory().expect("database");
-        connection
-            .execute_batch(
-                "CREATE TABLE privacy_schema_metadata(
-                   key TEXT PRIMARY KEY,value TEXT NOT NULL,
-                   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                 );
-                 INSERT INTO privacy_schema_metadata(key,value) VALUES('schema_version','1');",
-            )
-            .expect("v1 metadata");
-        PrivacyStore::initialize(&connection).expect("migrate");
+        PrivacyStore::initialize(&connection).expect("initialize fresh store");
         let version: String = connection
             .query_row(
                 "SELECT value FROM privacy_schema_metadata WHERE key='schema_version'",
@@ -207,7 +209,14 @@ mod lifecycle_tests {
     fn encrypted_mapping_round_trip_access_expiry_rotation_and_revocation() {
         let (mut connection, lifecycle) = setup_review();
         let summary = lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 1)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
             .expect("save mapping");
         assert_eq!(summary.key_version, 1);
         let stored: Vec<u8> = connection
@@ -308,7 +317,14 @@ mod lifecycle_tests {
     fn mapping_tamper_wrong_key_and_expiry_fail_closed() {
         let (mut connection, lifecycle) = setup_review();
         let summary = lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 1)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
             .expect("mapping");
         let context = MappingAccessContextV1 {
             access_id: "tamper-access",
@@ -380,7 +396,14 @@ mod lifecycle_tests {
             .expect("wrong key");
         let (mut connection, lifecycle) = setup_review();
         lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 1)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
             .expect("mapping");
         connection
             .execute(
@@ -403,7 +426,14 @@ mod lifecycle_tests {
 
         let (mut connection, lifecycle) = setup_review();
         lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 1)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
             .expect("mapping");
         assert_eq!(
             lifecycle.load_mapping_revision(
@@ -452,7 +482,9 @@ mod lifecycle_tests {
                 |row| row.get(0),
             )
             .expect("protected output");
-        assert!(!protected.windows(content.len()).any(|window| window == content));
+        assert!(!protected
+            .windows(content.len())
+            .any(|window| window == content));
         let context = ApprovedOutputAccessContextV1 {
             redaction_id: "redaction-1",
             approval_generation_id: &receipt_id,
@@ -469,7 +501,13 @@ mod lifecycle_tests {
             .expect("load output");
         assert_eq!(loaded.content, content);
         assert!(!format!("{loaded:?}").contains("SYNTHETIC_APPROVED_PROVIDER_RESULT"));
-        assert_eq!(lifecycle.list_approved_outputs(&connection, "redaction-1").expect("list").len(), 1);
+        assert_eq!(
+            lifecycle
+                .list_approved_outputs(&connection, "redaction-1")
+                .expect("list")
+                .len(),
+            1
+        );
         assert_eq!(
             lifecycle.load_approved_output(
                 &connection,
@@ -510,7 +548,14 @@ mod lifecycle_tests {
             )
             .expect("short policy");
         lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 2)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 2,
+            )
             .expect("mapping");
         PrivacyStore::save_review_draft(
             &connection,
@@ -600,7 +645,12 @@ mod lifecycle_tests {
             .commit_retention_sweep(&mut connection, third, NOW + 28)
             .expect("commit cleanup");
         assert!(report.removed >= 2);
-        assert_eq!(lifecycle.verify_cleanup_journal(&connection).expect("journal"), 3);
+        assert_eq!(
+            lifecycle
+                .verify_cleanup_journal(&connection)
+                .expect("journal"),
+            3
+        );
         let sibling_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM privacy_redactions
@@ -634,6 +684,303 @@ mod lifecycle_tests {
 
     #[cfg(windows)]
     #[test]
+    fn final_generation_cleanup_retains_only_audited_non_sensitive_material_identity() {
+        let (mut connection, lifecycle) = setup_review();
+        let display_name = b"synthetic-private-filename.pdf";
+        let protected_display_name = protect_local(display_name).expect("protected display name");
+        connection
+            .execute(
+                "UPDATE privacy_materials
+                 SET protected_display_name=?2,display_name_sha256=?3,
+                     display_name_protection_scheme=?4,source_kind='local_review',
+                     row_version=row_version+1
+                 WHERE material_id=?1",
+                params![
+                    "material-1",
+                    protected_display_name,
+                    sha256_hex(display_name),
+                    LOCAL_PROTECTION_SCHEME,
+                ],
+            )
+            .expect("seed protected display name");
+        connection
+            .execute(
+                "INSERT INTO case_material_migration_ledger(
+                    migration_id,source_store,source_table,source_key,source_fingerprint,
+                    target_material_id,target_redaction_id,assigned_generation_number,
+                    result_state,error_code,started_at,completed_at
+                 ) VALUES(
+                    'case-material-unification-v1','privacy-workflow.sqlite',
+                    'privacy_redactions','redaction-1',?1,
+                    'material-1','redaction-1',1,'migrated',NULL,
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                 )",
+                [sha256_hex(b"synthetic migration source")],
+            )
+            .expect("migration ledger");
+        let current = lifecycle.retention_policy(&connection).expect("policy");
+        lifecycle
+            .set_retention_policy(
+                &mut connection,
+                &RetentionPolicyV1 {
+                    policy_id: "short-final-generation-retention".to_owned(),
+                    review_retention_seconds: 10,
+                    mapping_retention_seconds: 10,
+                    receipt_grace_seconds: 0,
+                    backup_retention_seconds: 20,
+                    revision: current.revision + 1,
+                    updated_at_unix: NOW + 1,
+                },
+            )
+            .expect("short policy");
+        lifecycle
+            .bind_redaction_retention(&connection, "redaction-1", NOW + 2)
+            .expect("retention binding");
+        let cleanup_id = "cln_88888888888888888888888888888888";
+        lifecycle
+            .run_retention_sweep(&mut connection, cleanup_id, NOW + 20)
+            .expect("final-generation cleanup");
+
+        let tombstone = connection
+            .query_row(
+                "SELECT project_id,source_sha256,source_kind,state,deleted_at IS NOT NULL,
+                        protected_display_name,display_name_sha256,
+                        display_name_protection_scheme
+                 FROM privacy_materials WHERE material_id='material-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .expect("retained tombstone");
+        assert_eq!(tombstone.0.as_deref(), Some("project-1"));
+        assert_eq!(
+            tombstone.1.as_deref(),
+            Some(sha256_hex(b"synthetic source").as_str())
+        );
+        assert_eq!(tombstone.2, "local_review");
+        assert_eq!(tombstone.3, "revoked");
+        assert!(tombstone.4);
+        assert_eq!((tombstone.5, tombstone.6, tombstone.7), (None, None, None));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM case_material_migration_ledger",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("ledger count"),
+            1
+        );
+        assert!(lifecycle
+            .redaction_cleanup_is_authorized(&connection, "redaction-1", "material-1", 1,)
+            .expect("exact erasure evidence"));
+        assert!(lifecycle
+            .material_cleanup_is_authorized(&connection, "material-1")
+            .expect("material erasure evidence"));
+        assert!(connection
+            .execute(
+                "UPDATE privacy_cleanup_candidates
+                 SET expected_sha256=?2
+                 WHERE cleanup_id=?1 AND target_kind='redaction'",
+                params![cleanup_id, sha256_hex(b"tampered candidate")],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "DELETE FROM privacy_cleanup_candidates WHERE cleanup_id=?1",
+                [cleanup_id],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "INSERT OR REPLACE INTO privacy_cleanup_journal(
+                    cleanup_id,state,policy_revision,started_at_unix,completed_at_unix,
+                    candidate_count,removed_count,keys_destroyed,error_code,
+                    previous_event_hash,event_hash,erasure_disclosure
+                 ) SELECT cleanup_id,state,policy_revision,started_at_unix,completed_at_unix,
+                          candidate_count,removed_count,keys_destroyed,error_code,
+                          previous_event_hash,event_hash,erasure_disclosure
+                   FROM privacy_cleanup_journal WHERE cleanup_id=?1",
+                [cleanup_id],
+            )
+            .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_cleanup_does_not_retain_an_unjournaled_revoked_material() {
+        let (mut connection, lifecycle) = setup_review();
+        connection
+            .execute(
+                "UPDATE privacy_materials
+                 SET state='revoked',deleted_at=CURRENT_TIMESTAMP,row_version=row_version+1
+                 WHERE material_id='material-1'",
+                [],
+            )
+            .expect("seed non-project-deletion revocation");
+        let current = lifecycle.retention_policy(&connection).expect("policy");
+        lifecycle
+            .set_retention_policy(
+                &mut connection,
+                &RetentionPolicyV1 {
+                    policy_id: "unjournaled-revocation-retention".to_owned(),
+                    review_retention_seconds: 10,
+                    mapping_retention_seconds: 10,
+                    receipt_grace_seconds: 0,
+                    backup_retention_seconds: 20,
+                    revision: current.revision + 1,
+                    updated_at_unix: NOW + 1,
+                },
+            )
+            .expect("short policy");
+        lifecycle
+            .bind_redaction_retention(&connection, "redaction-1", NOW + 2)
+            .expect("retention binding");
+        lifecycle
+            .run_retention_sweep(
+                &mut connection,
+                "cln_89898989898989898989898989898989",
+                NOW + 20,
+            )
+            .expect("cleanup unjournaled revocation");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_materials WHERE material_id='material-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("material count"),
+            0
+        );
+        assert!(!lifecycle
+            .material_cleanup_is_authorized(&connection, "material-1")
+            .expect("no retained tombstone authorization"));
+        assert!(lifecycle
+            .redaction_cleanup_is_authorized(&connection, "redaction-1", "material-1", 1,)
+            .expect("exact redaction erasure remains authorized"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_hash_chain_follows_finalization_order_not_prepared_row_order() {
+        let (mut connection, lifecycle) = setup_review();
+        let first = "cln_99999999999999999999999999999999";
+        let second = "cln_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            lifecycle
+                .prepare_retention_sweep(&mut connection, first, NOW + 1)
+                .expect("prepare first"),
+            0
+        );
+        assert_eq!(
+            lifecycle
+                .prepare_retention_sweep(&mut connection, second, NOW + 2)
+                .expect("prepare second"),
+            0
+        );
+        lifecycle
+            .commit_retention_sweep(&mut connection, second, NOW + 3)
+            .expect("commit later row first");
+        lifecycle
+            .commit_retention_sweep(&mut connection, first, NOW + 4)
+            .expect("commit earlier row second");
+        assert_eq!(
+            lifecycle
+                .verify_cleanup_journal(&connection)
+                .expect("finalization-ordered chain"),
+            2
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_cleanup_journal_verifies_but_cannot_authorize_missing_migration_target() {
+        let (connection, lifecycle) = setup_review();
+        let cleanup_id = "cln_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let expected_sha256 = sha256_hex(b"legacy cleanup candidate");
+        connection
+            .execute(
+                "INSERT INTO privacy_cleanup_journal(
+                    cleanup_id,state,policy_revision,started_at_unix,completed_at_unix,
+                    candidate_count,removed_count,keys_destroyed,error_code,
+                    previous_event_hash,event_hash,erasure_disclosure
+                 ) VALUES(?1,'prepared',1,?2,NULL,1,0,0,NULL,'','',?3)",
+                params![
+                    cleanup_id,
+                    i64::try_from(NOW).expect("small time"),
+                    LOGICAL_ERASURE_DISCLOSURE
+                ],
+            )
+            .expect("legacy prepared journal");
+        connection
+            .execute(
+                "INSERT INTO privacy_cleanup_candidates(
+                    cleanup_id,target_kind,target_id,expected_sha256,state
+                 ) VALUES(?1,'redaction','redaction-1',?2,'pending')",
+                params![cleanup_id, expected_sha256],
+            )
+            .expect("legacy candidate");
+        connection
+            .execute(
+                "UPDATE privacy_cleanup_candidates SET state='removed'
+                 WHERE cleanup_id=?1 AND target_kind='redaction'
+                   AND target_id='redaction-1'",
+                [cleanup_id],
+            )
+            .expect("legacy removed candidate");
+        let legacy_row = CleanupJournalRow {
+            cleanup_id: cleanup_id.to_owned(),
+            state: "committed".to_owned(),
+            policy_revision: 1,
+            started_at_unix: i64::try_from(NOW).expect("small time"),
+            completed_at_unix: Some(i64::try_from(NOW + 1).expect("small time")),
+            candidate_count: 1,
+            removed_count: 1,
+            keys_destroyed: 0,
+            error_code: None,
+            previous_event_hash: String::new(),
+            event_hash: String::new(),
+            erasure_disclosure: LOGICAL_ERASURE_DISCLOSURE.to_owned(),
+        };
+        let event_hash = cleanup_event_hash(&legacy_row).expect("legacy event hash");
+        connection
+            .execute(
+                "UPDATE privacy_cleanup_journal
+                 SET state='committed',completed_at_unix=?2,removed_count=1,
+                     previous_event_hash='',event_hash=?3
+                 WHERE cleanup_id=?1 AND state='prepared'",
+                params![
+                    cleanup_id,
+                    i64::try_from(NOW + 1).expect("small time"),
+                    event_hash
+                ],
+            )
+            .expect("finalize legacy journal");
+        assert_eq!(
+            lifecycle
+                .verify_cleanup_journal(&connection)
+                .expect("legacy chain remains readable"),
+            1
+        );
+        assert!(!lifecycle
+            .redaction_cleanup_is_authorized(&connection, "redaction-1", "material-1", 1,)
+            .expect("legacy evidence is not v2 authorization"));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn late_legal_hold_cancels_a_mapping_only_prepared_sweep_before_external_invalidation() {
         let (mut connection, lifecycle) = setup_review();
         let current = lifecycle.retention_policy(&connection).expect("policy");
@@ -652,7 +999,14 @@ mod lifecycle_tests {
             )
             .expect("mapping-first policy");
         lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 2)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 2,
+            )
             .expect("mapping");
         assert_eq!(
             lifecycle
@@ -696,13 +1050,422 @@ mod lifecycle_tests {
 
     #[cfg(windows)]
     #[test]
+    fn pre_migration_backup_records_and_authenticates_actual_v4_while_normal_export_rejects_it() {
+        let (mut connection, lifecycle) = setup_review();
+        lifecycle
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
+            .expect("complete lifecycle state");
+        set_privacy_store_schema_version(&connection, 4);
+        let directory = tempfile::tempdir().expect("backup directory");
+        let store =
+            EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
+        let normal_backup_id = "bkp_44444444444444444444444444444444";
+        let request = BackupExportRequestV1 {
+            backup_id: normal_backup_id,
+            created_at_unix: NOW + 2,
+            expires_at_unix: Some(NOW + 100),
+        };
+        assert_eq!(
+            store.export_database(&mut connection, &lifecycle, &request),
+            Err(LifecycleError::UnsupportedSchema)
+        );
+        assert!(!store
+            .backup_path(normal_backup_id)
+            .expect("normal backup path")
+            .exists());
+
+        let request = BackupExportRequestV1 {
+            backup_id: BACKUP_ID,
+            ..request
+        };
+        let exported = store
+            .export_pre_migration_database(
+                &mut connection,
+                &lifecycle,
+                &request,
+                &PreMigrationBackupExportContextV1 {
+                    expected_privacy_store_schema_version: 4,
+                },
+            )
+            .expect("export complete v4 pre-migration backup");
+        assert_eq!(exported.privacy_store_schema_version, 4);
+        let envelope_bytes =
+            fs::read(store.backup_path(BACKUP_ID).expect("backup path")).expect("envelope");
+        let envelope: BackupEnvelopeV1 =
+            strict_json_v1_from_slice(&envelope_bytes).expect("strict envelope");
+        assert_eq!(envelope.privacy_store_schema_version, 4);
+
+        let key_epoch = lifecycle
+            .current_key_epoch(&connection)
+            .expect("current key epoch");
+        let pre_migration_context = PreMigrationBackupVerificationContextV1 {
+            expected_workspace_instance_id: lifecycle.workspace_instance_id(),
+            expected_key_epoch: key_epoch,
+            expected_privacy_store_schema_version: 4,
+            now_unix: NOW + 3,
+        };
+        assert_eq!(
+            store
+                .verify_pre_migration_backup(&connection, BACKUP_ID, &pre_migration_context)
+                .expect("verify registered v4 backup"),
+            exported
+        );
+        assert_eq!(
+            store
+                .verify_detached_pre_migration_backup(BACKUP_ID, &pre_migration_context)
+                .expect("verify detached v4 backup"),
+            exported
+        );
+        let portable = store
+            .export_pre_migration_portable_bundle(BACKUP_ID, &pre_migration_context)
+            .expect("export v4 portable bundle");
+        assert!(!portable.is_empty());
+
+        let normal_context = BackupVerificationContextV1 {
+            expected_workspace_instance_id: lifecycle.workspace_instance_id(),
+            expected_key_epoch: key_epoch,
+            now_unix: NOW + 3,
+        };
+        assert_eq!(
+            store.verify_backup(&connection, BACKUP_ID, &normal_context),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+        assert_eq!(
+            store.export_portable_bundle(BACKUP_ID, &normal_context),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+        let restore_directory = tempfile::tempdir().expect("coordinated restore directory");
+        let restore_store = EncryptedPrivacyBackupStore::initialize(restore_directory.path())
+            .expect("coordinated restore store");
+        assert_eq!(
+            restore_store.import_portable_bundle(&portable, &normal_context),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+        let imported = restore_store
+            .import_portable_bundle_for_coordinated_pre_migration_restore(
+                &portable,
+                &normal_context,
+            )
+            .expect("coordinated application restore authenticates exact v4");
+        assert_eq!(imported.privacy_store_schema_version, 4);
+        assert_eq!(
+            restore_store
+                .import_portable_bundle_for_coordinated_pre_migration_restore(
+                    &portable,
+                    &normal_context,
+                )
+                .expect("coordinated restore import is exact-idempotent"),
+            imported
+        );
+        let mut restored = Connection::open_in_memory().expect("legacy restore target");
+        let restored_backup = restore_store
+            .restore_detached_for_coordinated_pre_migration_restore(
+                &mut restored,
+                BACKUP_ID,
+                imported.privacy_store_schema_version,
+                &normal_context,
+            )
+            .expect("restore exact v4 without schema evolution");
+        assert_eq!(restored_backup, imported);
+        assert_eq!(
+            read_privacy_store_schema_version(&restored).expect("restored schema marker"),
+            4
+        );
+        assert_eq!(
+            PrivacyStore::preflight_schema(&restored).expect("restored legacy preflight"),
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 4 }
+        );
+        let mut wrong_schema_target =
+            Connection::open_in_memory().expect("wrong-schema restore target");
+        assert_eq!(
+            restore_store.restore_detached_for_coordinated_pre_migration_restore(
+                &mut wrong_schema_target,
+                BACKUP_ID,
+                3,
+                &normal_context,
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+        let mut future_schema_target =
+            Connection::open_in_memory().expect("future-schema restore target");
+        assert_eq!(
+            restore_store.restore_detached_for_coordinated_pre_migration_restore(
+                &mut future_schema_target,
+                BACKUP_ID,
+                PRIVACY_STORE_SCHEMA_VERSION + 1,
+                &normal_context,
+            ),
+            Err(LifecycleError::UnsupportedSchema)
+        );
+        assert_eq!(
+            store.verify_pre_migration_backup(
+                &connection,
+                BACKUP_ID,
+                &PreMigrationBackupVerificationContextV1 {
+                    expected_privacy_store_schema_version: 3,
+                    ..pre_migration_context
+                },
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+        assert_eq!(
+            store.verify_pre_migration_backup(
+                &connection,
+                BACKUP_ID,
+                &PreMigrationBackupVerificationContextV1 {
+                    expected_workspace_instance_id: &other_workspace(),
+                    ..pre_migration_context
+                },
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+        assert_eq!(
+            store.verify_pre_migration_backup(
+                &connection,
+                BACKUP_ID,
+                &PreMigrationBackupVerificationContextV1 {
+                    expected_key_epoch: key_epoch + 1,
+                    ..pre_migration_context
+                },
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pre_migration_backup_rejects_invalid_empty_future_mismatched_and_damaged_sources() {
+        let invalid_versions = [0, PRIVACY_STORE_SCHEMA_VERSION, 6];
+        for invalid_version in invalid_versions {
+            let (mut connection, lifecycle) = setup_review();
+            set_privacy_store_schema_version(&connection, 4);
+            let directory = tempfile::tempdir().expect("backup directory");
+            let store =
+                EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
+            assert_eq!(
+                store.export_pre_migration_database(
+                    &mut connection,
+                    &lifecycle,
+                    &BackupExportRequestV1 {
+                        backup_id: BACKUP_ID,
+                        created_at_unix: NOW + 2,
+                        expires_at_unix: Some(NOW + 100),
+                    },
+                    &PreMigrationBackupExportContextV1 {
+                        expected_privacy_store_schema_version: invalid_version,
+                    },
+                ),
+                Err(LifecycleError::InvalidInput),
+                "invalid expected version {invalid_version}"
+            );
+            assert!(!store
+                .backup_path(BACKUP_ID)
+                .expect("invalid-context backup path")
+                .exists());
+        }
+
+        let (mut empty, empty_lifecycle) = setup_review();
+        set_privacy_store_schema_version(&empty, 4);
+        empty
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TABLE privacy_redactions;
+                 DROP TABLE privacy_materials;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .expect("remove required privacy backing tables");
+        let empty_directory = tempfile::tempdir().expect("empty backup directory");
+        let empty_store = EncryptedPrivacyBackupStore::initialize(empty_directory.path())
+            .expect("empty backup store");
+        assert_eq!(
+            empty_store.export_pre_migration_database(
+                &mut empty,
+                &empty_lifecycle,
+                &BackupExportRequestV1 {
+                    backup_id: BACKUP_ID,
+                    created_at_unix: NOW + 2,
+                    expires_at_unix: Some(NOW + 100),
+                },
+                &PreMigrationBackupExportContextV1 {
+                    expected_privacy_store_schema_version: 4,
+                },
+            ),
+            Err(LifecycleError::UnsupportedSchema)
+        );
+
+        let (mut future, future_lifecycle) = setup_review();
+        set_privacy_store_schema_version(&future, 6);
+        let future_directory = tempfile::tempdir().expect("future backup directory");
+        let future_store = EncryptedPrivacyBackupStore::initialize(future_directory.path())
+            .expect("future backup store");
+        assert_eq!(
+            future_store.export_pre_migration_database(
+                &mut future,
+                &future_lifecycle,
+                &BackupExportRequestV1 {
+                    backup_id: BACKUP_ID,
+                    created_at_unix: NOW + 2,
+                    expires_at_unix: Some(NOW + 100),
+                },
+                &PreMigrationBackupExportContextV1 {
+                    expected_privacy_store_schema_version: 4,
+                },
+            ),
+            Err(LifecycleError::UnsupportedSchema)
+        );
+
+        let (mut mismatched, mismatched_lifecycle) = setup_review();
+        set_privacy_store_schema_version(&mismatched, 3);
+        let mismatched_directory = tempfile::tempdir().expect("mismatched backup directory");
+        let mismatched_store = EncryptedPrivacyBackupStore::initialize(mismatched_directory.path())
+            .expect("mismatched backup store");
+        assert_eq!(
+            mismatched_store.export_pre_migration_database(
+                &mut mismatched,
+                &mismatched_lifecycle,
+                &BackupExportRequestV1 {
+                    backup_id: BACKUP_ID,
+                    created_at_unix: NOW + 2,
+                    expires_at_unix: Some(NOW + 100),
+                },
+                &PreMigrationBackupExportContextV1 {
+                    expected_privacy_store_schema_version: 4,
+                },
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+
+        let (mut damaged, damaged_lifecycle) = setup_review();
+        damaged
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DELETE FROM privacy_materials WHERE material_id='material-1';
+                 PRAGMA foreign_keys=ON;",
+            )
+            .expect("create synthetic foreign-key damage");
+        set_privacy_store_schema_version(&damaged, 4);
+        let damaged_directory = tempfile::tempdir().expect("damaged backup directory");
+        let damaged_store = EncryptedPrivacyBackupStore::initialize(damaged_directory.path())
+            .expect("damaged backup store");
+        assert_eq!(
+            damaged_store.export_pre_migration_database(
+                &mut damaged,
+                &damaged_lifecycle,
+                &BackupExportRequestV1 {
+                    backup_id: BACKUP_ID,
+                    created_at_unix: NOW + 2,
+                    expires_at_unix: Some(NOW + 100),
+                },
+                &PreMigrationBackupExportContextV1 {
+                    expected_privacy_store_schema_version: 4,
+                },
+            ),
+            Err(LifecycleError::BackupTampered)
+        );
+        assert!(!damaged_store
+            .backup_path(BACKUP_ID)
+            .expect("damaged backup path")
+            .exists());
+        let registered: i64 = damaged
+            .query_row(
+                "SELECT COUNT(*) FROM privacy_backup_registry WHERE backup_id=?1",
+                [BACKUP_ID],
+                |row| row.get(0),
+            )
+            .expect("damaged backup registry");
+        assert_eq!(registered, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_v5_backup_remains_normal_and_never_falls_back_to_pre_migration() {
+        let (mut connection, lifecycle) = setup_review();
+        let directory = tempfile::tempdir().expect("backup directory");
+        let store =
+            EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
+        let request = BackupExportRequestV1 {
+            backup_id: BACKUP_ID,
+            created_at_unix: NOW + 2,
+            expires_at_unix: Some(NOW + 100),
+        };
+        let exported = store
+            .export_database(&mut connection, &lifecycle, &request)
+            .expect("normal current-schema export");
+        assert_eq!(
+            exported.privacy_store_schema_version,
+            PRIVACY_STORE_SCHEMA_VERSION
+        );
+        let normal_context = BackupVerificationContextV1 {
+            expected_workspace_instance_id: lifecycle.workspace_instance_id(),
+            expected_key_epoch: lifecycle
+                .current_key_epoch(&connection)
+                .expect("current key epoch"),
+            now_unix: NOW + 3,
+        };
+        assert_eq!(
+            store
+                .verify_detached_backup(BACKUP_ID, &normal_context)
+                .expect("normal detached verification"),
+            exported
+        );
+        assert_eq!(
+            store.verify_detached_pre_migration_backup(
+                BACKUP_ID,
+                &PreMigrationBackupVerificationContextV1 {
+                    expected_workspace_instance_id: lifecycle.workspace_instance_id(),
+                    expected_key_epoch: normal_context.expected_key_epoch,
+                    expected_privacy_store_schema_version: 4,
+                    now_unix: NOW + 3,
+                },
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+
+        let second_id = "bkp_55555555555555555555555555555555";
+        assert_eq!(
+            store.export_pre_migration_database(
+                &mut connection,
+                &lifecycle,
+                &BackupExportRequestV1 {
+                    backup_id: second_id,
+                    ..request
+                },
+                &PreMigrationBackupExportContextV1 {
+                    expected_privacy_store_schema_version: PRIVACY_STORE_SCHEMA_VERSION,
+                },
+            ),
+            Err(LifecycleError::InvalidInput)
+        );
+        assert!(!store
+            .backup_path(second_id)
+            .expect("pre-migration current-schema path")
+            .exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn encrypted_backup_round_trip_tamper_wrong_environment_expiry_revoke_and_hardlink() {
         let (mut connection, lifecycle) = setup_review();
         lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 1)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
             .expect("mapping");
         let directory = tempfile::tempdir().expect("backup directory");
-        let store = EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
+        let store =
+            EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
         let exported = store
             .export_database(
                 &mut connection,
@@ -724,15 +1487,19 @@ mod lifecycle_tests {
             expected_key_epoch: lifecycle.current_key_epoch(&connection).expect("epoch"),
             now_unix: NOW + 3,
         };
-        assert_eq!(store.verify_backup(&connection, BACKUP_ID, &context).expect("verify"), exported);
+        assert_eq!(
+            store
+                .verify_backup(&connection, BACKUP_ID, &context)
+                .expect("verify"),
+            exported
+        );
         assert_eq!(
             store
                 .verify_detached_backup(BACKUP_ID, &context)
                 .expect("detached verify"),
             exported
         );
-        let mut detached_restore =
-            Connection::open_in_memory().expect("detached restore database");
+        let mut detached_restore = Connection::open_in_memory().expect("detached restore database");
         store
             .restore_detached_into_empty_database(&mut detached_restore, BACKUP_ID, &context)
             .expect("detached restore");
@@ -741,7 +1508,8 @@ mod lifecycle_tests {
         store
             .restore_into_empty_database(&connection, &mut restored, BACKUP_ID, &context)
             .expect("restore");
-        let restored_lifecycle = PrivacyLifecycle::open(&restored, workspace()).expect("open restored");
+        let restored_lifecycle =
+            PrivacyLifecycle::open(&restored, workspace()).expect("open restored");
         let loaded = restored_lifecycle
             .load_mapping_revision(
                 &mut restored,
@@ -850,7 +1618,14 @@ mod lifecycle_tests {
     fn portable_backup_bundle_import_restores_and_rejects_tamper_environment_and_duplicate() {
         let (mut connection, lifecycle) = setup_review();
         lifecycle
-            .save_mapping_revision(&mut connection, MAP_ID, "redaction-1", 1, &mapping(), NOW + 1)
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
             .expect("mapping");
         let source_directory = tempfile::tempdir().expect("source backup directory");
         let source_store =
@@ -879,8 +1654,9 @@ mod lifecycle_tests {
             .any(|window| window == b"SYNTHETIC_PRIVATE_NAME_CANARY"));
 
         let destination_directory = tempfile::tempdir().expect("destination directory");
-        let destination_store = EncryptedPrivacyBackupStore::initialize(destination_directory.path())
-            .expect("destination store");
+        let destination_store =
+            EncryptedPrivacyBackupStore::initialize(destination_directory.path())
+                .expect("destination store");
         destination_store
             .import_portable_bundle(&bundle, &context)
             .expect("import");
@@ -926,7 +1702,9 @@ mod lifecycle_tests {
         let mut tampered = bundle;
         let middle = tampered.len() / 2;
         tampered[middle] ^= 1;
-        assert!(wrong_store.import_portable_bundle(&tampered, &context).is_err());
+        assert!(wrong_store
+            .import_portable_bundle(&tampered, &context)
+            .is_err());
     }
 
     #[test]
@@ -960,9 +1738,8 @@ mod lifecycle_tests {
         let directory = tempfile::tempdir().expect("backup directory");
         EncryptedPrivacyBackupStore::initialize(directory.path()).expect("initialize store");
         let staging = directory.path().join(".staging");
-        let exact = staging.join(
-            "bkp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111111111111111-restore.sqlite",
-        );
+        let exact =
+            staging.join("bkp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111111111111111-restore.sqlite");
         fs::write(&exact, b"synthetic residual").expect("write exact residual");
         EncryptedPrivacyBackupStore::open(directory.path()).expect("clean exact residual");
         assert!(!exact.exists());
@@ -975,9 +1752,8 @@ mod lifecycle_tests {
         ));
         fs::remove_file(&unknown).expect("remove unknown residual");
 
-        let hardlinked = staging.join(
-            "bkp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-2222222222222222-sqlite",
-        );
+        let hardlinked =
+            staging.join("bkp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-2222222222222222-sqlite");
         let alias = directory.path().join("synthetic-hardlink");
         fs::write(&hardlinked, b"synthetic hardlinked residual").expect("write residual");
         fs::hard_link(&hardlinked, &alias).expect("create hardlink");
@@ -994,7 +1770,8 @@ mod lifecycle_tests {
     fn backup_valid_wrong_key_and_dpapi_wrapper_tamper_fail_closed() {
         let (mut connection, lifecycle) = setup_review();
         let directory = tempfile::tempdir().expect("backup directory");
-        let store = EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
+        let store =
+            EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
         store
             .export_database(
                 &mut connection,

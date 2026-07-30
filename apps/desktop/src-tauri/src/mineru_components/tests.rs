@@ -702,10 +702,28 @@ fn failed_download_artifact_cleanup_is_exact_and_does_not_follow_links() {
     let unsafe_directory = temporary.path().join("unsafe-download");
     fs::create_dir(&unsafe_directory).unwrap();
     let target = temporary.path().join("outside");
-    fs::write(&target, b"outside").unwrap();
-    std::os::windows::fs::symlink_file(&target, unsafe_directory.join("link")).unwrap();
-    assert!(package::cleanup_safe_transient(&unsafe_directory).is_err());
-    assert_eq!(fs::read(target).unwrap(), b"outside");
+    fs::create_dir(&target).unwrap();
+    let sentinel = target.join("sentinel.bin");
+    fs::write(&sentinel, b"outside").unwrap();
+    let link = unsafe_directory.join("link");
+    let created = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("launch the Windows junction fixture command");
+    assert!(created.success(), "create the NTFS junction fixture");
+    assert_eq!(
+        package::cleanup_safe_transient(&unsafe_directory)
+            .unwrap_err()
+            .code(),
+        "cleanup_failed"
+    );
+    assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+    fs::remove_dir(&link).unwrap();
 }
 
 #[test]

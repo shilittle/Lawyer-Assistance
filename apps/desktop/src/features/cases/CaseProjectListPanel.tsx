@@ -4,10 +4,12 @@ import type { CaseWorkspaceController } from "./useCaseWorkspaceController";
 
 export interface CaseProjectListPanelProps {
   controller: CaseWorkspaceController;
+  onBeforeProjectChange?: (projectId: string | null) => boolean;
 }
 
 export function CaseProjectListPanel({
   controller,
+  onBeforeProjectChange,
 }: CaseProjectListPanelProps) {
   const {
     caseProjects,
@@ -29,7 +31,10 @@ export function CaseProjectListPanel({
               <button
                 disabled={caseNavigationLocked}
                 type="button"
-                onClick={startNewCaseProject}
+                onClick={() => {
+                  if (onBeforeProjectChange?.(null) === false) return;
+                  startNewCaseProject();
+                }}
               >
                 新建案件
               </button>
@@ -45,7 +50,15 @@ export function CaseProjectListPanel({
                   disabled={caseNavigationLocked}
                   key={project.projectId}
                   type="button"
-                  onClick={() => selectCaseProject(project)}
+                  onClick={() => {
+                    if (
+                      project.projectId !== selectedCaseProjectId &&
+                      onBeforeProjectChange?.(project.projectId) === false
+                    ) {
+                      return;
+                    }
+                    selectCaseProject(project);
+                  }}
                 >
                   <span className="item-title">
                     {publicTitle(project.title, "未命名案件")}

@@ -216,6 +216,26 @@ pub struct ApplicationBackupOpenContext<'a> {
     pub now_unix: u64,
 }
 
+/// Narrow verification context for an already-installed pre-migration rollback point.
+///
+/// Unlike the normal restore/open context, this context authenticates the app version and
+/// validity window recorded when the rollback point was created instead of requiring the
+/// currently running version and wall clock. This prevents an expired backup, or a later
+/// application binary, from making an otherwise required migration rollback point impossible to
+/// authenticate. Callers must additionally bind this context to a migration-specific,
+/// DPAPI-protected identity manifest.
+#[derive(Debug, Clone)]
+pub struct MigrationApplicationBackupOpenContext<'a> {
+    pub expected_workspace_instance_id: &'a WorkspaceInstanceId,
+    pub expected_user_schema_version: i64,
+    pub expected_backup_id: &'a str,
+    pub expected_privacy_backup_id: &'a str,
+    pub expected_app_version: &'a str,
+    pub expected_created_at_unix: u64,
+    pub expected_expires_at_unix: u64,
+    pub expected_bundle_sha256: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplicationBackupMetadata {
@@ -823,6 +843,57 @@ pub fn open_application_backup(
         approved_workspace_bundle: None,
         work_products_bundle: None,
     })
+}
+
+/// Authenticates a V3 five-component backup retained as a pre-migration rollback point.
+///
+/// This deliberately does not change normal application-backup validation: interactive verify
+/// and restore still require the current application version and an unexpired envelope. The
+/// migration gate may use this function only after authenticating its separate source/component
+/// identity manifest.
+pub fn open_application_backup_for_migration_recovery(
+    bytes: &[u8],
+    context: &MigrationApplicationBackupOpenContext<'_>,
+) -> Result<OpenedApplicationBackup, ApplicationBackupError> {
+    if bytes.is_empty() || bytes.len() > MAX_APPLICATION_BACKUP_BYTES {
+        return Err(ApplicationBackupError::TooLarge);
+    }
+    validate_app_version(context.expected_app_version)?;
+    if context.expected_user_schema_version <= 0
+        || context.expected_created_at_unix == 0
+        || context.expected_created_at_unix >= context.expected_expires_at_unix
+        || validate_backup_id(context.expected_backup_id).is_err()
+        || validate_privacy_backup_id(context.expected_privacy_backup_id).is_err()
+        || !is_hash(context.expected_bundle_sha256)
+        || sha256_hex(bytes) != context.expected_bundle_sha256
+    {
+        return Err(ApplicationBackupError::InvalidInput);
+    }
+    let probe: ApplicationBackupSchemaProbe =
+        strict_json_v1_from_slice(bytes).map_err(|_| ApplicationBackupError::Tampered)?;
+    if probe.schema_version != APPLICATION_BACKUP_V3_SCHEMA_VERSION {
+        return Err(ApplicationBackupError::UnsupportedSchema);
+    }
+    let envelope: ApplicationBackupEnvelopeV3 =
+        strict_json_v1_from_slice(bytes).map_err(|_| ApplicationBackupError::Tampered)?;
+    if envelope.backup_id != context.expected_backup_id
+        || envelope.privacy_backup_id != context.expected_privacy_backup_id
+        || envelope.app_version != context.expected_app_version
+        || envelope.created_at_unix != context.expected_created_at_unix
+        || envelope.expires_at_unix != context.expected_expires_at_unix
+    {
+        return Err(ApplicationBackupError::EnvironmentMismatch);
+    }
+    open_application_backup_v3(
+        bytes,
+        &ApplicationBackupOpenContext {
+            expected_workspace_instance_id: context.expected_workspace_instance_id,
+            expected_app_version: context.expected_app_version,
+            expected_user_schema_version: context.expected_user_schema_version,
+            // The authenticated creation instant is inside the authenticated validity window.
+            now_unix: context.expected_created_at_unix,
+        },
+    )
 }
 
 fn open_application_backup_v3(
@@ -1855,6 +1926,53 @@ mod tests {
             Some(work_products_manifest.as_str())
         );
         assert!(!format!("{opened:?}").contains("CANARY"));
+    }
+
+    #[test]
+    fn migration_recovery_open_authenticates_v3_after_normal_expiry_and_version_drift() {
+        let workspace = test_workspace('9');
+        let vault_manifest = sha256_hex(b"recovery-vault-manifest");
+        let approved_manifest = sha256_hex(b"recovery-approved-manifest");
+        let work_manifest = sha256_hex(b"recovery-work-manifest");
+        let request = request_v3(
+            &workspace,
+            b"SQLite format 3\0RECOVERY_USER",
+            b"RECOVERY_PRIVACY",
+            b"RECOVERY_VAULT",
+            &vault_manifest,
+            b"RECOVERY_APPROVED",
+            &approved_manifest,
+            b"RECOVERY_WORK",
+            &work_manifest,
+        );
+        let (bundle, metadata) = seal_application_backup_v3(&request).expect("seal recovery V3");
+        assert_eq!(
+            open_application_backup(
+                &bundle,
+                &ApplicationBackupOpenContext {
+                    expected_workspace_instance_id: &workspace,
+                    expected_app_version: "0.4.0-beta.3",
+                    expected_user_schema_version: 9,
+                    now_unix: 20_000,
+                },
+            ),
+            Err(ApplicationBackupError::EnvironmentMismatch)
+        );
+        let opened = open_application_backup_for_migration_recovery(
+            &bundle,
+            &MigrationApplicationBackupOpenContext {
+                expected_workspace_instance_id: &workspace,
+                expected_user_schema_version: 9,
+                expected_backup_id: request.backup_id,
+                expected_privacy_backup_id: request.privacy_backup_id,
+                expected_app_version: request.app_version,
+                expected_created_at_unix: request.created_at_unix,
+                expected_expires_at_unix: request.expires_at_unix,
+                expected_bundle_sha256: &metadata.bundle_sha256,
+            },
+        )
+        .expect("migration-only recovery authenticates the original V3 envelope");
+        assert_eq!(opened.metadata, metadata);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::privacy_workflow::{
 };
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::mpsc,
+    sync::{mpsc, Arc},
     thread,
     time::Duration,
 };
@@ -13,7 +13,6 @@ use tempfile::TempDir;
 const USER_CANARY_KEY: &str = "privacy_vnext_paired_backup_canary";
 const BACKED_UP_USER_CANARY: &str = "SYNTHETIC_USER_DB_BEFORE_BACKUP_4F9C";
 const MUTATED_USER_CANARY: &str = "SYNTHETIC_USER_DB_AFTER_BACKUP_A71D";
-
 fn policy(days: u64) -> SetRetentionPolicyRequest {
     SetRetentionPolicyRequest {
         review_retention_seconds: days * 86_400,
@@ -61,6 +60,765 @@ fn fixture_v3() -> (
     (directory, workspace, state, workflow, approved)
 }
 
+#[test]
+fn pre_migration_backup_gate_creates_one_fixed_five_component_backup_and_reuses_it() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect("create fixed pre-migration backup");
+    let expected_path = directory
+        .path()
+        .join(MIGRATION_BACKUP_DIRECTORY_NAME)
+        .join(format!(
+            "case-material-unification-v1-{source_fingerprint}.lavbackup"
+        ));
+    assert!(first.created);
+    assert_eq!(first.path, expected_path);
+    assert_eq!(first.metadata.chunk_count, 5);
+    assert!(first.metadata.approved_workspace_bundle_sha256.is_some());
+    assert!(first.metadata.work_products_bundle_sha256.is_some());
+    assert!(first.path.is_file());
+    assert!(migration_backup_identity_path(&first.path)
+        .expect("identity path")
+        .is_file());
+
+    let second = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect("strictly validate and reuse fixed pre-migration backup");
+    assert!(!second.created);
+    assert_eq!(second.path, first.path);
+    assert_eq!(second.metadata, first.metadata);
+
+    let connection =
+        Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE)).expect("privacy DB");
+    let active_backups: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM privacy_backup_registry WHERE state='active'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("active backup count");
+    assert_eq!(active_backups, 1);
+}
+
+#[test]
+fn pre_migration_backup_gate_never_reuses_a_snapshot_for_changed_source_rows() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let first_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("initial semantic source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &first_fingerprint,
+    )
+    .expect("create first source-bound backup");
+
+    database::upsert_case_project(
+        &database::open_user_database(state.user_database_path()).expect("open user database"),
+        &database::CaseProjectRow {
+            project_id: "case-backup-source-change".to_owned(),
+            title: "Changed migration source".to_owned(),
+            case_type: "civil".to_owned(),
+            status: "active".to_owned(),
+            opened_on: None,
+            summary: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        },
+    )
+    .expect("change project source rows");
+    let second_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("changed semantic source fingerprint");
+    assert_ne!(second_fingerprint, first_fingerprint);
+
+    let second = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &second_fingerprint,
+    )
+    .expect("create a new backup for changed source rows");
+
+    assert!(first.created);
+    assert!(second.created);
+    assert_ne!(second.path, first.path);
+    assert!(first.path.is_file());
+    assert!(second.path.is_file());
+}
+
+fn assert_component_drift_creates_new_preserved_backup(
+    first: &MigrationApplicationBackup,
+    second: &MigrationApplicationBackup,
+) {
+    assert!(first.created);
+    assert!(second.created);
+    assert_ne!(first.path, second.path);
+    for path in [&first.path, &second.path] {
+        assert!(path.is_file());
+        assert!(migration_backup_identity_path(path)
+            .expect("component identity path")
+            .is_file());
+    }
+}
+
+#[test]
+fn pre_migration_backup_rebuilds_without_replacement_for_user_database_component_drift() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("first backup");
+    set_user_canary(
+        state.user_database_path(),
+        "NON_SOURCE_USER_COMPONENT_DRIFT",
+    );
+    assert_eq!(
+        workflow
+            .case_material_migration_source_fingerprint()
+            .expect("unchanged semantic source"),
+        source
+    );
+    let second = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("new identity-bound backup");
+    assert_component_drift_creates_new_preserved_backup(&first, &second);
+}
+
+#[test]
+fn pre_migration_backup_rebuilds_without_replacement_for_privacy_component_drift() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("first backup");
+    workflow
+        .set_retention_policy(policy(2))
+        .expect("non-migration Privacy change");
+    let second = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("new identity-bound backup");
+    assert_component_drift_creates_new_preserved_backup(&first, &second);
+}
+
+#[test]
+fn pre_migration_backup_rebuilds_without_replacement_for_vault_component_drift() {
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
+    let source = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("first backup");
+    let vault = VaultStore::initialize(
+        directory.path().join(VAULT_DIRECTORY_NAME),
+        workspace.clone(),
+    )
+    .expect("open Vault");
+    vault
+        .create_source_object(
+            &privacy::vnext::CaseId::parse(format!("case_{}", "d".repeat(32)))
+                .expect("Privacy CaseId"),
+            privacy::vault_store::VaultPrivateMetadataInputV1 {
+                original_file_name: "vault-drift.txt".to_owned(),
+                original_source_path: None,
+                original_media_type: "text/plain".to_owned(),
+                imported_at_unix: 1_750_000_100,
+            },
+            b"isolated Vault component drift",
+            1_750_000_100,
+        )
+        .expect("committed Vault object");
+    drop(vault);
+    let second = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("new identity-bound backup");
+    assert_component_drift_creates_new_preserved_backup(&first, &second);
+}
+
+#[test]
+fn pre_migration_backup_rebuilds_without_replacement_for_approved_component_drift() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("first backup");
+    approved
+        .publish_generation(&format!("case_{}", "e".repeat(32)), 'e')
+        .expect("approved generation drift");
+    let second = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("new identity-bound backup");
+    assert_component_drift_creates_new_preserved_backup(&first, &second);
+}
+
+#[test]
+fn pre_migration_backup_rebuilds_without_replacement_for_work_product_component_drift() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let case_id = format!("case_{}", "f".repeat(32));
+    let published = approved
+        .publish_generation(&case_id, 'f')
+        .expect("baseline approved generation");
+    let source = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("first backup");
+    approved
+        .create_work_product(&published, b"[PERSON_001] isolated work-product drift")
+        .expect("work-product drift");
+    let second = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("new identity-bound backup");
+    assert_component_drift_creates_new_preserved_backup(&first, &second);
+}
+
+#[test]
+fn migration_reuse_authenticates_expired_and_cross_version_rollback_points_without_weakening_normal_open(
+) {
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
+    let source = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("source fingerprint");
+    let first = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("first backup");
+    let bytes = fs::read(&first.path).expect("backup bytes");
+    assert_eq!(
+        open_application_backup(
+            &bytes,
+            &ApplicationBackupOpenContext {
+                expected_workspace_instance_id: &workspace,
+                expected_app_version: env!("CARGO_PKG_VERSION"),
+                expected_user_schema_version: database::USER_SCHEMA_VERSION,
+                now_unix: first.metadata.expires_at_unix,
+            },
+        ),
+        Err(privacy::ApplicationBackupError::Expired)
+    );
+    assert_eq!(
+        open_application_backup(
+            &bytes,
+            &ApplicationBackupOpenContext {
+                expected_workspace_instance_id: &workspace,
+                expected_app_version: "999.0.0-migration-recovery-test",
+                expected_user_schema_version: database::USER_SCHEMA_VERSION,
+                now_unix: first.metadata.created_at_unix,
+            },
+        ),
+        Err(privacy::ApplicationBackupError::EnvironmentMismatch)
+    );
+    let reused = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source,
+    )
+    .expect("migration-only protected identity authenticates the rollback point");
+    assert!(!reused.created);
+    assert_eq!(reused.path, first.path);
+    let identity_path = migration_backup_identity_path(&first.path).expect("identity path");
+    let staged = stage_migration_application_restore_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &first.path,
+        &identity_path,
+        &bytes,
+    )
+    .expect("the supported restore command stages the authenticated migration rollback point");
+    assert_eq!(staged.bundle_sha256, first.metadata.bundle_sha256);
+    drop(workflow);
+    drop(state);
+    apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect("the normal pending-restore transaction applies all five migration components");
+    assert_no_restore_residue(&application_restore_paths(directory.path()));
+}
+
+#[test]
+fn pre_migration_backup_gate_fails_closed_for_tamper_and_hardlinks() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    let backup = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect("create fixed pre-migration backup");
+    let alias = directory.path().join("migration-backup-hardlink-alias");
+    fs::hard_link(&backup.path, &alias).expect("create backup hardlink");
+    let hardlink_error = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect_err("hardlinked fixed backup must fail closed");
+    assert_eq!(hardlink_error.error_type, "migration_backup_unsafe_path");
+    fs::remove_file(alias).expect("remove backup hardlink alias");
+
+    let mut bytes = fs::read(&backup.path).expect("read fixed backup");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    fs::write(&backup.path, bytes).expect("tamper fixed backup");
+    let tamper_error = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect_err("tampered fixed backup must fail closed");
+    assert_eq!(tamper_error.error_type, "migration_backup_tampered");
+}
+
+#[test]
+fn pre_migration_backup_gate_fails_closed_for_identity_sidecar_tamper() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    let backup = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect("create fixed pre-migration backup");
+    let identity_path = migration_backup_identity_path(&backup.path).expect("identity path");
+    let mut bytes = fs::read(&identity_path).expect("identity bytes");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    fs::write(&identity_path, bytes).expect("tamper identity");
+    let error = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect_err("tampered DPAPI identity must fail closed");
+    assert_eq!(error.error_type, "migration_backup_identity_tampered");
+    assert!(backup.path.is_file());
+}
+
+#[test]
+fn pre_migration_backup_gate_rejects_path_like_ids_before_creating_a_marker() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    let error = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        "../case-material-unification-v1",
+        &source_fingerprint,
+    )
+    .expect_err("path-like migration id must be rejected");
+    assert_eq!(error.error_type, "migration_backup_invalid_id");
+    assert!(!directory
+        .path()
+        .join(MIGRATION_BACKUP_DIRECTORY_NAME)
+        .exists());
+
+    let fingerprint_error = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        "../not-a-hash",
+    )
+    .expect_err("path-like source fingerprint must be rejected");
+    assert_eq!(
+        fingerprint_error.error_type,
+        "migration_backup_invalid_source_fingerprint"
+    );
+    assert!(!directory
+        .path()
+        .join(MIGRATION_BACKUP_DIRECTORY_NAME)
+        .exists());
+
+    let reparse_target = directory.path().join("synthetic-migration-backup-target");
+    fs::create_dir(&reparse_target).expect("create reparse target");
+    if std::os::windows::fs::symlink_dir(
+        &reparse_target,
+        directory.path().join(MIGRATION_BACKUP_DIRECTORY_NAME),
+    )
+    .is_err()
+    {
+        // Windows runners without Developer Mode cannot create a test reparse point.
+        // Production still rejects it through FILE_ATTRIBUTE_REPARSE_POINT.
+        return;
+    }
+    let reparse_error = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect_err("reparse migration backup directory must fail closed");
+    assert_eq!(reparse_error.error_type, "migration_backup_unsafe_path");
+}
+
+#[test]
+fn pre_migration_backup_build_failure_leaves_no_success_or_staging_file() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    fs::remove_file(state.user_database_path()).expect("remove synthetic user database");
+    ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect_err("backup build without the fixed user database must fail");
+    let backup_directory = directory.path().join(MIGRATION_BACKUP_DIRECTORY_NAME);
+    assert!(!backup_directory
+        .join(format!(
+            "case-material-unification-v1-{source_fingerprint}.lavbackup"
+        ))
+        .exists());
+    if backup_directory.exists() {
+        assert!(fs::read_dir(&backup_directory)
+            .expect("read backup directory")
+            .next()
+            .is_none());
+    }
+}
+
+#[test]
+fn pre_migration_backup_install_failure_preserves_and_recovers_the_authenticated_pair() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    let error = ensure_pre_migration_application_backup_with_install_hook(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+        |_, _| {
+            Err(ipc_error(
+                "synthetic_migration_backup_install_failure",
+                "Synthetic migration backup install failure.",
+            ))
+        },
+    )
+    .expect_err("synthetic install failure must propagate");
+    assert_eq!(error.error_type, "migration_backup_install_incomplete");
+    let backup_directory = directory.path().join(MIGRATION_BACKUP_DIRECTORY_NAME);
+    assert!(!backup_directory
+        .join(format!(
+            "case-material-unification-v1-{source_fingerprint}.lavbackup"
+        ))
+        .exists());
+    let identity_path = backup_directory.join(format!(
+        "case-material-unification-v1-{source_fingerprint}.lavbackup.identity.dpapi"
+    ));
+    assert!(identity_path.is_file());
+    assert!(fs::read_dir(&backup_directory)
+        .expect("read backup directory")
+        .any(|entry| entry
+            .expect("staging entry")
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".staged.lavbackup")));
+
+    let connection =
+        Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE)).expect("privacy DB");
+    let (active, revoked): (i64, i64) = connection
+        .query_row(
+            "SELECT
+               SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN state='revoked' THEN 1 ELSE 0 END)
+             FROM privacy_backup_registry",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("privacy backup states");
+    assert_eq!(active, 1);
+    assert_eq!(revoked, 0);
+    drop(connection);
+
+    let recovered = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect("next startup recovers the exact staged bundle named by the protected identity");
+    assert!(!recovered.created);
+    assert!(recovered.path.is_file());
+    assert!(identity_path.is_file());
+}
+
+#[test]
+fn pre_migration_backup_cleans_authenticated_precommit_staging_and_revokes_its_registry_row() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    let (bytes, metadata, _, built) = build_application_backup_internal(
+        directory.path(),
+        &state,
+        &workflow,
+        Some(&approved.workspace),
+        || {},
+    )
+    .expect("build interrupted pair");
+    let built = built.expect("five-component identity");
+    let file_name =
+        migration_backup_file_name(CASE_MATERIAL_UNIFICATION_MIGRATION_ID, &source_fingerprint)
+            .expect("fixed file name");
+    let identity = migration_backup_identity(
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+        &file_name,
+        &workflow,
+        &metadata,
+        &built,
+    )
+    .expect("protected identity");
+    let backup_directory =
+        ensure_migration_backup_directory(directory.path()).expect("backup directory");
+    let staged_backup = backup_directory.join(format!(
+        ".{}-{}-{}.staged.lavbackup",
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        source_fingerprint,
+        Uuid::new_v4().simple()
+    ));
+    let staged_identity = backup_directory.join(format!(
+        ".{}-{}-{}.staged.identity.dpapi",
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        source_fingerprint,
+        Uuid::new_v4().simple()
+    ));
+    stage_migration_backup_pair(
+        &staged_backup,
+        &staged_identity,
+        &bytes,
+        &identity,
+        &workflow,
+        &metadata,
+    )
+    .expect("durable precommit staging");
+
+    let completed = ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+    )
+    .expect("restart cleans the orphan and builds one committed pair");
+    assert!(completed.created);
+    assert!(!staged_backup.exists());
+    assert!(!staged_identity.exists());
+    let connection =
+        Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE)).expect("privacy DB");
+    let (active, revoked): (i64, i64) = connection
+        .query_row(
+            "SELECT
+               SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN state='revoked' THEN 1 ELSE 0 END)
+             FROM privacy_backup_registry",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("privacy backup states");
+    assert_eq!(active, 1);
+    assert_eq!(revoked, 1);
+}
+
+#[test]
+fn source_change_after_durable_install_preserves_the_old_source_rollback_pair_and_registry() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let source_fingerprint = workflow
+        .case_material_migration_source_fingerprint()
+        .expect("semantic migration source fingerprint");
+    let user_database = state.user_database_path().to_path_buf();
+    let error = ensure_pre_migration_application_backup_with_install_hook(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+        &source_fingerprint,
+        |staging, destination| {
+            atomic_install_new_migration_backup(staging, destination)?;
+            database::upsert_case_project(
+                &database::open_user_database(&user_database).map_err(|_| {
+                    ipc_error("synthetic_source_change_failed", "open synthetic user DB")
+                })?,
+                &database::CaseProjectRow {
+                    project_id: "case-post-install-source-change".to_owned(),
+                    title: "Post-install source change".to_owned(),
+                    case_type: "civil".to_owned(),
+                    status: "active".to_owned(),
+                    opened_on: None,
+                    summary: String::new(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+            )
+            .map_err(|_| {
+                ipc_error(
+                    "synthetic_source_change_failed",
+                    "mutate synthetic migration source",
+                )
+            })
+        },
+    )
+    .expect_err("source drift blocks migration after durable install");
+    assert_eq!(error.error_type, "migration_backup_source_changed");
+    let old_path = directory
+        .path()
+        .join(MIGRATION_BACKUP_DIRECTORY_NAME)
+        .join(format!(
+            "case-material-unification-v1-{source_fingerprint}.lavbackup"
+        ));
+    assert!(old_path.is_file());
+    assert!(migration_backup_identity_path(&old_path)
+        .expect("old identity")
+        .is_file());
+    let connection =
+        Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE)).expect("privacy DB");
+    let active: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM privacy_backup_registry WHERE state='active'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("active rollback registry");
+    assert_eq!(active, 1);
+}
+
 fn tree_sha256(root: &Path) -> String {
     fn collect(root: &Path, current: &Path, output: &mut Vec<(String, Vec<u8>)>) {
         let mut entries = fs::read_dir(current)
@@ -95,6 +853,16 @@ fn tree_sha256(root: &Path) -> String {
     privacy::sha256_hex(&bytes)
 }
 
+fn approved_lineage_manifests(workspace: &ApprovedMcpWorkspace) -> (String, String) {
+    let snapshot = workspace
+        .snapshot_for_application_backup()
+        .expect("snapshot approved/work-product lineage");
+    (
+        snapshot.approved_workspace_manifest_sha256,
+        snapshot.work_products_manifest_sha256,
+    )
+}
+
 fn assert_no_restore_residue(paths: &ApplicationRestorePaths) {
     for path in [
         &paths.marker,
@@ -111,6 +879,232 @@ fn assert_no_restore_residue(paths: &ApplicationRestorePaths) {
     ] {
         assert!(!path.exists(), "restore transaction residue: {path:?}");
     }
+}
+
+fn replace_privacy_store_with_exact_v4(
+    path: &Path,
+    workspace: &privacy::vnext::WorkspaceInstanceId,
+) {
+    for candidate in [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-journal"),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ] {
+        if candidate.exists() {
+            fs::remove_file(&candidate).expect("remove current Privacy fixture");
+        }
+    }
+    let mut connection = Connection::open(path).expect("create exact v4 Privacy fixture");
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE privacy_schema_metadata(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             INSERT INTO privacy_schema_metadata(key,value)
+             VALUES('schema_version','4');
+             CREATE TABLE privacy_materials(
+                material_id TEXT PRIMARY KEY,
+                project_id TEXT,
+                attachment_id TEXT,
+                source_sha256 TEXT NOT NULL,
+                source_name_sha256 TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                page_count INTEGER,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE privacy_redactions(
+                redaction_id TEXT PRIMARY KEY,
+                material_id TEXT NOT NULL,
+                extraction_sha256 TEXT NOT NULL,
+                redacted_content_sha256 TEXT NOT NULL,
+                approved_payload_sha256 TEXT,
+                policy_id TEXT NOT NULL,
+                policy_version INTEGER NOT NULL,
+                detector_version TEXT NOT NULL,
+                unresolved_high_risk_count INTEGER NOT NULL,
+                review_state TEXT NOT NULL,
+                protected_review_blob BLOB NOT NULL,
+                protection_scheme TEXT NOT NULL,
+                reviewed_by_sha256 TEXT,
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                FOREIGN KEY(material_id) REFERENCES privacy_materials(material_id)
+             );",
+        )
+        .expect("exact v4 backing schema");
+    PrivacyLifecycle::initialize(&mut connection, workspace.clone(), 1_750_000_000)
+        .expect("v4 lifecycle state");
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("flush v4 fixture");
+}
+
+#[test]
+fn five_component_restore_recovers_exact_v4_privacy_and_v1_vault_then_upgrades_after_backup() {
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
+    let privacy_database = directory.path().join(PRIVACY_DATABASE_RELATIVE);
+    let vault_root = directory.path().join(VAULT_DIRECTORY_NAME);
+    let vault_database = vault_root.join("vault-state.sqlite");
+    drop(workflow);
+    replace_privacy_store_with_exact_v4(&privacy_database, &workspace);
+    let connection = Connection::open(&vault_database).expect("open Vault database");
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP TRIGGER IF EXISTS trg_vault_cleanup_purged_no_update;
+             DROP TRIGGER IF EXISTS trg_vault_cleanup_no_delete;
+             DROP INDEX IF EXISTS idx_vault_retention_expiry;
+             DROP TABLE IF EXISTS vault_cleanup_candidates;
+             DROP TABLE IF EXISTS vault_cleanup_journal;
+             DROP TABLE IF EXISTS vault_object_retention;
+             DROP TABLE IF EXISTS vault_lifecycle_meta;
+             UPDATE vault_meta SET schema_version=1 WHERE singleton=1;
+             COMMIT;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("downgrade synthetic Vault to exact v1");
+    drop(connection);
+
+    let workflow =
+        PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+            directory.path().to_path_buf(),
+            workspace.clone(),
+            Arc::new(approved.workspace.clone()),
+        )
+        .expect("open exact legacy components without upgrading");
+    assert!(workflow.privacy_store_schema_upgrade_required());
+    assert!(workflow.vault_startup_write_required());
+    let (bundle, _, _) =
+        build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+            .expect("build five-component backup containing v4 Privacy and v1 Vault");
+
+    workflow
+        .upgrade_privacy_store_schema_after_backup()
+        .expect("upgrade active components only after the synthetic backup");
+    assert_eq!(
+        PrivacyStore::preflight_schema(
+            &Connection::open(&privacy_database).expect("open upgraded active Privacy")
+        )
+        .expect("upgraded active Privacy schema"),
+        PrivacyStoreSchemaStatus::Current
+    );
+
+    stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect("stage five components with authenticated legacy Privacy and Vault");
+    let paths = application_restore_paths(directory.path());
+    drop(workflow);
+    drop(state);
+
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let _ = apply_pending_application_restore_with_hook(
+            directory.path(),
+            &workspace,
+            Some(&approved.workspace),
+            |point| {
+                if point == ApplicationRestoreCommitPoint::PrivacyInstalled {
+                    panic!("synthetic process stop after legacy Privacy install");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(crashed.is_err());
+    apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect("restart completes the authenticated legacy five-component restore");
+
+    let (_restored, restored_upgrade_required) =
+        VaultStore::open_for_application_startup(&paths.vault_active, workspace.clone())
+            .expect("read restored v1 Vault");
+    assert!(restored_upgrade_required);
+    assert_eq!(
+        PrivacyStore::preflight_schema(
+            &Connection::open(&paths.privacy_active).expect("read restored v4 Privacy")
+        )
+        .expect("restored Privacy schema"),
+        PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 4 }
+    );
+    assert_no_restore_residue(&paths);
+
+    let restarted_state = AppState::new(
+        directory.path().join("legal.sqlite"),
+        database::user_database_path(directory.path()),
+    );
+    let restarted =
+        PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+            directory.path().to_path_buf(),
+            workspace.clone(),
+            Arc::new(approved.workspace.clone()),
+        )
+        .expect("read-only startup opens restored legacy components");
+    assert!(restarted.privacy_store_schema_upgrade_required());
+    assert!(restarted.vault_startup_write_required());
+    assert_eq!(
+        PrivacyStore::preflight_schema(
+            &Connection::open(&paths.privacy_active).expect("pre-backup legacy Privacy")
+        )
+        .expect("pre-backup schema remains legacy"),
+        PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 4 }
+    );
+    assert!(restarted
+        .case_material_migration_required()
+        .expect("legacy restore requires startup migration"));
+    restarted
+        .prepare_startup_storage_after_preflight()
+        .expect("prepare backed-up legacy sources");
+    let source_fingerprint = restarted
+        .case_material_migration_source_fingerprint()
+        .expect("restored migration source fingerprint");
+    for migration_id in [
+        PROJECT_PRIVACY_CASE_BINDING_MIGRATION_ID,
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID,
+    ] {
+        ensure_pre_migration_application_backup(
+            directory.path(),
+            &restarted_state,
+            &restarted,
+            &approved.workspace,
+            migration_id,
+            &source_fingerprint,
+        )
+        .expect("install a source-bound five-component backup before startup upgrade");
+        assert_eq!(
+            PrivacyStore::preflight_schema(
+                &Connection::open(&paths.privacy_active).expect("backed-up legacy Privacy")
+            )
+            .expect("backup does not evolve Privacy schema"),
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 4 }
+        );
+    }
+    restarted
+        .upgrade_privacy_store_schema_after_backup()
+        .expect("post-backup startup upgrades restored Privacy and Vault");
+    assert_eq!(
+        PrivacyStore::preflight_schema(
+            &Connection::open(&paths.privacy_active).expect("post-backup Privacy")
+        )
+        .expect("post-backup current Privacy"),
+        PrivacyStoreSchemaStatus::Current
+    );
+    let (_vault, vault_upgrade_required) =
+        VaultStore::open_for_application_startup(&paths.vault_active, workspace)
+            .expect("post-backup Vault");
+    assert!(!vault_upgrade_required);
 }
 
 #[test]
@@ -227,23 +1221,48 @@ fn v3_marker_precommit_failure_cleans_all_components_and_unmarked_crash_recovers
     let (bundle, _, _) =
         build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
             .expect("build V3 backup");
-    let injected = stage_application_restore_bytes_with_hook(
-        directory.path(),
-        state.user_database_path(),
-        &workflow,
-        Some(&approved.workspace),
-        &bundle,
-        |_| {
-            Err(ipc_error(
-                "synthetic_before_marker_failure",
-                "synthetic before marker failure",
-            ))
-        },
-    )
-    .expect_err("marker-precommit error must fail stage");
-    assert_eq!(injected.error_type, "synthetic_before_marker_failure");
     let paths = application_restore_paths(directory.path());
-    assert_no_restore_residue(&paths);
+    let epochs_before = approved.epochs().expect("pre-stage epochs");
+    let lineage_before = approved_lineage_manifests(&approved.workspace);
+    for failure_point in [
+        ApplicationRestoreStagePoint::VaultStaging,
+        ApplicationRestoreStagePoint::ApprovedAndWorkProductsStaging,
+        ApplicationRestoreStagePoint::BeforeProtectedMarker,
+    ] {
+        let injected = stage_application_restore_bytes_with_hook(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            Some(&approved.workspace),
+            &bundle,
+            |point| {
+                if point == failure_point {
+                    Err(ipc_error(
+                        "synthetic_precommit_stage_failure",
+                        "synthetic precommit stage failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("every pre-marker stage error must fail without business-state mutation");
+        assert_eq!(
+            injected.error_type, "synthetic_precommit_stage_failure",
+            "failure point: {failure_point:?}"
+        );
+        assert_no_restore_residue(&paths);
+        assert_eq!(
+            approved_lineage_manifests(&approved.workspace),
+            lineage_before
+        );
+        assert_eq!(approved.epochs().unwrap(), epochs_before);
+        assert_eq!(approved.workspace.list(Some(&case_id)).unwrap().len(), 1);
+        assert_eq!(
+            approved.committed_work_product_row_count(&case_id).unwrap(),
+            1
+        );
+    }
 
     let crashed = catch_unwind(AssertUnwindSafe(|| {
         let _ = stage_application_restore_bytes_with_hook(
@@ -252,7 +1271,12 @@ fn v3_marker_precommit_failure_cleans_all_components_and_unmarked_crash_recovers
             &workflow,
             Some(&approved.workspace),
             &bundle,
-            |_| panic!("synthetic process stop before protected marker"),
+            |point| {
+                if point == ApplicationRestoreStagePoint::BeforeProtectedMarker {
+                    panic!("synthetic process stop before protected marker");
+                }
+                Ok(())
+            },
         );
     }));
     assert!(crashed.is_err());
@@ -273,6 +1297,11 @@ fn v3_marker_precommit_failure_cleans_all_components_and_unmarked_crash_recovers
     )
     .expect("startup removes every unmarked incoming component");
     assert_no_restore_residue(&paths);
+    assert_eq!(
+        approved_lineage_manifests(&approved.workspace),
+        lineage_before
+    );
+    assert_eq!(approved.epochs().unwrap(), epochs_before);
 
     stage_application_restore_bytes_with_approved(
         directory.path(),
@@ -428,6 +1457,9 @@ fn v3_crash_after_four_components_finishes_exact_fifth_component_on_restart() {
                 path,
                 &workspace,
                 marker.privacy_key_epoch,
+                marker
+                    .privacy_store_schema_version
+                    .unwrap_or(PRIVACY_STORE_SCHEMA_VERSION),
                 &marker.privacy_database_sha256,
             )
         },
@@ -582,10 +1614,75 @@ fn user_canary(path: &Path) -> String {
         .expect("read synthetic user database canary")
 }
 
+fn user_source_identity(path: &Path) -> (Vec<u8>, i64, String) {
+    let bytes = fs::read(path).expect("read exact user database bytes");
+    let connection =
+        database::open_user_database_read_only(path).expect("open user source read-only");
+    let schema_version = connection
+        .query_row(
+            "SELECT value FROM user_database_metadata WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("user schema version")
+        .parse::<i64>()
+        .expect("numeric user schema version");
+    let manifest = logical_database_manifest(&connection, &BTreeSet::new())
+        .expect("logical user database manifest");
+    (bytes, schema_version, manifest)
+}
+
 fn status(workflow: &PrivacyWorkflowManager) -> crate::privacy_workflow::LifecycleStatusView {
     workflow
         .lifecycle_status(LifecycleStatusRequest { redaction_id: None })
         .expect("lifecycle status")
+}
+
+#[test]
+fn coherent_user_snapshot_is_query_only_and_preserves_source_bytes_schema_and_manifest() {
+    let (directory, _, state, workflow) = fixture();
+    set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
+    let before = user_source_identity(state.user_database_path());
+    let _privacy_guard = workflow.begin_application_backup_pair();
+    let (connection, mut source_file) =
+        open_coherent_user_snapshot(directory.path(), state.user_database_path())
+            .expect("open pinned read-only user snapshot");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+            .expect("query-only state"),
+        1
+    );
+    let update_error = connection
+        .execute(
+            "UPDATE user_database_metadata SET value='forbidden'
+             WHERE key=?1",
+            [USER_CANARY_KEY],
+        )
+        .expect_err("the migration source snapshot must not have UPDATE authority");
+    assert!(matches!(
+        update_error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::ReadOnly
+    ));
+    let snapshot = snapshot_user_database(
+        directory.path(),
+        state.user_database_path(),
+        &mut source_file,
+    )
+    .expect("read exact pinned source bytes");
+    assert_eq!(snapshot.as_slice(), before.0.as_slice());
+    rollback_user_snapshot(&connection).expect("close read-only source snapshot");
+    drop(connection);
+    drop(source_file);
+    drop(_privacy_guard);
+
+    let after = user_source_identity(state.user_database_path());
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, before.1);
+    assert_eq!(after.2, before.2);
+    database::validate_user_database_read_only(state.user_database_path())
+        .expect("source schema remains canonical");
 }
 
 #[test]
@@ -689,6 +1786,210 @@ fn identical_three_component_restore_consumes_every_staged_component() {
     }
     PrivacyWorkflowManager::new(directory.path().to_path_buf(), workspace)
         .expect("all restored components reopen after identical restore");
+}
+
+#[test]
+fn three_component_restore_refuses_unified_or_approved_workspace_lineage_without_staging() {
+    {
+        let (directory, _, state, workflow, approved) = fixture_v3();
+        set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
+        let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+            .expect("build legacy three-component backup");
+        let connection = Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE))
+            .expect("open unified Privacy store");
+        connection
+            .execute(
+                "INSERT INTO privacy_materials(
+                     material_id,source_kind,extraction_status,migration_status,state
+                 ) VALUES(
+                     'mat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'legacy_reference','legacy_reference','legacy_reference','blocked'
+                 )",
+                [],
+            )
+            .expect("install unified material state");
+        drop(connection);
+
+        let error = stage_application_restore_bytes_with_approved(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &approved.workspace,
+            &bundle,
+        )
+        .expect_err("legacy restore must not fork unified material lineage");
+        assert_eq!(
+            error.error_type,
+            "application_restore_requires_five_components"
+        );
+        assert_eq!(
+            user_canary(state.user_database_path()),
+            BACKED_UP_USER_CANARY
+        );
+        let material_count: i64 =
+            Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE))
+                .expect("reopen unified Privacy store")
+                .query_row("SELECT COUNT(*) FROM privacy_materials", [], |row| {
+                    row.get(0)
+                })
+                .expect("unified material count");
+        assert_eq!(material_count, 1);
+        assert_no_restore_residue(&application_restore_paths(directory.path()));
+    }
+
+    {
+        let (directory, _, state, workflow, approved) = fixture_v3();
+        set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
+        let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+            .expect("build legacy three-component backup");
+        let case_id = format!("case_{}", "9".repeat(32));
+        let generation = approved
+            .publish_generation(&case_id, '9')
+            .expect("install current approved-generation lineage");
+        approved
+            .create_work_product(&generation, b"[PERSON_009] current protected work product")
+            .expect("install current work-product lineage");
+        let paths = application_restore_paths(directory.path());
+        let epochs_before = approved.epochs().expect("current credential epochs");
+        let lineage_before = approved_lineage_manifests(&approved.workspace);
+
+        let error = stage_application_restore_bytes_with_approved(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &approved.workspace,
+            &bundle,
+        )
+        .expect_err("legacy restore must not fork approved/work-product lineage");
+        assert_eq!(
+            error.error_type,
+            "application_restore_requires_five_components"
+        );
+        assert_eq!(
+            approved_lineage_manifests(&approved.workspace),
+            lineage_before
+        );
+        assert_eq!(approved.epochs().unwrap(), epochs_before);
+        assert_eq!(approved.workspace.list(Some(&case_id)).unwrap().len(), 1);
+        assert_eq!(
+            approved.committed_work_product_row_count(&case_id).unwrap(),
+            1
+        );
+        assert_no_restore_residue(&paths);
+    }
+}
+
+#[test]
+fn three_component_restore_refuses_project_deletion_journal_lineage_without_staging() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
+    let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+        .expect("build legacy three-component backup");
+    let scope_json = concat!(
+        "{\"schemaVersion\":\"project-deletion-journal-v1\",",
+        "\"projectId\":\"case-retired-lineage\",",
+        "\"privacyCaseId\":null,",
+        "\"materialIds\":[],\"generationIds\":[]}"
+    );
+    let scope_sha256 = sha256_hex(scope_json.as_bytes());
+    let connection = Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE))
+        .expect("open unified Privacy store");
+    connection
+        .execute(
+            "INSERT INTO project_deletion_journal(
+                 deletion_id,project_id,privacy_case_id,scope_json,scope_sha256,state,
+                 created_at_unix,privacy_revoked_at_unix,user_deleted_at_unix,completed_at_unix
+             ) VALUES(
+                 'pdel_retired_lineage','case-retired-lineage',NULL,?1,?2,'completed',
+                 1700000000,1700000000,1700000000,1700000000
+             )",
+            rusqlite::params![scope_json, scope_sha256],
+        )
+        .expect("install completed project-deletion lineage");
+    drop(connection);
+
+    let error = stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect_err("legacy restore must not fork project-deletion lineage");
+    assert_eq!(
+        error.error_type,
+        "application_restore_requires_five_components"
+    );
+    assert_eq!(
+        user_canary(state.user_database_path()),
+        BACKED_UP_USER_CANARY
+    );
+    let deletion_count: i64 = Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE))
+        .expect("reopen unified Privacy store")
+        .query_row("SELECT COUNT(*) FROM project_deletion_journal", [], |row| {
+            row.get(0)
+        })
+        .expect("project deletion lineage count");
+    assert_eq!(deletion_count, 1);
+    assert_no_restore_residue(&application_restore_paths(directory.path()));
+}
+
+#[test]
+fn pending_three_component_restore_rechecks_lineage_before_any_component_swap() {
+    let (directory, workspace, state, workflow) = fixture();
+    set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
+    let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+        .expect("build legacy three-component backup");
+    stage_application_restore_bytes(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &bundle,
+    )
+    .expect("stage while the current lineage is empty");
+    let paths = application_restore_paths(directory.path());
+    assert!(paths.marker.exists());
+
+    set_user_canary(state.user_database_path(), MUTATED_USER_CANARY);
+    Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE))
+        .expect("open current Privacy store")
+        .execute(
+            "INSERT INTO privacy_materials(
+                 material_id,source_kind,extraction_status,migration_status,state
+             ) VALUES(
+                 'mat_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                 'legacy_reference','legacy_reference','legacy_reference','blocked'
+             )",
+            [],
+        )
+        .expect("create unified state after staging");
+    drop(workflow);
+    drop(state);
+
+    let error = apply_pending_application_restore(directory.path(), &workspace)
+        .expect_err("startup must recheck current lineage before the first swap");
+    assert_eq!(
+        error.error_type,
+        "application_restore_requires_five_components"
+    );
+    assert_eq!(
+        user_canary(&database::user_database_path(directory.path())),
+        MUTATED_USER_CANARY
+    );
+    let material_count: i64 = Connection::open(directory.path().join(PRIVACY_DATABASE_RELATIVE))
+        .expect("reopen current Privacy store")
+        .query_row("SELECT COUNT(*) FROM privacy_materials", [], |row| {
+            row.get(0)
+        })
+        .expect("current unified material count");
+    assert_eq!(material_count, 1);
+    assert!(paths.marker.exists());
+    assert!(paths.user_incoming.exists());
+    assert!(!paths.user_rollback.exists());
+    assert!(!paths.privacy_rollback.exists());
+    assert!(!paths.vault_rollback.exists());
+    cleanup_pair_incoming(&paths).expect("clean refused synthetic restore transaction");
+    assert_no_restore_residue(&paths);
 }
 
 #[test]

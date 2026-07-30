@@ -1,6 +1,8 @@
 import { useCallback, useRef, useState } from "react";
 
 import {
+  decideCaseMaterialContextChange,
+  decideCaseMaterialRouteNavigation,
   decideMcpRouteNavigation,
   decidePrivacyRouteNavigation,
 } from "./navigationGuards";
@@ -26,6 +28,7 @@ export interface UseAppNavigationControllerOptions {
   readonly initialRoute?: AppRoute;
   readonly mcp: NavigationProtectionChannel;
   readonly privacy: NavigationProtectionChannel;
+  readonly caseMaterials: NavigationProtectionChannel;
   readonly confirmDiscard: (message: string) => boolean;
 }
 
@@ -61,6 +64,7 @@ export interface AppNavigationController {
     request: LegalCitationRequest,
   ) => boolean;
   readonly consumeRouteState: (expectedRoute: AppRoute) => boolean;
+  readonly guardCaseMaterialContextChange: () => boolean;
 }
 
 const MCP_NAVIGATION_CANCELLED_MESSAGE =
@@ -68,6 +72,9 @@ const MCP_NAVIGATION_CANCELLED_MESSAGE =
 
 const PRIVACY_NAVIGATION_CANCELLED_MESSAGE =
   "已取消切换；未保存的隐私与本地 OCR 配置仍保留在当前工作区。";
+
+const CASE_MATERIAL_NAVIGATION_CANCELLED_MESSAGE =
+  "已取消切换；未保存的案件材料脱敏文本仍保留在当前工作区。";
 
 function initialAssistantHostRoute(route: AppRoute): AssistantHostRoute {
   return route.area === "assistant" && route.page === "chat"
@@ -114,6 +121,12 @@ export function useAppNavigationController(
     options.privacy.readMutationInFlight;
   const readPrivacyDraftDirty = options.privacy.readDraftDirty;
   const discardPrivacyDraft = options.privacy.discardDraft;
+  const readCaseMaterialMutationInFlight =
+    options.caseMaterials.readMutationInFlight;
+  const readCaseMaterialDraftDirty =
+    options.caseMaterials.readDraftDirty;
+  const discardCaseMaterialDraft =
+    options.caseMaterials.discardDraft;
   const confirmDiscard = options.confirmDiscard;
   const assistantRequestSequence = useRef(
     assistantHostRoute.state?.request.requestId ?? 0,
@@ -164,6 +177,26 @@ export function useAppNavigationController(
       discardPrivacyDraft();
     }
 
+    const caseMaterialDecision = decideCaseMaterialRouteNavigation(
+      currentRoute,
+      nextRoute,
+      readCaseMaterialMutationInFlight(),
+      readCaseMaterialDraftDirty(),
+    );
+    if (caseMaterialDecision.kind === "block") {
+      setProtectionMessage(caseMaterialDecision.message);
+      return false;
+    }
+    if (caseMaterialDecision.kind === "confirm_discard") {
+      if (!confirmDiscard(caseMaterialDecision.message)) {
+        setProtectionMessage(
+          CASE_MATERIAL_NAVIGATION_CANCELLED_MESSAGE,
+        );
+        return false;
+      }
+      discardCaseMaterialDraft();
+    }
+
     if (
       nextRoute.area === "assistant" &&
       nextRoute.page === "chat" &&
@@ -194,10 +227,40 @@ export function useAppNavigationController(
     confirmDiscard,
     discardMcpDraft,
     discardPrivacyDraft,
+    discardCaseMaterialDraft,
     readMcpDraftDirty,
     readMcpMutationInFlight,
     readPrivacyDraftDirty,
     readPrivacyMutationInFlight,
+    readCaseMaterialDraftDirty,
+    readCaseMaterialMutationInFlight,
+  ]);
+
+  const guardCaseMaterialContextChange = useCallback((): boolean => {
+    const decision = decideCaseMaterialContextChange(
+      readCaseMaterialMutationInFlight(),
+      readCaseMaterialDraftDirty(),
+    );
+    if (decision.kind === "block") {
+      setProtectionMessage(decision.message);
+      return false;
+    }
+    if (decision.kind === "confirm_discard") {
+      if (!confirmDiscard(decision.message)) {
+        setProtectionMessage(
+          CASE_MATERIAL_NAVIGATION_CANCELLED_MESSAGE,
+        );
+        return false;
+      }
+      discardCaseMaterialDraft();
+    }
+    setProtectionMessage(null);
+    return true;
+  }, [
+    confirmDiscard,
+    discardCaseMaterialDraft,
+    readCaseMaterialDraftDirty,
+    readCaseMaterialMutationInFlight,
   ]);
 
   const clearProtectionMessage = useCallback(() => {
@@ -300,5 +363,6 @@ export function useAppNavigationController(
     handoffGraphTarget,
     handoffLegalCitation,
     consumeRouteState,
+    guardCaseMaterialContextChange,
   };
 }

@@ -313,7 +313,10 @@ fn stage_archive_entries(
         write_new_synced_file(&path, decoded.as_slice())?;
     }
 
-    let store = VaultStore::open(destination, expected_workspace_instance_id.clone())?;
+    let (store, _schema_upgrade_required) = VaultStore::open_for_application_startup(
+        destination,
+        expected_workspace_instance_id.clone(),
+    )?;
     let isolation = store.isolation_status()?;
     if !isolation.private_acl_enforced
         || !isolation.content_indexing_disabled

@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   assistantWritesBlockClose,
   canBypassDirtyDraftsForWorkspaceRecovery,
+  decideCaseMaterialContextChange,
+  decideCaseMaterialRouteNavigation,
   decideMcpRouteNavigation,
   decidePrivacyRouteNavigation,
   decideWorkspaceClose,
@@ -257,6 +259,62 @@ describe("navigation guards", () => {
         false,
       ),
     ).toEqual({ kind: "proceed" });
+  });
+
+  it("protects case-material edits only when leaving materials or changing its project context", () => {
+    expect(
+      decideCaseMaterialRouteNavigation(
+        { area: "cases", page: "materials" },
+        { area: "cases", page: "materials" },
+        true,
+        true,
+      ),
+    ).toEqual({ kind: "proceed" });
+    expect(
+      decideCaseMaterialRouteNavigation(
+        { area: "cases", page: "overview" },
+        { area: "assistant", page: "chat" },
+        true,
+        true,
+      ),
+    ).toEqual({ kind: "proceed" });
+    expect(
+      decideCaseMaterialRouteNavigation(
+        { area: "cases", page: "materials" },
+        { area: "cases", page: "work" },
+        true,
+        false,
+      ),
+    ).toEqual({
+      kind: "block",
+      message:
+        "案件材料脱敏操作尚未完成；为避免结果不明，已阻止切换。请等待当前操作完成后重试。",
+    });
+    expect(decideCaseMaterialContextChange(false, true)).toEqual({
+      kind: "confirm_discard",
+      message:
+        "切换将永久丢弃当前案件材料与风险审阅草稿。确定继续吗？",
+    });
+  });
+
+  it("includes case-material operations and drafts in window-close protection", () => {
+    const mutation = decideWorkspaceClose({
+      ...cleanCloseState,
+      caseMaterialMutationInFlight: true,
+    });
+    expect(mutation.kind).toBe("block");
+    expect("message" in mutation ? mutation.message : "").toContain(
+      "案件材料脱敏操作",
+    );
+
+    const draft = decideWorkspaceClose({
+      ...cleanCloseState,
+      caseMaterialDraftDirty: true,
+    });
+    expect(draft.kind).toBe("confirm_discard");
+    expect("message" in draft ? draft.message : "").toContain(
+      "案件材料与风险审阅草稿",
+    );
   });
 
   it("protects typed navigation only when leaving settings/privacy", () => {

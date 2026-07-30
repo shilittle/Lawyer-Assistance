@@ -2,7 +2,8 @@ use super::privacy_workflow::IpcError;
 use crate::{
     privacy_manager,
     privacy_workflow::{
-        export_reason, ExportApprovedPrivacyReviewRequest, PrivacyWorkflowManager, SafeExportFormat,
+        export_reason, ExportApprovedCaseRedactionRequest, ExportApprovedPrivacyReviewRequest,
+        PrivacyWorkflowManager, SafeExportFormat,
     },
 };
 use serde::Serialize;
@@ -40,13 +41,24 @@ pub struct ExportApprovedPrivacyReviewResponse {
     pub output_page_count: u32,
 }
 
+// Phase 3 keeps this compatibility adapter for one release cycle, but it must not be registered
+// with the renderer after the project-scoped cutover.
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn export_approved_privacy_review(
     app: tauri::AppHandle,
     workflow: State<'_, PrivacyWorkflowManager>,
     request: ExportApprovedPrivacyReviewRequest,
 ) -> Result<ExportApprovedPrivacyReviewResponse, IpcError> {
-    let workflow = workflow.inner().clone();
+    export_approved_privacy_review_internal(app, workflow.inner().clone(), request, None).await
+}
+
+async fn export_approved_privacy_review_internal(
+    app: tauri::AppHandle,
+    workflow: PrivacyWorkflowManager,
+    request: ExportApprovedPrivacyReviewRequest,
+    case_scope: Option<ExportApprovedCaseRedactionRequest>,
+) -> Result<ExportApprovedPrivacyReviewResponse, IpcError> {
     tauri::async_runtime::spawn_blocking(move || {
         let format = request.format;
         let selected = app
@@ -57,6 +69,11 @@ pub async fn export_approved_privacy_review(
             .add_filter(format.dialog_filter_label(), &[format.file_extension()])
             .blocking_save_file();
         let Some(selected) = selected else {
+            if let Some(case_request) = case_scope.as_ref() {
+                workflow
+                    .validate_case_export_scope(case_request)
+                    .map_err(IpcError::from)?;
+            }
             workflow
                 .record_safe_export_cancellation(&request)
                 .map_err(IpcError::from)?;
@@ -87,25 +104,42 @@ pub async fn export_approved_privacy_review(
         validate_safe_export_destination(&path, format)?;
 
         let pending_reason = export_reason(format, "attempt_pending");
-        let install_result = install_safe_export(
-            &path,
-            format,
-            &built.bytes,
-            || {
-                workflow
-                    .record_safe_export_event(&built, false, &pending_reason)
-                    .map_err(IpcError::from)?;
-                workflow
-                    .verify_safe_export_authorization(&built)
-                    .map_err(IpcError::from)
-            },
-            |_| Ok(()),
-            |installed| {
-                workflow
-                    .verify_installed_safe_export(&built, installed)
-                    .map_err(IpcError::from)
-            },
-        );
+        workflow
+            .record_safe_export_event(&built, false, &pending_reason)
+            .map_err(IpcError::from)?;
+        let install_result = if let Some(case_request) = case_scope.as_ref() {
+            workflow.with_case_safe_export_authorization(case_request, &built, || {
+                install_safe_export(
+                    &path,
+                    format,
+                    &built.bytes,
+                    || Ok(()),
+                    |_| Ok(()),
+                    |installed| {
+                        workflow
+                            .verify_installed_safe_export(&built, installed)
+                            .map_err(IpcError::from)
+                    },
+                )
+            })
+        } else {
+            install_safe_export(
+                &path,
+                format,
+                &built.bytes,
+                || {
+                    workflow
+                        .verify_safe_export_authorization(&built)
+                        .map_err(IpcError::from)
+                },
+                |_| Ok(()),
+                |installed| {
+                    workflow
+                        .verify_installed_safe_export(&built, installed)
+                        .map_err(IpcError::from)
+                },
+            )
+        };
         if let Err(error) = install_result {
             let failure = export_reason(
                 format,
@@ -153,6 +187,20 @@ pub async fn export_approved_privacy_review(
         error_type: "runtime_failure".to_owned(),
         message: "安全派生文书重建、保存与严格复核任务未完成。".to_owned(),
     })?
+}
+
+#[tauri::command]
+pub async fn export_approved_case_redaction(
+    app: tauri::AppHandle,
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: ExportApprovedCaseRedactionRequest,
+) -> Result<ExportApprovedPrivacyReviewResponse, IpcError> {
+    let manager = workflow.inner().clone();
+    manager
+        .validate_case_export_scope(&request)
+        .map_err(IpcError::from)?;
+    let legacy_request = request.legacy_request();
+    export_approved_privacy_review_internal(app, manager, legacy_request, Some(request)).await
 }
 
 fn force_fixed_extension(path: &mut PathBuf, format: SafeExportFormat) {
@@ -310,6 +358,10 @@ where
     ));
 
     let result = (|| -> Result<(), IpcError> {
+        // Recheck the active receipt (and, for case exports, the exact
+        // ProjectId scope) before creating even the zero-byte staging file.
+        // The case-scoped caller keeps the workflow gate held through install.
+        final_authorize()?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -327,9 +379,6 @@ where
             });
         }
 
-        // The receipt is checked after target selection and immediately before
-        // any artifact bytes are written.
-        final_authorize()?;
         file.write_all(bytes).map_err(|_| IpcError {
             error_type: "export_write_failed".to_owned(),
             message: "安全派生文书临时文件无法完整写入。".to_owned(),
@@ -426,6 +475,57 @@ mod tests {
             error_type: error_type.to_owned(),
             message: message.to_owned(),
         }
+    }
+
+    #[test]
+    fn case_export_request_requires_project_id_and_denies_private_or_unknown_identity_fields() {
+        let valid = serde_json::json!({
+            "projectId": "case-export-contract",
+            "redactionId": "red_export_contract",
+            "format": "pdf"
+        });
+        let request: ExportApprovedCaseRedactionRequest =
+            serde_json::from_value(valid.clone()).expect("valid case export request");
+        assert_eq!(request.project_id, "case-export-contract");
+        assert_eq!(request.redaction_id, "red_export_contract");
+
+        let mut missing_project_id = valid.clone();
+        missing_project_id
+            .as_object_mut()
+            .expect("request object")
+            .remove("projectId");
+        assert!(
+            serde_json::from_value::<ExportApprovedCaseRedactionRequest>(missing_project_id)
+                .is_err()
+        );
+
+        for private_or_unknown_key in ["caseId", "privacyCaseId", "unexpected"] {
+            let mut with_unknown = valid.clone();
+            with_unknown
+                .as_object_mut()
+                .expect("request object")
+                .insert(
+                    private_or_unknown_key.to_owned(),
+                    serde_json::Value::String("case_88888888888888888888888888888888".to_owned()),
+                );
+            assert!(
+                serde_json::from_value::<ExportApprovedCaseRedactionRequest>(with_unknown).is_err(),
+                "case export request must deny {private_or_unknown_key}"
+            );
+        }
+
+        let serialized = serde_json::to_value(&request).expect("serialize case export request");
+        assert_eq!(
+            serialized
+                .get("projectId")
+                .and_then(serde_json::Value::as_str),
+            Some("case-export-contract")
+        );
+        assert!(serialized.get("caseId").is_none());
+        assert!(serialized.get("privacyCaseId").is_none());
+        let legacy = request.legacy_request();
+        assert_eq!(legacy.redaction_id, "red_export_contract");
+        assert_eq!(legacy.format, SafeExportFormat::Pdf);
     }
 
     #[test]
@@ -550,7 +650,7 @@ mod tests {
     fn command_orders_build_validate_install_reread_and_success_audit() {
         let source = include_str!("privacy_export.rs");
         let command = source
-            .split("pub async fn export_approved_privacy_review")
+            .split("async fn export_approved_privacy_review_internal")
             .nth(1)
             .expect("export command source");
         let build = command.find(".build_safe_export(&request)").expect("build");
@@ -569,5 +669,28 @@ mod tests {
         assert!(build < validate && validate < install);
         assert!(install < final_verify && final_verify < success);
         assert!(command.contains("record_safe_export_cancellation(&request)"));
+
+        let installer = source
+            .split("fn install_safe_export")
+            .nth(1)
+            .expect("safe installer source");
+        let final_authorize = installer
+            .find("final_authorize()?")
+            .expect("final authorization");
+        let staged_create = installer
+            .find("OpenOptions::new()")
+            .expect("staging file creation");
+        assert!(
+            final_authorize < staged_create,
+            "final authorization must precede every staging-file creation"
+        );
+
+        let case_branch = command
+            .find(".with_case_safe_export_authorization")
+            .expect("case scope and receipt authorization");
+        assert!(
+            case_branch < install,
+            "case scope authorization must wrap atomic installation"
+        );
     }
 }

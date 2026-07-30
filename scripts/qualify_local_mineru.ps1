@@ -802,7 +802,7 @@ try {
       "-l", $script:ExpectedLanguage
     ) `
     -Environment $environment `
-    -WorkingDirectory $jobRoot `
+    -WorkingDirectory $runtimeRoot `
     -TimeoutMilliseconds ($TimeoutSeconds * 1000)
   if ($mineruResult.ExitCode -ne 0) {
     throw "MinerU did not exit successfully (exit code $($mineruResult.ExitCode)); diagnostic text was discarded"

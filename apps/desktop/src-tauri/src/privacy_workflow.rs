@@ -17,17 +17,20 @@ use privacy::vnext::{
 };
 use privacy::{
     scan_residual, sha256_hex, vault_store::VaultIsolationStatusV1, ActiveReceiptVerification,
-    DataClassification, DestinationKind, DestinationScope, EgressCandidate, EgressPolicyEngine,
-    LifecycleError, PrivacyEgressAuditRecord, PrivacyLifecycle, PrivacyStore, PrivacyStoreError,
-    ReceiptSigner, RedactionOptions, RedactionReceiptClaims, RedactionSummary, Redactor,
-    RegisterPrivacyMaterial, ReviewActionV1, ReviewSessionInputV1, ReviewSessionV1, ReviewState,
-    ReviewStateViewV1, SaveReviewDraft, SaveRiskReviewRevision, SensitiveMappingEntryV1,
-    SensitiveMappingPayloadV1, VerifiedReviewActionContextV1, REDACTION_VERSION,
+    BindingCreationSource, BindingLifecycleContext, DataClassification, DestinationKind,
+    DestinationScope, EgressCandidate, EgressPolicyEngine, LifecycleError, PrivacyCaseId,
+    PrivacyEgressAuditRecord, PrivacyLifecycle, PrivacyStore, PrivacyStoreError,
+    PrivacyStoreSchemaStatus, ProjectId, ProjectPrivacyCaseBindingError,
+    ProjectPrivacyCaseBindingStore, ReceiptSigner, RedactionOptions, RedactionReceiptClaims,
+    RedactionSummary, Redactor, RegisterPrivacyMaterial, ReviewActionV1, ReviewSessionInputV1,
+    ReviewSessionV1, ReviewState, ReviewStateViewV1, SaveReviewDraft, SaveRiskReviewRevision,
+    SensitiveMappingEntryV1, SensitiveMappingPayloadV1, VerifiedReviewActionContextV1,
+    REDACTION_VERSION,
 };
 use providers::{
     windows_credentials::WindowsCredentialStore, ApiSecret, CredentialStore, ProviderCredentialKey,
 };
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,7 +39,10 @@ use std::{
     io::Read,
     os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use unicode_normalization::UnicodeNormalization;
@@ -48,8 +54,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 mod approved_provider;
 pub(crate) mod approved_workspace;
 mod case_dictionary_store;
+mod case_material_migration;
+mod case_materials;
 mod lifecycle_admin;
 mod local_detection;
+mod project_deletion;
 mod provider_qualification;
 mod safe_derived;
 mod vault_broker;
@@ -60,6 +69,16 @@ pub use approved_provider::{
     ApprovedProviderTask, DispatchApprovedProviderRequest, DispatchApprovedProviderResponse,
     ListApprovedProviderOutputsRequest, LoadApprovedProviderOutputRequest,
     RevokeApprovedProviderOutputRequest,
+};
+pub use case_materials::{
+    ApplyCaseRedactionRiskReviewActionRequest, ApproveCaseRedactionReviewRequest,
+    AssignUnassignedCaseMaterialRequest, AssignUnassignedCaseMaterialResponse, CaseMaterialSummary,
+    CaseRedactionGenerationSummary, CaseRedactionReviewView,
+    CaseRedactionRiskReviewRevisionRequest, DeleteCaseRedactionReviewRequest,
+    ExportApprovedCaseRedactionRequest, ListCaseMaterialsRequest,
+    ListCaseRedactionGenerationsRequest, ListUnassignedCaseMaterialsRequest,
+    LoadCaseRedactionReviewRequest, PrepareCaseMaterialRequest, PrepareCaseMaterialResponse,
+    UnassignedCaseMaterialSummary,
 };
 pub use lifecycle_admin::{
     BackupIdRequest, CleanupReportView, DestroyMappingKeyRequest, LifecycleStatusRequest,
@@ -157,6 +176,10 @@ impl PrivacyWorkflowError {
             "本机加密案卷库操作失败；未进行明文或网络回退。",
         )
     }
+
+    fn project_case_binding(error: ProjectPrivacyCaseBindingError) -> Self {
+        Self::new(error.code(), "案件与隐私工作区身份绑定校验失败。")
+    }
 }
 
 impl fmt::Display for PrivacyWorkflowError {
@@ -167,24 +190,12 @@ impl fmt::Display for PrivacyWorkflowError {
 
 impl std::error::Error for PrivacyWorkflowError {}
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PreparePrivacyMaterialRequest {
-    #[serde(default)]
-    pub case_id: Option<String>,
-    #[serde(default)]
-    pub custom_terms: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreparePrivacyMaterialResponse {
-    pub cancelled: bool,
-    pub review: Option<PrivacyReviewView>,
-}
+pub type PreparePrivacyMaterialRequest = PrepareCaseMaterialRequest;
+pub type PreparePrivacyMaterialResponse = PrepareCaseMaterialResponse;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct LoadPrivacyReviewRequest {
     pub redaction_id: String,
 }
@@ -529,6 +540,7 @@ pub(crate) trait ApprovedPublicationInvalidator: Send + Sync {
 
 struct PrivacyWorkflowShared {
     database_path: PathBuf,
+    user_database_path: PathBuf,
     workspace_instance_id: WorkspaceInstanceId,
     provider_qualification_root: PathBuf,
     vault_broker: Arc<dyn vault_broker::VaultBroker>,
@@ -539,6 +551,7 @@ struct PrivacyWorkflowShared {
     provider_qualification_key_override:
         Mutex<Option<Arc<dyn provider_qualification::ProviderQualificationKeyProvider>>>,
     now_unix_override: Mutex<Option<u64>>,
+    schema_upgrade_required: AtomicBool,
 }
 
 pub(crate) struct ApplicationBackupPrivacyGuard<'a> {
@@ -565,9 +578,10 @@ impl PrivacyWorkflowManager {
         app_local_data_directory: PathBuf,
         workspace_instance_id: WorkspaceInstanceId,
     ) -> Result<Self, PrivacyWorkflowError> {
-        Self::new_internal(app_local_data_directory, workspace_instance_id, None)
+        Self::new_internal(app_local_data_directory, workspace_instance_id, None, false)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_with_approved_publication_invalidator(
         app_local_data_directory: PathBuf,
         workspace_instance_id: WorkspaceInstanceId,
@@ -577,6 +591,20 @@ impl PrivacyWorkflowManager {
             app_local_data_directory,
             workspace_instance_id,
             Some(invalidator),
+            false,
+        )
+    }
+
+    pub(crate) fn new_for_application_startup_with_approved_publication_invalidator(
+        app_local_data_directory: PathBuf,
+        workspace_instance_id: WorkspaceInstanceId,
+        invalidator: Arc<dyn ApprovedPublicationInvalidator>,
+    ) -> Result<Self, PrivacyWorkflowError> {
+        Self::new_internal(
+            app_local_data_directory,
+            workspace_instance_id,
+            Some(invalidator),
+            true,
         )
     }
 
@@ -584,22 +612,58 @@ impl PrivacyWorkflowManager {
         app_local_data_directory: PathBuf,
         workspace_instance_id: WorkspaceInstanceId,
         approved_publication_invalidator: Option<Arc<dyn ApprovedPublicationInvalidator>>,
+        defer_startup_maintenance: bool,
     ) -> Result<Self, PrivacyWorkflowError> {
+        let user_database_path = database::user_database_path(&app_local_data_directory);
         let directory = app_local_data_directory.join(PRIVACY_DIRECTORY_NAME);
-        fs::create_dir_all(&directory).map_err(|_| {
-            PrivacyWorkflowError::new("privacy_store_unavailable", "本机隐私数据库目录无法创建。")
-        })?;
-        validate_ordinary_directory(&directory)?;
-        let vault_broker: Arc<dyn vault_broker::VaultBroker> = Arc::new(
-            vault_broker::LocalEncryptedVaultBroker::initialize(
-                &app_local_data_directory,
-                workspace_instance_id.clone(),
+        let privacy_directory_present = match fs::symlink_metadata(&directory) {
+            Ok(_) => {
+                validate_ordinary_directory(&directory)?;
+                true
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && defer_startup_maintenance =>
+            {
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&directory).map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "privacy_store_unavailable",
+                        "本机隐私数据库目录无法创建。",
+                    )
+                })?;
+                validate_ordinary_directory(&directory)?;
+                true
+            }
+            Err(_) => {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_store_unavailable",
+                    "The local privacy directory could not be inspected.",
+                ))
+            }
+        };
+        let vault_broker: Arc<dyn vault_broker::VaultBroker> = if defer_startup_maintenance {
+            Arc::new(
+                vault_broker::LocalEncryptedVaultBroker::open_for_application_startup(
+                    &app_local_data_directory,
+                    workspace_instance_id.clone(),
+                )
+                .map_err(PrivacyWorkflowError::vault)?,
             )
-            .map_err(PrivacyWorkflowError::vault)?,
-        );
+        } else {
+            Arc::new(
+                vault_broker::LocalEncryptedVaultBroker::initialize(
+                    &app_local_data_directory,
+                    workspace_instance_id.clone(),
+                )
+                .map_err(PrivacyWorkflowError::vault)?,
+            )
+        };
         let manager = Self {
             shared: Arc::new(PrivacyWorkflowShared {
                 database_path: directory.join(PRIVACY_DATABASE_NAME),
+                user_database_path,
                 workspace_instance_id,
                 provider_qualification_root: directory.join("provider-qualification"),
                 vault_broker,
@@ -609,50 +673,79 @@ impl PrivacyWorkflowManager {
                 receipt_signer_override: Mutex::new(None),
                 provider_qualification_key_override: Mutex::new(None),
                 now_unix_override: Mutex::new(None),
+                schema_upgrade_required: AtomicBool::new(false),
             }),
         };
-        if pending_restore_artifacts_exist(&directory)? {
-            manager.invalidate_all_publications("privacy_restore_startup_recovery")?;
+        if privacy_directory_present {
+            lifecycle_admin::apply_pending_privacy_restore(
+                &directory,
+                manager.shared.workspace_instance_id.as_str(),
+                || {
+                    manager
+                        .invalidate_all_publications("privacy_restore_startup_recovery")
+                        .map(|_| ())
+                },
+            )?;
         }
-        lifecycle_admin::apply_pending_privacy_restore(
-            &directory,
-            manager.shared.workspace_instance_id.as_str(),
-        )?;
+        let schema_status = manager.preflight_privacy_store_schema_read_only()?;
+        if matches!(
+            schema_status,
+            PrivacyStoreSchemaStatus::UpgradeRequired { .. }
+        ) {
+            manager
+                .shared
+                .schema_upgrade_required
+                .store(true, Ordering::Release);
+            validate_ordinary_database_file(&manager.shared.database_path)?;
+            return Ok(manager);
+        }
+        if defer_startup_maintenance {
+            if !matches!(schema_status, PrivacyStoreSchemaStatus::Empty) {
+                validate_ordinary_database_file(&manager.shared.database_path)?;
+            }
+            return Ok(manager);
+        }
         let mut connection = manager.open_connection()?;
-        PrivacyStore::initialize(&connection).map_err(PrivacyWorkflowError::store)?;
+        manager.run_startup_maintenance(&mut connection)?;
+        drop(connection);
+        validate_ordinary_database_file(&manager.shared.database_path)?;
+        Ok(manager)
+    }
+
+    fn run_startup_maintenance(
+        &self,
+        connection: &mut Connection,
+    ) -> Result<(), PrivacyWorkflowError> {
         let now_unix = unix_now()?;
-        manager
-            .shared
+        self.shared
             .vault_broker
             .recover_cleanups(now_unix)
             .map_err(PrivacyWorkflowError::vault)?;
         let lifecycle = PrivacyLifecycle::initialize(
-            &mut connection,
-            manager.shared.workspace_instance_id.clone(),
+            connection,
+            self.shared.workspace_instance_id.clone(),
             now_unix,
         )
         .map_err(PrivacyWorkflowError::lifecycle)?;
-        manager.recover_prepared_retention_sweeps(
+        self.recover_pending_project_deletions_unlocked(connection)?;
+        self.recover_prepared_retention_sweeps(
             &lifecycle,
-            &mut connection,
+            connection,
             now_unix,
             "privacy_retention_startup_recovery",
         )?;
-        manager.run_retention_sweep_with_publication_invalidation(
+        self.run_retention_sweep_with_publication_invalidation(
             &lifecycle,
-            &mut connection,
+            connection,
             &format!("cln_{}", Uuid::new_v4().simple()),
             now_unix,
             "privacy_retention_startup_cleanup",
         )?;
-        manager
-            .shared
+        self.shared
             .vault_broker
             .run_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now_unix)
             .map_err(PrivacyWorkflowError::vault)?;
-        drop(connection);
-        validate_ordinary_database_file(&manager.shared.database_path)?;
-        Ok(manager)
+        Ok(())
     }
 
     pub(super) fn invalidate_case_publications(
@@ -817,7 +910,7 @@ impl PrivacyWorkflowManager {
     }
 
     #[cfg(test)]
-    fn set_test_runtime(&self, signer: ReceiptSigner, now_unix: u64) {
+    pub(crate) fn set_test_runtime(&self, signer: ReceiptSigner, now_unix: u64) {
         *self
             .shared
             .receipt_signer_override
@@ -851,14 +944,13 @@ impl PrivacyWorkflowManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now_unix);
     }
 
-    fn open_connection(&self) -> Result<Connection, PrivacyWorkflowError> {
+    fn open_raw_connection(&self) -> Result<Connection, PrivacyWorkflowError> {
         let connection = Connection::open(&self.shared.database_path).map_err(|_| {
             PrivacyWorkflowError::new("privacy_store_unavailable", "本机隐私数据库无法打开。")
         })?;
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON;
-                 PRAGMA journal_mode=DELETE;
                  PRAGMA synchronous=FULL;
                  PRAGMA trusted_schema=OFF;",
             )
@@ -868,11 +960,278 @@ impl PrivacyWorkflowManager {
                     "本机隐私数据库无法进入安全模式。",
                 )
             })?;
+        Ok(connection)
+    }
+
+    fn preflight_privacy_store_schema_read_only(
+        &self,
+    ) -> Result<PrivacyStoreSchemaStatus, PrivacyWorkflowError> {
+        match fs::symlink_metadata(&self.shared.database_path) {
+            Ok(_) => validate_ordinary_database_file(&self.shared.database_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PrivacyStoreSchemaStatus::Empty);
+            }
+            Err(_) => {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_store_unavailable",
+                    "The local privacy database could not be inspected.",
+                ));
+            }
+        }
+        let connection = Connection::open_with_flags(
+            &self.shared.database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_store_unavailable",
+                "The local privacy database could not be opened read-only.",
+            )
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_unavailable",
+                    "The local privacy database read-only preflight could not be configured.",
+                )
+            })?;
+        connection
+            .execute_batch(
+                "PRAGMA query_only=ON;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA trusted_schema=OFF;",
+            )
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_unavailable",
+                    "The local privacy database could not enter read-only preflight mode.",
+                )
+            })?;
+        PrivacyStore::preflight_schema(&connection).map_err(PrivacyWorkflowError::store)
+    }
+
+    fn open_connection(&self) -> Result<Connection, PrivacyWorkflowError> {
+        let mut connection = self.open_raw_connection()?;
+        if self.shared.schema_upgrade_required.load(Ordering::Acquire) {
+            return match PrivacyStore::preflight_schema(&connection)
+                .map_err(PrivacyWorkflowError::store)?
+            {
+                PrivacyStoreSchemaStatus::UpgradeRequired { .. } => Err(PrivacyWorkflowError::new(
+                    "privacy_store_backup_required",
+                    "The privacy store must be backed up before its schema can be upgraded.",
+                )),
+                PrivacyStoreSchemaStatus::Empty | PrivacyStoreSchemaStatus::Current => {
+                    Err(PrivacyWorkflowError::new(
+                        "privacy_store_schema_state_changed",
+                        "The privacy store schema changed while the upgrade gate was active.",
+                    ))
+                }
+            };
+        }
         PrivacyStore::initialize(&connection).map_err(PrivacyWorkflowError::store)?;
+        ProjectPrivacyCaseBindingStore::initialize(&mut connection)
+            .map_err(PrivacyWorkflowError::project_case_binding)?;
+        case_materials::initialize_assignment_schema(&mut connection)?;
         vault_broker::initialize_vault_link_schema(&connection)
             .map_err(PrivacyWorkflowError::vault)?;
         case_dictionary_store::initialize_schema(&connection)?;
+        project_deletion::initialize_schema(&connection)?;
         Ok(connection)
+    }
+
+    pub(crate) fn privacy_store_schema_upgrade_required(&self) -> bool {
+        self.shared.schema_upgrade_required.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn vault_startup_write_required(&self) -> bool {
+        self.shared.vault_broker.startup_write_required()
+    }
+
+    pub(crate) fn startup_vault_present(&self) -> bool {
+        self.shared.vault_broker.startup_vault_present()
+    }
+
+    /// Authorizes creation of a brand-new canonical user database only when no
+    /// pre-existing Privacy or Vault identity can be orphaned by doing so.
+    pub(crate) fn preflight_fresh_user_database_initialization(
+        &self,
+    ) -> Result<(), PrivacyWorkflowError> {
+        let _guard = self.gate();
+        if self.shared.user_database_path.exists() {
+            return Err(PrivacyWorkflowError::new(
+                "case_material_source_state_changed",
+                "The user database appeared while fresh-start initialization was being authorized.",
+            ));
+        }
+        if self.startup_vault_present()
+            || !matches!(
+                self.preflight_privacy_store_schema_read_only()?,
+                PrivacyStoreSchemaStatus::Empty
+            )
+        {
+            return Err(PrivacyWorkflowError::new(
+                "case_material_source_missing_with_history",
+                "A new user database cannot be created while Privacy or Vault history already exists.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs only after the complete read-only migration preflight succeeds.
+    /// It creates an empty Vault/Privacy baseline when that component did not
+    /// previously exist so the coordinated five-component backup can include
+    /// all components. Existing legacy schemas are deliberately not upgraded.
+    pub(crate) fn prepare_startup_storage_after_preflight(
+        &self,
+    ) -> Result<(), PrivacyWorkflowError> {
+        let _guard = self.gate();
+        let directory = self.shared.database_path.parent().ok_or_else(|| {
+            PrivacyWorkflowError::new(
+                "privacy_store_unavailable",
+                "The local privacy database has no controlled parent directory.",
+            )
+        })?;
+        match fs::symlink_metadata(directory) {
+            Ok(_) => validate_ordinary_directory(directory)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(directory).map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "privacy_store_unavailable",
+                        "The local privacy directory could not be created after preflight.",
+                    )
+                })?;
+                validate_ordinary_directory(directory)?;
+            }
+            Err(_) => {
+                return Err(PrivacyWorkflowError::new(
+                    "privacy_store_unavailable",
+                    "The local privacy directory could not be inspected after preflight.",
+                ))
+            }
+        }
+        self.shared
+            .vault_broker
+            .prepare_for_migration_backup_after_preflight()
+            .map_err(PrivacyWorkflowError::vault)?;
+        if matches!(
+            self.preflight_privacy_store_schema_read_only()?,
+            PrivacyStoreSchemaStatus::Empty
+        ) {
+            let mut connection = self.open_raw_connection()?;
+            PrivacyStore::initialize(&connection).map_err(PrivacyWorkflowError::store)?;
+            PrivacyLifecycle::initialize(
+                &mut connection,
+                self.shared.workspace_instance_id.clone(),
+                self.current_unix()?,
+            )
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+            ProjectPrivacyCaseBindingStore::initialize(&mut connection)
+                .map_err(PrivacyWorkflowError::project_case_binding)?;
+            case_materials::initialize_assignment_schema(&mut connection)?;
+            vault_broker::initialize_vault_link_schema(&connection)
+                .map_err(PrivacyWorkflowError::vault)?;
+            case_dictionary_store::initialize_schema(&connection)?;
+            project_deletion::initialize_schema(&connection)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn upgrade_privacy_store_schema_after_backup(
+        &self,
+    ) -> Result<(), PrivacyWorkflowError> {
+        let _guard = self.gate();
+        let mut connection = self.open_raw_connection()?;
+        if self.privacy_store_schema_upgrade_required() {
+            PrivacyStore::upgrade_schema_after_backup(&connection)
+                .map_err(PrivacyWorkflowError::store)?;
+            PrivacyLifecycle::initialize(
+                &mut connection,
+                self.shared.workspace_instance_id.clone(),
+                self.current_unix()?,
+            )
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+        }
+        ProjectPrivacyCaseBindingStore::initialize(&mut connection)
+            .map_err(PrivacyWorkflowError::project_case_binding)?;
+        case_materials::initialize_assignment_schema(&mut connection)?;
+        vault_broker::initialize_vault_link_schema(&connection)
+            .map_err(PrivacyWorkflowError::vault)?;
+        case_dictionary_store::initialize_schema(&connection)?;
+        project_deletion::initialize_schema(&connection)?;
+        self.shared
+            .vault_broker
+            .upgrade_schema_after_backup()
+            .map_err(PrivacyWorkflowError::vault)?;
+        self.shared
+            .schema_upgrade_required
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn complete_application_startup_maintenance(
+        &self,
+    ) -> Result<(), PrivacyWorkflowError> {
+        let _guard = self.gate();
+        let mut connection = self.open_connection()?;
+        self.run_startup_maintenance(&mut connection)
+    }
+
+    fn parse_project_id(&self, value: String) -> Result<ProjectId, PrivacyWorkflowError> {
+        ProjectId::parse(value).map_err(PrivacyWorkflowError::project_case_binding)
+    }
+
+    fn ensure_project_exists(&self, project_id: &ProjectId) -> Result<(), PrivacyWorkflowError> {
+        let connection = database::open_user_database_read_only(&self.shared.user_database_path)
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "case_material_source_unavailable",
+                    "案件数据库无法以只读方式核验。",
+                )
+            })?;
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM projects WHERE project_id=?1
+                 )",
+                [project_id.as_str()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "case_material_source_unavailable",
+                    "案件身份无法从只读案件数据库核验。",
+                )
+            })?;
+        if !exists {
+            return Err(PrivacyWorkflowError::new(
+                "case_project_not_found",
+                "指定案件不存在或已被删除。",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_or_create_privacy_case_id(
+        &self,
+        connection: &mut Connection,
+        project_id: &ProjectId,
+        creation_source: BindingCreationSource,
+        migration_id: Option<String>,
+    ) -> Result<PrivacyCaseId, PrivacyWorkflowError> {
+        project_deletion::ensure_project_accepts_privacy_writes(connection, project_id)?;
+        let lifecycle_context = BindingLifecycleContext::new(
+            creation_source,
+            format!("bind_{}", Uuid::new_v4().simple()),
+            migration_id,
+        )
+        .map_err(PrivacyWorkflowError::project_case_binding)?;
+        ProjectPrivacyCaseBindingStore::resolve_or_create(
+            connection,
+            project_id,
+            &lifecycle_context,
+        )
+        .map_err(PrivacyWorkflowError::project_case_binding)
     }
 
     #[cfg(test)]
@@ -911,9 +1270,6 @@ impl PrivacyWorkflowManager {
             mineru_config,
             qualification: ocr_qualification,
         } = ocr_execution;
-        let _gate = self.gate();
-        let (source_bytes, source_display_name) = read_bounded_selected_material(path)?;
-        let source_bytes = vault_broker::ZeroizingBytes::new(source_bytes);
         let case_id = requested_case_id
             .map_or_else(
                 || CaseId::parse(format!("case_{}", Uuid::new_v4().simple())),
@@ -925,6 +1281,79 @@ impl PrivacyWorkflowManager {
                     "案件标识无效；必须使用 App 生成的匿名 caseId。",
                 )
             })?;
+        let _gate = self.gate();
+        self.prepare_selected_material_for_identity_locked(
+            path,
+            config,
+            ocr_status,
+            mineru_config,
+            ocr_qualification,
+            None,
+            case_id,
+            custom_terms,
+        )
+    }
+
+    pub fn prepare_case_selected_material_with_qualification(
+        &self,
+        path: &Path,
+        config: &PrivacyConfig,
+        ocr_status: &LocalOcrStatus,
+        ocr_execution: LocalOcrExecutionContext<'_>,
+        requested_project_id: String,
+        custom_terms: Vec<String>,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        let project_id = self.parse_project_id(requested_project_id)?;
+        let LocalOcrExecutionContext {
+            mineru_config,
+            qualification: ocr_qualification,
+        } = ocr_execution;
+        let _gate = self.gate();
+        let project_guard = self.begin_case_project_read_guard(&project_id)?;
+        let mut connection = self.open_connection()?;
+        let privacy_case_id = self.resolve_or_create_privacy_case_id(
+            &mut connection,
+            &project_id,
+            BindingCreationSource::LifecycleInitialization,
+            None,
+        )?;
+        drop(connection);
+        let result = self.prepare_selected_material_for_identity_locked(
+            path,
+            config,
+            ocr_status,
+            mineru_config,
+            ocr_qualification,
+            Some(project_id.as_str()),
+            privacy_case_id.into_case_id(),
+            custom_terms,
+        );
+        match result {
+            Ok(review) => {
+                project_guard.commit()?;
+                Ok(review)
+            }
+            Err(error) => {
+                project_guard.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_selected_material_for_identity_locked(
+        &self,
+        path: &Path,
+        config: &PrivacyConfig,
+        ocr_status: &LocalOcrStatus,
+        mineru_config: Option<&LocalMineruConfig>,
+        ocr_qualification: Option<&QualificationSnapshotV1>,
+        project_id: Option<&str>,
+        case_id: CaseId,
+        custom_terms: Vec<String>,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
+        let (source_bytes, source_display_name) = read_bounded_selected_material(path)?;
+        let source_bytes = vault_broker::ZeroizingBytes::new(source_bytes);
         let material_id = MaterialId::parse(format!("mat_{}", Uuid::new_v4().simple()))
             .expect("generated material identifiers satisfy the opaque-id contract");
         let source_media_type = file_ingest::detect_format(&source_display_name)
@@ -972,13 +1401,20 @@ impl PrivacyWorkflowManager {
             &transaction,
             &RegisterPrivacyMaterial {
                 material_id: material_id.as_str(),
-                project_id: Some(case_id.as_str()),
+                project_id,
                 attachment_id: Some(binding.object_id.as_str()),
                 source_sha256: binding.source_sha256.as_str(),
                 source_name_sha256: &source_name_sha256,
                 media_type: source_media_type,
                 page_count: None,
             },
+        )
+        .map_err(PrivacyWorkflowError::store)?;
+        PrivacyStore::set_material_display_name(
+            &transaction,
+            material_id.as_str(),
+            Some(1),
+            &source_display_name,
         )
         .map_err(PrivacyWorkflowError::store)?;
         vault_broker::persist_vault_import(
@@ -1025,7 +1461,6 @@ impl PrivacyWorkflowManager {
         }
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     fn prepare_material_bytes(
         &self,
@@ -1295,6 +1730,13 @@ impl PrivacyWorkflowManager {
                 },
             )
             .map_err(PrivacyWorkflowError::store)?;
+            PrivacyStore::set_material_display_name(
+                &transaction,
+                &material_id,
+                Some(1),
+                &source_display_name,
+            )
+            .map_err(PrivacyWorkflowError::store)?;
         }
         let unresolved_high_risk_count = risk_state
             .as_ref()
@@ -1360,6 +1802,7 @@ impl PrivacyWorkflowManager {
         Ok(view)
     }
 
+    #[allow(dead_code)]
     pub fn load_review(
         &self,
         redaction_id: &str,
@@ -1368,12 +1811,20 @@ impl PrivacyWorkflowManager {
         self.load_review_unlocked(redaction_id)
     }
 
+    #[allow(dead_code)]
     pub fn load_latest_review(&self) -> Result<Option<PrivacyReviewView>, PrivacyWorkflowError> {
         let _gate = self.gate();
         let connection = self.open_connection()?;
         let redaction_id = connection
             .query_row(
-                "SELECT redaction_id FROM privacy_redactions ORDER BY rowid DESC LIMIT 1",
+                "SELECT generation.redaction_id
+                 FROM privacy_redactions AS generation
+                 JOIN privacy_materials AS material
+                   ON material.material_id=generation.material_id
+                 WHERE generation.revocation_state='active'
+                   AND generation.revoked_at IS NULL
+                   AND material.deleted_at IS NULL
+                 ORDER BY generation.rowid DESC LIMIT 1",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -1394,10 +1845,22 @@ impl PrivacyWorkflowManager {
         let connection = self.open_connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT redaction_id,approved_payload_sha256
-                 FROM privacy_redactions
-                 WHERE review_state='approved' AND approved_payload_sha256 IS NOT NULL
-                 ORDER BY rowid DESC LIMIT 256",
+                "SELECT generation.redaction_id,generation.approved_payload_sha256
+                 FROM privacy_redactions AS generation
+                 JOIN privacy_materials AS material
+                   ON material.material_id=generation.material_id
+                 WHERE generation.review_state='approved'
+                   AND generation.approved_payload_sha256 IS NOT NULL
+                   AND generation.unresolved_high_risk_count=0
+                   AND generation.generation_status='ready'
+                   AND generation.revocation_state='active'
+                   AND generation.revoked_at IS NULL
+                   AND material.project_id IS NOT NULL
+                   AND material.source_kind='vault'
+                   AND material.migration_status='ready'
+                   AND material.state IN ('approved','outbound_ready')
+                   AND material.deleted_at IS NULL
+                 ORDER BY generation.rowid DESC LIMIT 256",
             )
             .map_err(|_| {
                 PrivacyWorkflowError::new(
@@ -1426,6 +1889,8 @@ impl PrivacyWorkflowManager {
 
         let mut selections = Vec::with_capacity(indexed.len());
         for (redaction_id, approved_payload_sha256) in indexed {
+            let (_authorization, project_guard) =
+                self.begin_live_case_redaction_authorization(&redaction_id, true)?;
             let loaded = PrivacyStore::load_review_draft(&connection, &redaction_id)
                 .map_err(PrivacyWorkflowError::store)?;
             if loaded.review_state != "approved" {
@@ -1493,6 +1958,7 @@ impl PrivacyWorkflowManager {
                     "Approved review payload binding is invalid.",
                 )
             })?;
+            project_guard.commit()?;
             selections.push(ApprovedPrivacyReviewSelection {
                 redaction_id,
                 material_id: loaded.material_id,
@@ -1584,8 +2050,10 @@ impl PrivacyWorkflowManager {
         }
         let reviewer = request.reviewer.trim().to_owned();
         let expected_payload_sha256 = request.expected_approved_payload_sha256.clone();
+        let _gate = self.gate();
+        let (authorization, project_guard) =
+            self.begin_live_case_redaction_authorization(&request.redaction_id, true)?;
         let approval_request = {
-            let _gate = self.gate();
             let connection = self.open_connection()?;
             let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
                 .map_err(PrivacyWorkflowError::store)?;
@@ -1702,7 +2170,7 @@ impl PrivacyWorkflowManager {
                 ttl_seconds: request.ttl_seconds,
             }
         };
-        let approved = self.approve_review(approval_request)?;
+        let approved = self.approve_review_unlocked(approval_request, Some(&authorization))?;
         if approved.approved_payload_sha256 != expected_payload_sha256
             || approved.destination.kind != DestinationKind::ExternalMcpHost
             || approved.destination.identifier
@@ -1714,6 +2182,7 @@ impl PrivacyWorkflowManager {
                 "The approved MCP publication receipt has an invalid fixed binding.",
             ));
         }
+        project_guard.commit()?;
         Ok(ApproveReviewForApprovedWorkspaceResponse {
             receipt_id: approved.receipt_id,
             approved_payload_sha256: approved.approved_payload_sha256,
@@ -1725,11 +2194,20 @@ impl PrivacyWorkflowManager {
         })
     }
 
+    #[allow(dead_code)]
     pub fn delete_review(
         &self,
         request: DeletePrivacyReviewRequest,
     ) -> Result<DeletePrivacyReviewResponse, PrivacyWorkflowError> {
         let _gate = self.gate();
+        self.delete_review_unlocked(request, None)
+    }
+
+    fn delete_review_unlocked(
+        &self,
+        request: DeletePrivacyReviewRequest,
+        case_authorization: Option<&case_materials::CaseRedactionAuthorization>,
+    ) -> Result<DeletePrivacyReviewResponse, PrivacyWorkflowError> {
         if !valid_identifier(&request.redaction_id)
             || !valid_hash(&request.expected_source_sha256)
             || !valid_hash(&request.expected_extraction_sha256)
@@ -1741,110 +2219,155 @@ impl PrivacyWorkflowManager {
         }
 
         let mut connection = self.open_connection()?;
-        if vault_broker::load_vault_binding_for_redaction(&connection, &request.redaction_id)
-            .map_err(PrivacyWorkflowError::vault)?
-            .is_some()
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&connection, authorization)?;
+        }
+        let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
+            .map_err(PrivacyWorkflowError::store)?;
+        let (source_sha256, deleted_at) = connection
+            .query_row(
+                "SELECT source_sha256,deleted_at
+                 FROM privacy_materials WHERE material_id=?1",
+                [&loaded.material_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_database_error",
+                    "待删除原件身份无法核验。",
+                )
+            })?;
+        if request.expected_source_sha256 != source_sha256
+            || request.expected_extraction_sha256 != loaded.extraction_sha256
         {
-            let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
-                .map_err(PrivacyWorkflowError::store)?;
-            if request.expected_source_sha256
-                != connection
-                    .query_row(
-                        "SELECT source_sha256 FROM privacy_materials WHERE material_id=?1",
-                        [&loaded.material_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map_err(|_| {
-                        PrivacyWorkflowError::new(
-                            "privacy_store_database_error",
-                            "待删除原件身份无法核验。",
-                        )
-                    })?
-                || request.expected_extraction_sha256 != loaded.extraction_sha256
-            {
-                return Err(PrivacyWorkflowError::new(
-                    "redaction_stale",
-                    "审阅记录已变化，请重新载入后再删除。",
-                ));
-            }
-            let stored: StoredReviewPayload =
-                serde_json::from_slice(&loaded.review_payload_plaintext).map_err(|_| {
-                    PrivacyWorkflowError::new(
-                        "review_payload_invalid",
-                        "本机审阅数据无法解密或解析。",
-                    )
-                })?;
-            validate_loaded_review(&loaded, &stored)?;
-            let binding = self
-                .verify_stored_vault_source(&connection, &stored)?
-                .ok_or_else(|| {
-                    PrivacyWorkflowError::new(
-                        "vault_reference_mismatch",
-                        "受 Vault 管理的审阅缺少原件引用；删除已拒绝。",
-                    )
-                })?;
-            let (legal_hold, policy_revision) = connection
-                .query_row(
-                    "SELECT legal_hold,policy_revision FROM privacy_retention_bindings
-                     WHERE redaction_id=?1",
-                    [&request.redaction_id],
-                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
+            return Err(PrivacyWorkflowError::new(
+                "redaction_stale",
+                "审阅记录已变化，请重新载入后再删除。",
+            ));
+        }
+        if deleted_at.is_some() {
+            return Ok(DeletePrivacyReviewResponse { deleted: false });
+        }
+        let stored: StoredReviewPayload = serde_json::from_slice(&loaded.review_payload_plaintext)
+            .map_err(|_| {
+                PrivacyWorkflowError::new("review_payload_invalid", "本机审阅数据无法解密或解析。")
+            })?;
+        validate_loaded_review(&loaded, &stored)?;
+        let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_review_identity_invalid",
+                "The review material identity is invalid.",
+            )
+        })?;
+        let generation_ids = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT redaction_id FROM privacy_redactions
+                     WHERE material_id=?1 ORDER BY generation_number",
                 )
                 .map_err(|_| {
                     PrivacyWorkflowError::new(
-                        "retention_binding_unavailable",
-                        "原件保留与法律保留状态无法核验；删除已拒绝。",
+                        "privacy_store_database_error",
+                        "The material generation history cannot be read for deletion.",
                     )
                 })?;
-            if legal_hold {
-                return Err(PrivacyWorkflowError::new(
-                    "legal_hold_active",
-                    "该案件材料处于法律保留状态，不能删除原件或审阅。",
-                ));
-            }
-            let policy_revision = u64::try_from(policy_revision).map_err(|_| {
+            let rows = statement
+                .query_map([material_id.as_str()], |row| row.get::<_, String>(0))
+                .map_err(|_| {
+                    PrivacyWorkflowError::new(
+                        "privacy_store_database_error",
+                        "The material generation history cannot be read for deletion.",
+                    )
+                })?;
+            rows.collect::<Result<BTreeSet<_>, _>>().map_err(|_| {
                 PrivacyWorkflowError::new(
-                    "retention_binding_invalid",
-                    "原件保留策略版本无效；删除已拒绝。",
+                    "privacy_store_database_error",
+                    "The material generation history cannot be read for deletion.",
                 )
-            })?;
-            let case_id = CaseId::parse(stored.case_id.clone().ok_or_else(|| {
-                PrivacyWorkflowError::new(
-                    "privacy_review_identity_invalid",
-                    "A Vault-backed review must remain case-bound before deletion.",
-                )
-            })?)
+            })?
+        };
+        if generation_ids.is_empty() {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_store_database_error",
+                "The material has no revocable generation history.",
+            ));
+        }
+        let vault_binding = self.verify_stored_vault_source(&connection, &stored)?;
+        if case_authorization.is_some() && vault_binding.is_none() {
+            return Err(PrivacyWorkflowError::new(
+                "vault_reference_mismatch",
+                "A case material is missing its exact Vault source reference; deletion was refused.",
+            ));
+        }
+        let (binding_count, legal_hold_count, policy_revision) = connection
+            .query_row(
+                "SELECT COUNT(binding.redaction_id),
+                        COALESCE(SUM(CASE WHEN binding.legal_hold=1 THEN 1 ELSE 0 END),0),
+                        COALESCE(MAX(binding.policy_revision),0)
+                 FROM privacy_redactions AS generation
+                 LEFT JOIN privacy_retention_bindings AS binding
+                   ON binding.redaction_id=generation.redaction_id
+                 WHERE generation.material_id=?1",
+                [material_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
             .map_err(|_| {
                 PrivacyWorkflowError::new(
-                    "privacy_review_identity_invalid",
-                    "The review case identity is invalid.",
+                    "retention_binding_unavailable",
+                    "Material retention and legal-hold state cannot be verified; deletion was refused.",
                 )
             })?;
-            let material_id = MaterialId::parse(stored.material_id.clone()).map_err(|_| {
-                PrivacyWorkflowError::new(
-                    "privacy_review_identity_invalid",
-                    "The review material identity is invalid.",
-                )
-            })?;
-            self.invalidate_material_publications(&case_id, &material_id, "vault_source_deleted")?;
-            let now_unix = self.current_unix()?;
-            let bound_at_unix = now_unix.checked_sub(1).ok_or_else(|| {
-                PrivacyWorkflowError::new("invalid_time", "本机时间无效；删除已拒绝。")
-            })?;
-            self.shared
-                .vault_broker
-                .bind_retention(&binding, now_unix, false, policy_revision, bound_at_unix)
-                .map_err(PrivacyWorkflowError::vault)?;
-            self.shared
-                .vault_broker
-                .run_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now_unix)
-                .map_err(PrivacyWorkflowError::vault)?;
+        if usize::try_from(binding_count).ok() != Some(generation_ids.len()) || policy_revision <= 0
+        {
+            return Err(PrivacyWorkflowError::new(
+                "retention_binding_unavailable",
+                "Every material generation must have a valid retention binding before deletion.",
+            ));
         }
-        let deleted = match PrivacyStore::delete_redaction_material_exact(
+        if legal_hold_count != 0 {
+            return Err(PrivacyWorkflowError::new(
+                "legal_hold_active",
+                "The case material is under legal hold and cannot be deleted.",
+            ));
+        }
+
+        if let Some(binding) = vault_binding.as_ref() {
+            self.invalidate_material_publications(
+                &binding.case_id,
+                &material_id,
+                "case_material_deleted",
+            )?;
+            self.invalidate_lifecycle_bindings(&generation_ids, "case_material_deleted")?;
+        }
+        let now_unix = self.current_unix()?;
+        let lifecycle = self.privacy_lifecycle(&connection)?;
+        for redaction_id in &generation_ids {
+            for output in lifecycle
+                .list_approved_outputs(&connection, redaction_id)
+                .map_err(PrivacyWorkflowError::lifecycle)?
+                .into_iter()
+                .filter(|output| !output.revoked)
+            {
+                lifecycle
+                    .revoke_approved_output(&connection, &output.output_id, now_unix)
+                    .map_err(PrivacyWorkflowError::lifecycle)?;
+            }
+        }
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&connection, authorization)?;
+        }
+        let deleted = match PrivacyStore::tombstone_redaction_material_exact(
             &mut connection,
             &request.redaction_id,
             &request.expected_source_sha256,
             &request.expected_extraction_sha256,
+            now_unix,
         ) {
             Ok(deleted) => deleted,
             Err(PrivacyStoreError::Conflict) => {
@@ -1863,6 +2386,33 @@ impl PrivacyWorkflowManager {
         redaction_id: &str,
     ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
         let connection = self.open_connection()?;
+        let available = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM privacy_redactions AS generation
+                   JOIN privacy_materials AS material
+                     ON material.material_id=generation.material_id
+                   WHERE generation.redaction_id=?1
+                     AND generation.revocation_state='active'
+                     AND generation.revoked_at IS NULL
+                     AND material.deleted_at IS NULL
+                 )",
+                [redaction_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_store_database_error",
+                    "The requested review availability cannot be verified.",
+                )
+            })?;
+        if !available {
+            return Err(PrivacyWorkflowError::new(
+                "redaction_not_available",
+                "The requested review is deleted, revoked, or unavailable.",
+            ));
+        }
         let loaded = PrivacyStore::load_review_draft(&connection, redaction_id)
             .map_err(PrivacyWorkflowError::store)?;
         let stored: StoredReviewPayload = serde_json::from_slice(&loaded.review_payload_plaintext)
@@ -1944,6 +2494,7 @@ impl PrivacyWorkflowManager {
             )),
         }
     }
+    #[allow(dead_code)]
     pub fn load_risk_review(
         &self,
         redaction_id: &str,
@@ -2038,6 +2589,14 @@ impl PrivacyWorkflowManager {
         request: ApplyPrivacyRiskReviewActionRequest,
     ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
         let _gate = self.gate();
+        self.apply_risk_review_action_unlocked(request, None)
+    }
+
+    fn apply_risk_review_action_unlocked(
+        &self,
+        request: ApplyPrivacyRiskReviewActionRequest,
+        case_authorization: Option<&case_materials::CaseRedactionAuthorization>,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
         if !valid_identifier(&request.redaction_id)
             || request.expected_revision == 0
             || request.actor.trim().is_empty()
@@ -2050,6 +2609,9 @@ impl PrivacyWorkflowManager {
             ));
         }
         let mut connection = self.open_connection()?;
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&connection, authorization)?;
+        }
         let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
             .map_err(PrivacyWorkflowError::store)?;
         let mut stored: StoredReviewPayload =
@@ -2220,6 +2782,9 @@ impl PrivacyWorkflowManager {
             .map_err(|_| {
                 PrivacyWorkflowError::new("privacy_store_busy", "Risk review store is busy.")
             })?;
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&transaction, authorization)?;
+        }
         if let Some(pending) = pending_dictionary.as_ref() {
             case_dictionary_store::commit_pending_revision(&transaction, pending)?;
         }
@@ -2244,6 +2809,7 @@ impl PrivacyWorkflowManager {
         Ok(view)
     }
 
+    #[allow(dead_code)]
     pub fn undo_risk_review(
         &self,
         request: PrivacyRiskReviewRevisionRequest,
@@ -2251,6 +2817,7 @@ impl PrivacyWorkflowManager {
         self.move_risk_review_history(request, false)
     }
 
+    #[allow(dead_code)]
     pub fn redo_risk_review(
         &self,
         request: PrivacyRiskReviewRevisionRequest,
@@ -2258,12 +2825,22 @@ impl PrivacyWorkflowManager {
         self.move_risk_review_history(request, true)
     }
 
+    #[allow(dead_code)]
     fn move_risk_review_history(
         &self,
         request: PrivacyRiskReviewRevisionRequest,
         redo: bool,
     ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
         let _gate = self.gate();
+        self.move_risk_review_history_unlocked(request, redo, None)
+    }
+
+    fn move_risk_review_history_unlocked(
+        &self,
+        request: PrivacyRiskReviewRevisionRequest,
+        redo: bool,
+        case_authorization: Option<&case_materials::CaseRedactionAuthorization>,
+    ) -> Result<PrivacyReviewView, PrivacyWorkflowError> {
         if !valid_identifier(&request.redaction_id) || request.expected_revision == 0 {
             return Err(PrivacyWorkflowError::new(
                 "privacy_review_input_invalid",
@@ -2271,6 +2848,9 @@ impl PrivacyWorkflowManager {
             ));
         }
         let mut connection = self.open_connection()?;
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&connection, authorization)?;
+        }
         let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
             .map_err(PrivacyWorkflowError::store)?;
         let mut stored: StoredReviewPayload =
@@ -2366,6 +2946,9 @@ impl PrivacyWorkflowManager {
             .map_err(|_| {
                 PrivacyWorkflowError::new("privacy_store_busy", "Risk review store is busy.")
             })?;
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&transaction, authorization)?;
+        }
         PrivacyStore::update_review_draft_exact(
             &transaction,
             &request.redaction_id,
@@ -2392,9 +2975,19 @@ impl PrivacyWorkflowManager {
     }
     /// Renderer-facing approval entry point. External Provider and MCP scopes
     /// must use their dedicated, fixed-purpose approval commands instead.
+    #[allow(dead_code)]
     pub fn approve_local_safe_export_review(
         &self,
         request: ApprovePrivacyReviewRequest,
+    ) -> Result<ApprovePrivacyReviewResponse, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        self.approve_local_safe_export_review_unlocked(request, None)
+    }
+
+    fn approve_local_safe_export_review_unlocked(
+        &self,
+        request: ApprovePrivacyReviewRequest,
+        case_authorization: Option<&case_materials::CaseRedactionAuthorization>,
     ) -> Result<ApprovePrivacyReviewResponse, PrivacyWorkflowError> {
         if request.destination.kind != DestinationKind::VerifiedLocalProvider {
             return Err(PrivacyWorkflowError::new(
@@ -2402,16 +2995,28 @@ impl PrivacyWorkflowManager {
                 "External Provider and MCP destinations require their dedicated approval flow.",
             ));
         }
-        self.approve_review(request)
+        self.approve_review_unlocked(request, case_authorization)
     }
 
+    #[allow(dead_code)]
     pub fn approve_review(
         &self,
         request: ApprovePrivacyReviewRequest,
     ) -> Result<ApprovePrivacyReviewResponse, PrivacyWorkflowError> {
         let _gate = self.gate();
+        self.approve_review_unlocked(request, None)
+    }
+
+    fn approve_review_unlocked(
+        &self,
+        request: ApprovePrivacyReviewRequest,
+        case_authorization: Option<&case_materials::CaseRedactionAuthorization>,
+    ) -> Result<ApprovePrivacyReviewResponse, PrivacyWorkflowError> {
         validate_approval_request(&request)?;
         let connection = self.open_connection()?;
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&connection, authorization)?;
+        }
         let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
             .map_err(PrivacyWorkflowError::store)?;
         if request.expected_suggested_redacted_sha256 != loaded.redacted_content_sha256 {
@@ -2644,6 +3249,9 @@ impl PrivacyWorkflowManager {
         let signer = self.receipt_signer()?;
 
         let mut mutable_connection = connection;
+        if let Some(authorization) = case_authorization {
+            self.revalidate_case_redaction_authorization(&mutable_connection, authorization)?;
+        }
         let approval_result = if let Some(state) = publication_bound_risk.as_ref() {
             let state_plaintext = encode_risk_state(state)?;
             let risk_sha256 = state.session.risk_sha256().map_err(review_session_error)?;
@@ -3536,29 +4144,6 @@ fn approved_publication_invalidation_error(code: &'static str) -> PrivacyWorkflo
         code,
         "Existing approved publications could not be revoked before the privacy revision changed.",
     )
-}
-
-fn pending_restore_artifacts_exist(directory: &Path) -> Result<bool, PrivacyWorkflowError> {
-    let active_name = PRIVACY_DATABASE_NAME;
-    [
-        format!("{active_name}.restore-incoming"),
-        format!("{active_name}.restore-pending.dpapi"),
-        format!("{active_name}.restore-rollback"),
-        format!("{active_name}.application-restore-incoming"),
-    ]
-    .into_iter()
-    .try_fold(false, |found, name| {
-        directory
-            .join(name)
-            .try_exists()
-            .map(|exists| found || exists)
-            .map_err(|_| {
-                PrivacyWorkflowError::new(
-                    "privacy_restore_state_unavailable",
-                    "Pending privacy restore state could not be inspected.",
-                )
-            })
-    })
 }
 
 fn prepared_retention_cleanup_ids(
@@ -4538,6 +5123,7 @@ mod tests {
 
     fn manager_with_test_signer() -> (TempDir, PrivacyWorkflowManager, ReceiptSigner) {
         let directory = tempfile::tempdir().expect("temp privacy directory");
+        database::ensure_user_database(directory.path()).expect("test user database");
         let manager = PrivacyWorkflowManager::new(
             directory.path().to_path_buf(),
             test_workspace_instance_id(),
@@ -4546,6 +5132,173 @@ mod tests {
         let signer = ReceiptSigner::new([7u8; 32]).expect("test receipt signer");
         manager.set_test_runtime(signer.clone(), TEST_NOW);
         (directory, manager, signer)
+    }
+
+    fn file_tree_hashes(root: &Path) -> BTreeMap<String, String> {
+        fn visit(base: &Path, directory: &Path, output: &mut BTreeMap<String, String>) {
+            for entry in fs::read_dir(directory).expect("read test tree") {
+                let entry = entry.expect("test tree entry");
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).expect("test tree metadata");
+                assert!(!metadata.file_type().is_symlink());
+                if metadata.is_dir() {
+                    visit(base, &path, output);
+                } else if metadata.is_file() {
+                    let relative = path
+                        .strip_prefix(base)
+                        .expect("relative test path")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    output.insert(
+                        relative,
+                        sha256_hex(&fs::read(&path).expect("read test file")),
+                    );
+                }
+            }
+        }
+        let mut output = BTreeMap::new();
+        visit(root, root, &mut output);
+        output
+    }
+
+    #[test]
+    fn application_startup_constructor_does_not_upgrade_legacy_privacy_or_vault() {
+        let directory = tempfile::tempdir().expect("startup gate directory");
+        database::ensure_user_database(directory.path()).expect("canonical user database");
+        let initialized = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("initialize synthetic current stores");
+        drop(initialized);
+
+        let privacy_database = directory
+            .path()
+            .join(PRIVACY_DIRECTORY_NAME)
+            .join(PRIVACY_DATABASE_NAME);
+        Connection::open(&privacy_database)
+            .expect("open privacy fixture")
+            .execute(
+                "UPDATE privacy_schema_metadata SET value='4' WHERE key='schema_version'",
+                [],
+            )
+            .expect("downgrade privacy fixture marker");
+
+        let vault_database = directory
+            .path()
+            .join(vault_broker::VAULT_ROOT_DIRECTORY)
+            .join("vault-state.sqlite");
+        let vault = Connection::open(&vault_database).expect("open Vault fixture");
+        vault
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS trg_vault_cleanup_purged_no_update;
+                 DROP TRIGGER IF EXISTS trg_vault_cleanup_no_delete;
+                 DROP INDEX IF EXISTS idx_vault_retention_expiry;
+                 DROP TABLE IF EXISTS vault_cleanup_candidates;
+                 DROP TABLE IF EXISTS vault_cleanup_journal;
+                 DROP TABLE IF EXISTS vault_object_retention;
+                 DROP TABLE IF EXISTS vault_lifecycle_meta;
+                 UPDATE vault_meta SET schema_version=1 WHERE singleton=1;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("create synthetic legacy Vault");
+        drop(vault);
+
+        let before = file_tree_hashes(directory.path());
+        let pending =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                Arc::new(TogglePublicationInvalidator::default()),
+            )
+            .expect("read-only application startup open");
+        assert!(pending.privacy_store_schema_upgrade_required());
+        assert!(pending.vault_startup_write_required());
+        assert!(pending
+            .case_material_migration_required()
+            .expect("read-only migration probe"));
+        assert_eq!(file_tree_hashes(directory.path()), before);
+    }
+
+    #[test]
+    fn application_startup_rejects_unmarked_nonempty_privacy_store_without_writing() {
+        let directory = tempfile::tempdir().expect("startup gate directory");
+        database::ensure_user_database(directory.path()).expect("canonical user database");
+        let privacy_directory = directory.path().join(PRIVACY_DIRECTORY_NAME);
+        fs::create_dir_all(&privacy_directory).expect("privacy directory");
+        let privacy_database = privacy_directory.join(PRIVACY_DATABASE_NAME);
+        Connection::open(&privacy_database)
+            .expect("open unmarked privacy fixture")
+            .execute_batch(
+                "CREATE TABLE historical_private_rows(
+                    row_id TEXT PRIMARY KEY,
+                    protected_payload BLOB NOT NULL
+                 );
+                 INSERT INTO historical_private_rows(row_id,protected_payload)
+                 VALUES('historical-row',X'01020304');",
+            )
+            .expect("create unmarked nonempty privacy fixture");
+
+        let before = file_tree_hashes(directory.path());
+        let error =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                Arc::new(TogglePublicationInvalidator::default()),
+            )
+            .expect_err("unmarked nonempty Privacy store must fail closed");
+
+        assert_eq!(error.code(), "privacy_store_schema_unsupported");
+        assert_eq!(file_tree_hashes(directory.path()), before);
+        assert!(!directory
+            .path()
+            .join(vault_broker::VAULT_ROOT_DIRECTORY)
+            .exists());
+    }
+
+    #[test]
+    fn fresh_user_database_is_authorized_only_without_privacy_or_vault_history() {
+        let fresh_directory = tempfile::tempdir().expect("fresh startup directory");
+        let fresh =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                fresh_directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                Arc::new(TogglePublicationInvalidator::default()),
+            )
+            .expect("open fresh startup workflow");
+        fresh
+            .preflight_fresh_user_database_initialization()
+            .expect("fresh empty stores authorize a new user database");
+        assert!(!database::user_database_path(fresh_directory.path()).exists());
+        assert!(
+            !fresh_directory.path().join(PRIVACY_DIRECTORY_NAME).exists(),
+            "startup preflight must not create an empty Privacy target directory"
+        );
+
+        let historical_directory = tempfile::tempdir().expect("historical startup directory");
+        database::ensure_user_database(historical_directory.path())
+            .expect("historical canonical user database");
+        let historical = PrivacyWorkflowManager::new(
+            historical_directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("initialize historical stores");
+        drop(historical);
+        fs::remove_file(database::user_database_path(historical_directory.path()))
+            .expect("simulate missing user database");
+        let before = file_tree_hashes(historical_directory.path());
+        let pending =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                historical_directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                Arc::new(TogglePublicationInvalidator::default()),
+            )
+            .expect("read-only historical startup open");
+        let error = pending
+            .preflight_fresh_user_database_initialization()
+            .expect_err("existing Privacy or Vault history blocks a replacement user database");
+        assert_eq!(error.code(), "case_material_source_missing_with_history");
+        assert_eq!(file_tree_hashes(historical_directory.path()), before);
     }
 
     fn prepare_text(
@@ -4581,16 +5334,70 @@ mod tests {
         case_id: &str,
         custom_terms: Vec<String>,
     ) -> PrivacyReviewView {
+        let privacy_case_id =
+            PrivacyCaseId::parse(case_id.to_owned()).expect("strict test Privacy CaseId");
+        let mut privacy_connection = manager.open_connection().expect("privacy database");
+        let project_id =
+            ProjectPrivacyCaseBindingStore::reverse_resolve(&privacy_connection, &privacy_case_id)
+                .expect("resolve test project binding")
+                .unwrap_or_else(|| {
+                    let project_id =
+                        ProjectId::parse(format!("case-test-{}", Uuid::new_v4().simple()))
+                            .expect("strict test ProjectId");
+                    let app_local_data_directory = manager
+                        .shared
+                        .user_database_path
+                        .parent()
+                        .expect("test user database has an App-local parent");
+                    let user_database_path =
+                        database::ensure_user_database(app_local_data_directory)
+                            .expect("initialize test user database");
+                    let user_connection = database::open_user_database(&user_database_path)
+                        .expect("open test user database");
+                    database::upsert_case_project(
+                        &user_connection,
+                        &database::CaseProjectRow {
+                            project_id: project_id.as_str().to_owned(),
+                            title: "Synthetic privacy workflow case".to_owned(),
+                            case_type: "civil".to_owned(),
+                            status: "active".to_owned(),
+                            opened_on: None,
+                            summary: String::new(),
+                            created_at: String::new(),
+                            updated_at: String::new(),
+                        },
+                    )
+                    .expect("insert synthetic case project");
+                    drop(user_connection);
+                    let lifecycle_context = BindingLifecycleContext::new(
+                        BindingCreationSource::LegacyMigration,
+                        format!("bind-test-{}", Uuid::new_v4().simple()),
+                        Some("privacy-workflow-test-binding-v1".to_owned()),
+                    )
+                    .expect("test binding context");
+                    ProjectPrivacyCaseBindingStore::bind_existing_for_migration(
+                        &mut privacy_connection,
+                        &project_id,
+                        &privacy_case_id,
+                        &lifecycle_context,
+                    )
+                    .expect("bind exact test ProjectId and Privacy CaseId");
+                    project_id
+                });
+        drop(privacy_connection);
         let source_directory = tempfile::tempdir().expect("temporary case source");
         let source_path = source_directory.path().join(source_name);
         fs::write(&source_path, text).expect("write synthetic case source");
         manager
-            .prepare_selected_material(
+            .prepare_case_selected_material_with_qualification(
                 &source_path,
                 &PrivacyConfig::default(),
                 &local_ocr_status(),
-                None,
-                Some(case_id.to_owned()),
+                LocalOcrExecutionContext {
+                    mineru_config: None,
+                    qualification: None,
+                },
+                project_id.as_str().to_owned(),
                 custom_terms,
             )
             .expect("prepare Vault-bound case text")
@@ -4760,7 +5567,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_material_is_vault_backed_reverified_and_cryptographically_cleaned() {
+    fn selected_material_is_vault_backed_reverified_and_tombstoned_under_retention() {
         const RAW_CANARY: &str = "SYNTHETIC_SELECTED_VAULT_PRIVATE_CANARY";
         const SOURCE_NAME: &str = "synthetic-selected-private.txt";
         let (directory, manager, _signer) = manager_with_test_signer();
@@ -4831,16 +5638,18 @@ mod tests {
 
         let deleted = manager
             .delete_review(deletion_request(&review))
-            .expect("delete review and cryptographically clean vault source");
+            .expect("tombstone review and revoke every live capability");
         assert!(deleted.deleted);
         assert!(
             source_path.exists(),
             "the user-selected original is never deleted"
         );
-        assert!(matches!(
-            manager.shared.vault_broker.read_source(&binding),
-            Err(privacy::vault_store::VaultStoreError::ObjectNotAvailable)
-        ));
+        let retained_source = manager
+            .shared
+            .vault_broker
+            .read_source(&binding)
+            .expect("encrypted Vault source remains governed by retention");
+        drop(retained_source);
         assert!(manager.load_review(&review.redaction_id).is_err());
     }
     #[test]
@@ -5635,7 +6444,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_review_revokes_receipts_removes_protected_state_and_preserves_audit() {
+    fn deleting_review_tombstones_and_revokes_while_preserving_protected_history_and_audit() {
         let (_directory, manager, _signer) = manager_with_test_signer();
         let review = prepare_case_text(
             &manager,
@@ -5704,7 +6513,44 @@ mod tests {
                 },
             )
             .expect("read protected row counts");
-        assert_eq!(protected_counts, (0, 0, 0));
+        assert_eq!(protected_counts, (1, 1, 1));
+        let retained_state = connection
+            .query_row(
+                "SELECT material.deleted_at IS NOT NULL,material.state,
+                        generation.revocation_state,generation.revoked_at IS NOT NULL,
+                        receipt.revoked_at_unix IS NOT NULL,
+                        (SELECT COUNT(*) FROM privacy_risk_review_revisions
+                         WHERE redaction_id=generation.redaction_id)
+                 FROM privacy_materials AS material
+                 JOIN privacy_redactions AS generation
+                   ON generation.material_id=material.material_id
+                 JOIN privacy_receipts AS receipt
+                   ON receipt.redaction_id=generation.redaction_id
+                 WHERE generation.redaction_id=?1",
+                [&review.redaction_id],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .expect("read retained tombstone and revocation state");
+        assert_eq!(
+            (
+                retained_state.0,
+                retained_state.1,
+                retained_state.2,
+                retained_state.3,
+                retained_state.4,
+            ),
+            (true, "revoked".to_owned(), "revoked".to_owned(), true, true,)
+        );
+        assert!(retained_state.5 > 0);
         let audit_after = connection
             .query_row(
                 "SELECT COUNT(*),MAX(event_hash) FROM privacy_egress_audit",
@@ -5722,7 +6568,7 @@ mod tests {
                 .build_safe_pdf(old_export)
                 .expect_err("deleted receipt must no longer authorize export")
                 .code(),
-            "redaction_receipt_invalid"
+            "redaction_receipt_revoked"
         );
         assert_eq!(
             manager
@@ -5853,7 +6699,9 @@ mod tests {
             .expect("source-name hash");
         connection
             .execute(
-                "UPDATE privacy_materials SET source_name_sha256=?2 WHERE material_id=?1",
+                "UPDATE privacy_materials
+                 SET source_name_sha256=?2,row_version=row_version+1
+                 WHERE material_id=?1",
                 rusqlite::params![&review.material_id, "0".repeat(64)],
             )
             .expect("inject source-name drift");
@@ -5871,7 +6719,9 @@ mod tests {
         let connection = manager.open_connection().expect("privacy database");
         connection
             .execute(
-                "UPDATE privacy_materials SET source_name_sha256=?2 WHERE material_id=?1",
+                "UPDATE privacy_materials
+                 SET source_name_sha256=?2,row_version=row_version+1
+                 WHERE material_id=?1",
                 rusqlite::params![&review.material_id, original_source_name_hash],
             )
             .expect("restore source-name binding");

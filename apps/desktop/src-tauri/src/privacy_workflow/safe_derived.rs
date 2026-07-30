@@ -287,11 +287,32 @@ impl PrivacyWorkflowManager {
         built: &BuiltSafeExport,
     ) -> Result<(), PrivacyWorkflowError> {
         let _gate = self.gate();
+        self.verify_safe_export_authorization_unlocked(built)
+    }
+
+    pub(super) fn verify_safe_export_authorization_unlocked(
+        &self,
+        built: &BuiltSafeExport,
+    ) -> Result<(), PrivacyWorkflowError> {
         validate_built_export(built)?;
         let signer = self.receipt_signer()?;
         let now_unix = self.current_unix()?;
         let connection = self.open_connection()?;
         verify_authorization(&connection, &signer, now_unix, &built.authorization)
+    }
+
+    pub(super) fn verify_safe_export_authorization_for_redaction_unlocked(
+        &self,
+        built: &BuiltSafeExport,
+        expected_redaction_id: &str,
+    ) -> Result<(), PrivacyWorkflowError> {
+        if built.authorization.redaction_id != expected_redaction_id {
+            return Err(PrivacyWorkflowError::new(
+                "case_material_scope_mismatch",
+                "The safe export artifact is not bound to the requested case redaction.",
+            ));
+        }
+        self.verify_safe_export_authorization_unlocked(built)
     }
 
     /// Reopen bytes read from the final installed path and compare all evidence.

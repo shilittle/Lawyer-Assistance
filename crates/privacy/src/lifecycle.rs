@@ -13,13 +13,13 @@ use crate::{
     vault_crypto::{open, seal, unwrap_case_key, wrap_case_key, AeadSealedV1, SecretKey32},
     vault_store::{FixedLocalStorageRoot, VaultStoreError},
     vnext::{canonical_json_v1, strict_json_v1_from_slice, WorkspaceInstanceId},
-    PrivacyStoreError, PRIVACY_STORE_SCHEMA_VERSION,
+    PrivacyStore, PrivacyStoreError, PrivacyStoreSchemaStatus, PRIVACY_STORE_SCHEMA_VERSION,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rusqlite::{backup::Backup, params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
@@ -51,6 +51,8 @@ const DEFAULT_MAPPING_RETENTION_SECONDS: u64 = 90 * 24 * 60 * 60;
 const DEFAULT_REVIEW_RETENTION_SECONDS: u64 = 90 * 24 * 60 * 60;
 const DEFAULT_RECEIPT_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_BACKUP_RETENTION_SECONDS: u64 = 180 * 24 * 60 * 60;
+const MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION: i64 = 1;
+const MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
@@ -294,6 +296,19 @@ pub struct CleanupReportV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionCleanupAuthorizationV1 {
+    pub redaction_id: String,
+    pub material_id: String,
+    pub generation_number: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupAuthorizationSnapshotV1 {
+    pub redactions: Vec<RedactionCleanupAuthorizationV1>,
+    pub tombstoned_material_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupExportRequestV1<'a> {
     pub backup_id: &'a str,
     pub created_at_unix: u64,
@@ -307,10 +322,24 @@ pub struct BackupVerificationContextV1<'a> {
     pub now_unix: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreMigrationBackupExportContextV1 {
+    pub expected_privacy_store_schema_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreMigrationBackupVerificationContextV1<'a> {
+    pub expected_workspace_instance_id: &'a WorkspaceInstanceId,
+    pub expected_key_epoch: u64,
+    pub expected_privacy_store_schema_version: i64,
+    pub now_unix: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBackupV1 {
     pub backup_id: String,
     pub workspace_instance_id: WorkspaceInstanceId,
+    pub privacy_store_schema_version: i64,
     pub created_at_unix: u64,
     pub expires_at_unix: u64,
     pub key_epoch: u64,
@@ -356,6 +385,78 @@ struct BackupAadV1<'a> {
     database_bytes: u64,
     database_sha256: &'a str,
     wrapped_data_key_sha256: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupSchemaExpectation {
+    Current,
+    PreMigration(i64),
+}
+
+impl BackupSchemaExpectation {
+    fn expected_version(self) -> Result<i64, LifecycleError> {
+        match self {
+            Self::Current => Ok(PRIVACY_STORE_SCHEMA_VERSION),
+            Self::PreMigration(version)
+                if (MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+                    ..=MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION)
+                    .contains(&version) =>
+            {
+                Ok(version)
+            }
+            Self::PreMigration(_) => Err(LifecycleError::InvalidInput),
+        }
+    }
+
+    fn validate_actual(self, actual: i64) -> Result<i64, LifecycleError> {
+        let expected = self.expected_version()?;
+        match self {
+            Self::Current if actual == expected => Ok(actual),
+            Self::Current => Err(LifecycleError::UnsupportedSchema),
+            Self::PreMigration(_)
+                if !(MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+                    ..=MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION)
+                    .contains(&actual) =>
+            {
+                Err(LifecycleError::UnsupportedSchema)
+            }
+            Self::PreMigration(_) if actual == expected => Ok(actual),
+            Self::PreMigration(_) => Err(LifecycleError::EnvironmentMismatch),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackupVerificationExpectation<'a> {
+    expected_workspace_instance_id: &'a WorkspaceInstanceId,
+    expected_key_epoch: u64,
+    expected_privacy_store_schema_version: i64,
+    now_unix: u64,
+}
+
+fn current_backup_verification_expectation<'a>(
+    context: &BackupVerificationContextV1<'a>,
+) -> BackupVerificationExpectation<'a> {
+    BackupVerificationExpectation {
+        expected_workspace_instance_id: context.expected_workspace_instance_id,
+        expected_key_epoch: context.expected_key_epoch,
+        expected_privacy_store_schema_version: PRIVACY_STORE_SCHEMA_VERSION,
+        now_unix: context.now_unix,
+    }
+}
+
+fn pre_migration_backup_verification_expectation<'a>(
+    context: &PreMigrationBackupVerificationContextV1<'a>,
+) -> Result<BackupVerificationExpectation<'a>, LifecycleError> {
+    let expected_privacy_store_schema_version =
+        BackupSchemaExpectation::PreMigration(context.expected_privacy_store_schema_version)
+            .expected_version()?;
+    Ok(BackupVerificationExpectation {
+        expected_workspace_instance_id: context.expected_workspace_instance_id,
+        expected_key_epoch: context.expected_key_epoch,
+        expected_privacy_store_schema_version,
+        now_unix: context.now_unix,
+    })
 }
 
 pub struct PrivacyLifecycle {
@@ -1398,21 +1499,227 @@ impl PrivacyLifecycle {
                     erasure_disclosure: row.get(11)?,
                 })
             })
+            .map_err(|_| LifecycleError::Database)?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|_| LifecycleError::Database)?;
-        let mut previous = String::new();
-        let mut count = 0_u64;
-        for row in rows {
-            let row = row.map_err(|_| LifecycleError::Database)?;
-            if row.previous_event_hash != previous
-                || row.erasure_disclosure != LOGICAL_ERASURE_DISCLOSURE
-                || cleanup_event_hash(&row)? != row.event_hash
+        drop(statement);
+        let expected_count =
+            u64::try_from(rows.len()).map_err(|_| LifecycleError::CleanupIntegrity)?;
+        let mut rows_by_previous = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            if rows_by_previous
+                .insert(row.previous_event_hash.as_str(), row)
+                .is_some()
             {
                 return Err(LifecycleError::CleanupIntegrity);
             }
-            previous = row.event_hash;
+        }
+        let mut previous = String::new();
+        let mut visited = BTreeSet::new();
+        let mut count = 0_u64;
+        while count < expected_count {
+            let row = rows_by_previous
+                .remove(previous.as_str())
+                .ok_or(LifecycleError::CleanupIntegrity)?;
+            if row.event_hash.len() != 64 || !visited.insert(row.event_hash.clone()) {
+                return Err(LifecycleError::CleanupIntegrity);
+            }
+            let evidence_manifest_sha256 = cleanup_evidence_manifest(connection, &row.cleanup_id)?;
+            let legacy_event_hash = cleanup_event_hash(row)?;
+            let evidence_event_hash =
+                cleanup_event_hash_with_evidence(row, &evidence_manifest_sha256)?;
+            let (
+                candidate_total,
+                removed_total,
+                redaction_candidate_total,
+                redaction_evidence_total,
+                invalid_redaction_evidence,
+            ): (i64, i64, i64, i64, bool) = connection
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM privacy_cleanup_candidates
+                        WHERE cleanup_id=?1),
+                       (SELECT COUNT(*) FROM privacy_cleanup_candidates
+                        WHERE cleanup_id=?1 AND state='removed'),
+                       (SELECT COUNT(*) FROM privacy_cleanup_candidates
+                        WHERE cleanup_id=?1 AND target_kind='redaction'),
+                       (SELECT COUNT(*) FROM privacy_cleanup_redaction_evidence
+                        WHERE cleanup_id=?1),
+                       EXISTS(
+                         SELECT 1
+                         FROM privacy_cleanup_redaction_evidence AS evidence
+                         LEFT JOIN privacy_cleanup_candidates AS candidate
+                           ON candidate.cleanup_id=evidence.cleanup_id
+                          AND candidate.target_kind='redaction'
+                          AND candidate.target_id=evidence.redaction_id
+                          AND candidate.expected_sha256=evidence.expected_sha256
+                         WHERE evidence.cleanup_id=?1
+                           AND candidate.target_id IS NULL
+                       )",
+                    [&row.cleanup_id],
+                    |values| {
+                        Ok((
+                            values.get(0)?,
+                            values.get(1)?,
+                            values.get(2)?,
+                            values.get(3)?,
+                            values.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(|_| LifecycleError::Database)?;
+            let legacy_event = redaction_evidence_total == 0 && row.event_hash == legacy_event_hash;
+            let inventory_valid = candidate_total == row.candidate_count
+                && removed_total == row.removed_count
+                && !invalid_redaction_evidence
+                && match row.state.as_str() {
+                    "committed" => {
+                        removed_total == candidate_total
+                            && (redaction_evidence_total == redaction_candidate_total
+                                || legacy_event)
+                    }
+                    "failed" => removed_total == 0 && redaction_evidence_total == 0,
+                    _ => false,
+                };
+            let event_valid = row.event_hash == evidence_event_hash || legacy_event;
+            if row.erasure_disclosure != LOGICAL_ERASURE_DISCLOSURE
+                || !inventory_valid
+                || !event_valid
+            {
+                return Err(LifecycleError::CleanupIntegrity);
+            }
+            previous = row.event_hash.clone();
             count = count.saturating_add(1);
         }
+        if !rows_by_previous.is_empty() {
+            return Err(LifecycleError::CleanupIntegrity);
+        }
         Ok(count)
+    }
+
+    /// Authenticates the complete cleanup chain once, then returns the exact v2 redaction
+    /// erasures and retained final-material tombstones covered by that verified snapshot.
+    pub fn cleanup_authorization_snapshot(
+        &self,
+        connection: &Connection,
+    ) -> Result<CleanupAuthorizationSnapshotV1, LifecycleError> {
+        ensure_workspace(connection, &self.workspace_instance_id)?;
+        self.verify_cleanup_journal(connection)?;
+        let evidence = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT evidence.redaction_id,evidence.material_id,
+                            evidence.generation_number,
+                            evidence.material_provenance_sha256,
+                            evidence.material_tombstoned
+                     FROM privacy_cleanup_redaction_evidence AS evidence
+                     JOIN privacy_cleanup_candidates AS candidate
+                       ON candidate.cleanup_id=evidence.cleanup_id
+                      AND candidate.target_kind='redaction'
+                      AND candidate.target_id=evidence.redaction_id
+                      AND candidate.expected_sha256=evidence.expected_sha256
+                      AND candidate.state='removed'
+                     JOIN privacy_cleanup_journal AS journal
+                       ON journal.cleanup_id=evidence.cleanup_id
+                      AND journal.state='committed'
+                     ORDER BY evidence.rowid",
+                )
+                .map_err(|_| LifecycleError::Database)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                })
+                .map_err(|_| LifecycleError::Database)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| LifecycleError::Database)?;
+            rows
+        };
+        let evidence_total: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM privacy_cleanup_redaction_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| LifecycleError::Database)?;
+        if usize::try_from(evidence_total).ok() != Some(evidence.len()) {
+            return Err(LifecycleError::CleanupIntegrity);
+        }
+        let mut redactions = Vec::with_capacity(evidence.len());
+        let mut tombstoned_material_ids = BTreeSet::new();
+        for (
+            redaction_id,
+            material_id,
+            generation_number,
+            material_provenance_sha256,
+            material_tombstoned,
+        ) in evidence
+        {
+            if material_tombstoned
+                && (retention_material_provenance_sha256(connection, &material_id)?
+                    != material_provenance_sha256
+                    || !tombstoned_material_ids.insert(material_id.clone()))
+            {
+                return Err(LifecycleError::CleanupIntegrity);
+            }
+            redactions.push(RedactionCleanupAuthorizationV1 {
+                redaction_id,
+                material_id,
+                generation_number,
+            });
+        }
+        Ok(CleanupAuthorizationSnapshotV1 {
+            redactions,
+            tombstoned_material_ids: tombstoned_material_ids.into_iter().collect(),
+        })
+    }
+
+    /// Returns `true` only when a physically absent redaction is covered by an exact,
+    /// candidate-manifest-bound committed cleanup record. Legacy count-only cleanup events are
+    /// deliberately insufficient authorization for migration-ledger target disappearance.
+    pub fn redaction_cleanup_is_authorized(
+        &self,
+        connection: &Connection,
+        redaction_id: &str,
+        material_id: &str,
+        generation_number: i64,
+    ) -> Result<bool, LifecycleError> {
+        ensure_workspace(connection, &self.workspace_instance_id)?;
+        if redaction_id.is_empty() || material_id.is_empty() || generation_number <= 0 {
+            return Err(LifecycleError::InvalidInput);
+        }
+        Ok(self
+            .cleanup_authorization_snapshot(connection)?
+            .redactions
+            .iter()
+            .any(|entry| {
+                entry.redaction_id == redaction_id
+                    && entry.material_id == material_id
+                    && entry.generation_number == generation_number
+            }))
+    }
+
+    /// Identifies a final-generation retention tombstone without reconstructing erased review
+    /// payloads. At least one exact v2 redaction-erasure record must name the retained material.
+    pub fn material_cleanup_is_authorized(
+        &self,
+        connection: &Connection,
+        material_id: &str,
+    ) -> Result<bool, LifecycleError> {
+        ensure_workspace(connection, &self.workspace_instance_id)?;
+        if material_id.is_empty() {
+            return Err(LifecycleError::InvalidInput);
+        }
+        Ok(self
+            .cleanup_authorization_snapshot(connection)?
+            .tombstoned_material_ids
+            .iter()
+            .any(|value| value == material_id))
     }
 }
 
@@ -1447,11 +1754,49 @@ impl EncryptedPrivacyBackupStore {
         lifecycle: &PrivacyLifecycle,
         request: &BackupExportRequestV1<'_>,
     ) -> Result<VerifiedBackupV1, LifecycleError> {
+        self.export_database_with_schema_expectation(
+            connection,
+            lifecycle,
+            request,
+            BackupSchemaExpectation::Current,
+        )
+    }
+
+    /// Creates a rollback backup before a v1-v4 privacy-store migration.
+    ///
+    /// This path is intentionally separate from `export_database`: callers must name the exact
+    /// legacy schema they preflighted, and both the live database and the coherent snapshot must
+    /// match it. Current or future schemas are never accepted through this API.
+    pub fn export_pre_migration_database(
+        &self,
+        connection: &mut Connection,
+        lifecycle: &PrivacyLifecycle,
+        request: &BackupExportRequestV1<'_>,
+        context: &PreMigrationBackupExportContextV1,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        self.export_database_with_schema_expectation(
+            connection,
+            lifecycle,
+            request,
+            BackupSchemaExpectation::PreMigration(context.expected_privacy_store_schema_version),
+        )
+    }
+
+    fn export_database_with_schema_expectation(
+        &self,
+        connection: &mut Connection,
+        lifecycle: &PrivacyLifecycle,
+        request: &BackupExportRequestV1<'_>,
+        schema_expectation: BackupSchemaExpectation,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        schema_expectation.expected_version()?;
         valid_opaque_id(request.backup_id, "bkp_")?;
         if request.created_at_unix == 0 {
             return Err(LifecycleError::InvalidInput);
         }
         ensure_workspace(connection, lifecycle.workspace_instance_id())?;
+        let privacy_store_schema_version =
+            schema_expectation.validate_actual(read_privacy_store_schema_version(connection)?)?;
         let policy = load_retention_policy(connection)?;
         let expires_at_unix = request.expires_at_unix.unwrap_or(
             request
@@ -1479,6 +1824,7 @@ impl EncryptedPrivacyBackupStore {
             &database_bytes,
             lifecycle.workspace_instance_id(),
             key_epoch,
+            privacy_store_schema_version,
             &self.root,
             request.backup_id,
         )?;
@@ -1491,6 +1837,7 @@ impl EncryptedPrivacyBackupStore {
         let aad = backup_aad(
             request.backup_id,
             lifecycle.workspace_instance_id(),
+            privacy_store_schema_version,
             key_epoch,
             request.created_at_unix,
             expires_at_unix,
@@ -1504,7 +1851,7 @@ impl EncryptedPrivacyBackupStore {
             crypto_suite: BACKUP_CRYPTO_SUITE.to_owned(),
             backup_id: request.backup_id.to_owned(),
             workspace_instance_id: lifecycle.workspace_instance_id().clone(),
-            privacy_store_schema_version: PRIVACY_STORE_SCHEMA_VERSION,
+            privacy_store_schema_version,
             lifecycle_schema_version: PRIVACY_LIFECYCLE_SCHEMA_VERSION,
             key_epoch,
             created_at_unix: request.created_at_unix,
@@ -1535,6 +1882,7 @@ impl EncryptedPrivacyBackupStore {
         let verified = VerifiedBackupV1 {
             backup_id: request.backup_id.to_owned(),
             workspace_instance_id: lifecycle.workspace_instance_id().clone(),
+            privacy_store_schema_version,
             created_at_unix: request.created_at_unix,
             expires_at_unix,
             key_epoch,
@@ -1573,7 +1921,26 @@ impl EncryptedPrivacyBackupStore {
         backup_id: &str,
         context: &BackupVerificationContextV1<'_>,
     ) -> Result<VerifiedBackupV1, LifecycleError> {
-        let (_, verified) = self.decrypt_and_verify(registry_connection, backup_id, context)?;
+        let expectation = current_backup_verification_expectation(context);
+        let (_, verified) =
+            self.decrypt_and_verify(registry_connection, backup_id, &expectation)?;
+        Ok(verified)
+    }
+
+    /// Verifies a backup created by `export_pre_migration_database`.
+    ///
+    /// The expected legacy schema is part of the authenticated envelope and AAD and must also
+    /// match the decrypted SQLite snapshot. This does not make the normal verification path accept
+    /// legacy schemas.
+    pub fn verify_pre_migration_backup(
+        &self,
+        registry_connection: &Connection,
+        backup_id: &str,
+        context: &PreMigrationBackupVerificationContextV1<'_>,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        let expectation = pre_migration_backup_verification_expectation(context)?;
+        let (_, verified) =
+            self.decrypt_and_verify(registry_connection, backup_id, &expectation)?;
         Ok(verified)
     }
 
@@ -1584,9 +1951,45 @@ impl EncryptedPrivacyBackupStore {
         backup_id: &str,
         context: &BackupVerificationContextV1<'_>,
     ) -> Result<VerifiedBackupV1, LifecycleError> {
+        let expectation = current_backup_verification_expectation(context);
+        self.restore_into_empty_database_with_expectation(
+            registry_connection,
+            destination,
+            backup_id,
+            &expectation,
+        )
+    }
+
+    /// Restores an exact v1-v4 rollback snapshot without upgrading it.
+    ///
+    /// This is deliberately separate from the current-schema restore path. The caller must name
+    /// the authenticated legacy schema exactly; future schemas and the current schema are rejected.
+    pub fn restore_pre_migration_into_empty_database(
+        &self,
+        registry_connection: &Connection,
+        destination: &mut Connection,
+        backup_id: &str,
+        context: &PreMigrationBackupVerificationContextV1<'_>,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
+        let expectation = pre_migration_backup_verification_expectation(context)?;
+        self.restore_into_empty_database_with_expectation(
+            registry_connection,
+            destination,
+            backup_id,
+            &expectation,
+        )
+    }
+
+    fn restore_into_empty_database_with_expectation(
+        &self,
+        registry_connection: &Connection,
+        destination: &mut Connection,
+        backup_id: &str,
+        expectation: &BackupVerificationExpectation<'_>,
+    ) -> Result<VerifiedBackupV1, LifecycleError> {
         ensure_empty_database(destination)?;
         let (database_bytes, verified) =
-            self.decrypt_and_verify(registry_connection, backup_id, context)?;
+            self.decrypt_and_verify(registry_connection, backup_id, expectation)?;
         let snapshot_path = self.temporary_path(backup_id, "restore.sqlite")?;
         write_new_safe_file(&snapshot_path, &database_bytes)?;
         let restore_result = (|| {
@@ -1595,8 +1998,9 @@ impl EncryptedPrivacyBackupStore {
                     .map_err(|_| LifecycleError::BackupInvalid)?;
             validate_sqlite_connection(
                 &source,
-                context.expected_workspace_instance_id,
-                context.expected_key_epoch,
+                expectation.expected_workspace_instance_id,
+                expectation.expected_key_epoch,
+                expectation.expected_privacy_store_schema_version,
             )?;
             {
                 let backup =
@@ -1607,8 +2011,9 @@ impl EncryptedPrivacyBackupStore {
             }
             validate_sqlite_connection(
                 destination,
-                context.expected_workspace_instance_id,
-                context.expected_key_epoch,
+                expectation.expected_workspace_instance_id,
+                expectation.expected_key_epoch,
+                expectation.expected_privacy_store_schema_version,
             )
         })();
         finish_sensitive_temporary(&snapshot_path, self.root.canonical_root(), restore_result)?;
@@ -1655,7 +2060,7 @@ impl EncryptedPrivacyBackupStore {
         &self,
         registry_connection: &Connection,
         backup_id: &str,
-        context: &BackupVerificationContextV1<'_>,
+        context: &BackupVerificationExpectation<'_>,
     ) -> Result<(ZeroizingBytes, VerifiedBackupV1), LifecycleError> {
         valid_opaque_id(backup_id, "bkp_")?;
         if context.now_unix == 0 || context.expected_key_epoch == 0 {
@@ -1719,6 +2124,7 @@ impl EncryptedPrivacyBackupStore {
         let aad = backup_aad(
             backup_id,
             context.expected_workspace_instance_id,
+            envelope.privacy_store_schema_version,
             envelope.key_epoch,
             envelope.created_at_unix,
             envelope.expires_at_unix,
@@ -1737,6 +2143,7 @@ impl EncryptedPrivacyBackupStore {
             &database_bytes,
             context.expected_workspace_instance_id,
             context.expected_key_epoch,
+            context.expected_privacy_store_schema_version,
             &self.root,
             backup_id,
         )?;
@@ -1745,6 +2152,7 @@ impl EncryptedPrivacyBackupStore {
             VerifiedBackupV1 {
                 backup_id: backup_id.to_owned(),
                 workspace_instance_id: envelope.workspace_instance_id,
+                privacy_store_schema_version: envelope.privacy_store_schema_version,
                 created_at_unix: envelope.created_at_unix,
                 expires_at_unix: envelope.expires_at_unix,
                 key_epoch: envelope.key_epoch,
@@ -1871,6 +2279,21 @@ pub(crate) fn initialize_lifecycle_schema(
                PRIMARY KEY(cleanup_id,target_kind,target_id),
                FOREIGN KEY(cleanup_id) REFERENCES privacy_cleanup_journal(cleanup_id)
              ) STRICT;
+             CREATE INDEX IF NOT EXISTS idx_privacy_cleanup_previous_event_hash
+               ON privacy_cleanup_journal(state,previous_event_hash);
+             CREATE TABLE IF NOT EXISTS privacy_cleanup_redaction_evidence(
+               cleanup_id TEXT NOT NULL,
+               redaction_id TEXT NOT NULL UNIQUE,
+               material_id TEXT NOT NULL,
+               generation_number INTEGER NOT NULL CHECK(generation_number>0),
+               expected_sha256 TEXT NOT NULL CHECK(length(expected_sha256)=64),
+               material_provenance_sha256 TEXT NOT NULL CHECK(
+                 length(material_provenance_sha256)=64
+               ),
+               material_tombstoned INTEGER NOT NULL CHECK(material_tombstoned IN(0,1)),
+               PRIMARY KEY(cleanup_id,redaction_id),
+               FOREIGN KEY(cleanup_id) REFERENCES privacy_cleanup_journal(cleanup_id)
+             ) STRICT;
              CREATE TABLE IF NOT EXISTS privacy_mapping_access_audit(
                access_id TEXT PRIMARY KEY,
                mapping_id TEXT NOT NULL,
@@ -1917,10 +2340,69 @@ pub(crate) fn initialize_lifecycle_schema(
                BEFORE DELETE ON privacy_cleanup_journal BEGIN
                  SELECT RAISE(ABORT,'privacy cleanup journal is append only');
                END;
+             CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_no_replace
+               BEFORE INSERT ON privacy_cleanup_journal
+               WHEN EXISTS(
+                 SELECT 1 FROM privacy_cleanup_journal AS existing
+                 WHERE existing.cleanup_id=NEW.cleanup_id
+               ) BEGIN
+                 SELECT RAISE(ABORT,'privacy cleanup journal is append only');
+               END;
              CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_final_no_update
                BEFORE UPDATE ON privacy_cleanup_journal
                WHEN OLD.state!='prepared' BEGIN
                  SELECT RAISE(ABORT,'final privacy cleanup journal is immutable');
+               END;
+             CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_candidate_no_delete
+               BEFORE DELETE ON privacy_cleanup_candidates BEGIN
+                 SELECT RAISE(ABORT,'privacy cleanup candidate is append preserving');
+               END;
+             CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_candidate_no_replace
+               BEFORE INSERT ON privacy_cleanup_candidates
+               WHEN EXISTS(
+                 SELECT 1 FROM privacy_cleanup_candidates AS existing
+                 WHERE existing.cleanup_id=NEW.cleanup_id
+                   AND existing.target_kind=NEW.target_kind
+                   AND existing.target_id=NEW.target_id
+               ) BEGIN
+                 SELECT RAISE(ABORT,'privacy cleanup candidate is append preserving');
+               END;
+             CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_candidate_one_way
+               BEFORE UPDATE ON privacy_cleanup_candidates
+               WHEN NEW.cleanup_id IS NOT OLD.cleanup_id
+                 OR NEW.target_kind IS NOT OLD.target_kind
+                 OR NEW.target_id IS NOT OLD.target_id
+                 OR NEW.expected_sha256 IS NOT OLD.expected_sha256
+                 OR OLD.state<>'pending'
+                 OR NEW.state<>'removed'
+                 OR NOT EXISTS(
+                   SELECT 1 FROM privacy_cleanup_journal AS journal
+                   WHERE journal.cleanup_id=OLD.cleanup_id
+                     AND journal.state='prepared'
+                 )
+               BEGIN
+                 SELECT RAISE(ABORT,'privacy cleanup candidate transition is invalid');
+               END;
+             CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_redaction_evidence_no_update
+               BEFORE UPDATE ON privacy_cleanup_redaction_evidence BEGIN
+                 SELECT RAISE(ABORT,'privacy cleanup redaction evidence is immutable');
+               END;
+             CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_redaction_evidence_no_delete
+               BEFORE DELETE ON privacy_cleanup_redaction_evidence BEGIN
+                 SELECT RAISE(ABORT,'privacy cleanup redaction evidence is append only');
+               END;
+             CREATE TRIGGER IF NOT EXISTS trg_privacy_cleanup_redaction_evidence_no_replace
+               BEFORE INSERT ON privacy_cleanup_redaction_evidence
+               WHEN EXISTS(
+                 SELECT 1 FROM privacy_cleanup_redaction_evidence AS existing
+                 WHERE existing.redaction_id=NEW.redaction_id
+                    OR (
+                      NEW.material_tombstoned=1
+                      AND existing.material_id=NEW.material_id
+                      AND existing.material_tombstoned=1
+                    )
+               ) BEGIN
+                 SELECT RAISE(ABORT,'privacy cleanup redaction evidence is append only');
                END;
              CREATE TRIGGER IF NOT EXISTS trg_privacy_mapping_access_no_update
                BEFORE UPDATE ON privacy_mapping_access_audit BEGIN

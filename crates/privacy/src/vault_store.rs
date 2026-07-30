@@ -22,6 +22,9 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::{
     collections::BTreeSet,
     error::Error,
@@ -29,8 +32,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{compiler_fence, Ordering},
+    sync::{
+        atomic::{compiler_fence, Ordering},
+        Mutex,
+    },
 };
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 pub const VAULT_STORE_SCHEMA_VERSION: u32 = 2;
 pub const VAULT_OBJECT_ENVELOPE_VERSION: &str = "vault-object-envelope-v1";
@@ -42,6 +50,11 @@ pub const MAX_VAULT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_VAULT_PRIVATE_METADATA_BYTES: usize = 128 * 1024;
 pub const MAX_VAULT_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_VAULT_KEY_RECORD_BYTES: usize = 64 * 1024;
+const READ_ONLY_SNAPSHOT_ALLOCATION_ATTEMPTS: usize = 32;
+const READ_ONLY_SNAPSHOT_BASE_DIRECTORY: &str = "lawyer-assistance-vault-read-only-snapshots";
+const READ_ONLY_SNAPSHOT_DIRECTORY_PREFIX: &str = "snapshot-";
+const READ_ONLY_SNAPSHOT_LOCK_FILE: &str = "active.lock";
+static READ_ONLY_SNAPSHOT_GATE: Mutex<()> = Mutex::new(());
 const MAX_ORIGINAL_FILE_NAME_BYTES: usize = 1024;
 const MAX_ORIGINAL_SOURCE_PATH_BYTES: usize = 32 * 1024;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
@@ -439,6 +452,23 @@ pub struct VaultStore {
     workspace_instance_id: WorkspaceInstanceId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultReadOnlyInventoryV1 {
+    pub journal_row_count: u64,
+    pub committed_object_count: u64,
+    pub key_record_count: u64,
+    pub object_root_entry_count: u64,
+}
+
+impl VaultReadOnlyInventoryV1 {
+    pub fn is_empty(self) -> bool {
+        self.journal_row_count == 0
+            && self.committed_object_count == 0
+            && self.key_record_count == 0
+            && self.object_root_entry_count == 0
+    }
+}
+
 impl VaultStore {
     pub fn initialize(
         root: impl AsRef<Path>,
@@ -461,6 +491,75 @@ impl VaultStore {
         Ok(Self {
             root,
             workspace_instance_id,
+        })
+    }
+
+    /// Opens an existing Vault for the application-startup migration gate without
+    /// initializing directories, changing journal mode, creating lifecycle tables,
+    /// recovering cleanups, or upgrading the schema.
+    ///
+    /// The returned boolean is `true` only for the legacy v1 store that must be
+    /// upgraded after the coordinated five-component backup has been installed.
+    pub fn open_for_application_startup(
+        root: impl AsRef<Path>,
+        workspace_instance_id: WorkspaceInstanceId,
+    ) -> Result<(Self, bool), VaultStoreError> {
+        let root = ValidatedVaultRoot::open_read_only(root.as_ref())?;
+        let schema_version =
+            preflight_database_for_application_startup(&root, &workspace_instance_id)?;
+        Ok((
+            Self {
+                root,
+                workspace_instance_id,
+            },
+            schema_version == 1,
+        ))
+    }
+
+    /// Performs the only supported v1-to-current Vault schema upgrade. Callers
+    /// must establish the coordinated pre-migration backup gate first.
+    pub fn upgrade_schema_after_backup(&self) -> Result<(), VaultStoreError> {
+        initialize_database(&self.root, &self.workspace_instance_id)
+    }
+
+    /// Returns the persisted Vault inventory without opening the source database
+    /// itself through SQLite. The database is inspected from a verified temporary
+    /// snapshot so WAL-mode read-only preflight cannot create or mutate source
+    /// `-wal`/`-shm` sidecars.
+    pub fn inspect_inventory_read_only(&self) -> Result<VaultReadOnlyInventoryV1, VaultStoreError> {
+        let key_record_count = count_read_only_root_entries(&self.root, &self.root.keys)?;
+        let object_root_entry_count = count_read_only_root_entries(&self.root, &self.root.objects)?;
+        with_database_read_only_snapshot(&self.root, |db| {
+            validate_database_integrity(db)?;
+            let (store_version, workspace): (u32, String) = db
+                .query_row(
+                    "SELECT schema_version,workspace_instance_id
+                     FROM vault_meta WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            if !matches!(store_version, 1 | VAULT_STORE_SCHEMA_VERSION)
+                || workspace != self.workspace_instance_id.as_str()
+            {
+                return Err(VaultStoreError::ContentCorrupt);
+            }
+            let (journal_row_count, committed_object_count): (i64, i64) = db
+                .query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(state='committed'),0)
+                     FROM object_journal",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            Ok(VaultReadOnlyInventoryV1 {
+                journal_row_count: u64::try_from(journal_row_count)
+                    .map_err(|_| VaultStoreError::ContentCorrupt)?,
+                committed_object_count: u64::try_from(committed_object_count)
+                    .map_err(|_| VaultStoreError::ContentCorrupt)?,
+                key_record_count,
+                object_root_entry_count,
+            })
         })
     }
 
@@ -1204,6 +1303,18 @@ impl FixedLocalStorageRoot {
         Ok(Self { canonical_root })
     }
 
+    /// Validates and canonicalizes an existing root without repairing ACLs or
+    /// changing filesystem attributes. Startup migration preflight must remain
+    /// observational until the coordinated application backup is installed.
+    fn open_read_only(root: &Path) -> Result<Self, VaultStoreError> {
+        if !root.is_absolute() || !root.is_dir() {
+            return Err(VaultStoreError::InvalidRoot);
+        }
+        platform::validate_fixed_local_root(root)?;
+        let canonical_root = fs::canonicalize(root).map_err(|_| VaultStoreError::InvalidRoot)?;
+        Ok(Self { canonical_root })
+    }
+
     pub(crate) fn canonical_root(&self) -> &Path {
         &self.canonical_root
     }
@@ -1358,6 +1469,17 @@ impl ValidatedVaultRoot {
         ))
     }
 
+    fn open_read_only(root: &Path) -> Result<Self, VaultStoreError> {
+        let fixed_root = FixedLocalStorageRoot::open_read_only(root)?;
+        for relative in ["objects", "keys", ".staging", ".quarantine"] {
+            fixed_root.validate_existing_directory(Path::new(relative))?;
+        }
+        fixed_root.validate_existing_file(Path::new("vault-state.sqlite"))?;
+        Ok(Self::from_canonical(
+            fixed_root.canonical_root().to_path_buf(),
+        ))
+    }
+
     fn from_canonical(root: PathBuf) -> Self {
         Self {
             objects: root.join("objects"),
@@ -1391,88 +1513,140 @@ fn initialize_database(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;
          PRAGMA secure_delete=ON;
-         CREATE TABLE IF NOT EXISTS vault_meta(
-             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-             schema_version INTEGER NOT NULL,
-             workspace_instance_id TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS object_journal(
-             object_id TEXT NOT NULL,
-             version INTEGER NOT NULL CHECK(version>0),
-             workspace_instance_id TEXT NOT NULL,
-             case_id TEXT NOT NULL,
-             object_kind TEXT NOT NULL,
-             state TEXT NOT NULL CHECK(state IN('allocated','prepared','committed','quarantined')),
-             envelope_sha256 TEXT,
-             content_bytes INTEGER,
-             chunk_count INTEGER,
-             created_at_unix INTEGER NOT NULL,
-             committed_at_unix INTEGER,
-             PRIMARY KEY(object_id,version)
-         );
-         CREATE TABLE IF NOT EXISTS nonce_reservations(
-             case_id TEXT NOT NULL,
-             nonce_hex TEXT NOT NULL CHECK(length(nonce_hex)=24),
-             object_id TEXT NOT NULL,
-             version INTEGER NOT NULL CHECK(version>0),
-             component TEXT NOT NULL CHECK(component IN('content','private_metadata')),
-             chunk_index INTEGER NOT NULL CHECK(chunk_index>=-1),
-             reserved_at_unix INTEGER NOT NULL,
-             PRIMARY KEY(case_id,nonce_hex),
-             FOREIGN KEY(object_id,version) REFERENCES object_journal(object_id,version),
-             UNIQUE(object_id,version,component,chunk_index)
-         );
-         CREATE INDEX IF NOT EXISTS nonce_object_component
-             ON nonce_reservations(object_id,version,component,chunk_index);",
+         BEGIN IMMEDIATE;",
     )
     .map_err(|_| VaultStoreError::DatabaseFailed)?;
-    let existing: Option<(u32, String)> = db
-        .query_row(
-            "SELECT schema_version,workspace_instance_id FROM vault_meta WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+    let initialize_result = (|| {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vault_meta(
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               schema_version INTEGER NOT NULL,
+               workspace_instance_id TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS object_journal(
+               object_id TEXT NOT NULL,
+               version INTEGER NOT NULL CHECK(version>0),
+               workspace_instance_id TEXT NOT NULL,
+               case_id TEXT NOT NULL,
+               object_kind TEXT NOT NULL,
+               state TEXT NOT NULL CHECK(
+                 state IN('allocated','prepared','committed','quarantined')
+               ),
+               envelope_sha256 TEXT,
+               content_bytes INTEGER,
+               chunk_count INTEGER,
+               created_at_unix INTEGER NOT NULL,
+               committed_at_unix INTEGER,
+               PRIMARY KEY(object_id,version)
+             );
+             CREATE TABLE IF NOT EXISTS nonce_reservations(
+               case_id TEXT NOT NULL,
+               nonce_hex TEXT NOT NULL CHECK(length(nonce_hex)=24),
+               object_id TEXT NOT NULL,
+               version INTEGER NOT NULL CHECK(version>0),
+               component TEXT NOT NULL CHECK(component IN('content','private_metadata')),
+               chunk_index INTEGER NOT NULL CHECK(chunk_index>=-1),
+               reserved_at_unix INTEGER NOT NULL,
+               PRIMARY KEY(case_id,nonce_hex),
+               FOREIGN KEY(object_id,version) REFERENCES object_journal(object_id,version),
+               UNIQUE(object_id,version,component,chunk_index)
+             );
+             CREATE INDEX IF NOT EXISTS nonce_object_component
+               ON nonce_reservations(object_id,version,component,chunk_index);",
         )
-        .optional()
         .map_err(|_| VaultStoreError::DatabaseFailed)?;
-    match existing {
-        Some((version, workspace))
-            if version == VAULT_STORE_SCHEMA_VERSION
-                && workspace == workspace_instance_id.as_str() =>
-        {
-            initialize_vault_lifecycle_schema(&db)?;
-        }
-        Some((1, workspace)) if workspace == workspace_instance_id.as_str() => {
-            initialize_vault_lifecycle_schema(&db)?;
-            db.execute(
-                "UPDATE vault_meta SET schema_version=?1 WHERE singleton=1 AND schema_version=1",
-                [VAULT_STORE_SCHEMA_VERSION],
+        let existing: Option<(u32, String)> = db
+            .query_row(
+                "SELECT schema_version,workspace_instance_id
+                 FROM vault_meta WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .map_err(|_| VaultStoreError::DatabaseFailed)?;
-        }
-        Some(_) => return Err(VaultStoreError::DatabaseFailed),
-        None => {
-            let journal_count: i64 = db
-                .query_row("SELECT COUNT(*) FROM object_journal", [], |row| row.get(0))
-                .map_err(|_| VaultStoreError::DatabaseFailed)?;
-            if journal_count != 0
-                || !directory_is_empty(&root.objects)?
-                || !directory_is_empty(&root.keys)?
+        match existing {
+            Some((version, workspace))
+                if version == VAULT_STORE_SCHEMA_VERSION
+                    && workspace == workspace_instance_id.as_str() =>
             {
-                // Never bless an existing orphan object/key layout by manufacturing a new
-                // workspace identity database around it.
-                return Err(VaultStoreError::DatabaseFailed);
+                initialize_vault_lifecycle_schema(&db)?;
             }
-            db.execute(
-                "INSERT INTO vault_meta(singleton,schema_version,workspace_instance_id)
-                 VALUES(1,?1,?2)",
-                params![VAULT_STORE_SCHEMA_VERSION, workspace_instance_id.as_str()],
-            )
-            .map_err(|_| VaultStoreError::DatabaseFailed)?;
-            initialize_vault_lifecycle_schema(&db)?;
+            Some((1, workspace)) if workspace == workspace_instance_id.as_str() => {
+                if vault_lifecycle_table_count(&db)? != 0 {
+                    return Err(VaultStoreError::ContentCorrupt);
+                }
+                initialize_vault_lifecycle_schema(&db)?;
+                let updated = db
+                    .execute(
+                        "UPDATE vault_meta
+                         SET schema_version=?1
+                         WHERE singleton=1
+                           AND schema_version=1
+                           AND workspace_instance_id=?2",
+                        params![VAULT_STORE_SCHEMA_VERSION, workspace_instance_id.as_str()],
+                    )
+                    .map_err(|_| VaultStoreError::DatabaseFailed)?;
+                if updated != 1 {
+                    return Err(VaultStoreError::DatabaseFailed);
+                }
+            }
+            Some(_) => return Err(VaultStoreError::DatabaseFailed),
+            None => {
+                let journal_count: i64 = db
+                    .query_row("SELECT COUNT(*) FROM object_journal", [], |row| row.get(0))
+                    .map_err(|_| VaultStoreError::DatabaseFailed)?;
+                if journal_count != 0
+                    || !directory_is_empty(&root.objects)?
+                    || !directory_is_empty(&root.keys)?
+                {
+                    // Never bless an existing orphan object/key layout by manufacturing a new
+                    // workspace identity database around it.
+                    return Err(VaultStoreError::DatabaseFailed);
+                }
+                db.execute(
+                    "INSERT INTO vault_meta(singleton,schema_version,workspace_instance_id)
+                     VALUES(1,?1,?2)",
+                    params![VAULT_STORE_SCHEMA_VERSION, workspace_instance_id.as_str()],
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+                initialize_vault_lifecycle_schema(&db)?;
+            }
         }
+        Ok(())
+    })();
+    if let Err(error) = initialize_result {
+        let _ = db.execute_batch("ROLLBACK");
+        return Err(error);
+    }
+    if db.execute_batch("COMMIT").is_err() {
+        let _ = db.execute_batch("ROLLBACK");
+        return Err(VaultStoreError::DatabaseFailed);
     }
     platform::mark_not_content_indexed(&root.database)?;
     Ok(())
+}
+
+fn preflight_database_for_application_startup(
+    root: &ValidatedVaultRoot,
+    workspace_instance_id: &WorkspaceInstanceId,
+) -> Result<u32, VaultStoreError> {
+    with_database_read_only_snapshot(root, |db| {
+        validate_database_integrity(db)?;
+        let (version, workspace): (u32, String) = db
+            .query_row(
+                "SELECT schema_version,workspace_instance_id
+                 FROM vault_meta WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        if !matches!(version, 1 | VAULT_STORE_SCHEMA_VERSION)
+            || workspace != workspace_instance_id.as_str()
+        {
+            return Err(VaultStoreError::DatabaseFailed);
+        }
+        Ok(version)
+    })
 }
 
 fn validate_database(
@@ -1502,6 +1676,246 @@ fn open_database(root: &ValidatedVaultRoot) -> Result<Connection, VaultStoreErro
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")
         .map_err(|_| VaultStoreError::DatabaseFailed)?;
     Ok(db)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadOnlyDatabaseSourceProof {
+    database_sha256: String,
+    wal_sha256: Option<String>,
+}
+
+fn with_database_read_only_snapshot<T>(
+    root: &ValidatedVaultRoot,
+    operation: impl FnOnce(&Connection) -> Result<T, VaultStoreError>,
+) -> Result<T, VaultStoreError> {
+    let _snapshot_gate = READ_ONLY_SNAPSHOT_GATE
+        .lock()
+        .map_err(|_| VaultStoreError::DatabaseFailed)?;
+    let source_before = capture_read_only_database_source_proof(root)?;
+    let temporary_parent = std::env::temp_dir();
+    if !temporary_parent.is_absolute() {
+        return Err(VaultStoreError::UnsafeFilesystem);
+    }
+    let snapshot_storage = FixedLocalStorageRoot::initialize(
+        &temporary_parent.join(READ_ONLY_SNAPSHOT_BASE_DIRECTORY),
+    )?;
+    let temporary_base = snapshot_storage.canonical_root();
+    cleanup_stale_read_only_snapshot_roots(temporary_base)?;
+    let (temporary_root, snapshot_lock) = allocate_read_only_snapshot_root(&snapshot_storage)?;
+    let snapshot_database = temporary_root.join("vault-state.sqlite");
+    let snapshot_wal = temporary_root.join("vault-state.sqlite-wal");
+    let source_wal = sqlite_sidecar_path(&root.database, "-wal")?;
+    let copy_result = (|| {
+        fs::copy(&root.database, &snapshot_database).map_err(|_| VaultStoreError::IoFailed)?;
+        if source_before.wal_sha256.is_some() {
+            fs::copy(&source_wal, &snapshot_wal).map_err(|_| VaultStoreError::IoFailed)?;
+        }
+        enforce_vault_private_acl_tree(&temporary_root)?;
+        platform::mark_not_content_indexed(&snapshot_database)?;
+        if snapshot_wal.exists() {
+            platform::mark_not_content_indexed(&snapshot_wal)?;
+        }
+        if capture_read_only_database_source_proof(root)? != source_before {
+            return Err(VaultStoreError::DatabaseFailed);
+        }
+        let db = Connection::open_with_flags(&snapshot_database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA query_only=ON;
+             PRAGMA trusted_schema=OFF;",
+        )
+        .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        let query_only: i64 = db
+            .pragma_query_value(None, "query_only", |row| row.get(0))
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        if query_only != 1 {
+            return Err(VaultStoreError::DatabaseFailed);
+        }
+        let result = operation(&db);
+        drop(db);
+        if capture_read_only_database_source_proof(root)? != source_before {
+            return Err(VaultStoreError::DatabaseFailed);
+        }
+        result
+    })();
+    drop(snapshot_lock);
+    let cleanup_result = remove_read_only_snapshot_root(temporary_base, &temporary_root);
+    match (copy_result, cleanup_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn allocate_read_only_snapshot_root(
+    storage: &FixedLocalStorageRoot,
+) -> Result<(PathBuf, File), VaultStoreError> {
+    for _ in 0..READ_ONLY_SNAPSHOT_ALLOCATION_ATTEMPTS {
+        let name = format!("{READ_ONLY_SNAPSHOT_DIRECTORY_PREFIX}{}", random_hex(16)?);
+        let candidate = storage.canonical_root().join(&name);
+        match fs::create_dir(&candidate) {
+            Ok(()) => {
+                platform::reject_reparse_components(storage.canonical_root(), &candidate)?;
+                enforce_vault_private_acl_tree(&candidate)?;
+                platform::mark_not_content_indexed(&candidate)?;
+                let lock_path = candidate.join(READ_ONLY_SNAPSHOT_LOCK_FILE);
+                let lock = open_read_only_snapshot_lock(&lock_path)?;
+                enforce_vault_private_acl_tree(&candidate)?;
+                platform::mark_not_content_indexed(&lock_path)?;
+                return Ok((candidate, lock));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(VaultStoreError::IoFailed),
+        }
+    }
+    Err(VaultStoreError::ObjectAllocationFailed)
+}
+
+#[cfg(windows)]
+fn open_read_only_snapshot_lock(path: &Path) -> Result<File, VaultStoreError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|_| VaultStoreError::IoFailed)
+}
+
+#[cfg(not(windows))]
+fn open_read_only_snapshot_lock(_path: &Path) -> Result<File, VaultStoreError> {
+    Err(VaultStoreError::PlatformUnavailable)
+}
+
+fn remove_read_only_snapshot_root(base: &Path, snapshot: &Path) -> Result<(), VaultStoreError> {
+    if snapshot.parent() != Some(base)
+        || !snapshot.starts_with(base)
+        || snapshot
+            .file_name()
+            .is_none_or(|name| !valid_read_only_snapshot_name(&name.to_string_lossy()))
+    {
+        return Err(VaultStoreError::UnsafeFilesystem);
+    }
+    platform::reject_reparse_components(base, snapshot)?;
+    enforce_vault_private_acl_tree(snapshot)?;
+    fs::remove_dir_all(snapshot).map_err(|_| VaultStoreError::IoFailed)
+}
+
+fn cleanup_stale_read_only_snapshot_roots(base: &Path) -> Result<(), VaultStoreError> {
+    for entry in fs::read_dir(base).map_err(|_| VaultStoreError::IoFailed)? {
+        let entry = entry.map_err(|_| VaultStoreError::IoFailed)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::UnsafeFilesystem)?;
+        if !valid_read_only_snapshot_name(&name) {
+            return Err(VaultStoreError::UnsafeFilesystem);
+        }
+        let path = entry.path();
+        platform::reject_reparse_components(base, &path)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|_| VaultStoreError::IoFailed)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(VaultStoreError::UnsafeFilesystem);
+        }
+        let lock_path = path.join(READ_ONLY_SNAPSHOT_LOCK_FILE);
+        let stale = match fs::remove_file(&lock_path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+            Err(_) => return Err(VaultStoreError::IoFailed),
+        };
+        if stale {
+            enforce_vault_private_acl_tree(&path)?;
+            fs::remove_dir_all(&path).map_err(|_| VaultStoreError::IoFailed)?;
+        }
+    }
+    Ok(())
+}
+
+fn valid_read_only_snapshot_name(name: &str) -> bool {
+    name.strip_prefix(READ_ONLY_SNAPSHOT_DIRECTORY_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn capture_read_only_database_source_proof(
+    root: &ValidatedVaultRoot,
+) -> Result<ReadOnlyDatabaseSourceProof, VaultStoreError> {
+    validate_controlled_path(root, &root.database, true)?;
+    let wal = sqlite_sidecar_path(&root.database, "-wal")?;
+    let wal_sha256 = match fs::symlink_metadata(&wal) {
+        Ok(_) => {
+            validate_controlled_path(root, &wal, true)?;
+            Some(stream_file_sha256(&wal)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(VaultStoreError::IoFailed),
+    };
+    let rollback_journal = sqlite_sidecar_path(&root.database, "-journal")?;
+    match fs::symlink_metadata(&rollback_journal) {
+        Ok(_) => return Err(VaultStoreError::DatabaseFailed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(VaultStoreError::IoFailed),
+    }
+    Ok(ReadOnlyDatabaseSourceProof {
+        database_sha256: stream_file_sha256(&root.database)?,
+        wal_sha256,
+    })
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> Result<PathBuf, VaultStoreError> {
+    let file_name = database
+        .file_name()
+        .ok_or(VaultStoreError::UnsafeFilesystem)?;
+    let mut sidecar_name = file_name.to_os_string();
+    sidecar_name.push(suffix);
+    Ok(database.with_file_name(sidecar_name))
+}
+
+fn stream_file_sha256(path: &Path) -> Result<String, VaultStoreError> {
+    let mut file = File::open(path).map_err(|_| VaultStoreError::IoFailed)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| VaultStoreError::IoFailed)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex_lower(&digest.finalize()))
+}
+
+fn count_read_only_root_entries(
+    root: &ValidatedVaultRoot,
+    directory: &Path,
+) -> Result<u64, VaultStoreError> {
+    validate_controlled_path(root, directory, false)?;
+    let mut count = 0_u64;
+    for entry in fs::read_dir(directory).map_err(|_| VaultStoreError::IoFailed)? {
+        let entry = entry.map_err(|_| VaultStoreError::IoFailed)?;
+        let path = entry.path();
+        validate_controlled_path(
+            root,
+            &path,
+            entry
+                .file_type()
+                .map_err(|_| VaultStoreError::IoFailed)?
+                .is_file(),
+        )?;
+        count = count
+            .checked_add(1)
+            .ok_or(VaultStoreError::ContentCorrupt)?;
+    }
+    Ok(count)
 }
 
 fn checkpoint_and_validate_database(db: &Connection) -> Result<(), VaultStoreError> {
@@ -2026,6 +2440,32 @@ mod platform {
 mod tests {
     use super::*;
 
+    fn clear_not_content_indexed(path: &Path) {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+            INVALID_FILE_ATTRIBUTES,
+        };
+
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        assert_ne!(attributes, INVALID_FILE_ATTRIBUTES);
+        assert_ne!(attributes & FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, 0);
+        assert_ne!(
+            unsafe {
+                SetFileAttributesW(
+                    wide.as_ptr(),
+                    attributes & !FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+                )
+            },
+            0
+        );
+    }
+
     fn workspace_id() -> WorkspaceInstanceId {
         WorkspaceInstanceId::parse("ws_0123456789abcdef0123456789abcdef")
             .expect("synthetic workspace ID")
@@ -2081,6 +2521,263 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn application_startup_open_does_not_repair_filesystem_attributes_before_backup() {
+        let root = test_root();
+        let workspace = workspace_id();
+        let store = VaultStore::initialize(&root, workspace.clone()).expect("initialize");
+        drop(store);
+        clear_not_content_indexed(&root);
+        assert!(!platform::content_indexing_disabled(&root).expect("read root attributes"));
+
+        let (_store, upgrade_required) =
+            VaultStore::open_for_application_startup(&root, workspace).expect("read-only open");
+
+        assert!(!upgrade_required);
+        assert!(
+            !platform::content_indexing_disabled(&root).expect("read root attributes after open"),
+            "startup preflight must not repair no-index state before the backup gate"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_inventory_reports_committed_state_without_source_sidecars() {
+        let root = test_root();
+        let workspace = workspace_id();
+        let store = VaultStore::initialize(&root, workspace).expect("initialize");
+        let case = case_id("abababababababababababababababab");
+        create(&store, &case, "inventory.pdf", b"inventory bytes", 20);
+        store
+            .prepare_encrypted_backup_snapshot()
+            .expect("checkpoint inventory fixture");
+        let database = root.join("vault-state.sqlite");
+        let wal = root.join("vault-state.sqlite-wal");
+        let shm = root.join("vault-state.sqlite-shm");
+        let before_database = fs::read(&database).expect("database before inventory");
+        let before_wal = fs::symlink_metadata(&wal)
+            .ok()
+            .map(|_| fs::read(&wal).expect("wal before inventory"));
+        let before_shm = fs::symlink_metadata(&shm)
+            .ok()
+            .map(|_| fs::read(&shm).expect("shm before inventory"));
+
+        let inventory = store
+            .inspect_inventory_read_only()
+            .expect("read-only inventory");
+
+        assert_eq!(inventory.journal_row_count, 1);
+        assert_eq!(inventory.committed_object_count, 1);
+        assert_eq!(inventory.key_record_count, 1);
+        assert_eq!(inventory.object_root_entry_count, 1);
+        assert!(!inventory.is_empty());
+        assert_eq!(
+            fs::read(&database).expect("database after inventory"),
+            before_database
+        );
+        assert_eq!(
+            fs::symlink_metadata(&wal)
+                .ok()
+                .map(|_| fs::read(&wal).expect("wal after inventory")),
+            before_wal
+        );
+        assert_eq!(
+            fs::symlink_metadata(&shm)
+                .ok()
+                .map(|_| fs::read(&shm).expect("shm after inventory")),
+            before_shm
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_preflight_cleans_secured_stale_snapshot_residue() {
+        let root = test_root();
+        let workspace = workspace_id();
+        let store = VaultStore::initialize(&root, workspace).expect("initialize");
+        let temporary_parent = std::env::temp_dir();
+        let stale = {
+            let _gate = READ_ONLY_SNAPSHOT_GATE
+                .lock()
+                .expect("read-only snapshot test gate");
+            let storage = FixedLocalStorageRoot::initialize(
+                &temporary_parent.join(READ_ONLY_SNAPSHOT_BASE_DIRECTORY),
+            )
+            .expect("secure snapshot storage");
+            cleanup_stale_read_only_snapshot_roots(storage.canonical_root())
+                .expect("clean prior synthetic residue");
+            let stale = storage
+                .canonical_root()
+                .join("snapshot-11111111111111111111111111111111");
+            fs::create_dir(&stale).expect("create stale snapshot");
+            fs::write(
+                stale.join("vault-state.sqlite"),
+                b"encrypted-control-residue",
+            )
+            .expect("write stale encrypted control residue");
+            enforce_vault_private_acl_tree(&stale).expect("protect stale snapshot");
+            platform::mark_not_content_indexed(&stale).expect("mark stale snapshot no-index");
+            assert!(verify_vault_private_acl(&stale).expect("private stale snapshot ACL"));
+            stale
+        };
+
+        store
+            .inspect_inventory_read_only()
+            .expect("preflight cleans stale snapshot");
+
+        assert!(!stale.exists());
+        let secure_base = temporary_parent.join(READ_ONLY_SNAPSHOT_BASE_DIRECTORY);
+        assert!(verify_vault_private_acl(&secure_base).expect("private snapshot base ACL"));
+        assert!(platform::content_indexing_disabled(&secure_base)
+            .expect("snapshot base content-indexing state"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v1_upgrade_rolls_back_lifecycle_ddl_when_meta_cas_aborts() {
+        let root = test_root();
+        let workspace = workspace_id();
+        drop(VaultStore::initialize(&root, workspace.clone()).expect("initialize"));
+        let database = root.join("vault-state.sqlite");
+        let db = Connection::open(&database).expect("open v1 fixture");
+        db.execute_batch(
+            "DROP TRIGGER IF EXISTS trg_vault_cleanup_purged_no_update;
+             DROP TRIGGER IF EXISTS trg_vault_cleanup_no_delete;
+             DROP INDEX IF EXISTS idx_vault_retention_expiry;
+             DROP TABLE IF EXISTS vault_cleanup_candidates;
+             DROP TABLE IF EXISTS vault_cleanup_journal;
+             DROP TABLE IF EXISTS vault_object_retention;
+             DROP TABLE IF EXISTS vault_lifecycle_meta;
+             UPDATE vault_meta SET schema_version=1 WHERE singleton=1;
+             CREATE TRIGGER abort_vault_meta_upgrade
+             BEFORE UPDATE OF schema_version ON vault_meta
+             WHEN OLD.schema_version=1
+             BEGIN
+               SELECT RAISE(ABORT,'synthetic upgrade interruption');
+             END;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("prepare interrupted v1 fixture");
+        drop(db);
+
+        let interrupted = match VaultStore::initialize(&root, workspace.clone()) {
+            Ok(_) => panic!("CAS must abort"),
+            Err(error) => error,
+        };
+        assert_eq!(interrupted, VaultStoreError::DatabaseFailed);
+        let db = Connection::open(&database).expect("inspect rolled-back v1 fixture");
+        assert_eq!(
+            db.query_row(
+                "SELECT schema_version FROM vault_meta WHERE singleton=1",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .expect("v1 version"),
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='table' AND name IN(
+                   'vault_lifecycle_meta','vault_object_retention',
+                   'vault_cleanup_journal','vault_cleanup_candidates'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("rolled-back lifecycle tables"),
+            0
+        );
+        db.execute_batch("DROP TRIGGER abort_vault_meta_upgrade;")
+            .expect("remove synthetic abort");
+        drop(db);
+
+        drop(VaultStore::initialize(&root, workspace).expect("retry atomic upgrade"));
+        let db = Connection::open(&database).expect("inspect upgraded fixture");
+        assert_eq!(
+            db.query_row(
+                "SELECT schema_version FROM vault_meta WHERE singleton=1",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .expect("upgraded version"),
+            VAULT_STORE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='table' AND name IN(
+                   'vault_lifecycle_meta','vault_object_retention',
+                   'vault_cleanup_journal','vault_cleanup_candidates'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("complete lifecycle tables"),
+            4
+        );
+        drop(db);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v1_upgrade_rejects_partial_lifecycle_residue_without_repairing_it() {
+        let root = test_root();
+        let workspace = workspace_id();
+        drop(VaultStore::initialize(&root, workspace.clone()).expect("initialize"));
+        let database = root.join("vault-state.sqlite");
+        let db = Connection::open(&database).expect("open partial v1 fixture");
+        db.execute_batch(
+            "DROP TRIGGER IF EXISTS trg_vault_cleanup_purged_no_update;
+             DROP TRIGGER IF EXISTS trg_vault_cleanup_no_delete;
+             DROP INDEX IF EXISTS idx_vault_retention_expiry;
+             DROP TABLE IF EXISTS vault_cleanup_candidates;
+             DROP TABLE IF EXISTS vault_cleanup_journal;
+             DROP TABLE IF EXISTS vault_object_retention;
+             DROP TABLE IF EXISTS vault_lifecycle_meta;
+             UPDATE vault_meta SET schema_version=1 WHERE singleton=1;
+             CREATE TABLE vault_lifecycle_meta(
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               schema_version INTEGER NOT NULL CHECK(schema_version>0)
+             ) STRICT;
+             INSERT INTO vault_lifecycle_meta(singleton,schema_version) VALUES(1,1);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("prepare partial v1 fixture");
+        drop(db);
+
+        let partial = match VaultStore::initialize(&root, workspace) {
+            Ok(_) => panic!("partial v1 must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(partial, VaultStoreError::ContentCorrupt);
+        let db = Connection::open(&database).expect("inspect partial v1 fixture");
+        assert_eq!(
+            db.query_row(
+                "SELECT schema_version FROM vault_meta WHERE singleton=1",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .expect("v1 version"),
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='table' AND name IN(
+                   'vault_lifecycle_meta','vault_object_retention',
+                   'vault_cleanup_journal','vault_cleanup_candidates'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("partial lifecycle table count"),
+            1
+        );
+        drop(db);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

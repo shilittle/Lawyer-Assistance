@@ -8,9 +8,12 @@ import { CaseProjectListPanel } from "./CaseProjectListPanel";
 import { CasesWorkspace } from "./CasesWorkspace";
 import { CaseWorkbenchPanel } from "./CaseWorkbenchPanel";
 import { caseGraphNodeDomId } from "./model";
+import { CaseMaterialsWorkspace } from "./materials/CaseMaterialsWorkspace";
+import type { CaseSection } from "./CaseNavigation";
 import type { CaseWorkspaceController } from "./useCaseWorkspaceController";
 
 export interface CaseWorkspaceCompatibilityOutletProps {
+  section: Exclude<CaseSection, "outputs">;
   controller: CaseWorkspaceController;
   providerProfiles: readonly ProviderProfile[];
   legalSources: readonly LegalSource[];
@@ -18,9 +21,16 @@ export interface CaseWorkspaceCompatibilityOutletProps {
   onGraphTargetConsumed: (target: GraphTargetRequest) => void;
   onContinueInAssistant: () => void;
   onOpenCaseGraph: () => void;
+  caseMaterialResetKey: number;
+  onCaseMaterialDraftDirtyChange: (dirty: boolean) => void;
+  onCaseMaterialMutationActivityChange: (active: boolean) => void;
+  onBeforeCaseMaterialProjectChange: (
+    projectId: string | null,
+  ) => boolean;
 }
 
 export function CaseWorkspaceCompatibilityOutlet({
+  section,
   controller,
   providerProfiles,
   legalSources,
@@ -28,6 +38,10 @@ export function CaseWorkspaceCompatibilityOutlet({
   onGraphTargetConsumed,
   onContinueInAssistant,
   onOpenCaseGraph,
+  caseMaterialResetKey,
+  onCaseMaterialDraftDirtyChange,
+  onCaseMaterialMutationActivityChange,
+  onBeforeCaseMaterialProjectChange,
 }: CaseWorkspaceCompatibilityOutletProps) {
   const [activeGraphTarget, setActiveGraphTarget] =
     useState<GraphTargetRequest | null>(null);
@@ -65,6 +79,30 @@ export function CaseWorkspaceCompatibilityOutlet({
       window.clearTimeout(clearHighlight);
     };
   }, [activeGraphTarget]);
+
+  if (section === "materials") {
+    return (
+      <CasesWorkspace busy={controller.caseState.kind === "loading"}>
+        <CaseProjectListPanel
+          controller={controller}
+          onBeforeProjectChange={
+            onBeforeCaseMaterialProjectChange
+          }
+        />
+        <CaseMaterialsWorkspace
+          key={`${controller.selectedCaseProjectId ?? "none"}:${caseMaterialResetKey}`}
+          projectId={controller.selectedCaseProjectId}
+          resetKey={caseMaterialResetKey}
+          onDraftDirtyChange={
+            onCaseMaterialDraftDirtyChange
+          }
+          onMutationActivityChange={
+            onCaseMaterialMutationActivityChange
+          }
+        />
+      </CasesWorkspace>
+    );
+  }
 
   return (
     <CasesWorkspace busy={controller.caseState.kind === "loading"}>

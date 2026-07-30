@@ -21,6 +21,7 @@ import { useWorkspaceActivityChannel } from "./app/useWorkspaceActivityChannel";
 import { AssistantWorkspace } from "./features/assistant/AssistantWorkspace";
 import { useAssistantController } from "./features/assistant/useAssistantController";
 import { CaseWorkspaceCompatibilityOutlet } from "./features/cases/CaseWorkspaceCompatibilityOutlet";
+import { useCaseMaterialActivityChannel } from "./features/cases/materials/useCaseMaterialActivityChannel";
 import { graphNodeDestination } from "./features/cases/model";
 import { useGraphOutputController } from "./features/cases/outputs/useGraphOutputController";
 import { useCaseWorkspaceController } from "./features/cases/useCaseWorkspaceController";
@@ -88,6 +89,7 @@ export function App() {
   const graphOutput = useGraphOutputController();
   const mcpActivity = useWorkspaceActivityChannel();
   const privacyActivity = useWorkspaceActivityChannel();
+  const caseMaterialsActivity = useCaseMaterialActivityChannel();
   const confirmDiscard = useCallback(
     (message: string) => window.confirm(message),
     [],
@@ -95,6 +97,7 @@ export function App() {
   const navigation = useAppNavigationController({
     mcp: mcpActivity,
     privacy: privacyActivity,
+    caseMaterials: caseMaterialsActivity,
     confirmDiscard,
   });
   const consumeRouteState = navigation.consumeRouteState;
@@ -203,6 +206,7 @@ export function App() {
     provider: providerActivity,
     mcp: mcpActivity,
     privacy: privacyActivity,
+    caseMaterials: caseMaterialsActivity,
     readLegalBridgeMutationInFlight,
     onCaseCloseBlocked: reportCaseError,
   });
@@ -352,6 +356,7 @@ export function App() {
     ),
     cases: ({ route }) => (
       <CaseWorkspaceCompatibilityOutlet
+        section={route.page}
         controller={caseController}
         graphTarget={route.state?.request ?? null}
         legalSources={legalLibrary.activeSources}
@@ -359,6 +364,10 @@ export function App() {
         onGraphTargetConsumed={consumeGraphTarget}
         onOpenCaseGraph={openCaseGraph}
         providerProfiles={providerSettings.profiles}
+        caseMaterialResetKey={caseMaterialsActivity.resetKey}
+        onCaseMaterialDraftDirtyChange={caseMaterialsActivity.onDraftDirtyChange}
+        onCaseMaterialMutationActivityChange={caseMaterialsActivity.onMutationActivityChange}
+        onBeforeCaseMaterialProjectChange={navigation.guardCaseMaterialContextChange}
       />
     ),
     documents: () => (

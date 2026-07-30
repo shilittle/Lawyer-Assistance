@@ -392,13 +392,41 @@ enum QualificationMode<'a> {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProviderApprovalMode {
+    PersistedCase,
+    InternalQualificationCanary,
+}
+
 impl PrivacyWorkflowManager {
     pub fn approve_approved_provider_task(
         &self,
         profile: &ProviderProfile,
         request: ApproveApprovedProviderTaskRequest,
     ) -> Result<ApproveApprovedProviderTaskResponse, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        self.approve_approved_provider_task_unlocked(
+            profile,
+            request,
+            ProviderApprovalMode::PersistedCase,
+        )
+    }
+
+    fn approve_approved_provider_task_unlocked(
+        &self,
+        profile: &ProviderProfile,
+        request: ApproveApprovedProviderTaskRequest,
+        mode: ProviderApprovalMode,
+    ) -> Result<ApproveApprovedProviderTaskResponse, PrivacyWorkflowError> {
         validate_provider_task_approval_request(&request, profile)?;
+        let (case_authorization, project_guard) = match mode {
+            ProviderApprovalMode::PersistedCase => {
+                let (authorization, guard) =
+                    self.begin_live_case_redaction_authorization(&request.redaction_id, false)?;
+                (Some(authorization), Some(guard))
+            }
+            ProviderApprovalMode::InternalQualificationCanary => (None, None),
+        };
         let instruction = normalized_task_instruction(&request.instruction)?;
         let connection = self.open_connection()?;
         let loaded = PrivacyStore::load_review_draft(&connection, &request.redaction_id)
@@ -490,19 +518,22 @@ impl PrivacyWorkflowManager {
         )?;
         drop(connection);
 
-        let approval = self.approve_review(ApprovePrivacyReviewRequest {
-            redaction_id: request.redaction_id,
-            expected_risk_revision: request.expected_risk_revision,
-            expected_suggested_redacted_sha256: request.expected_suggested_redacted_sha256,
-            edited_pages: request.edited_pages,
-            reviewer: request.reviewer,
-            destination: ReceiptDestinationInput {
-                kind: DestinationKind::ExternalProvider,
-                identifier: profile.id.clone(),
+        let approval = self.approve_review_unlocked(
+            ApprovePrivacyReviewRequest {
+                redaction_id: request.redaction_id,
+                expected_risk_revision: request.expected_risk_revision,
+                expected_suggested_redacted_sha256: request.expected_suggested_redacted_sha256,
+                edited_pages: request.edited_pages,
+                reviewer: request.reviewer,
+                destination: ReceiptDestinationInput {
+                    kind: DestinationKind::ExternalProvider,
+                    identifier: profile.id.clone(),
+                },
+                purpose: binding.bound_purpose.clone(),
+                ttl_seconds: request.ttl_seconds,
             },
-            purpose: binding.bound_purpose.clone(),
-            ttl_seconds: request.ttl_seconds,
-        })?;
+            case_authorization.as_ref(),
+        )?;
         if approval.purpose != binding.bound_purpose
             || approval.destination.kind != DestinationKind::ExternalProvider
             || approval.destination.identifier != profile.id
@@ -515,7 +546,7 @@ impl PrivacyWorkflowManager {
                 "The signed Provider task approval does not match the exact local task binding.",
             ));
         }
-        Ok(ApproveApprovedProviderTaskResponse {
+        let response = ApproveApprovedProviderTaskResponse {
             receipt_id: approval.receipt_id,
             approved_payload_sha256: approval.approved_payload_sha256,
             redacted_content_sha256: approval.redacted_content_sha256,
@@ -527,7 +558,11 @@ impl PrivacyWorkflowManager {
             issued_at_unix: approval.issued_at_unix,
             expires_at_unix: approval.expires_at_unix,
             transport_enforcement: "active_receipt_exact_provider_task_input_and_generation",
-        })
+        };
+        if let Some(guard) = project_guard {
+            guard.commit()?;
+        }
+        Ok(response)
     }
 
     pub fn dispatch_approved_provider<T: ChatTransport>(
@@ -558,8 +593,19 @@ impl PrivacyWorkflowManager {
         validate_dispatch_request(&request, &profile)?;
         let now_unix = self.current_unix()?;
         self.verify_dispatch_qualification(&profile, &request, &qualification, now_unix)?;
+        let (case_authorization, project_guard) = match &qualification {
+            QualificationMode::Persisted => {
+                let (authorization, guard) =
+                    self.begin_live_case_redaction_authorization(&request.redaction_id, true)?;
+                (Some(authorization), Some(guard))
+            }
+            QualificationMode::ExactCanary { .. } => (None, None),
+        };
         let signer = self.receipt_signer()?;
         let mut connection = self.open_connection()?;
+        if let Some(authorization) = case_authorization.as_ref() {
+            self.revalidate_case_redaction_authorization(&connection, authorization)?;
+        }
         let restored = restore_provider_authorization(
             self,
             &connection,
@@ -655,6 +701,9 @@ impl PrivacyWorkflowManager {
             &qualification,
             self.current_unix()?,
         )?;
+        if let Some(authorization) = case_authorization.as_ref() {
+            self.revalidate_case_redaction_authorization(&connection, authorization)?;
+        }
         let dispatch_consumption_id = format!("dispatch_{}", Uuid::new_v4().simple());
         PrivacyStore::consume_receipt_for_dispatch(
             &mut connection,
@@ -769,7 +818,7 @@ impl PrivacyWorkflowManager {
                 },
             )
             .map_err(PrivacyWorkflowError::lifecycle)?;
-        Ok(DispatchApprovedProviderResponse {
+        let response = DispatchApprovedProviderResponse {
             result_id,
             provider_id: profile.id,
             model_id: expected_model,
@@ -779,7 +828,11 @@ impl PrivacyWorkflowManager {
             content: completion.content,
             content_sha256,
             approval_generation_id,
-        })
+        };
+        if let Some(guard) = project_guard {
+            guard.commit()?;
+        }
+        Ok(response)
     }
 
     fn verify_dispatch_qualification(
@@ -1789,30 +1842,36 @@ pub(super) fn run_provider_qualification_canary(
     review = complete_synthetic_provider_human_review(manager, review)?;
     let (base_url, server) = spawn_loopback_provider()?;
     let profile = canary_profile(base_url);
-    let approval = manager.approve_approved_provider_task(
-        &profile,
-        ApproveApprovedProviderTaskRequest {
-            redaction_id: review.redaction_id.clone(),
-            expected_risk_revision: review.risk_review.as_ref().map(|risk| risk.revision),
-            expected_suggested_redacted_sha256: review.suggested_redacted_content_sha256.clone(),
-            edited_pages: review
-                .pages
-                .iter()
-                .map(|page| EditedRedactedPage {
-                    page_number: page.page_number,
-                    redacted_text: page.redacted_text.clone(),
-                })
-                .collect(),
-            reviewer: "local-provider-qualification-canary".to_owned(),
-            provider_id: CANARY_PROVIDER_ID.to_owned(),
-            task: ApprovedProviderTask::Summary,
-            instruction: CANARY_TASK_INSTRUCTION.to_owned(),
-            prior_output: None,
-            max_tokens: CANARY_MAX_TOKENS,
-            ttl_seconds: 10 * 60,
-            confirmed: true,
-        },
-    )?;
+    let approval = {
+        let _gate = manager.gate();
+        manager.approve_approved_provider_task_unlocked(
+            &profile,
+            ApproveApprovedProviderTaskRequest {
+                redaction_id: review.redaction_id.clone(),
+                expected_risk_revision: review.risk_review.as_ref().map(|risk| risk.revision),
+                expected_suggested_redacted_sha256: review
+                    .suggested_redacted_content_sha256
+                    .clone(),
+                edited_pages: review
+                    .pages
+                    .iter()
+                    .map(|page| EditedRedactedPage {
+                        page_number: page.page_number,
+                        redacted_text: page.redacted_text.clone(),
+                    })
+                    .collect(),
+                reviewer: "local-provider-qualification-canary".to_owned(),
+                provider_id: CANARY_PROVIDER_ID.to_owned(),
+                task: ApprovedProviderTask::Summary,
+                instruction: CANARY_TASK_INSTRUCTION.to_owned(),
+                prior_output: None,
+                max_tokens: CANARY_MAX_TOKENS,
+                ttl_seconds: 10 * 60,
+                confirmed: true,
+            },
+            ProviderApprovalMode::InternalQualificationCanary,
+        )?
+    };
     if !valid_hash(&approval.task_binding_sha256) {
         return Err(canary_error());
     }

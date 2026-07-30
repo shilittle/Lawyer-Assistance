@@ -458,10 +458,55 @@ impl ApprovedWorkspaceQualificationProvider for DesktopApprovedMcpQualificationP
 }
 
 impl ApprovedMcpWorkspace {
+    pub(crate) fn preflight_startup_workspace_identity(
+        &self,
+    ) -> Result<StartupWorkspaceIdentityPreflight, ApprovedMcpError> {
+        let _operation = self.operation()?;
+        let history_present = self.startup_history_present_read_only()?;
+        let existing_key = self.inner.keys.load_existing(KeyRole::ApprovedManifest)?;
+        match existing_key {
+            Some(mut manifest_key) => {
+                let identity = super::workspace_instance_id(&manifest_key);
+                zeroize(&mut manifest_key);
+                identity.map(StartupWorkspaceIdentityPreflight::Existing)
+            }
+            None if history_present => Err(startup_identity_missing_error()),
+            None => Ok(StartupWorkspaceIdentityPreflight::Fresh {
+                app_local_data_directory: self.inner.app_local_data_directory.clone(),
+            }),
+        }
+    }
+
+    pub(crate) fn workspace_instance_id_after_startup_preflight(
+        &self,
+        preflight: StartupWorkspaceIdentityPreflight,
+    ) -> Result<WorkspaceInstanceId, ApprovedMcpError> {
+        let _operation = self.operation()?;
+        match preflight {
+            StartupWorkspaceIdentityPreflight::Existing(identity) => Ok(identity),
+            StartupWorkspaceIdentityPreflight::Fresh {
+                app_local_data_directory,
+            } => {
+                if app_local_data_directory != self.inner.app_local_data_directory
+                    || self.startup_history_present_read_only()?
+                {
+                    return Err(startup_identity_preflight_error());
+                }
+                let mut manifest_key = self.inner.keys.load_or_create(KeyRole::ApprovedManifest)?;
+                let identity = super::workspace_instance_id(&manifest_key);
+                zeroize(&mut manifest_key);
+                identity
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn workspace_instance_id(&self) -> Result<WorkspaceInstanceId, ApprovedMcpError> {
         let _operation = self.operation()?;
-        let manifest_key = self.inner.keys.load_or_create(KeyRole::ApprovedManifest)?;
-        super::workspace_instance_id(&manifest_key)
+        let mut manifest_key = self.inner.keys.load_or_create(KeyRole::ApprovedManifest)?;
+        let identity = super::workspace_instance_id(&manifest_key);
+        zeroize(&mut manifest_key);
+        identity
     }
 
     pub(crate) fn qualification_status(

@@ -88,6 +88,21 @@ pub struct PublishApprovedGenerationRequest {
     pub expected_approved_payload_sha256: String,
 }
 
+pub(crate) fn publish_approved_generation_inner(
+    workflow: &PrivacyWorkflowManager,
+    workspace: &ApprovedMcpWorkspace,
+    request: PublishApprovedGenerationRequest,
+) -> Result<PublishedApprovedGeneration, IpcError> {
+    workflow
+        .with_approved_generation_source_publish(
+            &request.redaction_id,
+            &request.expected_approved_payload_sha256,
+            |source| workspace.publish(&request.case_id, source),
+        )
+        .map_err(IpcError::from)?
+        .map_err(IpcError::from)
+}
+
 #[tauri::command]
 pub async fn publish_approved_generation(
     workflow: State<'_, PrivacyWorkflowManager>,
@@ -97,14 +112,7 @@ pub async fn publish_approved_generation(
     let workflow = workflow.inner().clone();
     let workspace = workspace.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        workflow
-            .with_approved_generation_source_publish(
-                &request.redaction_id,
-                &request.expected_approved_payload_sha256,
-                |source| workspace.publish(&request.case_id, source),
-            )
-            .map_err(IpcError::from)?
-            .map_err(IpcError::from)
+        publish_approved_generation_inner(&workflow, &workspace, request)
     })
     .await
     .map_err(|_| runtime_error("Approved generation publication did not complete."))?

@@ -19,7 +19,10 @@ use std::{
 use tauri::State;
 use uuid::Uuid;
 
-use crate::state::{AppState, PendingExtractionReview};
+use crate::{
+    privacy_workflow::{PrivacyWorkflowError, PrivacyWorkflowManager},
+    state::{AppState, PendingExtractionReview},
+};
 
 const MAX_CASE_ID_BYTES: usize = 256;
 const MAX_CASE_TITLE_BYTES: usize = 1_024;
@@ -431,11 +434,22 @@ fn update_pending_structured_case_extraction_with_connection(
 #[tauri::command]
 pub fn upsert_case_project(
     state: State<'_, AppState>,
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: UpsertCaseProjectRequest,
+) -> Result<CaseProjectResponse, IpcError> {
+    upsert_case_project_with_services(state.inner(), workflow.inner(), request)
+}
+
+fn upsert_case_project_with_services(
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
     request: UpsertCaseProjectRequest,
 ) -> Result<CaseProjectResponse, IpcError> {
     validate_case_project(&request.project)?;
-    let connection = database::open_user_database(state.user_database_path())?;
-    database::upsert_case_project(&connection, &project_to_row(&request.project)?)?;
+    let mut connection = database::open_user_database(state.user_database_path())?;
+    workflow
+        .upsert_case_project_lifecycle(&mut connection, &project_to_row(&request.project)?)
+        .map_err(privacy_workflow_error)?;
     let project = database::get_case_workspace_rows(&connection, &request.project.project_id)?
         .map(|workspace| workspace.project)
         .map(project_from_row)
@@ -448,16 +462,31 @@ pub fn upsert_case_project(
 #[tauri::command]
 pub fn delete_case_project(
     state: State<'_, AppState>,
+    workflow: State<'_, PrivacyWorkflowManager>,
+    request: DeleteCaseProjectRequest,
+) -> Result<DeleteCaseProjectResponse, IpcError> {
+    delete_case_project_with_services(state.inner(), workflow.inner(), request)
+}
+
+fn delete_case_project_with_services(
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
     request: DeleteCaseProjectRequest,
 ) -> Result<DeleteCaseProjectResponse, IpcError> {
     validate_case_id("projectId", &request.project_id)?;
-    let connection = database::open_user_database(state.user_database_path())?;
-    let deleted = database::delete_case_project(&connection, &request.project_id)?;
+    let mut connection = database::open_user_database(state.user_database_path())?;
+    let deleted = workflow
+        .delete_case_project_lifecycle(&mut connection, &request.project_id)
+        .map_err(privacy_workflow_error)?;
     if deleted {
         let _ = state.discard_project_extraction_reviews(&request.project_id);
     }
 
     Ok(DeleteCaseProjectResponse { deleted })
+}
+
+fn privacy_workflow_error(error: PrivacyWorkflowError) -> IpcError {
+    IpcError::new(error.code(), error.message())
 }
 
 #[tauri::command]
@@ -2804,6 +2833,59 @@ mod tests {
         collections::VecDeque,
         sync::{Arc, Mutex},
     };
+
+    #[test]
+    fn case_project_commands_use_journaled_lifecycle_and_reject_id_resurrection() {
+        let directory = tempfile::tempdir().expect("command fixture directory");
+        let user_database_path =
+            database::ensure_user_database(directory.path()).expect("user database");
+        let state = AppState::new(
+            directory.path().join("legal-core.sqlite"),
+            user_database_path,
+        );
+        let workflow = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            crate::privacy_workflow::test_workspace_instance_id(),
+        )
+        .expect("privacy workflow");
+        let project = CaseProject {
+            project_id: "case-command-project-delete".to_owned(),
+            title: "Command lifecycle project".to_owned(),
+            case_type: "civil".to_owned(),
+            status: CaseProjectStatus::Active,
+            opened_on: None,
+            summary: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        upsert_case_project_with_services(
+            &state,
+            &workflow,
+            UpsertCaseProjectRequest {
+                project: project.clone(),
+            },
+        )
+        .expect("create project through command service");
+        assert!(
+            delete_case_project_with_services(
+                &state,
+                &workflow,
+                DeleteCaseProjectRequest {
+                    project_id: project.project_id.clone(),
+                },
+            )
+            .expect("delete project through command service")
+            .deleted
+        );
+        let error = upsert_case_project_with_services(
+            &state,
+            &workflow,
+            UpsertCaseProjectRequest { project },
+        )
+        .expect_err("completed deletion journal retires the project id");
+        assert_eq!(error.error_type, "case_project_id_retired");
+    }
 
     #[test]
     fn legacy_structured_extraction_redirect_is_typed_and_stops_before_transport() {

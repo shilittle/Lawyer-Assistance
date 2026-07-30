@@ -248,6 +248,10 @@ mod platform {
         pub fn new() -> Self {
             Self
         }
+
+        pub fn with_service_prefix(_service_prefix: impl Into<String>) -> Self {
+            Self
+        }
     }
 
     impl CredentialStore for WindowsCredentialStore {

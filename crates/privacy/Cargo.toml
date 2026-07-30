@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 unicode-normalization = "0.1.25"
+uuid.workspace = true
 windows-sys.workspace = true
 zeroize.workspace = true
 [dev-dependencies]

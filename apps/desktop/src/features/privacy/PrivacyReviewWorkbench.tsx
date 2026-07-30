@@ -22,8 +22,9 @@ import {
 import type { PrivacyRiskReviewAction } from "../../ipc/privacy/risk-types";
 import { RiskReviewPanel } from "./RiskReviewPanel";
 import { deletePrivacyReviewAfterConfirmation } from "./privacyReviewDeletion";
+import type { PrivacyReviewDisplay } from "./reviewDisplay";
 
-type ReviewOperation =
+export type ReviewOperation =
   | "idle"
   | "preparing"
   | "loading"
@@ -52,7 +53,7 @@ export interface PrivacyReviewWorkbenchViewProps {
   disabled: boolean;
   operation: ReviewOperation;
   customTerms: string;
-  review: PrivacyReview | null;
+  review: PrivacyReviewDisplay | null;
   editedPages: EditedRedactedPage[];
   approvalDraft: ApprovalDraft;
   approval: ApprovePrivacyReviewResponse | null;
@@ -63,7 +64,13 @@ export interface PrivacyReviewWorkbenchViewProps {
   onLoadLatest: () => void;
   onDelete: () => void;
   onEditedPageChange: (pageNumber: number, value: string) => void;
-  onRiskAction?: (action: PrivacyRiskReviewAction) => void;
+  riskDraftContextKey?: string | number;
+  riskDraftDirty?: boolean;
+  riskHistoryActionsDisabled?: boolean;
+  onRiskAction?: (
+    action: PrivacyRiskReviewAction,
+  ) => boolean | void | Promise<boolean | void>;
+  onRiskDraftDirtyChange?: (dirty: boolean) => void;
   onRiskUndo?: () => void;
   onRiskRedo?: () => void;
   onApprovalDraftChange: (value: ApprovalDraft) => void;
@@ -178,7 +185,7 @@ export function parseCustomRedactionTerms(value: string): string[] {
   return unique;
 }
 
-function reviewStateLabel(state: PrivacyReview["reviewState"]): string {
+function reviewStateLabel(state: PrivacyReviewDisplay["reviewState"]): string {
   switch (state) {
     case "review_required":
       return "待人工复核";
@@ -189,7 +196,9 @@ function reviewStateLabel(state: PrivacyReview["reviewState"]): string {
   }
 }
 
-function backendLabel(backend: PrivacyReview["backendTrace"][number]["backend"]): string {
+function backendLabel(
+  backend: PrivacyReviewDisplay["backendTrace"][number]["backend"],
+): string {
   return backend === "native_text" ? "本机原生文本提取" : "本机 MinerU";
 }
 
@@ -224,6 +233,10 @@ export function PrivacyReviewWorkbenchView({
   onDelete,
   onEditedPageChange,
   onRiskAction,
+  riskDraftContextKey,
+  riskDraftDirty = false,
+  riskHistoryActionsDisabled = false,
+  onRiskDraftDirtyChange,
   onRiskUndo,
   onRiskRedo,
   onApprovalDraftChange,
@@ -232,6 +245,7 @@ export function PrivacyReviewWorkbenchView({
 }: PrivacyReviewWorkbenchViewProps) {
   const busy = disabled || operation !== "idle";
   const manualRiskReady = Boolean(
+    !riskDraftDirty &&
     review?.riskReview?.detectorRunCompleted &&
       review.riskReview.hardGates.every(
         (gate) =>
@@ -391,12 +405,18 @@ export function PrivacyReviewWorkbenchView({
 
           {review.riskReview ? (
             <RiskReviewPanel
+              key={`${review.redactionId}:${riskDraftContextKey ?? 0}`}
               state={review.riskReview}
+              projectId={review.projectId}
               busy={busy}
+              historyActionsDisabled={
+                riskHistoryActionsDisabled
+              }
               onAction={(action) => onRiskAction?.(action)}
               onUndo={() => onRiskUndo?.()}
               onRedo={() => onRiskRedo?.()}
               onManualApprove={onApprove}
+              onDraftDirtyChange={onRiskDraftDirtyChange}
             />
           ) : (
             <section className="privacy-risk-panel" role="alert">
@@ -695,11 +715,11 @@ export function PrivacyReviewWorkbench({
   }, []);
 
   const applyRiskAction = useCallback(async (action: PrivacyRiskReviewAction) => {
-    if (disabled || operation !== "idle" || !review?.riskReview) return;
+    if (disabled || operation !== "idle" || !review?.riskReview) return false;
     const actor = approvalDraft.reviewer.trim();
     if (!actor || actor.length > 128) {
       setError("执行风险审阅动作前必须填写不超过 128 个字符的批准人。");
-      return;
+      return false;
     }
     begin("risk_review");
     try {
@@ -712,8 +732,10 @@ export function PrivacyReviewWorkbench({
       });
       installReview(nextReview);
       setNotice("风险动作、编辑后脱敏页与 append-only revision 已在本机原子保存。");
+      return true;
     } catch (reason: unknown) {
       setError(displayError(reason));
+      return false;
     } finally {
       finish();
     }
@@ -880,7 +902,7 @@ export function PrivacyReviewWorkbench({
       setApprovalDraft({ ...DEFAULT_APPROVAL_DRAFT });
       setNotice(
         outcome.deleted
-          ? "已撤销关联回执并删除应用内加密复核数据；原始文书、已另存文件及哈希审计未删除。"
+          ? "已将材料标记为已删除，并撤销全部脱敏代次、回执、发布与派生工作能力；版本和审计历史已保留。"
           : "该复核记录已不存在；已清空当前界面，未删除任何原始文书或已另存文件。",
       );
     } catch (reason: unknown) {
@@ -906,7 +928,7 @@ export function PrivacyReviewWorkbench({
       onLoadLatest={() => void loadLatest()}
       onDelete={() => void deleteCurrentReview()}
       onEditedPageChange={editPage}
-      onRiskAction={(action) => void applyRiskAction(action)}
+      onRiskAction={applyRiskAction}
       onRiskUndo={() => void undoRisk()}
       onRiskRedo={() => void redoRisk()}
       onApprovalDraftChange={updateApprovalDraft}

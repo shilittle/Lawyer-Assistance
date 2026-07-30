@@ -49,7 +49,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, fs,
+    os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     ptr,
     sync::{
@@ -59,8 +60,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
-use windows_sys::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+use windows_sys::Win32::{
+    Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
+    Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
 };
 
 const KEY_FORMAT_PREFIX: &str = "approved-mcp-key-v1.";
@@ -69,6 +71,39 @@ const KEY_VERSION: u64 = 1;
 const APPROVED_ROOT_NAME: &str = "approved-generations";
 const WORK_PRODUCT_ROOT_NAME: &str = "work-products";
 const TICKET_ROOT_NAME: &str = "ticket-sessions";
+const STARTUP_IDENTITY_PRIMARY_HISTORY_PATHS: [&str; 5] = [
+    "user.sqlite",
+    "privacy/privacy-workflow.sqlite",
+    "case-vault-v2",
+    "privacy/approved-mcp/approved-generations",
+    "privacy/approved-mcp/work-products",
+];
+const STARTUP_IDENTITY_RECOVERY_HISTORY_PATHS: [&str; 24] = [
+    "application-restore-pending.dpapi",
+    "user.sqlite-wal",
+    "user.sqlite-shm",
+    "user.sqlite-journal",
+    "user.sqlite.application-restore-incoming",
+    "user.sqlite.application-restore-rollback",
+    "user.sqlite.restore-incoming",
+    "user.sqlite.restore-pending.json",
+    "user.sqlite.restore-rollback",
+    "privacy/privacy-workflow.sqlite.application-restore-incoming",
+    "privacy/privacy-workflow.sqlite.application-restore-rollback",
+    "case-vault-v2.application-restore-incoming",
+    "case-vault-v2.application-restore-rollback",
+    "privacy/approved-mcp/approved-generations.application-restore-incoming",
+    "privacy/approved-mcp/approved-generations.application-restore-rollback",
+    "privacy/approved-mcp/work-products.application-restore-incoming",
+    "privacy/approved-mcp/work-products.application-restore-rollback",
+    "migration-backups",
+    "privacy/privacy-workflow.sqlite-wal",
+    "privacy/privacy-workflow.sqlite-shm",
+    "privacy/privacy-workflow.sqlite-journal",
+    "privacy/privacy-workflow.sqlite.restore-incoming",
+    "privacy/privacy-workflow.sqlite.restore-pending.dpapi",
+    "privacy/privacy-workflow.sqlite.restore-rollback",
+];
 #[cfg(test)]
 const MAX_PREPARED_ARGUMENT_BYTES: usize = 256 * 1024;
 
@@ -130,6 +165,14 @@ impl KeyRole {
 }
 
 trait ApprovedMcpKeyProvider: Send + Sync {
+    /// Reads an existing key without creating, rotating, or otherwise mutating the provider.
+    ///
+    /// Providers that cannot offer this guarantee must fail closed. Startup identity preflight
+    /// deliberately never falls back to `load_or_create`.
+    fn load_existing(&self, _role: KeyRole) -> Result<Option<[u8; 32]>, ApprovedMcpError> {
+        Err(key_store_error())
+    }
+
     fn load_or_create(&self, role: KeyRole) -> Result<[u8; 32], ApprovedMcpError>;
     fn rotate(&self, role: KeyRole) -> Result<[u8; 32], ApprovedMcpError>;
 }
@@ -170,6 +213,16 @@ impl WindowsApprovedMcpKeyProvider {
 }
 
 impl ApprovedMcpKeyProvider for WindowsApprovedMcpKeyProvider {
+    fn load_existing(&self, role: KeyRole) -> Result<Option<[u8; 32]>, ApprovedMcpError> {
+        let _store_lock = ProviderStoreLock::acquire().map_err(|_| key_store_error())?;
+        let credential_key = ProviderCredentialKey::new(role.provider_id(), "user-boundary-v1");
+        self.store
+            .read_api_key(&credential_key)
+            .map_err(|_| key_store_error())?
+            .map(|secret| decode_key(secret.expose_secret()))
+            .transpose()
+    }
+
     fn load_or_create(&self, role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
         let _store_lock = ProviderStoreLock::acquire().map_err(|_| key_store_error())?;
         let credential_key = ProviderCredentialKey::new(role.provider_id(), "user-boundary-v1");
@@ -236,6 +289,20 @@ fn key_store_error() -> ApprovedMcpError {
     )
 }
 
+fn startup_identity_missing_error() -> ApprovedMcpError {
+    ApprovedMcpError::new(
+        "approved_mcp_identity_missing_for_existing_state",
+        "The local approved MCP identity is missing while application data already exists.",
+    )
+}
+
+fn startup_identity_preflight_error() -> ApprovedMcpError {
+    ApprovedMcpError::new(
+        "approved_mcp_identity_preflight_failed",
+        "The local application history could not be verified before approved MCP identity startup.",
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StandaloneMcpHostBinding {
     pub legal_database_path: PathBuf,
@@ -260,6 +327,11 @@ struct ApprovedMcpWorkspaceInner {
 #[derive(Clone)]
 pub(crate) struct ApprovedMcpWorkspace {
     inner: Arc<ApprovedMcpWorkspaceInner>,
+}
+
+pub(crate) enum StartupWorkspaceIdentityPreflight {
+    Existing(WorkspaceInstanceId),
+    Fresh { app_local_data_directory: PathBuf },
 }
 
 impl fmt::Debug for ApprovedMcpWorkspace {
@@ -326,6 +398,27 @@ impl ApprovedMcpWorkspace {
                 operation: Mutex::new(()),
             }),
         }
+    }
+
+    fn startup_history_present_read_only(&self) -> Result<bool, ApprovedMcpError> {
+        STARTUP_IDENTITY_PRIMARY_HISTORY_PATHS
+            .iter()
+            .chain(STARTUP_IDENTITY_RECOVERY_HISTORY_PATHS.iter())
+            .try_fold(false, |history_present, relative| {
+                let path = self.inner.app_local_data_directory.join(relative);
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) => {
+                        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                            return Err(startup_identity_preflight_error());
+                        }
+                        Ok(true)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(history_present)
+                    }
+                    Err(_) => Err(startup_identity_preflight_error()),
+                }
+            })
     }
 
     pub(crate) fn publish(

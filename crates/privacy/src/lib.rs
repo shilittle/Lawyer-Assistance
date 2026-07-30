@@ -13,6 +13,7 @@ pub mod finding_engine;
 pub mod lifecycle;
 pub mod local_ner;
 pub mod mcp_ticket;
+pub mod project_case_binding;
 pub mod protected_blob;
 pub mod qualification;
 pub mod receipt;
@@ -29,9 +30,10 @@ pub mod work_products;
 pub mod workspace;
 
 pub use application_backup::{
-    open_application_backup, seal_application_backup, seal_application_backup_v3,
-    ApplicationBackupCreateRequest, ApplicationBackupCreateRequestV3, ApplicationBackupError,
-    ApplicationBackupMetadata, ApplicationBackupOpenContext, OpenedApplicationBackup,
+    open_application_backup, open_application_backup_for_migration_recovery,
+    seal_application_backup, seal_application_backup_v3, ApplicationBackupCreateRequest,
+    ApplicationBackupCreateRequestV3, ApplicationBackupError, ApplicationBackupMetadata,
+    ApplicationBackupOpenContext, MigrationApplicationBackupOpenContext, OpenedApplicationBackup,
     APPLICATION_BACKUP_CHUNK_BYTES, APPLICATION_BACKUP_CRYPTO_SUITE,
     APPLICATION_BACKUP_SCHEMA_VERSION, APPLICATION_BACKUP_V3_CRYPTO_SUITE,
     APPLICATION_BACKUP_V3_SCHEMA_VERSION, MAX_APPLICATION_BACKUP_BYTES,
@@ -46,16 +48,22 @@ pub use lifecycle::{
     ApprovedOutputAccessContextV1, ApprovedOutputSummaryV1, BackupExportRequestV1,
     BackupVerificationContextV1, CleanupReportV1, EncryptedPrivacyBackupStore, LifecycleError,
     LoadedApprovedOutputV1, MappingAccessContextV1, MappingKeySummaryV1, MappingRevisionStatusV1,
-    MappingRevisionSummaryV1, PrivacyLifecycle, RetentionBindingSummaryV1, RetentionPolicyV1,
-    SaveApprovedOutputV1, SensitiveMappingEntryV1, SensitiveMappingPayloadV1, VerifiedBackupV1,
-    BACKUP_CRYPTO_SUITE, ENCRYPTED_BACKUP_SCHEMA_VERSION, LOGICAL_ERASURE_DISCLOSURE,
-    PORTABLE_BACKUP_SCHEMA_VERSION, PRIVACY_LIFECYCLE_SCHEMA_VERSION,
+    MappingRevisionSummaryV1, PreMigrationBackupExportContextV1,
+    PreMigrationBackupVerificationContextV1, PrivacyLifecycle, RetentionBindingSummaryV1,
+    RetentionPolicyV1, SaveApprovedOutputV1, SensitiveMappingEntryV1, SensitiveMappingPayloadV1,
+    VerifiedBackupV1, BACKUP_CRYPTO_SUITE, ENCRYPTED_BACKUP_SCHEMA_VERSION,
+    LOGICAL_ERASURE_DISCLOSURE, PORTABLE_BACKUP_SCHEMA_VERSION, PRIVACY_LIFECYCLE_SCHEMA_VERSION,
     SENSITIVE_MAPPING_SCHEMA_VERSION,
 };
 pub use mcp_ticket::{
     McpAccessTargetV1, McpAccessTicketClaimsV1, McpAccessTicketRequestV1, McpAccessTicketStore,
     McpTicketError, McpTicketSigningKey, McpTicketVerificationContextV1, McpTransportBindingV1,
     SignedMcpAccessTicketV1, MCP_ACCESS_TICKET_PROFILE, MCP_ACCESS_TICKET_VERSION,
+};
+pub use project_case_binding::{
+    BindingCreationSource, BindingLifecycleContext, PrivacyCaseId, ProjectId,
+    ProjectPrivacyCaseBindingError, ProjectPrivacyCaseBindingStore,
+    PROJECT_PRIVACY_CASE_BINDING_SCHEMA_VERSION,
 };
 pub use protected_blob::{
     protect_local, unprotect_local, ProtectedBlobError, LOCAL_PROTECTION_SCHEME,
@@ -78,8 +86,8 @@ pub use review_session::{
 };
 pub use store::{
     ActiveReceiptVerification, ApproveReviewWithRiskRevision, LoadedReviewDraft,
-    LoadedRiskReviewRevision, PrivacyStore, PrivacyStoreError, RegisterPrivacyMaterial,
-    RiskReviewRevisionSummary, SaveReviewDraft, SaveRiskReviewRevision,
+    LoadedRiskReviewRevision, PrivacyStore, PrivacyStoreError, PrivacyStoreSchemaStatus,
+    RegisterPrivacyMaterial, RiskReviewRevisionSummary, SaveReviewDraft, SaveRiskReviewRevision,
     MAX_ACTIVE_RECEIPT_TTL_SECONDS, PRIVACY_STORE_SCHEMA_VERSION,
 };
 pub use vault_backup::{
@@ -89,8 +97,8 @@ pub use vault_backup::{
 };
 pub use vault_store::{
     fixed_local_file_identity, validate_fixed_local_directory, validate_fixed_local_regular_file,
-    VaultCleanupReportV1, VaultRetentionBindingV1, VAULT_LIFECYCLE_SCHEMA_VERSION,
-    VAULT_LOGICAL_ERASURE_DISCLOSURE,
+    VaultCleanupReportV1, VaultReadOnlyInventoryV1, VaultRetentionBindingV1,
+    VAULT_LIFECYCLE_SCHEMA_VERSION, VAULT_LOGICAL_ERASURE_DISCLOSURE,
 };
 
 use serde::{Deserialize, Serialize};

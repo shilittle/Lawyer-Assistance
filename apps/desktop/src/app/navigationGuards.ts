@@ -36,6 +36,8 @@ export interface WorkspaceCloseProtectionState {
   mcpDraftDirty?: boolean;
   privacyMutationInFlight?: boolean;
   privacyDraftDirty?: boolean;
+  caseMaterialMutationInFlight?: boolean;
+  caseMaterialDraftDirty?: boolean;
 }
 
 export type WorkspaceCloseDecision =
@@ -63,6 +65,9 @@ export function decideWorkspaceClose(
       : null,
     state.mcpMutationInFlight ? "MCP 服务配置或生命周期变更" : null,
     state.privacyMutationInFlight ? "隐私与本地处理配置写入" : null,
+    state.caseMaterialMutationInFlight
+      ? "案件材料脱敏操作"
+      : null,
   ].filter((item): item is string => item !== null);
   if (activeWrites.length > 0) {
     return {
@@ -85,6 +90,9 @@ export function decideWorkspaceClose(
   }
   if (state.privacyDraftDirty) {
     unsaved.push("隐私与本地 OCR 配置");
+  }
+  if (state.caseMaterialDraftDirty) {
+    unsaved.push("案件材料与风险审阅草稿");
   }
   if (unsaved.length > 0) {
     return {
@@ -166,6 +174,48 @@ export function decidePrivacyRouteNavigation(
     return { kind: "proceed" };
   }
   return decideChangedPrivacyWorkspaceNavigation(
+    mutationInFlight,
+    draftDirty,
+  );
+}
+
+export function decideCaseMaterialContextChange(
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
+  if (mutationInFlight) {
+    return {
+      kind: "block",
+      message:
+        "案件材料脱敏操作尚未完成；为避免结果不明，已阻止切换。请等待当前操作完成后重试。",
+    };
+  }
+  if (draftDirty) {
+    return {
+      kind: "confirm_discard",
+      message:
+        "切换将永久丢弃当前案件材料与风险审阅草稿。确定继续吗？",
+    };
+  }
+  return { kind: "proceed" };
+}
+
+export function decideCaseMaterialRouteNavigation(
+  currentRoute: AppRoute,
+  nextRoute: AppRoute,
+  mutationInFlight: boolean,
+  draftDirty: boolean,
+): WorkspaceCloseDecision {
+  if (sameRouteLocation(currentRoute, nextRoute)) {
+    return { kind: "proceed" };
+  }
+  if (
+    currentRoute.area !== "cases" ||
+    currentRoute.page !== "materials"
+  ) {
+    return { kind: "proceed" };
+  }
+  return decideCaseMaterialContextChange(
     mutationInFlight,
     draftDirty,
   );
