@@ -7,66 +7,17 @@ import {
   AssistantWorkspace,
   UNVALIDATED_LIVE_DRAFT_NOTICE,
   archiveConversationWithDraftConfirmation,
-  approvedProviderTaskForAssistantIntent,
-  assistantRunIsIndependentPublicLegal,
   assistantWorkspaceHasUnsavedDrafts,
   attachmentDeletionFailureText,
   buildArtifactRegenerationConfirmation,
-  buildAssistantProviderDisclosure,
   confirmArtifactDraftDiscard,
   confirmArtifactRegeneration,
   deleteAttachmentWithConfirmation,
 } from "./AssistantWorkspace";
-
-describe("AssistantWorkspace approved Provider routing", () => {
-  it("maps every legacy assistant intent and regeneration to a fixed task", () => {
-    expect(approvedProviderTaskForAssistantIntent("legal_research")).toBe(
-      "case_legal_qa",
-    );
-    expect(approvedProviderTaskForAssistantIntent("file_analysis")).toBe(
-      "case_organization",
-    );
-    expect(approvedProviderTaskForAssistantIntent("document_draft")).toBe(
-      "document_generation",
-    );
-    expect(approvedProviderTaskForAssistantIntent("map_build")).toBe(
-      "relationship_graph",
-    );
-    expect(approvedProviderTaskForAssistantIntent("case_analysis")).toBe(
-      "legal_analysis",
-    );
-    expect(
-      approvedProviderTaskForAssistantIntent("document_draft", true),
-    ).toBe("regenerate");
-  });
-
-  it("routes even a completely empty independent legal-research shell to approval", () => {
-    const clean = {
-      intent: "legal_research" as const,
-      projectId: null,
-      messageCount: 0,
-      artifactCount: 0,
-      runCount: 0,
-      selectedAttachmentCount: 0,
-    };
-    expect(assistantRunIsIndependentPublicLegal(clean)).toBe(false);
-    expect(
-      assistantRunIsIndependentPublicLegal({ ...clean, messageCount: 1 }),
-    ).toBe(false);
-    expect(
-      assistantRunIsIndependentPublicLegal({ ...clean, artifactCount: 1 }),
-    ).toBe(false);
-    expect(
-      assistantRunIsIndependentPublicLegal({ ...clean, projectId: "case-1" }),
-    ).toBe(false);
-    expect(
-      assistantRunIsIndependentPublicLegal({
-        ...clean,
-        intent: "file_analysis",
-      }),
-    ).toBe(false);
-  });
-});
+import {
+  buildInteractiveProviderDisclosure,
+  INTERACTIVE_PROVIDER_EGRESS_WARNING,
+} from "./providerEgressDisclosure";
 
 const PROVIDER: ProviderProfile = {
   id: "provider-1",
@@ -95,6 +46,9 @@ describe("AssistantWorkspace static accessibility", () => {
     expect(markup).toContain('aria-label="来源、成果与案件建议"');
     expect(markup).toContain("未打开案件；仍可创建独立会话");
     expect(markup).toContain("从一个独立会话开始");
+    expect(markup).toContain('aria-label="模型供应商外发提示"');
+    expect(markup).toContain(INTERACTIVE_PROVIDER_EGRESS_WARNING);
+    expect(markup).not.toContain("前往脱敏批准");
     expect(markup).not.toContain("Codex");
   });
 
@@ -231,33 +185,33 @@ describe("AssistantWorkspace destructive action guards", () => {
 });
 
 describe("AssistantWorkspace provider and regeneration disclosure", () => {
-  it("states the exact provider, history, attachment, case, and off-device scope", () => {
-    const disclosure = buildAssistantProviderDisclosure({
+  it("states the exact ordinary-chat provider and explicit attachment scope", () => {
+    const disclosure = buildInteractiveProviderDisclosure({
       provider: PROVIDER,
-      intent: "document_draft",
-      attachmentPolicyAccepts: true,
       selectedAttachments: [
         {
           originalName: "evidence.pdf",
           extension: "pdf",
+          detectedMime: "application/pdf",
           sizeBytes: 1536,
         },
       ],
-      intentUsesCase: true,
-      boundCaseLabel: "示例案件",
     });
-    const text = [disclosure.target, ...disclosure.items].join("\n");
+    const text = [
+      disclosure.providerLabel,
+      disclosure.attachmentSummary,
+      ASSISTANT_HISTORY_DISCLOSURE,
+    ].join("\n");
 
-    expect(disclosure.target).toBe("本地配置");
+    expect(disclosure.providerLabel).toBe("本地配置");
     expect(text).toContain(ASSISTANT_HISTORY_DISCLOSURE);
     expect(text).toContain(
-      "发送所选附件的提取正文：evidence.pdf（PDF，1.5 KB）；不发送本地路径。",
+      "evidence.pdf（application/pdf，1.5 KiB）",
     );
-    expect(text).toContain("生成版本化成果");
-    expect(text).toContain("示例案件");
-    expect(text).toContain("已确认案件数据");
-    expect(text).toContain("会离开本机");
-    expect(text).toContain("留存及是否用于训练");
+    expect(text).toContain("本地提取正文发送给模型服务");
+    expect(text).toContain("不会发送本地路径");
+    expect(text).not.toContain("示例案件");
+    expect(text).not.toContain("已确认案件数据");
     expect(text).not.toContain("model-1");
     expect(text).not.toContain("https://api.example.test");
   });
