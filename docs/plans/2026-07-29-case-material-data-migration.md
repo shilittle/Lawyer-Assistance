@@ -235,6 +235,11 @@ privacy_redactions.redaction_id` 验证发布物来源，但：
 Vault 内既有 `case_id`。如果归属涉及 Vault case identity 变化，应创建新的受控
 Vault revision/binding，而不是只更新数据库字符串。
 
+归属命令必须由后端重新验证目标项目仍存在且未退休、现有双向绑定、材料与所有
+generation 的身份一致性，以及任何 Vault 四元组。操作需要事务性或 journaled，
+同一请求重试只能得到同一结果，并发归属到不同项目必须 fail closed；前端只提交
+用户选择的 `ProjectId`，不得提交或生成权威 `PrivacyCaseId`。
+
 ## 4. 目标逻辑模型与物理落盘原则
 
 为避免第三套平行材料系统，后续实现应演进现有
@@ -531,6 +536,11 @@ mat_ + first_32_hex(
 以只读 snapshot 打开 `user.sqlite`，只在隐私库写 target + ledger。因为源记录不被
 修改，不需要伪造跨库原子提交；若 snapshot 结束前源 fingerprint 改变，本批次回滚。
 
+只读 snapshot 必须使用操作系统/SQLite 只读打开方式并启用 `query_only`，在同一
+deferred read transaction 中固定 schema、project manifest 和逻辑内容。不能只依赖
+调用约定；测试注入写 SQL 必须得到 `SQLITE_READONLY`，且迁移前后源文件 bytes、
+schema version 与逻辑 manifest 均保持一致。
+
 身份绑定 backfill 使用独立固定 migration id
 `project-privacy-case-binding-v1`，并遵循：
 
@@ -636,6 +646,11 @@ table 或复制单个数据库“回滚”。
 恢复 A 阶段创建的完整五组件应用备份，并与对应应用版本一起恢复。不能只恢复
 `user.sqlite` 或 `privacy-workflow.sqlite`，否则 Vault、approved publication 与
 work-product revocation 状态可能分叉。
+
+同样地，旧三组件备份只对尚无 unified material/binding、approved publication 和
+work-product lineage 的切换前状态保持读兼容。一旦任一 lineage 存在，恢复服务
+必须在暂存前以及首次组件替换前各检查一次并拒绝三组件恢复，防止检查与应用之间
+新增状态造成部分回滚。
 
 恢复前后都必须保留迁移报告。恢复动作不得删除用户原始外部文件；现有
 `delete_review` 的显式、hash-checked、legal-hold-aware 删除流程不属于迁移回滚。

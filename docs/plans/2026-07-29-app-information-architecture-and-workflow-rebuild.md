@@ -247,6 +247,13 @@ raw_local
   静默重绑。
 * 绑定迁移只读 `user.sqlite`，只在 Privacy 可写库中写入绑定、审计和迁移结果；
   必须幂等、可恢复、并发安全，且回滚不得修改或删除既有 Vault 数据。
+* 绑定与审计的不可变性必须覆盖 SQLite `REPLACE` / upsert 冲突算法；可写连接要
+  核验实际 schema、外键和递归触发器，不能只相信同名表或触发器存在。
+* 项目删除采用 append-preserving journal：先撤销 Privacy/Vault/approved/work
+  lineage 并 tombstone 材料，再删除用户项目。绑定与审计保留，原 `ProjectId`
+  永久 retired，不允许同名项目重新绑定或生成第二套 Vault。
+* unified material/binding、approved publication 或 work-product lineage 任一存在
+  后，只允许恢复一致的五组件应用备份；旧三组件备份不得部分覆盖新模型状态。
 
 ## 6. 前端目录重构
 

@@ -60,6 +60,12 @@ updated_at
 v1 不允许普通更新改变任一身份列。发现同一端已绑定另一身份时返回
 `binding_conflict`，不得覆盖、删除后重建或静默修复。
 
+SQLite 的冲突算法也不得成为绕过路径。绑定与创建审计必须同时拒绝普通
+`UPDATE`、`DELETE`、`INSERT OR REPLACE` 以及会改写身份的
+`ON CONFLICT DO UPDATE`。每个可写连接必须启用并核验外键与递归触发器，
+初始化时还要验证实际 schema/trigger 契约；同名弱表、缺失保护触发器或被替换为
+空操作的触发器都必须使应用 fail closed，而不是继续运行。
+
 ### 解析服务
 
 可信后端提供唯一的身份解析边界：
@@ -110,6 +116,13 @@ Vault 内部仍只接受严格 `PrivacyCaseId`，并继续验证完整
 publication、ticket、grant、签名、撤销 epoch 和 protected work-product 边界不因
 本 ADR 放宽。
 
+删除项目是跨 `user.sqlite`、Privacy、Vault、approved publication 与 work-product
+边界的可恢复生命周期操作，不是删除绑定的理由。删除必须先持久化
+append-preserving journal，在 Privacy/Vault 侧完成撤销和材料 tombstone，再把
+用户项目删除作为最后一个业务提交，并允许启动时幂等续作。原绑定、创建审计和
+删除 journal 永久保留；已删除的 `ProjectId` 视为 retired，不得通过重新创建同名
+项目、删除后插入绑定或生成新 `PrivacyCaseId` 使其复活。
+
 ### 历史迁移
 
 迁移只读扫描 `user.sqlite`，只写 Privacy 可写库：
@@ -127,12 +140,23 @@ publication、ticket、grant、签名、撤销 epoch 和 protected work-product 
 历史 Vault object、payload、publication 和 work product 保留原
 `PrivacyCaseId`。无法无歧义关联的记录保持未归属并保留 `legacyCaseId`。
 
+未归属记录只能经用户明确发起、后端审计的归属命令处理。该命令必须重新验证目标
+项目、既有双向绑定、材料/generation 身份和 Vault 四元组，并在单一事务或可恢复
+journal 边界内完成；重复请求只能返回同一结果，并发冲突必须 fail closed。
+不得用单纯改写 `project_id` 或 `case_id` 把既有 Vault 对象移动到另一身份。
+需要改变 Vault case identity 时必须创建受控的新 revision/ref，并保留原始
+`PrivacyCaseId` 与完整审计链。
+
 ### 回滚
 
 绑定 schema 与 ledger 是 append-preserving 数据，不通过 drop table 或改写 Vault
 回滚。切换前可关闭 target-primary 读并保留绑定供核对；已有新模型写入后只能使用
 计划规定的五组件一致性备份与对应应用版本恢复。任何回滚都不得修改或删除既有
 Vault object。
+
+旧版三组件备份仅允许用于尚未产生 unified material/binding、approved publication
+或 work-product lineage 的切换前历史状态。一旦存在任一上述状态，恢复入口在暂存
+前和首次组件替换前都必须再次拒绝三组件恢复；不得用旧备份部分覆盖五组件状态。
 
 ## 影响
 
