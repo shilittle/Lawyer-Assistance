@@ -16,6 +16,7 @@ pub const DEFAULT_MAX_EGRESS_BYTES: usize = 16 * 1024 * 1024;
 pub enum DataClassification {
     LegalPublic,
     ProductPublic,
+    InteractiveUserProvided,
     #[default]
     CaseRaw,
     CaseRedactedPending,
@@ -259,11 +260,19 @@ impl EgressPolicyEngine {
             return Err(EgressError::PayloadTooLarge);
         }
         let scan = scan.ok_or(EgressError::NonUtf8Payload)?;
-        if !scan.passed {
+        if candidate.classification != DataClassification::InteractiveUserProvided && !scan.passed {
             return Err(EgressError::ResidualSensitiveContent);
         }
         match candidate.classification {
             DataClassification::LegalPublic | DataClassification::ProductPublic => {}
+            DataClassification::InteractiveUserProvided => {
+                if !matches!(
+                    candidate.destination.kind,
+                    DestinationKind::ExternalProvider | DestinationKind::VerifiedLocalProvider
+                ) {
+                    return Err(EgressError::ClassificationForbidden);
+                }
+            }
             DataClassification::CaseRedactedApproved => {
                 let receipt = candidate.receipt.ok_or(EgressError::ReceiptRequired)?;
                 self.signer.verify(
@@ -404,6 +413,71 @@ mod tests {
                 Some(EgressError::ClassificationForbidden)
             );
         }
+    }
+
+    #[test]
+    fn interactive_user_content_allows_provider_residuals_and_audits_detector_counts() {
+        let engine = EgressPolicyEngine::new(signer(), "cn-legal-default", 1).expect("engine");
+        let payload = br#"{"phone":"13800138000","request":"call me"}"#;
+
+        for kind in [
+            DestinationKind::ExternalProvider,
+            DestinationKind::VerifiedLocalProvider,
+        ] {
+            let destination = destination(kind);
+            let candidate = EgressCandidate {
+                payload,
+                classification: DataClassification::InteractiveUserProvided,
+                destination: &destination,
+                purpose: "assistant_interactive_chat",
+                receipt: None,
+                now_unix: 500,
+            };
+            let (approved, audit) = engine.authorize_with_audit(&candidate);
+
+            assert_eq!(
+                approved.expect("interactive provider egress").payload(),
+                payload
+            );
+            assert!(audit.allowed);
+            assert_eq!(audit.detector_version, REDACTION_VERSION);
+            assert_eq!(audit.residual_counts.get("phone_number"), Some(&1));
+            assert_eq!(audit.reason_code, "allowed");
+        }
+    }
+
+    #[test]
+    fn interactive_user_content_is_forbidden_for_external_mcp_hosts() {
+        let engine = EgressPolicyEngine::new(signer(), "cn-legal-default", 1).expect("engine");
+        let destination = destination(DestinationKind::ExternalMcpHost);
+        let candidate = EgressCandidate {
+            payload: br#"{"phone":"13800138000"}"#,
+            classification: DataClassification::InteractiveUserProvided,
+            destination: &destination,
+            purpose: "assistant_interactive_chat",
+            receipt: None,
+            now_unix: 500,
+        };
+        let (result, audit) = engine.authorize_with_audit(&candidate);
+
+        assert_eq!(result.err(), Some(EgressError::ClassificationForbidden));
+        assert!(!audit.allowed);
+        assert_eq!(
+            audit.reason_code,
+            EgressError::ClassificationForbidden.code()
+        );
+        assert_eq!(audit.residual_counts.get("phone_number"), Some(&1));
+    }
+
+    #[test]
+    fn data_classification_serde_contract_includes_interactive_user_provided() {
+        let wire = serde_json::to_string(&DataClassification::InteractiveUserProvided)
+            .expect("classification serializes");
+        assert_eq!(wire, "\"interactive_user_provided\"");
+        assert_eq!(
+            serde_json::from_str::<DataClassification>(&wire).expect("classification deserializes"),
+            DataClassification::InteractiveUserProvided
+        );
     }
 
     #[test]

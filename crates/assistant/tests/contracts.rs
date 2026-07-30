@@ -160,6 +160,7 @@ fn registry_is_exact_unique_bounded_and_confirmation_is_enforced() {
         "document.draft",
         "document.render",
         "map.build",
+        "assistant.interactive_chat",
     ];
     let registry = capability_registry();
     assert_eq!(registry.len(), CAPABILITY_COUNT);
@@ -199,10 +200,50 @@ fn registry_is_exact_unique_bounded_and_confirmation_is_enforced() {
         .unwrap()
         .validate_call(1, 1, 1, true)
         .is_ok());
+    let interactive = find_capability("assistant.interactive_chat").unwrap();
+    assert_eq!(
+        interactive.access,
+        CapabilityAccess {
+            read: true,
+            write: false,
+        }
+    );
+    assert!(!interactive.requires_user_confirmation);
+    assert_eq!(interactive.max_calls_per_run, 1);
+    assert_eq!(interactive.max_input_bytes, MAX_INPUT_BODY_BYTES_PER_RUN);
+    assert_eq!(interactive.max_output_bytes, MAX_MODEL_RESPONSE_BYTES);
+    assert!(interactive
+        .allowed_error_types
+        .contains(&CapabilityErrorType::ProviderFailure));
+    assert!(interactive
+        .allowed_error_types
+        .contains(&CapabilityErrorType::Conflict));
+    assert!(interactive
+        .audit_fields
+        .contains(&AuditField::ProviderSnapshot));
+    assert!(interactive
+        .audit_fields
+        .contains(&AuditField::Classification));
+    assert!(interactive.audit_fields.contains(&AuditField::InputHashes));
+    assert!(interactive.audit_fields.contains(&AuditField::OutputHashes));
+    assert!(interactive.audit_fields.contains(&AuditField::OutputIds));
+    assert!(!interactive.audit_fields.contains(&AuditField::SourceRefs));
     assert_eq!(
         find_capability("shell.exec").unwrap_err().error_type,
         ContractErrorType::UnknownCapability
     );
+}
+
+#[test]
+fn interactive_chat_capability_serde_wire_contract_is_exact_and_closed() {
+    let wire =
+        serde_json::to_string(&CapabilityName::AssistantInteractiveChat).expect("serialize name");
+    assert_eq!(wire, "\"assistant.interactive_chat\"");
+    assert_eq!(
+        serde_json::from_str::<CapabilityName>(&wire).expect("deserialize name"),
+        CapabilityName::AssistantInteractiveChat
+    );
+    assert!(serde_json::from_str::<CapabilityName>("\"assistant.interactive\"").is_err());
 }
 
 #[test]

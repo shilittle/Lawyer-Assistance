@@ -921,6 +921,7 @@ fn build_transport_request(
         ChatRequestAuthority::ConnectionProbe
             | ChatRequestAuthority::LegalPublic
             | ChatRequestAuthority::ProductPublic
+            | ChatRequestAuthority::InteractiveUserContent
     ) {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
@@ -1103,7 +1104,7 @@ pub fn prepare_approved_chat(
     let model_id = effective_model_id(profile).to_owned();
     validate_provider_binding_text("provider ID", &profile.id)?;
     validate_provider_binding_text("model ID", &model_id)?;
-    scan_message_content(&messages)?;
+    scan_message_content(&messages, ChatRequestAuthority::ApprovedCase)?;
 
     let request = ChatRequest::approved_case(messages, stream, temperature, max_tokens);
     let transport_body_sha256 = approved_transport_body_sha256(profile, &request)?;
@@ -1468,6 +1469,7 @@ fn validate_transport_authorization(
                     ChatRequestAuthority::ConnectionProbe
                         | ChatRequestAuthority::LegalPublic
                         | ChatRequestAuthority::ProductPublic
+                        | ChatRequestAuthority::InteractiveUserContent
                 )
             {
                 return Err(transport_authorization_error());
@@ -1669,6 +1671,7 @@ fn build_chat_body(
             ChatRequestAuthority::ConnectionProbe
                 | ChatRequestAuthority::LegalPublic
                 | ChatRequestAuthority::ProductPublic
+                | ChatRequestAuthority::InteractiveUserContent
         )
     };
     if !authority_matches {
@@ -1678,7 +1681,7 @@ fn build_chat_body(
         ));
     }
     validate_chat_shape(&request.messages, request.temperature, request.max_tokens)?;
-    scan_message_content(&request.messages)?;
+    scan_message_content(&request.messages, request.authority)?;
     if profile.kind == ProviderKind::SiliconFlow
         && profile
             .options
@@ -1753,7 +1756,7 @@ fn build_chat_body(
             "provider request privacy validation failed",
         )
     })?;
-    if !residual.passed {
+    if request.authority != ChatRequestAuthority::InteractiveUserContent && !residual.passed {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "provider request rejected by privacy policy",
@@ -1788,7 +1791,10 @@ fn validate_chat_shape(
     Ok(())
 }
 
-fn scan_message_content(messages: &[ChatMessage]) -> Result<(), ProviderError> {
+fn scan_message_content(
+    messages: &[ChatMessage],
+    authority: ChatRequestAuthority,
+) -> Result<(), ProviderError> {
     let serialized = serde_json::to_vec(messages).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::InvalidRequest,
@@ -1801,7 +1807,7 @@ fn scan_message_content(messages: &[ChatMessage]) -> Result<(), ProviderError> {
             "provider message privacy validation failed",
         )
     })?;
-    if !residual.passed {
+    if authority != ChatRequestAuthority::InteractiveUserContent && !residual.passed {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "provider message contains residual sensitive content",
@@ -2589,6 +2595,61 @@ mod tests {
         assert!(transport.requests.lock().expect("requests lock").is_empty());
         assert!(!error.to_string().contains(RAW_MARKER));
         assert!(!format!("{error:?}").contains("13800138000"));
+    }
+
+    #[test]
+    fn interactive_user_content_with_pii_reaches_direct_provider_but_public_content_does_not() {
+        let messages = vec![ChatMessage {
+            role: ChatMessageRole::User,
+            content: "Please call me at 13800138000 about my question.".to_owned(),
+        }];
+        let interactive =
+            ChatRequest::interactive_user_content(messages.clone(), false, Some(0.0), Some(32));
+        assert_eq!(
+            interactive.data_classification(),
+            privacy::DataClassification::InteractiveUserProvided
+        );
+        let provider_profile = profile(ProviderKind::DeepSeek);
+        let secret = ApiSecret::new("synthetic-secret");
+        let built = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
+            &provider_profile,
+            &secret,
+            &interactive,
+        )
+        .expect("interactive user content builds");
+        validate_transport_authorization(&built, false)
+            .expect("interactive authority survives the transport boundary");
+        let serialized_messages = serde_json::to_vec(&messages).expect("messages serialize");
+        assert!(
+            !privacy::scan_residual(&serialized_messages)
+                .expect("detector runs")
+                .passed,
+            "the fixture must exercise the interactive residual exception"
+        );
+
+        let transport = MockTransport::new(TransportResponse {
+            status: 200,
+            body: r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 1,
+        });
+        let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+        adapter
+            .send_chat(&provider_profile, &secret, &interactive)
+            .expect("interactive user content reaches the direct provider transport");
+        assert_eq!(transport.requests.lock().expect("requests lock").len(), 1);
+
+        let public = ChatRequest::product_public(messages, false, Some(0.0), Some(32));
+        let error = adapter
+            .send_chat(&provider_profile, &secret, &public)
+            .expect_err("public authority must retain residual rejection");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("residual sensitive content"));
+        assert_eq!(
+            transport.requests.lock().expect("requests lock").len(),
+            1,
+            "rejected public content must not reach transport"
+        );
     }
 
     #[test]
