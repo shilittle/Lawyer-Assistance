@@ -525,6 +525,7 @@ pub fn run() {
             commands::assistant::reject_assistant_case_change_proposal,
             commands::assistant::apply_assistant_case_change_proposal,
             commands::assistant_run::start_assistant_run,
+            commands::assistant_run::start_interactive_assistant_run,
             commands::assistant::cancel_assistant_run,
             commands::case::list_case_projects,
             commands::case::get_case_workspace,
@@ -726,6 +727,7 @@ mod tests {
             .expect("Tauri invoke registration list");
 
         for scoped in [
+            "commands::assistant_run::start_interactive_assistant_run,",
             "commands::privacy_workflow::list_unassigned_case_materials,",
             "commands::privacy_workflow::assign_unassigned_case_material,",
             "commands::privacy_workflow::load_case_redaction_review,",

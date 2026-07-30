@@ -1,24 +1,36 @@
 import { describe, expect, it } from "vitest";
 
 import appSource from "./App.tsx?raw";
+import assistantClientSource from "./ipc/assistant/client.ts?raw";
 import assistantWorkspaceSource from "./features/assistant/AssistantWorkspace.tsx?raw";
+import providerEgressNoticeSource from "./features/assistant/ProviderEgressNotice.tsx?raw";
 import redactionWorkbenchSource from "./features/cases/materials/RedactionWorkbench.tsx?raw";
 import privacyWorkspaceSource from "./features/privacy/PrivacyWorkspace.tsx?raw";
 
 describe("Phase 1 current application workflow characterization", () => {
-  it("routes every ordinary Assistant submission into the Privacy approved-Provider flow", () => {
+  it("sends ordinary Assistant messages through the independent interactive boundary", () => {
+    expect(assistantClientSource).toContain(
+      'invokeAssistant("start_interactive_assistant_run"',
+    );
+    expect(assistantWorkspaceSource).toContain("<ProviderEgressNotice");
+    expect(providerEgressNoticeSource).toContain(
+      "INTERACTIVE_PROVIDER_EGRESS_WARNING",
+    );
+    expect(assistantWorkspaceSource).not.toContain(
+      "assistantRunIsIndependentPublicLegal",
+    );
+    expect(assistantWorkspaceSource).not.toContain("onOpenApprovedProvider");
+    expect(assistantWorkspaceSource).not.toContain("前往脱敏批准");
     expect(assistantWorkspaceSource).toMatch(
-      /export function assistantRunIsIndependentPublicLegal[\s\S]*?return false;\s*\}/u,
+      /<form className="assistant-composer"[\s\S]*?<ProviderEgressNotice/u,
     );
-    expect(assistantWorkspaceSource).toMatch(
-      /if \(!independentPublicLegalShell && onOpenApprovedProvider\) \{[\s\S]*?onOpenApprovedProvider\([\s\S]*?approvedProviderTaskForAssistantIntent\(intent\)[\s\S]*?return;/u,
+    expect(assistantWorkspaceSource).toContain(
+      "onOpenProtectedArtifactRegeneration",
     );
-    expect(appSource).toMatch(
-      /function redirectLegacyEgressToApprovedProvider\([\s\S]*?navigation\.handoffApprovedProvider\(\{ task, notice \}\)[\s\S]*?\}/u,
+    expect(appSource).not.toMatch(
+      /<AssistantWorkspace[\s\S]*?onOpenApprovedProvider=/u,
     );
-    expect(appSource).toMatch(
-      /<AssistantWorkspace[\s\S]*?onOpenApprovedProvider=\{[\s\S]*?redirectLegacyEgressToApprovedProvider[\s\S]*?\}/u,
-    );
+    expect(appSource).toContain("onOpenProtectedArtifactRegeneration=");
   });
 
   it("routes case material preparation through the required ProjectId boundary", () => {

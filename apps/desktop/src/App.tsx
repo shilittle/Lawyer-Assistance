@@ -336,11 +336,11 @@ export function App() {
           assistantController.workspaceCallbacks
             .onMutationActivityChange
         }
+        onOpenProtectedArtifactRegeneration={(notice) =>
+          redirectLegacyEgressToApprovedProvider("regenerate", notice)
+        }
         onOpenProviderSettings={() =>
           navigateFromShell(PROVIDER_SETTINGS_ROUTE)
-        }
-        onOpenApprovedProvider={
-          redirectLegacyEgressToApprovedProvider
         }
         onRunActivityChange={
           assistantController.workspaceCallbacks.onRunActivityChange

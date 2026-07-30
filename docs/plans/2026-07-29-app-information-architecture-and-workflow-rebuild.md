@@ -442,6 +442,48 @@ Tauri commands 只做 typed IPC 转换。
 * 普通聊天直接走现有 Provider streaming pipeline。
 * 普通聊天不得读取案件 workspace。
 
+#### Phase 4 实施澄清（2026-07-31）
+
+本节只收窄 Phase 4 的实现契约，不改变 Phase 5 的案件助手或 Phase 6 的 MCP
+边界：
+
+* 新命令 `start_interactive_assistant_run` 使用独立、无 `intent` 的闭合 IPC：
+  `runId`、`conversationId`、`providerId`、`prompt`、显式
+  `attachmentIds` 和可选 `budget`。请求拒绝 `projectId`、`caseId`、
+  `privacyCaseId`、redaction generation、receipt、authority、classification、
+  artifact/regeneration 和 MCP 字段；authority 与 classification 只能由可信后端构造。
+* 旧 `start_assistant_run` 在 Phase 7 清理前继续 fail closed，不能借 Phase 4
+  恢复旧的 legal/file/document/map/case 多意图执行计划。Phase 5 只通过独立
+  `start_case_assistant_run` 恢复案件能力。
+* 案件绑定会话可以继续承载普通聊天，但 `projectId` 仅是保留的会话容器元数据：
+  普通聊天不得以其分支、查询或构造上下文，不读取 Case Workspace、CaseMaterial、
+  Privacy、Vault、approved generation 或 MCP 服务，也不把该标识写入 Provider
+  请求或发送范围审计。
+* 自动携带的历史只包括同一会话中 `intent = interactive_chat` 且已成功运行的、
+  成对的 user/assistant 文本消息，并继续受 24 条与 32 KiB 上限约束。旧多意图、
+  案件、artifact、source、proposal 和 automation lineage 保留显示但不得自动重发；
+  畸形 interactive lineage 必须 fail closed。
+* 附件正文只允许从本次请求显式列出的、属于当前会话且本地提取成功的附件定点读取；
+  未选择和跨会话附件不得枚举或发送。发送给模型的正文不包含本地路径、附件 ID
+  或原始文件名，持久化前在同一 immediate transaction 中复核附件哈希、提取状态
+  和模型可见正文哈希，防止 TOCTOU。普通附件不得自动登记为 CaseMaterial。
+* `InteractiveUserContent` 精确映射到 `InteractiveUserProvided`。只有该 authority
+  可以把用户主动输入的正文发送到 External Provider 或显式配置的 Verified Local
+  Provider；不得发送到 External MCP Host。ProductPublic、LegalPublic、
+  ApprovedCase、raw/pending case 和 Secret 的既有残留检测、receipt 与拒绝规则
+  保持不变。
+* 每次 Provider dispatch 使用 `assistant.interactive_chat` capability 写入
+  `user.sqlite` 的 agent-run/tool-call 审计链。审计只保存 classification、
+  conversation/显式 attachment 标识、内容哈希、字节数、条数、截断计数和 Provider
+  快照，不保存 raw prompt、历史正文、附件正文、路径或案件标识；不修改 Privacy/Vault
+  审计库 schema。
+* 普通聊天使用现有 Provider streaming、取消、credential 隔离、SSRF/private-network
+  许可、请求/响应额度和错误脱敏机制。输出作为普通文本消息持久化，不创建 artifact、
+  proposal、citation report 或案件成果。
+* 输入框附近始终显示：
+  `内容将通过 API 发送至所选模型供应商服务器。请勿输入或上传未脱敏的案件材料。案件文件请先到“案件工作台 → 材料与脱敏”处理。`
+  选择附件时还必须显示将发送正文的文件名、类型和大小，但不得显示或传递本地路径。
+
 ### Phase 5：案件工作页
 
 * 创建独立 Case Assistant。

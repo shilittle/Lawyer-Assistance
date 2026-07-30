@@ -33,7 +33,6 @@ import type {
   AssistantMessage,
   AssistantRun,
   AssistantRunEvent,
-  AssistantRegenerationTarget,
   AssistantRunStreamStatus,
   AssistantRunStreamUsage,
   AssistantRunStatus,
@@ -44,13 +43,11 @@ import {
   listProviderProfiles,
 } from "../../ipc/provider/client";
 import type { ProviderProfile } from "../../ipc/provider/types";
-import type { ApprovedProviderTask } from "../../ipc/privacy/types";
 import { publicErrorMessage, publicTitle } from "../../publicOutput";
 import {
   ASSISTANT_RUN_INTENT_LABELS,
   advanceAssistantRunEventCursor,
   applyAssistantCancellationResult,
-  assistantAttachmentPolicy,
   createAssistantRunId,
   defaultAssistantRunBoundary,
   type AssistantRunBoundary,
@@ -63,6 +60,7 @@ import {
   replaceRunIfCurrent,
   toggleAttachmentSelection,
 } from "./workspaceState";
+import { ProviderEgressNotice } from "./ProviderEgressNotice";
 import "./assistant.css";
 
 export interface AssistantProjectContext {
@@ -79,47 +77,11 @@ export interface AssistantWorkspaceProps {
   onDraftDirtyChange?: (dirty: boolean) => void;
   onCaseProposalApplied?: (projectId: string) => void;
   onMutationActivityChange?: (active: boolean) => void;
-  onOpenApprovedProvider?: (
-    task: ApprovedProviderTask,
-    notice: string,
-  ) => void;
+  onOpenProtectedArtifactRegeneration?: (notice: string) => void;
   onOpenProviderSettings?: () => void;
   onRunActivityChange?: (active: boolean) => void;
   proposalApplyBlockedReason?: string | null;
   runBoundary?: AssistantRunBoundary;
-}
-
-export function approvedProviderTaskForAssistantIntent(
-  intent: AssistantRunIntent,
-  regenerating = false,
-): ApprovedProviderTask {
-  if (regenerating) return "regenerate";
-  switch (intent) {
-    case "legal_research":
-      return "case_legal_qa";
-    case "file_analysis":
-      return "case_organization";
-    case "document_draft":
-      return "document_generation";
-    case "map_build":
-      return "relationship_graph";
-    case "case_analysis":
-      return "legal_analysis";
-  }
-}
-
-export function assistantRunIsIndependentPublicLegal(input: {
-  intent: AssistantRunIntent;
-  projectId: string | null;
-  messageCount: number;
-  artifactCount: number;
-  runCount: number;
-  selectedAttachmentCount: number;
-}): boolean {
-  void input;
-  // User-authored free text has no trustworthy public provenance. The legacy Assistant never
-  // sends it directly, even when the surrounding conversation shell appears empty.
-  return false;
 }
 
 const RUN_INTENTS = Object.keys(
@@ -149,7 +111,7 @@ export const UNVALIDATED_LIVE_DRAFT_NOTICE =
   "正在生成并校验内容；完成前不会显示未经确认的草稿。";
 
 export const ASSISTANT_HISTORY_DISCLOSURE =
-  "最多发送同一会话最近 24 条、合计 32 KiB 的持久化消息摘要上下文；成果只发送引用元数据，不读取隐藏原始响应，也不读取其他会话。";
+  "最多发送同一会话最近 24 条、合计 32 KiB 的成功普通聊天文本；不会自动发送旧任务、成果、案件、来源或自动化记录。";
 
 export function assistantWorkspaceHasUnsavedDrafts(
   promptDrafts: Readonly<Record<string, string>>,
@@ -265,69 +227,6 @@ export function confirmArtifactRegeneration(
   confirmAction: ConfirmationAction = (message) => window.confirm(message),
 ): boolean {
   return confirmAction(buildArtifactRegenerationConfirmation(options));
-}
-
-export function buildAssistantProviderDisclosure(options: {
-  provider: ProviderProfile | undefined;
-  intent: AssistantRunIntent;
-  attachmentPolicyAccepts: boolean;
-  selectedAttachments: readonly Pick<
-    AssistantAttachment,
-    "originalName" | "extension" | "sizeBytes"
-  >[];
-  intentUsesCase: boolean;
-  boundCaseLabel: string | null;
-}): { target: string; items: string[] } {
-  const {
-    provider,
-    intent,
-    attachmentPolicyAccepts,
-    selectedAttachments,
-    intentUsesCase,
-    boundCaseLabel,
-  } = options;
-  const intentDisclosure =
-    intent === "case_analysis"
-      ? "本次只读取已确认案件数据，并最多生成一份待审阅的案件建议；不会直接写入案件。"
-      : intent === "document_draft" || intent === "map_build"
-        ? "本次生成版本化成果；不会直接修改案件数据。"
-        : intent === "legal_research"
-          ? "本次只读检索本地法律库，并保存附有完整法条依据的研究成果。"
-          : "本次只读分析所选材料并保存回答；不会直接修改案件数据。";
-  const selectedAttachmentLabels = selectedAttachments.map(
-    (attachment) =>
-      `${attachment.originalName}（${attachment.extension.toUpperCase()}，${byteSize(attachment.sizeBytes)}）`,
-  );
-  const items = [
-    intentDisclosure,
-    "发送你在上方填写的任务文本。",
-    ASSISTANT_HISTORY_DISCLOSURE,
-    attachmentPolicyAccepts && selectedAttachmentLabels.length > 0
-      ? `发送所选附件的提取正文：${selectedAttachmentLabels.join("、")}；不发送本地路径。`
-      : "不发送附件正文或本地路径。",
-    intentUsesCase
-      ? `发送“${boundCaseLabel}”范围内的已确认案件数据；不发送待确认草稿。`
-      : "不发送案件数据。",
-    intent === "legal_research"
-      ? "本地检索完成后，会发送命中的法律条文片段用于生成受引用约束的回答。"
-      : "本任务不会自动附加法律检索结果。",
-    "所选任务文本、附件提取正文、案件确认数据或法律片段会离开本机；服务地域、留存及是否用于训练由目标模型服务的条款与配置决定。",
-  ];
-  if (provider?.kind === "custom") {
-    items.push(
-      `自定义模型服务的私网访问：${
-        provider.options.allowPrivateNetwork
-          ? "已显式允许 localhost/私网/链路本地地址（高风险）。"
-          : "未允许私网地址。"
-      }`,
-    );
-  }
-  return {
-    target: provider
-      ? provider.displayName
-      : "尚未选择模型服务",
-    items,
-  };
 }
 
 function displayError(error: unknown): string {
@@ -515,7 +414,7 @@ export function AssistantWorkspace({
   onDraftDirtyChange,
   onCaseProposalApplied,
   onMutationActivityChange,
-  onOpenApprovedProvider,
+  onOpenProtectedArtifactRegeneration,
   onOpenProviderSettings,
   onRunActivityChange,
   proposalApplyBlockedReason,
@@ -538,7 +437,6 @@ export function AssistantWorkspace({
   const [bindNewConversation, setBindNewConversation] = useState(
     activeProject !== null,
   );
-  const [intent, setIntent] = useState<AssistantRunIntent>("legal_research");
   const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
   const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<string[]>([]);
   const [activeRun, setActiveRun] = useState<ActiveAssistantRun | null>(null);
@@ -888,37 +786,9 @@ export function AssistantWorkspace({
     ? providerStatuses[selectedProvider.id]
     : false;
   const conversationProjectId = detail?.conversation.projectId ?? null;
-  const attachmentPolicy = assistantAttachmentPolicy(
-    intent,
-    conversationProjectId !== null,
-  );
-  const requiredAttachmentsMissing =
-    attachmentPolicy.requires && selectedAttachmentIds.length === 0;
-  const intentUsesCase = Boolean(
-    conversationProjectId &&
-      (intent === "case_analysis" ||
-        intent === "document_draft" ||
-        intent === "map_build"),
-  );
-  const boundCaseLabel = conversationProjectId
-    ? activeProject?.projectId === conversationProjectId
-      ? publicTitle(activeProject.title, "当前案件")
-      : "已绑定的其他案件"
-    : null;
   const selectedAttachments = attachments.filter((attachment) =>
     selectedAttachmentIds.includes(attachment.attachmentId),
   );
-  const providerDisclosure = buildAssistantProviderDisclosure({
-    provider: selectedProvider,
-    intent,
-    attachmentPolicyAccepts: attachmentPolicy.accepts,
-    selectedAttachments,
-    intentUsesCase,
-    boundCaseLabel,
-  });
-  useEffect(() => {
-    if (!attachmentPolicy.accepts) setSelectedAttachmentIds([]);
-  }, [attachmentPolicy.accepts]);
   const activeRunForConversation =
     activeRun?.conversationId === state.selectedConversationId ? activeRun : null;
   const currentNotice =
@@ -927,34 +797,12 @@ export function AssistantWorkspace({
       notice.conversationId === state.selectedConversationId)
       ? notice
       : null;
-  const caseIntentWithoutCase = intent === "case_analysis" && !conversationProjectId;
-  const independentPublicLegalShell = Boolean(
-    detail &&
-      assistantRunIsIndependentPublicLegal({
-        intent,
-        projectId: detail.conversation.projectId,
-        messageCount: detail.messages.length,
-        artifactCount: detail.artifacts.length,
-        runCount: detail.runs.length,
-        selectedAttachmentCount: selectedAttachmentIds.length,
-      }),
-  );
-  const routesToApprovedProvider = Boolean(
-    detail &&
-      prompt.trim() &&
-      !activeRun &&
-      !independentPublicLegalShell &&
-      onOpenApprovedProvider,
-  );
   const canSend = Boolean(
     detail &&
       prompt.trim() &&
       !activeRun &&
-      (routesToApprovedProvider ||
-        (selectedProvider &&
-          selectedProviderConfigured === true &&
-          !caseIntentWithoutCase &&
-          !requiredAttachmentsMissing)),
+      selectedProvider &&
+      selectedProviderConfigured === true,
   );
 
   async function createConversation(event: FormEvent) {
@@ -1132,26 +980,18 @@ export function AssistantWorkspace({
 
   async function performRun(options: {
     conversationId: string;
-    intent: AssistantRunIntent;
     requestPrompt: string;
     attachmentIds: string[];
-    saveResearchArtifact: boolean;
-    regenerationTarget?: AssistantRegenerationTarget;
     promptDraftAtStart?: string;
-    rethrowError?: boolean;
   }) {
     if (!selectedProvider) {
       throw new Error("尚未选择模型服务配置。");
     }
     const {
       conversationId,
-      intent: runIntent,
       requestPrompt,
       attachmentIds,
-      saveResearchArtifact,
-      regenerationTarget,
       promptDraftAtStart,
-      rethrowError = false,
     } = options;
     const runId = createAssistantRunId();
     const epoch = runEpoch.current + 1;
@@ -1174,11 +1014,8 @@ export function AssistantWorkspace({
         runId,
         conversationId,
         providerId: selectedProvider.id,
-        intent: runIntent,
         prompt: requestPrompt,
         attachmentIds,
-        saveResearchArtifact,
-        ...(regenerationTarget ? { regenerationTarget } : {}),
       }, (streamEvent: AssistantRunEvent) => {
         if (!mounted.current) return;
         setActiveRun((current) => {
@@ -1250,24 +1087,9 @@ export function AssistantWorkspace({
       if (selectedConversationRef.current === conversationId) {
         setSelectedAttachmentIds([]);
         loadConversation(conversationId);
-        if (response.artifact) selectArtifact(response.artifact.artifactId);
       }
     } catch (error: unknown) {
       if (!mounted.current) return;
-      if (
-        error instanceof AssistantIpcClientError &&
-        error.errorType === "approved_provider_required" &&
-        onOpenApprovedProvider
-      ) {
-        onOpenApprovedProvider(
-          approvedProviderTaskForAssistantIntent(
-            runIntent,
-            regenerationTarget !== undefined,
-          ),
-          "用户自由文本不得从旧助理入口直接发送；已切换到脱敏工作区，并预选对应的 Approved Provider 固定任务。",
-        );
-        return;
-      }
       const cancelled =
         error instanceof AssistantIpcClientError &&
         error.errorType === "cancelled";
@@ -1279,7 +1101,6 @@ export function AssistantWorkspace({
       if (selectedConversationRef.current === conversationId) {
         loadConversation(conversationId);
       }
-      if (rethrowError) throw error;
     } finally {
       if (mounted.current) {
         setActiveRun((current) => replaceRunIfCurrent(current, runId, null));
@@ -1290,27 +1111,16 @@ export function AssistantWorkspace({
   async function startRun(event: FormEvent) {
     event.preventDefault();
     if (!detail || !prompt.trim() || activeRun) return;
-    if (!independentPublicLegalShell && onOpenApprovedProvider) {
-      onOpenApprovedProvider(
-        approvedProviderTaskForAssistantIntent(intent),
-        "旧助理入口不再直接发送任何用户自由文本；已切换到脱敏工作区并预选对应的 Approved Provider 固定任务。",
-      );
-      return;
-    }
     if (!canSend || !selectedProvider) return;
     await performRun({
       conversationId: detail.conversation.conversationId,
-      intent,
       requestPrompt: prompt.trim(),
-      attachmentIds: attachmentPolicy.accepts
-        ? [...selectedAttachmentIds]
-        : [],
-      saveResearchArtifact: intent === "legal_research",
+      attachmentIds: [...selectedAttachmentIds],
       promptDraftAtStart: prompt,
     });
   }
 
-  async function regenerateArtifact(
+  async function openProtectedArtifactRegeneration(
     request: ArtifactRegenerationRequest,
   ): Promise<boolean> {
     if (
@@ -1362,36 +1172,13 @@ export function AssistantWorkspace({
     if (!kindMatches) {
       throw new Error("成果类型与原生成任务不一致，已停止重新生成。");
     }
-    if (onOpenApprovedProvider) {
-      onOpenApprovedProvider(
-        approvedProviderTaskForAssistantIntent(regenerationIntent, true),
-        "重新生成必须使用当前脱敏 generation 和受保护历史输出；已切换到 Approved Provider 固定任务“重新生成”。",
-      );
-      return false;
+    if (!onOpenProtectedArtifactRegeneration) {
+      throw new Error("受保护的成果重新生成工作流当前不可用。");
     }
-    if (!selectedProvider || selectedProviderConfigured !== true) {
-      throw new Error("模型服务尚未准备好，不能重新生成。");
-    }
-    const confirmed = confirmArtifactRegeneration({
-      artifactTitle: artifact.title,
-      sourceVersionNumber: request.sourceVersionNumber,
-      provider: selectedProvider,
-    });
-    if (!confirmed) return false;
-    await performRun({
-      conversationId: request.conversationId,
-      intent: regenerationIntent,
-      requestPrompt: `请基于所选成果第 ${request.sourceVersionNumber} 版重新生成并改进；保持原成果类型、标题与来源约束。`,
-      attachmentIds: [],
-      saveResearchArtifact: request.kind === "research",
-      regenerationTarget: {
-        artifactId: request.artifactId,
-        sourceVersionNumber: request.sourceVersionNumber,
-        expectedCurrentVersion: artifact.currentVersion,
-      },
-      rethrowError: true,
-    });
-    return true;
+    onOpenProtectedArtifactRegeneration(
+      "重新生成只允许使用当前有效的脱敏 generation 和受保护历史输出；已切换到 Approved Provider 固定任务“重新生成”。",
+    );
+    return false;
   }
 
   async function cancelRun() {
@@ -1506,6 +1293,12 @@ export function AssistantWorkspace({
         className="assistant-conversation-main"
         aria-label="助理会话详情"
       >
+        {!detail ? (
+          <ProviderEgressNotice
+            provider={selectedProvider}
+            selectedAttachments={selectedAttachments}
+          />
+        ) : null}
         {state.detailPhase === "loading" ? (
           <p className="assistant-loading" role="status">正在读取会话…</p>
         ) : null}
@@ -1577,6 +1370,10 @@ export function AssistantWorkspace({
             ) : null}
 
             <form className="assistant-composer" onSubmit={(event) => void startRun(event)}>
+              <ProviderEgressNotice
+                provider={selectedProvider}
+                selectedAttachments={selectedAttachments}
+              />
               <div className="assistant-composer-context" role="status">
                 <span>
                   模型服务：{selectedProvider
@@ -1588,24 +1385,10 @@ export function AssistantWorkspace({
                     : "尚未创建配置"}
                 </span>
                 <span>
-                  案件范围：
-                  {intentUsesCase
-                    ? `将读取“${boundCaseLabel}”的已确认数据`
-                    : "本任务不读取案件数据"}
+                  普通聊天不读取案件工作区；会话绑定只用于归档和导航。
                 </span>
               </div>
               <div className="assistant-composer-options">
-                <label>
-                  任务类型
-                  <select
-                    value={intent}
-                    onChange={(event) => setIntent(event.currentTarget.value as AssistantRunIntent)}
-                  >
-                    {RUN_INTENTS.map((value) => (
-                      <option key={value} value={value}>{ASSISTANT_RUN_INTENT_LABELS[value]}</option>
-                    ))}
-                  </select>
-                </label>
                 <label>
                   模型服务配置
                   <select
@@ -1622,21 +1405,11 @@ export function AssistantWorkspace({
                   <button type="button" onClick={onOpenProviderSettings}>管理模型服务</button>
                 ) : null}
               </div>
-              {caseIntentWithoutCase ? (
-                <p className="assistant-problem" role="note">案件分析需要先把本会话绑定到案件。</p>
-              ) : null}
-              {requiredAttachmentsMissing ? (
-                <p className="assistant-problem" role="note">
-                  {intent === "file_analysis"
-                    ? "材料分析至少需要选择 1 个已提取附件。"
-                    : "当前任务在没有案件上下文时至少需要选择 1 个已提取附件。"}
-                </p>
-              ) : null}
               <label className="assistant-prompt-label">
-                给助理的任务
+                普通聊天消息
                 <textarea
                   maxLength={12000}
-                  placeholder="写清楚目标、已知条件与希望的输出形式。模型生成内容仍需人工核对。"
+                  placeholder="输入一般法律问题或其他已确认可发送给模型供应商的内容。模型回答仍需人工核对。"
                   rows={5}
                   value={prompt}
                   onChange={(event) => {
@@ -1652,9 +1425,7 @@ export function AssistantWorkspace({
               </label>
               <fieldset className="assistant-attachment-picker">
                 <legend>
-                  {attachmentPolicy.accepts
-                    ? `本次可见附件（最多 2 个，已选 ${selectedAttachmentIds.length}/2）`
-                    : "当前任务不向模型发送附件"}
+                  本次显式发送的普通附件（最多 2 个，已选 {selectedAttachmentIds.length}/2）
                 </legend>
                 <button
                   disabled={operation !== null || activeRun !== null}
@@ -1681,7 +1452,6 @@ export function AssistantWorkspace({
                               checked={selected}
                               disabled={
                                 !selectable ||
-                                !attachmentPolicy.accepts ||
                                 (!selected && selectedAttachmentIds.length >= 2) ||
                                 activeRun !== null
                               }
@@ -1713,25 +1483,9 @@ export function AssistantWorkspace({
                   </div>
                 )}
               </fieldset>
-              <section
-                className="assistant-provider-disclosure"
-                aria-label="发送到模型服务的数据范围"
-              >
-                <strong>发送前确认范围</strong>
-                <p>目标：{providerDisclosure.target}</p>
-                <ul>
-                  {providerDisclosure.items.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-              </section>
               <div className="assistant-composer-submit">
                 <button disabled={!canSend} type="submit">
-                  {activeRun
-                    ? "另一个任务正在运行"
-                    : routesToApprovedProvider
-                      ? "前往脱敏批准"
-                      : "发送任务"}
+                  {activeRun ? "另一个任务正在运行" : "发送消息"}
                 </button>
                 {activeRun ? (
                   <button
@@ -1769,7 +1523,11 @@ export function AssistantWorkspace({
         onDraftDirtyChange={updateArtifactDraftDirty}
         onMutationActivityChange={setArtifactMutationActive}
         onProposalApplied={onCaseProposalApplied}
-        onRegenerateArtifact={regenerateArtifact}
+        onRegenerateArtifact={
+          onOpenProtectedArtifactRegeneration
+            ? openProtectedArtifactRegeneration
+            : undefined
+        }
         onSelectArtifact={selectArtifact}
         proposalApplyBlockedReason={proposalApplyBlockedReason}
       />

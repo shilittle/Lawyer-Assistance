@@ -3278,7 +3278,7 @@ mod tests {
     fn capabilities_expose_the_fixed_registry_and_default_budget() {
         let response = get_assistant_capabilities();
 
-        assert_eq!(response.capabilities.len(), 10);
+        assert_eq!(response.capabilities.len(), assistant::CAPABILITY_COUNT);
         assert_eq!(response.default_budget, RunBudget::default());
         assert!(response
             .capabilities
@@ -3783,6 +3783,43 @@ mod tests {
         .detail;
         assert_eq!(detail.messages.len(), 1);
         assert_eq!(detail.messages[0].attachments.len(), 2);
+    }
+
+    #[test]
+    fn assistant_attachment_import_never_registers_a_case_material() {
+        let (_directory, state) = initialized_state();
+        insert_project(&state, "case-chat-attachment");
+        let conversation = create_bound_conversation(&state, "case-chat-attachment");
+        let connection =
+            database::open_user_database(state.user_database_path()).expect("user database opens");
+        let before = database::get_case_workspace_rows(&connection, "case-chat-attachment")
+            .expect("case workspace reads")
+            .expect("case workspace exists")
+            .files
+            .len();
+        drop(connection);
+
+        let response = import_assistant_files_inner(
+            &state,
+            ImportAssistantFilesRequest {
+                conversation_id: conversation.conversation_id,
+            },
+            vec![SelectedFileBytes {
+                file_name: "ordinary-chat.txt".to_owned(),
+                bytes: b"explicit ordinary attachment".to_vec(),
+            }],
+        )
+        .expect("ordinary attachment imports");
+        assert_eq!(response.attachments.len(), 1);
+
+        let connection =
+            database::open_user_database(state.user_database_path()).expect("user database opens");
+        let after = database::get_case_workspace_rows(&connection, "case-chat-attachment")
+            .expect("case workspace reads")
+            .expect("case workspace exists")
+            .files
+            .len();
+        assert_eq!(after, before);
     }
 
     #[test]

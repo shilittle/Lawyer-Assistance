@@ -7,6 +7,7 @@ export type JsonValue =
   | { [key: string]: JsonValue };
 
 export type AssistantCapabilityName =
+  | "assistant.interactive_chat"
   | "legal.search"
   | "legal.read"
   | "file.import"
@@ -568,6 +569,19 @@ export interface StartAssistantRunRequest {
   regenerationTarget?: AssistantRegenerationTarget | null;
 }
 
+/**
+ * Closed ordinary-chat boundary. Case, approval, authority, classification,
+ * artifact and MCP fields are deliberately absent and cannot cross IPC.
+ */
+export interface StartInteractiveAssistantRunRequest {
+  runId: string;
+  conversationId: string;
+  providerId: string;
+  prompt: string;
+  attachmentIds: string[];
+  budget?: AssistantRunBudget | null;
+}
+
 export interface AssistantRegenerationTarget {
   artifactId: string;
   sourceVersionNumber: number;
@@ -630,6 +644,10 @@ export interface StartAssistantRunResponse {
   artifact: AssistantArtifact | null;
   proposal: AssistantCaseChangeProposal | null;
   citationReport: CitationValidationReport | null;
+}
+
+export interface StartInteractiveAssistantRunResponse {
+  run: AssistantRun;
 }
 
 export interface CreateAssistantCaseChangeProposalRequest {

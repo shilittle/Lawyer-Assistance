@@ -38,6 +38,8 @@ import type {
   RejectAssistantCaseChangeProposalRequest,
   SaveAssistantArtifactRequest,
   SaveAssistantArtifactResponse,
+  StartInteractiveAssistantRunRequest,
+  StartInteractiveAssistantRunResponse,
   StartAssistantRunRequest,
   StartAssistantRunResponse,
   AssistantRunEvent,
@@ -485,6 +487,35 @@ export function startAssistantRun(
   }
   const eventChannel = new Channel<AssistantRunEvent>(onEvent);
   return invokeAssistant("start_assistant_run", {
+    request: closedRequest,
+    onEvent: eventChannel,
+  });
+}
+
+export function startInteractiveAssistantRun(
+  request: StartInteractiveAssistantRunRequest,
+  onEvent: (event: AssistantRunEvent) => void,
+): Promise<StartInteractiveAssistantRunResponse> {
+  const closedRequest: StartInteractiveAssistantRunRequest = {
+    runId: request.runId,
+    conversationId: request.conversationId,
+    providerId: request.providerId,
+    prompt: request.prompt,
+    attachmentIds: copyStrings(request.attachmentIds),
+  };
+  if (request.budget !== undefined) {
+    closedRequest.budget = request.budget === null
+      ? null
+      : {
+          maxToolCalls: request.budget.maxToolCalls,
+          maxProviderRoundTrips: request.budget.maxProviderRoundTrips,
+          maxInputBodyBytes: request.budget.maxInputBodyBytes,
+          maxVisibleAttachments: request.budget.maxVisibleAttachments,
+          maxModelResponseBytes: request.budget.maxModelResponseBytes,
+        };
+  }
+  const eventChannel = new Channel<AssistantRunEvent>(onEvent);
+  return invokeAssistant("start_interactive_assistant_run", {
     request: closedRequest,
     onEvent: eventChannel,
   });

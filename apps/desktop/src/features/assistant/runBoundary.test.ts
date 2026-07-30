@@ -1,10 +1,70 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { cancelAssistantRun, startInteractiveAssistantRun } = vi.hoisted(() => ({
+  cancelAssistantRun: vi.fn(),
+  startInteractiveAssistantRun: vi.fn(),
+}));
+vi.mock("../../ipc/assistant/client", () => ({
+  cancelAssistantRun,
+  startInteractiveAssistantRun,
+}));
 
 import {
   advanceAssistantRunEventCursor,
   applyAssistantCancellationResult,
   assistantAttachmentPolicy,
+  defaultAssistantRunBoundary,
 } from "./runBoundary";
+
+describe("defaultAssistantRunBoundary", () => {
+  beforeEach(() => {
+    cancelAssistantRun.mockReset();
+    startInteractiveAssistantRun.mockReset();
+    startInteractiveAssistantRun.mockResolvedValue({
+      run: { runId: "run-1", status: "succeeded" },
+    });
+    cancelAssistantRun.mockResolvedValue({ runId: "run-1", cancelled: true });
+  });
+
+  it("delegates ordinary messages to the interactive client and preserves streaming", async () => {
+    const events: string[] = [];
+    const request = {
+      runId: "run-1",
+      conversationId: "conversation-1",
+      providerId: "provider-1",
+      prompt: "合同解除的一般条件是什么？",
+      attachmentIds: [],
+    };
+    startInteractiveAssistantRun.mockImplementationOnce(
+      async (_request, onEvent) => {
+        onEvent({
+          runId: "run-1",
+          sequence: 1,
+          eventType: "delta",
+          content: "第一段",
+        });
+        onEvent({
+          runId: "run-1",
+          sequence: 2,
+          eventType: "delta",
+          content: "第二段",
+        });
+        return { run: { runId: "run-1", status: "succeeded" } };
+      },
+    );
+
+    await defaultAssistantRunBoundary.start(request, (event) => {
+      if (event.eventType === "delta") events.push(event.content);
+    });
+
+    expect(startInteractiveAssistantRun).toHaveBeenCalledWith(
+      request,
+      expect.any(Function),
+    );
+    expect(events).toEqual(["第一段", "第二段"]);
+    await expect(defaultAssistantRunBoundary.cancel("run-1")).resolves.toBe(true);
+  });
+});
 
 describe("assistantAttachmentPolicy", () => {
   it.each([

@@ -1258,6 +1258,8 @@ impl PrivacyStore {
         event_id: &str,
         audit: &PrivacyEgressAuditRecord,
     ) -> Result<String, PrivacyStoreError> {
+        let persisted_classification =
+            classification(audit.classification).ok_or(PrivacyStoreError::InvalidInput)?;
         valid_id(event_id)?;
         valid_id(&audit.purpose)?;
         valid_hash(&audit.payload_sha256)?;
@@ -1306,7 +1308,7 @@ impl PrivacyStore {
                 params![
                     event_id,
                     occurred,
-                    classification(audit.classification),
+                    persisted_classification,
                     destination_kind(&audit.destination_kind),
                     &audit.destination_identifier_sha256,
                     &audit.purpose,
@@ -2673,14 +2675,15 @@ const fn destination_kind(value: &DestinationKind) -> &'static str {
     }
 }
 
-const fn classification(value: DataClassification) -> &'static str {
+const fn classification(value: DataClassification) -> Option<&'static str> {
     match value {
-        DataClassification::LegalPublic => "legal_public",
-        DataClassification::ProductPublic => "product_public",
-        DataClassification::CaseRaw => "case_raw",
-        DataClassification::CaseRedactedPending => "case_redacted_pending",
-        DataClassification::CaseRedactedApproved => "case_redacted_approved",
-        DataClassification::Secret => "secret",
+        DataClassification::LegalPublic => Some("legal_public"),
+        DataClassification::ProductPublic => Some("product_public"),
+        DataClassification::InteractiveUserProvided => None,
+        DataClassification::CaseRaw => Some("case_raw"),
+        DataClassification::CaseRedactedPending => Some("case_redacted_pending"),
+        DataClassification::CaseRedactedApproved => Some("case_redacted_approved"),
+        DataClassification::Secret => Some("secret"),
     }
 }
 
@@ -4318,6 +4321,41 @@ mod tests {
                 []
             )
             .is_err());
+    }
+
+    #[test]
+    fn interactive_audit_is_not_persisted_into_the_v5_classification_schema() {
+        let mut connection = setup();
+        let audit = PrivacyEgressAuditRecord {
+            occurred_at_unix: 100,
+            classification: DataClassification::InteractiveUserProvided,
+            destination_kind: DestinationKind::ExternalProvider,
+            destination_identifier_sha256: hash(b"provider"),
+            purpose: "assistant_interactive_chat".to_owned(),
+            payload_sha256: hash(b"user-provided-content"),
+            payload_bytes: 21,
+            policy_id: "cn-legal-default".to_owned(),
+            policy_version: 1,
+            detector_version: REDACTION_VERSION.to_owned(),
+            receipt_id: None,
+            residual_counts: BTreeMap::from([("phone_number".to_owned(), 1)]),
+            allowed: true,
+            reason_code: "allowed".to_owned(),
+        };
+
+        assert_eq!(
+            PrivacyStore::append_egress_audit(&mut connection, "interactive-event", &audit),
+            Err(PrivacyStoreError::InvalidInput)
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM privacy_egress_audit", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .expect("audit row count"),
+            0
+        );
+        assert_eq!(PRIVACY_STORE_SCHEMA_VERSION, 5);
     }
 
     #[cfg(windows)]

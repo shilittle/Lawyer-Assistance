@@ -35,6 +35,7 @@ import {
   rejectAssistantCaseChangeProposal,
   saveAssistantArtifact,
   startAssistantRun,
+  startInteractiveAssistantRun,
 } from "./client";
 import type {
   CaseChangeSpec,
@@ -448,6 +449,91 @@ describe("assistant typed IPC client", () => {
     expect(payload).not.toContain("arbitrary-command");
     expect(payload).not.toContain("hiddenBudgetField");
     expect(payload).not.toContain("hiddenTargetField");
+  });
+
+  it("starts ordinary chat through the minimal interactive command only", async () => {
+    const received: string[] = [];
+    const promise = startInteractiveAssistantRun(
+      {
+        runId: "assistant-run-interactive",
+        conversationId: "conversation-1",
+        providerId: "provider-1",
+        prompt: "合同解除的一般条件是什么？",
+        attachmentIds: ["attachment-1"],
+        budget: {
+          maxToolCalls: 1,
+          maxProviderRoundTrips: 1,
+          maxInputBodyBytes: 4096,
+          maxVisibleAttachments: 1,
+          maxModelResponseBytes: 8192,
+          hiddenBudgetField: "must-not-cross",
+        },
+        intent: "case_analysis",
+        projectId: "case-must-not-cross",
+        privacyCaseId: "case_00000000000000000000000000000000",
+        generationIds: ["generation-must-not-cross"],
+        receipt: "receipt-must-not-cross",
+        authority: "approved_case",
+        classification: "case_raw",
+        regenerationTarget: { artifactId: "artifact-must-not-cross" },
+        mcpProfileId: "mcp-must-not-cross",
+      } as never,
+      (event) => received.push(event.eventType),
+    );
+    const invocation = invoke.mock.calls[0][1] as {
+      onEvent: {
+        onmessage: (event: {
+          runId: string;
+          sequence: number;
+          eventType: "delta";
+          content: string;
+        }) => void;
+      };
+    };
+    invocation.onEvent.onmessage({
+      runId: "assistant-run-interactive",
+      sequence: 1,
+      eventType: "delta",
+      content: "partial",
+    });
+    await promise;
+
+    expect(invoke).toHaveBeenCalledWith(
+      "start_interactive_assistant_run",
+      {
+        request: {
+          runId: "assistant-run-interactive",
+          conversationId: "conversation-1",
+          providerId: "provider-1",
+          prompt: "合同解除的一般条件是什么？",
+          attachmentIds: ["attachment-1"],
+          budget: {
+            maxToolCalls: 1,
+            maxProviderRoundTrips: 1,
+            maxInputBodyBytes: 4096,
+            maxVisibleAttachments: 1,
+            maxModelResponseBytes: 8192,
+          },
+        },
+        onEvent: invocation.onEvent,
+      },
+    );
+    expect(received).toEqual(["delta"]);
+    const payload = JSON.stringify(invoke.mock.calls[0]);
+    for (const forbidden of [
+      "intent",
+      "projectId",
+      "privacyCaseId",
+      "generationIds",
+      "receipt",
+      "authority",
+      "classification",
+      "regenerationTarget",
+      "mcpProfileId",
+      "hiddenBudgetField",
+    ]) {
+      expect(payload).not.toContain(forbidden);
+    }
   });
 
   it("creates a closed pending case-change proposal without an apply flag", async () => {

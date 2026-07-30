@@ -7,7 +7,7 @@ pub const MAX_INPUT_BODY_BYTES_PER_RUN: usize = 2 * 1024 * 1024;
 pub const MAX_MODEL_VISIBLE_ATTACHMENTS_PER_RUN: usize = 2;
 pub const MAX_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
-pub const CAPABILITY_COUNT: usize = 10;
+pub const CAPABILITY_COUNT: usize = 11;
 pub const MAX_CAPABILITY_VERSION_BYTES: usize = 16;
 pub const MAX_AUDIT_FIELDS_PER_CAPABILITY: usize = 16;
 pub const MAX_ALLOWED_ERRORS_PER_CAPABILITY: usize = 12;
@@ -34,6 +34,8 @@ pub enum CapabilityName {
     DocumentRender,
     #[serde(rename = "map.build")]
     MapBuild,
+    #[serde(rename = "assistant.interactive_chat")]
+    AssistantInteractiveChat,
 }
 
 impl CapabilityName {
@@ -49,6 +51,7 @@ impl CapabilityName {
             Self::DocumentDraft => "document.draft",
             Self::DocumentRender => "document.render",
             Self::MapBuild => "map.build",
+            Self::AssistantInteractiveChat => "assistant.interactive_chat",
         }
     }
 }
@@ -82,10 +85,12 @@ pub enum AuditField {
     RequestId,
     RunId,
     Capability,
+    Classification,
     InputIds,
     InputHashes,
     InputCounts,
     OutputIds,
+    OutputHashes,
     OutputCounts,
     SourceRefs,
     ProviderSnapshot,
@@ -181,6 +186,16 @@ const APPLY_ERRORS: &[CapabilityErrorType] = &[
     CapabilityErrorType::ConfirmationRequired,
     CapabilityErrorType::Internal,
 ];
+const INTERACTIVE_CHAT_ERRORS: &[CapabilityErrorType] = &[
+    CapabilityErrorType::InvalidInput,
+    CapabilityErrorType::NotFound,
+    CapabilityErrorType::PermissionDenied,
+    CapabilityErrorType::LimitExceeded,
+    CapabilityErrorType::Cancelled,
+    CapabilityErrorType::Conflict,
+    CapabilityErrorType::ProviderFailure,
+    CapabilityErrorType::Internal,
+];
 
 const READ_AUDIT: &[AuditField] = &[
     AuditField::RequestId,
@@ -232,6 +247,22 @@ const APPLY_AUDIT: &[AuditField] = &[
     AuditField::OutputCounts,
     AuditField::SourceRefs,
     AuditField::Confirmation,
+    AuditField::Status,
+    AuditField::Timing,
+    AuditField::ErrorType,
+];
+const INTERACTIVE_CHAT_AUDIT: &[AuditField] = &[
+    AuditField::RequestId,
+    AuditField::RunId,
+    AuditField::Capability,
+    AuditField::Classification,
+    AuditField::InputIds,
+    AuditField::InputHashes,
+    AuditField::InputCounts,
+    AuditField::OutputIds,
+    AuditField::OutputHashes,
+    AuditField::OutputCounts,
+    AuditField::ProviderSnapshot,
     AuditField::Status,
     AuditField::Timing,
     AuditField::ErrorType,
@@ -326,6 +357,14 @@ pub static CAPABILITY_REGISTRY: [CapabilityDescriptor; CAPABILITY_COUNT] = [
         limits(1, MAX_MODEL_RESPONSE_BYTES, MAX_MODEL_RESPONSE_BYTES),
         COMMON_ERRORS,
         MODEL_AUDIT,
+    ),
+    descriptor(
+        CapabilityName::AssistantInteractiveChat,
+        READ_ONLY,
+        false,
+        limits(1, MAX_INPUT_BODY_BYTES_PER_RUN, MAX_MODEL_RESPONSE_BYTES),
+        INTERACTIVE_CHAT_ERRORS,
+        INTERACTIVE_CHAT_AUDIT,
     ),
 ];
 

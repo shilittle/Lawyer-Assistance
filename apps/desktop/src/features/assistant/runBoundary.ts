@@ -1,25 +1,25 @@
 import {
   cancelAssistantRun,
-  startAssistantRun,
+  startInteractiveAssistantRun,
 } from "../../ipc/assistant/client";
 import type {
   AssistantRunEvent,
   AssistantRunIntent,
-  StartAssistantRunRequest,
-  StartAssistantRunResponse,
+  StartInteractiveAssistantRunRequest,
+  StartInteractiveAssistantRunResponse,
 } from "../../ipc/assistant/types";
 
 export type {
   AssistantRunIntent,
-  StartAssistantRunRequest,
-  StartAssistantRunResponse,
+  StartInteractiveAssistantRunRequest,
+  StartInteractiveAssistantRunResponse,
 };
 
 export interface AssistantRunBoundary {
   start(
-    request: StartAssistantRunRequest,
+    request: StartInteractiveAssistantRunRequest,
     onEvent: (event: AssistantRunEvent) => void,
-  ): Promise<StartAssistantRunResponse>;
+  ): Promise<StartInteractiveAssistantRunResponse>;
   cancel(runId: string): Promise<boolean>;
 }
 
@@ -91,7 +91,7 @@ export function assistantAttachmentPolicy(
 
 /** Keeps the component testable and prevents run-command details spreading. */
 export const defaultAssistantRunBoundary: AssistantRunBoundary = {
-  start: startAssistantRun,
+  start: startInteractiveAssistantRun,
 
   async cancel(runId) {
     const response = await cancelAssistantRun({ runId });

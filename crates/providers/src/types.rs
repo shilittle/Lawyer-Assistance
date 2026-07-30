@@ -186,6 +186,7 @@ pub(crate) enum ChatRequestAuthority {
     ConnectionProbe,
     LegalPublic,
     ProductPublic,
+    InteractiveUserContent,
     ApprovedCase,
 }
 
@@ -231,6 +232,26 @@ impl ChatRequest {
             max_tokens,
             ChatRequestAuthority::ProductPublic,
         )
+    }
+
+    /// Constructs an ordinary interactive-chat request from content the user
+    /// explicitly chose to send to the configured Provider. The authority is
+    /// closed inside this crate so callers cannot self-assign another privacy
+    /// classification.
+    #[must_use]
+    pub fn interactive_user_content(
+        messages: Vec<ChatMessage>,
+        stream: bool,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            messages,
+            stream,
+            temperature,
+            max_tokens,
+            authority: ChatRequestAuthority::InteractiveUserContent,
+        }
     }
 
     /// Constructs a case request that can only exercise the fail-closed
@@ -317,6 +338,9 @@ impl ChatRequest {
                 privacy::DataClassification::ProductPublic
             }
             ChatRequestAuthority::LegalPublic => privacy::DataClassification::LegalPublic,
+            ChatRequestAuthority::InteractiveUserContent => {
+                privacy::DataClassification::InteractiveUserProvided
+            }
             ChatRequestAuthority::ApprovedCase => privacy::DataClassification::CaseRedactedApproved,
         }
     }
@@ -637,6 +661,31 @@ mod tests {
             request.data_classification(),
             privacy::DataClassification::CaseRedactedApproved
         );
+    }
+
+    #[test]
+    fn interactive_constructor_assigns_the_closed_authority_and_exact_classification() {
+        let request = ChatRequest::interactive_user_content(
+            vec![ChatMessage {
+                role: ChatMessageRole::User,
+                content: "Call me at 13800138000".to_owned(),
+            }],
+            true,
+            Some(0.2),
+            Some(128),
+        );
+
+        assert_eq!(
+            request.authority,
+            ChatRequestAuthority::InteractiveUserContent
+        );
+        assert_eq!(
+            request.data_classification(),
+            privacy::DataClassification::InteractiveUserProvided
+        );
+        let wire = serde_json::to_value(&request).expect("request serializes");
+        assert!(wire.get("authority").is_none());
+        assert_eq!(wire["stream"], true);
     }
 
     #[test]
