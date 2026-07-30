@@ -224,6 +224,30 @@ raw_local
 
 现有 `PrivacyReview.caseId`、`materialId`、Vault object 字段应迁移进入这一统一模型，不另建第三套平行材料系统。
 
+### 5.1 身份绑定决策（2026-07-30）
+
+本计划采用
+[`ADR-0001：ProjectId 与 PrivacyCaseId 的持久化一对一绑定`](../adr/0001-project-privacy-case-binding.md)。
+这是对 Phase 1 已识别身份冲突的授权消解，不改变本计划的其他目标和阶段边界。
+
+* `ProjectId` 保留现有 `case-...` 形式，继续作为应用案件、材料归属和前端工作流
+  的主身份；不得迁移或重写 `projects.project_id` 及其引用。
+* `PrivacyCaseId` 保留 `case_` 加 32 位小写十六进制的冻结格式，继续作为 Privacy、
+  Vault、签名、approved workspace 和 MCP 隐私边界的身份；不得放宽校验。
+* 两者禁止依赖字符串相等、字符串替换、哈希截断或可预测计数器关联。唯一受支持
+  的关联是隐私库中审计型、持久化、一对一且默认不可变的绑定。
+* 所有以项目为入口的 Privacy/Vault 操作必须在可信后端边界解析绑定，再把严格的
+  `PrivacyCaseId` 传入 Vault；前端不得生成、缓存为权威值或猜测
+  `PrivacyCaseId`。
+* 生命周期校验必须验证
+  `binding(ProjectId).privacyCaseId == Vault PrivacyCaseId`，不得继续验证
+  `ProjectId == PrivacyCaseId`。
+* 历史 Privacy/Vault 数据保留原 `PrivacyCaseId`。只有可信元数据能够无歧义恢复
+  关系时才建立绑定；其余记录 fail closed 并进入迁移冲突报告，不得猜测、覆盖或
+  静默重绑。
+* 绑定迁移只读 `user.sqlite`，只在 Privacy 可写库中写入绑定、审计和迁移结果；
+  必须幂等、可恢复、并发安全，且回滚不得修改或删除既有 Vault 数据。
+
 ## 6. 前端目录重构
 
 目标目录：
@@ -395,7 +419,8 @@ Tauri commands 只做 typed IPC 转换。
 ### Phase 3：材料与脱敏迁移
 
 * 将 Privacy Review Workbench 改造成 case-scoped Redaction Workbench。
-* 调用 `preparePrivacyMaterial` 时强制传入当前 project/case ID。
+* 调用 `preparePrivacyMaterial` 时强制传入当前 `ProjectId`；可信后端通过
+  ADR-0001 绑定解析或事务性初始化对应 `PrivacyCaseId`，再进入 Privacy/Vault。
 * 按案件列出材料、review 和 generation。
 * 建立 CaseMaterial 与 RedactionGeneration 绑定。
 * 把 OCR 运行环境配置留在设置。
