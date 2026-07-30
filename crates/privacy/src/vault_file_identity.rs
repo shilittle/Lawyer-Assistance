@@ -71,7 +71,7 @@ pub fn fixed_local_file_identity(file: &File) -> Result<Vec<u8>, VaultStoreError
         let mut identity = Vec::with_capacity(16);
         identity.extend_from_slice(&metadata.dev().to_le_bytes());
         identity.extend_from_slice(&metadata.ino().to_le_bytes());
-        return Ok(identity);
+        Ok(identity)
     }
     #[cfg(not(unix))]
     Err(VaultStoreError::PlatformUnavailable)

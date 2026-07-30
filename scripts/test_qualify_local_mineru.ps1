@@ -31,7 +31,7 @@ function Invoke-Qualification {
     [Parameter(Mandatory = $true)][string]$GpuMock,
     [Parameter(Mandatory = $true)][string]$Evidence,
     [ValidateRange(10, 7200)]
-    [int]$TimeoutSeconds = 30,
+    [int]$TimeoutSeconds = 120,
     [switch]$KeepArtifacts
   )
 

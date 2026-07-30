@@ -1667,7 +1667,7 @@ impl WireReplayGuard {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     #[allow(clippy::too_many_arguments)]
     fn reserve_with_fault(
         &mut self,
