@@ -190,13 +190,16 @@ class ProductionMineruBuilderTests(unittest.TestCase):
             "pointerBits": 64,
             "maxsize": 9223372036854775807,
         }
+        canonical_python_home = self.repo_builder.validate_local_path(
+            self.python_home, directory=True
+        )
 
         def completed(command, **options):
             environment = options["env"]
             self.assertEqual(
                 command,
                 [
-                    str(self.python_home / "python.exe"),
+                    str(canonical_python_home / "python.exe"),
                     "-I",
                     "-S",
                     "-c",
@@ -222,7 +225,7 @@ class ProductionMineruBuilderTests(unittest.TestCase):
                     "ALL_PROXY",
                 },
             )
-            self.assertEqual(environment["PATH"], str(self.python_home))
+            self.assertEqual(environment["PATH"], str(canonical_python_home))
             self.assertTrue(options["check"])
             self.assertTrue(options["capture_output"])
             self.assertEqual(options["timeout"], 30)
@@ -500,7 +503,13 @@ class ProductionMineruBuilderTests(unittest.TestCase):
         runtime = json.loads((output / "runtime-manifest.json").read_bytes())
         normalized = str(output / "worker/mineru-worker.exe").replace("/", "\\").lower()
         self.assertEqual(runtime["executables"][0]["pathSha256"], builder.sha256_bytes(normalized.encode()))
-        self.assertIn(str(self.python_home / "Lib"), (output / "worker/mineru-worker._pth").read_text())
+        canonical_python_home = builder.validate_local_path(
+            self.python_home, directory=True
+        )
+        self.assertIn(
+            str(canonical_python_home / "Lib"),
+            (output / "worker/mineru-worker._pth").read_text(),
+        )
 
     def test_output_is_create_new_and_failed_stage_is_cleaned(self) -> None:
         self.build_stage("existing")
