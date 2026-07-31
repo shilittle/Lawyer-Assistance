@@ -24,6 +24,11 @@ describe("Phase 1 current application workflow characterization", () => {
     );
     expect(assistantWorkspaceSource).not.toContain("onOpenApprovedProvider");
     expect(assistantWorkspaceSource).not.toContain("前往脱敏批准");
+    expect(assistantWorkspaceSource).not.toContain("caseHandoff");
+    expect(assistantWorkspaceSource).not.toContain("handledCaseHandoff");
+    expect(assistantWorkspaceSource).not.toContain(
+      "latestCaseHandoffRequest",
+    );
     expect(assistantWorkspaceSource).toMatch(
       /<form className="assistant-composer"[\s\S]*?<ProviderEgressNotice/u,
     );

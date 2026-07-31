@@ -69,7 +69,6 @@ export interface AssistantProjectContext {
 
 export interface AssistantWorkspaceProps {
   activeProject: AssistantProjectContext | null;
-  caseHandoff?: (AssistantProjectContext & { requestId: number }) | null;
   externalRefreshKey?: number;
   providerProfiles?: readonly ProviderProfile[];
   onConversationChange?: (conversation: AssistantConversation | null) => void;
@@ -405,7 +404,6 @@ function LiveRunProgress({ run }: { run: ActiveAssistantRun }) {
 
 export function AssistantWorkspace({
   activeProject,
-  caseHandoff = null,
   externalRefreshKey = 0,
   providerProfiles,
   onConversationChange,
@@ -448,14 +446,11 @@ export function AssistantWorkspace({
   const [artifactMutationActive, setArtifactMutationActive] = useState(false);
   const detailEpoch = useRef(0);
   const runEpoch = useRef(0);
-  const handledCaseHandoff = useRef<number | null>(null);
-  const latestCaseHandoffRequest = useRef<number | null>(null);
   const lastExternalRefreshKey = useRef(externalRefreshKey);
   const selectedConversationRef = useRef<string | null>(null);
   const selectedArtifactIdRef = useRef<string | null>(selectedArtifactId);
   const artifactDraftDirtyRef = useRef(false);
   const mounted = useRef(true);
-  latestCaseHandoffRequest.current = caseHandoff?.requestId ?? null;
   selectedArtifactIdRef.current = selectedArtifactId;
 
   const updateArtifactDraftDirty = useCallback((dirty: boolean) => {
@@ -671,80 +666,6 @@ export function AssistantWorkspace({
     refreshConversation();
   }, [externalRefreshKey, refreshConversation]);
 
-  useEffect(() => {
-    if (
-      !caseHandoff ||
-      !conversationListLoaded ||
-      operation !== null ||
-      handledCaseHandoff.current === caseHandoff.requestId
-    ) {
-      return;
-    }
-    handledCaseHandoff.current = caseHandoff.requestId;
-    const existing = state.conversations.find(
-      (conversation) => conversation.projectId === caseHandoff.projectId,
-    );
-    if (existing) {
-      if (!loadConversation(existing.conversationId)) {
-        setNotice({
-          conversationId: selectedConversationRef.current,
-          kind: "status",
-          text: `已取消打开案件“${publicTitle(caseHandoff.title, "当前案件")}”的助理会话；未保存的成果编辑仍保留。`,
-        });
-        return;
-      }
-      setNotice({
-        conversationId: existing.conversationId,
-        kind: "status",
-        text: `已打开案件“${publicTitle(caseHandoff.title, "当前案件")}”的助理会话。`,
-      });
-      return;
-    }
-
-    setOperation("create");
-    setNotice(null);
-    void createAssistantConversation({
-      title: truncateUtf8(`${publicTitle(caseHandoff.title, "当前案件")} · 助理`, 256),
-      projectId: caseHandoff.projectId,
-    })
-      .then((response) => {
-        if (!mounted.current) return;
-        dispatch({ type: "upsert_conversation", conversation: response.conversation });
-        if (latestCaseHandoffRequest.current !== caseHandoff.requestId) return;
-        if (!loadConversation(response.conversation.conversationId)) {
-          setNotice({
-            conversationId: selectedConversationRef.current,
-            kind: "status",
-            text: `已为案件“${publicTitle(caseHandoff.title, "当前案件")}”创建助理会话；因保留未保存的成果编辑，仍停留在当前会话。`,
-          });
-          return;
-        }
-        setNotice({
-          conversationId: response.conversation.conversationId,
-          kind: "status",
-          text: `已创建并绑定案件“${publicTitle(caseHandoff.title, "当前案件")}”的助理会话。`,
-        });
-      })
-      .catch((error: unknown) => {
-        if (!mounted.current) return;
-        setNotice({
-          conversationId: null,
-          kind: "error",
-          text: `打开案件助理会话失败：${displayError(error)}`,
-        });
-      })
-      .finally(() => {
-        if (mounted.current) {
-          setOperation((current) => (current === "create" ? null : current));
-        }
-      });
-  }, [
-    caseHandoff,
-    conversationListLoaded,
-    loadConversation,
-    operation,
-    state.conversations,
-  ]);
   const attachments = useMemo(
     () => (detail ? uniqueAttachments(detail) : []),
     [detail],
