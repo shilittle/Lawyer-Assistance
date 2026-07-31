@@ -178,11 +178,18 @@ describe("Phase 7 ordinary Assistant and explicit-attachment acceptance", () => 
       expect(requestWire).not.toContain(forbidden);
     }
 
+    const performRunStart = assistantWorkspaceSource.indexOf(
+      "async function performRun(",
+    );
+    const performRunEnd = assistantWorkspaceSource.indexOf(
+      "async function startRun(",
+      performRunStart,
+    );
+    expect(performRunStart).toBeGreaterThanOrEqual(0);
+    expect(performRunEnd).toBeGreaterThan(performRunStart);
     const ordinaryRunSource = assistantWorkspaceSource.slice(
-      assistantWorkspaceSource.indexOf("async function performRun("),
-      assistantWorkspaceSource.indexOf(
-        "async function openProtectedArtifactRegeneration(",
-      ),
+      performRunStart,
+      performRunEnd,
     );
     expect(ordinaryRunSource).toContain("runBoundary.start({");
     expect(ordinaryRunSource).not.toMatch(

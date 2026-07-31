@@ -15,6 +15,9 @@ describe("Phase 1 current application workflow characterization", () => {
     expect(assistantClientSource).toContain(
       'invokeAssistant("start_interactive_assistant_run"',
     );
+    expect(assistantClientSource).not.toContain(
+      'invokeAssistant("start_assistant_run"',
+    );
     expect(assistantWorkspaceSource).toContain("<ProviderEgressNotice");
     expect(providerEgressNoticeSource).toContain(
       "INTERACTIVE_PROVIDER_EGRESS_WARNING",

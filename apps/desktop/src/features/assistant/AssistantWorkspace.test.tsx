@@ -9,9 +9,7 @@ import {
   archiveConversationWithDraftConfirmation,
   assistantWorkspaceHasUnsavedDrafts,
   attachmentDeletionFailureText,
-  buildArtifactRegenerationConfirmation,
   confirmArtifactDraftDiscard,
-  confirmArtifactRegeneration,
   deleteAttachmentWithConfirmation,
 } from "./AssistantWorkspace";
 import {
@@ -214,28 +212,6 @@ describe("AssistantWorkspace provider and regeneration disclosure", () => {
     expect(text).not.toContain("已确认案件数据");
     expect(text).not.toContain("model-1");
     expect(text).not.toContain("https://api.example.test");
-  });
-
-  it("makes regeneration confirmation cancellation explicit and append-only", () => {
-    const options = {
-      artifactTitle: "付款风险分析",
-      sourceVersionNumber: 3,
-      provider: PROVIDER,
-    };
-    const message = buildArtifactRegenerationConfirmation(options);
-    expect(message).toContain("模型服务“本地配置”");
-    expect(message).toContain("当前会话的必要摘要");
-    expect(message).not.toContain("model-1");
-    expect(message).not.toContain("https://api.example.test");
-    expect(message).toContain("留存及是否用于训练");
-    expect(message).toContain("只追加新版本，不覆盖或删除旧版");
-
-    const cancel = vi.fn(() => false);
-    const accept = vi.fn(() => true);
-    expect(confirmArtifactRegeneration(options, cancel)).toBe(false);
-    expect(confirmArtifactRegeneration(options, accept)).toBe(true);
-    expect(cancel).toHaveBeenCalledWith(message);
-    expect(accept).toHaveBeenCalledWith(message);
   });
 
   it("labels streaming text as an unvalidated and unsaved draft", () => {

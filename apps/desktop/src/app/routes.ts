@@ -20,8 +20,8 @@ export const LEGAL_LIBRARY_ROUTE_PAGES = ["library"] as const;
 export type LegalLibraryRoutePage =
   (typeof LEGAL_LIBRARY_ROUTE_PAGES)[number];
 
-// Phase 2 keeps the existing settings destinations. Responsibility and label
-// changes for local processing and automation belong to the later phases.
+// Settings exposes only the four product owners fixed by the completed
+// information-architecture cutover.
 export const SETTINGS_ROUTE_PAGES = [
   "providers",
   "local-processing",

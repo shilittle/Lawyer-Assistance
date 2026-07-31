@@ -210,22 +210,6 @@ export function attachmentDeletionFailureText(error: unknown): string {
   return `附件删除失败：${displayError(error)}`;
 }
 
-export function buildArtifactRegenerationConfirmation(options: {
-  artifactTitle: string;
-  sourceVersionNumber: number;
-  provider: Pick<ProviderProfile, "displayName">;
-}): string {
-  const { artifactTitle, sourceVersionNumber, provider } = options;
-  return `将把“${artifactTitle}”第 ${sourceVersionNumber} 版的正文、当前会话的必要摘要以及该任务依法需要的材料发送到模型服务“${provider.displayName}”。这些内容会离开本机；留存及是否用于训练由该服务条款决定。成功后只追加新版本，不覆盖或删除旧版。继续吗？`;
-}
-
-export function confirmArtifactRegeneration(
-  options: Parameters<typeof buildArtifactRegenerationConfirmation>[0],
-  confirmAction: ConfirmationAction = (message) => window.confirm(message),
-): boolean {
-  return confirmAction(buildArtifactRegenerationConfirmation(options));
-}
-
 function displayError(error: unknown): string {
   return publicErrorMessage(error);
 }
