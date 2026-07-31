@@ -538,7 +538,7 @@ fn every_non_prior_task_completes_real_loopback_dispatch_persistence_and_readbac
         dispatched.push((*task, result));
     }
 
-    let requests = server.join().expect("loopback server exits");
+    let requests = server.finish();
     assert_eq!(requests.len(), tasks.len());
     assert!(requests.iter().all(|request| {
         let wire = String::from_utf8_lossy(request);
@@ -622,7 +622,7 @@ fn regenerate_and_repair_complete_real_loopback_with_protected_prior_readback() 
         dispatched.push((task, result));
     }
 
-    let requests = server.join().expect("loopback server exits");
+    let requests = server.finish();
     assert_eq!(requests.len(), 3);
     assert!(requests
         .iter()
@@ -796,7 +796,7 @@ fn full_app_reqwest_loopback_sends_once_restores_backend_state_and_persists_outp
             dispatch_request(&fixture),
         )
         .expect("approved Provider dispatch succeeds");
-    let requests = server.join().expect("loopback server exits");
+    let requests = server.finish();
 
     assert_eq!(requests.len(), 1);
     let wire = String::from_utf8_lossy(&requests[0]);
@@ -1264,21 +1264,63 @@ fn qualification_revoke_cannot_race_the_final_transport_lease() {
     assert!(blocked.request_bodies().is_empty());
 }
 
+struct TestProviderServer {
+    shutdown: mpsc::Sender<()>,
+    server_thread: Option<thread::JoinHandle<Vec<Vec<u8>>>>,
+}
+
+impl TestProviderServer {
+    fn finish(mut self) -> Vec<Vec<u8>> {
+        let _ = self.shutdown.send(());
+        self.server_thread
+            .take()
+            .expect("test Provider server thread is owned")
+            .join()
+            .expect("test Provider server exits")
+    }
+}
+
+impl Drop for TestProviderServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(server_thread) = self.server_thread.take() {
+            if server_thread.join().is_err() {
+                if thread::panicking() {
+                    eprintln!("test Provider server thread terminated unexpectedly");
+                } else {
+                    panic!("test Provider server thread terminated unexpectedly");
+                }
+            }
+        }
+    }
+}
+
 fn spawn_test_server(
     listener: TcpListener,
     content: &'static str,
     model: &'static str,
     expected_requests: usize,
-) -> thread::JoinHandle<Vec<Vec<u8>>> {
+) -> TestProviderServer {
     listener
         .set_nonblocking(true)
         .expect("nonblocking listener");
-    thread::spawn(move || {
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    let (shutdown, shutdown_receiver) = mpsc::channel();
+    let server_thread = thread::spawn(move || {
         let mut requests = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while requests.len() < expected_requests && Instant::now() < deadline {
+        if ready_sender.send(()).is_err() {
+            return requests;
+        }
+        while requests.len() < expected_requests {
+            match shutdown_receiver.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("test Provider connection becomes blocking");
                     requests.push(read_http_request(&mut stream));
                     let body = json!({
                         "model": model,
@@ -1292,6 +1334,9 @@ fn spawn_test_server(
                     stream.write_all(headers.as_bytes()).unwrap();
                     stream.write_all(body.as_bytes()).unwrap();
                     stream.flush().unwrap();
+                    stream.shutdown(std::net::Shutdown::Write).unwrap();
+                    let mut peer_close = [0_u8; 1];
+                    let _ = stream.read(&mut peer_close);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -1300,5 +1345,13 @@ fn spawn_test_server(
             }
         }
         requests
-    })
+    });
+    let server = TestProviderServer {
+        shutdown,
+        server_thread: Some(server_thread),
+    };
+    ready_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("test Provider server becomes ready");
+    server
 }
