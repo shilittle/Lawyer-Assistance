@@ -13,7 +13,10 @@
 - Provider 请求、模型适配和凭据访问放在 `crates/providers`。
 - 引用解析、校验和来源映射放在 `crates/citations`。
 - 助理能力契约、结构化 Artifact 校验与纯渲染放在 `crates/assistant`。
+- 闭合图示 schema、固定模板和确定性渲染放在 `crates/diagrams`。
 - 本地文件格式检测、限额和确定性提取放在 `crates/file-ingest`。
+- 本地 OCR/材料处理、worker 协议、进程树与隔离编排放在 `crates/material-processing`。
+- Privacy store、项目/隐私身份绑定、Vault、批准投影、出站分类、生命周期和备份契约放在 `crates/privacy`。
 - UI 与协议无关的应用编排、写入审计和文件边界放在 `crates/legal-services`。
 - MCP schema、stdio/Streamable HTTP 传输和 CLI 适配放在 `crates/legal-mcp`。
 - Tauri 不得启动 sidecar；桌面设置页只可在用户手动启动或显式保存自动启动后，
@@ -32,10 +35,13 @@
 |   +-- assistant/
 |   +-- citations/
 |   +-- database/
+|   +-- diagrams/
 |   +-- domain/
 |   +-- file-ingest/
 |   +-- legal-mcp/
 |   +-- legal-services/
+|   +-- material-processing/
+|   +-- privacy/
 |   +-- providers/
 |   +-- retrieval/
 +-- integrations/
@@ -87,16 +93,35 @@
 ```text
 apps/desktop/src/
 +-- app/
+|   +-- AppErrorBoundary.tsx
+|   +-- AppRouter.tsx
 |   +-- AppShell.tsx
+|   +-- navigationGuards.ts
+|   +-- routes.ts
 |   +-- views.ts
 +-- features/
 |   +-- assistant/
 |   +-- artifacts/
 |   +-- cases/
 |   +-- legal-library/
+|   +-- privacy/
 |   +-- settings/
+|       +-- automation/
+|       +-- local-processing/
+|       +-- maintenance/
+|       +-- providers/
 +-- ipc/
 |   +-- assistant/
+|   +-- case/
+|   +-- case-assistant/
+|   +-- document/
+|   +-- graph/
+|   +-- health/
+|   +-- legal/
+|   +-- mcp/
+|   +-- privacy/
+|   +-- provider/
+|   +-- release/
 +-- App.tsx
 +-- main.tsx
 +-- styles.css
@@ -104,10 +129,16 @@ apps/desktop/src/
 
 放置规则：
 
-- `app/`：仅放顶层产品导航、标题和产品区映射；当前顶层固定为助理、案件工作台 β、法律库、设置与维护。
-- `features/assistant/`：conversation-first 三栏工作区、运行边界、附件和受控 Provider 外发提示。
+- `app/`：仅放 typed route、顶层产品导航、标题、错误边界、导航/关窗保护和 workspace slot 映射；当前顶层固定为助理、案件工作台、法律库、设置。
+- `features/assistant/`：conversation-first 普通聊天工作区、显式普通附件和持续 Provider 外发提示。它只调用 `start_interactive_assistant_run`，不得读取案件、Privacy、Vault 或 MCP 状态。
 - `features/artifacts/`：Research/Document/Map Artifact 预览、版本编辑、导出、案件绑定及 proposal 审阅。
-- `features/cases|legal-library|settings/`：渐进式产品域边界；业务状态迁出 `App.tsx` 时按域进入对应目录，不能再创建平级顶层入口。
+- `features/cases/`：案件工作台的概览、材料与脱敏、案件工作、成果，以及只使用 approved-only 投影的案件助理。案件助理只调用 `start_case_assistant_run`。
+- `features/privacy/`：保留案件材料和维护页面共享的 review、risk、lifecycle 与样式模块；它不再拥有顶层 `PrivacyWorkspace` 或 `settings:privacy` 产品路由。
+- `features/settings/providers/`：Provider profile 和凭据设置。
+- `features/settings/local-processing/`：Privacy/OCR 配置、MinerU 组件管理和资格控制的唯一设置 owner；typed route 为 `settings:local-processing`。
+- `features/settings/automation/`：本地 MCP、自动化出站批准和 Approved MCP 的唯一设置 owner；三类 activity 独立聚合。
+- `features/settings/maintenance/`：应用更新/诊断与 Privacy 生命周期、映射、清理和五组件备份/恢复的高级维护 owner。
+- `features/legal-library/`：本地法律检索和兼容引用问答；不得把旧 Provider redirect 恢复为普通聊天或案件工作的 fallback。
 - `ipc/<group>/`：Tauri command 的 TypeScript 类型和 typed client。
 - UI 状态可放在 feature 邻近 hooks/state 模块；持久化业务状态只由 Rust 和 SQLite 管理。
 - 共享前端视图类型必须来自 typed IPC 契约或与其严格镜像。
@@ -282,7 +313,38 @@ Command 规则：
 
 - crate 只接收安全 basename 与 bytes，不接收任意本地路径。
 - 不记录正文或 parser 内部细节；稳定错误不得回显敏感文件内容。
-- OCR、扫描件识别、旧 `.doc` 和批量压缩包不在本阶段范围。
+- 旧 `.doc` 和批量压缩包不在当前支持范围。视觉 OCR 的资格、worker、网络隔离和运行编排由 `material-processing` 与 Privacy/Tauri 受信边界负责，不得塞入本 crate 的普通提取路径。
+
+### `crates/diagrams`
+
+负责闭合图示 schema、固定模板、确定性渲染、更新和导出描述符校验。
+
+规则：
+
+- 合成/公开图示与 approved-case 图示共用受测 schema 和渲染核心，但使用不同存储与授权边界。
+- 不接受脚本、外部资源、任意 HTML、路径或 URI。
+- approved-case HTML 只能由受控 work-product 服务加密保存。
+
+### `crates/material-processing`
+
+负责本地材料处理和 MinerU worker 编排，包括原生/视觉路由、worker 协议、运行时配置、进程树、网络隔离、输出校验和安全派生导出。
+
+规则：
+
+- 不提供 HTTP、SSH、云 OCR 或远程模型回退。
+- 真实视觉 OCR 只有在当前组件、运行时、模型、防火墙和资格 tuple 全部有效时才能运行。
+- worker 输入输出、页数、几何、置信度、文件集和临时目录均执行有界校验与清理。
+
+### `crates/privacy`
+
+负责 Privacy store、ProjectId 与 PrivacyCaseId 的审计型一对一绑定、Vault、脱敏 finding/risk/review、approved-only 投影、receipt、qualification、MCP ticket、egress classification、生命周期和五组件备份契约。
+
+规则：
+
+- `ProjectId` 与严格 `PrivacyCaseId` 只能通过可信后端持久化绑定解析；前端不得生成或猜测 Privacy 身份。
+- raw、pending、approved、interactive user content 和 secret 分类不得互相降级。
+- binding、risk、selection、lifecycle 和迁移证据保持 append-preserving；安全关键冲突必须 fail closed。
+- 任何案件正文恢复都通过受限 loader/service，不向前端、MCP handler 或普通日志暴露 Vault 路径、原文或密钥。
 
 ### `crates/legal-services`
 
@@ -317,7 +379,6 @@ Command 规则：
 - `case_analysis`：案件事实、证据缺口、结构化模型结果。
 - `documents`：Markdown 预览、模板渲染、PDF 导出。
 - `credentials`：如果凭据管理超出 provider 范围再拆。
-- `privacy`：本地脱敏和日志清理。
 - `diagnostics`：崩溃日志和诊断信息。
 
 不要为了长期设想创建空 crate。只有阶段任务真正需要代码和测试时再加。

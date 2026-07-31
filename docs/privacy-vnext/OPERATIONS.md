@@ -1,6 +1,6 @@
 # Privacy vNext operations guide
 
-Updated: 2026-07-22
+Updated: 2026-08-01
 Applies to: Lawyer Assistance `0.4.0-beta.2` on Windows x86_64
 
 This guide describes the implemented production paths. It does not grant qualification by itself. The App's current backend status, signed evidence, current-machine remeasurement, revocation state, and exact purpose/session binding are authoritative. All acceptance fixtures must be synthetic. Never use a real client file to prove a release, and never send raw or pending material to a browser, search engine, remote OCR service, external MCP, Skill, memory, subagent, log, or test service.
@@ -12,7 +12,9 @@ The privacy workflow separates these states:
 - `CASE_RAW`: source bytes, native extraction, OCR, filenames, paths, private metadata, and any unreviewed derivative. Local App only.
 - `CASE_REDACTED_PENDING`: automatically detected or manually edited text before final residual scan and human approval. Local App only.
 - `CASE_REDACTED_APPROVED`: one immutable approved generation whose content, policy, provenance, purpose, destination, expiry, and revocation epoch are cryptographically bound. It is not a general permission to paste or upload the text.
-- Approved MCP and Provider authorization: a separate, short-lived, exact authorization derived from an active approved generation. It cannot be replaced by a prompt label, consent, broad host permission, a filename, or copied text.
+- `interactive_chat`: ordinary user-provided text and this request's explicit non-case attachments may reach the selected Provider without a case or redaction approval. It cannot read Case Workspace, Privacy, Vault, approved generations, or MCP state.
+- `interactive_case_work`: the in-case assistant may use only this request's explicitly selected active approved-only projections and minimal confirmed case data. It does not reuse MCP grants/tickets or the fixed-task automation approval panel.
+- `approved_automation`: Approved MCP and fixed-task Provider automation require separate, short-lived, exact authorization derived from an active approved generation. It cannot be replaced by a prompt label, consent, broad host permission, a filename, or copied text.
 
 The frontend exchanges opaque IDs and bounded enums. Rust restores protected content and credentials, verifies every binding immediately before use, and never returns signing keys, session secrets, receipt tokens, database paths, or raw OCR to the browser layer.
 
@@ -37,7 +39,7 @@ Every final installed component path must be at most 259 UTF-16 code units.
 
 ### App sequence
 
-1. Open **隐私与本地处理** and run **发现本机安装**. Discovery only inspects fixed local candidates and creates a minimal offline configuration; it does not run OCR or authorize production.
+1. Open **设置 → 本地处理环境与 OCR 组件** and run **发现本机安装**. Discovery only inspects fixed local candidates and creates a minimal offline configuration; it does not run OCR or authorize production.
 2. Select the OCR routing policy and save:
    - `disabled`: visual OCR is unavailable.
    - `auto_local`: only pages that fail the reliable native-text threshold route to the qualified local worker.
@@ -92,9 +94,9 @@ Qualification is reloaded at startup and remeasured before use. It becomes unusa
 
 ### Document processing
 
-After qualification, select a local PDF/DOCX/TXT/Markdown file in the App. The backend chooses reliable native extraction or qualified OCR, validates page count, order, dimensions, bounding boxes, confidence, output file count/size, and provenance, then creates a unified local review document. Missing pages, malformed geometry, low confidence, unexpected output, timeout, cancellation, process escape, hash drift, or isolation loss fail closed.
+After qualification, open **案件工作台 → 材料与脱敏** for the target case and select a local PDF/DOCX/TXT/Markdown file. The backend resolves the trusted `ProjectId ↔ PrivacyCaseId` binding, chooses reliable native extraction or qualified OCR, validates page count, order, dimensions, bounding boxes, confidence, output file count/size, and provenance, then creates a case-scoped unified local review document. Missing pages, malformed geometry, low confidence, unexpected output, timeout, cancellation, process escape, hash drift, or isolation loss fail closed.
 
-OCR is preparation, not approval. Review every page in the side-by-side workbench, add explicit subject terms where needed, resolve page warnings, run the residual-risk check, and approve the exact generation manually.
+OCR is preparation, not approval. Review every page in the case-scoped side-by-side workbench, add explicit subject terms where needed, resolve page warnings, run the residual-risk check, and approve the exact generation manually. Review text, human review, approved generations, revocation, and version history remain in **案件工作台 → 材料与脱敏** and are never shown in Settings.
 
 ## 3. Safe approval and exports
 
@@ -113,7 +115,7 @@ Revoking the approval makes subsequent export, MCP publication, Provider dispatc
 
 ## 4. Approved MCP workflow
 
-The default MCP remains `public_law_only`. Approved case work is a separate flow:
+The default MCP remains `public_law_only`. Local MCP service configuration, fixed-task Provider automation, and Approved MCP are colocated under **设置 → MCP 与自动化**, but they retain independent activity and authorization state. Approved case work is a separate flow:
 
 1. In the App, publish the active approved generation to the approved workspace for the exact case/material scope and permitted purpose.
 2. Run the App's approved-MCP qualification canary. A formal build first hashes the exact paired MCP sibling and compiles that SHA-256 trust anchor into the same App; an unbound development App, a substituted binary, or a binary that only copies the expected name/version/canary behavior cannot qualify. Qualification and session state are then signed, persisted, bound to the current app/workspace/server binary identity/transport and revocation epoch, and reverified at use.
@@ -142,12 +144,26 @@ Restart recovery completes only an authenticated pending transition whose databa
 
 Streamable HTTP is brokered by the App for controlled acceptance and is not distributed as a static host credential. Static WorkBuddy, Codex, and OpenCode approved assets are Windows stdio only.
 
-## 5. Approved Provider workflow
+## 5. Interactive case-assistant workflow
 
-Ordinary case-bearing `ChatRequest` values remain blocked before serialization. The approved path is separate:
+The case assistant is the `interactive_case_work` product path. It is not the fixed-task automation panel and does not reuse MCP publication, grant, or ticket semantics:
 
-1. Save the Provider profile and credential using the normal Provider settings. The credential remains in Windows Credential Manager.
-2. In **已批准案件 Provider 正链**, select the saved profile and one fixed task. Free-form purposes are not accepted. Supported fixed tasks cover summary, legal analysis, chronology, document outline, structured extraction, assistant response, case organization, case legal Q&A, relationship graph, document generation, regenerate, and repair.
+1. In **案件工作台 → 材料与脱敏**, finish local extraction, redaction, human review, and approval for the exact material generations needed.
+2. Open **案件工作台 → 案件工作**, create a case-work conversation, select the saved Provider and output kind, and refresh the current approved-generation list.
+3. Explicitly select only the approved/current generations needed for this request. Restored selections are UI convenience only; the request's explicit list is authoritative for dispatch scope.
+4. Review the case-assistant Provider notice. The request sends only the selected approved-only projections, minimal confirmed case data, bounded history from the same case-work conversation, and the current instruction. It excludes source files, original text, filenames, paths, Vault/attachment/internal IDs, ordinary-chat attachments, unconfirmed data, and MCP authorization.
+5. Send with a new run ID. The backend resolves the trusted project/privacy binding and revalidates every selected generation, payload/version/risk snapshot, project ownership, and revocation state before Provider socket write.
+6. The complete response is bounded and residual-scanned before display. Analysis, document, and diagram responses remain pending until a separate confirmation rechecks the immutable source snapshots and workspace CAS; an unconfirmed response does not enter Case Outputs or modify case data.
+7. If a generation is revoked, deleted, blocked, or becomes stale, refresh clears the invalid selection and sending remains disabled with **请重新选择材料**. A retry must fail before Provider transport and must not create a success message, pending output, or case write-back.
+
+Every run repeats explicit source selection and validation. Prior answers may remain visible as history, but a revoked source never becomes a new source and cannot authorize confirmation of an existing pending output.
+
+## 6. Automation outbound Provider workflow
+
+Ordinary case-bearing `ChatRequest` values remain blocked before serialization. This section describes the separate `approved_automation` fixed-task path; it is not ordinary chat or the case assistant:
+
+1. Save the Provider profile and credential in **设置 → Provider 与凭据**. The credential remains in Windows Credential Manager.
+2. Open **设置 → MCP 与自动化 → 自动化出站批准**, select the saved profile and one fixed task. Free-form purposes are not accepted. Supported fixed tasks cover summary, legal analysis, chronology, document outline, structured extraction, assistant response, case organization, case legal Q&A, relationship graph, document generation, regenerate, and repair.
 3. Run and persist Provider qualification. The canary binds the exact Provider kind, endpoint origin, model, adapter behavior, app/policy version, and current revocation epoch; restart reload and remeasurement are mandatory.
 4. Select an active approved redaction generation, the exact fixed task, expiry and output limit; check the explicit per-generation confirmation; then sign the precise Provider/purpose approval.
 5. Dispatch using only the opaque redaction ID, saved Provider ID, fixed task enum, and output limit. Rust restores the protected payload and receipt and revalidates content hash, generation, Provider, endpoint, model, purpose, policy, detector/OCR provenance, expiry, and revocation immediately before transport.
@@ -155,9 +171,9 @@ Ordinary case-bearing `ChatRequest` values remain blocked before serialization. 
 
 Any naked case request or mismatch fails before network serialization, so the rejected path sends zero HTTP requests. Provider qualification is independent of OCR and approved MCP qualification; passing one never authorizes another.
 
-## 6. Lifecycle, mapping, retention and backup
+## 7. Lifecycle, mapping, retention and backup
 
-Open **隐私生命周期、映射与加密备份** to manage:
+Open **设置 → 版本、备份与诊断 → 隐私生命周期与备份维护** to manage:
 
 - separate retention periods for review payloads, mappings, approved content/work products, and backups;
 - per-redaction legal hold, which pauses expiry cleanup but grants no read or egress permission;
@@ -168,7 +184,9 @@ Open **隐私生命周期、映射与加密备份** to manage:
 
 Logical deletion and cryptographic key destruction are claimed only at those layers. The product does not claim forensic erasure of SSD cells, filesystem history, external backups, host caches, or already disclosed copies. `SQLite secure_delete=ON` is not represented as forensic deletion.
 
-For ordinary disaster recovery, use **完整应用加密备份** (`.lavbackup`) V3. A new backup snapshots and binds five components as one authenticated outer set:
+Application update/diagnostics and Privacy lifecycle operations use independent activity state and are mutually disabled while either side is writing. This page has no discardable Privacy draft; every active mutation blocks navigation and window close.
+
+For ordinary disaster recovery, use **完整应用加密备份** (`.lavbackup`) V3 on the same maintenance page. A new backup snapshots and binds five components as one authenticated outer set:
 
 1. `user.sqlite`;
 2. the encrypted privacy bundle;
@@ -186,7 +204,7 @@ A fresh AES-256-GCM outer key is wrapped with Windows DPAPI CurrentUser; every c
 
 The `.lavprivacy` bundle is the privacy-database-only maintenance format. Prefer newly created `.lavbackup` V3 for complete application recovery. V2 three-component bundles remain read/restore-compatible only; legacy `.lavbackup` V1 fails closed. Pending legacy single-database, V2 and V3 restore states cannot coexist. All accepted formats reject tamper, wrong user/machine/workspace/app/schema binding, expiry, revocation, duplicates, overwrite, UNC/cloud/reparse/hardlink targets, and partial restore state. Vault, approved-workspace and work-product export/staging additionally enforce canonical strict path allowlists, file-count/size bounds, regular-file/single-link identities and committed-active-state checks.
 
-## 7. WorkBuddy, Codex and OpenCode
+## 8. WorkBuddy, Codex and OpenCode
 
 Public-only and approved packages are intentionally separate. Never combine both Skills/Agents in one case task. The approved package does not permit attachments, paste, host file reads, browser/search, cloud storage, remote OCR, another MCP/Skill/connector, shell reconstruction, memory, subagent, team, or unapproved Provider. It starts with opaque IDs and receives approved text only from the direct current MCP response.
 
@@ -201,7 +219,7 @@ python integrations\validate_approved_workspace_examples.py
 python -m unittest integrations.test_validate_approved_workspace_examples
 ```
 
-## 8. Release acceptance boundary
+## 9. Release acceptance boundary
 
 Run only repository-generated synthetic documents and canaries. Record machine qualification separately from code test results. A release statement must distinguish `CODE_COMPLETE`, `E2E_COMPLETE`, `EXTERNAL_CREDENTIAL_BLOCKED`, and final `COMPLETE`; it must not convert a schema, fail-closed negative test, historical single-page canary, or packaging success into a positive business-flow claim.
 

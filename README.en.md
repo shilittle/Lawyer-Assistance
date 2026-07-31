@@ -8,11 +8,15 @@ Current version: `0.4.0-beta.2`
 
 > [!WARNING]
 > This version is a technical prerelease. The current Windows installer is not Authenticode-signed and has no trusted publisher identity. Production OCR and automatic updates are not enabled. Download files only from the project Releases page, and verify the SHA-256 checksum and manifest before installation.
+>
+> The source repository is public. Public access to source code or downloadable files does not make an installer signed, activate the updater, qualify OCR, or satisfy formal-release acceptance.
 
 ## Highlights
 
 - **Local legal research**: a bundled read-only legal database supports laws, articles, historical versions, effective periods, and legal relations without requiring a model.
-- **Case workspace**: locally manage matters, materials, parties, facts, evidence, issues, legal authorities, and their relationships, with timeline, gap-analysis, research, document, and graph workspaces.
+- **Ordinary Assistant chat**: start a conversation after configuring a Provider without first creating a case, importing a case file, or completing redaction approval. The composer keeps the Provider-server warning visible and sends only the message, eligible ordinary-chat history, and attachments explicitly selected for that send.
+- **Case workspace**: locally manage matters through Overview, Materials & Redaction, Case Work, and Outputs. Materials & Redaction owns import, local extraction or qualified OCR, redaction review, immutable approval, revocation, and version history.
+- **Approved-only Case Assistant**: Case Work can use only the current case's explicitly selected approved/current redaction generations plus confirmed case data. It never reads raw case files or Vault objects, and a revoked source must be reselected before another request.
 - **Privacy approval chain**: materials are extracted, detected, aliased, and reviewed in the App. Only an immutable, explicitly approved generation can enter a designated workflow, with purpose, destination, model, expiry, and revocation checked again at use time.
 - **21-tool approved MCP**: the separate `approved_case_workspace` profile contains exactly 5 public-law tools, 10 opaque-ID-only case/work-product tools, and 6 approved-diagram tools. It is disabled by default and opens only with current App qualification plus short-lived, least-privilege sessions and tickets.
 - **Synthetic/public diagrams**: the `diagram_authoring` profile provides 5 public-law tools and 6 diagram tools for synthetic or public data only. Its local HTML bundle is plaintext and must never contain real case data. Approved-case diagrams use the encrypted work-product path instead.
@@ -26,7 +30,8 @@ Current version: `0.4.0-beta.2`
 | Windows x86_64 desktop App | Technical prerelease |
 | Installer | NSIS, currently unsigned |
 | Local legal research and case workspace | Available |
-| BYOK public-law Q&A | Available; calls the selected Provider over the network |
+| Ordinary Assistant chat and explicit attachments | Available with BYOK; no case is required, and selected content is sent to the Provider over the network |
+| Approved-only Case Assistant | Implemented under Case Work; source and Provider authorization are rechecked before transport |
 | Privacy approval and approved MCP | Implemented; disabled by default and qualification-gated |
 | `diagram_authoring` | Synthetic/public data only |
 | Production OCR | Not enabled; scanned/image-only PDFs should not be treated as supported |
@@ -72,11 +77,14 @@ After verification, run the installer. It uses current-user installation mode. B
 
 ## Quick start
 
-1. Launch Lawyer Assistance and search for a law, keyword, or article number.
-2. Open an article to review its source, version, effective period, and related authorities.
-3. To organize a matter, create a local case workspace and enter materials, facts, evidence, and issues. Reliable text layers can be extracted locally; do not rely on production OCR for scans in this prerelease.
-4. To use a model, create a BYOK Provider under Settings and select it only for a defined task. Public-law Q&A uses local candidate sources and validates `[SRC:...]` citations.
-5. For public-law access from an external host, start the default `public_law_only` MCP:
+1. Under **Settings → Provider services and credentials**, create a BYOK Provider and store its API key.
+2. Open **Assistant**, create an independent conversation, choose the Provider, and send an ordinary message. No case, case upload, redaction review, or task-specific approval form is required.
+3. To include an ordinary attachment, import it into that conversation and explicitly select it for the current send. The App shows its name, type, and size and states that locally extracted text will be sent; cancelling or leaving it unselected sends no attachment body or local path. Ordinary attachments do not become case materials automatically.
+4. Keep the Provider disclosure beside the composer in view: ordinary chat is sent through the selected Provider API and must not contain unredacted case material.
+5. Use **Legal Library** for offline laws, versions, effective periods, relations, and source review.
+6. For a real matter, create a case and open **Cases → Materials & Redaction**. Import the material, complete local text extraction, review the redaction, and approve an immutable generation. Do not rely on production OCR in this prerelease.
+7. Open **Cases → Case Work → Case Assistant**, explicitly select approved/current generations for that request, and choose **Select and send**. Only those approved projections and confirmed case data may be used. Applying analysis, document, or diagram output remains a separate confirmation step.
+8. For public-law access from an external host, start the default `public_law_only` MCP:
 
 ```text
 lawyer-assistance-mcp --privacy-profile public_law_only stdio
@@ -93,6 +101,20 @@ legal_get_relations
 ```
 
 Never send case data through the public-only integration. `approved_case_workspace` may be issued only after in-App material approval, current qualification, and least-privilege authorization. Host tasks use opaque IDs only and must not paste or attach case text.
+
+## Information architecture and execution modes
+
+The top-level product areas are fixed to **Assistant**, **Cases**, **Legal Library**, and **Settings**. Settings has four owners: **Provider services and credentials**, **Local processing environment and OCR components**, **MCP and automation**, and **Version, backup, and diagnostics**. Case material, redacted text, and human review remain under **Cases → Materials & Redaction**, not Settings.
+
+The three execution modes are intentionally separate:
+
+| Mode | Product use | Allowed source boundary |
+| --- | --- | --- |
+| `interactive_chat` | Ordinary Assistant chat | User-entered text, eligible ordinary-chat history, and attachments explicitly selected for that send; never the case workspace or Vault |
+| `interactive_case_work` | Case Assistant inside Case Work | Explicit approved/current generations from the current case plus confirmed case data; never raw or pending material |
+| `approved_automation` | MCP and external hosts | Opaque IDs, approved source references, current qualification, grants, exact tickets, and protected work-product sinks |
+
+Approval in one mode never authorizes another mode or provides a fallback route.
 
 ## Documentation
 
@@ -166,7 +188,9 @@ The large legal databases are generated/release resources rather than ordinary G
 ## Security and privacy
 
 - **Local-first does not mean network-free**: legal research, case storage, and most workspace functions are local. BYOK Provider requests are sent to the third party selected by the user.
+- **Ordinary chat is case-free, not automatically public**: its explicit `interactive_chat` authority permits the user-selected Provider request but never grants access to case services. The App continuously warns against entering or attaching unredacted case material.
 - **Approval is not blanket authorization**: even locally approved material remains bound to an exact destination, purpose, model, generation, expiry, and revocation state.
+- **Case Assistant is approved-only**: each send revalidates the current case and only the generations explicitly selected for that request. Raw files, pending redactions, Vault objects, paths, and ordinary-chat attachments are excluded.
 - **Public MCP has no case capabilities**: the default profile contains only 5 read-only public-law tools.
 - **Approved MCP uses least privilege**: the non-public tools in the 21-tool profile are divided into `read`, `write`, `diagram_read`, and `diagram_write`. Missing, expired, revoked, or mismatched state fails closed.
 - **Do not paste raw case material into an external host**: WorkBuddy, Codex, OpenCode, or another model host may process an attachment or first message before integration rules load. Rules cannot retract a disclosure that has already occurred.
