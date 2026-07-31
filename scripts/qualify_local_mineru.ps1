@@ -159,6 +159,7 @@ function Resolve-CommandDescriptor {
       CommandSha256 = Get-Sha256Hex -LiteralPath $commandPath
       LauncherPath = $powerShellPath
       LauncherSha256 = Get-Sha256Hex -LiteralPath $powerShellPath
+      IsPowerShellTestDouble = $true
       PrefixArguments = @(
         "-NoLogo",
         "-NoProfile",
@@ -178,8 +179,33 @@ function Resolve-CommandDescriptor {
     CommandSha256 = Get-Sha256Hex -LiteralPath $commandPath
     LauncherPath = $commandPath
     LauncherSha256 = Get-Sha256Hex -LiteralPath $commandPath
+    IsPowerShellTestDouble = $false
     PrefixArguments = @()
   }
+}
+
+function Resolve-QualificationProcessTimeoutMilliseconds {
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("mineru_ocr", "gpu_inventory")]
+    [string]$Stage,
+    [Parameter(Mandatory = $true)]
+    [bool]$IsPowerShellTestDouble,
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(10, 7200)]
+    [int]$TimeoutSeconds
+  )
+
+  $effectiveTimeoutSeconds = if ($Stage -ceq "gpu_inventory") {
+    if ($IsPowerShellTestDouble) {
+      [Math]::Min($TimeoutSeconds, 120)
+    } else {
+      30
+    }
+  } else {
+    $TimeoutSeconds
+  }
+  return [int]($effectiveTimeoutSeconds * 1000)
 }
 
 function ConvertTo-NativeArgument {
@@ -229,13 +255,22 @@ function Stop-ProcessTree {
 function Invoke-SanitizedProcess {
   param(
     [Parameter(Mandatory = $true)]$Descriptor,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("mineru_ocr", "gpu_inventory")]
+    [string]$Stage,
     [Parameter(Mandatory = $true)][string[]]$Arguments,
     [Parameter(Mandatory = $true)][hashtable]$Environment,
     [Parameter(Mandatory = $true)][string]$WorkingDirectory,
-    [Parameter(Mandatory = $true)][int]$TimeoutMilliseconds
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(10, 7200)]
+    [int]$TimeoutSeconds
   )
 
   $allArguments = @($Descriptor.PrefixArguments) + $Arguments
+  $timeoutMilliseconds = Resolve-QualificationProcessTimeoutMilliseconds `
+    -Stage $Stage `
+    -IsPowerShellTestDouble ([bool]$Descriptor.IsPowerShellTestDouble) `
+    -TimeoutSeconds $TimeoutSeconds
   $startInfo = New-Object Diagnostics.ProcessStartInfo
   $startInfo.FileName = $Descriptor.LauncherPath
   $startInfo.Arguments = (($allArguments | ForEach-Object { ConvertTo-NativeArgument -Value $_ }) -join " ")
@@ -276,9 +311,24 @@ function Invoke-SanitizedProcess {
     $process.StandardInput.Close()
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-      Stop-ProcessTree -ProcessId $process.Id
-      throw "local qualification process timed out"
+    if (-not $process.WaitForExit($timeoutMilliseconds)) {
+      $terminationFailed = $false
+      try {
+        Stop-ProcessTree -ProcessId $process.Id
+      } catch {
+        $terminationFailed = $true
+      }
+      try {
+        if (-not $process.WaitForExit(10000)) {
+          $terminationFailed = $true
+        }
+      } catch {
+        $terminationFailed = $true
+      }
+      if ($terminationFailed) {
+        throw "local qualification process termination failed (stage=$Stage)"
+      }
+      throw "local qualification process timed out (stage=$Stage)"
     }
     $process.WaitForExit()
     $stdout = $stdoutTask.GetAwaiter().GetResult()
@@ -603,15 +653,19 @@ function Get-GpuMetadata {
   param(
     [Parameter(Mandatory = $true)]$Descriptor,
     [Parameter(Mandatory = $true)][hashtable]$Environment,
-    [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(10, 7200)]
+    [int]$TimeoutSeconds
   )
 
   $result = Invoke-SanitizedProcess `
     -Descriptor $Descriptor `
+    -Stage "gpu_inventory" `
     -Arguments @("--query-gpu=index,name,driver_version,memory.total", "--format=csv,noheader,nounits") `
     -Environment $Environment `
     -WorkingDirectory $WorkingDirectory `
-    -TimeoutMilliseconds 30000
+    -TimeoutSeconds $TimeoutSeconds
   if ($result.ExitCode -ne 0) {
     throw "nvidia-smi did not exit successfully"
   }
@@ -794,6 +848,7 @@ try {
 
   $mineruResult = Invoke-SanitizedProcess `
     -Descriptor $mineru `
+    -Stage "mineru_ocr" `
     -Arguments @(
       "-p", $inputPath,
       "-o", $outputRoot,
@@ -803,7 +858,7 @@ try {
     ) `
     -Environment $environment `
     -WorkingDirectory $runtimeRoot `
-    -TimeoutMilliseconds ($TimeoutSeconds * 1000)
+    -TimeoutSeconds $TimeoutSeconds
   if ($mineruResult.ExitCode -ne 0) {
     throw "MinerU did not exit successfully (exit code $($mineruResult.ExitCode)); diagnostic text was discarded"
   }
@@ -817,7 +872,13 @@ try {
       throw "qualification process created an unexpected top-level artifact"
     }
   }
-  $gpus = @(Get-GpuMetadata -Descriptor $nvidiaSmi -Environment $environment -WorkingDirectory $jobRoot)
+  $gpus = @(
+    Get-GpuMetadata `
+      -Descriptor $nvidiaSmi `
+      -Environment $environment `
+      -WorkingDirectory $jobRoot `
+      -TimeoutSeconds $TimeoutSeconds
+  )
 
   $evidence = [ordered]@{
     schemaVersion = 1
