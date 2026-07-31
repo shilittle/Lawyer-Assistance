@@ -51,8 +51,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
 };
 
+mod approved_case_projection;
 mod approved_provider;
 pub(crate) mod approved_workspace;
+mod case_assistant;
 mod case_dictionary_store;
 mod case_material_migration;
 mod case_materials;
@@ -69,6 +71,9 @@ pub use approved_provider::{
     ApprovedProviderTask, DispatchApprovedProviderRequest, DispatchApprovedProviderResponse,
     ListApprovedProviderOutputsRequest, LoadApprovedProviderOutputRequest,
     RevokeApprovedProviderOutputRequest,
+};
+pub(crate) use case_assistant::{
+    CaseAssistantDispatchOutputKind, CaseAssistantDispatchRequest, CaseAssistantDispatchResponse,
 };
 pub use case_materials::{
     ApplyCaseRedactionRiskReviewActionRequest, ApproveCaseRedactionReviewRequest,
@@ -180,6 +185,17 @@ impl PrivacyWorkflowError {
     fn project_case_binding(error: ProjectPrivacyCaseBindingError) -> Self {
         Self::new(error.code(), "案件与隐私工作区身份绑定校验失败。")
     }
+}
+
+fn ensure_standalone_restore_lineage_safe(
+    app_local_data_directory: &Path,
+) -> Result<(), PrivacyWorkflowError> {
+    crate::commands::application_backup::ensure_standalone_restore_is_lineage_safe(
+        app_local_data_directory,
+    )
+    .map_err(|error| {
+        PrivacyWorkflowError::new("privacy_restore_requires_five_components", error.message)
+    })
 }
 
 impl fmt::Display for PrivacyWorkflowError {
@@ -681,6 +697,7 @@ impl PrivacyWorkflowManager {
                 &directory,
                 manager.shared.workspace_instance_id.as_str(),
                 || {
+                    ensure_standalone_restore_lineage_safe(&app_local_data_directory)?;
                     manager
                         .invalidate_all_publications("privacy_restore_startup_recovery")
                         .map(|_| ())
@@ -951,6 +968,7 @@ impl PrivacyWorkflowManager {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON;
+                 PRAGMA recursive_triggers=ON;
                  PRAGMA synchronous=FULL;
                  PRAGMA trusted_schema=OFF;",
             )
@@ -1163,9 +1181,13 @@ impl PrivacyWorkflowManager {
             .vault_broker
             .upgrade_schema_after_backup()
             .map_err(PrivacyWorkflowError::vault)?;
+        let privacy_schema_upgrade_required = matches!(
+            PrivacyStore::preflight_schema(&connection).map_err(PrivacyWorkflowError::store)?,
+            PrivacyStoreSchemaStatus::UpgradeRequired { .. }
+        );
         self.shared
             .schema_upgrade_required
-            .store(false, Ordering::Release);
+            .store(privacy_schema_upgrade_required, Ordering::Release);
         Ok(())
     }
 
@@ -3275,6 +3297,7 @@ impl PrivacyWorkflowManager {
                     approved_payload_sha256: &approved_payload_sha256,
                     reviewed_by_sha256: &reviewer_sha256,
                     approved_review_payload_plaintext: &approved_review_payload_plaintext,
+                    approved_payload_plaintext: &approved_payload,
                     risk_revision: SaveRiskReviewRevision {
                         redaction_id: &request.redaction_id,
                         expected_previous_revision,

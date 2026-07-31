@@ -4,6 +4,7 @@ import type { GraphTargetRequest } from "../../app/routes";
 import type { LegalSource } from "../../ipc/legal/types";
 import type { ProviderProfile } from "../../ipc/provider/types";
 import { CaseGapExtractionPanel } from "./CaseGapExtractionPanel";
+import { CaseAssistantWorkspace } from "./assistant/CaseAssistantWorkspace";
 import { CaseProjectListPanel } from "./CaseProjectListPanel";
 import { CasesWorkspace } from "./CasesWorkspace";
 import { CaseWorkbenchPanel } from "./CaseWorkbenchPanel";
@@ -19,7 +20,6 @@ export interface CaseWorkspaceCompatibilityOutletProps {
   legalSources: readonly LegalSource[];
   graphTarget: GraphTargetRequest | null;
   onGraphTargetConsumed: (target: GraphTargetRequest) => void;
-  onContinueInAssistant: () => void;
   onOpenCaseGraph: () => void;
   caseMaterialResetKey: number;
   onCaseMaterialDraftDirtyChange: (dirty: boolean) => void;
@@ -36,7 +36,6 @@ export function CaseWorkspaceCompatibilityOutlet({
   legalSources,
   graphTarget,
   onGraphTargetConsumed,
-  onContinueInAssistant,
   onOpenCaseGraph,
   caseMaterialResetKey,
   onCaseMaterialDraftDirtyChange,
@@ -45,6 +44,12 @@ export function CaseWorkspaceCompatibilityOutlet({
 }: CaseWorkspaceCompatibilityOutletProps) {
   const [activeGraphTarget, setActiveGraphTarget] =
     useState<GraphTargetRequest | null>(null);
+  const [caseAssistantDraftDirty, setCaseAssistantDraftDirty] =
+    useState(false);
+  const [caseAssistantMutationActive, setCaseAssistantMutationActive] =
+    useState(false);
+  const [caseAssistantRunActive, setCaseAssistantRunActive] =
+    useState(false);
 
   useEffect(() => {
     if (!graphTarget) return;
@@ -104,20 +109,60 @@ export function CaseWorkspaceCompatibilityOutlet({
     );
   }
 
+  const caseAssistantLocked =
+    caseAssistantMutationActive || caseAssistantRunActive;
+  const beforeCaseAssistantProjectChange = () => {
+    if (caseAssistantLocked) return false;
+    if (
+      caseAssistantDraftDirty &&
+      !window.confirm(
+        "切换案件将清空当前案件助理尚未发送的会话标题和任务草稿。是否放弃这些草稿？",
+      )
+    ) {
+      return false;
+    }
+    setCaseAssistantDraftDirty(false);
+    return true;
+  };
+
   return (
     <CasesWorkspace busy={controller.caseState.kind === "loading"}>
-      <CaseProjectListPanel controller={controller} />
+      <CaseProjectListPanel
+        controller={controller}
+        externallyLocked={section === "work" && caseAssistantLocked}
+        onBeforeProjectChange={
+          section === "work"
+            ? beforeCaseAssistantProjectChange
+            : undefined
+        }
+      />
       <CaseWorkbenchPanel
         controller={controller}
         graphTarget={activeGraphTarget}
         legalSources={legalSources}
-        onContinueInAssistant={onContinueInAssistant}
         onOpenCaseGraph={onOpenCaseGraph}
       />
       <CaseGapExtractionPanel
         controller={controller}
         providerProfiles={providerProfiles}
       />
+      {section === "work" ? (
+        <CaseAssistantWorkspace
+          key={controller.selectedCaseProjectId ?? "no-case"}
+          projectId={controller.selectedCaseProjectId}
+          providerProfiles={providerProfiles}
+          onDraftDirtyChange={setCaseAssistantDraftDirty}
+          onMutationActivityChange={setCaseAssistantMutationActive}
+          onRunActivityChange={setCaseAssistantRunActive}
+          onOutputApplied={() => {
+            if (controller.selectedCaseProjectId) {
+              controller.refreshCaseAfterAssistantProposal(
+                controller.selectedCaseProjectId,
+              );
+            }
+          }}
+        />
+      ) : null}
     </CasesWorkspace>
   );
 }

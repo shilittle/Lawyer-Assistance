@@ -326,6 +326,8 @@ pub fn apply_pending_database_restore(app_local_data_dir: &Path) -> Result<(), I
             "pending restore marker version or digest is invalid",
         ));
     }
+    super::application_backup::ensure_standalone_restore_is_lineage_safe(app_local_data_dir)
+        .map_err(|error| IpcError::new(error.error_type, error.message))?;
 
     if paths.incoming.exists() {
         if file_sha256(&paths.incoming)? != marker.incoming_sha256 {
@@ -917,5 +919,57 @@ mod tests {
         assert!(!paths.marker.exists());
         assert!(!paths.rollback.exists());
         database::validate_and_migrate_user_database(&active).unwrap();
+    }
+
+    #[test]
+    fn legacy_pending_user_restore_refuses_unified_lineage_before_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let active = database::ensure_user_database(directory.path()).unwrap();
+        let backup = directory.path().join("backup.sqlite");
+        backup_database(&active, &backup, &[&active]).unwrap();
+        {
+            let connection = database::open_user_database(&active).unwrap();
+            database::upsert_case_project(
+                &connection,
+                &database::CaseProjectRow {
+                    project_id: "current-project".to_owned(),
+                    title: "Current project must survive".to_owned(),
+                    case_type: "civil".to_owned(),
+                    status: "active".to_owned(),
+                    opened_on: None,
+                    summary: String::new(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+            )
+            .unwrap();
+        }
+        stage_database_restore(&backup, &active).unwrap();
+        let privacy_directory = directory.path().join("privacy");
+        fs::create_dir_all(&privacy_directory).unwrap();
+        let privacy_database = privacy_directory.join("privacy-workflow.sqlite");
+        Connection::open(&privacy_database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE case_material_selections(selection_id TEXT PRIMARY KEY);
+                 INSERT INTO case_material_selections VALUES('selection-current');",
+            )
+            .unwrap();
+        let paths = restore_paths(&active).unwrap();
+
+        let error = apply_pending_database_restore(directory.path())
+            .expect_err("single-database restore must fail closed for unified lineage");
+        assert_eq!(
+            error.error_type,
+            "application_restore_requires_five_components"
+        );
+        let connection = database::open_user_database(&active).unwrap();
+        assert_eq!(
+            database::list_case_projects(&connection).unwrap()[0].project_id,
+            "current-project"
+        );
+        assert!(paths.marker.exists());
+        assert!(paths.incoming.exists());
+        assert!(!paths.rollback.exists());
     }
 }

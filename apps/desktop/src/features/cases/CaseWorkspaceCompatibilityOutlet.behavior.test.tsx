@@ -133,7 +133,6 @@ function props(
     legalSources: [],
     graphTarget,
     onGraphTargetConsumed,
-    onContinueInAssistant: vi.fn(),
     onOpenCaseGraph: vi.fn(),
     caseMaterialResetKey: 0,
     onCaseMaterialDraftDirtyChange: vi.fn(),

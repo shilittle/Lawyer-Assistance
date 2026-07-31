@@ -101,10 +101,11 @@ pub fn render_map_summary(
             let source = labels.get(edge.source.as_str()).copied().unwrap_or("前项");
             let target = labels.get(edge.target.as_str()).copied().unwrap_or("后项");
             summary.push_str(&format!(
-                "- {} → {}：{}\n\n",
+                "- {} → {}：{}（关系类型：{}）\n\n",
                 escape_markdown(source),
                 escape_markdown(target),
                 escape_markdown(&edge.label),
+                escape_markdown(&edge.relation),
             ));
         }
         summary.pop();
@@ -170,15 +171,20 @@ fn validate_public_summary_text(spec: &MapSpec) -> Result<(), ArtifactRenderErro
                 (format!("map.nodes[{index}].summary"), node.summary.as_str()),
             ]
         }))
-        .chain(
-            spec.edges
-                .iter()
-                .enumerate()
-                .map(|(index, edge)| (format!("map.edges[{index}].label"), edge.label.as_str())),
-        );
+        .chain(spec.edges.iter().enumerate().flat_map(|(index, edge)| {
+            [
+                (format!("map.edges[{index}].label"), edge.label.as_str()),
+                (
+                    format!("map.edges[{index}].relation"),
+                    edge.relation.as_str(),
+                ),
+            ]
+        }));
 
     for (path, value) in fields {
-        if contains_non_deliverable_summary_text(value) {
+        if crate::validate_public_output_text(&path, value).is_err()
+            || contains_non_deliverable_summary_text(value)
+        {
             let error = ContractError::new(
                 ContractErrorType::InvalidEnvelope,
                 path,

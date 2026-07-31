@@ -5,6 +5,7 @@
 //! preview and human review.
 
 pub mod application_backup;
+pub mod approved_case_projection;
 pub mod case_dictionary;
 pub mod deterministic;
 pub mod egress;
@@ -39,6 +40,12 @@ pub use application_backup::{
     APPLICATION_BACKUP_V3_SCHEMA_VERSION, MAX_APPLICATION_BACKUP_BYTES,
     MAX_APPROVED_WORKSPACE_BACKUP_BYTES, MAX_USER_DATABASE_BACKUP_BYTES,
     MAX_WORK_PRODUCTS_BACKUP_BYTES,
+};
+pub use approved_case_projection::{
+    ApprovedCaseGenerationMetadata, ApprovedCasePageV1, ApprovedCasePayloadV1,
+    ApprovedCaseProjection, ApprovedCaseSourceSnapshot, ApprovedProjectionBackfill,
+    APPROVED_CASE_PAYLOAD_SCHEMA_VERSION, APPROVED_CASE_PROJECTION_MIGRATION_ID,
+    INTERACTIVE_CASE_WORK_PURPOSE, MAX_APPROVED_CASE_PAYLOAD_BYTES,
 };
 pub use egress::{
     scan_residual, ApprovedOutboundPayload, DataClassification, EgressCandidate, EgressError,

@@ -439,6 +439,51 @@ pub fn run() {
                         ))
                     })?;
             }
+            if privacy_workflow
+                .approved_projection_migration_required()
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to preflight the approved-only case projection migration: {error}"
+                    ))
+                })?
+            {
+                let source_fingerprint = privacy_workflow
+                    .approved_projection_migration_source_fingerprint()
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to fingerprint the approved-only case projection source: {error}"
+                        ))
+                    })?;
+                let backup =
+                    commands::application_backup::ensure_pre_migration_application_backup(
+                        &app_local_data_dir,
+                        &app_state,
+                        &privacy_workflow,
+                        &approved_mcp_workspace,
+                        commands::application_backup::APPROVED_CASE_PROJECTION_MIGRATION_ID,
+                        &source_fingerprint,
+                    )
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to establish the approved-only projection five-component backup gate: {}",
+                            error.message
+                        ))
+                    })?;
+                let _verified_projection_backup = (
+                    &backup.path,
+                    &backup.metadata.bundle_sha256,
+                    backup.created,
+                );
+                privacy_workflow
+                    .run_approved_projection_migration_after_backup_for_source(
+                        &source_fingerprint,
+                    )
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to migrate the approved-only case projection: {error}"
+                        ))
+                    })?;
+            }
             privacy_workflow
                 .complete_application_startup_maintenance()
                 .map_err(|error| {
@@ -527,6 +572,13 @@ pub fn run() {
             commands::assistant_run::start_assistant_run,
             commands::assistant_run::start_interactive_assistant_run,
             commands::assistant::cancel_assistant_run,
+            commands::case_assistant::create_case_assistant_conversation,
+            commands::case_assistant::list_case_assistant_conversations,
+            commands::case_assistant::get_case_assistant_conversation,
+            commands::case_assistant::list_case_assistant_generations,
+            commands::case_assistant::start_case_assistant_run,
+            commands::case_assistant::list_case_assistant_pending_outputs,
+            commands::case_assistant::confirm_case_assistant_output,
             commands::case::list_case_projects,
             commands::case::get_case_workspace,
             commands::case::get_pending_structured_case_extraction,
@@ -728,6 +780,13 @@ mod tests {
 
         for scoped in [
             "commands::assistant_run::start_interactive_assistant_run,",
+            "commands::case_assistant::create_case_assistant_conversation,",
+            "commands::case_assistant::list_case_assistant_conversations,",
+            "commands::case_assistant::get_case_assistant_conversation,",
+            "commands::case_assistant::list_case_assistant_generations,",
+            "commands::case_assistant::start_case_assistant_run,",
+            "commands::case_assistant::list_case_assistant_pending_outputs,",
+            "commands::case_assistant::confirm_case_assistant_output,",
             "commands::privacy_workflow::list_unassigned_case_materials,",
             "commands::privacy_workflow::assign_unassigned_case_material,",
             "commands::privacy_workflow::load_case_redaction_review,",
@@ -790,6 +849,21 @@ mod tests {
         let migration_run = setup
             .find(".run_case_material_migration_after_backup_for_source")
             .expect("source-bound case-material migration");
+        let projection_probe = setup
+            .find(".approved_projection_migration_required()")
+            .expect("approved-only projection migration probe");
+        let projection_fingerprint = setup
+            .find(".approved_projection_migration_source_fingerprint()")
+            .expect("approved-only projection source fingerprint");
+        let projection_backup = setup
+            .find("APPROVED_CASE_PROJECTION_MIGRATION_ID")
+            .expect("approved-only projection five-component backup");
+        let projection_run = setup
+            .find(".run_approved_projection_migration_after_backup_for_source")
+            .expect("source-bound approved-only projection migration");
+        let privacy_maintenance = setup
+            .find(".complete_application_startup_maintenance()")
+            .expect("privacy startup maintenance");
         let user_maintenance = setup
             .find("let maintained_user_database = database::ensure_user_database")
             .expect("deferred user database maintenance");
@@ -806,7 +880,12 @@ mod tests {
         assert!(fresh_authorization < fresh_initialization);
         assert!(fresh_initialization < migration_probe);
         assert!(migration_probe < migration_run);
-        assert!(migration_run < user_maintenance);
+        assert!(migration_run < projection_probe);
+        assert!(projection_probe < projection_fingerprint);
+        assert!(projection_fingerprint < projection_backup);
+        assert!(projection_backup < projection_run);
+        assert!(projection_run < privacy_maintenance);
+        assert!(privacy_maintenance < user_maintenance);
         assert!(user_maintenance < assistant_recovery);
         assert!(user_maintenance < document_recovery);
     }

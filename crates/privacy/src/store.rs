@@ -7,7 +7,8 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
 
-pub const PRIVACY_STORE_SCHEMA_VERSION: i64 = 5;
+pub const PRIVACY_STORE_SCHEMA_VERSION: i64 = 6;
+const INTERMEDIATE_PRIVACY_STORE_SCHEMA_VERSION: i64 = 5;
 const RISK_REVIEW_REVISION_PROFILE: &str = "privacy-risk-review-revision-v1";
 pub const MAX_ACTIVE_RECEIPT_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_ID_BYTES: usize = 128;
@@ -233,10 +234,10 @@ impl PrivacyStore {
                 Ok(PrivacyStoreSchemaStatus::Current)
             }
             PRIVACY_STORE_SCHEMA_VERSION => Err(PrivacyStoreError::UnsupportedSchema),
-            1..=4 if has_backing_tables => Ok(PrivacyStoreSchemaStatus::UpgradeRequired {
+            1..=5 if has_backing_tables => Ok(PrivacyStoreSchemaStatus::UpgradeRequired {
                 found_version: version,
             }),
-            1..=4 => Err(PrivacyStoreError::UnsupportedSchema),
+            1..=5 => Err(PrivacyStoreError::UnsupportedSchema),
             _ => Err(PrivacyStoreError::UnsupportedSchema),
         }
     }
@@ -248,10 +249,10 @@ impl PrivacyStore {
     /// backup before the first target/schema write.
     pub fn initialize(connection: &Connection) -> Result<(), PrivacyStoreError> {
         match Self::preflight_schema(connection)? {
-            PrivacyStoreSchemaStatus::Empty => create_empty_v5_schema(connection),
+            PrivacyStoreSchemaStatus::Empty => create_empty_v6_schema(connection),
             PrivacyStoreSchemaStatus::Current => {
-                ensure_v5_append_only_insert_guards(connection)?;
-                validate_v5_schema(connection)?;
+                configure_v6_connection(connection)?;
+                validate_v6_schema(connection)?;
                 crate::lifecycle::initialize_lifecycle_schema(connection)
             }
             PrivacyStoreSchemaStatus::UpgradeRequired { .. } => {
@@ -266,16 +267,180 @@ impl PrivacyStore {
     /// required by the case-material migration contract has completed successfully.
     pub fn upgrade_schema_after_backup(connection: &Connection) -> Result<(), PrivacyStoreError> {
         match Self::preflight_schema(connection)? {
-            PrivacyStoreSchemaStatus::Empty => create_empty_v5_schema(connection),
+            PrivacyStoreSchemaStatus::Empty => create_empty_v6_schema(connection),
             PrivacyStoreSchemaStatus::Current => {
-                ensure_v5_append_only_insert_guards(connection)?;
-                validate_v5_schema(connection)?;
+                configure_v6_connection(connection)?;
+                validate_v6_schema(connection)?;
                 crate::lifecycle::initialize_lifecycle_schema(connection)
             }
             PrivacyStoreSchemaStatus::UpgradeRequired { found_version } => {
-                upgrade_legacy_schema_to_v5(connection, found_version)
+                if (1..=4).contains(&found_version) {
+                    upgrade_legacy_schema_to_v5(connection, found_version)?;
+                }
+                Self::prepare_approved_projection_schema_after_backup(connection)
             }
         }
+    }
+
+    /// Adds the nullable v6 projection columns and migration-only guards while
+    /// deliberately keeping schema metadata at v5. The caller must have already
+    /// established the coordinated five-component backup and capacity gate.
+    pub fn prepare_approved_projection_schema_after_backup(
+        connection: &Connection,
+    ) -> Result<(), PrivacyStoreError> {
+        configure_v6_connection(connection)?;
+        match Self::preflight_schema(connection)? {
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 5 } => {}
+            PrivacyStoreSchemaStatus::Current => return validate_v6_schema(connection),
+            PrivacyStoreSchemaStatus::Empty | PrivacyStoreSchemaStatus::UpgradeRequired { .. } => {
+                return Err(PrivacyStoreError::UnsupportedSchema)
+            }
+        }
+        validate_v5_schema(connection)?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+                .map_err(|_| PrivacyStoreError::Database)?;
+        let columns = table_columns(&transaction, "privacy_redactions")?;
+        for (column, declaration) in [
+            (
+                "approved_payload_schema_version",
+                "approved_payload_schema_version INTEGER CHECK(
+                    approved_payload_schema_version IS NULL
+                    OR approved_payload_schema_version = 1
+                 )",
+            ),
+            (
+                "protected_approved_payload_blob",
+                "protected_approved_payload_blob BLOB CHECK(
+                    protected_approved_payload_blob IS NULL
+                    OR length(protected_approved_payload_blob) > 0
+                 )",
+            ),
+            (
+                "approved_payload_protection_scheme",
+                "approved_payload_protection_scheme TEXT CHECK(
+                    approved_payload_protection_scheme IS NULL
+                    OR approved_payload_protection_scheme =
+                        'windows_dpapi_current_user_v1'
+                 )",
+            ),
+            (
+                "approved_risk_revision_hash",
+                "approved_risk_revision_hash TEXT CHECK(
+                    approved_risk_revision_hash IS NULL
+                    OR length(approved_risk_revision_hash) = 64
+                 )",
+            ),
+        ] {
+            if !columns.contains(column) {
+                transaction
+                    .execute_batch(&format!(
+                        "ALTER TABLE privacy_redactions ADD COLUMN {declaration};"
+                    ))
+                    .map_err(|_| PrivacyStoreError::Database)?;
+            }
+        }
+        install_projection_migration_guards(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|_| PrivacyStoreError::Database)
+    }
+
+    /// Finalizes v6 only after every active ready approved generation has a
+    /// complete projection. A ready approved generation revoked before this
+    /// migration may remain projection-free; post-v6 revocation preserves an
+    /// already-created immutable complete projection.
+    pub fn finalize_approved_projection_schema_after_backup(
+        connection: &Connection,
+    ) -> Result<(), PrivacyStoreError> {
+        configure_v6_connection(connection)?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+                .map_err(|_| PrivacyStoreError::Database)?;
+        let version = transaction
+            .query_row(
+                "SELECT value FROM privacy_schema_metadata WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| PrivacyStoreError::Database)?;
+        if version.as_deref() != Some("5") {
+            return Err(PrivacyStoreError::UnsupportedSchema);
+        }
+        let columns = table_columns(&transaction, "privacy_redactions")?;
+        if [
+            "approved_payload_schema_version",
+            "protected_approved_payload_blob",
+            "approved_payload_protection_scheme",
+            "approved_risk_revision_hash",
+        ]
+        .iter()
+        .any(|column| !columns.contains(*column))
+        {
+            return Err(PrivacyStoreError::UnsupportedSchema);
+        }
+        let invalid_projection_count = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM privacy_redactions
+                 WHERE
+                   (
+                     (approved_payload_schema_version IS NULL)
+                     + (protected_approved_payload_blob IS NULL)
+                     + (approved_payload_protection_scheme IS NULL)
+                     + (approved_risk_revision_hash IS NULL)
+                   ) NOT IN (0,4)
+                   OR (
+                     review_state='approved' AND generation_status='ready'
+                     AND revocation_state='active' AND revoked_at IS NULL
+                     AND approved_payload_schema_version IS NULL
+                   )
+                   OR (
+                     approved_payload_schema_version IS NOT NULL
+                     AND (
+                       review_state <> 'approved'
+                       OR generation_status <> 'ready'
+                       OR NOT (
+                         (revocation_state='active' AND revoked_at IS NULL)
+                         OR (revocation_state='revoked' AND revoked_at IS NOT NULL)
+                       )
+                       OR approved_payload_sha256 IS NULL
+                       OR approved_payload_schema_version <> 1
+                       OR protected_approved_payload_blob IS NULL
+                       OR approved_payload_protection_scheme <>
+                          'windows_dpapi_current_user_v1'
+                       OR approved_risk_revision_hash IS NULL
+                       OR risk_revision <= 0
+                       OR unresolved_high_risk_count <> 0
+                     )
+                   )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| PrivacyStoreError::Database)?;
+        if invalid_projection_count != 0 {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        install_v6_security_triggers(&transaction)?;
+        transaction
+            .execute("DROP TRIGGER IF EXISTS trg_privacy_v6_approval_blocked", [])
+            .map_err(|_| PrivacyStoreError::Database)?;
+        let changed = transaction
+            .execute(
+                "UPDATE privacy_schema_metadata
+                 SET value=?1,updated_at=CURRENT_TIMESTAMP
+                 WHERE key='schema_version' AND value='5'",
+                [PRIVACY_STORE_SCHEMA_VERSION.to_string()],
+            )
+            .map_err(|_| PrivacyStoreError::Database)?;
+        if changed != 1 {
+            return Err(PrivacyStoreError::Conflict);
+        }
+        validate_v6_schema(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|_| PrivacyStoreError::Database)
     }
 
     pub fn register_material(
@@ -819,7 +984,8 @@ impl PrivacyStore {
         let changed = transaction
             .execute(
                 "UPDATE privacy_redactions
-                 SET review_state='approved',approved_payload_sha256=?2,
+                 SET review_state='approved',generation_status='blocked',
+                     approved_payload_sha256=?2,
                      reviewed_by_sha256=?3,protected_review_blob=?5,
                      redacted_content_sha256=?6,reviewed_at=CURRENT_TIMESTAMP,
                      approved_at=CURRENT_TIMESTAMP,row_version=row_version+1
@@ -867,25 +1033,40 @@ impl PrivacyStore {
         if input.risk_revision.redaction_id != input.redaction_id
             || input.approved_review_payload_plaintext.is_empty()
             || input.approved_review_payload_plaintext.len() > MAX_APPROVED_PAYLOAD_BYTES
+            || input.approved_payload_plaintext.is_empty()
+            || input.approved_payload_plaintext.len() > MAX_APPROVED_PAYLOAD_BYTES
+            || sha256_hex(input.approved_payload_plaintext) != input.approved_payload_sha256
         {
             return Err(PrivacyStoreError::InvalidInput);
         }
         let protected_review_blob = protect_local(input.approved_review_payload_plaintext)
             .map_err(|_| PrivacyStoreError::ProtectedBlob)?;
+        let protected_approved_payload_blob = protect_local(input.approved_payload_plaintext)
+            .map_err(|_| PrivacyStoreError::ProtectedBlob)?;
         let transaction = connection
             .transaction()
             .map_err(|_| PrivacyStoreError::Database)?;
-        Self::append_risk_review_revision(&transaction, &input.risk_revision)?;
+        let risk = Self::append_risk_review_revision(&transaction, &input.risk_revision)?;
         let changed = transaction
             .execute(
                 "UPDATE privacy_redactions
                  SET review_state='approved',approved_payload_sha256=?2,
                      reviewed_by_sha256=?3,protected_review_blob=?5,
                      redacted_content_sha256=?6,reviewed_at=CURRENT_TIMESTAMP,
-                     approved_at=CURRENT_TIMESTAMP,row_version=row_version+1
+                     approved_at=CURRENT_TIMESTAMP,
+                     approved_payload_schema_version=1,
+                     protected_approved_payload_blob=?7,
+                     approved_payload_protection_scheme=?8,
+                     approved_risk_revision_hash=?9,
+                     row_version=row_version+1
                  WHERE redaction_id=?1 AND unresolved_high_risk_count=0
                    AND redacted_content_sha256=?4
-                   AND review_state='review_required'",
+                   AND review_state='review_required'
+                   AND risk_revision=?10
+                   AND approved_payload_schema_version IS NULL
+                   AND protected_approved_payload_blob IS NULL
+                   AND approved_payload_protection_scheme IS NULL
+                   AND approved_risk_revision_hash IS NULL",
                 params![
                     input.redaction_id,
                     input.approved_payload_sha256,
@@ -893,6 +1074,10 @@ impl PrivacyStore {
                     input.expected_redacted_sha256,
                     protected_review_blob,
                     input.approved_redacted_content_sha256,
+                    protected_approved_payload_blob,
+                    LOCAL_PROTECTION_SCHEME,
+                    risk.revision_hash,
+                    i64::try_from(risk.revision).map_err(|_| PrivacyStoreError::InvalidInput)?,
                 ],
             )
             .map_err(|_| PrivacyStoreError::Database)?;
@@ -1463,6 +1648,22 @@ const V5_BASE_SCHEMA_SQL: &str = "
         approved_payload_sha256 TEXT CHECK(
             approved_payload_sha256 IS NULL OR length(approved_payload_sha256) = 64
         ),
+        approved_payload_schema_version INTEGER CHECK(
+            approved_payload_schema_version IS NULL
+            OR approved_payload_schema_version = 1
+        ),
+        protected_approved_payload_blob BLOB CHECK(
+            protected_approved_payload_blob IS NULL
+            OR length(protected_approved_payload_blob) > 0
+        ),
+        approved_payload_protection_scheme TEXT CHECK(
+            approved_payload_protection_scheme IS NULL
+            OR approved_payload_protection_scheme = 'windows_dpapi_current_user_v1'
+        ),
+        approved_risk_revision_hash TEXT CHECK(
+            approved_risk_revision_hash IS NULL
+            OR length(approved_risk_revision_hash) = 64
+        ),
         policy_id TEXT NOT NULL CHECK(length(policy_id) BETWEEN 1 AND 128),
         policy_version INTEGER NOT NULL CHECK(policy_version > 0),
         detector_version TEXT NOT NULL CHECK(length(detector_version) BETWEEN 1 AND 128),
@@ -1490,6 +1691,53 @@ const V5_BASE_SCHEMA_SQL: &str = "
             (revocation_state = 'active' AND revoked_at IS NULL)
             OR (revocation_state = 'revoked' AND revoked_at IS NOT NULL)
             OR (revocation_state = 'revoked_legacy_time_unknown' AND revoked_at IS NULL)
+        ),
+        CHECK(
+            (
+                approved_payload_schema_version IS NULL
+                AND protected_approved_payload_blob IS NULL
+                AND approved_payload_protection_scheme IS NULL
+                AND approved_risk_revision_hash IS NULL
+            )
+            OR
+            (
+                approved_payload_schema_version = 1
+                AND protected_approved_payload_blob IS NOT NULL
+                AND approved_payload_protection_scheme =
+                    'windows_dpapi_current_user_v1'
+                AND approved_risk_revision_hash IS NOT NULL
+            )
+        ),
+        CHECK(
+            review_state <> 'approved'
+            OR generation_status <> 'ready'
+            OR revocation_state <> 'active'
+            OR (
+                approved_payload_sha256 IS NOT NULL
+                AND approved_payload_schema_version = 1
+                AND protected_approved_payload_blob IS NOT NULL
+                AND approved_payload_protection_scheme =
+                    'windows_dpapi_current_user_v1'
+                AND approved_risk_revision_hash IS NOT NULL
+                AND risk_revision > 0
+                AND unresolved_high_risk_count = 0
+            )
+        ),
+        CHECK(
+            approved_payload_schema_version IS NULL
+            OR (
+                review_state = 'approved'
+                AND generation_status = 'ready'
+                AND revocation_state IN ('active','revoked')
+                AND approved_payload_sha256 IS NOT NULL
+                AND approved_payload_schema_version = 1
+                AND protected_approved_payload_blob IS NOT NULL
+                AND approved_payload_protection_scheme =
+                    'windows_dpapi_current_user_v1'
+                AND approved_risk_revision_hash IS NOT NULL
+                AND risk_revision > 0
+                AND unresolved_high_risk_count = 0
+            )
         ),
         FOREIGN KEY(material_id)
             REFERENCES privacy_materials(material_id) ON DELETE CASCADE
@@ -2045,6 +2293,300 @@ const V5_APPEND_ONLY_TRIGGER_SQL: &[(&str, &str)] = &[
     ),
 ];
 
+const PROJECTION_MIGRATION_GUARD_SQL: &[(&str, &str)] = &[
+    (
+        "trg_privacy_v6_approval_blocked",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_v6_approval_blocked
+         BEFORE UPDATE ON privacy_redactions
+         WHEN OLD.review_state <> 'approved' AND NEW.review_state = 'approved'
+         BEGIN
+             SELECT RAISE(ABORT, 'approved projection migration is incomplete');
+         END;",
+    ),
+    (
+        "trg_privacy_risk_review_no_delete",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_risk_review_no_delete
+         BEFORE DELETE ON privacy_risk_review_revisions
+         WHEN NOT EXISTS(
+             SELECT 1
+             FROM privacy_cleanup_candidates AS candidate
+             JOIN privacy_cleanup_journal AS journal
+               ON journal.cleanup_id=candidate.cleanup_id
+             JOIN privacy_cleanup_redaction_evidence AS evidence
+               ON evidence.cleanup_id=candidate.cleanup_id
+              AND evidence.redaction_id=candidate.target_id
+             WHERE candidate.target_kind='redaction'
+               AND candidate.target_id=OLD.redaction_id
+               AND candidate.state='pending'
+               AND journal.state='prepared'
+               AND journal.candidate_count>0
+               AND evidence.expected_sha256=candidate.expected_sha256
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'privacy risk review revisions are append only');
+         END;",
+    ),
+    (
+        "trg_privacy_risk_review_no_replace",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_risk_review_no_replace
+         BEFORE INSERT ON privacy_risk_review_revisions
+         WHEN EXISTS(
+             SELECT 1 FROM privacy_risk_review_revisions AS existing
+             WHERE existing.redaction_id=NEW.redaction_id
+               AND existing.revision=NEW.revision
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'privacy risk review revisions are append only');
+         END;",
+    ),
+    (
+        "trg_case_material_selection_no_replace",
+        "CREATE TRIGGER IF NOT EXISTS trg_case_material_selection_no_replace
+         BEFORE INSERT ON case_material_selections
+         WHEN EXISTS(
+             SELECT 1 FROM case_material_selections AS existing
+             WHERE existing.selection_id=NEW.selection_id
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'case material selection history is append preserving');
+         END;",
+    ),
+];
+
+const V6_SECURITY_TRIGGER_SQL: &[(&str, &str)] = &[
+    (
+        "trg_privacy_redaction_approved_immutable",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_redaction_approved_immutable
+         BEFORE UPDATE ON privacy_redactions
+         WHEN OLD.review_state='approved'
+         AND (
+             NEW.review_state IS NOT OLD.review_state
+             OR NEW.extraction_sha256 IS NOT OLD.extraction_sha256
+             OR NEW.redacted_content_sha256 IS NOT OLD.redacted_content_sha256
+             OR NEW.approved_payload_sha256 IS NOT OLD.approved_payload_sha256
+             OR NEW.approved_payload_schema_version
+                IS NOT OLD.approved_payload_schema_version
+             OR NEW.protected_approved_payload_blob
+                IS NOT OLD.protected_approved_payload_blob
+             OR NEW.approved_payload_protection_scheme
+                IS NOT OLD.approved_payload_protection_scheme
+             OR NEW.approved_risk_revision_hash IS NOT OLD.approved_risk_revision_hash
+             OR NEW.policy_id IS NOT OLD.policy_id
+             OR NEW.policy_version IS NOT OLD.policy_version
+             OR NEW.detector_version IS NOT OLD.detector_version
+             OR NEW.risk_revision IS NOT OLD.risk_revision
+             OR NEW.protected_review_blob IS NOT OLD.protected_review_blob
+             OR NEW.protection_scheme IS NOT OLD.protection_scheme
+             OR NEW.reviewed_by_sha256 IS NOT OLD.reviewed_by_sha256
+             OR NEW.approved_at IS NOT OLD.approved_at
+             OR NEW.reviewed_at IS NOT OLD.reviewed_at
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'approved redaction generation content is immutable');
+         END;",
+    ),
+    (
+        "trg_privacy_redaction_projection_shape_insert",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_redaction_projection_shape_insert
+         BEFORE INSERT ON privacy_redactions
+         WHEN (
+             (
+               (NEW.approved_payload_schema_version IS NULL)
+               + (NEW.protected_approved_payload_blob IS NULL)
+               + (NEW.approved_payload_protection_scheme IS NULL)
+               + (NEW.approved_risk_revision_hash IS NULL)
+             ) NOT IN (0,4)
+             OR (
+               NEW.review_state='approved' AND NEW.generation_status='ready'
+               AND NEW.revocation_state='active' AND NEW.revoked_at IS NULL
+               AND NEW.approved_payload_schema_version IS NULL
+             )
+             OR (
+               NEW.approved_payload_schema_version IS NOT NULL
+               AND (
+                 NEW.review_state <> 'approved'
+                 OR NEW.generation_status <> 'ready'
+                 OR NOT (
+                   (NEW.revocation_state='active' AND NEW.revoked_at IS NULL)
+                   OR (NEW.revocation_state='revoked' AND NEW.revoked_at IS NOT NULL)
+                 )
+                 OR NEW.approved_payload_sha256 IS NULL
+                 OR NEW.approved_payload_schema_version <> 1
+                 OR NEW.protected_approved_payload_blob IS NULL
+                 OR NEW.approved_payload_protection_scheme <>
+                    'windows_dpapi_current_user_v1'
+                 OR NEW.approved_risk_revision_hash IS NULL
+                 OR NEW.risk_revision <= 0
+                 OR NEW.unresolved_high_risk_count <> 0
+               )
+             )
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'approved projection tuple is invalid');
+         END;",
+    ),
+    (
+        "trg_privacy_redaction_projection_shape_update",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_redaction_projection_shape_update
+         BEFORE UPDATE ON privacy_redactions
+         WHEN (
+             (
+               (NEW.approved_payload_schema_version IS NULL)
+               + (NEW.protected_approved_payload_blob IS NULL)
+               + (NEW.approved_payload_protection_scheme IS NULL)
+               + (NEW.approved_risk_revision_hash IS NULL)
+             ) NOT IN (0,4)
+             OR (
+               NEW.review_state='approved' AND NEW.generation_status='ready'
+               AND NEW.revocation_state='active' AND NEW.revoked_at IS NULL
+               AND NEW.approved_payload_schema_version IS NULL
+             )
+             OR (
+               NEW.approved_payload_schema_version IS NOT NULL
+               AND (
+                 NEW.review_state <> 'approved'
+                 OR NEW.generation_status <> 'ready'
+                 OR NOT (
+                   (NEW.revocation_state='active' AND NEW.revoked_at IS NULL)
+                   OR (NEW.revocation_state='revoked' AND NEW.revoked_at IS NOT NULL)
+                 )
+                 OR NEW.approved_payload_sha256 IS NULL
+                 OR NEW.approved_payload_schema_version <> 1
+                 OR NEW.protected_approved_payload_blob IS NULL
+                 OR NEW.approved_payload_protection_scheme <>
+                    'windows_dpapi_current_user_v1'
+                 OR NEW.approved_risk_revision_hash IS NULL
+                 OR NEW.risk_revision <= 0
+                 OR NEW.unresolved_high_risk_count <> 0
+               )
+             )
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'approved projection tuple is invalid');
+         END;",
+    ),
+    (
+        "trg_privacy_redaction_projection_no_delete",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_redaction_projection_no_delete
+         BEFORE DELETE ON privacy_redactions
+         WHEN OLD.approved_payload_schema_version IS NOT NULL
+         AND NOT EXISTS(
+             SELECT 1
+             FROM privacy_cleanup_candidates AS candidate
+             JOIN privacy_cleanup_journal AS journal
+               ON journal.cleanup_id=candidate.cleanup_id
+             JOIN privacy_cleanup_redaction_evidence AS evidence
+               ON evidence.cleanup_id=candidate.cleanup_id
+              AND evidence.redaction_id=candidate.target_id
+             WHERE candidate.target_kind='redaction'
+               AND candidate.target_id=OLD.redaction_id
+               AND candidate.state='pending'
+               AND journal.state='prepared'
+               AND journal.candidate_count>0
+               AND evidence.redaction_id=OLD.redaction_id
+               AND evidence.material_id=OLD.material_id
+               AND evidence.generation_number=OLD.generation_number
+               AND evidence.expected_sha256=candidate.expected_sha256
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'approved projection is append preserving');
+         END;",
+    ),
+    (
+        "trg_privacy_redaction_no_replace",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_redaction_no_replace
+         BEFORE INSERT ON privacy_redactions
+         WHEN EXISTS(
+             SELECT 1 FROM privacy_redactions AS existing
+             WHERE existing.redaction_id=NEW.redaction_id
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'redaction generation identity is append preserving');
+         END;",
+    ),
+    (
+        "trg_privacy_risk_review_no_delete",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_risk_review_no_delete
+         BEFORE DELETE ON privacy_risk_review_revisions
+         WHEN NOT EXISTS(
+             SELECT 1
+             FROM privacy_cleanup_candidates AS candidate
+             JOIN privacy_cleanup_journal AS journal
+               ON journal.cleanup_id=candidate.cleanup_id
+             JOIN privacy_cleanup_redaction_evidence AS evidence
+               ON evidence.cleanup_id=candidate.cleanup_id
+              AND evidence.redaction_id=candidate.target_id
+             WHERE candidate.target_kind='redaction'
+               AND candidate.target_id=OLD.redaction_id
+               AND candidate.state='pending'
+               AND journal.state='prepared'
+               AND journal.candidate_count>0
+               AND evidence.expected_sha256=candidate.expected_sha256
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'privacy risk review revisions are append only');
+         END;",
+    ),
+    (
+        "trg_privacy_risk_review_no_replace",
+        "CREATE TRIGGER IF NOT EXISTS trg_privacy_risk_review_no_replace
+         BEFORE INSERT ON privacy_risk_review_revisions
+         WHEN EXISTS(
+             SELECT 1 FROM privacy_risk_review_revisions AS existing
+             WHERE existing.redaction_id=NEW.redaction_id
+               AND existing.revision=NEW.revision
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'privacy risk review revisions are append only');
+         END;",
+    ),
+    (
+        "trg_case_material_selection_no_replace",
+        "CREATE TRIGGER IF NOT EXISTS trg_case_material_selection_no_replace
+         BEFORE INSERT ON case_material_selections
+         WHEN EXISTS(
+             SELECT 1 FROM case_material_selections AS existing
+             WHERE existing.selection_id=NEW.selection_id
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'case material selection history is append preserving');
+         END;",
+    ),
+];
+
+fn configure_v6_connection(connection: &Connection) -> Result<(), PrivacyStoreError> {
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|_| PrivacyStoreError::Database)?;
+    connection
+        .pragma_update(None, "recursive_triggers", "ON")
+        .map_err(|_| PrivacyStoreError::Database)?;
+    connection
+        .pragma_update(None, "trusted_schema", "OFF")
+        .map_err(|_| PrivacyStoreError::Database)
+}
+
+fn install_projection_migration_guards(connection: &Connection) -> Result<(), PrivacyStoreError> {
+    for (_, sql) in PROJECTION_MIGRATION_GUARD_SQL {
+        connection
+            .execute_batch(sql)
+            .map_err(|_| PrivacyStoreError::Database)?;
+    }
+    Ok(())
+}
+
+fn install_v6_security_triggers(connection: &Connection) -> Result<(), PrivacyStoreError> {
+    for (name, sql) in V6_SECURITY_TRIGGER_SQL {
+        connection
+            .execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            .map_err(|_| PrivacyStoreError::Database)?;
+        connection
+            .execute_batch(sql)
+            .map_err(|_| PrivacyStoreError::Database)?;
+    }
+    Ok(())
+}
+
 fn ensure_v5_append_only_insert_guards(connection: &Connection) -> Result<(), PrivacyStoreError> {
     for (_, sql) in V5_APPEND_ONLY_TRIGGER_SQL {
         connection
@@ -2054,9 +2596,15 @@ fn ensure_v5_append_only_insert_guards(connection: &Connection) -> Result<(), Pr
     Ok(())
 }
 
-fn create_empty_v5_schema(connection: &Connection) -> Result<(), PrivacyStoreError> {
+fn create_empty_v6_schema(connection: &Connection) -> Result<(), PrivacyStoreError> {
     connection
         .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|_| PrivacyStoreError::Database)?;
+    connection
+        .pragma_update(None, "recursive_triggers", "ON")
+        .map_err(|_| PrivacyStoreError::Database)?;
+    connection
+        .pragma_update(None, "trusted_schema", "OFF")
         .map_err(|_| PrivacyStoreError::Database)?;
     let transaction =
         rusqlite::Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
@@ -2069,6 +2617,7 @@ fn create_empty_v5_schema(connection: &Connection) -> Result<(), PrivacyStoreErr
         .map_err(|_| PrivacyStoreError::Database)?;
     ensure_v5_append_only_insert_guards(&transaction)?;
     crate::lifecycle::initialize_lifecycle_schema(&transaction)?;
+    install_v6_security_triggers(&transaction)?;
     transaction
         .execute(
             "INSERT INTO privacy_schema_metadata(key,value,updated_at)
@@ -2078,7 +2627,7 @@ fn create_empty_v5_schema(connection: &Connection) -> Result<(), PrivacyStoreErr
             [PRIVACY_STORE_SCHEMA_VERSION.to_string()],
         )
         .map_err(|_| PrivacyStoreError::Database)?;
-    validate_v5_schema(&transaction)?;
+    validate_v6_schema(&transaction)?;
     transaction
         .commit()
         .map_err(|_| PrivacyStoreError::Database)
@@ -2120,7 +2669,7 @@ fn upgrade_legacy_schema_to_v5(
                  SET value=?1,updated_at=CURRENT_TIMESTAMP
                  WHERE key='schema_version' AND value=?2",
                 params![
-                    PRIVACY_STORE_SCHEMA_VERSION.to_string(),
+                    INTERMEDIATE_PRIVACY_STORE_SCHEMA_VERSION.to_string(),
                     found_version.to_string()
                 ],
             )
@@ -2502,7 +3051,11 @@ fn validate_v5_schema(connection: &Connection) -> Result<(), PrivacyStoreError> 
                 [name],
                 |row| row.get::<_, String>(0),
             )
+            .optional()
             .map_err(|_| PrivacyStoreError::Database)?;
+        let Some(stored_sql) = stored_sql else {
+            return Err(PrivacyStoreError::UnsupportedSchema);
+        };
         if normalize_v5_trigger_sql(&stored_sql) != normalize_v5_trigger_sql(canonical_sql) {
             return Err(PrivacyStoreError::UnsupportedSchema);
         }
@@ -2553,6 +3106,153 @@ fn validate_v5_schema(connection: &Connection) -> Result<(), PrivacyStoreError> 
         }
     }
 
+    let mut foreign_key_check = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|_| PrivacyStoreError::Database)?;
+    let mut rows = foreign_key_check
+        .query([])
+        .map_err(|_| PrivacyStoreError::Database)?;
+    if rows
+        .next()
+        .map_err(|_| PrivacyStoreError::Database)?
+        .is_some()
+    {
+        return Err(PrivacyStoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn validate_v6_schema(connection: &Connection) -> Result<(), PrivacyStoreError> {
+    let version = connection
+        .query_row(
+            "SELECT value FROM privacy_schema_metadata WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| PrivacyStoreError::Database)?;
+    if version.as_deref() != Some("6") {
+        return Err(PrivacyStoreError::UnsupportedSchema);
+    }
+    let foreign_keys = connection
+        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+        .map_err(|_| PrivacyStoreError::Database)?;
+    let recursive_triggers = connection
+        .pragma_query_value(None, "recursive_triggers", |row| row.get::<_, bool>(0))
+        .map_err(|_| PrivacyStoreError::Database)?;
+    let trusted_schema = connection
+        .pragma_query_value(None, "trusted_schema", |row| row.get::<_, bool>(0))
+        .map_err(|_| PrivacyStoreError::Database)?;
+    if !foreign_keys || !recursive_triggers || trusted_schema {
+        return Err(PrivacyStoreError::UnsupportedSchema);
+    }
+
+    for (kind, name) in [
+        ("table", "privacy_materials"),
+        ("table", "privacy_redactions"),
+        ("table", "privacy_risk_review_revisions"),
+        ("table", "case_material_selections"),
+        ("table", "case_material_migration_ledger"),
+        ("table", "case_material_migration_events"),
+        ("table", "case_material_legacy_references"),
+        ("index", "idx_privacy_redactions_generation"),
+        ("index", "idx_case_material_selection_active"),
+        ("trigger", "trg_privacy_redaction_generation_immutable"),
+        ("trigger", "trg_case_material_selection_no_delete"),
+        ("trigger", "trg_privacy_risk_review_no_update"),
+    ] {
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2
+                 )",
+                params![kind, name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|_| PrivacyStoreError::Database)?;
+        if !exists {
+            return Err(PrivacyStoreError::UnsupportedSchema);
+        }
+    }
+    for (name, canonical_sql) in V5_APPEND_ONLY_TRIGGER_SQL
+        .iter()
+        .chain(V6_SECURITY_TRIGGER_SQL.iter())
+    {
+        let stored_sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| PrivacyStoreError::Database)?;
+        let Some(stored_sql) = stored_sql else {
+            return Err(PrivacyStoreError::UnsupportedSchema);
+        };
+        if normalize_v5_trigger_sql(&stored_sql) != normalize_v5_trigger_sql(canonical_sql) {
+            return Err(PrivacyStoreError::UnsupportedSchema);
+        }
+    }
+    let redaction_columns = table_columns(connection, "privacy_redactions")?;
+    for column in [
+        "generation_number",
+        "generation_status",
+        "risk_revision",
+        "approved_at",
+        "revocation_state",
+        "revoked_at",
+        "row_version",
+        "approved_payload_schema_version",
+        "protected_approved_payload_blob",
+        "approved_payload_protection_scheme",
+        "approved_risk_revision_hash",
+    ] {
+        if !redaction_columns.contains(column) {
+            return Err(PrivacyStoreError::UnsupportedSchema);
+        }
+    }
+    let invalid_projection_count = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM privacy_redactions
+             WHERE
+               (
+                 (approved_payload_schema_version IS NULL)
+                 + (protected_approved_payload_blob IS NULL)
+                 + (approved_payload_protection_scheme IS NULL)
+                 + (approved_risk_revision_hash IS NULL)
+               ) NOT IN (0,4)
+               OR (
+                 review_state='approved' AND generation_status='ready'
+                 AND revocation_state='active' AND revoked_at IS NULL
+                 AND approved_payload_schema_version IS NULL
+               )
+               OR (
+                 approved_payload_schema_version IS NOT NULL
+                 AND (
+                   review_state <> 'approved'
+                   OR generation_status <> 'ready'
+                   OR NOT (
+                     (revocation_state='active' AND revoked_at IS NULL)
+                     OR (revocation_state='revoked' AND revoked_at IS NOT NULL)
+                   )
+                   OR approved_payload_sha256 IS NULL
+                   OR approved_payload_schema_version <> 1
+                   OR protected_approved_payload_blob IS NULL
+                   OR approved_payload_protection_scheme <>
+                      'windows_dpapi_current_user_v1'
+                   OR approved_risk_revision_hash IS NULL
+                   OR risk_revision <= 0
+                   OR unresolved_high_risk_count <> 0
+                 )
+               )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| PrivacyStoreError::Database)?;
+    if invalid_projection_count != 0 {
+        return Err(PrivacyStoreError::Conflict);
+    }
     let mut foreign_key_check = connection
         .prepare("PRAGMA foreign_key_check")
         .map_err(|_| PrivacyStoreError::Database)?;
@@ -2847,12 +3547,15 @@ mod tests {
                     policy_id,policy_version,detector_version,
                     unresolved_high_risk_count,review_state,risk_revision,
                     protected_review_blob,protection_scheme,reviewed_by_sha256,
-                    approved_at,revocation_state,row_version,created_at,reviewed_at
+                    approved_at,revocation_state,row_version,created_at,reviewed_at,
+                    approved_payload_schema_version,protected_approved_payload_blob,
+                    approved_payload_protection_scheme,approved_risk_revision_hash
                  ) VALUES(
-                    ?1,?2,?3,'ready',?4,?5,?6,'policy',1,'detector',0,
-                    'approved',?7,x'01','windows_dpapi_current_user_v1',?8,
-                    '2025-02-01 00:00:00','active',1,
-                    '2025-01-01 00:00:00','2025-02-01 00:00:00'
+                     ?1,?2,?3,'ready',?4,?5,?6,'policy',1,'detector',0,
+                     'approved',?7,x'01','windows_dpapi_current_user_v1',?8,
+                     '2025-02-01 00:00:00','active',1,
+                     '2025-01-01 00:00:00','2025-02-01 00:00:00',
+                     1,x'02','windows_dpapi_current_user_v1',?9
                  )",
                 params![
                     redaction_id,
@@ -2863,6 +3566,7 @@ mod tests {
                     approved_payload_sha256,
                     risk_revision,
                     hash(b"reviewer"),
+                    hash(format!("{redaction_id}-risk-head").as_bytes()),
                 ],
             )
             .expect("approved generation");
@@ -3112,6 +3816,7 @@ mod tests {
                     approved_payload_sha256: &approved_payload_sha256,
                     reviewed_by_sha256: &reviewed_by_sha256,
                     approved_review_payload_plaintext: b"approval-review-v2",
+                    approved_payload_plaintext: b"approval-payload",
                     risk_revision: SaveRiskReviewRevision {
                         redaction_id: "redaction-risk-approval-1",
                         expected_previous_revision: $expected_previous_revision,
@@ -3500,12 +4205,14 @@ mod tests {
             PrivacyStore::upgrade_schema_after_backup(&connection)
                 .expect("explicit post-backup upgrade");
             assert_eq!(
-                PrivacyStore::preflight_schema(&connection).expect("current preflight"),
-                PrivacyStoreSchemaStatus::Current
+                PrivacyStore::preflight_schema(&connection).expect("intermediate preflight"),
+                PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 5 }
             );
-            PrivacyStore::initialize(&connection).expect("v5 initialize is idempotent");
+            PrivacyStore::finalize_approved_projection_schema_after_backup(&connection)
+                .expect("finalize empty approved projection migration");
+            PrivacyStore::initialize(&connection).expect("v6 initialize is idempotent");
             PrivacyStore::upgrade_schema_after_backup(&connection)
-                .expect("explicit upgrade is idempotent at v5");
+                .expect("explicit upgrade is idempotent at v6");
 
             let counts = connection
                 .query_row(
@@ -3538,6 +4245,100 @@ mod tests {
     }
 
     #[test]
+    fn v5_finalize_allows_pre_migration_revoked_approved_row_without_projection() {
+        let connection = legacy_store(4);
+        PrivacyStore::upgrade_schema_after_backup(&connection).expect("prepare v5 projection");
+        connection
+            .execute_batch("DROP TRIGGER trg_privacy_v6_approval_blocked;")
+            .expect("seed a historical pre-guard row");
+        connection
+            .execute(
+                "UPDATE privacy_redactions
+                 SET review_state='approved',
+                     approved_payload_sha256=?1,
+                     reviewed_by_sha256=?2,
+                     approved_at='2026-07-30 00:00:00',
+                     reviewed_at='2026-07-30 00:00:00',
+                     risk_revision=1,
+                     revocation_state='revoked',
+                     revoked_at='2026-07-30 01:00:00',
+                     row_version=row_version+1
+                 WHERE redaction_id='redaction-a'",
+                params![hash(b"legacy revoked payload"), hash(b"legacy reviewer")],
+            )
+            .expect("seed pre-migration revoked approval");
+
+        PrivacyStore::finalize_approved_projection_schema_after_backup(&connection)
+            .expect("revoked pre-migration approval may remain projection-free");
+        PrivacyStore::initialize(&connection).expect("validate finalized v6");
+        assert!(connection
+            .query_row(
+                "SELECT
+                       approved_payload_schema_version IS NULL
+                       AND protected_approved_payload_blob IS NULL
+                       AND approved_payload_protection_scheme IS NULL
+                       AND approved_risk_revision_hash IS NULL
+                     FROM privacy_redactions WHERE redaction_id='redaction-a'",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("projection absence"));
+        connection
+            .execute(
+                "UPDATE privacy_redactions
+                 SET row_version=row_version+1
+                 WHERE redaction_id='redaction-a'",
+                [],
+            )
+            .expect("revoked projection-free row remains a valid v6 shape");
+        assert!(connection
+            .execute(
+                "UPDATE privacy_redactions
+                 SET approved_payload_schema_version=1,
+                     protected_approved_payload_blob=x'01',
+                     approved_payload_protection_scheme=
+                       'windows_dpapi_current_user_v1',
+                     approved_risk_revision_hash=?1,
+                     row_version=row_version+1
+                 WHERE redaction_id='redaction-a'",
+                [hash(b"late projection risk head")],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v5_finalize_rejects_active_ready_approved_row_without_projection() {
+        let connection = legacy_store(4);
+        PrivacyStore::upgrade_schema_after_backup(&connection).expect("prepare v5 projection");
+        connection
+            .execute_batch("DROP TRIGGER trg_privacy_v6_approval_blocked;")
+            .expect("seed a historical pre-guard row");
+        connection
+            .execute(
+                "UPDATE privacy_redactions
+                 SET review_state='approved',
+                     approved_payload_sha256=?1,
+                     reviewed_by_sha256=?2,
+                     approved_at='2026-07-30 00:00:00',
+                     reviewed_at='2026-07-30 00:00:00',
+                     risk_revision=1,
+                     row_version=row_version+1
+                 WHERE redaction_id='redaction-a'",
+                params![hash(b"active missing payload"), hash(b"active reviewer")],
+            )
+            .expect("seed active approved row without projection");
+
+        assert_eq!(
+            PrivacyStore::finalize_approved_projection_schema_after_backup(&connection),
+            Err(PrivacyStoreError::Conflict)
+        );
+        assert_eq!(
+            PrivacyStore::preflight_schema(&connection).expect("v5 remains"),
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 5 }
+        );
+    }
+
+    #[test]
     fn generation_backfill_is_stable_contiguous_and_new_numbers_never_reorder() {
         let connection = legacy_store(4);
         PrivacyStore::upgrade_schema_after_backup(&connection).expect("upgrade v4");
@@ -3567,7 +4368,9 @@ mod tests {
             ]
         );
 
-        PrivacyStore::initialize(&connection).expect("repeat v5 initialization");
+        PrivacyStore::finalize_approved_projection_schema_after_backup(&connection)
+            .expect("finalize v6");
+        PrivacyStore::initialize(&connection).expect("repeat v6 initialization");
         let unchanged = {
             let mut statement = connection
                 .prepare(
@@ -3686,6 +4489,21 @@ mod tests {
                 [],
             )
             .expect("one-way revocation");
+        PrivacyStore::initialize(&connection)
+            .expect("post-v6 revocation retains a valid immutable projection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT approved_payload_schema_version,
+                            approved_payload_protection_scheme
+                     FROM privacy_redactions
+                     WHERE redaction_id='redaction-approved'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("retained projection"),
+            (1, LOCAL_PROTECTION_SCHEME.to_owned())
+        );
         assert!(connection
             .execute(
                 "UPDATE privacy_redactions
@@ -4182,7 +5000,7 @@ mod tests {
     }
 
     #[test]
-    fn current_v5_initialization_repairs_required_no_replace_guards() {
+    fn current_v6_initialization_rejects_missing_required_no_replace_guards() {
         let connection = setup();
         connection
             .execute_batch(
@@ -4191,13 +5009,10 @@ mod tests {
                  DROP TRIGGER trg_case_material_legacy_reference_no_replace;",
             )
             .expect("remove insert guards");
-        assert!(matches!(
-            validate_v5_schema(&connection),
+        assert_eq!(
+            PrivacyStore::initialize(&connection),
             Err(PrivacyStoreError::UnsupportedSchema)
-        ));
-
-        PrivacyStore::initialize(&connection).expect("repair current schema guards");
-        validate_v5_schema(&connection).expect("validate repaired schema");
+        );
     }
 
     #[test]
@@ -4355,7 +5170,7 @@ mod tests {
                 .expect("audit row count"),
             0
         );
-        assert_eq!(PRIVACY_STORE_SCHEMA_VERSION, 5);
+        assert_eq!(PRIVACY_STORE_SCHEMA_VERSION, 6);
     }
 
     #[cfg(windows)]
@@ -4783,5 +5598,6 @@ pub struct ApproveReviewWithRiskRevision<'a> {
     pub approved_payload_sha256: &'a str,
     pub reviewed_by_sha256: &'a str,
     pub approved_review_payload_plaintext: &'a [u8],
+    pub approved_payload_plaintext: &'a [u8],
     pub risk_revision: SaveRiskReviewRevision<'a>,
 }

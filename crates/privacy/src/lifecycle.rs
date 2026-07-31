@@ -40,9 +40,12 @@ const RETENTION_PRECONDITION_CHANGED_ERROR_CODE: &str =
     "privacy_cleanup_retention_precondition_changed";
 pub const MAX_MAPPING_ENTRIES: usize = 4_096;
 pub const MAX_MAPPING_PLAINTEXT_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_BACKUP_DATABASE_BYTES: usize = 96 * 1024 * 1024;
-pub const MAX_BACKUP_ENVELOPE_BYTES: usize = 160 * 1024 * 1024;
-pub const MAX_PORTABLE_BACKUP_BYTES: usize = 224 * 1024 * 1024;
+pub const MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES: usize = 96 * 1024 * 1024;
+pub const MAX_PRE_MIGRATION_BACKUP_ENVELOPE_BYTES: usize = 160 * 1024 * 1024;
+pub const MAX_PRE_MIGRATION_PORTABLE_BACKUP_BYTES: usize = 224 * 1024 * 1024;
+pub const MAX_BACKUP_DATABASE_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_BACKUP_ENVELOPE_BYTES: usize = 352 * 1024 * 1024;
+pub const MAX_PORTABLE_BACKUP_BYTES: usize = 416 * 1024 * 1024;
 pub const MAX_RETENTION_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 const MAX_ID_BYTES: usize = 128;
 const MAPPING_AAD_VERSION: &str = "mapping-aad-v1";
@@ -52,7 +55,43 @@ const DEFAULT_REVIEW_RETENTION_SECONDS: u64 = 90 * 24 * 60 * 60;
 const DEFAULT_RECEIPT_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_BACKUP_RETENTION_SECONDS: u64 = 180 * 24 * 60 * 60;
 const MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION: i64 = 1;
-const MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION: i64 = 4;
+const MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION: i64 = 5;
+
+pub const fn max_backup_database_bytes_for_schema(schema_version: i64) -> Option<usize> {
+    if schema_version >= MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+        && schema_version <= MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+    {
+        Some(MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES)
+    } else if schema_version == PRIVACY_STORE_SCHEMA_VERSION {
+        Some(MAX_BACKUP_DATABASE_BYTES)
+    } else {
+        None
+    }
+}
+
+const fn max_backup_envelope_bytes_for_schema(schema_version: i64) -> Option<usize> {
+    if schema_version >= MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+        && schema_version <= MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+    {
+        Some(MAX_PRE_MIGRATION_BACKUP_ENVELOPE_BYTES)
+    } else if schema_version == PRIVACY_STORE_SCHEMA_VERSION {
+        Some(MAX_BACKUP_ENVELOPE_BYTES)
+    } else {
+        None
+    }
+}
+
+pub const fn max_portable_backup_bytes_for_schema(schema_version: i64) -> Option<usize> {
+    if schema_version >= MIN_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+        && schema_version <= MAX_PRE_MIGRATION_PRIVACY_STORE_SCHEMA_VERSION
+    {
+        Some(MAX_PRE_MIGRATION_PORTABLE_BACKUP_BYTES)
+    } else if schema_version == PRIVACY_STORE_SCHEMA_VERSION {
+        Some(MAX_PORTABLE_BACKUP_BYTES)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
@@ -1762,7 +1801,7 @@ impl EncryptedPrivacyBackupStore {
         )
     }
 
-    /// Creates a rollback backup before a v1-v4 privacy-store migration.
+    /// Creates a rollback backup before a v1-v5 privacy-store migration.
     ///
     /// This path is intentionally separate from `export_database`: callers must name the exact
     /// legacy schema they preflighted, and both the live database and the coherent snapshot must
@@ -1797,6 +1836,12 @@ impl EncryptedPrivacyBackupStore {
         ensure_workspace(connection, lifecycle.workspace_instance_id())?;
         let privacy_store_schema_version =
             schema_expectation.validate_actual(read_privacy_store_schema_version(connection)?)?;
+        let maximum_database_bytes =
+            max_backup_database_bytes_for_schema(privacy_store_schema_version)
+                .ok_or(LifecycleError::InvalidInput)?;
+        let maximum_envelope_bytes =
+            max_backup_envelope_bytes_for_schema(privacy_store_schema_version)
+                .ok_or(LifecycleError::InvalidInput)?;
         let policy = load_retention_policy(connection)?;
         let expires_at_unix = request.expires_at_unix.unwrap_or(
             request
@@ -1814,7 +1859,7 @@ impl EncryptedPrivacyBackupStore {
         let snapshot_result = snapshot_database(connection, &snapshot_path);
         let database_bytes = match snapshot_result {
             Ok(()) => {
-                read_safe_file(&snapshot_path, MAX_BACKUP_DATABASE_BYTES).map(ZeroizingBytes::new)
+                read_safe_file(&snapshot_path, maximum_database_bytes).map(ZeroizingBytes::new)
             }
             Err(error) => Err(error),
         };
@@ -1867,7 +1912,7 @@ impl EncryptedPrivacyBackupStore {
         };
         let envelope_bytes =
             canonical_json_v1(&envelope).map_err(|_| LifecycleError::BackupInvalid)?;
-        if envelope_bytes.len() > MAX_BACKUP_ENVELOPE_BYTES {
+        if envelope_bytes.len() > maximum_envelope_bytes {
             return Err(LifecycleError::InvalidInput);
         }
         let envelope_sha256 = sha256_hex(&envelope_bytes);
@@ -1960,7 +2005,7 @@ impl EncryptedPrivacyBackupStore {
         )
     }
 
-    /// Restores an exact v1-v4 rollback snapshot without upgrading it.
+    /// Restores an exact v1-v5 rollback snapshot without upgrading it.
     ///
     /// This is deliberately separate from the current-schema restore path. The caller must name
     /// the authenticated legacy schema exactly; future schemas and the current schema are rejected.
@@ -2106,6 +2151,15 @@ impl EncryptedPrivacyBackupStore {
         }
         let envelope: BackupEnvelopeV1 = strict_json_v1_from_slice(&envelope_bytes)
             .map_err(|_| LifecycleError::BackupInvalid)?;
+        let maximum_envelope_bytes =
+            max_backup_envelope_bytes_for_schema(envelope.privacy_store_schema_version)
+                .ok_or(LifecycleError::BackupInvalid)?;
+        let maximum_database_bytes =
+            max_backup_database_bytes_for_schema(envelope.privacy_store_schema_version)
+                .ok_or(LifecycleError::BackupInvalid)?;
+        if envelope_bytes.len() > maximum_envelope_bytes {
+            return Err(LifecycleError::BackupInvalid);
+        }
         validate_backup_envelope(&envelope, backup_id, context, &registry)?;
         let wrapped = decode_bounded_base64(&envelope.wrapped_data_key_base64, 64 * 1024)?;
         if sha256_hex(&wrapped) != envelope.wrapped_data_key_sha256 {
@@ -2114,7 +2168,7 @@ impl EncryptedPrivacyBackupStore {
         let key = unwrap_case_key(&wrapped).map_err(map_crypto_error)?;
         let nonce = decode_bounded_base64(&envelope.nonce_base64, 64)?;
         let ciphertext =
-            decode_bounded_base64(&envelope.ciphertext_base64, MAX_BACKUP_DATABASE_BYTES)?;
+            decode_bounded_base64(&envelope.ciphertext_base64, maximum_database_bytes)?;
         let tag = decode_bounded_base64(&envelope.tag_base64, 64)?;
         if sha256_hex(&ciphertext) != envelope.ciphertext_sha256 {
             return Err(LifecycleError::BackupTampered);

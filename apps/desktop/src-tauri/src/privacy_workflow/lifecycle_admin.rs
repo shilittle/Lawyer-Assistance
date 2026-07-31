@@ -1,6 +1,7 @@
 use super::{
-    validate_ordinary_database_file, validate_ordinary_directory, vault_broker,
-    ApplicationBackupPrivacyGuard, PrivacyWorkflowError, PrivacyWorkflowManager,
+    ensure_standalone_restore_lineage_safe, validate_ordinary_database_file,
+    validate_ordinary_directory, vault_broker, ApplicationBackupPrivacyGuard, PrivacyWorkflowError,
+    PrivacyWorkflowManager,
 };
 use privacy::vnext::{CaseId, MaterialId};
 use privacy::{
@@ -36,7 +37,7 @@ use windows_sys::Win32::{
 const BACKUP_ROOT_NAME: &str = "encrypted-backups";
 const RESTORE_FORMAT_VERSION: u16 = 1;
 const MAX_RESTORE_MARKER_BYTES: usize = 128 * 1024;
-const MAX_PRIVACY_DATABASE_BYTES: u64 = 96 * 1024 * 1024;
+const MAX_PRIVACY_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
 const MAPPING_REVEAL_AUTHORIZATION_TTL_SECONDS: u64 = 30;
 const MAX_PENDING_MAPPING_REVEAL_AUTHORIZATIONS: usize = 8;
 const INVALIDATE_REASON_MAPPING_REVOKED: &str = "privacy_mapping_revoked";
@@ -895,6 +896,14 @@ impl PrivacyWorkflowManager {
     ) -> Result<VerifiedBackupView, PrivacyWorkflowError> {
         require_confirmation(&request.confirmation, RESTORE_BACKUP_CONFIRMATION)?;
         let _gate = self.gate();
+        let app_local_data_directory =
+            self.shared.user_database_path.parent().ok_or_else(|| {
+                PrivacyWorkflowError::new(
+                    "privacy_restore_invalid",
+                    "The application data directory could not be resolved.",
+                )
+            })?;
+        ensure_standalone_restore_lineage_safe(app_local_data_directory)?;
         let connection = self.open_connection()?;
         let lifecycle = self.privacy_lifecycle(&connection)?;
         let context = self.backup_context(&connection, &lifecycle)?;
@@ -1922,8 +1931,8 @@ mod tests {
                      1,
                      'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
                      'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-                     'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-                     'policy-test',1,'detector-test',0,'approved',X'01',
+                     NULL,
+                     'policy-test',1,'detector-test',0,'review_required',X'01',
                      'windows_dpapi_current_user_v1'
                  );
                  INSERT INTO privacy_sensitive_mappings(
@@ -1938,11 +1947,21 @@ mod tests {
                  );",
             )
             .expect("mapping fixture");
+        PrivacyStore::approve_review(
+            &mut connection,
+            TEST_REDACTION_ID,
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            &sha256_hex(b"lifecycle fixture reviewer"),
+            b"lifecycle fixture legacy approval",
+        )
+        .expect("blocked legacy mapping approval fixture");
     }
 
     fn install_retention_fixture(manager: &PrivacyWorkflowManager) {
         install_mapping_fixture(manager);
-        let connection = manager.open_connection().expect("privacy connection");
+        let mut connection = manager.open_connection().expect("privacy connection");
         connection
             .execute_batch(
                 "INSERT INTO privacy_materials(
@@ -1987,16 +2006,16 @@ mod tests {
                   1,
                   '3535353535353535353535353535353535353535353535353535353535353535',
                   '4545454545454545454545454545454545454545454545454545454545454545',
-                  '5555555555555555555555555555555555555555555555555555555555555555',
-                  'policy-test',1,'detector-test',0,'approved',X'01',
+                  NULL,
+                  'policy-test',1,'detector-test',0,'review_required',X'01',
                   'windows_dpapi_current_user_v1'),
                  ('red_66666666666666666666666666666666',
                   'mat_66666666666666666666666666666666',
                   1,
                   '3636363636363636363636363636363636363636363636363636363636363636',
                   '4646464646464646464646464646464646464646464646464646464646464646',
-                  '5656565656565656565656565656565656565656565656565656565656565656',
-                  'policy-test',1,'detector-test',0,'approved',X'01',
+                  NULL,
+                  'policy-test',1,'detector-test',0,'review_required',X'01',
                   'windows_dpapi_current_user_v1');
                  INSERT INTO privacy_retention_bindings(
                      redaction_id,expires_at_unix,legal_hold,bound_at_unix,
@@ -2007,6 +2026,29 @@ mod tests {
                  ('red_66666666666666666666666666666666',2100000000,0,1500000000,1,NULL);",
             )
             .expect("retention fixture");
+        for (redaction_id, redacted_sha256, approved_payload_sha256) in [
+            (
+                "red_55555555555555555555555555555555",
+                "4545454545454545454545454545454545454545454545454545454545454545",
+                "5555555555555555555555555555555555555555555555555555555555555555",
+            ),
+            (
+                "red_66666666666666666666666666666666",
+                "4646464646464646464646464646464646464646464646464646464646464646",
+                "5656565656565656565656565656565656565656565656565656565656565656",
+            ),
+        ] {
+            PrivacyStore::approve_review(
+                &mut connection,
+                redaction_id,
+                redacted_sha256,
+                redacted_sha256,
+                approved_payload_sha256,
+                &sha256_hex(b"retention fixture reviewer"),
+                b"retention fixture legacy approval",
+            )
+            .expect("blocked legacy retention approval fixture");
+        }
     }
 
     fn one_day_policy() -> SetRetentionPolicyRequest {
@@ -2523,6 +2565,98 @@ mod tests {
             )
             .expect("late hold state");
         assert!(held);
+    }
+
+    #[test]
+    fn standalone_privacy_restore_stage_rejects_existing_unified_lineage_without_staging_files() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let invalidator = Arc::new(RecordingInvalidator::default());
+        let manager = manager_with_invalidator(&directory, invalidator.clone());
+        let backup = manager
+            .create_privacy_backup()
+            .expect("pre-lineage privacy backup");
+        install_mapping_fixture(&manager);
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+
+        let error = manager
+            .stage_privacy_restore(StagePrivacyRestoreRequest {
+                backup_id: backup.backup_id,
+                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
+            })
+            .expect_err("unified lineage requires a five-component restore");
+
+        assert_eq!(error.code(), "privacy_restore_requires_five_components");
+        assert!(invalidator.take_calls().is_empty());
+        assert!(!paths.incoming.exists());
+        assert!(!paths.marker.exists());
+        assert!(!paths.rollback.exists());
+        assert_eq!(
+            manager
+                .open_connection()
+                .expect("current privacy connection")
+                .query_row("SELECT COUNT(*) FROM privacy_materials", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .expect("current unified lineage"),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_privacy_restore_apply_rechecks_lineage_before_any_database_swap() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let invalidator = Arc::new(RecordingInvalidator::default());
+        let manager = manager_with_invalidator(&directory, invalidator.clone());
+        let backup = manager
+            .create_privacy_backup()
+            .expect("pre-lineage privacy backup");
+        manager
+            .stage_privacy_restore(StagePrivacyRestoreRequest {
+                backup_id: backup.backup_id,
+                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
+            })
+            .expect("stage while unified lineage is empty");
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+        assert!(paths.incoming.exists());
+        assert!(paths.marker.exists());
+        assert!(!paths.rollback.exists());
+
+        install_mapping_fixture(&manager);
+        invalidator.take_calls();
+        drop(manager);
+        let active_before_apply =
+            fs::read(&paths.active).expect("active Privacy after late lineage creation");
+
+        let error =
+            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                invalidator.clone(),
+            )
+            .expect_err("startup must recheck late lineage before any restore swap");
+
+        assert_eq!(error.code(), "privacy_restore_requires_five_components");
+        assert!(invalidator.take_calls().is_empty());
+        assert_eq!(
+            fs::read(&paths.active).expect("active Privacy after refused restore"),
+            active_before_apply
+        );
+        assert!(paths.incoming.exists());
+        assert!(paths.marker.exists());
+        assert!(!paths.rollback.exists());
+        let current = Connection::open_with_flags(
+            &paths.active,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("read current active Privacy");
+        assert_eq!(
+            current
+                .query_row("SELECT COUNT(*) FROM privacy_materials", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .expect("late unified lineage remains current"),
+            1
+        );
     }
 
     #[test]

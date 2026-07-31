@@ -5,11 +5,13 @@ import type { CaseWorkspaceController } from "./useCaseWorkspaceController";
 export interface CaseProjectListPanelProps {
   controller: CaseWorkspaceController;
   onBeforeProjectChange?: (projectId: string | null) => boolean;
+  externallyLocked?: boolean;
 }
 
 export function CaseProjectListPanel({
   controller,
   onBeforeProjectChange,
+  externallyLocked = false,
 }: CaseProjectListPanelProps) {
   const {
     caseProjects,
@@ -29,7 +31,7 @@ export function CaseProjectListPanel({
             </div>
             <div className="provider-create-row">
               <button
-                disabled={caseNavigationLocked}
+                disabled={caseNavigationLocked || externallyLocked}
                 type="button"
                 onClick={() => {
                   if (onBeforeProjectChange?.(null) === false) return;
@@ -47,10 +49,12 @@ export function CaseProjectListPanel({
                       ? "is-selected"
                       : ""
                   }`}
-                  disabled={caseNavigationLocked}
+                  disabled={caseNavigationLocked || externallyLocked}
+                  aria-disabled={caseNavigationLocked || externallyLocked}
                   key={project.projectId}
                   type="button"
                   onClick={() => {
+                    if (externallyLocked) return;
                     if (
                       project.projectId !== selectedCaseProjectId &&
                       onBeforeProjectChange?.(project.projectId) === false
@@ -80,7 +84,9 @@ export function CaseProjectListPanel({
               <nav className="case-pagination" aria-label="案件列表分页">
                 <button
                   disabled={
-                    caseNavigationLocked || paginatedCaseProjects.page <= 1
+                    caseNavigationLocked ||
+                    externallyLocked ||
+                    paginatedCaseProjects.page <= 1
                   }
                   type="button"
                   onClick={() =>
@@ -97,6 +103,7 @@ export function CaseProjectListPanel({
                 <button
                   disabled={
                     caseNavigationLocked ||
+                    externallyLocked ||
                     paginatedCaseProjects.page >= paginatedCaseProjects.totalPages
                   }
                   type="button"

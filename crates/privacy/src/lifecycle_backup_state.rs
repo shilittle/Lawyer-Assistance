@@ -75,16 +75,23 @@ fn decode_portable_bundle(
     if bundle.schema_version != PORTABLE_BACKUP_SCHEMA_VERSION {
         return Err(LifecycleError::BackupInvalid);
     }
-    let envelope = BASE64_STANDARD
-        .decode(bundle.envelope_base64.as_bytes())
-        .map_err(|_| LifecycleError::BackupInvalid)?;
-    let protected_state = BASE64_STANDARD
-        .decode(bundle.protected_state_base64.as_bytes())
-        .map_err(|_| LifecycleError::BackupInvalid)?;
+    let envelope = decode_bounded_base64(&bundle.envelope_base64, MAX_BACKUP_ENVELOPE_BYTES)?;
+    let protected_state = decode_bounded_base64(
+        &bundle.protected_state_base64,
+        MAX_PROTECTED_BACKUP_STATE_BYTES,
+    )?;
+    let envelope_metadata: BackupEnvelopeV1 =
+        strict_json_v1_from_slice(&envelope).map_err(|_| LifecycleError::BackupInvalid)?;
+    if let (Some(maximum_envelope_bytes), Some(maximum_portable_bytes)) = (
+        max_backup_envelope_bytes_for_schema(envelope_metadata.privacy_store_schema_version),
+        max_portable_backup_bytes_for_schema(envelope_metadata.privacy_store_schema_version),
+    ) {
+        if envelope.len() > maximum_envelope_bytes || bundle_bytes.len() > maximum_portable_bytes {
+            return Err(LifecycleError::BackupInvalid);
+        }
+    }
     if envelope.is_empty()
-        || envelope.len() > MAX_BACKUP_ENVELOPE_BYTES
         || protected_state.is_empty()
-        || protected_state.len() > MAX_PROTECTED_BACKUP_STATE_BYTES
         || sha256_hex(&envelope) != bundle.envelope_sha256
         || sha256_hex(&protected_state) != bundle.protected_state_sha256
     {
@@ -168,7 +175,7 @@ impl EncryptedPrivacyBackupStore {
     /// Restores the Privacy component of a coordinated pre-migration application backup.
     ///
     /// This API is intentionally not used by standalone Privacy restore. It accepts only the
-    /// current schema or an exact authenticated v1-v4 schema and restores the snapshot unchanged,
+    /// current schema or an exact authenticated v1-v5 schema and restores the snapshot unchanged,
     /// leaving any legacy-to-current upgrade to the post-backup startup gate.
     pub fn restore_detached_for_coordinated_pre_migration_restore(
         &self,
@@ -213,7 +220,7 @@ impl EncryptedPrivacyBackupStore {
     }
 
     /// Produces the portable inner bundle used by the coordinated five-component migration
-    /// backup. The exact expected v1-v4 schema is re-verified before any bytes are returned.
+    /// backup. The exact expected v1-v5 schema is re-verified before any bytes are returned.
     pub fn export_pre_migration_portable_bundle(
         &self,
         backup_id: &str,
@@ -230,7 +237,13 @@ impl EncryptedPrivacyBackupStore {
     ) -> Result<Vec<u8>, LifecycleError> {
         let envelope_path = self.backup_path(backup_id)?;
         let state_path = self.backup_state_path(backup_id)?;
-        let envelope = read_safe_file(&envelope_path, MAX_BACKUP_ENVELOPE_BYTES)?;
+        let maximum_envelope_bytes =
+            max_backup_envelope_bytes_for_schema(verified.privacy_store_schema_version)
+                .ok_or(LifecycleError::BackupInvalid)?;
+        let maximum_portable_bytes =
+            max_portable_backup_bytes_for_schema(verified.privacy_store_schema_version)
+                .ok_or(LifecycleError::BackupInvalid)?;
+        let envelope = read_safe_file(&envelope_path, maximum_envelope_bytes)?;
         let protected_state = read_safe_file(&state_path, MAX_PROTECTED_BACKUP_STATE_BYTES)?;
         if sha256_hex(&envelope) != verified.envelope_sha256 {
             return Err(LifecycleError::BackupTampered);
@@ -244,7 +257,7 @@ impl EncryptedPrivacyBackupStore {
             protected_state_base64: BASE64_STANDARD.encode(protected_state),
         };
         let bytes = canonical_json_v1(&bundle).map_err(|_| LifecycleError::BackupInvalid)?;
-        if bytes.is_empty() || bytes.len() > MAX_PORTABLE_BACKUP_BYTES {
+        if bytes.is_empty() || bytes.len() > maximum_portable_bytes {
             return Err(LifecycleError::BackupInvalid);
         }
         Ok(bytes)
@@ -290,7 +303,7 @@ impl EncryptedPrivacyBackupStore {
 
     /// Imports the Privacy component of a coordinated five-component migration rollback.
     ///
-    /// Unlike normal portable import, this narrow path may authenticate an exact v1-v4 snapshot.
+    /// Unlike normal portable import, this narrow path may authenticate an exact v1-v5 snapshot.
     /// It also accepts the current schema so the V3 application restore coordinator has one
     /// deterministic path. Future schemas are rejected, and existing IDs are accepted only when
     /// both encrypted files are byte-for-byte identical. Standalone Privacy restore must continue

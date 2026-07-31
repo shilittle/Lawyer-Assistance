@@ -61,6 +61,57 @@ fn fixture_v3() -> (
 }
 
 #[test]
+fn application_restore_uses_legacy_96_mib_and_current_v6_256_mib_privacy_limits() {
+    assert_eq!(
+        privacy_database_backup_maximum(5).expect("v5 migration restore limit"),
+        privacy::lifecycle::MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES
+    );
+    assert_eq!(
+        privacy_database_backup_maximum(PRIVACY_STORE_SCHEMA_VERSION)
+            .expect("current v6 restore limit"),
+        privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES
+    );
+    assert_eq!(
+        privacy_database_backup_maximum(PRIVACY_STORE_SCHEMA_VERSION + 1)
+            .expect_err("future schema is rejected")
+            .error_type,
+        "application_restore_invalid"
+    );
+
+    let page_size = 4_096_u64;
+    let legacy_pages = u64::try_from(privacy::lifecycle::MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES)
+        .expect("legacy maximum")
+        / page_size;
+    let current_pages = u64::try_from(privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES)
+        .expect("current maximum")
+        / page_size;
+    validate_privacy_database_page_values(5, legacy_pages, page_size)
+        .expect("v5 source at 96 MiB remains valid");
+    assert_eq!(
+        validate_privacy_database_page_values(5, legacy_pages + 1, page_size)
+            .expect_err("v5 source above 96 MiB is blocked before migration")
+            .error_type,
+        "migration_backup_privacy_source_too_large"
+    );
+    validate_privacy_database_page_values(
+        PRIVACY_STORE_SCHEMA_VERSION,
+        legacy_pages + 1,
+        page_size,
+    )
+    .expect("v6 source above the old ceiling remains valid");
+    assert_eq!(
+        validate_privacy_database_page_values(
+            PRIVACY_STORE_SCHEMA_VERSION,
+            current_pages + 1,
+            page_size,
+        )
+        .expect_err("v6 source above 256 MiB is blocked")
+        .error_type,
+        "migration_backup_privacy_source_too_large"
+    );
+}
+
+#[test]
 fn pre_migration_backup_gate_creates_one_fixed_five_component_backup_and_reuses_it() {
     let (directory, _, state, workflow, approved) = fixture_v3();
     let source_fingerprint = workflow
@@ -991,9 +1042,26 @@ fn five_component_restore_recovers_exact_v4_privacy_and_v1_vault_then_upgrades_a
         PrivacyStore::preflight_schema(
             &Connection::open(&privacy_database).expect("open upgraded active Privacy")
         )
-        .expect("upgraded active Privacy schema"),
-        PrivacyStoreSchemaStatus::Current
+        .expect("intermediate active Privacy schema"),
+        PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 5 }
     );
+    let active_projection_source_fingerprint = workflow
+        .approved_projection_migration_source_fingerprint()
+        .expect("active approved-projection source fingerprint");
+    ensure_pre_migration_application_backup(
+        directory.path(),
+        &state,
+        &workflow,
+        &approved.workspace,
+        APPROVED_CASE_PROJECTION_MIGRATION_ID,
+        &active_projection_source_fingerprint,
+    )
+    .expect("install the distinct active approved-projection backup");
+    workflow
+        .run_approved_projection_migration_after_backup_for_source(
+            &active_projection_source_fingerprint,
+        )
+        .expect("complete the active approved-projection migration");
 
     stage_application_restore_bytes_with_approved(
         directory.path(),
@@ -1098,9 +1166,35 @@ fn five_component_restore_recovers_exact_v4_privacy_and_v1_vault_then_upgrades_a
         PrivacyStore::preflight_schema(
             &Connection::open(&paths.privacy_active).expect("post-backup Privacy")
         )
-        .expect("post-backup current Privacy"),
+        .expect("post-backup unified Privacy"),
+        PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 5 }
+    );
+    restarted
+        .run_case_material_migration_after_backup_for_source(&source_fingerprint)
+        .expect("complete the restored unified case-material migration");
+    let projection_source_fingerprint = restarted
+        .approved_projection_migration_source_fingerprint()
+        .expect("approved-only projection source fingerprint");
+    ensure_pre_migration_application_backup(
+        directory.path(),
+        &restarted_state,
+        &restarted,
+        &approved.workspace,
+        APPROVED_CASE_PROJECTION_MIGRATION_ID,
+        &projection_source_fingerprint,
+    )
+    .expect("install the distinct source-bound approved-projection backup");
+    restarted
+        .run_approved_projection_migration_after_backup_for_source(&projection_source_fingerprint)
+        .expect("complete the approved-only projection migration");
+    assert_eq!(
+        PrivacyStore::preflight_schema(
+            &Connection::open(&paths.privacy_active).expect("post-projection Privacy")
+        )
+        .expect("post-projection current Privacy"),
         PrivacyStoreSchemaStatus::Current
     );
+    assert!(!restarted.privacy_store_schema_upgrade_required());
     let (_vault, vault_upgrade_required) =
         VaultStore::open_for_application_startup(&paths.vault_active, workspace)
             .expect("post-backup Vault");
@@ -1444,6 +1538,7 @@ fn v3_crash_after_four_components_finishes_exact_fifth_component_on_restart() {
         &paths.user_incoming,
         &paths.user_rollback,
         &marker.user_database_sha256,
+        MAX_USER_DATABASE_BACKUP_BYTES,
         |path| validate_user_component(path, &marker.user_database_sha256),
     )
     .expect("install user before crash");
@@ -1452,6 +1547,12 @@ fn v3_crash_after_four_components_finishes_exact_fifth_component_on_restart() {
         &paths.privacy_incoming,
         &paths.privacy_rollback,
         &marker.privacy_database_sha256,
+        privacy::lifecycle::max_backup_database_bytes_for_schema(
+            marker
+                .privacy_store_schema_version
+                .unwrap_or(PRIVACY_STORE_SCHEMA_VERSION),
+        )
+        .expect("supported Privacy restore schema"),
         |path| {
             validate_privacy_component(
                 path,
@@ -1576,6 +1677,258 @@ fn set_user_canary(path: &Path, value: &str) {
             (USER_CANARY_KEY, value),
         )
         .expect("write synthetic user database canary");
+}
+
+fn case_work_test_provider_snapshot_json() -> String {
+    serde_json::to_string(&serde_json::json!({
+        "kind": "deep_seek",
+        "modelId": "test-model",
+        "baseUrl": "https://api.example.invalid/v1",
+        "capabilities": {
+            "chat": true,
+            "streaming": true,
+            "customModelId": true,
+            "customBaseUrl": true,
+            "reasoning": true,
+        },
+        "options": {
+            "thinking": false,
+            "enableThinking": null,
+            "thinkingBudget": null,
+            "reasoningEffort": null,
+            "endpointId": null,
+            "workspaceId": null,
+            "allowPrivateNetwork": false,
+        },
+    }))
+    .expect("serialize no-credential provider snapshot")
+}
+
+fn install_case_assistant_pending_output(path: &Path, suffix: &str) {
+    let connection = database::open_user_database(path).expect("open user database");
+    let project_id = format!("case-pending-{suffix}");
+    let conversation_id = format!("case-pending-conversation-{suffix}");
+    let user_message_id = format!("case-pending-user-{suffix}");
+    let assistant_message_id = format!("case-pending-assistant-{suffix}");
+    let run_id = format!("case-pending-run-{suffix}");
+    let tool_call_id = format!("case-pending-tool-{suffix}");
+    let generation_id = format!("generation-{suffix}");
+    let source_snapshots_json = serde_json::to_string(&serde_json::json!([{
+        "approvedPayloadSha256": "c".repeat(64),
+        "extractionSha256": "d".repeat(64),
+        "generationId": generation_id,
+        "generationNumber": 1,
+        "generationRowVersion": 1,
+        "materialId": format!("material-{suffix}"),
+        "ordinal": 0,
+        "redactedContentSha256": "e".repeat(64),
+        "riskRevision": 1,
+        "riskRevisionHash": "f".repeat(64),
+        "selectionId": format!("selection-{suffix}"),
+        "selectionRowVersion": 1
+    }]))
+    .expect("serialize pending source lineage");
+    let source_snapshots_sha256 = sha256_hex(source_snapshots_json.as_bytes());
+    let output_payload_json = serde_json::to_string(&serde_json::json!({
+        "content": {},
+        "outputKind": "case_document",
+        "schemaVersion": 1
+    }))
+    .expect("serialize pending output");
+    let output_sha256 = sha256_hex(output_payload_json.as_bytes());
+    let provider_snapshot_json = case_work_test_provider_snapshot_json();
+    let provider_snapshot = serde_json::from_str::<serde_json::Value>(&provider_snapshot_json)
+        .expect("parse provider snapshot");
+    database::upsert_case_project(
+        &connection,
+        &database::CaseProjectRow {
+            project_id: project_id.clone(),
+            title: "Pending lineage project".to_owned(),
+            case_type: "civil".to_owned(),
+            status: "active".to_owned(),
+            opened_on: None,
+            summary: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        },
+    )
+    .expect("create pending lineage project");
+    database::create_case_work_conversation(
+        &connection,
+        &conversation_id,
+        &project_id,
+        "Pending lineage conversation",
+    )
+    .expect("create pending lineage conversation");
+    database::create_message(
+        &connection,
+        &database::NewMessageRow {
+            message_id: user_message_id.clone(),
+            conversation_id: conversation_id.clone(),
+            role: "user".to_owned(),
+            kind: "text".to_owned(),
+            text_summary: "Question".to_owned(),
+            artifact_id: None,
+            run_id: None,
+        },
+    )
+    .expect("create pending lineage user message");
+    database::create_agent_run(
+        &connection,
+        &database::NewAgentRunRow {
+            run_id: run_id.clone(),
+            conversation_id: conversation_id.clone(),
+            user_message_id,
+            provider_id: None,
+            provider_snapshot_json: provider_snapshot_json.clone(),
+            intent: "interactive_case_work".to_owned(),
+            status: "queued".to_owned(),
+            budget_json: "{}".to_owned(),
+        },
+    )
+    .expect("create pending lineage run");
+    database::create_tool_call(
+        &connection,
+        &database::NewToolCallRow {
+            tool_call_id: tool_call_id.clone(),
+            run_id: run_id.clone(),
+            ordinal: 0,
+            capability_name: "assistant.case_work".to_owned(),
+            status: "running".to_owned(),
+            access_mode: "write".to_owned(),
+            requires_confirmation: false,
+            input_audit_json: serde_json::to_string(&serde_json::json!({
+                "requestId": run_id,
+                "runId": run_id,
+                "capability": "assistant.case_work",
+                "classification": "case_redacted_approved",
+                "inputIds": {
+                    "projectId": project_id,
+                    "conversationId": conversation_id,
+                    "redactionGenerationIds": [generation_id],
+                },
+                "inputHashes": {
+                    "promptSha256": "1".repeat(64),
+                    "historySha256": "2".repeat(64),
+                    "minimalContextSha256": "3".repeat(64),
+                    "generationSetSha256": "4".repeat(64),
+                    "workspaceDigest": "b".repeat(64),
+                },
+                "inputCounts": {
+                    "promptBytes": 1,
+                    "historyMessages": 0,
+                    "historyBytes": 0,
+                    "generationCount": 1,
+                    "knownBodyBytes": 1,
+                },
+                "providerSnapshot": provider_snapshot,
+                "confirmation": {
+                    "writebackRequired": true,
+                    "received": false,
+                },
+                "status": "running",
+            }))
+            .expect("serialize pending input audit"),
+            output_audit_json: "{}".to_owned(),
+            source_audit_json: "{}".to_owned(),
+        },
+    )
+    .expect("create pending lineage tool audit");
+    database::create_message(
+        &connection,
+        &database::NewMessageRow {
+            message_id: assistant_message_id.clone(),
+            conversation_id: conversation_id.clone(),
+            role: "assistant".to_owned(),
+            kind: "text".to_owned(),
+            text_summary: "Pending output".to_owned(),
+            artifact_id: None,
+            run_id: Some(run_id.clone()),
+        },
+    )
+    .expect("create pending lineage assistant message");
+    assert!(matches!(
+        database::compare_and_set_tool_call_status(
+            &connection,
+            &tool_call_id,
+            "running",
+            "succeeded",
+            &serde_json::to_string(&serde_json::json!({
+                "outputIds": {"pendingOutputKind": "case_document"},
+                "outputHashes": {
+                    "providerOutputSha256": "5".repeat(64),
+                    "typedOutputSha256": output_sha256,
+                    "approvedEnvelopeSha256": "6".repeat(64),
+                    "proposalSourceRefsSha256": sha256_hex(b"[]"),
+                },
+                "outputCounts": {
+                    "approvedEnvelopeBytes": 1,
+                    "bytes": 1,
+                    "items": 1,
+                },
+                "status": "succeeded",
+                "confirmation": {
+                    "writebackRequired": true,
+                    "received": false,
+                },
+            }))
+            .expect("serialize pending output audit"),
+            &serde_json::to_string(&serde_json::json!({
+                "classification": "case_redacted_approved",
+                "sourceRefs": [generation_id],
+                "inputHashes": {
+                    "projectBindingSha256": "a".repeat(64),
+                    "sourceSnapshotsSha256": source_snapshots_sha256,
+                    "aggregateSourceSha256": "7".repeat(64),
+                    "aggregateExtractionSha256": "8".repeat(64),
+                    "aggregateRedactedContentSha256": "9".repeat(64),
+                },
+                "providerSnapshot": provider_snapshot,
+                "confirmation": {
+                    "writebackRequired": true,
+                    "received": false,
+                },
+            }))
+            .expect("serialize pending source audit"),
+            None,
+        )
+        .expect("complete pending lineage tool audit"),
+        database::ToolCallStatusUpdateResult::Updated(_)
+    ));
+    assert!(matches!(
+        database::compare_and_set_agent_run_status(
+            &connection,
+            &run_id,
+            "queued",
+            "succeeded",
+            Some(&assistant_message_id),
+            None,
+        )
+        .expect("complete pending lineage run"),
+        database::AgentRunStatusUpdateResult::Updated(_)
+    ));
+    database::create_case_assistant_pending_output(
+        &connection,
+        &database::NewCaseAssistantPendingOutputRow {
+            pending_output_id: format!("case-pending-output-{suffix}"),
+            project_id,
+            conversation_id,
+            run_id,
+            assistant_message_id,
+            project_binding_sha256: "a".repeat(64),
+            source_snapshots_sha256,
+            source_snapshots_json,
+            expected_proposal_source_refs_json: "[]".to_owned(),
+            expected_proposal_source_refs_sha256: sha256_hex(b"[]"),
+            output_kind: "case_document".to_owned(),
+            output_sha256,
+            output_payload_json,
+            output_preview: "Pending output".to_owned(),
+            output_version: 1,
+            workspace_base_digest: "b".repeat(64),
+        },
+    )
+    .expect("create independent pending-output lineage");
 }
 
 fn user_write_is_busy(path: &Path, value: &str) -> bool {
@@ -1932,6 +2285,86 @@ fn three_component_restore_refuses_project_deletion_journal_lineage_without_stag
         .expect("project deletion lineage count");
     assert_eq!(deletion_count, 1);
     assert_no_restore_residue(&application_restore_paths(directory.path()));
+}
+
+#[test]
+fn three_component_restore_refuses_case_assistant_pending_output_lineage() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
+    let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+        .expect("build legacy three-component backup");
+    install_case_assistant_pending_output(state.user_database_path(), "before-stage");
+
+    let error = stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect_err("legacy restore must not discard pending-output lineage");
+    assert_eq!(
+        error.error_type,
+        "application_restore_requires_five_components"
+    );
+    let connection =
+        database::open_user_database(state.user_database_path()).expect("reopen user database");
+    assert_eq!(
+        database::list_case_assistant_pending_outputs(
+            &connection,
+            "case-pending-before-stage",
+            "case-pending-conversation-before-stage",
+            10,
+        )
+        .expect("list preserved pending outputs")
+        .len(),
+        1
+    );
+    assert_no_restore_residue(&application_restore_paths(directory.path()));
+}
+
+#[test]
+fn pending_three_component_restore_rechecks_case_assistant_pending_output_lineage() {
+    let (directory, workspace, state, workflow) = fixture();
+    set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
+    let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+        .expect("build legacy three-component backup");
+    stage_application_restore_bytes(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &bundle,
+    )
+    .expect("stage while pending-output lineage is empty");
+    let paths = application_restore_paths(directory.path());
+    install_case_assistant_pending_output(state.user_database_path(), "before-install");
+    drop(workflow);
+    drop(state);
+
+    let error = apply_pending_application_restore(directory.path(), &workspace)
+        .expect_err("startup must recheck pending-output lineage before the first swap");
+    assert_eq!(
+        error.error_type,
+        "application_restore_requires_five_components"
+    );
+    let connection = database::open_user_database(database::user_database_path(directory.path()))
+        .expect("reopen current user database");
+    assert_eq!(
+        database::list_case_assistant_pending_outputs(
+            &connection,
+            "case-pending-before-install",
+            "case-pending-conversation-before-install",
+            10,
+        )
+        .expect("list preserved pending outputs")
+        .len(),
+        1
+    );
+    assert!(paths.marker.exists());
+    assert!(paths.user_incoming.exists());
+    assert!(!paths.user_rollback.exists());
+    cleanup_pair_incoming(&paths).expect("clean refused synthetic restore transaction");
+    assert_no_restore_residue(&paths);
 }
 
 #[test]

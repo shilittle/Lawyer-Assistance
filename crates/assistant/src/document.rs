@@ -863,7 +863,7 @@ fn contains_hash(value: &str) -> bool {
             has_digit |= byte.is_ascii_digit();
             has_hex_letter |= matches!(byte.to_ascii_lowercase(), b'a'..=b'f');
         } else {
-            if length >= 16 && has_digit && has_hex_letter {
+            if length >= 64 || (length >= 16 && has_digit && has_hex_letter) {
                 return true;
             }
             length = 0;

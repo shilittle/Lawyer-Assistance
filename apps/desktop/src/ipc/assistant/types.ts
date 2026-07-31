@@ -8,6 +8,7 @@ export type JsonValue =
 
 export type AssistantCapabilityName =
   | "assistant.interactive_chat"
+  | "assistant.case_work"
   | "legal.search"
   | "legal.read"
   | "file.import"

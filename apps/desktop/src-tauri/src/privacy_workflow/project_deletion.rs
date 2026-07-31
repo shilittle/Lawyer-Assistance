@@ -288,6 +288,11 @@ impl PrivacyWorkflowManager {
 
         let current_scope = load_and_validate_scope(&privacy_connection, &project_id)?;
         ensure_no_legal_hold(&privacy_connection, &current_scope)?;
+        let deletion_id = existing_journal
+            .as_ref()
+            .map(|journal| journal.deletion_id.clone())
+            .unwrap_or_else(new_project_deletion_id);
+        preflight_user_project_delete(&user_transaction, &project_id, &deletion_id)?;
         let journal = match existing_journal {
             Some(journal) => {
                 ensure_scope_matches(&journal, &current_scope)?;
@@ -296,6 +301,7 @@ impl PrivacyWorkflowManager {
             None => {
                 let journal = insert_prepared_journal(
                     &mut privacy_connection,
+                    deletion_id,
                     current_scope,
                     self.current_unix()?,
                 )?;
@@ -317,8 +323,12 @@ impl PrivacyWorkflowManager {
         if journal.state == JournalState::UserDeleted {
             return Err(project_deletion_journal_error());
         }
-        let deleted = database::delete_case_project(&user_transaction, project_id.as_str())
-            .map_err(|_| project_source_error())?;
+        let deleted = database::delete_case_project(
+            &user_transaction,
+            project_id.as_str(),
+            &journal.deletion_id,
+        )
+        .map_err(|_| project_source_error())?;
         if !deleted {
             return Err(project_source_changed_error());
         }
@@ -358,6 +368,11 @@ impl PrivacyWorkflowManager {
             JournalState::PrivacyRevoked | JournalState::UserDeleted => {
                 verify_privacy_revoked(privacy_connection, &journal.scope)?;
                 self.invalidate_project_external_scope(&journal.scope)?;
+                retire_absent_project_id(
+                    &user_transaction,
+                    &journal.project_id,
+                    &journal.deletion_id,
+                )?;
                 user_transaction
                     .commit()
                     .map_err(|_| project_source_error())?;
@@ -370,6 +385,11 @@ impl PrivacyWorkflowManager {
                 Ok(true)
             }
             JournalState::Completed => {
+                retire_absent_project_id(
+                    &user_transaction,
+                    &journal.project_id,
+                    &journal.deletion_id,
+                )?;
                 user_transaction
                     .commit()
                     .map_err(|_| project_source_error())?;
@@ -423,6 +443,11 @@ impl PrivacyWorkflowManager {
         let user_transaction = user_connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| project_source_error())?;
+        if database::case_project_id_is_retired(&user_transaction, project_id.as_str())
+            .map_err(|_| project_source_error())?
+        {
+            return Err(project_id_retired_error());
+        }
         let privacy_connection = self.open_connection()?;
         initialize_schema(&privacy_connection)?;
         let exists = user_project_exists(&user_transaction, &project_id)?;
@@ -489,6 +514,7 @@ impl PrivacyWorkflowManager {
             if project_exists {
                 return Err(project_id_retired_error());
             }
+            retire_absent_project_id(&user_transaction, &journal.project_id, &journal.deletion_id)?;
             user_transaction
                 .commit()
                 .map_err(|_| project_source_error())?;
@@ -510,6 +536,7 @@ impl PrivacyWorkflowManager {
             let current_scope = load_and_validate_scope(privacy_connection, project_id)?;
             ensure_scope_matches(&journal, &current_scope)?;
             ensure_no_legal_hold(privacy_connection, &current_scope)?;
+            preflight_user_project_delete(&user_transaction, project_id, &journal.deletion_id)?;
         }
 
         if journal.state == JournalState::Prepared {
@@ -521,11 +548,17 @@ impl PrivacyWorkflowManager {
         }
 
         if project_exists {
-            let deleted = database::delete_case_project(&user_transaction, project_id.as_str())
-                .map_err(|_| project_source_error())?;
+            let deleted = database::delete_case_project(
+                &user_transaction,
+                project_id.as_str(),
+                &journal.deletion_id,
+            )
+            .map_err(|_| project_source_error())?;
             if !deleted {
                 return Err(project_source_changed_error());
             }
+        } else {
+            retire_absent_project_id(&user_transaction, &journal.project_id, &journal.deletion_id)?;
         }
         user_transaction
             .commit()
@@ -773,6 +806,41 @@ fn user_project_exists(
         .map_err(|_| project_source_error())
 }
 
+fn preflight_user_project_delete(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    privacy_deletion_id: &str,
+) -> Result<(), PrivacyWorkflowError> {
+    match database::preflight_delete_case_project(
+        transaction,
+        project_id.as_str(),
+        privacy_deletion_id,
+    )
+    .map_err(|_| project_source_error())?
+    {
+        true => Ok(()),
+        false => Err(project_source_changed_error()),
+    }
+}
+
+fn retire_absent_project_id(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    privacy_deletion_id: &str,
+) -> Result<(), PrivacyWorkflowError> {
+    if database::retire_absent_case_project_id_after_privacy_revocation(
+        transaction,
+        project_id.as_str(),
+        privacy_deletion_id,
+    )
+    .map_err(|_| project_source_error())?
+    {
+        Ok(())
+    } else {
+        Err(project_source_changed_error())
+    }
+}
+
 fn load_and_validate_scope(
     connection: &Connection,
     project_id: &ProjectId,
@@ -898,13 +966,13 @@ fn ensure_no_legal_hold(
 
 fn insert_prepared_journal(
     connection: &mut Connection,
+    deletion_id: String,
     scope: ProjectDeletionScope,
     created_at_unix: u64,
 ) -> Result<ProjectDeletionJournal, PrivacyWorkflowError> {
-    if created_at_unix == 0 {
+    if created_at_unix == 0 || !valid_project_deletion_id(&deletion_id) {
         return Err(project_deletion_journal_error());
     }
-    let deletion_id = format!("pdel_{}", Uuid::new_v4().simple());
     let scope_json = String::from_utf8(scope.canonical_bytes()?)
         .map_err(|_| project_deletion_journal_error())?;
     let scope_sha256 = scope.fingerprint()?;
@@ -940,6 +1008,19 @@ fn insert_prepared_journal(
     })
 }
 
+fn new_project_deletion_id() -> String {
+    format!("pdel_{}", Uuid::new_v4().simple())
+}
+
+fn valid_project_deletion_id(value: &str) -> bool {
+    value.len() == 37
+        && value.starts_with("pdel_")
+        && value[5..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value[5..]
+            .bytes()
+            .all(|byte| !byte.is_ascii_alphabetic() || byte.is_ascii_lowercase())
+}
+
 fn load_journal_for_project(
     connection: &Connection,
     project_id: &ProjectId,
@@ -965,7 +1046,7 @@ fn load_journal_for_project(
     row.map(|row| {
         let stored_project_id =
             ProjectId::parse(row.1).map_err(PrivacyWorkflowError::project_case_binding)?;
-        if &stored_project_id != project_id {
+        if &stored_project_id != project_id || !valid_project_deletion_id(&row.0) {
             return Err(project_deletion_journal_error());
         }
         let scope: ProjectDeletionScope =
@@ -1364,6 +1445,10 @@ mod tests {
     use super::*;
     use crate::privacy_workflow::ApprovedPublicationInvalidator;
     use privacy::vnext::{CaseId, MaterialId};
+    use privacy::{
+        ApproveReviewWithRiskRevision, ApprovedCasePageV1, ApprovedCasePayloadV1, PrivacyStore,
+        SaveRiskReviewRevision, APPROVED_CASE_PAYLOAD_SCHEMA_VERSION,
+    };
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -1374,6 +1459,13 @@ mod tests {
     const LEGACY_REDACTION_ID: &str = "red_77777777777777777777777777777777";
     const RECEIPT_ID: &str = "rcpt_44444444444444444444444444444444";
     const OUTPUT_ID: &str = "out_55555555555555555555555555555555";
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureRedactedContent<'a> {
+        schema_version: u16,
+        pages: &'a [ApprovedCasePageV1],
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum InvalidationCall {
@@ -1539,74 +1631,141 @@ mod tests {
                         'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
                         32,4102444800,1,1700000000,'review_ready'
                     );
-                    INSERT INTO privacy_redactions(
+                    ",
+                )
+                .expect("seed project material fixture");
+
+            let pages = vec![ApprovedCasePageV1 {
+                page_number: 1,
+                text: "project deletion fixture approved text".to_owned(),
+            }];
+            let approved_payload = ApprovedCasePayloadV1 {
+                schema_version: APPROVED_CASE_PAYLOAD_SCHEMA_VERSION,
+                source_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                extraction_sha256:
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                media_type: "text/plain".to_owned(),
+                pages,
+            };
+            let approved_payload_plaintext = approved_payload
+                .canonical_bytes()
+                .expect("canonical approved projection fixture");
+            let approved_payload_sha256 = sha256_hex(&approved_payload_plaintext);
+            let redacted_content_sha256 = sha256_hex(
+                &serde_json::to_vec(&FixtureRedactedContent {
+                    schema_version: APPROVED_CASE_PAYLOAD_SCHEMA_VERSION,
+                    pages: &approved_payload.pages,
+                })
+                .expect("canonical redacted-content fixture"),
+            );
+            privacy
+                .execute(
+                    "INSERT INTO privacy_redactions(
                         redaction_id,material_id,generation_number,extraction_sha256,
-                        redacted_content_sha256,approved_payload_sha256,policy_id,
-                        policy_version,detector_version,unresolved_high_risk_count,
-                        review_state,risk_revision,protected_review_blob,protection_scheme,
-                        reviewed_by_sha256,approved_at,reviewed_at
-                    ) VALUES(
-                        'red_33333333333333333333333333333333',
-                        'mat_22222222222222222222222222222222',1,
-                        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-                        'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-                        'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                        'policy',1,'detector',0,'approved',1,X'01020304',
-                        'windows_dpapi_current_user_v1',
-                        'abababababababababababababababababababababababababababababababab',
-                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-                    );
+                        redacted_content_sha256,policy_id,policy_version,detector_version,
+                        unresolved_high_risk_count,review_state,protected_review_blob,
+                        protection_scheme
+                     ) VALUES(?1,?2,1,?3,?4,'policy',1,'detector',0,
+                              'review_required',X'01020304',
+                              'windows_dpapi_current_user_v1')",
+                    params![
+                        REDACTION_ID,
+                        MATERIAL_ID,
+                        approved_payload.extraction_sha256,
+                        redacted_content_sha256,
+                    ],
+                )
+                .expect("seed review-required generation");
+            let risk_sha256 = sha256_hex(b"project deletion fixture risk");
+            let hard_gate_sha256 = sha256_hex(b"project deletion fixture hard gate");
+            let reviewer_sha256 = sha256_hex(b"project deletion fixture reviewer");
+            let reason_codes = Vec::new();
+            PrivacyStore::approve_review_with_risk_revision(
+                &mut privacy,
+                &ApproveReviewWithRiskRevision {
+                    redaction_id: REDACTION_ID,
+                    expected_redacted_sha256: &redacted_content_sha256,
+                    approved_redacted_content_sha256: &redacted_content_sha256,
+                    approved_payload_sha256: &approved_payload_sha256,
+                    reviewed_by_sha256: &reviewer_sha256,
+                    approved_review_payload_plaintext: b"project deletion fixture full review",
+                    approved_payload_plaintext: &approved_payload_plaintext,
+                    risk_revision: SaveRiskReviewRevision {
+                        redaction_id: REDACTION_ID,
+                        expected_previous_revision: 0,
+                        risk_sha256: &risk_sha256,
+                        hard_gate_sha256: &hard_gate_sha256,
+                        action_code: "full_review_approved",
+                        reason_codes: &reason_codes,
+                        state_plaintext: b"project deletion fixture risk state",
+                    },
+                },
+            )
+            .expect("atomically approve safe projection fixture");
+            privacy
+                .execute_batch(
+                    "
                     INSERT INTO privacy_retention_bindings(
                         redaction_id,expires_at_unix,legal_hold,bound_at_unix,policy_revision
                     ) VALUES(
                         'red_33333333333333333333333333333333',4102444800,0,1700000000,1
                     );
-                    INSERT INTO privacy_receipts(
+                    ",
+                )
+                .expect("seed retention binding fixture");
+            privacy
+                .execute(
+                    "INSERT INTO privacy_receipts(
                         receipt_id,redaction_id,signed_token,destination_kind,
                         destination_identifier_sha256,purpose,payload_sha256,policy_id,
                         policy_version,issued_at_unix,expires_at_unix
-                    ) VALUES(
-                        'rcpt_44444444444444444444444444444444',
-                        'red_33333333333333333333333333333333','signed-fixture',
-                        'external_mcp_host',
+                     ) VALUES(
+                        ?1,?2,'signed-fixture','external_mcp_host',
                         '1212121212121212121212121212121212121212121212121212121212121212',
-                        'approved-material-read',
-                        'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                        'policy',1,1700000000,4102444800
-                    );
-                    INSERT INTO case_material_selections(
+                        'approved-material-read',?3,'policy',1,1700000000,4102444800
+                     )",
+                    params![RECEIPT_ID, REDACTION_ID, approved_payload_sha256],
+                )
+                .expect("seed receipt fixture");
+            privacy
+                .execute(
+                    "INSERT INTO case_material_selections(
                         selection_id,project_id,material_id,redaction_id,purpose,
                         selected_by_user,selected_at,selected_generation_number,
                         selected_approved_payload_sha256,selected_risk_revision
-                    ) VALUES(
-                        'sel_66666666666666666666666666666666',
-                        'case-project-delete-test',
-                        'mat_22222222222222222222222222222222',
-                        'red_33333333333333333333333333333333',
-                        'case_assistant',1,CURRENT_TIMESTAMP,1,
-                        'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',1
-                    );
-                    INSERT INTO privacy_approved_outputs(
+                     ) VALUES(
+                        'sel_66666666666666666666666666666666',?1,?2,?3,
+                        'interactive_case_work',1,CURRENT_TIMESTAMP,1,?4,1
+                     )",
+                    params![
+                        PROJECT_ID,
+                        MATERIAL_ID,
+                        REDACTION_ID,
+                        approved_payload_sha256
+                    ],
+                )
+                .expect("seed exact case-work selection fixture");
+            privacy
+                .execute(
+                    "INSERT INTO privacy_approved_outputs(
                         output_id,redaction_id,approval_generation_id,receipt_id,
                         provider_sha256,model_sha256,purpose_sha256,
                         approved_payload_sha256,content_sha256,content_bytes,
                         protected_content,protection_scheme,created_at_unix,expires_at_unix
-                    ) VALUES(
-                        'out_55555555555555555555555555555555',
-                        'red_33333333333333333333333333333333',
-                        'rcpt_44444444444444444444444444444444',
-                        'rcpt_44444444444444444444444444444444',
+                     ) VALUES(
+                        ?1,?2,?3,?3,
                         '1313131313131313131313131313131313131313131313131313131313131313',
                         '1414141414141414141414141414141414141414141414141414141414141414',
                         '1515151515151515151515151515151515151515151515151515151515151515',
-                        'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                        ?4,
                         '1616161616161616161616161616161616161616161616161616161616161616',
                         4,X'01020304','windows_dpapi_current_user_v1',
                         1700000000,4102444800
-                    );
-                    ",
+                     )",
+                    params![OUTPUT_ID, REDACTION_ID, RECEIPT_ID, approved_payload_sha256],
                 )
-                .expect("seed five-store lifecycle fixture");
+                .expect("seed approved output fixture");
         }
 
         fn user_connection(&self) -> Connection {
@@ -1626,6 +1785,580 @@ mod tests {
                 )
                 .expect("project existence")
         }
+    }
+
+    const CASE_WORK_CONVERSATION_ID: &str = "case-work-delete-conversation";
+    const CASE_WORK_RUN_ID: &str = "case-work-delete-run";
+    const CASE_WORK_USER_MESSAGE_ID: &str = "case-work-delete-user-message";
+    const CASE_WORK_ASSISTANT_MESSAGE_ID: &str = "case-work-delete-assistant-message";
+    const CASE_WORK_TOOL_CALL_ID: &str = "case-work-delete-tool-call";
+    const CASE_WORK_PENDING_OUTPUT_ID: &str = "case-work-delete-pending-output";
+    const CASE_WORK_PROPOSAL_ID: &str = "case-work-delete-proposal";
+    const CASE_WORK_ARTIFACT_ID: &str = "case-work-delete-artifact";
+    const ASSISTANT_CONVERSATION_ID: &str = "assistant-delete-preserved";
+    const ASSISTANT_MESSAGE_ID: &str = "assistant-delete-preserved-message";
+
+    #[derive(Clone, Copy)]
+    enum CaseWorkDeletionVariant {
+        Empty,
+        Pending,
+        ConfirmedProposal,
+        ConfirmedArtifact,
+    }
+
+    fn case_work_source_snapshots_json() -> String {
+        serde_json::to_string(&serde_json::json!([{
+            "approvedPayloadSha256": "1".repeat(64),
+            "extractionSha256": "2".repeat(64),
+            "generationId": "generation-one",
+            "generationNumber": 1,
+            "generationRowVersion": 1,
+            "materialId": MATERIAL_ID,
+            "ordinal": 0,
+            "redactedContentSha256": "3".repeat(64),
+            "riskRevision": 1,
+            "riskRevisionHash": "4".repeat(64),
+            "selectionId": "selection-one",
+            "selectionRowVersion": 1
+        }]))
+        .expect("case-work source snapshots serialize")
+    }
+
+    fn case_work_output_payload_json(output_kind: &str) -> String {
+        let content = if output_kind == "case_analysis" {
+            serde_json::json!({"changes": []})
+        } else {
+            serde_json::json!({"body": "case-work deletion fixture"})
+        };
+        serde_json::to_string(&serde_json::json!({
+            "content": content,
+            "outputKind": output_kind,
+            "schemaVersion": 1
+        }))
+        .expect("case-work output serializes")
+    }
+
+    fn case_work_provider_snapshot_json() -> String {
+        serde_json::to_string(&serde_json::json!({
+            "kind": "deep_seek",
+            "modelId": "test-model",
+            "baseUrl": "https://api.example.invalid/v1",
+            "capabilities": {
+                "chat": true,
+                "streaming": true,
+                "customModelId": true,
+                "customBaseUrl": true,
+                "reasoning": true,
+            },
+            "options": {
+                "thinking": false,
+                "enableThinking": null,
+                "thinkingBudget": null,
+                "reasoningEffort": null,
+                "endpointId": null,
+                "workspaceId": null,
+                "allowPrivateNetwork": false,
+            },
+        }))
+        .expect("case-work provider snapshot serializes")
+    }
+
+    fn seed_case_work_deletion_variant(fixture: &Fixture, variant: CaseWorkDeletionVariant) {
+        let mut user = fixture.user_connection();
+        database::create_conversation(
+            &user,
+            ASSISTANT_CONVERSATION_ID,
+            Some(PROJECT_ID),
+            "Preserved assistant history",
+        )
+        .expect("assistant conversation creates");
+        database::create_message(
+            &user,
+            &database::NewMessageRow {
+                message_id: ASSISTANT_MESSAGE_ID.to_owned(),
+                conversation_id: ASSISTANT_CONVERSATION_ID.to_owned(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "preserve ordinary assistant history".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("assistant message creates");
+        database::create_case_work_conversation(
+            &user,
+            CASE_WORK_CONVERSATION_ID,
+            PROJECT_ID,
+            "Case-work deletion fixture",
+        )
+        .expect("case-work conversation creates");
+        if matches!(variant, CaseWorkDeletionVariant::Empty) {
+            return;
+        }
+        let workspace_base_digest = database::case_workspace_digest(&user, PROJECT_ID)
+            .expect("workspace digest computes")
+            .expect("project exists");
+        let output_kind = if matches!(variant, CaseWorkDeletionVariant::ConfirmedProposal) {
+            "case_analysis"
+        } else {
+            "case_document"
+        };
+        let snapshots = case_work_source_snapshots_json();
+        let source_snapshots_sha256 = sha256_hex(snapshots.as_bytes());
+        let output_payload = case_work_output_payload_json(output_kind);
+        let output_sha256 = sha256_hex(output_payload.as_bytes());
+        let provider_snapshot_json = case_work_provider_snapshot_json();
+        let provider_snapshot = serde_json::from_str::<serde_json::Value>(&provider_snapshot_json)
+            .expect("case-work provider snapshot parses");
+        let generation_ids = vec!["generation-one"];
+        let input_audit_json = serde_json::to_string(&serde_json::json!({
+            "requestId": CASE_WORK_RUN_ID,
+            "runId": CASE_WORK_RUN_ID,
+            "capability": "assistant.case_work",
+            "classification": "case_redacted_approved",
+            "inputIds": {
+                "projectId": PROJECT_ID,
+                "conversationId": CASE_WORK_CONVERSATION_ID,
+                "redactionGenerationIds": generation_ids,
+            },
+            "inputHashes": {
+                "promptSha256": "1".repeat(64),
+                "historySha256": "2".repeat(64),
+                "minimalContextSha256": "3".repeat(64),
+                "generationSetSha256": "4".repeat(64),
+                "workspaceDigest": workspace_base_digest,
+            },
+            "inputCounts": {
+                "promptBytes": 1,
+                "historyMessages": 0,
+                "historyBytes": 0,
+                "generationCount": 1,
+                "knownBodyBytes": 1,
+            },
+            "providerSnapshot": provider_snapshot,
+            "confirmation": {
+                "writebackRequired": true,
+                "received": false,
+            },
+            "status": "running",
+        }))
+        .expect("case-work input audit serializes");
+        let output_audit_json = serde_json::to_string(&serde_json::json!({
+            "outputIds": {"pendingOutputKind": output_kind},
+            "outputHashes": {
+                "providerOutputSha256": "5".repeat(64),
+                "typedOutputSha256": output_sha256,
+                "approvedEnvelopeSha256": "6".repeat(64),
+                "proposalSourceRefsSha256": sha256_hex(b"[]"),
+            },
+            "outputCounts": {
+                "approvedEnvelopeBytes": 1,
+                "bytes": 1,
+                "items": 1,
+            },
+            "status": "succeeded",
+            "confirmation": {
+                "writebackRequired": true,
+                "received": false,
+            },
+        }))
+        .expect("case-work output audit serializes");
+        let source_audit_json = serde_json::to_string(&serde_json::json!({
+            "classification": "case_redacted_approved",
+            "sourceRefs": generation_ids,
+            "inputHashes": {
+                "projectBindingSha256": "a".repeat(64),
+                "sourceSnapshotsSha256": source_snapshots_sha256,
+                "aggregateSourceSha256": "7".repeat(64),
+                "aggregateExtractionSha256": "8".repeat(64),
+                "aggregateRedactedContentSha256": "9".repeat(64),
+            },
+            "providerSnapshot": provider_snapshot,
+            "confirmation": {
+                "writebackRequired": true,
+                "received": false,
+            },
+        }))
+        .expect("case-work source audit serializes");
+
+        database::create_message(
+            &user,
+            &database::NewMessageRow {
+                message_id: CASE_WORK_USER_MESSAGE_ID.to_owned(),
+                conversation_id: CASE_WORK_CONVERSATION_ID.to_owned(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "case-work question".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("case-work user message creates");
+        database::create_agent_run(
+            &user,
+            &database::NewAgentRunRow {
+                run_id: CASE_WORK_RUN_ID.to_owned(),
+                conversation_id: CASE_WORK_CONVERSATION_ID.to_owned(),
+                user_message_id: CASE_WORK_USER_MESSAGE_ID.to_owned(),
+                provider_id: None,
+                provider_snapshot_json: provider_snapshot_json.clone(),
+                intent: "interactive_case_work".to_owned(),
+                status: "running".to_owned(),
+                budget_json: "{}".to_owned(),
+            },
+        )
+        .expect("case-work run creates");
+        database::create_tool_call(
+            &user,
+            &database::NewToolCallRow {
+                tool_call_id: CASE_WORK_TOOL_CALL_ID.to_owned(),
+                run_id: CASE_WORK_RUN_ID.to_owned(),
+                ordinal: 0,
+                capability_name: "assistant.case_work".to_owned(),
+                status: "running".to_owned(),
+                access_mode: "write".to_owned(),
+                requires_confirmation: false,
+                input_audit_json,
+                output_audit_json: "{}".to_owned(),
+                source_audit_json: "{}".to_owned(),
+            },
+        )
+        .expect("case-work tool audit creates");
+        database::create_message(
+            &user,
+            &database::NewMessageRow {
+                message_id: CASE_WORK_ASSISTANT_MESSAGE_ID.to_owned(),
+                conversation_id: CASE_WORK_CONVERSATION_ID.to_owned(),
+                role: "assistant".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "case-work response".to_owned(),
+                artifact_id: None,
+                run_id: Some(CASE_WORK_RUN_ID.to_owned()),
+            },
+        )
+        .expect("case-work assistant message creates");
+        assert!(matches!(
+            database::compare_and_set_tool_call_status(
+                &user,
+                CASE_WORK_TOOL_CALL_ID,
+                "running",
+                "succeeded",
+                &output_audit_json,
+                &source_audit_json,
+                None,
+            )
+            .expect("case-work tool audit succeeds"),
+            database::ToolCallStatusUpdateResult::Updated(_)
+        ));
+        assert!(matches!(
+            database::compare_and_set_agent_run_status(
+                &user,
+                CASE_WORK_RUN_ID,
+                "running",
+                "succeeded",
+                Some(CASE_WORK_ASSISTANT_MESSAGE_ID),
+                None,
+            )
+            .expect("case-work run succeeds"),
+            database::AgentRunStatusUpdateResult::Updated(_)
+        ));
+        let pending = database::NewCaseAssistantPendingOutputRow {
+            pending_output_id: CASE_WORK_PENDING_OUTPUT_ID.to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            conversation_id: CASE_WORK_CONVERSATION_ID.to_owned(),
+            run_id: CASE_WORK_RUN_ID.to_owned(),
+            assistant_message_id: CASE_WORK_ASSISTANT_MESSAGE_ID.to_owned(),
+            project_binding_sha256: "a".repeat(64),
+            source_snapshots_sha256,
+            source_snapshots_json: snapshots,
+            expected_proposal_source_refs_json: "[]".to_owned(),
+            expected_proposal_source_refs_sha256: sha256_hex(b"[]"),
+            output_kind: output_kind.to_owned(),
+            output_sha256,
+            output_payload_json: output_payload,
+            output_preview: "case-work response".to_owned(),
+            output_version: 1,
+            workspace_base_digest: workspace_base_digest.clone(),
+        };
+        database::create_case_assistant_pending_output(&user, &pending)
+            .expect("case-work pending output creates");
+
+        match variant {
+            CaseWorkDeletionVariant::Empty | CaseWorkDeletionVariant::Pending => {}
+            CaseWorkDeletionVariant::ConfirmedProposal => {
+                let transaction = user
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .expect("proposal confirmation transaction begins");
+                database::create_case_change_proposal(
+                    &transaction,
+                    &database::NewCaseChangeProposalRow {
+                        proposal_id: CASE_WORK_PROPOSAL_ID.to_owned(),
+                        conversation_id: CASE_WORK_CONVERSATION_ID.to_owned(),
+                        project_id: PROJECT_ID.to_owned(),
+                        run_id: Some(CASE_WORK_RUN_ID.to_owned()),
+                        base_case_digest: workspace_base_digest.clone(),
+                        changes_json: r#"{"changes":[]}"#.to_owned(),
+                        source_refs_json: "[]".to_owned(),
+                    },
+                )
+                .expect("case-work proposal creates");
+                assert!(matches!(
+                    database::compare_and_set_case_change_proposal_status(
+                        &transaction,
+                        CASE_WORK_PROPOSAL_ID,
+                        PROJECT_ID,
+                        &workspace_base_digest,
+                        "applied",
+                    )
+                    .expect("case-work proposal applies"),
+                    database::CaseChangeProposalStatusUpdateResult::Updated(_)
+                ));
+                let target = database::CaseAssistantConfirmationTarget::Proposal(
+                    CASE_WORK_PROPOSAL_ID.to_owned(),
+                );
+                assert!(matches!(
+                    database::compare_and_set_case_assistant_pending_output_confirmed(
+                        &transaction,
+                        &database::ConfirmCaseAssistantPendingOutput {
+                            pending_output_id: CASE_WORK_PENDING_OUTPUT_ID,
+                            project_id: PROJECT_ID,
+                            expected_output_version: 1,
+                            expected_output_sha256: &pending.output_sha256,
+                            expected_workspace_base_digest: &workspace_base_digest,
+                            expected_proposal_source_refs_json: &pending
+                                .expected_proposal_source_refs_json,
+                            expected_proposal_source_refs_sha256: &pending
+                                .expected_proposal_source_refs_sha256,
+                            confirmation_request_sha256: &"b".repeat(64),
+                            target: &target,
+                        },
+                    )
+                    .expect("proposal confirmation succeeds"),
+                    database::CaseAssistantPendingOutputConfirmResult::Confirmed(_)
+                ));
+                transaction.commit().expect("proposal confirmation commits");
+            }
+            CaseWorkDeletionVariant::ConfirmedArtifact => {
+                let transaction = user
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .expect("artifact confirmation transaction begins");
+                database::create_artifact(
+                    &transaction,
+                    &database::NewArtifactRow {
+                        artifact_id: CASE_WORK_ARTIFACT_ID.to_owned(),
+                        conversation_id: Some(CASE_WORK_CONVERSATION_ID.to_owned()),
+                        project_id: None,
+                        kind: "document".to_owned(),
+                        title: "Confirmed case-work artifact".to_owned(),
+                        status: "draft".to_owned(),
+                    },
+                    &database::NewArtifactVersionRow {
+                        version_id: format!("{CASE_WORK_ARTIFACT_ID}-v1"),
+                        artifact_id: CASE_WORK_ARTIFACT_ID.to_owned(),
+                        content_json: r#"{"body":"case-work deletion fixture"}"#.to_owned(),
+                        rendered_text: pending.output_preview.clone(),
+                        source_refs_json: "[]".to_owned(),
+                        citation_report_json: "{}".to_owned(),
+                        provider_snapshot_json: provider_snapshot_json.clone(),
+                    },
+                )
+                .expect("case-work artifact creates");
+                assert!(database::bind_artifact_to_case(
+                    &transaction,
+                    CASE_WORK_ARTIFACT_ID,
+                    PROJECT_ID,
+                )
+                .expect("case-work artifact binds"));
+                let target = database::CaseAssistantConfirmationTarget::Artifact(
+                    CASE_WORK_ARTIFACT_ID.to_owned(),
+                );
+                assert!(matches!(
+                    database::compare_and_set_case_assistant_pending_output_confirmed(
+                        &transaction,
+                        &database::ConfirmCaseAssistantPendingOutput {
+                            pending_output_id: CASE_WORK_PENDING_OUTPUT_ID,
+                            project_id: PROJECT_ID,
+                            expected_output_version: 1,
+                            expected_output_sha256: &pending.output_sha256,
+                            expected_workspace_base_digest: &workspace_base_digest,
+                            expected_proposal_source_refs_json: &pending
+                                .expected_proposal_source_refs_json,
+                            expected_proposal_source_refs_sha256: &pending
+                                .expected_proposal_source_refs_sha256,
+                            confirmation_request_sha256: &"c".repeat(64),
+                            target: &target,
+                        },
+                    )
+                    .expect("artifact confirmation succeeds"),
+                    database::CaseAssistantPendingOutputConfirmResult::Confirmed(_)
+                ));
+                transaction.commit().expect("artifact confirmation commits");
+            }
+        }
+    }
+
+    fn assert_case_work_variant_deletes_without_split(variant: CaseWorkDeletionVariant) {
+        let fixture = Fixture::new();
+        seed_case_work_deletion_variant(&fixture, variant);
+        let mut user = fixture.user_connection();
+        assert!(fixture
+            .manager
+            .delete_case_project_lifecycle(&mut user, PROJECT_ID)
+            .expect("case-work project lifecycle deletes"));
+        drop(user);
+
+        let privacy = fixture.privacy_connection();
+        let (deletion_id, journal_state, material_state, generation_state) = privacy
+            .query_row(
+                "SELECT
+                     (SELECT deletion_id FROM project_deletion_journal WHERE project_id=?1),
+                     (SELECT state FROM project_deletion_journal WHERE project_id=?1),
+                     (SELECT state FROM privacy_materials WHERE material_id=?2),
+                     (SELECT revocation_state FROM privacy_redactions WHERE redaction_id=?3)",
+                params![PROJECT_ID, MATERIAL_ID, REDACTION_ID],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("Privacy deletion state reads");
+        assert_eq!(journal_state, "completed");
+        assert_eq!(material_state, "revoked");
+        assert_eq!(generation_state, "revoked");
+        drop(privacy);
+
+        let user = fixture.user_connection();
+        assert_eq!(
+            user.query_row(
+                "SELECT COUNT(*) FROM projects WHERE project_id=?1",
+                [PROJECT_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("project count reads"),
+            0
+        );
+        assert_eq!(
+            user.query_row(
+                "SELECT retirement_reason,privacy_deletion_id
+                 FROM retired_case_project_ids WHERE project_id=?1",
+                [PROJECT_ID],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("retirement tombstone reads"),
+            ("case_project_deleted".to_owned(), deletion_id)
+        );
+        for (table, column, id) in [
+            (
+                "conversations",
+                "conversation_id",
+                CASE_WORK_CONVERSATION_ID,
+            ),
+            ("agent_runs", "run_id", CASE_WORK_RUN_ID),
+            ("messages", "conversation_id", CASE_WORK_CONVERSATION_ID),
+            ("tool_calls", "run_id", CASE_WORK_RUN_ID),
+            (
+                "case_change_proposals",
+                "proposal_id",
+                CASE_WORK_PROPOSAL_ID,
+            ),
+            ("artifacts", "artifact_id", CASE_WORK_ARTIFACT_ID),
+        ] {
+            assert_eq!(
+                user.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column}=?1"),
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("live case-work lineage count reads"),
+                0,
+                "{table} live lineage must be physically removed"
+            );
+        }
+        assert_eq!(
+            user.query_row(
+                "SELECT project_id FROM conversations WHERE conversation_id=?1",
+                [ASSISTANT_CONVERSATION_ID],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("ordinary assistant history remains"),
+            None
+        );
+        assert_eq!(
+            user.query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id=?1",
+                [ASSISTANT_MESSAGE_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("ordinary assistant message count reads"),
+            1
+        );
+
+        if matches!(variant, CaseWorkDeletionVariant::Empty) {
+            assert_eq!(
+                user.query_row(
+                    "SELECT COUNT(*) FROM case_assistant_pending_outputs",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("empty pending audit count reads"),
+                0
+            );
+        } else {
+            let audit = database::get_case_assistant_pending_output(
+                &user,
+                CASE_WORK_PENDING_OUTPUT_ID,
+                PROJECT_ID,
+            )
+            .expect("retired pending audit reads")
+            .expect("retired pending audit remains");
+            match variant {
+                CaseWorkDeletionVariant::Pending => {
+                    assert_eq!(audit.status, "pending");
+                    assert_eq!(audit.row_version, 1);
+                }
+                CaseWorkDeletionVariant::ConfirmedProposal => {
+                    assert_eq!(audit.status, "confirmed");
+                    assert_eq!(
+                        audit.confirmed_proposal_id.as_deref(),
+                        Some(CASE_WORK_PROPOSAL_ID)
+                    );
+                }
+                CaseWorkDeletionVariant::ConfirmedArtifact => {
+                    assert_eq!(audit.status, "confirmed");
+                    assert_eq!(
+                        audit.confirmed_artifact_id.as_deref(),
+                        Some(CASE_WORK_ARTIFACT_ID)
+                    );
+                }
+                CaseWorkDeletionVariant::Empty => unreachable!(),
+            }
+        }
+        database::validate_open_user_database(&user)
+            .expect("deleted case-work variant remains canonical");
+    }
+
+    #[test]
+    fn project_delete_handles_empty_case_work_without_cross_database_split() {
+        assert_case_work_variant_deletes_without_split(CaseWorkDeletionVariant::Empty);
+    }
+
+    #[test]
+    fn project_delete_handles_pending_output_without_cross_database_split() {
+        assert_case_work_variant_deletes_without_split(CaseWorkDeletionVariant::Pending);
+    }
+
+    #[test]
+    fn project_delete_handles_confirmed_proposal_without_cross_database_split() {
+        assert_case_work_variant_deletes_without_split(CaseWorkDeletionVariant::ConfirmedProposal);
+    }
+
+    #[test]
+    fn project_delete_handles_confirmed_artifact_without_cross_database_split() {
+        assert_case_work_variant_deletes_without_split(CaseWorkDeletionVariant::ConfirmedArtifact);
     }
 
     #[test]

@@ -161,6 +161,7 @@ fn registry_is_exact_unique_bounded_and_confirmation_is_enforced() {
         "document.render",
         "map.build",
         "assistant.interactive_chat",
+        "assistant.case_work",
     ];
     let registry = capability_registry();
     assert_eq!(registry.len(), CAPABILITY_COUNT);
@@ -228,6 +229,24 @@ fn registry_is_exact_unique_bounded_and_confirmation_is_enforced() {
     assert!(interactive.audit_fields.contains(&AuditField::OutputHashes));
     assert!(interactive.audit_fields.contains(&AuditField::OutputIds));
     assert!(!interactive.audit_fields.contains(&AuditField::SourceRefs));
+    let case_work = find_capability("assistant.case_work").unwrap();
+    assert_eq!(
+        case_work.access,
+        CapabilityAccess {
+            read: true,
+            write: true,
+        }
+    );
+    assert!(!case_work.requires_user_confirmation);
+    assert_eq!(case_work.max_calls_per_run, 1);
+    assert!(case_work
+        .allowed_error_types
+        .contains(&CapabilityErrorType::ProviderFailure));
+    assert!(case_work.audit_fields.contains(&AuditField::Classification));
+    assert!(case_work.audit_fields.contains(&AuditField::InputHashes));
+    assert!(case_work.audit_fields.contains(&AuditField::OutputHashes));
+    assert!(case_work.audit_fields.contains(&AuditField::SourceRefs));
+    assert!(case_work.audit_fields.contains(&AuditField::Confirmation));
     assert_eq!(
         find_capability("shell.exec").unwrap_err().error_type,
         ContractErrorType::UnknownCapability
@@ -244,6 +263,18 @@ fn interactive_chat_capability_serde_wire_contract_is_exact_and_closed() {
         CapabilityName::AssistantInteractiveChat
     );
     assert!(serde_json::from_str::<CapabilityName>("\"assistant.interactive\"").is_err());
+}
+
+#[test]
+fn case_work_capability_serde_wire_contract_is_exact_and_closed() {
+    let wire = serde_json::to_string(&CapabilityName::AssistantCaseWork)
+        .expect("serialize case-work capability name");
+    assert_eq!(wire, "\"assistant.case_work\"");
+    assert_eq!(
+        serde_json::from_str::<CapabilityName>(&wire).expect("deserialize case-work name"),
+        CapabilityName::AssistantCaseWork
+    );
+    assert!(serde_json::from_str::<CapabilityName>("\"assistant.case\"").is_err());
 }
 
 #[test]
@@ -419,6 +450,7 @@ fn document_rejects_internal_data_in_every_user_visible_text_family() {
                 Some("019f6e3e-6822-70c1-86a7-6f88022a815e".to_owned())
         },
         |document| document.sections[0].clauses[0].body = "deadbeef0123456789abcdef".to_owned(),
+        |document| document.sections[0].body = "a".repeat(64),
         |document| document.assumptions[0].text = "as_of=2026-01-01".to_owned(),
         |document| document.missing_information[0].description = "snippet 待补充".to_owned(),
         |document| document.risk_warnings[0] = "结构化文书预览".to_owned(),

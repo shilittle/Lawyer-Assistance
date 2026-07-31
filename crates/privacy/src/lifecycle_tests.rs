@@ -1048,6 +1048,132 @@ mod lifecycle_tests {
             .is_some());
     }
 
+    #[test]
+    fn backup_database_limits_keep_v1_through_v5_at_96_mib_and_allow_v6_to_256_mib() {
+        assert_eq!(
+            max_backup_database_bytes_for_schema(1),
+            Some(MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES)
+        );
+        assert_eq!(
+            max_backup_database_bytes_for_schema(5),
+            Some(MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES)
+        );
+        assert_eq!(
+            max_backup_database_bytes_for_schema(PRIVACY_STORE_SCHEMA_VERSION),
+            Some(MAX_BACKUP_DATABASE_BYTES)
+        );
+        assert_eq!(
+            max_backup_envelope_bytes_for_schema(5),
+            Some(MAX_PRE_MIGRATION_BACKUP_ENVELOPE_BYTES)
+        );
+        assert_eq!(
+            max_backup_envelope_bytes_for_schema(PRIVACY_STORE_SCHEMA_VERSION),
+            Some(MAX_BACKUP_ENVELOPE_BYTES)
+        );
+        assert_eq!(
+            max_portable_backup_bytes_for_schema(5),
+            Some(MAX_PRE_MIGRATION_PORTABLE_BACKUP_BYTES)
+        );
+        assert_eq!(
+            max_portable_backup_bytes_for_schema(PRIVACY_STORE_SCHEMA_VERSION),
+            Some(MAX_PORTABLE_BACKUP_BYTES)
+        );
+        assert_eq!(max_backup_database_bytes_for_schema(0), None);
+        assert_eq!(
+            max_backup_database_bytes_for_schema(PRIVACY_STORE_SCHEMA_VERSION + 1),
+            None
+        );
+
+        let workspace = workspace();
+        let registry = (
+            "f".repeat(64),
+            i64::try_from(NOW).expect("created time"),
+            i64::try_from(NOW + 100).expect("expiry time"),
+            1,
+            "active".to_owned(),
+        );
+        let envelope_for = |schema_version, database_bytes| BackupEnvelopeV1 {
+            schema_version: ENCRYPTED_BACKUP_SCHEMA_VERSION.to_owned(),
+            crypto_suite: BACKUP_CRYPTO_SUITE.to_owned(),
+            backup_id: BACKUP_ID.to_owned(),
+            workspace_instance_id: workspace.clone(),
+            privacy_store_schema_version: schema_version,
+            lifecycle_schema_version: PRIVACY_LIFECYCLE_SCHEMA_VERSION,
+            key_epoch: 1,
+            created_at_unix: NOW,
+            expires_at_unix: NOW + 100,
+            database_bytes,
+            database_sha256: "a".repeat(64),
+            wrapped_data_key_base64: "AA==".to_owned(),
+            wrapped_data_key_sha256: "b".repeat(64),
+            nonce_base64: "AA==".to_owned(),
+            ciphertext_base64: "AA==".to_owned(),
+            ciphertext_sha256: "c".repeat(64),
+            tag_base64: "AA==".to_owned(),
+        };
+        let legacy_context = BackupVerificationExpectation {
+            expected_workspace_instance_id: &workspace,
+            expected_key_epoch: 1,
+            expected_privacy_store_schema_version: 5,
+            now_unix: NOW + 1,
+        };
+        assert_eq!(
+            validate_backup_envelope(
+                &envelope_for(
+                    5,
+                    u64::try_from(MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES).expect("legacy maximum")
+                ),
+                BACKUP_ID,
+                &legacy_context,
+                &registry,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_backup_envelope(
+                &envelope_for(
+                    5,
+                    u64::try_from(MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES).expect("legacy maximum")
+                        + 1
+                ),
+                BACKUP_ID,
+                &legacy_context,
+                &registry,
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+
+        let current_context = BackupVerificationExpectation {
+            expected_privacy_store_schema_version: PRIVACY_STORE_SCHEMA_VERSION,
+            ..legacy_context
+        };
+        assert_eq!(
+            validate_backup_envelope(
+                &envelope_for(
+                    PRIVACY_STORE_SCHEMA_VERSION,
+                    u64::try_from(MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES).expect("legacy maximum")
+                        + 1
+                ),
+                BACKUP_ID,
+                &current_context,
+                &registry,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_backup_envelope(
+                &envelope_for(
+                    PRIVACY_STORE_SCHEMA_VERSION,
+                    u64::try_from(MAX_BACKUP_DATABASE_BYTES).expect("current maximum") + 1
+                ),
+                BACKUP_ID,
+                &current_context,
+                &registry,
+            ),
+            Err(LifecycleError::EnvironmentMismatch)
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn pre_migration_backup_records_and_authenticates_actual_v4_while_normal_export_rejects_it() {
@@ -1242,7 +1368,11 @@ mod lifecycle_tests {
     #[cfg(windows)]
     #[test]
     fn pre_migration_backup_rejects_invalid_empty_future_mismatched_and_damaged_sources() {
-        let invalid_versions = [0, PRIVACY_STORE_SCHEMA_VERSION, 6];
+        let invalid_versions = [
+            0,
+            PRIVACY_STORE_SCHEMA_VERSION,
+            PRIVACY_STORE_SCHEMA_VERSION + 1,
+        ];
         for invalid_version in invalid_versions {
             let (mut connection, lifecycle) = setup_review();
             set_privacy_store_schema_version(&connection, 4);
@@ -1385,7 +1515,7 @@ mod lifecycle_tests {
 
     #[cfg(windows)]
     #[test]
-    fn current_v5_backup_remains_normal_and_never_falls_back_to_pre_migration() {
+    fn current_v6_backup_remains_normal_and_never_falls_back_to_pre_migration() {
         let (mut connection, lifecycle) = setup_review();
         let directory = tempfile::tempdir().expect("backup directory");
         let store =

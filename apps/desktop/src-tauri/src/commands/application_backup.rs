@@ -67,6 +67,8 @@ const MAX_MIGRATION_BACKUP_CANDIDATES: usize = 64;
 pub(crate) const CASE_MATERIAL_UNIFICATION_MIGRATION_ID: &str = "case-material-unification-v1";
 pub(crate) const PROJECT_PRIVACY_CASE_BINDING_MIGRATION_ID: &str =
     "project-privacy-case-binding-v1";
+pub(crate) const APPROVED_CASE_PROJECTION_MIGRATION_ID: &str =
+    privacy::APPROVED_CASE_PROJECTION_MIGRATION_ID;
 pub const FULL_RESTORE_CONFIRMATION: &str = "恢复完整应用备份";
 
 #[derive(Debug, Clone, Serialize)]
@@ -462,7 +464,7 @@ where
     Install: FnOnce(&Path, &Path) -> Result<(), IpcError>,
 {
     let canonical_file_name = migration_backup_file_name(migration_id, source_fingerprint)?;
-    verify_current_migration_source_fingerprint(workflow, source_fingerprint)?;
+    verify_current_migration_source_fingerprint(workflow, migration_id, source_fingerprint)?;
     let directory = ensure_migration_backup_directory(app_local_data_dir)?;
     // Recover a bundle whose authenticated identity was already installed before treating
     // remaining dot-files as pre-commit staging. The durable identity is the commit record for
@@ -491,7 +493,11 @@ where
                 })
             })
         {
-            verify_current_migration_source_fingerprint(workflow, source_fingerprint)?;
+            verify_current_migration_source_fingerprint(
+                workflow,
+                migration_id,
+                source_fingerprint,
+            )?;
             return Ok(MigrationApplicationBackup {
                 path: candidate.path.clone(),
                 metadata: candidate.metadata.clone(),
@@ -510,7 +516,9 @@ where
         )?;
     let built_identity = built_identity.ok_or_else(five_component_backup_error)?;
     let expected_bundle_sha256 = sha256_hex(&bytes);
-    if let Err(error) = verify_current_migration_source_fingerprint(workflow, source_fingerprint) {
+    if let Err(error) =
+        verify_current_migration_source_fingerprint(workflow, migration_id, source_fingerprint)
+    {
         return Err(abort_built_migration_backup(
             workflow,
             &privacy_backup_id,
@@ -671,7 +679,7 @@ where
     };
     // The pair is already durably installed and may be the only coherent rollback point for
     // the old source. Preserve its active Privacy backup state; only block this migration run.
-    verify_current_migration_source_fingerprint(workflow, source_fingerprint)?;
+    verify_current_migration_source_fingerprint(workflow, migration_id, source_fingerprint)?;
     Ok(MigrationApplicationBackup {
         path: destination,
         metadata: installed.metadata,
@@ -1144,7 +1152,13 @@ fn verify_migration_backup_pair(
     )
     .map_err(application_backup_error)?;
     let metadata = validate_opened_five_component_backup(bytes.as_slice(), opened)?;
-    if metadata.user_database_sha256 != identity.components.user_database_sha256
+    let maximum_privacy_bundle_bytes = privacy::lifecycle::max_portable_backup_bytes_for_schema(
+        identity.components.privacy_store_schema_version,
+    )
+    .and_then(|maximum| u64::try_from(maximum).ok())
+    .ok_or_else(five_component_backup_error)?;
+    if metadata.encrypted_privacy_bundle_bytes > maximum_privacy_bundle_bytes
+        || metadata.user_database_sha256 != identity.components.user_database_sha256
         || metadata.encrypted_privacy_bundle_sha256
             != identity.components.encrypted_privacy_bundle_sha256
         || metadata.vault_manifest_sha256 != identity.components.vault_manifest_sha256
@@ -1386,6 +1400,7 @@ fn privacy_store_identity(
             PrivacyStoreSchemaStatus::UpgradeRequired { found_version } => found_version,
             PrivacyStoreSchemaStatus::Empty => return Err(five_component_backup_error()),
         };
+        validate_privacy_database_page_bound(&connection, schema_version)?;
         let workspace: String = connection
             .query_row(
                 "SELECT workspace_instance_id FROM privacy_lifecycle_meta WHERE singleton=1",
@@ -1408,6 +1423,43 @@ fn privacy_store_identity(
     });
     rollback?;
     result
+}
+
+fn validate_privacy_database_page_bound(
+    connection: &Connection,
+    schema_version: i64,
+) -> Result<(), IpcError> {
+    let page_count = connection
+        .pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(five_component_backup_error)?;
+    let page_size = connection
+        .pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(five_component_backup_error)?;
+    validate_privacy_database_page_values(schema_version, page_count, page_size)
+}
+
+fn validate_privacy_database_page_values(
+    schema_version: i64,
+    page_count: u64,
+    page_size: u64,
+) -> Result<(), IpcError> {
+    let maximum = privacy_database_backup_maximum(schema_version)?;
+    let database_bytes = page_count
+        .checked_mul(page_size)
+        .ok_or_else(five_component_backup_error)?;
+    if database_bytes == 0
+        || database_bytes > u64::try_from(maximum).map_err(|_| five_component_backup_error())?
+    {
+        return Err(ipc_error(
+            "migration_backup_privacy_source_too_large",
+            "The Privacy migration source exceeds its schema-specific raw database limit.",
+        ));
+    }
+    Ok(())
 }
 
 fn vault_content_identity(
@@ -1681,11 +1733,25 @@ fn stream_sha256(path: &Path) -> Result<String, IpcError> {
 
 fn verify_current_migration_source_fingerprint(
     workflow: &PrivacyWorkflowManager,
+    migration_id: &str,
     expected: &str,
 ) -> Result<(), IpcError> {
-    let current = workflow
-        .case_material_migration_source_fingerprint()
-        .map_err(workflow_error)?;
+    let current = match migration_id {
+        CASE_MATERIAL_UNIFICATION_MIGRATION_ID | PROJECT_PRIVACY_CASE_BINDING_MIGRATION_ID => {
+            workflow
+                .case_material_migration_source_fingerprint()
+                .map_err(workflow_error)?
+        }
+        APPROVED_CASE_PROJECTION_MIGRATION_ID => workflow
+            .approved_projection_migration_source_fingerprint()
+            .map_err(workflow_error)?,
+        _ => {
+            return Err(ipc_error(
+                "migration_backup_invalid_id",
+                "The migration backup identifier is not in the fixed application allowlist.",
+            ))
+        }
+    };
     if current != expected {
         return Err(ipc_error(
             "migration_backup_source_changed",
@@ -1708,6 +1774,7 @@ fn migration_backup_file_name(
     let stem = match migration_id {
         CASE_MATERIAL_UNIFICATION_MIGRATION_ID => "case-material-unification-v1",
         PROJECT_PRIVACY_CASE_BINDING_MIGRATION_ID => "project-privacy-case-binding-v1",
+        APPROVED_CASE_PROJECTION_MIGRATION_ID => "approved-case-projection-v1",
         _ => {
             return Err(ipc_error(
                 "migration_backup_invalid_id",
@@ -2420,7 +2487,11 @@ fn stage_migration_application_restore_with_approved(
         &identity.migration_id,
         &identity.source_fingerprint,
     )?;
-    verify_current_migration_source_fingerprint(workflow, &identity.source_fingerprint)?;
+    verify_current_migration_source_fingerprint(
+        workflow,
+        &identity.migration_id,
+        &identity.source_fingerprint,
+    )?;
     let candidate = verify_migration_backup_pair(source, identity_path, workflow, None, None)?;
     let current = capture_current_migration_components(
         app_local_data_dir,
@@ -2805,6 +2876,7 @@ where
             marker.vault_archive_sha256.as_str(),
         ),
     };
+    privacy_database_backup_maximum(privacy_store_schema_version)?;
     let result = (|| {
         if let PendingApplicationRestore::V3(marker) = &marker {
             let approved_candidate = pending_directory_candidate(
@@ -2837,6 +2909,7 @@ where
             &paths.user_incoming,
             &paths.user_rollback,
             user_database_sha256,
+            MAX_USER_DATABASE_BACKUP_BYTES,
             |path| validate_user_component(path, user_database_sha256),
         )?;
         hook(ApplicationRestoreCommitPoint::UserInstalled)?;
@@ -2845,6 +2918,7 @@ where
             &paths.privacy_incoming,
             &paths.privacy_rollback,
             privacy_database_sha256,
+            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES,
             |path| {
                 validate_privacy_component(
                     path,
@@ -3195,9 +3269,18 @@ fn application_restore_paths(app_local_data_dir: &Path) -> ApplicationRestorePat
     }
 }
 
+pub(crate) fn ensure_standalone_restore_is_lineage_safe(
+    app_local_data_dir: &Path,
+) -> Result<(), IpcError> {
+    ensure_legacy_three_component_restore_is_lineage_safe(&application_restore_paths(
+        app_local_data_dir,
+    ))
+}
+
 fn ensure_legacy_three_component_restore_is_lineage_safe(
     paths: &ApplicationRestorePaths,
 ) -> Result<(), IpcError> {
+    const UNIFIED_USER_STATE_TABLES: &[&str] = &["case_assistant_pending_outputs"];
     const UNIFIED_PRIVACY_STATE_TABLES: &[&str] = &[
         "privacy_materials",
         "privacy_redactions",
@@ -3211,8 +3294,13 @@ fn ensure_legacy_three_component_restore_is_lineage_safe(
         "project_deletion_journal",
         "case_material_assignment_audit",
     ];
-    let unified_state =
-        restore_database_has_rows(&paths.privacy_active, UNIFIED_PRIVACY_STATE_TABLES, false)?;
+    let pending_output_state =
+        restore_database_has_rows_if_present(&paths.user_active, UNIFIED_USER_STATE_TABLES, false)?;
+    let unified_state = restore_database_has_rows_if_present(
+        &paths.privacy_active,
+        UNIFIED_PRIVACY_STATE_TABLES,
+        false,
+    )?;
     let approved_state = restore_workspace_component_has_state(
         &paths.approved_active,
         APPROVED_DATABASE_FILE_NAME,
@@ -3223,13 +3311,28 @@ fn ensure_legacy_three_component_restore_is_lineage_safe(
         WORK_PRODUCTS_DATABASE_FILE_NAME,
         "work_product_versions",
     )?;
-    if unified_state || approved_state || work_product_state {
+    if pending_output_state || unified_state || approved_state || work_product_state {
         return Err(ipc_error(
             "application_restore_requires_five_components",
             "A legacy three-component backup cannot replace a workspace that already has unified case-material, approved-generation, or work-product state. Restore an authenticated five-component backup instead.",
         ));
     }
     Ok(())
+}
+
+fn restore_database_has_rows_if_present(
+    path: &Path,
+    tables: &[&str],
+    require_tables: bool,
+) -> Result<bool, IpcError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => restore_database_has_rows(path, tables, require_tables),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The current application lineage database could not be inspected.",
+        )),
+    }
 }
 
 fn restore_workspace_component_has_state(
@@ -3644,15 +3747,13 @@ fn advance_component<Validate>(
     incoming: &Path,
     rollback: &Path,
     expected_sha256: &str,
+    maximum_bytes: usize,
     validate: Validate,
 ) -> Result<(), IpcError>
 where
     Validate: Fn(&Path) -> Result<(), IpcError>,
 {
-    if restore_path_is_present(active)?
-        && file_sha256(active, MAX_USER_DATABASE_BACKUP_BYTES.max(96 * 1024 * 1024))?
-            == expected_sha256
-    {
+    if restore_path_is_present(active)? && file_sha256(active, maximum_bytes)? == expected_sha256 {
         validate(active)?;
         if restore_path_is_present(incoming)? {
             validate(incoming)?;
@@ -3929,7 +4030,7 @@ fn validate_pair_marker(
 }
 
 fn supported_restored_privacy_schema(schema_version: i64) -> bool {
-    (1..=4).contains(&schema_version) || schema_version == PRIVACY_STORE_SCHEMA_VERSION
+    (1..=5).contains(&schema_version) || schema_version == PRIVACY_STORE_SCHEMA_VERSION
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4021,7 +4122,8 @@ fn validate_privacy_component(
     expected_privacy_store_schema_version: i64,
     expected_sha256: &str,
 ) -> Result<(), IpcError> {
-    if file_sha256(path, 96 * 1024 * 1024)? != expected_sha256 {
+    let maximum_bytes = privacy_database_backup_maximum(expected_privacy_store_schema_version)?;
+    if file_sha256(path, maximum_bytes)? != expected_sha256 {
         return Err(ipc_error(
             "application_restore_tampered",
             "隐私数据库恢复组件哈希不匹配。",
@@ -4073,6 +4175,15 @@ fn validate_privacy_component(
         ));
     }
     Ok(())
+}
+
+fn privacy_database_backup_maximum(schema_version: i64) -> Result<usize, IpcError> {
+    privacy::lifecycle::max_backup_database_bytes_for_schema(schema_version).ok_or_else(|| {
+        ipc_error(
+            "application_restore_invalid",
+            "隐私数据库恢复组件 schema 不受当前版本支持。",
+        )
+    })
 }
 
 fn validate_new_local_file(path: &Path) -> Result<(), IpcError> {
