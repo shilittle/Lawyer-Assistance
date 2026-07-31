@@ -130,9 +130,9 @@ describe("navigation guards", () => {
   });
 
   it("treats route-state changes at one location as non-navigation", () => {
-    const currentPrivacyRoute = {
+    const currentMcpRoute = {
       area: "settings",
-      page: "privacy",
+      page: "mcp",
       state: {
         kind: "approved-provider-task",
         request: {
@@ -142,9 +142,9 @@ describe("navigation guards", () => {
         },
       },
     } as const;
-    const nextPrivacyRoute = {
+    const nextMcpRoute = {
       area: "settings",
-      page: "privacy",
+      page: "mcp",
       state: {
         kind: "approved-provider-task",
         request: {
@@ -157,16 +157,16 @@ describe("navigation guards", () => {
 
     expect(
       decideMcpRouteNavigation(
-        currentPrivacyRoute,
-        nextPrivacyRoute,
+        currentMcpRoute,
+        nextMcpRoute,
         true,
         true,
       ),
     ).toEqual({ kind: "proceed" });
     expect(
       decidePrivacyRouteNavigation(
-        currentPrivacyRoute,
-        nextPrivacyRoute,
+        currentMcpRoute,
+        nextMcpRoute,
         true,
         true,
       ),

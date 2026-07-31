@@ -190,7 +190,7 @@ describe("useAppNavigationController", () => {
     const options = controllerOptions({
       initialRoute: {
         area: "settings",
-        page: "privacy",
+        page: "mcp",
         state: {
           kind: "approved-provider-task",
           request: {
@@ -207,7 +207,7 @@ describe("useAppNavigationController", () => {
     const controller = renderController(options);
     const nextRoute = {
       area: "settings",
-      page: "privacy",
+      page: "mcp",
       state: {
         kind: "approved-provider-task",
         request: {
@@ -393,7 +393,7 @@ describe("useAppNavigationController", () => {
     controller = renderController(options);
     expect(controller.route).toEqual({
       area: "settings",
-      page: "privacy",
+      page: "mcp",
       state: {
         kind: "approved-provider-task",
         request: {
@@ -539,7 +539,7 @@ describe("useAppNavigationController", () => {
     expect(controller.consumeRouteState(secondRoute)).toBe(true);
     expect(renderController(options).route).toEqual({
       area: "settings",
-      page: "privacy",
+      page: "mcp",
     });
   });
 });

@@ -6,8 +6,8 @@ import {
   useState,
 } from "react";
 
-import { listProviderProfiles } from "../../ipc/provider/client";
-import type { ProviderProfile } from "../../ipc/provider/types";
+import { listProviderProfiles } from "../../../ipc/provider/client";
+import type { ProviderProfile } from "../../../ipc/provider/types";
 import {
   approveApprovedProviderTask,
   dispatchApprovedProvider,
@@ -17,7 +17,7 @@ import {
   revokeApprovedProviderOutput,
   revokeProviderQualification,
   runProviderQualification,
-} from "../../ipc/privacy/client";
+} from "../../../ipc/privacy/client";
 import type {
   ApprovedProviderOutput,
   ApprovedProviderOutputSummary,
@@ -29,8 +29,8 @@ import type {
   DispatchApprovedProviderResponse,
   PrivacyReview,
   ProviderQualificationStatus,
-} from "../../ipc/privacy/types";
-import "./provider-approval.css";
+} from "../../../ipc/privacy/types";
+import "./automation-outbound-approval.css";
 
 type ProviderOperation =
   | "loading"
@@ -78,7 +78,7 @@ export const APPROVED_PROVIDER_TASK_OPTIONS: readonly ApprovedProviderTaskOption
   { task: "repair", purpose: "case_repair", label: "修复结果" },
 ] as const;
 
-export interface ProviderApprovalPanelProps {
+export interface AutomationOutboundApprovalPanelProps {
   disabled?: boolean;
   taskRequest?: ProviderTaskRequest | null;
   onTaskRequestConsumed?: (request: ProviderTaskRequest) => void;
@@ -91,7 +91,7 @@ export interface ProviderTaskRequest {
   requestId: number;
 }
 
-export interface ProviderApprovalPanelViewProps {
+export interface AutomationOutboundApprovalPanelViewProps {
   disabled: boolean;
   operation: ProviderOperation;
   providers: readonly ProviderProfile[];
@@ -374,7 +374,7 @@ function qualificationLabel(status: ProviderQualificationStatus | null): string 
   return status.qualified ? "已资格化" : `未资格化：${status.reasonCode}`;
 }
 
-export function ProviderApprovalPanelView({
+export function AutomationOutboundApprovalPanelView({
   disabled,
   operation,
   providers,
@@ -409,7 +409,7 @@ export function ProviderApprovalPanelView({
   onDispatch,
   onLoadOutput,
   onRevokeOutput,
-}: ProviderApprovalPanelViewProps) {
+}: AutomationOutboundApprovalPanelViewProps) {
   const busy = disabled || operation !== "idle";
   const selectedProfile = providers.find((profile) => profile.id === providerId);
   const exactPurpose = approvedProviderPurpose(task);
@@ -446,14 +446,14 @@ export function ProviderApprovalPanelView({
 
   return (
     <section
-      id="privacy-approved-provider"
-      className="privacy-provider-panel"
-      aria-labelledby="privacy-provider-title"
+      id="automation-outbound-approval"
+      className="automation-outbound-panel"
+      aria-labelledby="automation-outbound-title"
     >
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Approved Provider</p>
-          <h2 id="privacy-provider-title">已批准案件 Provider 正链</h2>
+          <h2 id="automation-outbound-title">自动化出站批准</h2>
         </div>
         <button disabled={busy} type="button" onClick={onRefresh}>
           {operation === "refreshing" || operation === "loading"
@@ -462,14 +462,14 @@ export function ProviderApprovalPanelView({
         </button>
       </div>
 
-      {notice ? <p className="privacy-notice" aria-live="polite">{notice}</p> : null}
+      {notice ? <p className="automation-outbound-notice" aria-live="polite">{notice}</p> : null}
 
       <p>
         页面只提交脱敏记录 ID、已保存 Provider ID、固定任务枚举和输出上限。批准正文、签名凭据与本地映射均由 Rust
         从受保护存储恢复；任一资格、用途、模型、endpoint、hash、有效期或撤销状态不一致都会在网络前拒绝。
       </p>
 
-      <div className="privacy-provider-grid">
+      <div className="automation-outbound-grid">
         <label>
           <span>已保存 Provider profile</span>
           <select
@@ -499,31 +499,31 @@ export function ProviderApprovalPanelView({
             ))}
           </select>
         </label>
-        <div className="privacy-provider-binding">
+        <div className="automation-outbound-binding">
           <span>后端固定用途</span>
           <code>{exactPurpose}</code>
         </div>
-        <div className="privacy-provider-binding">
+        <div className="automation-outbound-binding">
           <span>当前脱敏 generation</span>
           <code>{review?.redactionId ?? "尚未载入"}</code>
           <small>{approvedGenerationReady ? "已人工批准" : "必须先完成双栏人工批准"}</small>
         </div>
       </div>
       {!review ? (
-        <p className="privacy-risk-blocker" role="status">
+        <p className="automation-outbound-risk-blocker" role="status">
           设置页不再自动读取未限定案件的“最近一次”脱敏记录。请从案件工作台的“材料与脱敏”
           进入已批准 generation；案件限定的 Provider 入口将在该工作流中提供。
         </p>
       ) : null}
 
-      <section className="privacy-provider-qualification" aria-label="Provider 资格状态">
+      <section className="automation-outbound-qualification" aria-label="Provider 资格状态">
         <div className="panel-heading">
           <h3>Provider 案件出站资格</h3>
           <strong data-qualified={qualification?.qualified ?? false}>
             {qualificationLabel(qualification)}
           </strong>
         </div>
-        <div className="privacy-provider-evidence">
+        <div className="automation-outbound-evidence">
           <span>App/工作区/策略：{qualification?.exactWorkspaceAppPolicyBinding ? "匹配" : "未匹配"}</span>
           <span>Provider/model/endpoint：{qualification?.exactProviderContractBinding ? "匹配" : "未匹配"}</span>
           <span>任务 contract：{qualification?.exactTaskContractBinding ? "匹配" : "未匹配"}</span>
@@ -531,7 +531,7 @@ export function ProviderApprovalPanelView({
           <span>原始 canary 不在 wire：{qualification?.rawCanaryAbsent ? "通过" : "未通过"}</span>
           <span>单次请求：{qualification?.exactlyOneRequest ? "通过" : "未通过"}</span>
         </div>
-        <label className="privacy-provider-number">
+        <label className="automation-outbound-number">
           <span>资格与精确批准有效期（秒）</span>
           <input
             disabled={busy}
@@ -540,7 +540,7 @@ export function ProviderApprovalPanelView({
             onChange={(event) => onTtlSecondsChange(event.target.value)}
           />
         </label>
-        <div className="privacy-actions">
+        <div className="automation-outbound-actions">
           <button disabled={busy || !selectedProfile} type="button" onClick={onRunQualification}>
             {operation === "qualifying" ? "正在执行完整 canary…" : "运行并持久化资格"}
           </button>
@@ -555,13 +555,13 @@ export function ProviderApprovalPanelView({
         </div>
       </section>
 
-      <section aria-labelledby="privacy-provider-approval-title">
-        <h3 id="privacy-provider-approval-title">签发精确批准并发送</h3>
+      <section aria-labelledby="automation-outbound-approval-title">
+        <h3 id="automation-outbound-approval-title">签发精确批准并发送</h3>
         <p>
           当前绑定模型：<code>{exactModel || "尚未选择"}</code>。任务指令只应描述处理要求，不得粘贴未脱敏案情；
           指令会在本机先做残留扫描，再与当前脱敏正文一起签发。
         </p>
-        <label className="privacy-provider-instruction">
+        <label className="automation-outbound-instruction">
           <span>人工批准的任务指令</span>
           <textarea
             autoComplete="off"
@@ -572,7 +572,7 @@ export function ProviderApprovalPanelView({
           />
           <small>换行会规范化；审批与发送使用完全相同的规范化指令。</small>
         </label>
-        <div className="privacy-provider-grid">
+        <div className="automation-outbound-grid">
           <label>
             <span>批准人</span>
             <input
@@ -614,7 +614,7 @@ export function ProviderApprovalPanelView({
             </small>
           </label>
         </div>
-        <label className="privacy-provider-confirmation">
+        <label className="automation-outbound-confirmation">
           <input
             checked={confirmed}
             disabled={
@@ -630,7 +630,7 @@ export function ProviderApprovalPanelView({
             我已逐页核对当前脱敏 generation，并确认上方 Provider、模型、任务、指令、历史输出和 token 上限。
           </span>
         </label>
-        <div className="privacy-actions">
+        <div className="automation-outbound-actions">
           <button
             disabled={
               busy ||
@@ -662,7 +662,7 @@ export function ProviderApprovalPanelView({
           </button>
         </div>
         {approvalReady && approval ? (
-          <p className="privacy-notice">
+          <p className="automation-outbound-notice">
             精确批准已持久化；Provider <code>{approval.providerId}</code>，
             模型 <code>{approval.modelId}</code>，用途 <code>{approval.purpose}</code>，
             任务绑定 SHA-256 <code>{approval.taskBindingSha256}</code>，
@@ -671,7 +671,7 @@ export function ProviderApprovalPanelView({
           </p>
         ) : null}
         {dispatchResult ? (
-          <article className="privacy-provider-result">
+          <article className="automation-outbound-result">
             <h4>最新 Provider 结果</h4>
             <p>
               <code>{dispatchResult.resultId}</code> · {dispatchResult.purpose} ·{" "}
@@ -686,10 +686,10 @@ export function ProviderApprovalPanelView({
         ) : null}
       </section>
 
-      <section aria-labelledby="privacy-provider-output-title">
-        <h3 id="privacy-provider-output-title">受保护输出历史</h3>
+      <section aria-labelledby="automation-outbound-output-title">
+        <h3 id="automation-outbound-output-title">受保护输出历史</h3>
         {outputs.length === 0 ? <p>当前脱敏记录没有 Provider 输出。</p> : (
-          <ul className="privacy-provider-output-list">
+          <ul className="automation-outbound-output-list">
             {outputs.map((output) => (
               <li key={output.outputId}>
                 <div>
@@ -697,7 +697,7 @@ export function ProviderApprovalPanelView({
                   <span>{output.contentBytes} 字节 · {new Date(output.createdAtUnix * 1000).toLocaleString("zh-CN")}</span>
                   <code>{output.contentSha256}</code>
                 </div>
-                <div className="privacy-actions">
+                <div className="automation-outbound-actions">
                   <button disabled={busy || output.revoked} type="button" onClick={() => onLoadOutput(output)}>
                     读取精确绑定输出
                   </button>
@@ -714,7 +714,7 @@ export function ProviderApprovalPanelView({
           </ul>
         )}
         {loadedOutput ? (
-          <article className="privacy-provider-result">
+          <article className="automation-outbound-result">
             <h4>已读取输出 {loadedOutput.outputId}</h4>
             <pre>{loadedOutput.content}</pre>
             <small>内容 SHA-256：{loadedOutput.contentSha256}</small>
@@ -727,12 +727,12 @@ export function ProviderApprovalPanelView({
   );
 }
 
-export function ProviderApprovalPanel({
+export function AutomationOutboundApprovalPanel({
   disabled = false,
   taskRequest = null,
   onTaskRequestConsumed,
   onActivityChange,
-}: ProviderApprovalPanelProps) {
+}: AutomationOutboundApprovalPanelProps) {
   const [operation, setOperation] = useState<ProviderOperation>("loading");
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [review, setReview] = useState<PrivacyReview | null>(null);
@@ -768,7 +768,7 @@ export function ProviderApprovalPanel({
   }, []);
 
   useEffect(() => {
-    if (!taskRequest) return;
+    if (!taskRequest || disabled || operation !== "idle") return;
     if (
       handledTaskRequestId.current !== null &&
       taskRequest.requestId <= handledTaskRequestId.current
@@ -785,10 +785,16 @@ export function ProviderApprovalPanel({
     onTaskRequestConsumed?.(taskRequest);
     globalThis.requestAnimationFrame?.(() => {
       document
-        .getElementById("privacy-approved-provider")
+        .getElementById("automation-outbound-approval")
         ?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
-  }, [invalidateBoundState, onTaskRequestConsumed, taskRequest]);
+  }, [
+    disabled,
+    invalidateBoundState,
+    onTaskRequestConsumed,
+    operation,
+    taskRequest,
+  ]);
 
   const installSnapshot = useCallback(
     (snapshot: PanelSnapshot) => {
@@ -1243,7 +1249,7 @@ export function ProviderApprovalPanel({
   );
 
   return (
-    <ProviderApprovalPanelView
+    <AutomationOutboundApprovalPanelView
       disabled={disabled}
       operation={operation}
       providers={providers}

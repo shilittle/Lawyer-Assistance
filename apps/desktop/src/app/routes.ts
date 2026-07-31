@@ -123,16 +123,16 @@ export interface LegalLibraryRoute {
 export type SettingsRoute =
   | {
       readonly area: "settings";
-      readonly page: "privacy";
+      readonly page: "mcp";
       readonly state?: ApprovedProviderTaskRouteState;
     }
   | {
-      readonly [Page in "providers" | "mcp" | "maintenance"]: {
+      readonly [Page in "providers" | "privacy" | "maintenance"]: {
         readonly area: "settings";
         readonly page: Page;
         readonly state?: never;
       };
-    }["providers" | "mcp" | "maintenance"];
+    }["providers" | "privacy" | "maintenance"];
 
 export type AppRoute =
   | AssistantRoute

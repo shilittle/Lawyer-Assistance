@@ -95,8 +95,8 @@ function routeWithoutNonAssistantState(route: AppRoute): AppRoute | null {
         ? { area: "legal-library", page: "library" }
         : null;
     case "settings":
-      return route.page === "privacy" && route.state
-        ? { area: "settings", page: "privacy" }
+      return route.page === "mcp" && route.state
+        ? { area: "settings", page: "mcp" }
         : null;
   }
 }
@@ -133,7 +133,7 @@ export function useAppNavigationController(
   );
   const approvedProviderRequestSequence = useRef(
     initialRoute.area === "settings" &&
-      initialRoute.page === "privacy" &&
+      initialRoute.page === "mcp" &&
       initialRoute.state?.kind === "approved-provider-task"
       ? initialRoute.state.request.requestId
       : 0,
@@ -210,7 +210,7 @@ export function useAppNavigationController(
     }
     if (
       nextRoute.area === "settings" &&
-      nextRoute.page === "privacy" &&
+      nextRoute.page === "mcp" &&
       nextRoute.state?.kind === "approved-provider-task"
     ) {
       approvedProviderRequestSequence.current = Math.max(
@@ -290,7 +290,7 @@ export function useAppNavigationController(
       approvedProviderRequestSequence.current += 1;
       return navigate({
         area: "settings",
-        page: "privacy",
+        page: "mcp",
         state: {
           kind: "approved-provider-task",
           request: {

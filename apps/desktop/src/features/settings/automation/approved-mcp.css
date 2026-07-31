@@ -8,6 +8,19 @@
   background: var(--panel-background, #fff);
 }
 
+.automation-approved-mcp-gate-badge {
+  padding: 0.35rem 0.7rem;
+  border: 1px solid #b42318;
+  border-radius: 999px;
+  color: #8f1d16;
+  font-weight: 700;
+  background: #fff0ed;
+}
+
+.automation-approved-mcp-notice {
+  margin: 0;
+}
+
 .approved-mcp-boundary,
 .approved-mcp-host-policy {
   margin: 0;

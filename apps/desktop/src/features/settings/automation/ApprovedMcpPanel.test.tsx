@@ -6,7 +6,7 @@ import type {
   ApprovedMcpQualificationStatus,
   ApprovedPrivacyReviewSelection,
   StandaloneApprovedMcpSessionMetadata,
-} from "../../ipc/privacy/approved-mcp-client";
+} from "../../../ipc/privacy/approved-mcp-client";
 import {
   ApprovedMcpPanel,
   ApprovedMcpPanelView,

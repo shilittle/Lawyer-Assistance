@@ -578,6 +578,44 @@ Tauri commands 只做 typed IPC 转换。
 * 普通聊天不再加载这些面板。
 * WorkBuddy/Codex/OpenCode 继续使用严格 approved workspace。
 
+#### Phase 6 实施澄清（2026-07-31）
+
+本节只收窄 Phase 6 的界面归位与加载边界，不改变 Provider、Privacy、
+approved workspace 或 MCP 后端安全契约，也不得提前执行 Phase 7 的物理清理：
+
+* 原 `ProviderApprovalPanel` 改以“自动化出站批准”呈现，并迁入“设置 → MCP
+  与自动化”。审批、派发、历史输出、加载和撤销能力原样保留；既有 approved
+  Provider outputs 继续在该设置区域的“历史输出”中读取。
+* `ApprovedMcpPanel` 迁入“设置 → MCP 与自动化”，与本地 MCP 服务配置处于同一
+  产品目的地下，但仍保持独立的 approved MCP 资格、发布批准、宿主会话和撤销
+  流程，不得降格为普通 MCP 配置。
+* `PrivacyWorkspace` 在 Phase 6 停止挂载上述两个面板；普通
+  `AssistantWorkspace` 和 `CaseAssistantWorkspace` 不得导入、渲染、懒加载或
+  消费其状态，也不得调用 approved Provider/MCP IPC。
+* “设置 → MCP 与自动化”使用独立 lazy workspace 持有三个互不覆盖的 activity
+  状态：本地 MCP 服务、自动化出站批准和 approved MCP。向根导航与关窗保护上报
+  三者的逻辑或；任一子区域结束不得清除另一子区域仍在进行的写入保护。普通 MCP
+  配置与 Bearer 草稿仍是该设置区域唯一的 dirty 状态。
+* Phase 7 前继续保留 `approvedProviderTaskRequest` 一次性兼容 handoff，但目标
+  迁到 `settings:mcp`；只有“自动化出站批准”接受新 `requestId`、应用固定任务后
+  才消费 route state，不得自动签发批准或派发。
+* 普通聊天继续只使用 `start_interactive_assistant_run`，不得访问 MCP profile、
+  grant、ticket、receipt 或 approved workspace；案件助手继续只使用
+  `start_case_assistant_run`，不得复用 approved automation/MCP 的授权语义。
+* Provider approved automation 与 `crates/legal-mcp` 的后端契约保持不变，包括
+  opaque IDs、approved source refs、clean-task gate、qualification、publication、
+  grant、exact ticket、destination/purpose binding、optimistic concurrency、
+  撤销感知 fail closed、完整输出扫描和 protected work-product sink。Phase 6
+  不修改相关 schema、IPC 语义或五组件备份/恢复门槛。
+* WorkBuddy、Codex 和 OpenCode 继续只能通过受控 standalone approved MCP
+  session 使用严格 approved workspace；不得开放宿主文件、浏览器、搜索、其他
+  MCP、memory、subagent、远程 OCR 或网络 fallback，Bearer 与其他 secret 继续
+  执行一次性显示、凭据隔离和不落日志规则。
+* Phase 6 不删除旧 `PrivacyWorkspace` 大页面、compatibility redirect、
+  `assistant-case-handoff`、失效的 `approvedProviderTaskRequest` handoff 或
+  fail-closed 的旧 `start_assistant_run`。这些兼容入口可继续导向新的自动化设置
+  位置，但其物理删除统一留到 Phase 7。
+
 ### Phase 7：清理与产品验收
 
 * 删除旧 Privacy 大页面。

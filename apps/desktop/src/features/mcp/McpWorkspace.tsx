@@ -42,6 +42,7 @@ const PHASE_LABELS: Readonly<Record<McpServerPhase, string>> = {
 type Operation = "idle" | "saving" | "starting" | "stopping" | "credential";
 
 export interface McpWorkspaceProps {
+  externalDisabled?: boolean;
   onDraftDirtyChange?: (dirty: boolean) => void;
   onMutationActivityChange?: (active: boolean) => void;
 }
@@ -186,6 +187,14 @@ export function mcpStatusResponseIsCurrent(
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
+export function mcpWorkspaceMutationAllowed(
+  externalDisabled: boolean,
+  mutationActive: boolean,
+): boolean {
+  return !externalDisabled && !mutationActive;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
 export function formatMcpError(error: unknown): string {
   return publicErrorMessage(
     error,
@@ -202,6 +211,7 @@ interface McpWorkspaceViewProps {
   dirty: boolean;
   notice: string;
   error: string;
+  externalDisabled?: boolean;
   onDraftChange: (draft: McpServerConfigDraft) => void;
   onBearerTokenChange: (value: string) => void;
   onSave: (event: FormEvent<HTMLFormElement>) => void;
@@ -220,6 +230,7 @@ export function McpWorkspaceView({
   dirty,
   notice,
   error,
+  externalDisabled = false,
   onDraftChange,
   onBearerTokenChange,
   onSave,
@@ -231,7 +242,8 @@ export function McpWorkspaceView({
   const busy = operation !== "idle";
   const lifecycleBusy = status.phase === "starting" || status.phase === "stopping";
   const running = status.phase === "running";
-  const configurationLocked = busy || lifecycleBusy || running;
+  const configurationLocked =
+    externalDisabled || busy || lifecycleBusy || running;
   const bearerDraftDirty = bearerToken.length > 0;
   const setField = <K extends keyof McpServerConfigDraft>(
     field: K,
@@ -246,7 +258,11 @@ export function McpWorkspaceView({
   };
 
   return (
-    <section className="workspace-card mcp-workspace" aria-busy={busy || lifecycleBusy}>
+    <section
+      className="workspace-card mcp-workspace"
+      aria-busy={busy || lifecycleBusy}
+      aria-disabled={externalDisabled || undefined}
+    >
       <header>
         <h2>本地 MCP 服务</h2>
         <p className="muted">
@@ -397,6 +413,7 @@ export function McpWorkspaceView({
           <button
             type="button"
             disabled={
+              externalDisabled ||
               busy ||
               lifecycleBusy ||
               running ||
@@ -411,7 +428,9 @@ export function McpWorkspaceView({
           <button
             className="is-stop"
             type="button"
-            disabled={busy || lifecycleBusy || !running}
+            disabled={
+              externalDisabled || busy || lifecycleBusy || !running
+            }
             onClick={onStop}
           >
             {operation === "stopping" || status.phase === "stopping" ? "正在停止……" : "停止 MCP"}
@@ -476,6 +495,7 @@ export function McpWorkspaceView({
 }
 
 export function McpWorkspace({
+  externalDisabled = false,
   onDraftDirtyChange,
   onMutationActivityChange,
 }: McpWorkspaceProps) {
@@ -567,7 +587,14 @@ export function McpWorkspace({
   );
 
   function beginOperation(nextOperation: Exclude<Operation, "idle">): boolean {
-    if (operationRef.current !== "idle") return false;
+    if (
+      !mcpWorkspaceMutationAllowed(
+        externalDisabled,
+        operationRef.current !== "idle",
+      )
+    ) {
+      return false;
+    }
     operationRef.current = nextOperation;
     // Invalidate any status read that began before this mutation. Its response
     // must never overwrite the authoritative lifecycle response below.
@@ -584,6 +611,7 @@ export function McpWorkspace({
   }
 
   function changeDraft(nextDraft: McpServerConfigDraft) {
+    if (externalDisabled) return;
     setDraft(nextDraft);
     if (configResponse) {
       onDraftDirtyChange?.(
@@ -596,13 +624,22 @@ export function McpWorkspace({
   }
 
   function changeBearerToken(nextToken: string) {
+    if (externalDisabled) return;
     setBearerToken(nextToken);
     onDraftDirtyChange?.(mcpWorkspaceHasUnsavedChanges(dirty, nextToken));
   }
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!draft || operationRef.current !== "idle") return;
+    if (
+      !mcpWorkspaceMutationAllowed(
+        externalDisabled,
+        operationRef.current !== "idle",
+      ) ||
+      !draft
+    ) {
+      return;
+    }
     let config: McpServerConfig;
     try {
       config = mcpDraftToConfig(draft);
@@ -638,7 +675,14 @@ export function McpWorkspace({
     nextOperation: "starting" | "stopping",
     action: () => Promise<McpServerStatus>,
   ) {
-    if (operationRef.current !== "idle") return;
+    if (
+      !mcpWorkspaceMutationAllowed(
+        externalDisabled,
+        operationRef.current !== "idle",
+      )
+    ) {
+      return;
+    }
     if (
       nextOperation === "starting" &&
       mcpWorkspaceHasUnsavedChanges(dirty, bearerToken)
@@ -663,7 +707,14 @@ export function McpWorkspace({
   }
 
   async function writeBearer() {
-    if (operationRef.current !== "idle") return;
+    if (
+      !mcpWorkspaceMutationAllowed(
+        externalDisabled,
+        operationRef.current !== "idle",
+      )
+    ) {
+      return;
+    }
     const validationError = validateMcpBearerToken(bearerToken);
     if (validationError) {
       setError(validationError);
@@ -689,7 +740,14 @@ export function McpWorkspace({
   }
 
   async function deleteBearer() {
-    if (operationRef.current !== "idle") return;
+    if (
+      !mcpWorkspaceMutationAllowed(
+        externalDisabled,
+        operationRef.current !== "idle",
+      )
+    ) {
+      return;
+    }
     if (!window.confirm("确定删除 MCP Bearer Token 吗？删除后客户端现有认证配置将失效。")) {
       return;
     }
@@ -735,6 +793,7 @@ export function McpWorkspace({
       dirty={dirty}
       notice={notice}
       error={error}
+      externalDisabled={externalDisabled}
       onDraftChange={changeDraft}
       onBearerTokenChange={changeBearerToken}
       onSave={(event) => void save(event)}

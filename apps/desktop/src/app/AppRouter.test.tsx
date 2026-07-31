@@ -202,6 +202,50 @@ describe("AppRouter workspace ownership", () => {
     expect(slots.cases).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps automation unrendered for Assistant and privacy, then passes exact state on the MCP route", () => {
+    for (const route of [
+      { area: "assistant", page: "chat" },
+      { area: "settings", page: "privacy" },
+    ] as const satisfies readonly AppRoute[]) {
+      const slots = slotSpies();
+      renderToStaticMarkup(
+        <AppRouter
+          route={route}
+          assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
+          slots={slots}
+          onNavigate={vi.fn()}
+        />,
+      );
+      expect(slots.mcp).not.toHaveBeenCalled();
+    }
+
+    const slots = slotSpies();
+    const route = {
+      area: "settings",
+      page: "mcp",
+      state: {
+        kind: "approved-provider-task",
+        request: {
+          task: "regenerate",
+          notice: "仅处理显式兼容请求",
+          requestId: 7,
+        },
+      },
+    } as const satisfies AppRoute;
+
+    renderToStaticMarkup(
+      <AppRouter
+        route={route}
+        assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
+        slots={slots}
+        onNavigate={vi.fn()}
+      />,
+    );
+
+    expect(slots.mcp).toHaveBeenCalledWith({ route, active: true });
+    expect(slots.privacy).not.toHaveBeenCalled();
+  });
+
   it("isolates the always-mounted Assistant and active workspace by location", () => {
     const { tree } = routerTree({
       area: "cases",
@@ -340,7 +384,7 @@ describe("AppRouter typed subnavigation", () => {
       ],
       [
         settings.tree,
-        "MCP 服务",
+        "MCP 与自动化",
         { area: "settings", page: "mcp" },
         settings.onNavigate,
       ],
