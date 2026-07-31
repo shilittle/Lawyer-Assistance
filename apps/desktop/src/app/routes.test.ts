@@ -121,6 +121,26 @@ describe("typed application routes", () => {
       ),
     ).toBe(false);
   });
+
+  it("owns the compatibility approved Provider request on MCP and automation", () => {
+    const route = {
+      area: "settings",
+      page: "mcp",
+      state: {
+        kind: "approved-provider-task",
+        request: {
+          task: "summary",
+          notice: "显式兼容请求",
+          requestId: 4,
+        },
+      },
+    } as const satisfies AppRoute;
+
+    expect(route.state.request.requestId).toBe(4);
+    expect(
+      sameRouteLocation(route, { area: "settings", page: "mcp" }),
+    ).toBe(true);
+  });
 });
 
 describe("route-state request identity", () => {

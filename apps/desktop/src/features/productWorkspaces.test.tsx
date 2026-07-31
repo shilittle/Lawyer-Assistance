@@ -27,6 +27,6 @@ describe("top-level product workspace boundaries", () => {
     expect(settings).toContain('class="provider-layout"');
     expect(settings).toContain('aria-label="Provider 与凭据设置"');
     expect(mcp).toContain('class="settings-maintenance-workspace"');
-    expect(mcp).toContain('aria-label="MCP 服务设置"');
+    expect(mcp).toContain('aria-label="MCP 与自动化设置"');
   });
 });

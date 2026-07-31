@@ -22,7 +22,7 @@ import {
   type PublishApprovedGenerationRequest,
   type StandaloneApprovedMcpSessionMetadata,
   type ProvisionedStandaloneApprovedMcpSession,
-} from "../../ipc/privacy/approved-mcp-client";
+} from "../../../ipc/privacy/approved-mcp-client";
 import "./approved-mcp.css";
 
 type ApprovedMcpOperation =
@@ -460,7 +460,7 @@ export function ApprovedMcpPanelView({
           <p className="eyebrow">批准工作区 MCP</p>
           <h3>发布批准 generation、运行资格认证并管理宿主会话</h3>
         </div>
-        <span className={`privacy-gate-badge ${qualified ? "is-ready" : ""}`}>
+        <span className={`automation-approved-mcp-gate-badge ${qualified ? "is-ready" : ""}`}>
           {qualified ? "qualified" : "blocked"}
         </span>
       </div>
@@ -811,7 +811,7 @@ export function ApprovedMcpPanelView({
       </aside>
 
       {error ? <p className="error-text" role="alert">{error}</p> : null}
-      {notice ? <p className="privacy-notice" aria-live="polite">{notice}</p> : null}
+      {notice ? <p className="automation-approved-mcp-notice" aria-live="polite">{notice}</p> : null}
     </section>
   );
 }

@@ -89,9 +89,9 @@ export const VIEW_METADATA: Readonly<Record<ViewMode, ViewMetadata>> = {
   },
   mcp: {
     id: "mcp",
-    eyebrow: "本机 MCP 服务",
-    title: "MCP 服务",
-    navigationLabel: "MCP 服务",
+    eyebrow: "MCP 与自动化",
+    title: "MCP 与自动化",
+    navigationLabel: "MCP 与自动化",
     futureArea: "settings",
   },
   release: {

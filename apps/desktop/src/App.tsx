@@ -50,10 +50,12 @@ const GraphWorkspace = lazy(() =>
     default: module.GraphWorkspace,
   })),
 );
-const McpWorkspace = lazy(() =>
-  import("./features/mcp/McpWorkspace").then((module) => ({
-    default: module.McpWorkspace,
-  })),
+const McpAndAutomationWorkspace = lazy(() =>
+  import("./features/settings/automation/McpAndAutomationWorkspace").then(
+    (module) => ({
+      default: module.McpAndAutomationWorkspace,
+    }),
+  ),
 );
 const PrivacyWorkspace = lazy(() =>
   import("./features/privacy/PrivacyWorkspace").then((module) => ({
@@ -309,7 +311,7 @@ export function App() {
     (request: ApprovedProviderTaskRequest) => {
       consumeRouteState({
         area: "settings",
-        page: "privacy",
+        page: "mcp",
         state: { kind: "approved-provider-task", request },
       });
     },
@@ -410,7 +412,7 @@ export function App() {
     providers: () => (
       <ProviderSettingsWorkspace controller={providerSettings} />
     ),
-    privacy: ({ route }) => (
+    privacy: () => (
       <SettingsWorkspace mode="privacy">
         <Suspense
           fallback={
@@ -418,10 +420,6 @@ export function App() {
           }
         >
           <PrivacyWorkspace
-            providerTaskRequest={route.state?.request ?? null}
-            onProviderTaskRequestConsumed={
-              consumeApprovedProviderTask
-            }
             onDraftDirtyChange={
               privacyActivity.onDraftDirtyChange
             }
@@ -432,16 +430,20 @@ export function App() {
         </Suspense>
       </SettingsWorkspace>
     ),
-    mcp: () => (
+    mcp: ({ route }) => (
       <SettingsWorkspace mode="mcp">
         <Suspense
           fallback={
             <p className="empty-state">
-              正在加载 MCP 服务设置…
+              正在加载 MCP 与自动化设置…
             </p>
           }
         >
-          <McpWorkspace
+          <McpAndAutomationWorkspace
+            providerTaskRequest={route.state?.request ?? null}
+            onProviderTaskRequestConsumed={
+              consumeApprovedProviderTask
+            }
             onDraftDirtyChange={mcpActivity.onDraftDirtyChange}
             onMutationActivityChange={
               mcpActivity.onMutationActivityChange

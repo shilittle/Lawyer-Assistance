@@ -1,24 +1,24 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
-import type { ProviderProfile } from "../../ipc/provider/types";
-import type { PrivacyRiskReviewState } from "../../ipc/privacy/risk-types";
+import type { ProviderProfile } from "../../../ipc/provider/types";
+import type { PrivacyRiskReviewState } from "../../../ipc/privacy/risk-types";
 import type {
   ApprovedProviderOutputSummary,
   PrivacyReview,
   ProviderQualificationStatus,
-} from "../../ipc/privacy/types";
+} from "../../../ipc/privacy/types";
 import {
   APPROVED_PROVIDER_TASK_OPTIONS,
-  ProviderApprovalPanelView,
+  AutomationOutboundApprovalPanelView,
   approvedProviderPurpose,
   buildProviderApprovalRequest,
   buildProviderDispatchRequest,
   effectiveProviderModel,
   providerApprovalUiBindingKey,
   providerTaskRequiresPriorOutput,
-} from "./ProviderApprovalPanel";
-import providerApprovalPanelSource from "./ProviderApprovalPanel.tsx?raw";
+} from "./AutomationOutboundApprovalPanel";
+import automationOutboundApprovalPanelSource from "./AutomationOutboundApprovalPanel.tsx?raw";
 
 const profile: ProviderProfile = {
   id: "provider-main",
@@ -413,31 +413,34 @@ describe("Provider approved task contract", () => {
   });
 
   it("copies a typed task request before acknowledging route state", () => {
-    expect(providerApprovalPanelSource).toMatch(
+    expect(automationOutboundApprovalPanelSource).toMatch(
+      /if \(!taskRequest \|\| disabled \|\| operation !== "idle"\) return;/u,
+    );
+    expect(automationOutboundApprovalPanelSource).toMatch(
       /setTask\(taskRequest\.task\);[\s\S]*setNotice\(taskRequest\.notice\);[\s\S]*onTaskRequestConsumed\?\.\(taskRequest\);/u,
     );
-    expect(providerApprovalPanelSource).toMatch(
+    expect(automationOutboundApprovalPanelSource).toMatch(
       /taskRequest\.requestId <= handledTaskRequestId\.current[\s\S]*handledTaskRequestId\.current = taskRequest\.requestId/u,
     );
   });
 
   it("never loads an unscoped latest review and explains the case-scoped handoff", () => {
-    expect(providerApprovalPanelSource).not.toContain(
+    expect(automationOutboundApprovalPanelSource).not.toContain(
       "loadLatestPrivacyReview",
     );
-    expect(providerApprovalPanelSource).toContain(
+    expect(automationOutboundApprovalPanelSource).toContain(
       "设置页不再自动读取未限定案件的“最近一次”脱敏记录",
     );
-    expect(providerApprovalPanelSource).toContain(
+    expect(automationOutboundApprovalPanelSource).toContain(
       "请从案件工作台的“材料与脱敏”",
     );
   });
 });
 
-describe("ProviderApprovalPanelView", () => {
+describe("AutomationOutboundApprovalPanelView", () => {
   it("shows qualification, exact purpose, approved generation and protected outputs", () => {
     const markup = renderToStaticMarkup(
-      <ProviderApprovalPanelView
+      <AutomationOutboundApprovalPanelView
         disabled={false}
         operation="idle"
         providers={[profile]}
@@ -513,9 +516,9 @@ describe("ProviderApprovalPanelView", () => {
       />,
     );
 
-    expect(markup).toContain("已批准案件 Provider 正链");
+    expect(markup).toContain("自动化出站批准");
     expect(markup).toContain("case_summary");
-    expect(markup).toContain('id="privacy-approved-provider"');
+    expect(markup).toContain('id="automation-outbound-approval"');
     expect(markup).toContain("已从旧入口切换并预选固定任务。");
     expect(markup).toContain(review.redactionId);
     expect(markup).toContain("真实 localhost wire：通过");

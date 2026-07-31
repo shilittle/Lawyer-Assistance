@@ -14,6 +14,7 @@ import {
   mcpDraftToConfig,
   mcpStatusResponseIsCurrent,
   mcpWorkspaceHasUnsavedChanges,
+  mcpWorkspaceMutationAllowed,
   validateMcpBearerToken,
 } from "./McpWorkspace";
 
@@ -84,6 +85,9 @@ describe("McpWorkspace configuration", () => {
     expect(mcpStatusResponseIsCurrent(4, 4, false)).toBe(true);
     expect(mcpStatusResponseIsCurrent(3, 4, false)).toBe(false);
     expect(mcpStatusResponseIsCurrent(4, 4, true)).toBe(false);
+    expect(mcpWorkspaceMutationAllowed(false, false)).toBe(true);
+    expect(mcpWorkspaceMutationAllowed(true, false)).toBe(false);
+    expect(mcpWorkspaceMutationAllowed(false, true)).toBe(false);
   });
 });
 
@@ -203,5 +207,39 @@ describe("McpWorkspaceView", () => {
       /<input(?=[^>]*value="8787")(?=[^>]*disabled="")[^>]*>/u,
     );
     expect(markup).toMatch(/<input[^>]*type="password"[^>]*disabled=""/u);
+  });
+
+  it("keeps status visible but locks every mutation control while another automation is active", () => {
+    const markup = renderToStaticMarkup(
+      <McpWorkspaceView
+        configResponse={configResponse}
+        draft={mcpConfigToDraft(config)}
+        status={{
+          ...status,
+          phase: "stopped",
+          endpoint: null,
+          startedAt: null,
+        }}
+        bearerToken=""
+        operation="idle"
+        dirty={false}
+        notice=""
+        error=""
+        externalDisabled={true}
+        onDraftChange={vi.fn()}
+        onBearerTokenChange={vi.fn()}
+        onSave={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onWriteBearerToken={vi.fn()}
+        onDeleteBearerToken={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('aria-disabled="true"');
+    expect(markup).toContain('aria-live="polite"');
+    for (const control of markup.match(/<(?:button|input)\b[^>]*>/gu) ?? []) {
+      expect(control).toContain('disabled=""');
+    }
   });
 });

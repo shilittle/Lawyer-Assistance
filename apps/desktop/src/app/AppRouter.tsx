@@ -110,7 +110,7 @@ const CASE_OUTPUT_NAVIGATION = [
 const SETTINGS_NAVIGATION = [
   { page: "providers", label: "Provider 与凭据" },
   { page: "privacy", label: "隐私与本地处理" },
-  { page: "mcp", label: "MCP 服务" },
+  { page: "mcp", label: "MCP 与自动化" },
   { page: "maintenance", label: "版本、备份与诊断" },
 ] as const;
 

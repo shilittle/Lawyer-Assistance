@@ -23,7 +23,7 @@ export function SettingsWorkspace({
         mode === "providers"
           ? "Provider 与凭据设置"
           : mode === "mcp"
-            ? "MCP 服务设置"
+            ? "MCP 与自动化设置"
             : mode === "privacy"
               ? "隐私与本地处理设置"
               : "版本、备份与诊断"

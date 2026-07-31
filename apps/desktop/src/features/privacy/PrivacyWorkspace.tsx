@@ -20,22 +20,13 @@ import {
   type PrivacyConfigResponse,
 } from "../../ipc/privacy/types";
 import "./privacy.css";
-import { ApprovedMcpPanel } from "./ApprovedMcpPanel";
 import { MineruComponentManagerPanel } from "./MineruComponentManagerPanel";
-import {
-  ProviderApprovalPanel,
-  type ProviderTaskRequest,
-} from "./ProviderApprovalPanel";
 import { PrivacyLifecyclePanel } from "./PrivacyLifecyclePanel";
 import { PrivacyQualificationControls } from "./PrivacyQualificationControls";
 
 type PrivacyOperation = "loading" | "idle" | "discovering" | "saving" | "refreshing";
 
 export interface PrivacyWorkspaceProps {
-  providerTaskRequest?: ProviderTaskRequest | null;
-  onProviderTaskRequestConsumed?: (
-    request: ProviderTaskRequest,
-  ) => void;
   onDraftDirtyChange?: (dirty: boolean) => void;
   onMutationActivityChange?: (active: boolean) => void;
 }
@@ -578,8 +569,6 @@ export function PrivacyWorkspaceView({
 }
 
 export function PrivacyWorkspace({
-  providerTaskRequest = null,
-  onProviderTaskRequestConsumed,
   onDraftDirtyChange,
   onMutationActivityChange,
 }: PrivacyWorkspaceProps) {
@@ -590,8 +579,6 @@ export function PrivacyWorkspace({
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [lifecycleActive, setLifecycleActive] = useState(false);
-  const [providerActive, setProviderActive] = useState(false);
-  const [approvedMcpActive, setApprovedMcpActive] = useState(false);
   const [componentActive, setComponentActive] = useState(false);
   const [qualificationActive, setQualificationActive] = useState(false);
 
@@ -631,8 +618,6 @@ export function PrivacyWorkspace({
     operation === "discovering" ||
     operation === "saving" ||
     lifecycleActive ||
-    providerActive ||
-    approvedMcpActive ||
     componentActive ||
     qualificationActive;
   useEffect(() => {
@@ -742,8 +727,6 @@ export function PrivacyWorkspace({
           dirty ||
           operation !== "idle" ||
           lifecycleActive ||
-          providerActive ||
-          approvedMcpActive ||
           qualificationActive
         }
         onSnapshot={(next) => {
@@ -754,23 +737,13 @@ export function PrivacyWorkspace({
       />
       <PrivacyQualificationControls
         snapshot={configResponse}
-        disabled={dirty || operation !== "idle" || approvedMcpActive || componentActive}
+        disabled={dirty || operation !== "idle" || componentActive}
         onSnapshot={setConfigResponse}
         onActivityChange={setQualificationActive}
       />
       <PrivacyLifecyclePanel
-        disabled={dirty || operation !== "idle" || providerActive || approvedMcpActive || componentActive || qualificationActive}
+        disabled={dirty || operation !== "idle" || componentActive || qualificationActive}
         onActivityChange={setLifecycleActive}
-      />
-      <ProviderApprovalPanel
-        taskRequest={providerTaskRequest}
-        onTaskRequestConsumed={onProviderTaskRequestConsumed}
-        disabled={!configResponse.configValid || dirty || operation !== "idle" || lifecycleActive || approvedMcpActive || componentActive || qualificationActive}
-        onActivityChange={setProviderActive}
-      />
-      <ApprovedMcpPanel
-        disabled={!configResponse.configValid || dirty || operation !== "idle" || lifecycleActive || providerActive || componentActive || qualificationActive}
-        onActivityChange={setApprovedMcpActive}
       />
     </>
   );

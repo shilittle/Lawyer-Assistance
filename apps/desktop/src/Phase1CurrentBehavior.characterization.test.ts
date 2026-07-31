@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import appSource from "./App.tsx?raw";
 import assistantClientSource from "./ipc/assistant/client.ts?raw";
 import assistantWorkspaceSource from "./features/assistant/AssistantWorkspace.tsx?raw";
+import caseAssistantWorkspaceSource from "./features/cases/assistant/CaseAssistantWorkspace.tsx?raw";
 import providerEgressNoticeSource from "./features/assistant/ProviderEgressNotice.tsx?raw";
 import redactionWorkbenchSource from "./features/cases/materials/RedactionWorkbench.tsx?raw";
 import privacyWorkspaceSource from "./features/privacy/PrivacyWorkspace.tsx?raw";
+import automationWorkspaceSource from "./features/settings/automation/McpAndAutomationWorkspace.tsx?raw";
 
 describe("Phase 1 current application workflow characterization", () => {
   it("sends ordinary Assistant messages through the independent interactive boundary", () => {
@@ -45,7 +47,7 @@ describe("Phase 1 current application workflow characterization", () => {
     );
   });
 
-  it("keeps local processing and automation controls in settings but removes case review content", () => {
+  it("keeps local processing separate from the MCP and automation settings owner", () => {
     const workspaceImplementation = privacyWorkspaceSource.slice(
       privacyWorkspaceSource.indexOf("export function PrivacyWorkspace("),
     );
@@ -55,13 +57,36 @@ describe("Phase 1 current application workflow characterization", () => {
       "MineruComponentManagerPanel",
       "PrivacyQualificationControls",
       "PrivacyLifecyclePanel",
-      "ProviderApprovalPanel",
-      "ApprovedMcpPanel",
     ]) {
       expect(workspaceImplementation).toContain(`<${panel}`);
     }
     expect(workspaceImplementation).not.toContain(
+      "<AutomationOutboundApprovalPanel",
+    );
+    expect(workspaceImplementation).not.toContain("<ProviderApprovalPanel");
+    expect(workspaceImplementation).not.toContain("<ApprovedMcpPanel");
+    expect(workspaceImplementation).not.toContain(
       "<PrivacyReviewWorkbench",
     );
+
+    for (const panel of [
+      "McpWorkspace",
+      "AutomationOutboundApprovalPanel",
+      "ApprovedMcpPanel",
+    ]) {
+      expect(automationWorkspaceSource).toContain(`<${panel}`);
+    }
+  });
+
+  it("does not import automation panels into ordinary or case Assistant", () => {
+    for (const source of [
+      assistantWorkspaceSource,
+      caseAssistantWorkspaceSource,
+    ]) {
+      expect(source).not.toContain("AutomationOutboundApprovalPanel");
+      expect(source).not.toContain("ProviderApprovalPanel");
+      expect(source).not.toContain("ApprovedMcpPanel");
+      expect(source).not.toContain("McpAndAutomationWorkspace");
+    }
   });
 });
