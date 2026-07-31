@@ -3109,6 +3109,21 @@ fn remap_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        privacy_manager::{LocalOcrStatus, LocalOcrStatusCode, PrivacyConfig},
+        privacy_workflow::{
+            test_workspace_instance_id, ApplyCaseRedactionRiskReviewActionRequest,
+            ApproveCaseRedactionReviewRequest, CaseRedactionReviewView, EditedRedactedPage,
+            LocalOcrExecutionContext, ReceiptDestinationInput,
+        },
+    };
+    use privacy::{DestinationKind, PrivacyStore, ReceiptSigner, ReviewActionV1};
+    use providers::{
+        ApiSecret, ChatTransport, CredentialStore, ProviderCapabilities, ProviderCredentialKey,
+        ProviderError, ProviderKind, ProviderOptions, ProviderProfile, TransportRequest,
+        TransportResponse,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn case_work_test_provider_snapshot_json() -> String {
         canonical_json(&serde_json::json!({
@@ -4488,6 +4503,543 @@ mod tests {
             "selectionRowVersion": 1
         }]))
         .expect("source snapshots serialize")
+    }
+
+    #[derive(Clone)]
+    struct CaseAssistantMockCredentialStore {
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl Default for CaseAssistantMockCredentialStore {
+        fn default() -> Self {
+            Self {
+                read_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl CaseAssistantMockCredentialStore {
+        fn read_calls(&self) -> usize {
+            self.read_calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl CredentialStore for CaseAssistantMockCredentialStore {
+        type Error = ProviderError;
+
+        fn read_api_key(
+            &self,
+            _key: &ProviderCredentialKey,
+        ) -> Result<Option<ApiSecret>, Self::Error> {
+            self.read_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Some(ApiSecret::new("mock-case-assistant-secret-1234")))
+        }
+
+        fn write_api_key(
+            &self,
+            _key: &ProviderCredentialKey,
+            _secret: ApiSecret,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn delete_api_key(&self, _key: &ProviderCredentialKey) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CaseAssistantCapturingTransport {
+        requests: Arc<Mutex<Vec<TransportRequest>>>,
+        response: TransportResponse,
+    }
+
+    impl CaseAssistantCapturingTransport {
+        fn successful(content: String) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                response: TransportResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "choices": [{"message": {"content": content}}],
+                        "model": "mock-model",
+                    })
+                    .to_string(),
+                    first_content_token_latency_ms: None,
+                    total_latency_ms: 1,
+                },
+            }
+        }
+
+        fn requests(&self) -> Vec<TransportRequest> {
+            self.requests.lock().expect("request lock").clone()
+        }
+    }
+
+    impl ChatTransport for CaseAssistantCapturingTransport {
+        fn send(&self, request: TransportRequest) -> Result<TransportResponse, ProviderError> {
+            self.requests.lock().expect("request lock").push(request);
+            Ok(self.response.clone())
+        }
+    }
+
+    struct CaseAssistantRunFixture {
+        _directory: tempfile::TempDir,
+        state: AppState,
+        workflow: PrivacyWorkflowManager,
+        privacy_database_path: std::path::PathBuf,
+        project_id: String,
+        conversation_id: String,
+        redaction_id: String,
+        material_id: String,
+        privacy_case_id: String,
+        source_file_name: String,
+        raw_canary: String,
+        approved_text: String,
+    }
+
+    impl CaseAssistantRunFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("case assistant integration root");
+            let user_database_path =
+                database::ensure_user_database(directory.path()).expect("user database");
+            let legal_core_path = directory.path().join(database::LEGAL_CORE_DB_FILE_NAME);
+            let legal_connection =
+                rusqlite::Connection::open(&legal_core_path).expect("legal database");
+            database::initialize_legal_core_database(&legal_connection).expect("legal schema");
+            drop(legal_connection);
+
+            let project_id = "case-assistant-approved-only".to_owned();
+            let conversation_id = "case-work-approved-only".to_owned();
+            let user_connection =
+                database::open_user_database(&user_database_path).expect("open user database");
+            database::upsert_case_project(
+                &user_connection,
+                &database::CaseProjectRow {
+                    project_id: project_id.clone(),
+                    title: "PRIVATE PROJECT TITLE MUST NOT LEAVE DEVICE".to_owned(),
+                    case_type: "civil".to_owned(),
+                    status: "active".to_owned(),
+                    opened_on: None,
+                    summary: "PRIVATE PROJECT SUMMARY MUST NOT LEAVE DEVICE".to_owned(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+            )
+            .expect("insert project");
+            database::create_case_work_conversation(
+                &user_connection,
+                &conversation_id,
+                &project_id,
+                "Approved-only case work",
+            )
+            .expect("insert case-work conversation");
+            save_case_assistant_test_provider(&user_connection);
+            drop(user_connection);
+
+            let workflow = PrivacyWorkflowManager::new(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+            )
+            .expect("privacy workflow");
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_secs();
+            workflow.set_test_runtime(
+                ReceiptSigner::new([0x73; 32]).expect("test receipt signer"),
+                now_unix,
+            );
+
+            let source_file_name = "case-assistant-raw-canary.txt".to_owned();
+            let source_path = directory.path().join(&source_file_name);
+            let raw_canary = "13800138000".to_owned();
+            std::fs::write(
+                &source_path,
+                format!("Synthetic client {raw_canary} supplied contract evidence."),
+            )
+            .expect("write synthetic TXT source");
+            let prepared = workflow
+                .prepare_case_selected_material_with_qualification(
+                    &source_path,
+                    &PrivacyConfig::default(),
+                    &disabled_case_assistant_ocr_status(),
+                    LocalOcrExecutionContext {
+                        mineru_config: None,
+                        qualification: None,
+                    },
+                    project_id.clone(),
+                    Vec::new(),
+                )
+                .expect("prepare synthetic TXT without OCR");
+            let prepared = workflow
+                .case_redaction_review_view(project_id.clone(), prepared)
+                .expect("scope prepared review to project");
+            let reviewed = confirm_case_assistant_review(&workflow, prepared);
+            let approved_text = reviewed
+                .pages
+                .iter()
+                .map(|page| page.redacted_text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!approved_text.contains(&raw_canary));
+            let risk_revision = reviewed
+                .risk_review
+                .as_ref()
+                .expect("confirmed risk revision")
+                .revision;
+            workflow
+                .approve_case_redaction_review(ApproveCaseRedactionReviewRequest {
+                    project_id: project_id.clone(),
+                    redaction_id: reviewed.redaction_id.clone(),
+                    expected_risk_revision: Some(risk_revision),
+                    expected_suggested_redacted_sha256: reviewed
+                        .suggested_redacted_content_sha256
+                        .clone(),
+                    edited_pages: case_assistant_edited_pages(&reviewed),
+                    reviewer: "case-assistant-test-reviewer".to_owned(),
+                    destination: ReceiptDestinationInput {
+                        kind: DestinationKind::VerifiedLocalProvider,
+                        identifier: "local-safe-pdf-export-v1".to_owned(),
+                    },
+                    purpose: "local_safe_pdf_export".to_owned(),
+                    ttl_seconds: 3_600,
+                })
+                .expect("approve exact redacted generation");
+
+            let privacy_database_path = directory
+                .path()
+                .join("privacy")
+                .join("privacy-workflow.sqlite");
+            let privacy_connection =
+                rusqlite::Connection::open(&privacy_database_path).expect("open privacy database");
+            let privacy_case_id = privacy_connection
+                .query_row(
+                    "SELECT privacy_case_id FROM project_privacy_case_bindings WHERE project_id=?1",
+                    [&project_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read immutable privacy binding");
+            drop(privacy_connection);
+
+            Self {
+                state: AppState::new(legal_core_path, user_database_path),
+                workflow,
+                privacy_database_path,
+                project_id,
+                conversation_id,
+                redaction_id: reviewed.redaction_id,
+                material_id: reviewed.material_id,
+                privacy_case_id,
+                source_file_name,
+                raw_canary,
+                approved_text,
+                _directory: directory,
+            }
+        }
+
+        fn request(&self, run_id: &str) -> StartCaseAssistantRunRequest {
+            StartCaseAssistantRunRequest {
+                run_id: run_id.to_owned(),
+                conversation_id: self.conversation_id.clone(),
+                project_id: self.project_id.clone(),
+                provider_id: "provider-case-assistant-test".to_owned(),
+                prompt: "Assess the approved synthetic evidence only.".to_owned(),
+                redaction_generation_ids: vec![self.redaction_id.clone()],
+                output_kind: CaseAssistantOutputKind::Document,
+                budget: None,
+            }
+        }
+
+        fn revoke_generation_and_selection(&self) {
+            let mut connection = rusqlite::Connection::open(&self.privacy_database_path)
+                .expect("open privacy database for revocation");
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("begin exact generation revocation");
+            assert_eq!(
+                transaction
+                    .execute(
+                        "UPDATE privacy_redactions
+                         SET revocation_state='revoked',revoked_at=CURRENT_TIMESTAMP,
+                             row_version=row_version+1
+                         WHERE redaction_id=?1 AND revocation_state='active'",
+                        [&self.redaction_id],
+                    )
+                    .expect("revoke exact generation"),
+                1
+            );
+            assert_eq!(
+                PrivacyStore::invalidate_case_work_selections_for_generation(
+                    &transaction,
+                    &self.redaction_id,
+                    "generation_revoked",
+                )
+                .expect("invalidate exact active selection"),
+                1
+            );
+            transaction.commit().expect("commit generation revocation");
+        }
+    }
+
+    fn disabled_case_assistant_ocr_status() -> LocalOcrStatus {
+        LocalOcrStatus {
+            code: LocalOcrStatusCode::Disabled,
+            message: "disabled for synthetic TXT test".to_owned(),
+            worker_version: None,
+            model_version: None,
+            worker_sha256: None,
+            model_manifest_sha256: None,
+            worker_present: false,
+            model_directory_present: false,
+            integrity_verified: false,
+            network_isolation_verified: false,
+            worker_protocol_version: None,
+            worker_protocol_identity_sha256: None,
+            worker_health_evidence_sha256: None,
+            python_version: None,
+            mineru_version: None,
+            pytorch_version: None,
+            cuda_runtime_version: None,
+            gpu_driver_version: None,
+        }
+    }
+
+    fn case_assistant_edited_pages(review: &CaseRedactionReviewView) -> Vec<EditedRedactedPage> {
+        review
+            .pages
+            .iter()
+            .map(|page| EditedRedactedPage {
+                page_number: page.page_number,
+                redacted_text: page.redacted_text.clone(),
+            })
+            .collect()
+    }
+
+    fn confirm_case_assistant_review(
+        workflow: &PrivacyWorkflowManager,
+        mut review: CaseRedactionReviewView,
+    ) -> CaseRedactionReviewView {
+        let target_pages = case_assistant_edited_pages(&review);
+        let finding_ids = review
+            .risk_review
+            .as_ref()
+            .expect("initial risk revision")
+            .findings
+            .iter()
+            .map(|finding| finding.finding_id.clone())
+            .collect::<Vec<_>>();
+        for finding_id in finding_ids {
+            let revision = review
+                .risk_review
+                .as_ref()
+                .expect("current risk revision")
+                .revision;
+            review = workflow
+                .apply_case_redaction_risk_review_action(
+                    ApplyCaseRedactionRiskReviewActionRequest {
+                        project_id: review.project_id.clone(),
+                        redaction_id: review.redaction_id.clone(),
+                        expected_revision: revision,
+                        actor: "case-assistant-test-reviewer".to_owned(),
+                        edited_pages: target_pages.clone(),
+                        action: ReviewActionV1::AcceptReplacement {
+                            finding_id,
+                            apply_cluster: false,
+                        },
+                    },
+                )
+                .expect("accept local detector replacement");
+        }
+        let revision = review
+            .risk_review
+            .as_ref()
+            .expect("resolved risk revision")
+            .revision;
+        workflow
+            .apply_case_redaction_risk_review_action(ApplyCaseRedactionRiskReviewActionRequest {
+                project_id: review.project_id.clone(),
+                redaction_id: review.redaction_id.clone(),
+                expected_revision: revision,
+                actor: "case-assistant-test-reviewer".to_owned(),
+                edited_pages: target_pages,
+                action: ReviewActionV1::ConfirmEditedOutput,
+            })
+            .expect("confirm exact locally redacted output")
+    }
+
+    fn save_case_assistant_test_provider(connection: &rusqlite::Connection) {
+        let profile = ProviderProfile {
+            id: "provider-case-assistant-test".to_owned(),
+            display_name: "Case Assistant Mock Provider".to_owned(),
+            kind: ProviderKind::Custom,
+            model_id: "mock-model".to_owned(),
+            base_url: "https://example.com/v1".to_owned(),
+            credential_account_id: "default".to_owned(),
+            capabilities: ProviderCapabilities::custom_openai_compatible_defaults(),
+            options: ProviderOptions::default(),
+        };
+        database::upsert_provider_profile(
+            connection,
+            &database::ProviderProfileRow {
+                id: profile.id,
+                kind: "custom".to_owned(),
+                display_name: profile.display_name,
+                model_id: profile.model_id,
+                base_url: profile.base_url,
+                credential_account_id: profile.credential_account_id,
+                capabilities_json: serde_json::to_string(&profile.capabilities)
+                    .expect("serialize provider capabilities"),
+                options_json: serde_json::to_string(&profile.options)
+                    .expect("serialize provider options"),
+            },
+        )
+        .expect("insert mock provider");
+    }
+
+    fn case_assistant_document_envelope() -> String {
+        serde_json::to_string(&StructuredEnvelope {
+            schema_version: assistant::CONTRACT_SCHEMA_VERSION,
+            output: StructuredOutput::DocumentSpec(assistant::DocumentSpec {
+                schema_version: assistant::CONTRACT_SCHEMA_VERSION,
+                document_type: assistant::DocumentType::LawyerLetter,
+                title: "Synthetic approved-source assessment".to_owned(),
+                parties: Vec::new(),
+                sections: vec![assistant::DocumentSection {
+                    id: "section-one".to_owned(),
+                    heading: "Assessment".to_owned(),
+                    body: "The approved source supports this bounded synthetic assessment."
+                        .to_owned(),
+                    factual: true,
+                    provenance: vec![assistant::ProvenanceRef {
+                        kind: assistant::ProvenanceKind::UserMaterial,
+                        source_ref: Some("M1".to_owned()),
+                    }],
+                    clauses: Vec::new(),
+                }],
+                assumptions: Vec::new(),
+                missing_information: Vec::new(),
+                source_materials: vec![assistant::SourceMaterial {
+                    id: "M1".to_owned(),
+                    kind: assistant::SourceMaterialKind::UserMaterial,
+                    label: "Approved material".to_owned(),
+                    locator: None,
+                }],
+                legal_citations: Vec::new(),
+                risk_warnings: Vec::new(),
+            }),
+        })
+        .expect("serialize bounded document envelope")
+    }
+
+    fn no_op_case_assistant_events(run_id: &str) -> CaseAssistantEventEmitter {
+        CaseAssistantEventEmitter::new(run_id, Channel::new(|_| Ok(())))
+    }
+
+    #[test]
+    fn case_assistant_run_uses_only_approved_projection_and_revocation_blocks_retry_transport() {
+        let fixture = CaseAssistantRunFixture::new();
+        let credentials = CaseAssistantMockCredentialStore::default();
+        let transport =
+            CaseAssistantCapturingTransport::successful(case_assistant_document_envelope());
+        let first_request = fixture.request("case-assistant-run-approved");
+        let first_events = no_op_case_assistant_events(&first_request.run_id);
+
+        let response = start_case_assistant_run_with_dependencies(
+            &fixture.state,
+            &fixture.workflow,
+            first_request.clone(),
+            &credentials,
+            transport.clone(),
+            &first_events,
+        )
+        .expect("approved-only case assistant run succeeds through the command boundary");
+
+        assert_eq!(response.run.status, "succeeded");
+        assert_eq!(response.pending_output.status, "pending");
+        assert_eq!(response.pending_output.output_kind, "case_document");
+        assert!(response.pending_output.artifact_id.is_none());
+        assert!(response.pending_output.proposal_id.is_none());
+        assert_eq!(credentials.read_calls(), 1);
+
+        let sent = transport.requests();
+        assert_eq!(sent.len(), 1);
+        let body = sent[0].body();
+        assert!(body.contains(&first_request.prompt));
+        assert!(body.contains(&fixture.approved_text));
+        assert!(body.contains("M1"));
+        for forbidden in [
+            fixture.raw_canary.as_str(),
+            fixture.source_file_name.as_str(),
+            fixture.project_id.as_str(),
+            fixture.privacy_case_id.as_str(),
+            fixture.redaction_id.as_str(),
+            fixture.material_id.as_str(),
+            "PRIVATE PROJECT TITLE MUST NOT LEAVE DEVICE",
+            "PRIVATE PROJECT SUMMARY MUST NOT LEAVE DEVICE",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "Provider body leaked {forbidden}"
+            );
+        }
+
+        let selected = fixture
+            .workflow
+            .list_case_assistant_generations(&fixture.project_id)
+            .expect("list selected approved generation");
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].selected);
+
+        fixture.revoke_generation_and_selection();
+        assert!(fixture
+            .workflow
+            .list_case_assistant_generations(&fixture.project_id)
+            .expect("refresh after exact generation revocation")
+            .is_empty());
+
+        let retry_request = fixture.request("case-assistant-run-revoked");
+        let retry_events = no_op_case_assistant_events(&retry_request.run_id);
+        let retry_error = start_case_assistant_run_with_dependencies(
+            &fixture.state,
+            &fixture.workflow,
+            retry_request.clone(),
+            &credentials,
+            transport.clone(),
+            &retry_events,
+        )
+        .expect_err("revoked generation must fail before Provider transport");
+        assert_eq!(retry_error.error_type, "redaction_not_approved");
+        assert_eq!(credentials.read_calls(), 2);
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "revoked retry reached Provider transport"
+        );
+
+        let user_connection = database::open_user_database(fixture.state.user_database_path())
+            .expect("open user database after retry");
+        let failed_run = database::get_agent_run(&user_connection, &retry_request.run_id)
+            .expect("read revoked retry run")
+            .expect("revoked retry is durably finalized");
+        assert_eq!(failed_run.status, "failed");
+        assert_eq!(
+            failed_run.error_type.as_deref(),
+            Some("redaction_not_approved")
+        );
+        assert!(failed_run.assistant_message_id.is_none());
+        assert_eq!(
+            database::list_case_assistant_pending_outputs(
+                &user_connection,
+                &fixture.project_id,
+                &fixture.conversation_id,
+                100,
+            )
+            .expect("list pending outputs after revoked retry")
+            .len(),
+            1,
+            "revoked retry created a second pending output"
+        );
     }
 
     fn assert_confirmation_conflict(result: Result<(), AssistantIpcError>, scenario: &str) {

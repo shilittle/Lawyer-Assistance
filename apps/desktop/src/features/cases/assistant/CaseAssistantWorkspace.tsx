@@ -7,6 +7,7 @@ import {
 } from "react";
 
 import {
+  CaseAssistantIpcClientError,
   cancelCaseAssistantRun,
   confirmCaseAssistantOutput,
   createCaseAssistantConversation,
@@ -31,7 +32,9 @@ import { CaseAssistantPendingOutputs } from "./CaseAssistantPendingOutputs";
 import { CaseAssistantProviderNotice } from "./CaseAssistantProviderNotice";
 import {
   caseAssistantConfirmationMessage,
+  caseAssistantRunFailureMessage,
   initialCaseAssistantStreamState,
+  reconcileCaseAssistantGenerationIds,
   reduceCaseAssistantRunEvent,
   selectedGenerationIdsFromProjection,
   toggleCaseAssistantGeneration,
@@ -154,7 +157,9 @@ export function CaseAssistantWorkspace({
     [],
   );
 
-  const refreshGenerations = useCallback(async () => {
+  const refreshGenerations = useCallback(async (
+    options: { announceSuccess?: boolean } = {},
+  ) => {
     if (!projectId) return;
     const expectedEpoch = projectEpoch.current;
     setOperation("refresh_generations");
@@ -166,27 +171,19 @@ export function CaseAssistantWorkspace({
       ) {
         return;
       }
-      const availableIds = new Set(
-        response.generations.map(
-          (generation) => generation.redactionGenerationId,
+      setGenerations(response.generations);
+      setSelectedGenerationIds((current) =>
+        reconcileCaseAssistantGenerationIds(
+          current,
+          response.generations,
         ),
       );
-      const restoredIds = selectedGenerationIdsFromProjection(
-        response.generations,
-      );
-      setGenerations(response.generations);
-      setSelectedGenerationIds((current) => [
-        ...new Set([
-          ...current.filter((generationId) =>
-            availableIds.has(generationId),
-          ),
-          ...restoredIds,
-        ]),
-      ]);
-      setNotice({
-        kind: "status",
-        text: "已重新读取当前案件可用的 approved/current 脱敏版本。",
-      });
+      if (options.announceSuccess !== false) {
+        setNotice({
+          kind: "status",
+          text: "已重新读取当前案件可用的 approved/current 脱敏版本。",
+        });
+      }
     } catch (error: unknown) {
       if (
         mounted.current &&
@@ -529,11 +526,21 @@ export function CaseAssistantWorkspace({
         mounted.current &&
         projectEpoch.current === expectedEpoch
       ) {
-        setNotice({
-          kind: "error",
-          text: `案件助理运行失败：${publicErrorMessage(error)}`,
-        });
-        await refreshGenerations();
+        const errorType =
+          error instanceof CaseAssistantIpcClientError
+            ? error.errorType
+            : undefined;
+        const failureMessage = caseAssistantRunFailureMessage(
+          publicErrorMessage(error),
+          errorType,
+        );
+        await refreshGenerations({ announceSuccess: false });
+        if (
+          mounted.current &&
+          projectEpoch.current === expectedEpoch
+        ) {
+          setNotice({ kind: "error", text: failureMessage });
+        }
       }
     } finally {
       if (
