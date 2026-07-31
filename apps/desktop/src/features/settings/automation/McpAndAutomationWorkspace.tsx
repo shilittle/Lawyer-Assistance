@@ -6,18 +6,11 @@ import {
 
 import { McpWorkspace } from "../../mcp/McpWorkspace";
 import { getPrivacyConfig } from "../../../ipc/privacy/client";
-import {
-  AutomationOutboundApprovalPanel,
-  type ProviderTaskRequest,
-} from "./AutomationOutboundApprovalPanel";
+import { AutomationOutboundApprovalPanel } from "./AutomationOutboundApprovalPanel";
 import { ApprovedMcpPanel } from "./ApprovedMcpPanel";
 import "./McpAndAutomationWorkspace.css";
 
 export interface McpAndAutomationWorkspaceProps {
-  providerTaskRequest?: ProviderTaskRequest | null;
-  onProviderTaskRequestConsumed?: (
-    request: ProviderTaskRequest,
-  ) => void;
   onDraftDirtyChange?: (dirty: boolean) => void;
   onMutationActivityChange?: (active: boolean) => void;
 }
@@ -80,8 +73,6 @@ export interface McpAndAutomationWorkspaceViewProps
 export function McpAndAutomationWorkspaceView({
   gate,
   activity,
-  providerTaskRequest = null,
-  onProviderTaskRequestConsumed,
   onDraftDirtyChange,
   onMcpActivityChange,
   onOutboundActivityChange,
@@ -141,8 +132,6 @@ export function McpAndAutomationWorkspaceView({
             aria-label="受控 Provider 外发"
           >
             <AutomationOutboundApprovalPanel
-              taskRequest={providerTaskRequest}
-              onTaskRequestConsumed={onProviderTaskRequestConsumed}
               disabled={activity.mcp || activity.approvedMcp}
               onActivityChange={onOutboundActivityChange}
             />
@@ -163,8 +152,8 @@ export function McpAndAutomationWorkspaceView({
           {gate.phase === "loading"
             ? "正在读取本机隐私配置；自动化面板在核验完成前不会初始化。"
             : gate.phase === "error"
-              ? "无法核验本机隐私配置；自动化面板保持关闭，待处理任务未被消费。本地 MCP 仍可使用。"
-              : "本机隐私配置无效；自动化面板保持关闭，待处理任务未被消费。请修复配置后重新发起该任务。"}
+              ? "无法核验本机隐私配置；自动化面板保持关闭。本地 MCP 仍可使用。"
+              : "本机隐私配置无效；自动化面板保持关闭。请先修复本机配置。"}
         </p>
       )}
     </div>
@@ -172,8 +161,6 @@ export function McpAndAutomationWorkspaceView({
 }
 
 export function McpAndAutomationWorkspace({
-  providerTaskRequest = null,
-  onProviderTaskRequestConsumed,
   onDraftDirtyChange,
   onMutationActivityChange,
 }: McpAndAutomationWorkspaceProps) {
@@ -236,10 +223,6 @@ export function McpAndAutomationWorkspace({
     <McpAndAutomationWorkspaceView
       gate={gate}
       activity={activity}
-      providerTaskRequest={providerTaskRequest}
-      onProviderTaskRequestConsumed={
-        onProviderTaskRequestConsumed
-      }
       onDraftDirtyChange={onDraftDirtyChange}
       onMcpActivityChange={onMcpActivityChange}
       onOutboundActivityChange={onOutboundActivityChange}

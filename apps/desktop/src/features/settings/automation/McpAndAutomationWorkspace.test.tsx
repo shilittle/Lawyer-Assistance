@@ -13,14 +13,10 @@ const childSpies = vi.hoisted(() => ({
     ),
   ),
   outbound: vi.fn(
-    (props: {
-      disabled?: boolean;
-      taskRequest?: unknown;
-    }) => (
+    (props: { disabled?: boolean }) => (
       <div
         data-child="outbound"
         data-disabled={String(Boolean(props.disabled))}
-        data-has-task={String(props.taskRequest != null)}
       />
     ),
   ),
@@ -72,12 +68,6 @@ function renderView(
     <McpAndAutomationWorkspaceView
       gate={gate}
       activity={activity}
-      providerTaskRequest={{
-        task: "summary",
-        notice: "synthetic handoff",
-        requestId: 7,
-      }}
-      onProviderTaskRequestConsumed={vi.fn()}
       onDraftDirtyChange={vi.fn()}
       onMcpActivityChange={vi.fn()}
       onOutboundActivityChange={vi.fn()}
@@ -134,7 +124,7 @@ describe("MCP and automation activity boundary", () => {
     expect(markup).toContain('data-child="mcp"');
     expect(markup).not.toContain('data-child="outbound"');
     expect(markup).not.toContain('data-child="approved-mcp"');
-    expect(markup).toContain("待处理任务未被消费");
+    expect(markup).toContain("自动化面板保持关闭");
     expect(childSpies.outbound).not.toHaveBeenCalled();
     expect(childSpies.approvedMcp).not.toHaveBeenCalled();
     expect(
@@ -146,19 +136,12 @@ describe("MCP and automation activity boundary", () => {
     expect(automationPanelsMayMount(READY_GATE)).toBe(true);
   });
 
-  it("passes the task only to outbound automation and dirty state only to local MCP", () => {
+  it("passes dirty state only to local MCP and injects no legacy task into automation", () => {
     const dirty = vi.fn();
-    const task = {
-      task: "summary" as const,
-      notice: "synthetic handoff",
-      requestId: 9,
-    };
     renderToStaticMarkup(
       <McpAndAutomationWorkspaceView
         gate={READY_GATE}
         activity={IDLE_ACTIVITY}
-        providerTaskRequest={task}
-        onProviderTaskRequestConsumed={vi.fn()}
         onDraftDirtyChange={dirty}
         onMcpActivityChange={vi.fn()}
         onOutboundActivityChange={vi.fn()}
@@ -169,9 +152,9 @@ describe("MCP and automation activity boundary", () => {
     expect(childSpies.mcp.mock.calls.at(-1)?.[0]).toMatchObject({
       onDraftDirtyChange: dirty,
     });
-    expect(childSpies.outbound.mock.calls.at(-1)?.[0]).toMatchObject({
-      taskRequest: task,
-    });
+    expect(childSpies.outbound.mock.calls.at(-1)?.[0]).not.toHaveProperty(
+      "taskRequest",
+    );
     expect(childSpies.approvedMcp.mock.calls.at(-1)?.[0]).not.toHaveProperty(
       "taskRequest",
     );

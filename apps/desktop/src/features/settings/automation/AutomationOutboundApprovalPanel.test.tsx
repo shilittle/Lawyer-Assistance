@@ -412,15 +412,15 @@ describe("Provider approved task contract", () => {
     })).toBe("ep-bound-model");
   });
 
-  it("copies a typed task request before acknowledging route state", () => {
-    expect(automationOutboundApprovalPanelSource).toMatch(
-      /if \(!taskRequest \|\| disabled \|\| operation !== "idle"\) return;/u,
+  it("has no compatibility task injection or route-state acknowledgement", () => {
+    expect(automationOutboundApprovalPanelSource).not.toContain(
+      "taskRequest",
     );
-    expect(automationOutboundApprovalPanelSource).toMatch(
-      /setTask\(taskRequest\.task\);[\s\S]*setNotice\(taskRequest\.notice\);[\s\S]*onTaskRequestConsumed\?\.\(taskRequest\);/u,
+    expect(automationOutboundApprovalPanelSource).not.toContain(
+      "onTaskRequestConsumed",
     );
-    expect(automationOutboundApprovalPanelSource).toMatch(
-      /taskRequest\.requestId <= handledTaskRequestId\.current[\s\S]*handledTaskRequestId\.current = taskRequest\.requestId/u,
+    expect(automationOutboundApprovalPanelSource).not.toContain(
+      "handledTaskRequestId",
     );
   });
 

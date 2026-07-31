@@ -13,7 +13,7 @@ export const VIEW_MODES = [
   "qa",
   "cases",
   "providers",
-  "privacy",
+  "local-processing",
   "documents",
   "graph",
   "mcp",
@@ -66,11 +66,11 @@ export const VIEW_METADATA: Readonly<Record<ViewMode, ViewMetadata>> = {
     navigationLabel: "设置",
     futureArea: "settings",
   },
-  privacy: {
-    id: "privacy",
+  "local-processing": {
+    id: "local-processing",
     eyebrow: "本地脱敏与 OCR",
-    title: "隐私与本地处理",
-    navigationLabel: "隐私与本地处理",
+    title: "本地处理环境与 OCR 组件",
+    navigationLabel: "本地处理环境与 OCR 组件",
     futureArea: "settings",
   },
   documents: {

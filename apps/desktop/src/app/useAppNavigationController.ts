@@ -3,17 +3,15 @@ import { useCallback, useRef, useState } from "react";
 import {
   decideCaseMaterialContextChange,
   decideCaseMaterialRouteNavigation,
+  decideLocalProcessingRouteNavigation,
+  decideMaintenanceRouteNavigation,
   decideMcpRouteNavigation,
-  decidePrivacyRouteNavigation,
 } from "./navigationGuards";
 import {
   DEFAULT_ROUTE,
   sameRouteLocation,
   sameRouteStateRequest,
   type AppRoute,
-  type ApprovedProviderTaskRequest,
-  type AssistantCaseHandoffRequest,
-  type AssistantRoute,
   type GraphTargetRequest,
   type LegalCitationRequest,
 } from "./routes";
@@ -27,38 +25,17 @@ export interface NavigationProtectionChannel {
 export interface UseAppNavigationControllerOptions {
   readonly initialRoute?: AppRoute;
   readonly mcp: NavigationProtectionChannel;
-  readonly privacy: NavigationProtectionChannel;
+  readonly localProcessing: NavigationProtectionChannel;
+  readonly maintenance: NavigationProtectionChannel;
   readonly caseMaterials: NavigationProtectionChannel;
   readonly confirmDiscard: (message: string) => boolean;
 }
 
-export type AssistantHostRoute = Extract<
-  AssistantRoute,
-  { readonly page: "chat" }
->;
-
-export type AssistantCaseHandoffInput = Omit<
-  AssistantCaseHandoffRequest,
-  "requestId"
->;
-
-export type ApprovedProviderTaskInput = Omit<
-  ApprovedProviderTaskRequest,
-  "requestId"
->;
-
 export interface AppNavigationController {
   readonly route: AppRoute;
-  readonly assistantHostRoute: AssistantHostRoute;
   readonly protectionMessage: string | null;
   readonly navigate: (nextRoute: AppRoute) => boolean;
   readonly clearProtectionMessage: () => void;
-  readonly handoffAssistantCase: (
-    request: AssistantCaseHandoffInput,
-  ) => boolean;
-  readonly handoffApprovedProvider: (
-    request: ApprovedProviderTaskInput,
-  ) => boolean;
   readonly handoffGraphTarget: (request: GraphTargetRequest) => boolean;
   readonly handoffLegalCitation: (
     request: LegalCitationRequest,
@@ -70,17 +47,11 @@ export interface AppNavigationController {
 const MCP_NAVIGATION_CANCELLED_MESSAGE =
   "已取消切换；未保存的 MCP 设置仍保留在当前工作区。";
 
-const PRIVACY_NAVIGATION_CANCELLED_MESSAGE =
-  "已取消切换；未保存的隐私与本地 OCR 配置仍保留在当前工作区。";
+const LOCAL_PROCESSING_NAVIGATION_CANCELLED_MESSAGE =
+  "已取消切换；未保存的本地处理与 OCR 配置仍保留在当前工作区。";
 
 const CASE_MATERIAL_NAVIGATION_CANCELLED_MESSAGE =
   "已取消切换；未保存的案件材料脱敏文本仍保留在当前工作区。";
-
-function initialAssistantHostRoute(route: AppRoute): AssistantHostRoute {
-  return route.area === "assistant" && route.page === "chat"
-    ? route
-    : { area: "assistant", page: "chat" };
-}
 
 function routeWithoutNonAssistantState(route: AppRoute): AppRoute | null {
   switch (route.area) {
@@ -95,9 +66,7 @@ function routeWithoutNonAssistantState(route: AppRoute): AppRoute | null {
         ? { area: "legal-library", page: "library" }
         : null;
     case "settings":
-      return route.page === "mcp" && route.state
-        ? { area: "settings", page: "mcp" }
-        : null;
+      return null;
   }
 }
 
@@ -107,20 +76,19 @@ export function useAppNavigationController(
   const initialRoute = options.initialRoute ?? DEFAULT_ROUTE;
   const [route, setRoute] = useState<AppRoute>(initialRoute);
   const routeRef = useRef<AppRoute>(initialRoute);
-  const [assistantHostRoute, setAssistantHostRoute] =
-    useState<AssistantHostRoute>(() =>
-      initialAssistantHostRoute(initialRoute),
-    );
   const [protectionMessage, setProtectionMessage] = useState<string | null>(
     null,
   );
   const readMcpMutationInFlight = options.mcp.readMutationInFlight;
   const readMcpDraftDirty = options.mcp.readDraftDirty;
   const discardMcpDraft = options.mcp.discardDraft;
-  const readPrivacyMutationInFlight =
-    options.privacy.readMutationInFlight;
-  const readPrivacyDraftDirty = options.privacy.readDraftDirty;
-  const discardPrivacyDraft = options.privacy.discardDraft;
+  const readLocalProcessingMutationInFlight =
+    options.localProcessing.readMutationInFlight;
+  const readLocalProcessingDraftDirty =
+    options.localProcessing.readDraftDirty;
+  const discardLocalProcessingDraft = options.localProcessing.discardDraft;
+  const readMaintenanceMutationInFlight =
+    options.maintenance.readMutationInFlight;
   const readCaseMaterialMutationInFlight =
     options.caseMaterials.readMutationInFlight;
   const readCaseMaterialDraftDirty =
@@ -128,17 +96,6 @@ export function useAppNavigationController(
   const discardCaseMaterialDraft =
     options.caseMaterials.discardDraft;
   const confirmDiscard = options.confirmDiscard;
-  const assistantRequestSequence = useRef(
-    assistantHostRoute.state?.request.requestId ?? 0,
-  );
-  const approvedProviderRequestSequence = useRef(
-    initialRoute.area === "settings" &&
-      initialRoute.page === "mcp" &&
-      initialRoute.state?.kind === "approved-provider-task"
-      ? initialRoute.state.request.requestId
-      : 0,
-  );
-
   const navigate = useCallback((nextRoute: AppRoute): boolean => {
     const currentRoute = routeRef.current;
     const mcpDecision = decideMcpRouteNavigation(
@@ -159,22 +116,32 @@ export function useAppNavigationController(
       discardMcpDraft();
     }
 
-    const privacyDecision = decidePrivacyRouteNavigation(
+    const localProcessingDecision = decideLocalProcessingRouteNavigation(
       currentRoute,
       nextRoute,
-      readPrivacyMutationInFlight(),
-      readPrivacyDraftDirty(),
+      readLocalProcessingMutationInFlight(),
+      readLocalProcessingDraftDirty(),
     );
-    if (privacyDecision.kind === "block") {
-      setProtectionMessage(privacyDecision.message);
+    if (localProcessingDecision.kind === "block") {
+      setProtectionMessage(localProcessingDecision.message);
       return false;
     }
-    if (privacyDecision.kind === "confirm_discard") {
-      if (!confirmDiscard(privacyDecision.message)) {
-        setProtectionMessage(PRIVACY_NAVIGATION_CANCELLED_MESSAGE);
+    if (localProcessingDecision.kind === "confirm_discard") {
+      if (!confirmDiscard(localProcessingDecision.message)) {
+        setProtectionMessage(LOCAL_PROCESSING_NAVIGATION_CANCELLED_MESSAGE);
         return false;
       }
-      discardPrivacyDraft();
+      discardLocalProcessingDraft();
+    }
+
+    const maintenanceDecision = decideMaintenanceRouteNavigation(
+      currentRoute,
+      nextRoute,
+      readMaintenanceMutationInFlight(),
+    );
+    if (maintenanceDecision.kind === "block") {
+      setProtectionMessage(maintenanceDecision.message);
+      return false;
     }
 
     const caseMaterialDecision = decideCaseMaterialRouteNavigation(
@@ -197,28 +164,6 @@ export function useAppNavigationController(
       discardCaseMaterialDraft();
     }
 
-    if (
-      nextRoute.area === "assistant" &&
-      nextRoute.page === "chat" &&
-      nextRoute.state?.kind === "assistant-case-handoff"
-    ) {
-      assistantRequestSequence.current = Math.max(
-        assistantRequestSequence.current,
-        nextRoute.state.request.requestId,
-      );
-      setAssistantHostRoute(nextRoute);
-    }
-    if (
-      nextRoute.area === "settings" &&
-      nextRoute.page === "mcp" &&
-      nextRoute.state?.kind === "approved-provider-task"
-    ) {
-      approvedProviderRequestSequence.current = Math.max(
-        approvedProviderRequestSequence.current,
-        nextRoute.state.request.requestId,
-      );
-    }
-
     routeRef.current = nextRoute;
     setRoute(nextRoute);
     setProtectionMessage(null);
@@ -226,12 +171,13 @@ export function useAppNavigationController(
   }, [
     confirmDiscard,
     discardMcpDraft,
-    discardPrivacyDraft,
+    discardLocalProcessingDraft,
     discardCaseMaterialDraft,
     readMcpDraftDirty,
     readMcpMutationInFlight,
-    readPrivacyDraftDirty,
-    readPrivacyMutationInFlight,
+    readLocalProcessingDraftDirty,
+    readLocalProcessingMutationInFlight,
+    readMaintenanceMutationInFlight,
     readCaseMaterialDraftDirty,
     readCaseMaterialMutationInFlight,
   ]);
@@ -267,42 +213,6 @@ export function useAppNavigationController(
     setProtectionMessage(null);
   }, []);
 
-  const handoffAssistantCase = useCallback(
-    (request: AssistantCaseHandoffInput): boolean => {
-      assistantRequestSequence.current += 1;
-      return navigate({
-        area: "assistant",
-        page: "chat",
-        state: {
-          kind: "assistant-case-handoff",
-          request: {
-            ...request,
-            requestId: assistantRequestSequence.current,
-          },
-        },
-      });
-    },
-    [navigate],
-  );
-
-  const handoffApprovedProvider = useCallback(
-    (request: ApprovedProviderTaskInput): boolean => {
-      approvedProviderRequestSequence.current += 1;
-      return navigate({
-        area: "settings",
-        page: "mcp",
-        state: {
-          kind: "approved-provider-task",
-          request: {
-            ...request,
-            requestId: approvedProviderRequestSequence.current,
-          },
-        },
-      });
-    },
-    [navigate],
-  );
-
   const handoffGraphTarget = useCallback(
     (request: GraphTargetRequest): boolean =>
       navigate({
@@ -326,10 +236,7 @@ export function useAppNavigationController(
   const consumeRouteState = useCallback(
     (expectedRoute: AppRoute): boolean => {
       const expectedState = expectedRoute.state;
-      if (
-        !expectedState ||
-        expectedState.kind === "assistant-case-handoff"
-      ) {
+      if (!expectedState) {
         return false;
       }
 
@@ -354,12 +261,9 @@ export function useAppNavigationController(
 
   return {
     route,
-    assistantHostRoute,
     protectionMessage,
     navigate,
     clearProtectionMessage,
-    handoffAssistantCase,
-    handoffApprovedProvider,
     handoffGraphTarget,
     handoffLegalCitation,
     consumeRouteState,

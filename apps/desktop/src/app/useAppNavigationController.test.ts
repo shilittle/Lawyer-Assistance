@@ -123,7 +123,8 @@ function controllerOptions(
 ): UseAppNavigationControllerOptions {
   return {
     mcp: protectionChannel(),
-    privacy: protectionChannel(),
+    localProcessing: protectionChannel(),
+    maintenance: protectionChannel(),
     caseMaterials: protectionChannel(),
     confirmDiscard: vi.fn(() => true),
     ...patch,
@@ -150,8 +151,6 @@ describe("useAppNavigationController", () => {
     const callbacks = {
       navigate: initial.navigate,
       clearProtectionMessage: initial.clearProtectionMessage,
-      handoffAssistantCase: initial.handoffAssistantCase,
-      handoffApprovedProvider: initial.handoffApprovedProvider,
       handoffGraphTarget: initial.handoffGraphTarget,
       handoffLegalCitation: initial.handoffLegalCitation,
       consumeRouteState: initial.consumeRouteState,
@@ -162,7 +161,8 @@ describe("useAppNavigationController", () => {
     const latestOptions: UseAppNavigationControllerOptions = {
       ...initialOptions,
       mcp: { ...initialOptions.mcp },
-      privacy: { ...initialOptions.privacy },
+      localProcessing: { ...initialOptions.localProcessing },
+      maintenance: { ...initialOptions.maintenance },
       caseMaterials: { ...initialOptions.caseMaterials },
     };
     const rerendered = renderController(latestOptions);
@@ -181,39 +181,44 @@ describe("useAppNavigationController", () => {
     );
   });
 
-  it("changes only route state at one location without invoking leave confirmation", () => {
+  it("changes legal-citation state at one location without invoking leave confirmation", () => {
     const confirmDiscard = vi.fn(() => false);
     const mcpMutation = booleanRef(true);
     const mcpDraft = booleanRef(true);
-    const privacyMutation = booleanRef(true);
-    const privacyDraft = booleanRef(true);
+    const localProcessingMutation = booleanRef(true);
+    const localProcessingDraft = booleanRef(true);
     const options = controllerOptions({
       initialRoute: {
-        area: "settings",
-        page: "mcp",
+        area: "legal-library",
+        page: "library",
         state: {
-          kind: "approved-provider-task",
+          kind: "legal-citation",
           request: {
-            task: "case_legal_qa",
-            notice: "第一次",
-            requestId: 1,
+            sourceId: "citation-1",
+            documentId: "document-1",
+            versionId: "version-1",
+            articleId: "article-1",
           },
         },
       },
       mcp: protectionChannel(mcpMutation, mcpDraft),
-      privacy: protectionChannel(privacyMutation, privacyDraft),
+      localProcessing: protectionChannel(
+        localProcessingMutation,
+        localProcessingDraft,
+      ),
       confirmDiscard,
     });
     const controller = renderController(options);
     const nextRoute = {
-      area: "settings",
-      page: "mcp",
+      area: "legal-library",
+      page: "library",
       state: {
-        kind: "approved-provider-task",
+        kind: "legal-citation",
         request: {
-          task: "document_generation",
-          notice: "第二次",
-          requestId: 2,
+          sourceId: "citation-2",
+          documentId: "document-2",
+          versionId: "version-2",
+          articleId: "article-2",
         },
       },
     } as const satisfies AppRoute;
@@ -224,7 +229,7 @@ describe("useAppNavigationController", () => {
     expect(rerendered.protectionMessage).toBeNull();
     expect(confirmDiscard).not.toHaveBeenCalled();
     expect(mcpDraft.current).toBe(true);
-    expect(privacyDraft.current).toBe(true);
+    expect(localProcessingDraft.current).toBe(true);
   });
 
   it("preserves block, decline, and confirmed-discard navigation messages", () => {
@@ -264,12 +269,15 @@ describe("useAppNavigationController", () => {
     expect(mcpDraft.current).toBe(false);
   });
 
-  it("protects Privacy only when leaving its typed location", () => {
-    const privacyMutation = booleanRef(true);
-    const privacyDraft = booleanRef(true);
+  it("protects local processing only when leaving its typed location", () => {
+    const localProcessingMutation = booleanRef(true);
+    const localProcessingDraft = booleanRef(true);
     const outsideOptions = controllerOptions({
       initialRoute: { area: "settings", page: "providers" },
-      privacy: protectionChannel(privacyMutation, privacyDraft),
+      localProcessing: protectionChannel(
+        localProcessingMutation,
+        localProcessingDraft,
+      ),
       confirmDiscard: vi.fn(() => false),
     });
     const outside = renderController(outsideOptions);
@@ -279,21 +287,24 @@ describe("useAppNavigationController", () => {
     ).toBe(true);
 
     hookHarness.reset();
-    const privacyOptions = controllerOptions({
-      initialRoute: { area: "settings", page: "privacy" },
-      privacy: protectionChannel(privacyMutation, privacyDraft),
+    const localProcessingOptions = controllerOptions({
+      initialRoute: { area: "settings", page: "local-processing" },
+      localProcessing: protectionChannel(
+        localProcessingMutation,
+        localProcessingDraft,
+      ),
     });
-    let privacy = renderController(privacyOptions);
+    let localProcessing = renderController(localProcessingOptions);
     expect(
-      privacy.navigate({ area: "settings", page: "providers" }),
+      localProcessing.navigate({ area: "settings", page: "providers" }),
     ).toBe(false);
-    privacy = renderController(privacyOptions);
-    expect(privacy.route).toEqual({
+    localProcessing = renderController(localProcessingOptions);
+    expect(localProcessing.route).toEqual({
       area: "settings",
-      page: "privacy",
+      page: "local-processing",
     });
-    expect(privacy.protectionMessage).toBe(
-      "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
+    expect(localProcessing.protectionMessage).toBe(
+      "本地处理配置或组件操作尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
     );
   });
 
@@ -334,86 +345,9 @@ describe("useAppNavigationController", () => {
     expect(draft.current).toBe(false);
   });
 
-  it("creates monotonic Assistant handoffs and retains the host route while hidden", () => {
+  it("constructs graph-target and legal-citation routes", () => {
     const options = controllerOptions();
     let controller = renderController(options);
-
-    expect(
-      controller.handoffAssistantCase({
-        projectId: "case-1",
-        title: "案件一",
-      }),
-    ).toBe(true);
-    controller = renderController(options);
-    expect(controller.route).toEqual({
-      area: "assistant",
-      page: "chat",
-      state: {
-        kind: "assistant-case-handoff",
-        request: {
-          projectId: "case-1",
-          title: "案件一",
-          requestId: 1,
-        },
-      },
-    });
-    const retainedRoute = controller.assistantHostRoute;
-
-    expect(
-      controller.navigate({ area: "cases", page: "overview" }),
-    ).toBe(true);
-    controller = renderController(options);
-    expect(controller.route).toEqual({ area: "cases", page: "overview" });
-    expect(controller.assistantHostRoute).toEqual(retainedRoute);
-
-    expect(
-      controller.handoffAssistantCase({
-        projectId: "case-2",
-        title: "案件二",
-      }),
-    ).toBe(true);
-    controller = renderController(options);
-    expect(controller.assistantHostRoute.state?.request).toEqual({
-      projectId: "case-2",
-      title: "案件二",
-      requestId: 2,
-    });
-  });
-
-  it("constructs approved Provider, graph-target, and legal-citation routes", () => {
-    const options = controllerOptions();
-    let controller = renderController(options);
-
-    expect(
-      controller.handoffApprovedProvider({
-        task: "case_legal_qa",
-        notice: "必须先批准",
-      }),
-    ).toBe(true);
-    controller = renderController(options);
-    expect(controller.route).toEqual({
-      area: "settings",
-      page: "mcp",
-      state: {
-        kind: "approved-provider-task",
-        request: {
-          task: "case_legal_qa",
-          notice: "必须先批准",
-          requestId: 1,
-        },
-      },
-    });
-    expect(controller.consumeRouteState(controller.route)).toBe(true);
-    controller = renderController(options);
-
-    expect(
-      controller.handoffApprovedProvider({
-        task: "summary",
-        notice: "第二次批准",
-      }),
-    ).toBe(true);
-    controller = renderController(options);
-    expect(controller.route.state?.request).toMatchObject({ requestId: 2 });
 
     expect(
       controller.handoffGraphTarget({
@@ -500,35 +434,37 @@ describe("useAppNavigationController", () => {
     controller = renderController(options);
     expect(controller.route).toEqual({ area: "cases", page: "work" });
 
-    expect(
-      controller.handoffAssistantCase({
-        projectId: "case-assistant",
-        title: "助理案件",
-      }),
-    ).toBe(true);
+    const assistantRoute = {
+      area: "assistant",
+      page: "chat",
+    } as const satisfies AppRoute;
+    expect(controller.navigate(assistantRoute)).toBe(true);
     controller = renderController(options);
-    const assistantRoute = controller.route;
     expect(controller.consumeRouteState(assistantRoute)).toBe(false);
     expect(renderController(options).route).toEqual(assistantRoute);
   });
 
-  it("rejects a stale Provider acknowledgement after a newer request replaces it", () => {
+  it("rejects a stale citation acknowledgement after a newer request replaces it", () => {
     const options = controllerOptions();
     let controller = renderController(options);
 
     expect(
-      controller.handoffApprovedProvider({
-        task: "case_legal_qa",
-        notice: "第一次批准",
+      controller.handoffLegalCitation({
+        sourceId: "citation-1",
+        documentId: "document-1",
+        versionId: "version-1",
+        articleId: "article-1",
       }),
     ).toBe(true);
     controller = renderController(options);
     const firstRoute = controller.route;
 
     expect(
-      controller.handoffApprovedProvider({
-        task: "document_generation",
-        notice: "第二次批准",
+      controller.handoffLegalCitation({
+        sourceId: "citation-2",
+        documentId: "document-2",
+        versionId: "version-2",
+        articleId: "article-2",
       }),
     ).toBe(true);
     controller = renderController(options);
@@ -538,8 +474,8 @@ describe("useAppNavigationController", () => {
     expect(renderController(options).route).toEqual(secondRoute);
     expect(controller.consumeRouteState(secondRoute)).toBe(true);
     expect(renderController(options).route).toEqual({
-      area: "settings",
-      page: "mcp",
+      area: "legal-library",
+      page: "library",
     });
   });
 });

@@ -42,7 +42,6 @@ import type {
   LegalAnswerRecord,
   LegalAnswerResponse,
 } from "../../ipc/legal/types";
-import type { ApprovedProviderTask } from "../../ipc/privacy/types";
 import { publicErrorMessage, publicTitle } from "../../publicOutput";
 import {
   articleMatchesDocumentCitation,
@@ -94,10 +93,6 @@ export interface UseLegalLibraryControllerOptions {
   onOpenLawGraph: (documentId: string) => void;
   onOpenCaseAssistant: () => void;
   onOpenAssistant: () => void;
-  onLegacyApprovedProviderRequest: (
-    task: ApprovedProviderTask,
-    notice: string,
-  ) => void;
   onAddAssistantLegalSource: (sourceId: string) => Promise<void>;
   onProposeAssistantLegalBasis: (sourceId: string) => Promise<void>;
 }
@@ -642,14 +637,6 @@ export function useLegalLibraryController(
     }
   }
 
-  function submitLegalAnswer(event?: FormEvent<HTMLFormElement>) {
-    event?.preventDefault();
-    options.onLegacyApprovedProviderRequest(
-      "case_legal_qa",
-      "案件法律问答必须先完成本地脱敏和人工批准；已为你切换到 Approved Provider 的固定任务“案件法律问答”。",
-    );
-  }
-
   async function cancelCurrentLegalAnswer() {
     const requestId = activeQaRequestId.current;
     const stream = qaStreamRef.current;
@@ -1010,7 +997,6 @@ export function useLegalLibraryController(
       answeredScope: answeredQaScope,
       requestLocked: qaRequestLocked,
       preview: previewLegalAnswerContext,
-      submit: submitLegalAnswer,
       cancel: cancelCurrentLegalAnswer,
       restoreRecord: restoreLegalAnswerRecord,
       refreshHistory: refreshLegalAnswerHistory,

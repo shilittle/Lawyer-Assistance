@@ -34,8 +34,9 @@ export interface WorkspaceCloseProtectionState {
   assistantDraftDirty?: boolean;
   mcpMutationInFlight?: boolean;
   mcpDraftDirty?: boolean;
-  privacyMutationInFlight?: boolean;
-  privacyDraftDirty?: boolean;
+  localProcessingMutationInFlight?: boolean;
+  localProcessingDraftDirty?: boolean;
+  maintenanceMutationInFlight?: boolean;
   caseMaterialMutationInFlight?: boolean;
   caseMaterialDraftDirty?: boolean;
 }
@@ -64,7 +65,12 @@ export function decideWorkspaceClose(
       ? "助理保存、导入、导出、法律库桥接或已确认建议写入"
       : null,
     state.mcpMutationInFlight ? "MCP 服务配置或生命周期变更" : null,
-    state.privacyMutationInFlight ? "隐私与本地处理配置写入" : null,
+    state.localProcessingMutationInFlight
+      ? "本地处理配置或组件操作"
+      : null,
+    state.maintenanceMutationInFlight
+      ? "应用更新、诊断或隐私生命周期维护"
+      : null,
     state.caseMaterialMutationInFlight
       ? "案件材料脱敏操作"
       : null,
@@ -88,8 +94,8 @@ export function decideWorkspaceClose(
   if (state.mcpDraftDirty) {
     unsaved.push("MCP 服务配置或待写入 Bearer Token");
   }
-  if (state.privacyDraftDirty) {
-    unsaved.push("隐私与本地 OCR 配置");
+  if (state.localProcessingDraftDirty) {
+    unsaved.push("本地处理与 OCR 配置");
   }
   if (state.caseMaterialDraftDirty) {
     unsaved.push("案件材料与风险审阅草稿");
@@ -137,7 +143,7 @@ export function decideMcpRouteNavigation(
   return decideChangedMcpWorkspaceNavigation(mutationInFlight, draftDirty);
 }
 
-function decideChangedPrivacyWorkspaceNavigation(
+function decideChangedLocalProcessingWorkspaceNavigation(
   mutationInFlight: boolean,
   draftDirty: boolean,
 ): WorkspaceCloseDecision {
@@ -145,20 +151,20 @@ function decideChangedPrivacyWorkspaceNavigation(
     return {
       kind: "block",
       message:
-        "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
+        "本地处理配置或组件操作尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
     };
   }
   if (draftDirty) {
     return {
       kind: "confirm_discard",
       message:
-        "切换工作区将永久丢弃未保存的隐私与本地 OCR 配置。确定继续吗？",
+        "切换工作区将永久丢弃未保存的本地处理与 OCR 配置。确定继续吗？",
     };
   }
   return { kind: "proceed" };
 }
 
-export function decidePrivacyRouteNavigation(
+export function decideLocalProcessingRouteNavigation(
   currentRoute: AppRoute,
   nextRoute: AppRoute,
   mutationInFlight: boolean,
@@ -169,14 +175,38 @@ export function decidePrivacyRouteNavigation(
   }
   if (
     currentRoute.area !== "settings" ||
-    currentRoute.page !== "privacy"
+    currentRoute.page !== "local-processing"
   ) {
     return { kind: "proceed" };
   }
-  return decideChangedPrivacyWorkspaceNavigation(
+  return decideChangedLocalProcessingWorkspaceNavigation(
     mutationInFlight,
     draftDirty,
   );
+}
+
+export function decideMaintenanceRouteNavigation(
+  currentRoute: AppRoute,
+  nextRoute: AppRoute,
+  mutationInFlight: boolean,
+): WorkspaceCloseDecision {
+  if (sameRouteLocation(currentRoute, nextRoute)) {
+    return { kind: "proceed" };
+  }
+  if (
+    currentRoute.area !== "settings" ||
+    currentRoute.page !== "maintenance"
+  ) {
+    return { kind: "proceed" };
+  }
+  if (mutationInFlight) {
+    return {
+      kind: "block",
+      message:
+        "应用更新、诊断或隐私生命周期维护尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
+    };
+  }
+  return { kind: "proceed" };
 }
 
 export function decideCaseMaterialContextChange(

@@ -34,7 +34,6 @@ import type {
   EvidenceItem,
   LegalIssue,
 } from "../../ipc/case/types";
-import type { ApprovedProviderTask } from "../../ipc/privacy/types";
 import { publicErrorMessage, publicTitle } from "../../publicOutput";
 import {
   advanceCaseWorkspaceEpoch,
@@ -76,10 +75,6 @@ export type CaseLoadState =
   | { kind: "error"; message: string };
 
 export interface UseCaseWorkspaceControllerOptions {
-  onLegacyApprovedProviderRequest: (
-    task: ApprovedProviderTask,
-    notice: string,
-  ) => void;
   confirmAction?: (message: string) => boolean;
 }
 
@@ -99,9 +94,8 @@ async function runConfirmedAction<T>(
 }
 
 export function useCaseWorkspaceController({
-  onLegacyApprovedProviderRequest,
   confirmAction = (message) => window.confirm(message),
-}: UseCaseWorkspaceControllerOptions) {
+}: UseCaseWorkspaceControllerOptions = {}) {
   const [caseState, setCaseState] = useState<CaseLoadState>({ kind: "idle" });
   const [caseProjects, setCaseProjects] = useState<CaseProject[]>([]);
   const [caseProjectPage, setCaseProjectPage] = useState(1);
@@ -421,7 +415,6 @@ export function useCaseWorkspaceController({
         blockWorkspaceReloadForDirtyDrafts(allowed, action),
       loadCaseWorkspace,
     },
-    onLegacyApprovedProviderRequest,
     confirmAction,
   });
 

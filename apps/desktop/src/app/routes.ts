@@ -1,6 +1,5 @@
 import type { DocumentCitation } from "../ipc/document/types";
 import type { GraphNode } from "../ipc/graph/types";
-import type { ApprovedProviderTask } from "../ipc/privacy/types";
 import type { ProductArea, ViewMode } from "./views";
 
 export const ASSISTANT_ROUTE_PAGES = ["chat", "legacy-qa"] as const;
@@ -25,17 +24,11 @@ export type LegalLibraryRoutePage =
 // changes for local processing and automation belong to the later phases.
 export const SETTINGS_ROUTE_PAGES = [
   "providers",
-  "privacy",
+  "local-processing",
   "mcp",
   "maintenance",
 ] as const;
 export type SettingsRoutePage = (typeof SETTINGS_ROUTE_PAGES)[number];
-
-export interface AssistantCaseHandoffRequest {
-  readonly projectId: string;
-  readonly title: string;
-  readonly requestId: number;
-}
 
 export type LegalCitationRequest = Readonly<
   Pick<
@@ -48,17 +41,6 @@ export type GraphTargetRequest = Readonly<
   Pick<GraphNode, "sourceKind" | "sourceId">
 >;
 
-export interface ApprovedProviderTaskRequest {
-  readonly task: ApprovedProviderTask;
-  readonly notice: string;
-  readonly requestId: number;
-}
-
-export interface AssistantCaseHandoffRouteState {
-  readonly kind: "assistant-case-handoff";
-  readonly request: AssistantCaseHandoffRequest;
-}
-
 export interface LegalCitationRouteState {
   readonly kind: "legal-citation";
   readonly request: LegalCitationRequest;
@@ -69,22 +51,15 @@ export interface GraphTargetRouteState {
   readonly request: GraphTargetRequest;
 }
 
-export interface ApprovedProviderTaskRouteState {
-  readonly kind: "approved-provider-task";
-  readonly request: ApprovedProviderTaskRequest;
-}
-
 export type RouteState =
-  | AssistantCaseHandoffRouteState
   | LegalCitationRouteState
-  | GraphTargetRouteState
-  | ApprovedProviderTaskRouteState;
+  | GraphTargetRouteState;
 
 export type AssistantRoute =
   | {
       readonly area: "assistant";
       readonly page: "chat";
-      readonly state?: AssistantCaseHandoffRouteState;
+      readonly state?: never;
     }
   | {
       readonly area: "assistant";
@@ -124,15 +99,15 @@ export type SettingsRoute =
   | {
       readonly area: "settings";
       readonly page: "mcp";
-      readonly state?: ApprovedProviderTaskRouteState;
+      readonly state?: never;
     }
   | {
-      readonly [Page in "providers" | "privacy" | "maintenance"]: {
+      readonly [Page in "providers" | "local-processing" | "maintenance"]: {
         readonly area: "settings";
         readonly page: Page;
         readonly state?: never;
       };
-    }["providers" | "privacy" | "maintenance"];
+    }["providers" | "local-processing" | "maintenance"];
 
 export type AppRoute =
   | AssistantRoute
@@ -191,16 +166,6 @@ export function sameRouteStateRequest(
   if (left.kind !== right.kind) return false;
 
   switch (left.kind) {
-    case "assistant-case-handoff":
-      return (
-        right.kind === "assistant-case-handoff" &&
-        left.request.requestId === right.request.requestId
-      );
-    case "approved-provider-task":
-      return (
-        right.kind === "approved-provider-task" &&
-        left.request.requestId === right.request.requestId
-      );
     case "legal-citation":
       return (
         right.kind === "legal-citation" &&
@@ -234,8 +199,8 @@ export function routeFromLegacyView(view: ViewMode): AppRoute {
       return DEFAULT_ROUTE_BY_AREA["legal-library"];
     case "providers":
       return DEFAULT_ROUTE_BY_AREA.settings;
-    case "privacy":
-      return { area: "settings", page: "privacy" };
+    case "local-processing":
+      return { area: "settings", page: "local-processing" };
     case "mcp":
       return { area: "settings", page: "mcp" };
     case "release":
@@ -256,8 +221,8 @@ export function legacyViewFromRoute(route: AppRoute): ViewMode {
       switch (route.page) {
         case "providers":
           return "providers";
-        case "privacy":
-          return "privacy";
+        case "local-processing":
+          return "local-processing";
         case "mcp":
           return "mcp";
         case "maintenance":

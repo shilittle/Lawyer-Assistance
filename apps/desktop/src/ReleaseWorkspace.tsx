@@ -12,7 +12,22 @@ import {
   type DownloadEvent,
 } from "./ipc/release/updater";
 
-type ReleaseOperation = "idle" | "checking" | "installing" | "maintenance" | "restarting";
+export type ReleaseOperation =
+  | "idle"
+  | "checking"
+  | "installing"
+  | "maintenance"
+  | "restarting";
+
+export interface ReleaseWorkspaceProps {
+  disabled?: boolean;
+  onActivityChange?: (active: boolean) => void;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function releaseOperationIsActive(operation: ReleaseOperation): boolean {
+  return operation !== "idle";
+}
 
 function formatBuildTime(buildUnix: number): string {
   if (!Number.isFinite(buildUnix) || buildUnix <= 0) return "未知";
@@ -27,7 +42,10 @@ function formatReleaseDate(value?: string): string {
     : parsed.toLocaleString("zh-CN", { hour12: false });
 }
 
-export function ReleaseWorkspace() {
+export function ReleaseWorkspace({
+  disabled = false,
+  onActivityChange,
+}: ReleaseWorkspaceProps = {}) {
   const [info, setInfo] = useState<VersionInfo | null>(null);
   const [versionInfoError, setVersionInfoError] = useState("");
   const [status, setStatus] = useState("");
@@ -42,8 +60,17 @@ export function ReleaseWorkspace() {
     });
   }, []);
 
+  const activityActive = releaseOperationIsActive(operation);
+  useEffect(() => {
+    onActivityChange?.(activityActive);
+  }, [activityActive, onActivityChange]);
+  useEffect(
+    () => () => onActivityChange?.(false),
+    [onActivityChange],
+  );
+
   async function exportDiagnostics() {
-    if (operation !== "idle") return;
+    if (disabled || operation !== "idle") return;
     setOperation("maintenance");
     try {
       const result = await exportDiagnosticReport(null);
@@ -58,7 +85,7 @@ export function ReleaseWorkspace() {
   }
 
   async function checkForUpdates() {
-    if (operation !== "idle") return;
+    if (disabled || operation !== "idle") return;
     setOperation("checking");
     setStatus("正在检查签名更新……");
     setDownloadedBytes(0);
@@ -98,7 +125,7 @@ export function ReleaseWorkspace() {
   }
 
   async function installUpdate() {
-    if (!availableUpdate || operation !== "idle") return;
+    if (disabled || !availableUpdate || operation !== "idle") return;
     setOperation("installing");
     setDownloadedBytes(0);
     setTotalBytes(null);
@@ -116,6 +143,7 @@ export function ReleaseWorkspace() {
   const progressValue = totalBytes
     ? Math.min(downloadedBytes, totalBytes)
     : undefined;
+  const busy = disabled || activityActive;
 
   return (
     <section className="workspace-card release-workspace">
@@ -139,7 +167,7 @@ export function ReleaseWorkspace() {
       <div className="button-row">
         <button
           type="button"
-          disabled={operation !== "idle"}
+          disabled={busy}
           onClick={() => void checkForUpdates()}
         >
           {operation === "checking" ? "正在检查……" : "检查更新"}
@@ -147,7 +175,7 @@ export function ReleaseWorkspace() {
         {availableUpdate ? (
           <button
             type="button"
-            disabled={operation !== "idle"}
+            disabled={busy}
             onClick={() => void installUpdate()}
           >
             下载、安装并重启
@@ -178,7 +206,7 @@ export function ReleaseWorkspace() {
 
       <h3>完整应用加密备份与恢复</h3>
       <p className="muted">
-        备份操作已统一迁移到“隐私与本地处理 → 隐私生命周期、映射与加密备份”。
+        完整应用加密备份与恢复由本页下方的“隐私生命周期、映射与加密备份”统一管理。
         该入口只使用原生文件对话框处理 <code>.lavbackup</code>，并把用户数据库、加密隐私 bundle、加密案件 Vault、已批准工作区归档与加密 work products 绑定为同一五组件认证备份集；
         五组件会在重启时原子恢复或整体回滚；V2 三组件仅保留读取/恢复兼容，V1 与旧版明文单库恢复均 fail closed。
       </p>
@@ -187,7 +215,7 @@ export function ReleaseWorkspace() {
       <p className="muted">通过系统文件对话框选择保存位置；页面不会显示本地位置。</p>
       <button
         type="button"
-        disabled={operation !== "idle"}
+        disabled={busy}
         onClick={() => void exportDiagnostics()}
       >
         导出诊断报告

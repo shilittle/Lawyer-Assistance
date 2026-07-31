@@ -66,7 +66,6 @@ export function LegacyQaWorkspace({
     answeredScope,
     requestLocked,
     preview,
-    submit,
     cancel,
     restoreRecord,
     refreshHistory,
@@ -84,7 +83,10 @@ export function LegacyQaWorkspace({
           <h2 id="qa-control-title">问题</h2>
           <span>{formatLegalAnswerStreamStatus(stream)}</span>
         </div>
-        <form className="qa-form" onSubmit={submit}>
+        <form
+          className="qa-form"
+          onSubmit={(event) => event.preventDefault()}
+        >
           <p className="privacy-note">
             回答归属：
             {caseWorkspace && selectedCaseProjectId
@@ -190,9 +192,6 @@ export function LegacyQaWorkspace({
               onClick={() => void preview()}
             >
               本地检索来源
-            </button>
-            <button type="submit" disabled={requestLocked}>
-              转到脱敏批准后问答
             </button>
             {isLegalAnswerStreamCancellable(stream) ? (
               <button type="button" onClick={() => void cancel()}>

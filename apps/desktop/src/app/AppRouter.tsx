@@ -48,9 +48,9 @@ export type ProviderSettingsRoute = Extract<
   { readonly page: "providers" }
 >;
 
-export type PrivacySettingsRoute = Extract<
+export type LocalProcessingSettingsRoute = Extract<
   SettingsRoute,
-  { readonly page: "privacy" }
+  { readonly page: "local-processing" }
 >;
 
 export type McpSettingsRoute = Extract<
@@ -85,17 +85,21 @@ export interface AppRouterSlots {
   readonly graph: WorkspaceRenderer<CaseGraphRoute>;
   readonly search: WorkspaceRenderer<LegalLibraryRoute>;
   readonly providers: WorkspaceRenderer<ProviderSettingsRoute>;
-  readonly privacy: WorkspaceRenderer<PrivacySettingsRoute>;
+  readonly localProcessing: WorkspaceRenderer<LocalProcessingSettingsRoute>;
   readonly mcp: WorkspaceRenderer<McpSettingsRoute>;
-  readonly release: WorkspaceRenderer<MaintenanceSettingsRoute>;
+  readonly maintenance: WorkspaceRenderer<MaintenanceSettingsRoute>;
 }
 
 export interface AppRouterProps {
   readonly route: AppRoute;
-  readonly assistantHostRoute: AssistantChatRoute;
   readonly slots: AppRouterSlots;
   readonly onNavigate: (route: AppRoute) => void;
 }
+
+const ASSISTANT_CHAT_ROUTE: AssistantChatRoute = {
+  area: "assistant",
+  page: "chat",
+};
 
 const ASSISTANT_NAVIGATION = [
   { page: "chat", label: "助理工作区" },
@@ -109,7 +113,7 @@ const CASE_OUTPUT_NAVIGATION = [
 
 const SETTINGS_NAVIGATION = [
   { page: "providers", label: "Provider 与凭据" },
-  { page: "privacy", label: "隐私与本地处理" },
+  { page: "local-processing", label: "本地处理环境与 OCR 组件" },
   { page: "mcp", label: "MCP 与自动化" },
   { page: "maintenance", label: "版本、备份与诊断" },
 ] as const;
@@ -263,9 +267,9 @@ function ActiveWorkspaceSlot({
             route: route as ProviderSettingsRoute,
             active: true,
           });
-        case "privacy":
-          return slots.privacy({
-            route: route as PrivacySettingsRoute,
+        case "local-processing":
+          return slots.localProcessing({
+            route: route as LocalProcessingSettingsRoute,
             active: true,
           });
         case "mcp":
@@ -274,7 +278,7 @@ function ActiveWorkspaceSlot({
             active: true,
           });
         case "maintenance":
-          return slots.release({
+          return slots.maintenance({
             route: route as MaintenanceSettingsRoute,
             active: true,
           });
@@ -284,7 +288,6 @@ function ActiveWorkspaceSlot({
 
 export function AppRouter({
   route,
-  assistantHostRoute,
   slots,
   onNavigate,
 }: AppRouterProps) {
@@ -303,7 +306,7 @@ export function AppRouter({
           <AssistantWorkspaceSlot
             active={assistantActive}
             render={slots.assistant}
-            route={assistantHostRoute}
+            route={ASSISTANT_CHAT_ROUTE}
           />
         </AppErrorBoundary>
       </div>

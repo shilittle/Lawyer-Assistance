@@ -21,11 +21,6 @@ import {
 import type { AppRoute } from "./routes";
 import type { ViewMode } from "./views";
 
-const DEFAULT_ASSISTANT_HOST_ROUTE = {
-  area: "assistant",
-  page: "chat",
-} as const;
-
 const LEGACY_ROUTES: Readonly<Record<ViewMode, AppRoute>> = {
   assistant: { area: "assistant", page: "chat" },
   qa: { area: "assistant", page: "legacy-qa" },
@@ -34,7 +29,7 @@ const LEGACY_ROUTES: Readonly<Record<ViewMode, AppRoute>> = {
   graph: { area: "cases", page: "outputs", output: "graph" },
   search: { area: "legal-library", page: "library" },
   providers: { area: "settings", page: "providers" },
-  privacy: { area: "settings", page: "privacy" },
+  "local-processing": { area: "settings", page: "local-processing" },
   mcp: { area: "settings", page: "mcp" },
   release: { area: "settings", page: "maintenance" },
 };
@@ -54,9 +49,13 @@ function slotSpies() {
     graph: vi.fn(() => <p data-rendered-slot="graph">graph</p>),
     search: vi.fn(() => <p data-rendered-slot="search">search</p>),
     providers: vi.fn(() => <p data-rendered-slot="providers">providers</p>),
-    privacy: vi.fn(() => <p data-rendered-slot="privacy">privacy</p>),
+    localProcessing: vi.fn(() => (
+      <p data-rendered-slot="local-processing">local-processing</p>
+    )),
     mcp: vi.fn(() => <p data-rendered-slot="mcp">mcp</p>),
-    release: vi.fn(() => <p data-rendered-slot="release">release</p>),
+    maintenance: vi.fn(() => (
+      <p data-rendered-slot="maintenance">maintenance</p>
+    )),
   } satisfies AppRouterSlots;
 }
 
@@ -87,7 +86,6 @@ function routerTree(
     onNavigate,
     tree: AppRouter({
       route,
-      assistantHostRoute: DEFAULT_ASSISTANT_HOST_ROUTE,
       slots: slotSpies(),
       onNavigate,
     }),
@@ -102,11 +100,6 @@ describe("AppRouter workspace ownership", () => {
       const markup = renderToStaticMarkup(
         <AppRouter
           route={route}
-          assistantHostRoute={
-            route.area === "assistant" && route.page === "chat"
-              ? route
-              : DEFAULT_ASSISTANT_HOST_ROUTE
-          }
           slots={slots}
           onNavigate={vi.fn()}
         />,
@@ -119,7 +112,13 @@ describe("AppRouter workspace ownership", () => {
         ([name]) => name !== "assistant",
       );
       const expectedConditional =
-        destination === "assistant" ? null : destination;
+        destination === "assistant"
+          ? null
+          : destination === "local-processing"
+            ? "localProcessing"
+            : destination === "release"
+              ? "maintenance"
+              : destination;
       for (const [name, renderer] of conditionalSlots) {
         expect(renderer).toHaveBeenCalledTimes(
           name === expectedConditional ? 1 : 0,
@@ -141,25 +140,16 @@ describe("AppRouter workspace ownership", () => {
     },
   );
 
-  it("passes exact typed route state to the active Assistant renderer", () => {
+  it("passes the state-free typed chat route to the active Assistant renderer", () => {
     const slots = slotSpies();
     const route = {
       area: "assistant",
       page: "chat",
-      state: {
-        kind: "assistant-case-handoff",
-        request: {
-          projectId: "case-1",
-          title: "案件一",
-          requestId: 3,
-        },
-      },
     } as const satisfies AppRoute;
 
     renderToStaticMarkup(
       <AppRouter
         route={route}
-        assistantHostRoute={route}
         slots={slots}
         onNavigate={vi.fn()}
       />,
@@ -171,47 +161,33 @@ describe("AppRouter workspace ownership", () => {
     });
   });
 
-  it("keeps the retained Assistant handoff route while its host is hidden", () => {
+  it("keeps the state-free Assistant route while its host is hidden", () => {
     const slots = slotSpies();
-    const assistantHostRoute = {
-      area: "assistant",
-      page: "chat",
-      state: {
-        kind: "assistant-case-handoff",
-        request: {
-          projectId: "case-hidden",
-          title: "隐藏期间仍处理",
-          requestId: 9,
-        },
-      },
-    } as const;
 
     renderToStaticMarkup(
       <AppRouter
         route={{ area: "cases", page: "overview" }}
-        assistantHostRoute={assistantHostRoute}
         slots={slots}
         onNavigate={vi.fn()}
       />,
     );
 
     expect(slots.assistant).toHaveBeenCalledWith({
-      route: assistantHostRoute,
+      route: { area: "assistant", page: "chat" },
       active: false,
     });
     expect(slots.cases).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps automation unrendered for Assistant and privacy, then passes exact state on the MCP route", () => {
+  it("keeps automation unrendered for Assistant and local processing, then renders the state-free MCP route", () => {
     for (const route of [
       { area: "assistant", page: "chat" },
-      { area: "settings", page: "privacy" },
+      { area: "settings", page: "local-processing" },
     ] as const satisfies readonly AppRoute[]) {
       const slots = slotSpies();
       renderToStaticMarkup(
         <AppRouter
           route={route}
-          assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
           slots={slots}
           onNavigate={vi.fn()}
         />,
@@ -223,27 +199,18 @@ describe("AppRouter workspace ownership", () => {
     const route = {
       area: "settings",
       page: "mcp",
-      state: {
-        kind: "approved-provider-task",
-        request: {
-          task: "regenerate",
-          notice: "仅处理显式兼容请求",
-          requestId: 7,
-        },
-      },
     } as const satisfies AppRoute;
 
     renderToStaticMarkup(
       <AppRouter
         route={route}
-        assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
         slots={slots}
         onNavigate={vi.fn()}
       />,
     );
 
     expect(slots.mcp).toHaveBeenCalledWith({ route, active: true });
-    expect(slots.privacy).not.toHaveBeenCalled();
+    expect(slots.localProcessing).not.toHaveBeenCalled();
   });
 
   it("isolates the always-mounted Assistant and active workspace by location", () => {
@@ -277,7 +244,6 @@ describe("AppRouter typed subnavigation", () => {
       const markup = renderToStaticMarkup(
         <AppRouter
           route={route}
-          assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
           slots={slotSpies()}
           onNavigate={vi.fn()}
         />,
@@ -378,8 +344,8 @@ describe("AppRouter typed subnavigation", () => {
       ],
       [
         settings.tree,
-        "隐私与本地处理",
-        { area: "settings", page: "privacy" },
+        "本地处理环境与 OCR 组件",
+        { area: "settings", page: "local-processing" },
         settings.onNavigate,
       ],
       [
@@ -416,7 +382,6 @@ describe("AppRouter typed subnavigation", () => {
     const markup = renderToStaticMarkup(
       <AppRouter
         route={{ area: "legal-library", page: "library" }}
-        assistantHostRoute={DEFAULT_ASSISTANT_HOST_ROUTE}
         slots={slotSpies()}
         onNavigate={vi.fn()}
       />,

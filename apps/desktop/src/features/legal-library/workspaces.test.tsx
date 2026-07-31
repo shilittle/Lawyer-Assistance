@@ -187,7 +187,6 @@ function controllerFor(patch: ControllerPatch = {}): LegalLibraryController {
     answeredScope: "",
     requestLocked: false,
     preview: vi.fn(async () => undefined),
-    submit: vi.fn(),
     cancel: vi.fn(async () => undefined),
     restoreRecord: vi.fn(),
     refreshHistory: vi.fn(async () => undefined),
@@ -268,7 +267,7 @@ describe("LegalLibrarySearchWorkspace", () => {
 });
 
 describe("LegacyQaWorkspace", () => {
-  it("renders explicit case/provider ownership and the unchanged approval redirect", () => {
+  it("renders explicit case/provider ownership without the removed approval redirect", () => {
     const project = caseProject();
     const context = legalContext();
     const selectedSource = context.sources[0];
@@ -293,7 +292,7 @@ describe("LegacyQaWorkspace", () => {
     expect(markup).toContain("回答归属：");
     expect(markup).toContain(project.title);
     expect(markup).toContain(provider.displayName);
-    expect(markup).toContain("转到脱敏批准后问答");
+    expect(markup).not.toContain("转到脱敏批准后问答");
     expect(markup).toContain("请核对候选法律资料后再使用回答");
     expect(markup).toContain(selectedSource.canonicalLabel);
     expect(markup).toContain("当前案件暂无已保存回答");

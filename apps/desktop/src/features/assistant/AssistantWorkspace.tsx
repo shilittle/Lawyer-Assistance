@@ -11,7 +11,6 @@ import {
 
 import {
   ArtifactPanel,
-  type ArtifactRegenerationRequest,
 } from "../artifacts/ArtifactPanel";
 import { SafeArtifactMarkdown } from "../artifacts/SafeArtifactMarkdown";
 import {
@@ -77,7 +76,6 @@ export interface AssistantWorkspaceProps {
   onDraftDirtyChange?: (dirty: boolean) => void;
   onCaseProposalApplied?: (projectId: string) => void;
   onMutationActivityChange?: (active: boolean) => void;
-  onOpenProtectedArtifactRegeneration?: (notice: string) => void;
   onOpenProviderSettings?: () => void;
   onRunActivityChange?: (active: boolean) => void;
   proposalApplyBlockedReason?: string | null;
@@ -414,7 +412,6 @@ export function AssistantWorkspace({
   onDraftDirtyChange,
   onCaseProposalApplied,
   onMutationActivityChange,
-  onOpenProtectedArtifactRegeneration,
   onOpenProviderSettings,
   onRunActivityChange,
   proposalApplyBlockedReason,
@@ -1120,67 +1117,6 @@ export function AssistantWorkspace({
     });
   }
 
-  async function openProtectedArtifactRegeneration(
-    request: ArtifactRegenerationRequest,
-  ): Promise<boolean> {
-    if (
-      !detail ||
-      detail.conversation.conversationId !== request.conversationId ||
-      activeRun !== null ||
-      operation !== null
-    ) {
-      throw new Error("当前会话尚未准备好，不能重新生成。");
-    }
-    const artifact = detail.artifacts.find(
-      (candidate) => candidate.artifactId === request.artifactId,
-    );
-    if (
-      !artifact ||
-      artifact.kind !== request.kind ||
-      artifact.projectId !== request.projectId
-    ) {
-      throw new Error("成果已变化，请重新加载后再试。");
-    }
-    const originRun = [...detail.messages]
-      .reverse()
-      .filter(
-        (message) =>
-          message.artifactId === request.artifactId && message.runId !== null,
-      )
-      .map((message) =>
-        detail.runs.find(
-          (run) =>
-            run.runId === message.runId &&
-            run.status === "succeeded" &&
-            run.assistantMessageId === message.messageId,
-        ),
-      )
-      .find((run): run is AssistantRun => run !== undefined);
-    if (
-      !originRun ||
-      !RUN_INTENTS.includes(originRun.intent as AssistantRunIntent)
-    ) {
-      throw new Error("该成果没有可信的成功生成记录，不能自动重新生成。");
-    }
-    const regenerationIntent = originRun.intent as AssistantRunIntent;
-    const kindMatches =
-      (request.kind === "research" &&
-        (regenerationIntent === "legal_research" ||
-          regenerationIntent === "file_analysis")) ||
-      (request.kind === "document" && regenerationIntent === "document_draft") ||
-      (request.kind === "map" && regenerationIntent === "map_build");
-    if (!kindMatches) {
-      throw new Error("成果类型与原生成任务不一致，已停止重新生成。");
-    }
-    if (!onOpenProtectedArtifactRegeneration) {
-      throw new Error("受保护的成果重新生成工作流当前不可用。");
-    }
-    onOpenProtectedArtifactRegeneration(
-      "重新生成只允许使用当前有效的脱敏 generation 和受保护历史输出；已切换到 Approved Provider 固定任务“重新生成”。",
-    );
-    return false;
-  }
-
   async function cancelRun() {
     if (!activeRun) return;
     const run = activeRun;
@@ -1523,11 +1459,6 @@ export function AssistantWorkspace({
         onDraftDirtyChange={updateArtifactDraftDirty}
         onMutationActivityChange={setArtifactMutationActive}
         onProposalApplied={onCaseProposalApplied}
-        onRegenerateArtifact={
-          onOpenProtectedArtifactRegeneration
-            ? openProtectedArtifactRegeneration
-            : undefined
-        }
         onSelectArtifact={selectArtifact}
         proposalApplyBlockedReason={proposalApplyBlockedReason}
       />
