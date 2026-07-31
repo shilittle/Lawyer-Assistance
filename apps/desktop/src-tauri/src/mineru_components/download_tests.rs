@@ -5,8 +5,11 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+const LOCAL_HTTPS_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_HTTPS_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 const LOCAL_HTTPS_SERVER: &str = r#"
 import http.server
@@ -41,6 +44,40 @@ server.handle_request()
 server.server_close()
 "#;
 
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child
+            .as_mut()
+            .expect("local HTTPS child is owned")
+            .try_wait()
+            .unwrap_or_else(|_| panic!("local HTTPS fixture status could not be observed"))
+    }
+
+    fn into_child(mut self) -> Child {
+        self.child.take().expect("local HTTPS child is owned")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
 struct LocalHttpsServer {
     child: Child,
     certificate_pem: Vec<u8>,
@@ -69,35 +106,44 @@ fn spawn_local_https_once(root: &Path, body: &[u8]) -> LocalHttpsServer {
             .expect("generate the ephemeral local HTTPS certificate");
     fs::write(&certificate, cert.pem()).expect("write the local HTTPS certificate");
     fs::write(&key, signing_key.serialize_pem()).expect("write the local HTTPS private key");
+    let certificate_pem =
+        fs::read(&certificate).expect("read the local HTTPS certificate for pinning");
 
-    let child = Command::new("python")
-        .arg("-c")
-        .arg(LOCAL_HTTPS_SERVER)
-        .arg(&certificate)
-        .arg(&key)
-        .arg(&body_file)
-        .arg(&port_file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Python must be available for the real local HTTPS test");
+    let mut child = ChildGuard::new(
+        Command::new("python")
+            .arg("-c")
+            .arg(LOCAL_HTTPS_SERVER)
+            .arg(&certificate)
+            .arg(&key)
+            .arg(&body_file)
+            .arg(&port_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Python must be available for the real local HTTPS test"),
+    );
 
-    let mut port = None;
-    for _ in 0..200 {
+    let ready_deadline = Instant::now() + LOCAL_HTTPS_READY_TIMEOUT;
+    let port = loop {
         if let Ok(value) = fs::read_to_string(&port_file) {
             if let Ok(parsed) = value.trim().parse::<u16>() {
-                port = Some(parsed);
-                break;
+                break parsed;
             }
         }
-        thread::sleep(Duration::from_millis(25));
-    }
-    let port = port.expect("local HTTPS server did not publish its bound port");
+        if let Some(status) = child.try_wait() {
+            panic!("local HTTPS fixture exited before readiness: {status}");
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "local HTTPS fixture did not become ready within 30 seconds"
+        );
+        thread::sleep(LOCAL_HTTPS_READY_POLL_INTERVAL);
+    };
 
     LocalHttpsServer {
-        child,
-        certificate_pem: fs::read(certificate).unwrap(),
+        child: child.into_child(),
+        certificate_pem,
         url: Url::parse(&format!("https://127.0.0.1:{port}/component.laocrpkg")).unwrap(),
     }
 }

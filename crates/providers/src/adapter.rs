@@ -2215,7 +2215,7 @@ mod tests {
     };
     use std::{
         io::{Read, Write},
-        net::{TcpListener, TcpStream},
+        net::{Shutdown, TcpListener, TcpStream},
         sync::{mpsc, Arc, Mutex},
         thread,
     };
@@ -2708,11 +2708,12 @@ mod tests {
     #[test]
     fn approved_chat_reaches_loopback_once_and_cannot_be_replayed() {
         const RAW_MARKER: &str = "RAW_CASE_CANARY_NEVER_SEND";
-        let (base_url, server_thread) = spawn_approved_json_fixture(Duration::from_millis(600));
-        let provider_profile = approved_test_profile(base_url);
+        let fixture = spawn_approved_json_fixture();
+        let provider_profile = approved_test_profile(fixture.base_url.clone());
         let approved = approved_test_request(&provider_profile);
+        thread::sleep(Duration::from_millis(750));
         let transport =
-            ReqwestTransport::new_with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+            ReqwestTransport::new_with_timeouts(Duration::from_secs(5), Duration::from_secs(5))
                 .expect("transport builds");
         let adapter = OpenAiCompatibleAdapter::new(transport);
 
@@ -2735,10 +2736,23 @@ mod tests {
         assert_eq!(replay.kind, ProviderErrorKind::InvalidRequest);
         assert!(replay.to_string().contains("already been consumed"));
 
-        let requests = server_thread.join().expect("loopback fixture exits");
+        let requests = fixture.finish();
         assert_eq!(requests.len(), 1, "exactly one HTTP request is permitted");
         let wire = String::from_utf8_lossy(&requests[0]);
-        assert!(wire.contains("Approved redacted case: [PARTY_1] requests a procedural summary."));
+        let header_end = requests[0]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4);
+        let body_bytes = header_end
+            .map(|index| requests[0].len().saturating_sub(index))
+            .unwrap_or_default();
+        assert!(
+            wire.contains("Approved redacted case: [PARTY_1] requests a procedural summary."),
+            "approved request body is incomplete: total_bytes={}, body_bytes={}, complete={}",
+            requests[0].len(),
+            body_bytes,
+            request_is_complete(&requests[0])
+        );
         assert!(wire.contains("\"model\":\"approved-chat-model\""));
         assert!(!wire.contains(RAW_MARKER));
         assert!(!wire.contains("13800138000"));
@@ -2746,8 +2760,8 @@ mod tests {
 
     #[test]
     fn tampered_approved_body_is_rejected_with_zero_loopback_requests() {
-        let (base_url, server_thread) = spawn_approved_json_fixture(Duration::from_millis(600));
-        let provider_profile = approved_test_profile(base_url);
+        let fixture = spawn_approved_json_fixture();
+        let provider_profile = approved_test_profile(fixture.base_url.clone());
         let approved = approved_test_request(&provider_profile);
         let secret = ApiSecret::new("synthetic-loopback-secret");
         let mut request =
@@ -2770,16 +2784,13 @@ mod tests {
             .expect_err("body tampering is rejected before network I/O");
 
         assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-        assert!(server_thread
-            .join()
-            .expect("loopback fixture exits")
-            .is_empty());
+        assert!(fixture.finish().is_empty());
     }
 
     #[test]
     fn expired_approved_authorization_is_rejected_with_zero_loopback_requests() {
-        let (base_url, server_thread) = spawn_approved_json_fixture(Duration::from_millis(600));
-        let provider_profile = approved_test_profile(base_url);
+        let fixture = spawn_approved_json_fixture();
+        let provider_profile = approved_test_profile(fixture.base_url.clone());
         let approved = approved_test_request(&provider_profile);
         let secret = ApiSecret::new("synthetic-loopback-secret");
         let mut request =
@@ -2812,10 +2823,7 @@ mod tests {
             .expect_err("expired authorization is rejected before network I/O");
 
         assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-        assert!(server_thread
-            .join()
-            .expect("loopback fixture exits")
-            .is_empty());
+        assert!(fixture.finish().is_empty());
     }
 
     #[test]
@@ -3859,9 +3867,39 @@ mod tests {
         assert_eq!(response.expect("nested runtime is avoided").status, 200);
     }
 
-    fn spawn_approved_json_fixture(
-        observation_window: Duration,
-    ) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
+    struct ApprovedJsonFixture {
+        base_url: String,
+        shutdown: mpsc::Sender<()>,
+        server_thread: Option<thread::JoinHandle<Vec<Vec<u8>>>>,
+    }
+
+    impl ApprovedJsonFixture {
+        fn finish(mut self) -> Vec<Vec<u8>> {
+            let _ = self.shutdown.send(());
+            self.server_thread
+                .take()
+                .expect("approved provider fixture thread is owned")
+                .join()
+                .expect("approved provider fixture exits")
+        }
+    }
+
+    impl Drop for ApprovedJsonFixture {
+        fn drop(&mut self) {
+            let _ = self.shutdown.send(());
+            if let Some(server_thread) = self.server_thread.take() {
+                if server_thread.join().is_err() {
+                    if thread::panicking() {
+                        eprintln!("approved provider fixture thread terminated unexpectedly");
+                    } else {
+                        panic!("approved provider fixture thread terminated unexpectedly");
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_approved_json_fixture() -> ApprovedJsonFixture {
         let listener = TcpListener::bind("127.0.0.1:0").expect("approved provider listener binds");
         listener
             .set_nonblocking(true)
@@ -3872,14 +3910,26 @@ mod tests {
                 .local_addr()
                 .expect("approved provider address resolves")
         );
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (shutdown, shutdown_receiver) = mpsc::channel();
         let server_thread = thread::spawn(move || {
             const BODY: &[u8] = br#"{"model":"approved-chat-model","choices":[{"message":{"content":"ok"}}],"usage":null}"#;
             let mut requests = Vec::new();
-            let mut deadline = Instant::now() + observation_window;
-            while Instant::now() < deadline {
+            if ready_sender.send(()).is_err() {
+                return requests;
+            }
+            loop {
+                match shutdown_receiver.try_recv() {
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        requests.push(read_http_request(&mut stream));
+                        stream
+                            .set_nonblocking(false)
+                            .expect("approved provider connection becomes blocking");
+                        let request = read_http_request(&mut stream);
+                        requests.push(request);
                         let headers = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             BODY.len()
@@ -3888,8 +3938,10 @@ mod tests {
                             .write_all(headers.as_bytes())
                             .and_then(|_| stream.write_all(BODY))
                             .and_then(|_| stream.flush())
+                            .and_then(|_| stream.shutdown(Shutdown::Write))
                             .expect("approved provider fixture writes response");
-                        deadline = Instant::now() + Duration::from_millis(150);
+                        let mut peer_close = [0_u8; 1];
+                        let _ = stream.read(&mut peer_close);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -3899,7 +3951,15 @@ mod tests {
             }
             requests
         });
-        (base_url, server_thread)
+        let fixture = ApprovedJsonFixture {
+            base_url,
+            shutdown,
+            server_thread: Some(server_thread),
+        };
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("approved provider fixture becomes ready");
+        fixture
     }
 
     fn spawn_redirect_fixture(
