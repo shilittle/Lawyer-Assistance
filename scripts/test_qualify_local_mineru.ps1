@@ -5,6 +5,8 @@ $subject = Join-Path $PSScriptRoot "qualify_local_mineru.ps1"
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("lawyer-assistance-mineru-qualification-tests-" + [Guid]::NewGuid().ToString("N"))
 $keptJob = $null
 $timeoutProcessIds = @()
+$processTreeRootId = 0
+$processTreeProcess = $null
 
 function Assert-True {
   param(
@@ -162,11 +164,24 @@ exit 0
 
 $timeoutProcessMockSource = @'
 param(
-  [Parameter(Mandatory = $true)][string]$PidRecordPath,
-  [Parameter(Mandatory = $true)][string]$AttemptRecordPath
+  [Parameter(Mandatory = $true)][string]$PidRecordPath
 )
 $ErrorActionPreference = "Stop"
-[IO.File]::AppendAllText($AttemptRecordPath, "attempt`n", [Text.Encoding]::ASCII)
+[IO.File]::AppendAllText(
+  $PidRecordPath,
+  ("{0}`n" -f $PID),
+  [Text.Encoding]::ASCII
+)
+Write-Output ("discarded-stdout:" + $env:LA_TIMEOUT_SECRET_CANARY)
+[Console]::Error.WriteLine("discarded-stderr:" + $PidRecordPath)
+Start-Sleep -Seconds 60
+'@
+
+$processTreeMockSource = @'
+param(
+  [Parameter(Mandatory = $true)][string]$PidRecordPath
+)
+$ErrorActionPreference = "Stop"
 $childStartInfo = New-Object Diagnostics.ProcessStartInfo
 $childStartInfo.FileName = Join-Path $env:SystemRoot "System32\PING.EXE"
 $childStartInfo.Arguments = "-n 61 127.0.0.1"
@@ -180,8 +195,6 @@ $child = [Diagnostics.Process]::Start($childStartInfo)
   ("{0}`n{1}`n" -f $PID, $child.Id),
   [Text.Encoding]::ASCII
 )
-Write-Output ("discarded-stdout:" + $env:LA_TIMEOUT_SECRET_CANARY)
-[Console]::Error.WriteLine("discarded-stderr:" + $PidRecordPath)
 Start-Sleep -Seconds 60
 '@
 
@@ -189,10 +202,12 @@ try {
   [void][IO.Directory]::CreateDirectory($testRoot)
   $mockMineru = Join-Path $testRoot "mock-mineru.ps1"
   $mockGpu = Join-Path $testRoot "mock-nvidia-smi.ps1"
-  $timeoutProcessMock = Join-Path $testRoot "mock-timeout-process-tree.ps1"
+  $timeoutProcessMock = Join-Path $testRoot "mock-timeout-process.ps1"
+  $processTreeMock = Join-Path $testRoot "mock-process-tree.ps1"
   Write-Utf8NoBom -LiteralPath $mockMineru -Value $mockMineruSource
   Write-Utf8NoBom -LiteralPath $mockGpu -Value $mockGpuSource
   Write-Utf8NoBom -LiteralPath $timeoutProcessMock -Value $timeoutProcessMockSource
+  Write-Utf8NoBom -LiteralPath $processTreeMock -Value $processTreeMockSource
 
   $tokens = $null
   $parseErrors = $null
@@ -201,7 +216,9 @@ try {
   [Management.Automation.Language.Parser]::ParseFile($mockMineru, [ref]$tokens, [ref]$parseErrors) | Out-Null
   Assert-True -Condition ($parseErrors.Count -eq 0) -Message "mock MinerU script failed AST validation"
   [Management.Automation.Language.Parser]::ParseFile($timeoutProcessMock, [ref]$tokens, [ref]$parseErrors) | Out-Null
-  Assert-True -Condition ($parseErrors.Count -eq 0) -Message "timeout process-tree mock failed AST validation"
+  Assert-True -Condition ($parseErrors.Count -eq 0) -Message "timeout process mock failed AST validation"
+  [Management.Automation.Language.Parser]::ParseFile($processTreeMock, [ref]$tokens, [ref]$parseErrors) | Out-Null
+  Assert-True -Condition ($parseErrors.Count -eq 0) -Message "process-tree mock failed AST validation"
 
   foreach ($functionName in @(
     "Resolve-QualificationProcessTimeoutMilliseconds",
@@ -212,6 +229,35 @@ try {
     $definition = Get-SubjectFunctionDefinition -Ast $subjectAst -Name $functionName
     . ([scriptblock]::Create($definition.Extent.Text))
   }
+
+  $invokeSanitizedProcessDefinition = Get-SubjectFunctionDefinition -Ast $subjectAst -Name "Invoke-SanitizedProcess"
+  $timeoutStopTreeCalls = @(
+    $invokeSanitizedProcessDefinition.Body.FindAll({
+      param($node)
+      $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq "Stop-ProcessTree"
+    }, $true)
+  )
+  Assert-True -Condition ($timeoutStopTreeCalls.Count -eq 1) -Message "sanitized timeout path must call Stop-ProcessTree exactly once"
+  Assert-True -Condition (
+    $timeoutStopTreeCalls[0].Extent.Text -ceq 'Stop-ProcessTree -ProcessId $process.Id'
+  ) -Message "sanitized timeout path did not target the launched process tree"
+  $timeoutConditional = $timeoutStopTreeCalls[0].Parent
+  while ($null -ne $timeoutConditional -and $timeoutConditional -isnot [Management.Automation.Language.IfStatementAst]) {
+    $timeoutConditional = $timeoutConditional.Parent
+  }
+  Assert-True -Condition ($null -ne $timeoutConditional) -Message "Stop-ProcessTree is no longer inside a timeout conditional"
+  $timeoutConditionText = $timeoutConditional.Clauses[0].Item1.Extent.Text
+  Assert-True -Condition (
+    $timeoutConditionText.TrimStart().StartsWith("-not ", [StringComparison]::Ordinal) -and
+    $timeoutConditionText.Contains('$process.WaitForExit($timeoutMilliseconds)')
+  ) -Message "Stop-ProcessTree is no longer guarded by the bounded process timeout"
+  $timeoutConditionalText = $timeoutConditional.Extent.Text
+  Assert-True -Condition (
+    $timeoutConditionalText.Contains('$process.WaitForExit(10000)') -and
+    $timeoutConditionalText.Contains('local qualification process termination failed (stage=$Stage)') -and
+    $timeoutConditionalText.Contains('local qualification process timed out (stage=$Stage)')
+  ) -Message "sanitized timeout path no longer enforces bounded convergence and fixed failures"
 
   $timeoutCases = @(
     [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $false; InputSeconds = 10; ExpectedMilliseconds = 10000 },
@@ -327,7 +373,6 @@ try {
 
   $env:LA_QUALIFICATION_SECRET_CANARY = "must-not-reach-child"
   $timeoutPidRecord = Join-Path $testRoot "timeout-process-tree-pids.txt"
-  $timeoutAttemptRecord = Join-Path $testRoot "timeout-process-tree-attempts.txt"
   $timeoutEvidencePath = Join-Path $testRoot "timeout-process-tree-evidence.json"
   $timeoutSecret = "timeout-secret-must-not-leak"
   $powerShellLauncher = (Get-Process -Id $PID).Path
@@ -350,7 +395,7 @@ try {
     Invoke-SanitizedProcess `
       -Descriptor $timeoutDescriptor `
       -Stage "gpu_inventory" `
-      -Arguments @($timeoutPidRecord, $timeoutAttemptRecord) `
+      -Arguments @($timeoutPidRecord) `
       -Environment @{
         LA_TIMEOUT_SECRET_CANARY = $timeoutSecret
         LA_TIMEOUT_EVIDENCE_PATH = $timeoutEvidencePath
@@ -381,16 +426,12 @@ try {
   foreach ($forbidden in @($testRoot, $timeoutProcessMock, $timeoutSecret, "must-not-reach-child")) {
     Assert-True -Condition (-not $timeoutFailure.Contains($forbidden)) -Message "GPU timeout error leaked a local path or secret"
   }
-  Assert-True -Condition (Test-Path -LiteralPath $timeoutAttemptRecord -PathType Leaf) -Message "timeout mock did not record its invocation"
-  Assert-True -Condition (
-    @(Get-Content -LiteralPath $timeoutAttemptRecord | Where-Object { $_ -ceq "attempt" }).Count -eq 1
-  ) -Message "timeout path retried the process"
   Assert-True -Condition (Test-Path -LiteralPath $timeoutPidRecord -PathType Leaf) -Message "timeout mock did not record its process tree"
   Assert-True -Condition $recordedTimeoutProcessIdsAreValid -Message "timeout mock recorded an invalid process id"
   Assert-True -Condition (
-    $timeoutProcessIds.Count -eq 2 -and
-    @($timeoutProcessIds | Sort-Object -Unique).Count -eq 2
-  ) -Message "timeout mock did not record a distinct parent and child process"
+    $timeoutProcessIds.Count -eq 1 -and
+    @($timeoutProcessIds | Sort-Object -Unique).Count -eq 1
+  ) -Message "timeout path did not run exactly once with one root process"
   $processExitDeadline = [DateTime]::UtcNow.AddSeconds(5)
   do {
     $runningTimeoutProcesses = @(
@@ -406,6 +447,122 @@ try {
   Assert-True -Condition ($runningTimeoutProcesses.Count -eq 0) -Message "timeout process tree was not terminated"
   $timeoutProcessIds = @()
   Assert-True -Condition (-not (Test-Path -LiteralPath $timeoutEvidencePath)) -Message "timeout path produced evidence"
+
+  $processTreePidRecord = Join-Path $testRoot "process-tree-helper-pids.txt"
+  $processTreeStartInfo = New-Object Diagnostics.ProcessStartInfo
+  $processTreeStartInfo.FileName = $powerShellLauncher
+  $processTreeStartInfo.Arguments = ((@(
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    $processTreeMock,
+    $processTreePidRecord
+  ) | ForEach-Object { ConvertTo-NativeArgument -Value $_ }) -join " ")
+  $processTreeStartInfo.WorkingDirectory = $testRoot
+  $processTreeStartInfo.UseShellExecute = $false
+  $processTreeStartInfo.CreateNoWindow = $true
+  $processTreeStartInfo.RedirectStandardInput = $true
+  $processTreeStartInfo.RedirectStandardOutput = $true
+  $processTreeStartInfo.RedirectStandardError = $true
+  $processTreeProcess = New-Object Diagnostics.Process
+  $processTreeProcess.StartInfo = $processTreeStartInfo
+  Assert-True -Condition $processTreeProcess.Start() -Message "process-tree helper did not start"
+  $processTreeRootId = $processTreeProcess.Id
+  $timeoutProcessIds = @($processTreeRootId)
+  $processTreeProcess.StandardInput.Close()
+  $processTreeStdoutTask = $processTreeProcess.StandardOutput.ReadToEndAsync()
+  $processTreeStderrTask = $processTreeProcess.StandardError.ReadToEndAsync()
+  $processTreeSetupDeadline = [DateTime]::UtcNow.AddSeconds(120)
+  $recordedProcessTreeIds = @()
+  do {
+    if (Test-Path -LiteralPath $processTreePidRecord -PathType Leaf) {
+      $candidateProcessTreeIds = @()
+      $candidateProcessTreeIdsAreValid = $true
+      foreach ($recordedProcessIdText in @(Get-Content -LiteralPath $processTreePidRecord)) {
+        $parsedProcessId = 0
+        if ([int]::TryParse($recordedProcessIdText, [ref]$parsedProcessId) -and $parsedProcessId -gt 0) {
+          $candidateProcessTreeIds += $parsedProcessId
+        } else {
+          $candidateProcessTreeIdsAreValid = $false
+        }
+      }
+      if ($candidateProcessTreeIdsAreValid -and $candidateProcessTreeIds.Count -gt 0) {
+        $timeoutProcessIds = @(
+          @($processTreeRootId) + @($candidateProcessTreeIds) |
+            Sort-Object -Unique
+        )
+      }
+      if (
+        $candidateProcessTreeIdsAreValid -and
+        $candidateProcessTreeIds.Count -eq 2 -and
+        @($candidateProcessTreeIds | Sort-Object -Unique).Count -eq 2
+      ) {
+        $recordedProcessTreeIds = $candidateProcessTreeIds
+        $timeoutProcessIds = @($recordedProcessTreeIds)
+        break
+      }
+    }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $processTreeSetupDeadline)
+  Assert-True -Condition (
+    $recordedProcessTreeIds.Count -eq 2 -and
+    $recordedProcessTreeIds[0] -eq $processTreeRootId
+  ) -Message "process-tree helper did not record its distinct root and leaf processes"
+  Assert-True -Condition (
+    @($recordedProcessTreeIds | Where-Object {
+      $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue)
+    }).Count -eq 2
+  ) -Message "process-tree helper was not live before termination"
+  Stop-ProcessTree -ProcessId $processTreeRootId
+  $processTreeRootExited = $false
+  try {
+    $processTreeRootExited = $processTreeProcess.WaitForExit(10000)
+  } catch {
+    $processTreeRootExited = $false
+  }
+  Assert-True -Condition $processTreeRootExited -Message "process-tree helper root did not converge after termination"
+  $processTreeExitDeadline = [DateTime]::UtcNow.AddSeconds(5)
+  do {
+    $runningProcessTreeIds = @(
+      $recordedProcessTreeIds | Where-Object {
+        $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue)
+      }
+    )
+    if ($runningProcessTreeIds.Count -eq 0) {
+      break
+    }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $processTreeExitDeadline)
+  Assert-True -Condition ($runningProcessTreeIds.Count -eq 0) -Message "Stop-ProcessTree left a root or leaf process running"
+  $processTreeStreamsDrained = $false
+  $processTreeStdout = ""
+  $processTreeStderr = ""
+  try {
+    $processTreeStreamsDrained = [Threading.Tasks.Task]::WaitAll(
+      [Threading.Tasks.Task[]]@($processTreeStdoutTask, $processTreeStderrTask),
+      5000
+    )
+    if ($processTreeStreamsDrained) {
+      $processTreeStdout = $processTreeStdoutTask.GetAwaiter().GetResult()
+      $processTreeStderr = $processTreeStderrTask.GetAwaiter().GetResult()
+    }
+  } catch {
+    $processTreeStreamsDrained = $false
+  }
+  Assert-True -Condition $processTreeStreamsDrained -Message "process-tree helper streams did not close after termination"
+  Assert-True -Condition (
+    $processTreeStdout.Length -eq 0 -and
+    $processTreeStderr.Length -eq 0
+  ) -Message "process-tree helper emitted unexpected diagnostics"
+  $timeoutProcessIds = @()
+  $processTreeRootId = 0
+  $processTreeProcess.Dispose()
+  $processTreeProcess = $null
+  $processTreeStdoutTask = $null
+  $processTreeStderrTask = $null
 
   $evidencePath = Join-Path $testRoot "qualification.json"
   $evidence = Invoke-Qualification -MineruMock $mockMineru -GpuMock $mockGpu -Evidence $evidencePath
@@ -510,8 +667,22 @@ try {
   Write-Output "local MinerU qualification mock tests passed"
 } finally {
   Remove-Item Env:LA_QUALIFICATION_SECRET_CANARY -ErrorAction SilentlyContinue
+  if ($processTreeRootId -gt 0) {
+    try {
+      if ($null -ne (Get-Command -Name Stop-ProcessTree -CommandType Function -ErrorAction SilentlyContinue)) {
+        Stop-ProcessTree -ProcessId $processTreeRootId
+      } else {
+        Stop-Process -Id $processTreeRootId -Force -ErrorAction SilentlyContinue
+      }
+    } catch {
+      Stop-Process -Id $processTreeRootId -Force -ErrorAction SilentlyContinue
+    }
+  }
   foreach ($timeoutProcessId in @($timeoutProcessIds | Sort-Object -Unique)) {
     Stop-Process -Id $timeoutProcessId -Force -ErrorAction SilentlyContinue
+  }
+  if ($null -ne $processTreeProcess) {
+    $processTreeProcess.Dispose()
   }
   if ($null -ne $keptJob -and (Test-Path -LiteralPath $keptJob)) {
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
