@@ -33,6 +33,20 @@ try {
     throw "Independent replacement changed file content"
   }
 
+  $frontendPlaceholder = Join-Path $resolvedRoot "frontend-dist\.gitkeep"
+  Restore-LawyerAssistanceFrontendPlaceholder $frontendPlaceholder
+  $placeholderBytes = [IO.File]::ReadAllBytes($frontendPlaceholder)
+  if ($placeholderBytes.Length -ge 3 -and
+      $placeholderBytes[0] -eq 0xEF -and
+      $placeholderBytes[1] -eq 0xBB -and
+      $placeholderBytes[2] -eq 0xBF) {
+    throw "Frontend placeholder must be UTF-8 without BOM"
+  }
+  $placeholderText = [Text.Encoding]::UTF8.GetString($placeholderBytes)
+  if ($placeholderText -cne "# Production builds replace this placeholder with verified frontend assets.`n") {
+    throw "Frontend placeholder content drifted from the tracked canonical bytes"
+  }
+
   Write-Output "release independent-file copy test passed"
 } finally {
   if (Test-Path -LiteralPath $resolvedRoot) {

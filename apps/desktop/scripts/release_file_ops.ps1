@@ -1,5 +1,15 @@
 Set-StrictMode -Version Latest
 
+function Restore-LawyerAssistanceFrontendPlaceholder([string]$Path) {
+  $resolved = [IO.Path]::GetFullPath($Path)
+  New-Item -ItemType Directory -Path (Split-Path -Parent $resolved) -Force | Out-Null
+  [IO.File]::WriteAllText(
+    $resolved,
+    "# Production builds replace this placeholder with verified frontend assets.`n",
+    [Text.UTF8Encoding]::new($false)
+  )
+}
+
 function Get-LawyerAssistanceHardLinkCount([string]$Path) {
   $resolved = [IO.Path]::GetFullPath($Path)
   if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
