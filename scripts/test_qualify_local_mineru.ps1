@@ -167,12 +167,14 @@ param(
 )
 $ErrorActionPreference = "Stop"
 [IO.File]::AppendAllText($AttemptRecordPath, "attempt`n", [Text.Encoding]::ASCII)
-$powerShellPath = (Get-Process -Id $PID).Path
-$child = Start-Process `
-  -FilePath $powerShellPath `
-  -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60") `
-  -PassThru `
-  -WindowStyle Hidden
+$childStartInfo = New-Object Diagnostics.ProcessStartInfo
+$childStartInfo.FileName = Join-Path $env:SystemRoot "System32\PING.EXE"
+$childStartInfo.Arguments = "-n 61 127.0.0.1"
+$childStartInfo.UseShellExecute = $false
+$childStartInfo.CreateNoWindow = $true
+$childStartInfo.RedirectStandardOutput = $true
+$childStartInfo.RedirectStandardError = $true
+$child = [Diagnostics.Process]::Start($childStartInfo)
 [IO.File]::WriteAllText(
   $PidRecordPath,
   ("{0}`n{1}`n" -f $PID, $child.Id),
