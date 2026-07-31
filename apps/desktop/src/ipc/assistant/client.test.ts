@@ -34,7 +34,6 @@ import {
   proposeAssistantLegalBasis,
   rejectAssistantCaseChangeProposal,
   saveAssistantArtifact,
-  startAssistantRun,
   startInteractiveAssistantRun,
 } from "./client";
 import type {
@@ -373,82 +372,6 @@ describe("assistant typed IPC client", () => {
     expect(invoke).toHaveBeenCalledWith("cancel_assistant_run", {
       request: { runId: "assistant-run-1" },
     });
-  });
-
-  it("starts a cancellable run with one closed provider-agnostic plan", async () => {
-    const received: string[] = [];
-    const promise = startAssistantRun({
-      runId: "assistant-run-2",
-      conversationId: "conversation-1",
-      providerId: "provider-1",
-      intent: "document_draft",
-      prompt: "Draft a contract from the selected material.",
-      attachmentIds: ["attachment-1"],
-      saveResearchArtifact: null,
-      regenerationTarget: {
-        artifactId: "artifact-1",
-        sourceVersionNumber: 2,
-        expectedCurrentVersion: 3,
-        hiddenTargetField: "must-not-cross",
-      },
-      budget: {
-        maxToolCalls: 5,
-        maxProviderRoundTrips: 2,
-        maxInputBodyBytes: 1024,
-        maxVisibleAttachments: 1,
-        maxModelResponseBytes: 4096,
-        hiddenBudgetField: "must-not-cross",
-      } as never,
-      apiKey: "dummy-do-not-cross",
-      command: "arbitrary-command",
-    } as never, (event) => received.push(event.eventType));
-
-    const invocation = invoke.mock.calls[0][1] as {
-      onEvent: { onmessage: (event: {
-        runId: string;
-        sequence: number;
-        eventType: "delta";
-        content: string;
-      }) => void };
-    };
-    invocation.onEvent.onmessage({
-      runId: "assistant-run-2",
-      sequence: 1,
-      eventType: "delta",
-      content: "partial",
-    });
-    await promise;
-
-    expect(invoke).toHaveBeenCalledWith("start_assistant_run", {
-      request: {
-        runId: "assistant-run-2",
-        conversationId: "conversation-1",
-        providerId: "provider-1",
-        intent: "document_draft",
-        prompt: "Draft a contract from the selected material.",
-        attachmentIds: ["attachment-1"],
-        saveResearchArtifact: null,
-        regenerationTarget: {
-          artifactId: "artifact-1",
-          sourceVersionNumber: 2,
-          expectedCurrentVersion: 3,
-        },
-        budget: {
-          maxToolCalls: 5,
-          maxProviderRoundTrips: 2,
-          maxInputBodyBytes: 1024,
-          maxVisibleAttachments: 1,
-          maxModelResponseBytes: 4096,
-        },
-      },
-      onEvent: invocation.onEvent,
-    });
-    expect(received).toEqual(["delta"]);
-    const payload = JSON.stringify(invoke.mock.calls[0]);
-    expect(payload).not.toContain("apiKey");
-    expect(payload).not.toContain("arbitrary-command");
-    expect(payload).not.toContain("hiddenBudgetField");
-    expect(payload).not.toContain("hiddenTargetField");
   });
 
   it("starts ordinary chat through the minimal interactive command only", async () => {

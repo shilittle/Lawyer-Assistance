@@ -569,7 +569,6 @@ pub fn run() {
             commands::assistant::create_assistant_case_change_proposal,
             commands::assistant::reject_assistant_case_change_proposal,
             commands::assistant::apply_assistant_case_change_proposal,
-            commands::assistant_run::start_assistant_run,
             commands::assistant_run::start_interactive_assistant_run,
             commands::assistant::cancel_assistant_run,
             commands::case_assistant::create_case_assistant_conversation,
