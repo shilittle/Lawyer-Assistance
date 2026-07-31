@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $subject = Join-Path $PSScriptRoot "qualify_local_mineru.ps1"
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("lawyer-assistance-mineru-qualification-tests-" + [Guid]::NewGuid().ToString("N"))
 $keptJob = $null
+$timeoutProcessIds = @()
 
 function Assert-True {
   param(
@@ -23,6 +24,24 @@ function Write-Utf8NoBom {
   )
 
   [IO.File]::WriteAllText($LiteralPath, $Value, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Get-SubjectFunctionDefinition {
+  param(
+    [Parameter(Mandatory = $true)]
+    [Management.Automation.Language.ScriptBlockAst]$Ast,
+    [Parameter(Mandatory = $true)]
+    [string]$Name
+  )
+
+  $definitions = @(
+    $Ast.FindAll({
+      param($node)
+      $node -is [Management.Automation.Language.FunctionDefinitionAst]
+    }, $true) | Where-Object { $_.Name -ceq $Name }
+  )
+  Assert-True -Condition ($definitions.Count -eq 1) -Message ("expected exactly one subject function named " + $Name)
+  return $definitions[0]
 }
 
 function Invoke-Qualification {
@@ -141,19 +160,159 @@ Write-Output "0, NVIDIA GeForce RTX 5090, 572.70, 32607"
 exit 0
 '@
 
+$timeoutProcessMockSource = @'
+param(
+  [Parameter(Mandatory = $true)][string]$PidRecordPath,
+  [Parameter(Mandatory = $true)][string]$AttemptRecordPath
+)
+$ErrorActionPreference = "Stop"
+[IO.File]::AppendAllText($AttemptRecordPath, "attempt`n", [Text.Encoding]::ASCII)
+$powerShellPath = (Get-Process -Id $PID).Path
+$child = Start-Process `
+  -FilePath $powerShellPath `
+  -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60") `
+  -PassThru `
+  -WindowStyle Hidden
+[IO.File]::WriteAllText(
+  $PidRecordPath,
+  ("{0}`n{1}`n" -f $PID, $child.Id),
+  [Text.Encoding]::ASCII
+)
+Write-Output ("discarded-stdout:" + $env:LA_TIMEOUT_SECRET_CANARY)
+[Console]::Error.WriteLine("discarded-stderr:" + $PidRecordPath)
+Start-Sleep -Seconds 60
+'@
+
 try {
   [void][IO.Directory]::CreateDirectory($testRoot)
   $mockMineru = Join-Path $testRoot "mock-mineru.ps1"
   $mockGpu = Join-Path $testRoot "mock-nvidia-smi.ps1"
+  $timeoutProcessMock = Join-Path $testRoot "mock-timeout-process-tree.ps1"
   Write-Utf8NoBom -LiteralPath $mockMineru -Value $mockMineruSource
   Write-Utf8NoBom -LiteralPath $mockGpu -Value $mockGpuSource
+  Write-Utf8NoBom -LiteralPath $timeoutProcessMock -Value $timeoutProcessMockSource
 
   $tokens = $null
   $parseErrors = $null
-  [Management.Automation.Language.Parser]::ParseFile($subject, [ref]$tokens, [ref]$parseErrors) | Out-Null
+  $subjectAst = [Management.Automation.Language.Parser]::ParseFile($subject, [ref]$tokens, [ref]$parseErrors)
   Assert-True -Condition ($parseErrors.Count -eq 0) -Message "qualification script failed AST validation"
   [Management.Automation.Language.Parser]::ParseFile($mockMineru, [ref]$tokens, [ref]$parseErrors) | Out-Null
   Assert-True -Condition ($parseErrors.Count -eq 0) -Message "mock MinerU script failed AST validation"
+  [Management.Automation.Language.Parser]::ParseFile($timeoutProcessMock, [ref]$tokens, [ref]$parseErrors) | Out-Null
+  Assert-True -Condition ($parseErrors.Count -eq 0) -Message "timeout process-tree mock failed AST validation"
+
+  foreach ($functionName in @(
+    "Resolve-QualificationProcessTimeoutMilliseconds",
+    "ConvertTo-NativeArgument",
+    "Stop-ProcessTree",
+    "Invoke-SanitizedProcess"
+  )) {
+    $definition = Get-SubjectFunctionDefinition -Ast $subjectAst -Name $functionName
+    . ([scriptblock]::Create($definition.Extent.Text))
+  }
+
+  $timeoutCases = @(
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $false; InputSeconds = 10; ExpectedMilliseconds = 10000 },
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $false; InputSeconds = 120; ExpectedMilliseconds = 120000 },
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $false; InputSeconds = 1800; ExpectedMilliseconds = 1800000 },
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $false; InputSeconds = 7200; ExpectedMilliseconds = 7200000 },
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $true; InputSeconds = 10; ExpectedMilliseconds = 10000 },
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $true; InputSeconds = 120; ExpectedMilliseconds = 120000 },
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $true; InputSeconds = 1800; ExpectedMilliseconds = 1800000 },
+    [pscustomobject]@{ Stage = "mineru_ocr"; IsPowerShellTestDouble = $true; InputSeconds = 7200; ExpectedMilliseconds = 7200000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $false; InputSeconds = 10; ExpectedMilliseconds = 30000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $false; InputSeconds = 120; ExpectedMilliseconds = 30000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $false; InputSeconds = 1800; ExpectedMilliseconds = 30000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $false; InputSeconds = 7200; ExpectedMilliseconds = 30000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $true; InputSeconds = 10; ExpectedMilliseconds = 10000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $true; InputSeconds = 120; ExpectedMilliseconds = 120000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $true; InputSeconds = 1800; ExpectedMilliseconds = 120000 },
+    [pscustomobject]@{ Stage = "gpu_inventory"; IsPowerShellTestDouble = $true; InputSeconds = 7200; ExpectedMilliseconds = 120000 }
+  )
+  foreach ($case in $timeoutCases) {
+    $actualMilliseconds = Resolve-QualificationProcessTimeoutMilliseconds `
+      -Stage $case.Stage `
+      -IsPowerShellTestDouble $case.IsPowerShellTestDouble `
+      -TimeoutSeconds $case.InputSeconds
+    Assert-True -Condition ([int]$actualMilliseconds -eq [int]$case.ExpectedMilliseconds) -Message (
+      "qualification timeout resolver changed for stage={0}, testDouble={1}, seconds={2}" -f
+      $case.Stage,
+      $case.IsPowerShellTestDouble,
+      $case.InputSeconds
+    )
+  }
+  $invalidStageRejected = $false
+  try {
+    Resolve-QualificationProcessTimeoutMilliseconds `
+      -Stage "unapproved_stage" `
+      -IsPowerShellTestDouble $false `
+      -TimeoutSeconds 120 | Out-Null
+  } catch {
+    $invalidStageRejected = $true
+  }
+  Assert-True -Condition $invalidStageRejected -Message "qualification timeout resolver accepted an unapproved stage"
+
+  $invokeProcessCalls = @(
+    $subjectAst.FindAll({
+      param($node)
+      $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq "Invoke-SanitizedProcess"
+    }, $true)
+  )
+  Assert-True -Condition ($invokeProcessCalls.Count -eq 2) -Message "qualification script must have exactly two sanitized process call sites"
+  $observedStages = @()
+  foreach ($call in $invokeProcessCalls) {
+    $stageParameterIndices = @()
+    $timeoutParameterIndices = @()
+    $legacyTimeoutParameterIndices = @()
+    for ($elementIndex = 1; $elementIndex -lt $call.CommandElements.Count; $elementIndex += 1) {
+      $element = $call.CommandElements[$elementIndex]
+      if ($element -isnot [Management.Automation.Language.CommandParameterAst]) {
+        continue
+      }
+      if ($element.ParameterName -ceq "Stage") {
+        $stageParameterIndices += $elementIndex
+      } elseif ($element.ParameterName -ceq "TimeoutSeconds") {
+        $timeoutParameterIndices += $elementIndex
+      } elseif ($element.ParameterName -ceq "TimeoutMilliseconds") {
+        $legacyTimeoutParameterIndices += $elementIndex
+      }
+    }
+    Assert-True -Condition ($stageParameterIndices.Count -eq 1) -Message "sanitized process call must pass exactly one fixed stage"
+    Assert-True -Condition ($timeoutParameterIndices.Count -eq 1) -Message "sanitized process call must pass top-level TimeoutSeconds exactly once"
+    Assert-True -Condition ($legacyTimeoutParameterIndices.Count -eq 0) -Message "sanitized process call retained the legacy TimeoutMilliseconds parameter"
+    $stageArgument = $call.CommandElements[$stageParameterIndices[0] + 1].Extent.Text
+    $timeoutArgument = $call.CommandElements[$timeoutParameterIndices[0] + 1].Extent.Text
+    Assert-True -Condition (
+      @('"gpu_inventory"', '"mineru_ocr"') -ccontains $stageArgument
+    ) -Message "sanitized process call stage must be a fixed approved literal"
+    Assert-True -Condition ($timeoutArgument -ceq '$TimeoutSeconds') -Message "sanitized process call did not pass the top-level TimeoutSeconds variable"
+    $observedStages += $stageArgument.Trim('"')
+  }
+  Assert-True -Condition (
+    (($observedStages | Sort-Object) -join ",") -ceq "gpu_inventory,mineru_ocr"
+  ) -Message "sanitized process call stages changed"
+  $legacyTimeoutParameters = @(
+    $subjectAst.FindAll({
+      param($node)
+      $node -is [Management.Automation.Language.CommandParameterAst] -and
+        $node.ParameterName -ceq "TimeoutMilliseconds"
+    }, $true)
+  )
+  Assert-True -Condition ($legacyTimeoutParameters.Count -eq 0) -Message "qualification script retained a TimeoutMilliseconds call parameter"
+  $subjectSource = [IO.File]::ReadAllText($subject, [Text.Encoding]::UTF8)
+  Assert-True -Condition (-not $subjectSource.Contains("-TimeoutMilliseconds 30000")) -Message "qualification script retained the hidden 30000ms GPU invocation"
+
+  $topLevelTimeoutParameters = @(
+    $subjectAst.ParamBlock.Parameters | Where-Object {
+      $_.Name.VariablePath.UserPath -ceq "TimeoutSeconds"
+    }
+  )
+  Assert-True -Condition ($topLevelTimeoutParameters.Count -eq 1) -Message "qualification script must define exactly one top-level TimeoutSeconds parameter"
+  Assert-True -Condition (
+    $null -ne $topLevelTimeoutParameters[0].DefaultValue -and
+    $topLevelTimeoutParameters[0].DefaultValue.Extent.Text -ceq "1800"
+  ) -Message "qualification timeout default changed"
   $timeoutParameter = (Get-Command -Name $subject).Parameters["TimeoutSeconds"]
   $timeoutRange = @($timeoutParameter.Attributes | Where-Object {
     $_ -is [Management.Automation.ValidateRangeAttribute]
@@ -165,11 +324,109 @@ try {
   ) -Message "qualification timeout boundaries changed"
 
   $env:LA_QUALIFICATION_SECRET_CANARY = "must-not-reach-child"
+  $timeoutPidRecord = Join-Path $testRoot "timeout-process-tree-pids.txt"
+  $timeoutAttemptRecord = Join-Path $testRoot "timeout-process-tree-attempts.txt"
+  $timeoutEvidencePath = Join-Path $testRoot "timeout-process-tree-evidence.json"
+  $timeoutSecret = "timeout-secret-must-not-leak"
+  $powerShellLauncher = (Get-Process -Id $PID).Path
+  $timeoutDescriptor = [pscustomobject]@{
+    LauncherPath = $powerShellLauncher
+    IsPowerShellTestDouble = $true
+    PrefixArguments = @(
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      $timeoutProcessMock
+    )
+  }
+  $timeoutFailure = ""
+  $timeoutStopwatch = [Diagnostics.Stopwatch]::StartNew()
+  try {
+    Invoke-SanitizedProcess `
+      -Descriptor $timeoutDescriptor `
+      -Stage "gpu_inventory" `
+      -Arguments @($timeoutPidRecord, $timeoutAttemptRecord) `
+      -Environment @{
+        LA_TIMEOUT_SECRET_CANARY = $timeoutSecret
+        LA_TIMEOUT_EVIDENCE_PATH = $timeoutEvidencePath
+      } `
+      -WorkingDirectory $testRoot `
+      -TimeoutSeconds 10 | Out-Null
+  } catch {
+    $timeoutFailure = $_.Exception.Message
+  } finally {
+    $timeoutStopwatch.Stop()
+  }
+  $recordedTimeoutProcessIdsAreValid = $true
+  if (Test-Path -LiteralPath $timeoutPidRecord -PathType Leaf) {
+    foreach ($recordedProcessIdText in @(Get-Content -LiteralPath $timeoutPidRecord)) {
+      $parsedProcessId = 0
+      if ([int]::TryParse($recordedProcessIdText, [ref]$parsedProcessId) -and $parsedProcessId -gt 0) {
+        $timeoutProcessIds += $parsedProcessId
+      } else {
+        $recordedTimeoutProcessIdsAreValid = $false
+      }
+    }
+  }
+  Assert-True -Condition (
+    $timeoutFailure -ceq "local qualification process timed out (stage=gpu_inventory)"
+  ) -Message "GPU timeout did not return the fixed stage-safe error"
+  Assert-True -Condition ($timeoutStopwatch.ElapsedMilliseconds -ge 8000) -Message "GPU timeout returned before its fixed lower bound"
+  Assert-True -Condition ($timeoutStopwatch.ElapsedMilliseconds -lt 30000) -Message "GPU timeout did not converge within its fixed upper bound"
+  foreach ($forbidden in @($testRoot, $timeoutProcessMock, $timeoutSecret, "must-not-reach-child")) {
+    Assert-True -Condition (-not $timeoutFailure.Contains($forbidden)) -Message "GPU timeout error leaked a local path or secret"
+  }
+  Assert-True -Condition (Test-Path -LiteralPath $timeoutAttemptRecord -PathType Leaf) -Message "timeout mock did not record its invocation"
+  Assert-True -Condition (
+    @(Get-Content -LiteralPath $timeoutAttemptRecord | Where-Object { $_ -ceq "attempt" }).Count -eq 1
+  ) -Message "timeout path retried the process"
+  Assert-True -Condition (Test-Path -LiteralPath $timeoutPidRecord -PathType Leaf) -Message "timeout mock did not record its process tree"
+  Assert-True -Condition $recordedTimeoutProcessIdsAreValid -Message "timeout mock recorded an invalid process id"
+  Assert-True -Condition (
+    $timeoutProcessIds.Count -eq 2 -and
+    @($timeoutProcessIds | Sort-Object -Unique).Count -eq 2
+  ) -Message "timeout mock did not record a distinct parent and child process"
+  $processExitDeadline = [DateTime]::UtcNow.AddSeconds(5)
+  do {
+    $runningTimeoutProcesses = @(
+      $timeoutProcessIds | Where-Object {
+        $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue)
+      }
+    )
+    if ($runningTimeoutProcesses.Count -eq 0) {
+      break
+    }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $processExitDeadline)
+  Assert-True -Condition ($runningTimeoutProcesses.Count -eq 0) -Message "timeout process tree was not terminated"
+  $timeoutProcessIds = @()
+  Assert-True -Condition (-not (Test-Path -LiteralPath $timeoutEvidencePath)) -Message "timeout path produced evidence"
+
   $evidencePath = Join-Path $testRoot "qualification.json"
   $evidence = Invoke-Qualification -MineruMock $mockMineru -GpuMock $mockGpu -Evidence $evidencePath
   $rawEvidence = [IO.File]::ReadAllText($evidencePath, [Text.Encoding]::UTF8)
   foreach ($forbidden in @($testRoot, $mockMineru, $mockGpu, "must-not-reach-child")) {
     Assert-True -Condition (-not $rawEvidence.Contains($forbidden)) -Message "evidence recorded a local path or inherited secret"
+  }
+  foreach ($forbiddenProperty in @(
+    "stage",
+    "timeout",
+    "timeoutSeconds",
+    "timeoutMilliseconds",
+    "processKind",
+    "descriptorKind",
+    "isPowerShellTestDouble"
+  )) {
+    Assert-True -Condition (
+      -not [regex]::IsMatch(
+        $rawEvidence,
+        ('"' + [regex]::Escape($forbiddenProperty) + '"\s*:'),
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+      )
+    ) -Message ("evidence recorded forbidden process diagnostic property " + $forbiddenProperty)
   }
   Assert-True -Condition ([bool]$evidence.qualified) -Message "mock qualification did not pass"
   Assert-True -Condition ($evidence.scope -ceq "fixed_synthetic_canary_only") -Message "qualification scope changed"
@@ -251,6 +508,9 @@ try {
   Write-Output "local MinerU qualification mock tests passed"
 } finally {
   Remove-Item Env:LA_QUALIFICATION_SECRET_CANARY -ErrorAction SilentlyContinue
+  foreach ($timeoutProcessId in @($timeoutProcessIds | Sort-Object -Unique)) {
+    Stop-Process -Id $timeoutProcessId -Force -ErrorAction SilentlyContinue
+  }
   if ($null -ne $keptJob -and (Test-Path -LiteralPath $keptJob)) {
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
     $keptAbsolute = [IO.Path]::GetFullPath($keptJob).TrimEnd('\')
