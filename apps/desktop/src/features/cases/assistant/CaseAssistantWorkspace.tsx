@@ -33,6 +33,7 @@ import { CaseAssistantProviderNotice } from "./CaseAssistantProviderNotice";
 import {
   caseAssistantConfirmationMessage,
   caseAssistantRunFailureMessage,
+  failCaseAssistantStreamState,
   initialCaseAssistantStreamState,
   reconcileCaseAssistantGenerationIds,
   reduceCaseAssistantRunEvent,
@@ -533,6 +534,11 @@ export function CaseAssistantWorkspace({
         const failureMessage = caseAssistantRunFailureMessage(
           publicErrorMessage(error),
           errorType,
+        );
+        setStreamState((current) =>
+          current
+            ? failCaseAssistantStreamState(current, failureMessage)
+            : current,
         );
         await refreshGenerations({ announceSuccess: false });
         if (

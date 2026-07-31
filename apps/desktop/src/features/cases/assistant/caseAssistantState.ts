@@ -122,6 +122,17 @@ export function caseAssistantRunFailureMessage(
   }`;
 }
 
+export function failCaseAssistantStreamState(
+  current: CaseAssistantStreamState,
+  message: string,
+): CaseAssistantStreamState {
+  return {
+    ...current,
+    status: "failed",
+    error: message,
+  };
+}
+
 export function toggleCaseAssistantGeneration(
   generations: readonly CaseAssistantGeneration[],
   selectedIds: readonly string[],
