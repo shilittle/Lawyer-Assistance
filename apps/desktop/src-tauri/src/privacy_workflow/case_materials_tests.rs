@@ -1,11 +1,17 @@
-use super::super::{test_workspace_instance_id, LocalOcrExecutionContext};
+use super::super::{
+    test_workspace_instance_id, ApprovedPublicationInvalidator, LocalOcrExecutionContext,
+};
 use super::*;
 use crate::privacy_manager::{LocalOcrStatus, LocalOcrStatusCode, PrivacyConfig};
 use material_processing::ExtractionBackend;
-use privacy::{PrivacyStore, ReceiptSigner, RegisterPrivacyMaterial, SaveReviewDraft};
+use privacy::{
+    vnext::{CaseId, MaterialId},
+    PrivacyStore, ReceiptSigner, RegisterPrivacyMaterial, SaveReviewDraft,
+};
 use rusqlite::params;
 use serde_json::Value;
 use std::{
+    collections::BTreeSet,
     fs,
     sync::{mpsc, Arc, Barrier},
     thread,
@@ -15,6 +21,39 @@ use std::{
 const TEST_NOW: u64 = 1_800_000_000;
 const PROJECT_A: &str = "case-project-material-a";
 const PROJECT_B: &str = "case-project-material-b";
+
+struct NoopPublicationInvalidator;
+
+impl ApprovedPublicationInvalidator for NoopPublicationInvalidator {
+    fn invalidate_case(
+        &self,
+        _case_id: &CaseId,
+        _reason_code: &'static str,
+    ) -> Result<u64, &'static str> {
+        Ok(0)
+    }
+
+    fn invalidate_material(
+        &self,
+        _case_id: &CaseId,
+        _material_id: &MaterialId,
+        _reason_code: &'static str,
+    ) -> Result<u64, &'static str> {
+        Ok(0)
+    }
+
+    fn invalidate_all(&self, _reason_code: &'static str) -> Result<u64, &'static str> {
+        Ok(0)
+    }
+
+    fn invalidate_lifecycle_bindings(
+        &self,
+        _lifecycle_binding_ids: &BTreeSet<String>,
+        _reason_code: &'static str,
+    ) -> Result<u64, &'static str> {
+        Ok(0)
+    }
+}
 
 struct CaseFixture {
     directory: tempfile::TempDir,
@@ -46,9 +85,10 @@ impl CaseFixture {
         }
         drop(user_connection);
 
-        let manager = PrivacyWorkflowManager::new(
+        let manager = PrivacyWorkflowManager::new_with_approved_publication_invalidator(
             directory.path().to_path_buf(),
             test_workspace_instance_id(),
+            Arc::new(NoopPublicationInvalidator),
         )
         .expect("privacy workflow manager");
         let signer = ReceiptSigner::new([17_u8; 32]).expect("test receipt signer");
@@ -1487,6 +1527,7 @@ fn scoped_mutation_pins_project_until_privacy_commit_then_allows_project_delete(
     let (delete_started_tx, delete_started_rx) = mpsc::channel();
     let (delete_done_tx, delete_done_rx) = mpsc::channel();
     let mut deleter = None;
+    let deletion_manager = fixture.manager.clone();
 
     let deleted = fixture
         .manager
@@ -1496,13 +1537,13 @@ fn scoped_mutation_pins_project_until_privacy_commit_then_allows_project_delete(
             || {
                 let path = user_database_path.clone();
                 deleter = Some(thread::spawn(move || {
-                    let connection =
+                    let mut connection =
                         database::open_user_database(&path).expect("open user database writer");
                     delete_started_tx
                         .send(())
                         .expect("signal project delete attempt");
                     let result =
-                        connection.execute("DELETE FROM projects WHERE project_id=?1", [PROJECT_A]);
+                        deletion_manager.delete_case_project_lifecycle(&mut connection, PROJECT_A);
                     delete_done_tx
                         .send(result)
                         .expect("report project delete result");
@@ -1530,7 +1571,7 @@ fn scoped_mutation_pins_project_until_privacy_commit_then_allows_project_delete(
         .recv_timeout(Duration::from_secs(5))
         .expect("project delete finishes after scoped commit")
         .expect("project delete succeeds");
-    assert_eq!(deleted_projects, 1);
+    assert!(deleted_projects);
     deleter
         .take()
         .expect("project deleter thread")
@@ -1583,6 +1624,7 @@ fn material_catalog_read_pins_project_until_snapshot_commit() {
     let (delete_started_tx, delete_started_rx) = mpsc::channel();
     let (delete_done_tx, delete_done_rx) = mpsc::channel();
     let mut deleter = None;
+    let deletion_manager = fixture.manager.clone();
 
     let materials = fixture
         .manager
@@ -1593,13 +1635,13 @@ fn material_catalog_read_pins_project_until_snapshot_commit() {
             || {
                 let path = user_database_path.clone();
                 deleter = Some(thread::spawn(move || {
-                    let connection =
+                    let mut connection =
                         database::open_user_database(&path).expect("open user database writer");
                     delete_started_tx
                         .send(())
                         .expect("signal project delete attempt");
                     let result =
-                        connection.execute("DELETE FROM projects WHERE project_id=?1", [PROJECT_A]);
+                        deletion_manager.delete_case_project_lifecycle(&mut connection, PROJECT_A);
                     delete_done_tx
                         .send(result)
                         .expect("report project delete result");
@@ -1623,7 +1665,7 @@ fn material_catalog_read_pins_project_until_snapshot_commit() {
         .recv_timeout(Duration::from_secs(5))
         .expect("project delete finishes after catalog snapshot commit")
         .expect("project delete succeeds");
-    assert_eq!(deleted_projects, 1);
+    assert!(deleted_projects);
     deleter
         .take()
         .expect("project deleter thread")
@@ -1639,6 +1681,7 @@ fn generation_catalog_read_pins_project_until_snapshot_commit() {
     let (delete_started_tx, delete_started_rx) = mpsc::channel();
     let (delete_done_tx, delete_done_rx) = mpsc::channel();
     let mut deleter = None;
+    let deletion_manager = fixture.manager.clone();
 
     let generations = fixture
         .manager
@@ -1650,13 +1693,13 @@ fn generation_catalog_read_pins_project_until_snapshot_commit() {
             || {
                 let path = user_database_path.clone();
                 deleter = Some(thread::spawn(move || {
-                    let connection =
+                    let mut connection =
                         database::open_user_database(&path).expect("open user database writer");
                     delete_started_tx
                         .send(())
                         .expect("signal project delete attempt");
                     let result =
-                        connection.execute("DELETE FROM projects WHERE project_id=?1", [PROJECT_A]);
+                        deletion_manager.delete_case_project_lifecycle(&mut connection, PROJECT_A);
                     delete_done_tx
                         .send(result)
                         .expect("report project delete result");
@@ -1680,7 +1723,7 @@ fn generation_catalog_read_pins_project_until_snapshot_commit() {
         .recv_timeout(Duration::from_secs(5))
         .expect("project delete finishes after generation snapshot commit")
         .expect("project delete succeeds");
-    assert_eq!(deleted_projects, 1);
+    assert!(deleted_projects);
     deleter
         .take()
         .expect("project deleter thread")

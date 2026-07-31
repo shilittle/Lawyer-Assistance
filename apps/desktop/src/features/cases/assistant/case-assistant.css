@@ -1,0 +1,160 @@
+.case-assistant-workspace {
+  min-width: 0;
+  grid-column: 2 / -1;
+}
+
+.case-assistant-workspace .panel-heading > div > p,
+.case-assistant-source-picker .section-heading p,
+.case-assistant-pending-outputs .section-heading p {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+}
+
+.case-assistant-layout {
+  display: grid;
+  grid-template-columns: minmax(12rem, 16rem) minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.case-assistant-conversations,
+.case-assistant-main,
+.case-assistant-source-picker,
+.case-assistant-pending-outputs,
+.case-assistant-stream-result,
+.case-assistant-provider-notice {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.case-assistant-conversations {
+  align-content: start;
+}
+
+.case-assistant-conversations label,
+.case-assistant-prompt {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.case-assistant-history {
+  display: grid;
+  gap: 0.65rem;
+  max-height: 24rem;
+  overflow: auto;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface-muted);
+}
+
+.case-assistant-message {
+  max-width: min(90%, 54rem);
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface);
+}
+
+.case-assistant-message.is-user {
+  justify-self: end;
+}
+
+.case-assistant-message p {
+  margin: 0.35rem 0 0;
+  white-space: pre-wrap;
+}
+
+.case-assistant-source-picker,
+.case-assistant-pending-outputs,
+.case-assistant-stream-result,
+.case-assistant-provider-notice {
+  padding: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+}
+
+.case-assistant-provider-notice {
+  border-color: var(--warning-border, var(--border));
+  background: var(--warning-surface, var(--surface-muted));
+}
+
+.case-assistant-provider-notice p,
+.case-assistant-provider-notice dl {
+  margin: 0;
+}
+
+.case-assistant-provider-notice dl {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.case-assistant-provider-notice dl > div {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 0.5rem;
+}
+
+.case-assistant-provider-notice dt {
+  color: var(--muted);
+}
+
+.case-assistant-generation-list,
+.case-assistant-pending-list {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.case-assistant-generation-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+}
+
+.case-assistant-generation-option span {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.case-assistant-generation-option small {
+  color: var(--muted);
+}
+
+.case-assistant-pending-card {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+}
+
+.case-assistant-pending-card header,
+.case-assistant-pending-card footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.case-assistant-pending-card pre,
+.case-assistant-stream-result pre {
+  max-height: 24rem;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+@media (max-width: 900px) {
+  .case-assistant-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .case-assistant-provider-notice dl > div {
+    grid-template-columns: 1fr;
+  }
+}

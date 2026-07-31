@@ -72,7 +72,7 @@ export function LegalLibrarySearchWorkspace({
     bridgeState,
     addSelectedArticleToAssistant,
     proposeSelectedArticleForCase,
-    continueInAssistant,
+    openCaseAssistant,
     openAssistant,
   } = controller.search;
   const {
@@ -245,7 +245,7 @@ export function LegalLibrarySearchWorkspace({
                   type="button"
                   onClick={() =>
                     assistantActiveProject
-                      ? continueInAssistant()
+                      ? openCaseAssistant()
                       : openAssistant()
                   }
                 >

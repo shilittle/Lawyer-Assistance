@@ -1,26 +1,37 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashSet},
     error::Error,
     fmt::{self, Display},
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicI64, Ordering},
     time::Duration,
 };
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{functions::FunctionFlags, params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 pub const LEGAL_CORE_DB_FILE_NAME: &str = "legal_core.sqlite";
 pub const USER_DB_FILE_NAME: &str = "user.sqlite";
-pub const USER_SCHEMA_VERSION: i64 = 10;
+pub const USER_SCHEMA_VERSION: i64 = 11;
 const USER_CANONICAL_SCHEMA_MARKER_KEY: &str = "canonical_schema_version";
-// This marker describes the exact canonical shape within schema version 10.
+// This marker describes the exact canonical shape within schema version 11.
 // Keep it independent from USER_SCHEMA_VERSION so constraint-only repairs can
-// be applied once without pretending that an unverified v6 database is sound.
-const USER_CANONICAL_SCHEMA_MARKER_VALUE: &str = "v10-operation-audit-20260717";
+// be applied once without pretending that an unverified current database is sound.
+const USER_CANONICAL_SCHEMA_MARKER_VALUE: &str =
+    "v11-case-assistant-exact-proposal-provenance-trusted-retirement-20260731";
 const PENDING_EXTRACTION_REVIEW_RETENTION_SQL: &str = "+7 days";
 const CASE_MATERIAL_DIGEST_DOMAIN: &[u8] = b"lawyer-assistance-case-materials-v1\0";
 const CASE_WORKSPACE_DIGEST_DOMAIN: &[u8] = b"lawyer-assistance-case-workspace-v2-artifacts\0";
+const MAX_CASE_ASSISTANT_SOURCE_SNAPSHOTS_BYTES: usize = 256 * 1024;
+const MAX_CASE_ASSISTANT_OUTPUT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CASE_ASSISTANT_OUTPUT_PREVIEW_BYTES: usize = 16 * 1024;
+const MAX_CASE_ASSISTANT_TOOL_AUDIT_BYTES: usize = 64 * 1024;
+const MAX_CASE_ASSISTANT_AUDIT_BODY_BYTES: u64 = 16 * 1024 * 1024;
+const CASE_PROJECT_DELETED_RETIREMENT_REASON: &str = "case_project_deleted";
+const PRIVACY_JOURNAL_RECOVERY_RETIREMENT_REASON: &str = "privacy_journal_recovery";
+const LEGACY_MIGRATION_CLEANUP_RETIREMENT_REASON: &str = "legacy_migration_cleanup";
 const LEGACY_QA_CONVERSATION_ID_PREFIX: &str = "legacy-qa:";
 const LEGACY_QA_TITLE_MAX_CHARS: usize = 80;
 const COMPAT_QA_CONVERSATION_ID_PREFIX: &str = "qa:";
@@ -29,6 +40,79 @@ const LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE: &str = "迁移隔离：旧版未�
 const LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY: &str =
     "这些问答记录来自旧版数据库，旧版未保存案件归属，不能推断其真实案件。可在此查看恢复；删除本隔离项目会级联彻底清除全部记录。";
 pub const LEGAL_CORE_SCHEMA_SQL: &str = include_str!("../../../data/schema/legal_core.sql");
+
+static NEXT_CASE_RETIREMENT_CONNECTION_NONCE: AtomicI64 = AtomicI64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaseRetirementAuthority {
+    connection_nonce: i64,
+    project_id: String,
+    retirement_reason: String,
+    privacy_deletion_id: Option<String>,
+}
+
+thread_local! {
+    static CASE_RETIREMENT_AUTHORITY_STACK: RefCell<Vec<CaseRetirementAuthority>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+struct CaseRetirementAuthorityGuard {
+    authority: CaseRetirementAuthority,
+}
+
+impl CaseRetirementAuthorityGuard {
+    fn enter(authority: CaseRetirementAuthority) -> Self {
+        CASE_RETIREMENT_AUTHORITY_STACK.with(|stack| {
+            stack.borrow_mut().push(authority.clone());
+        });
+        Self { authority }
+    }
+}
+
+impl Drop for CaseRetirementAuthorityGuard {
+    fn drop(&mut self) {
+        CASE_RETIREMENT_AUTHORITY_STACK.with(|stack| {
+            let removed = stack.borrow_mut().pop();
+            debug_assert_eq!(removed.as_ref(), Some(&self.authority));
+        });
+    }
+}
+
+fn next_case_retirement_connection_nonce() -> Result<i64, DatabaseInitError> {
+    NEXT_CASE_RETIREMENT_CONNECTION_NONCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| {
+            user_schema_migration_error(
+                "case retirement connection nonce space is exhausted".to_owned(),
+            )
+            .into()
+        })
+}
+
+fn case_retirement_connection_nonce(connection: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    connection.query_row("SELECT case_retirement_connection_nonce()", [], |row| {
+        row.get(0)
+    })
+}
+
+fn with_case_retirement_authority<T>(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    retirement_reason: &str,
+    privacy_deletion_id: Option<&str>,
+    operation: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let authority = CaseRetirementAuthority {
+        connection_nonce: case_retirement_connection_nonce(connection)?,
+        project_id: project_id.to_owned(),
+        retirement_reason: retirement_reason.to_owned(),
+        privacy_deletion_id: privacy_deletion_id.map(str::to_owned),
+    };
+    let _guard = CaseRetirementAuthorityGuard::enter(authority);
+    operation()
+}
 
 #[derive(Debug)]
 pub enum DatabaseInitError {
@@ -184,8 +268,50 @@ fn configure_user_database_connection(
     // local workload and avoids changing the persistent journal mode (and its
     // backup/sidecar-file lifecycle) merely to serialize short writes.
     connection.busy_timeout(Duration::from_secs(5))?;
+    let retirement_connection_nonce = next_case_retirement_connection_nonce()?;
+    connection.create_scalar_function(
+        "case_retirement_connection_nonce",
+        0,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        move |_| Ok(retirement_connection_nonce),
+    )?;
+    connection.create_scalar_function(
+        "case_retirement_authorized",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
+        move |context| {
+            let project_id = context.get::<String>(0)?;
+            let retirement_reason = context.get::<String>(1)?;
+            let privacy_deletion_id = context.get::<Option<String>>(2)?;
+            let authorized = CASE_RETIREMENT_AUTHORITY_STACK.with(|stack| {
+                stack.borrow().last().is_some_and(|authority| {
+                    authority.connection_nonce == retirement_connection_nonce
+                        && authority.project_id == project_id
+                        && authority.retirement_reason == retirement_reason
+                        && authority.privacy_deletion_id == privacy_deletion_id
+                })
+            });
+            Ok(i64::from(authorized))
+        },
+    )?;
+    connection.create_scalar_function(
+        "case_assistant_sha256",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            let value = context.get::<String>(0)?;
+            Ok(sha256_hex(value.as_bytes()))
+        },
+    )?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "trusted_schema", "OFF")?;
+    // Append-preserving lineage tables rely on DELETE triggers also firing
+    // for SQLite's REPLACE conflict algorithm.
+    connection.pragma_update(None, "recursive_triggers", "ON")?;
     Ok(())
 }
 
@@ -553,6 +679,628 @@ fn invalid_provider_audit_snapshot() -> rusqlite::Error {
     )))
 }
 
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn canonical_json_value(json: &str, max_bytes: usize) -> rusqlite::Result<serde_json::Value> {
+    if json.is_empty() || json.len() > max_bytes {
+        return Err(user_schema_migration_error(
+            "case assistant canonical JSON exceeds its bounded contract".to_owned(),
+        ));
+    }
+    let value = serde_json::from_str::<serde_json::Value>(json).map_err(|_| {
+        user_schema_migration_error("case assistant canonical JSON is invalid".to_owned())
+    })?;
+    let encoded = serde_json::to_string(&value).map_err(|_| {
+        user_schema_migration_error("case assistant canonical JSON could not be encoded".to_owned())
+    })?;
+    if encoded != json {
+        return Err(user_schema_migration_error(
+            "case assistant JSON must use the canonical compact encoding".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_case_assistant_source_snapshots_json(
+    snapshots_json: &str,
+    expected_sha256: &str,
+) -> rusqlite::Result<()> {
+    let value = canonical_json_value(snapshots_json, MAX_CASE_ASSISTANT_SOURCE_SNAPSHOTS_BYTES)?;
+    if !is_lower_hex_sha256(expected_sha256)
+        || sha256_hex(snapshots_json.as_bytes()) != expected_sha256
+    {
+        return Err(user_schema_migration_error(
+            "case assistant source snapshot hash is invalid".to_owned(),
+        ));
+    }
+    let snapshots = value.as_array().ok_or_else(|| {
+        user_schema_migration_error(
+            "case assistant source snapshots must be a JSON array".to_owned(),
+        )
+    })?;
+    if snapshots.is_empty() || snapshots.len() > 64 {
+        return Err(user_schema_migration_error(
+            "case assistant source snapshot count is out of bounds".to_owned(),
+        ));
+    }
+
+    const SNAPSHOT_KEYS: &[&str] = &[
+        "approvedPayloadSha256",
+        "extractionSha256",
+        "generationId",
+        "generationNumber",
+        "generationRowVersion",
+        "materialId",
+        "ordinal",
+        "redactedContentSha256",
+        "riskRevision",
+        "riskRevisionHash",
+        "selectionId",
+        "selectionRowVersion",
+    ];
+    let mut material_ids = HashSet::new();
+    let mut generation_ids = HashSet::new();
+    let mut selection_ids = HashSet::new();
+    for (ordinal, snapshot) in snapshots.iter().enumerate() {
+        let object = snapshot.as_object().ok_or_else(|| {
+            user_schema_migration_error(
+                "case assistant source snapshot must be an object".to_owned(),
+            )
+        })?;
+        if !has_exact_json_keys(object, SNAPSHOT_KEYS)
+            || object.get("ordinal").and_then(serde_json::Value::as_u64)
+                != u64::try_from(ordinal).ok()
+            || ![
+                "generationNumber",
+                "generationRowVersion",
+                "riskRevision",
+                "selectionRowVersion",
+            ]
+            .iter()
+            .all(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value > 0 && i64::try_from(value).is_ok())
+            })
+            || ![
+                "approvedPayloadSha256",
+                "extractionSha256",
+                "redactedContentSha256",
+                "riskRevisionHash",
+            ]
+            .iter()
+            .all(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_lower_hex_sha256)
+            })
+        {
+            return Err(user_schema_migration_error(
+                "case assistant source snapshot does not match the closed schema".to_owned(),
+            ));
+        }
+        let opaque_id = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| {
+                    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+                })
+        };
+        let Some(material_id) = opaque_id("materialId") else {
+            return Err(user_schema_migration_error(
+                "case assistant material snapshot identifier is invalid".to_owned(),
+            ));
+        };
+        let Some(generation_id) = opaque_id("generationId") else {
+            return Err(user_schema_migration_error(
+                "case assistant generation snapshot identifier is invalid".to_owned(),
+            ));
+        };
+        let Some(selection_id) = opaque_id("selectionId") else {
+            return Err(user_schema_migration_error(
+                "case assistant selection snapshot identifier is invalid".to_owned(),
+            ));
+        };
+        if !material_ids.insert(material_id.to_owned())
+            || !generation_ids.insert(generation_id.to_owned())
+            || !selection_ids.insert(selection_id.to_owned())
+        {
+            return Err(user_schema_migration_error(
+                "case assistant source snapshots contain duplicate lineage".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_case_assistant_output_payload_json(
+    output_kind: &str,
+    output_payload_json: &str,
+    output_sha256: &str,
+) -> rusqlite::Result<()> {
+    if !matches!(
+        output_kind,
+        "case_analysis" | "case_document" | "case_diagram"
+    ) || !is_lower_hex_sha256(output_sha256)
+    {
+        return Err(user_schema_migration_error(
+            "case assistant output metadata is invalid".to_owned(),
+        ));
+    }
+    let value = canonical_json_value(output_payload_json, MAX_CASE_ASSISTANT_OUTPUT_PAYLOAD_BYTES)?;
+    let object = value.as_object().ok_or_else(|| {
+        user_schema_migration_error("case assistant output payload must be an object".to_owned())
+    })?;
+    if !has_exact_json_keys(object, &["content", "outputKind", "schemaVersion"])
+        || object
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || object.get("outputKind").and_then(serde_json::Value::as_str) != Some(output_kind)
+        || object.get("content").is_none_or(serde_json::Value::is_null)
+        || sha256_hex(output_payload_json.as_bytes()) != output_sha256
+    {
+        return Err(user_schema_migration_error(
+            "case assistant output payload does not match its typed hash contract".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_case_assistant_expected_proposal_source_refs(
+    output_kind: &str,
+    source_refs_json: &str,
+    source_refs_sha256: &str,
+) -> rusqlite::Result<()> {
+    if !is_lower_hex_sha256(source_refs_sha256)
+        || sha256_hex(source_refs_json.as_bytes()) != source_refs_sha256
+    {
+        return Err(user_schema_migration_error(
+            "case assistant expected proposal source refs do not match their hash".to_owned(),
+        ));
+    }
+    let value = canonical_json_value(source_refs_json, MAX_CASE_ASSISTANT_SOURCE_SNAPSHOTS_BYTES)?;
+    let refs = value.as_array().ok_or_else(|| {
+        user_schema_migration_error(
+            "case assistant expected proposal source refs must be an array".to_owned(),
+        )
+    })?;
+    let mut previous: Option<&str> = None;
+    for source_ref in refs {
+        let source_ref = source_ref.as_str().filter(|source_ref| {
+            !source_ref.is_empty()
+                && source_ref.len() <= 256
+                && !source_ref.chars().any(char::is_control)
+        });
+        let Some(source_ref) = source_ref else {
+            return Err(user_schema_migration_error(
+                "case assistant expected proposal source ref is invalid".to_owned(),
+            ));
+        };
+        if previous.is_some_and(|previous| previous >= source_ref) {
+            return Err(user_schema_migration_error(
+                "case assistant expected proposal source refs must be strictly sorted".to_owned(),
+            ));
+        }
+        previous = Some(source_ref);
+    }
+    if output_kind != "case_analysis" && !refs.is_empty() {
+        return Err(user_schema_migration_error(
+            "non-analysis case assistant output cannot expect proposal source refs".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedCaseAssistantToolAudit {
+    project_id: String,
+    conversation_id: String,
+    generation_ids: Vec<String>,
+    workspace_digest: String,
+    output_kind: Option<String>,
+    typed_output_sha256: Option<String>,
+    proposal_source_refs_sha256: Option<String>,
+    source_generation_ids: Vec<String>,
+    project_binding_sha256: Option<String>,
+    source_snapshots_sha256: Option<String>,
+}
+
+fn invalid_case_assistant_tool_audit() -> rusqlite::Error {
+    user_schema_migration_error(
+        "case assistant tool audit does not match the fixed no-body schema".to_owned(),
+    )
+}
+
+fn case_assistant_audit_text<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Option<&'a str> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+        })
+}
+
+fn case_assistant_audit_identifier<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    case_assistant_audit_text(object, key, 128)
+        .filter(|value| !value.contains('/') && !value.contains('\\'))
+}
+
+fn case_assistant_audit_id_array(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let values = value?.as_array()?;
+    if values.is_empty() || values.len() > 16 {
+        return None;
+    }
+    let mut identifiers = Vec::with_capacity(values.len());
+    let mut unique = HashSet::with_capacity(values.len());
+    for value in values {
+        let identifier = value.as_str().filter(|identifier| {
+            !identifier.is_empty()
+                && identifier.len() <= 128
+                && !identifier.chars().any(char::is_control)
+                && !identifier.contains('/')
+                && !identifier.contains('\\')
+        })?;
+        if !unique.insert(identifier.to_owned()) {
+            return None;
+        }
+        identifiers.push(identifier.to_owned());
+    }
+    Some(identifiers)
+}
+
+fn case_assistant_confirmation_audit_is_unreceived(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|confirmation| {
+            has_exact_json_keys(confirmation, &["received", "writebackRequired"])
+                && confirmation
+                    .get("received")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                && confirmation
+                    .get("writebackRequired")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+}
+
+fn validate_case_assistant_tool_audit_contract(
+    run_id: &str,
+    run_provider_snapshot_json: &str,
+    status: &str,
+    input_audit_json: &str,
+    output_audit_json: &str,
+    source_audit_json: &str,
+    error_type: Option<&str>,
+) -> rusqlite::Result<ValidatedCaseAssistantToolAudit> {
+    validate_provider_audit_snapshot_json(run_provider_snapshot_json)?;
+    let run_provider_snapshot =
+        serde_json::from_str::<serde_json::Value>(run_provider_snapshot_json)
+            .map_err(|_| invalid_case_assistant_tool_audit())?;
+
+    let input = canonical_json_value(input_audit_json, MAX_CASE_ASSISTANT_TOOL_AUDIT_BYTES)?;
+    let input = input
+        .as_object()
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    if run_id.is_empty()
+        || run_id.len() > 128
+        || run_id.chars().any(char::is_control)
+        || run_id.contains('/')
+        || run_id.contains('\\')
+        || !has_exact_json_keys(
+            input,
+            &[
+                "capability",
+                "classification",
+                "confirmation",
+                "inputCounts",
+                "inputHashes",
+                "inputIds",
+                "providerSnapshot",
+                "requestId",
+                "runId",
+                "status",
+            ],
+        )
+        || case_assistant_audit_identifier(input, "requestId") != Some(run_id)
+        || case_assistant_audit_identifier(input, "runId") != Some(run_id)
+        || case_assistant_audit_text(input, "capability", 64) != Some("assistant.case_work")
+        || case_assistant_audit_text(input, "classification", 64) != Some("case_redacted_approved")
+        || case_assistant_audit_text(input, "status", 32) != Some("running")
+        || input.get("providerSnapshot") != Some(&run_provider_snapshot)
+        || !case_assistant_confirmation_audit_is_unreceived(input.get("confirmation"))
+    {
+        return Err(invalid_case_assistant_tool_audit());
+    }
+
+    let input_ids = input
+        .get("inputIds")
+        .and_then(serde_json::Value::as_object)
+        .filter(|value| {
+            has_exact_json_keys(
+                value,
+                &["conversationId", "projectId", "redactionGenerationIds"],
+            )
+        })
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    let project_id = case_assistant_audit_identifier(input_ids, "projectId")
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    let conversation_id = case_assistant_audit_identifier(input_ids, "conversationId")
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    let generation_ids = case_assistant_audit_id_array(input_ids.get("redactionGenerationIds"))
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    if generation_ids
+        .windows(2)
+        .any(|pair| pair[0].as_str() >= pair[1].as_str())
+    {
+        return Err(invalid_case_assistant_tool_audit());
+    }
+
+    let input_hashes = input
+        .get("inputHashes")
+        .and_then(serde_json::Value::as_object)
+        .filter(|value| {
+            has_exact_json_keys(
+                value,
+                &[
+                    "generationSetSha256",
+                    "historySha256",
+                    "minimalContextSha256",
+                    "promptSha256",
+                    "workspaceDigest",
+                ],
+            )
+        })
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    if input_hashes.values().any(|value| {
+        value
+            .as_str()
+            .is_none_or(|value| !is_lower_hex_sha256(value))
+    }) {
+        return Err(invalid_case_assistant_tool_audit());
+    }
+    let workspace_digest = input_hashes
+        .get("workspaceDigest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+
+    let input_counts = input
+        .get("inputCounts")
+        .and_then(serde_json::Value::as_object)
+        .filter(|value| {
+            has_exact_json_keys(
+                value,
+                &[
+                    "generationCount",
+                    "historyBytes",
+                    "historyMessages",
+                    "knownBodyBytes",
+                    "promptBytes",
+                ],
+            )
+        })
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    if input_counts.values().any(|value| {
+        value
+            .as_u64()
+            .is_none_or(|value| value > MAX_CASE_ASSISTANT_AUDIT_BODY_BYTES)
+    }) || input_counts
+        .get("generationCount")
+        .and_then(serde_json::Value::as_u64)
+        != u64::try_from(generation_ids.len()).ok()
+    {
+        return Err(invalid_case_assistant_tool_audit());
+    }
+
+    let mut validated = ValidatedCaseAssistantToolAudit {
+        project_id: project_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        generation_ids,
+        workspace_digest: workspace_digest.to_owned(),
+        output_kind: None,
+        typed_output_sha256: None,
+        proposal_source_refs_sha256: None,
+        source_generation_ids: Vec::new(),
+        project_binding_sha256: None,
+        source_snapshots_sha256: None,
+    };
+
+    if status == "running" {
+        if output_audit_json != "{}" || source_audit_json != "{}" || error_type.is_some() {
+            return Err(invalid_case_assistant_tool_audit());
+        }
+        return Ok(validated);
+    }
+
+    let output = canonical_json_value(output_audit_json, MAX_CASE_ASSISTANT_TOOL_AUDIT_BYTES)?;
+    let output = output
+        .as_object()
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    let source = canonical_json_value(source_audit_json, MAX_CASE_ASSISTANT_TOOL_AUDIT_BYTES)?;
+    let source = source
+        .as_object()
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    if status == "succeeded" {
+        if error_type.is_some()
+            || !has_exact_json_keys(
+                output,
+                &[
+                    "confirmation",
+                    "outputCounts",
+                    "outputHashes",
+                    "outputIds",
+                    "status",
+                ],
+            )
+            || case_assistant_audit_text(output, "status", 32) != Some("succeeded")
+            || !case_assistant_confirmation_audit_is_unreceived(output.get("confirmation"))
+            || !has_exact_json_keys(
+                source,
+                &[
+                    "classification",
+                    "confirmation",
+                    "inputHashes",
+                    "providerSnapshot",
+                    "sourceRefs",
+                ],
+            )
+            || case_assistant_audit_text(source, "classification", 64)
+                != Some("case_redacted_approved")
+            || source.get("providerSnapshot") != Some(&run_provider_snapshot)
+            || !case_assistant_confirmation_audit_is_unreceived(source.get("confirmation"))
+        {
+            return Err(invalid_case_assistant_tool_audit());
+        }
+        let output_ids = output
+            .get("outputIds")
+            .and_then(serde_json::Value::as_object)
+            .filter(|value| has_exact_json_keys(value, &["pendingOutputKind"]))
+            .ok_or_else(invalid_case_assistant_tool_audit)?;
+        let output_kind = case_assistant_audit_text(output_ids, "pendingOutputKind", 32)
+            .filter(|value| matches!(*value, "case_analysis" | "case_document" | "case_diagram"))
+            .ok_or_else(invalid_case_assistant_tool_audit)?;
+        let output_hashes = output
+            .get("outputHashes")
+            .and_then(serde_json::Value::as_object)
+            .filter(|value| {
+                has_exact_json_keys(
+                    value,
+                    &[
+                        "approvedEnvelopeSha256",
+                        "proposalSourceRefsSha256",
+                        "providerOutputSha256",
+                        "typedOutputSha256",
+                    ],
+                )
+            })
+            .ok_or_else(invalid_case_assistant_tool_audit)?;
+        if output_hashes.values().any(|value| {
+            value
+                .as_str()
+                .is_none_or(|value| !is_lower_hex_sha256(value))
+        }) {
+            return Err(invalid_case_assistant_tool_audit());
+        }
+        let output_counts = output
+            .get("outputCounts")
+            .and_then(serde_json::Value::as_object)
+            .filter(|value| {
+                has_exact_json_keys(value, &["approvedEnvelopeBytes", "bytes", "items"])
+            })
+            .ok_or_else(invalid_case_assistant_tool_audit)?;
+        if output_counts.values().any(|value| {
+            value
+                .as_u64()
+                .is_none_or(|value| value > MAX_CASE_ASSISTANT_AUDIT_BODY_BYTES)
+        }) || output_counts
+            .get("items")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        {
+            return Err(invalid_case_assistant_tool_audit());
+        }
+        let source_refs = case_assistant_audit_id_array(source.get("sourceRefs"))
+            .ok_or_else(invalid_case_assistant_tool_audit)?;
+        let source_hashes = source
+            .get("inputHashes")
+            .and_then(serde_json::Value::as_object)
+            .filter(|value| {
+                has_exact_json_keys(
+                    value,
+                    &[
+                        "aggregateExtractionSha256",
+                        "aggregateRedactedContentSha256",
+                        "aggregateSourceSha256",
+                        "projectBindingSha256",
+                        "sourceSnapshotsSha256",
+                    ],
+                )
+            })
+            .ok_or_else(invalid_case_assistant_tool_audit)?;
+        if source_hashes.values().any(|value| {
+            value
+                .as_str()
+                .is_none_or(|value| !is_lower_hex_sha256(value))
+        }) {
+            return Err(invalid_case_assistant_tool_audit());
+        }
+        validated.output_kind = Some(output_kind.to_owned());
+        validated.typed_output_sha256 = output_hashes
+            .get("typedOutputSha256")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        validated.proposal_source_refs_sha256 = output_hashes
+            .get("proposalSourceRefsSha256")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        validated.source_generation_ids = source_refs;
+        validated.project_binding_sha256 = source_hashes
+            .get("projectBindingSha256")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        validated.source_snapshots_sha256 = source_hashes
+            .get("sourceSnapshotsSha256")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        return Ok(validated);
+    }
+
+    if !matches!(status, "failed" | "cancelled")
+        || error_type.is_none_or(|value| {
+            value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+        })
+        || !has_exact_json_keys(output, &["errorType", "outputCounts", "status"])
+        || case_assistant_audit_text(output, "status", 32) != Some(status)
+        || case_assistant_audit_text(output, "errorType", 128) != error_type
+        || !output
+            .get("outputCounts")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|counts| {
+                has_exact_json_keys(counts, &["items"])
+                    && counts.get("items").and_then(serde_json::Value::as_u64) == Some(0)
+            })
+        || !has_exact_json_keys(source, &["confirmation", "providerSnapshot", "sourceRefs"])
+        || source.get("providerSnapshot") != Some(&run_provider_snapshot)
+        || !source
+            .get("confirmation")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|confirmation| {
+                has_exact_json_keys(confirmation, &["received"])
+                    && confirmation
+                        .get("received")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+            })
+        || case_assistant_audit_id_array(source.get("sourceRefs")).is_none()
+    {
+        return Err(invalid_case_assistant_tool_audit());
+    }
+    Ok(validated)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasePartyRow {
     pub party_id: String,
@@ -738,13 +1486,109 @@ pub struct LegalAnswerRecordRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationScope {
+    Assistant,
+    CaseWork,
+}
+
+impl ConversationScope {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Assistant => "assistant",
+            Self::CaseWork => "case_work",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationRow {
     pub conversation_id: String,
     pub project_id: Option<String>,
+    pub scope: ConversationScope,
     pub title: String,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCaseAssistantPendingOutputRow {
+    pub pending_output_id: String,
+    pub project_id: String,
+    pub conversation_id: String,
+    pub run_id: String,
+    pub assistant_message_id: String,
+    pub project_binding_sha256: String,
+    /// Canonical compact JSON array. Each item is a closed, metadata-only
+    /// generation and selection snapshot; approved source bodies never belong
+    /// in this user-database lineage.
+    pub source_snapshots_json: String,
+    pub source_snapshots_sha256: String,
+    /// Canonical compact JSON array that the confirmation path must reproduce
+    /// exactly before creating an analysis proposal. Non-analysis outputs use
+    /// the canonical empty array.
+    pub expected_proposal_source_refs_json: String,
+    pub expected_proposal_source_refs_sha256: String,
+    pub output_kind: String,
+    /// Canonical typed output, not the raw Provider response envelope.
+    pub output_payload_json: String,
+    pub output_preview: String,
+    pub output_sha256: String,
+    pub output_version: i64,
+    pub workspace_base_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseAssistantPendingOutputRow {
+    pub pending_output_id: String,
+    pub project_id: String,
+    pub conversation_id: String,
+    pub run_id: String,
+    pub assistant_message_id: String,
+    pub project_binding_sha256: String,
+    pub source_snapshots_json: String,
+    pub source_snapshots_sha256: String,
+    pub expected_proposal_source_refs_json: String,
+    pub expected_proposal_source_refs_sha256: String,
+    pub output_kind: String,
+    pub output_payload_json: String,
+    pub output_preview: String,
+    pub output_sha256: String,
+    pub output_version: i64,
+    pub workspace_base_digest: String,
+    pub status: String,
+    pub confirmed_artifact_id: Option<String>,
+    pub confirmed_proposal_id: Option<String>,
+    pub confirmation_request_sha256: Option<String>,
+    pub row_version: i64,
+    pub created_at: String,
+    pub confirmed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaseAssistantConfirmationTarget {
+    Artifact(String),
+    Proposal(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmCaseAssistantPendingOutput<'a> {
+    pub pending_output_id: &'a str,
+    pub project_id: &'a str,
+    pub expected_output_version: i64,
+    pub expected_output_sha256: &'a str,
+    pub expected_workspace_base_digest: &'a str,
+    pub expected_proposal_source_refs_json: &'a str,
+    pub expected_proposal_source_refs_sha256: &'a str,
+    pub confirmation_request_sha256: &'a str,
+    pub target: &'a CaseAssistantConfirmationTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaseAssistantPendingOutputConfirmResult {
+    Confirmed(CaseAssistantPendingOutputRow),
+    Conflict(CaseAssistantPendingOutputRow),
+    NotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1091,12 +1935,37 @@ pub fn create_conversation(
     title: &str,
 ) -> rusqlite::Result<ConversationRow> {
     connection.execute(
-        "INSERT INTO conversations (conversation_id, project_id, title, status)
-         VALUES (?1, ?2, ?3, 'open')",
+        "INSERT INTO conversations (conversation_id, project_id, scope, title, status)
+         VALUES (?1, ?2, 'assistant', ?3, 'open')",
         params![conversation_id, project_id, title],
     )?;
     get_conversation(connection, conversation_id)?.ok_or_else(|| {
         user_schema_migration_error("created conversation could not be reloaded".to_owned())
+    })
+}
+
+pub fn create_case_work_conversation(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    project_id: &str,
+    title: &str,
+) -> rusqlite::Result<ConversationRow> {
+    let changed = connection.execute(
+        "INSERT INTO conversations (conversation_id, project_id, scope, title, status)
+         SELECT ?1, project_id, 'case_work', ?3, 'open'
+         FROM projects
+         WHERE project_id = ?2 AND status = 'active'",
+        params![conversation_id, project_id, title],
+    )?;
+    if changed != 1 {
+        return Err(user_schema_migration_error(
+            "case-work conversation requires an active project".to_owned(),
+        ));
+    }
+    get_case_work_conversation(connection, conversation_id, project_id)?.ok_or_else(|| {
+        user_schema_migration_error(
+            "created case-work conversation could not be reloaded".to_owned(),
+        )
     })
 }
 
@@ -1106,8 +1975,9 @@ pub fn list_conversations(
 ) -> rusqlite::Result<Vec<ConversationRow>> {
     let limit = i64::from(limit.clamp(1, 500));
     let mut statement = connection.prepare(
-        "SELECT conversation_id, project_id, title, status, created_at, updated_at
+        "SELECT conversation_id, project_id, scope, title, status, created_at, updated_at
          FROM conversations
+         WHERE scope = 'assistant'
          ORDER BY updated_at DESC, conversation_id DESC
          LIMIT ?1",
     )?;
@@ -1124,9 +1994,9 @@ pub fn list_conversations_for_project(
 ) -> rusqlite::Result<Vec<ConversationRow>> {
     let limit = i64::from(limit.clamp(1, 500));
     let mut statement = connection.prepare(
-        "SELECT conversation_id, project_id, title, status, created_at, updated_at
+        "SELECT conversation_id, project_id, scope, title, status, created_at, updated_at
          FROM conversations
-         WHERE project_id = ?1
+         WHERE project_id = ?1 AND scope = 'assistant'
          ORDER BY updated_at DESC, conversation_id DESC
          LIMIT ?2",
     )?;
@@ -1140,11 +2010,60 @@ pub fn get_conversation(
     connection: &rusqlite::Connection,
     conversation_id: &str,
 ) -> rusqlite::Result<Option<ConversationRow>> {
+    get_conversation_in_scope(
+        connection,
+        conversation_id,
+        None,
+        ConversationScope::Assistant,
+    )
+}
+
+pub fn list_case_work_conversations_for_project(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<ConversationRow>> {
+    let limit = i64::from(limit.clamp(1, 500));
+    let mut statement = connection.prepare(
+        "SELECT conversation_id, project_id, scope, title, status, created_at, updated_at
+         FROM conversations
+         WHERE project_id = ?1 AND scope = 'case_work'
+         ORDER BY updated_at DESC, conversation_id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![project_id, limit], conversation_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_case_work_conversation(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    project_id: &str,
+) -> rusqlite::Result<Option<ConversationRow>> {
+    get_conversation_in_scope(
+        connection,
+        conversation_id,
+        Some(project_id),
+        ConversationScope::CaseWork,
+    )
+}
+
+fn get_conversation_in_scope(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    project_id: Option<&str>,
+    scope: ConversationScope,
+) -> rusqlite::Result<Option<ConversationRow>> {
     connection
         .query_row(
-            "SELECT conversation_id, project_id, title, status, created_at, updated_at
-             FROM conversations WHERE conversation_id = ?1",
-            [conversation_id],
+            "SELECT conversation_id, project_id, scope, title, status, created_at, updated_at
+             FROM conversations
+             WHERE conversation_id = ?1
+               AND scope = ?2
+               AND (?3 IS NULL OR project_id = ?3)",
+            params![conversation_id, scope.as_str(), project_id],
             conversation_from_row,
         )
         .optional()
@@ -1160,6 +2079,7 @@ pub fn bind_conversation_to_case(
         "UPDATE conversations
          SET project_id = ?2, updated_at = CURRENT_TIMESTAMP
          WHERE conversation_id = ?1
+           AND scope = 'assistant'
            AND status = 'open'
            AND (project_id IS NULL OR project_id = ?2)
            AND NOT EXISTS (
@@ -1213,8 +2133,25 @@ pub fn archive_conversation(
     let changed = connection.execute(
         "UPDATE conversations
          SET status = 'archived', updated_at = CURRENT_TIMESTAMP
-         WHERE conversation_id = ?1 AND status = 'open'",
+         WHERE conversation_id = ?1 AND scope = 'assistant' AND status = 'open'",
         [conversation_id],
+    )?;
+    Ok(changed == 1)
+}
+
+pub fn archive_case_work_conversation(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE conversations
+         SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+         WHERE conversation_id = ?1
+           AND project_id = ?2
+           AND scope = 'case_work'
+           AND status = 'open'",
+        params![conversation_id, project_id],
     )?;
     Ok(changed == 1)
 }
@@ -2011,6 +2948,22 @@ pub fn create_tool_call(
     connection: &rusqlite::Connection,
     tool_call: &NewToolCallRow,
 ) -> rusqlite::Result<ToolCallRow> {
+    if tool_call.capability_name == "assistant.case_work" {
+        let run = get_agent_run(connection, &tool_call.run_id)?.ok_or_else(|| {
+            user_schema_migration_error(
+                "case assistant tool audit requires an existing run".to_owned(),
+            )
+        })?;
+        validate_case_assistant_tool_audit_contract(
+            &tool_call.run_id,
+            &run.provider_snapshot_json,
+            &tool_call.status,
+            &tool_call.input_audit_json,
+            &tool_call.output_audit_json,
+            &tool_call.source_audit_json,
+            None,
+        )?;
+    }
     connection.execute(
         "INSERT INTO tool_calls (
              tool_call_id, run_id, ordinal, capability_name, status, access_mode,
@@ -2081,6 +3034,24 @@ pub fn compare_and_set_tool_call_status(
     source_audit_json: &str,
     error_type: Option<&str>,
 ) -> rusqlite::Result<ToolCallStatusUpdateResult> {
+    if let Some(current) = get_tool_call(connection, tool_call_id)? {
+        if current.status == expected_status && current.capability_name == "assistant.case_work" {
+            let run = get_agent_run(connection, &current.run_id)?.ok_or_else(|| {
+                user_schema_migration_error(
+                    "case assistant tool audit requires an existing run".to_owned(),
+                )
+            })?;
+            validate_case_assistant_tool_audit_contract(
+                &current.run_id,
+                &run.provider_snapshot_json,
+                new_status,
+                &current.input_audit_json,
+                output_audit_json,
+                source_audit_json,
+                error_type,
+            )?;
+        }
+    }
     let changed = connection.execute(
         "UPDATE tool_calls
          SET status = ?3,
@@ -2219,6 +3190,297 @@ pub fn compare_and_set_case_change_proposal_status(
         (1, Some(row)) => CaseChangeProposalStatusUpdateResult::Updated(row),
         (_, Some(row)) => CaseChangeProposalStatusUpdateResult::Conflict(row),
         (_, None) => CaseChangeProposalStatusUpdateResult::NotFound,
+    })
+}
+
+fn validate_case_assistant_pending_output_audit_contract(
+    connection: &rusqlite::Connection,
+    output: &NewCaseAssistantPendingOutputRow,
+) -> rusqlite::Result<()> {
+    let run = get_agent_run(connection, &output.run_id)?.ok_or_else(|| {
+        user_schema_migration_error(
+            "case assistant pending output requires its exact run audit".to_owned(),
+        )
+    })?;
+    let tool_calls = list_tool_calls(connection, &output.run_id)?;
+    let [tool_call] = tool_calls.as_slice() else {
+        return Err(user_schema_migration_error(
+            "case assistant pending output requires one exact tool audit".to_owned(),
+        ));
+    };
+    if tool_call.ordinal != 0
+        || tool_call.capability_name != "assistant.case_work"
+        || tool_call.status != "succeeded"
+        || tool_call.access_mode != "write"
+        || tool_call.requires_confirmation
+        || tool_call.error_type.is_some()
+        || tool_call.finished_at.is_none()
+    {
+        return Err(user_schema_migration_error(
+            "case assistant pending output tool lineage is invalid".to_owned(),
+        ));
+    }
+    let audit = validate_case_assistant_tool_audit_contract(
+        &output.run_id,
+        &run.provider_snapshot_json,
+        &tool_call.status,
+        &tool_call.input_audit_json,
+        &tool_call.output_audit_json,
+        &tool_call.source_audit_json,
+        tool_call.error_type.as_deref(),
+    )?;
+    let snapshots = serde_json::from_str::<Vec<serde_json::Value>>(&output.source_snapshots_json)
+        .map_err(|_| invalid_case_assistant_tool_audit())?;
+    let generation_ids = snapshots
+        .iter()
+        .map(|snapshot| {
+            snapshot
+                .get("generationId")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(invalid_case_assistant_tool_audit)
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if audit.project_id != output.project_id
+        || audit.conversation_id != output.conversation_id
+        || audit.generation_ids != generation_ids
+        || audit.source_generation_ids != generation_ids
+        || audit.workspace_digest != output.workspace_base_digest
+        || audit.output_kind.as_deref() != Some(output.output_kind.as_str())
+        || audit.typed_output_sha256.as_deref() != Some(output.output_sha256.as_str())
+        || audit.proposal_source_refs_sha256.as_deref()
+            != Some(output.expected_proposal_source_refs_sha256.as_str())
+        || audit.project_binding_sha256.as_deref() != Some(output.project_binding_sha256.as_str())
+        || audit.source_snapshots_sha256.as_deref() != Some(output.source_snapshots_sha256.as_str())
+    {
+        return Err(user_schema_migration_error(
+            "case assistant pending output does not match its closed tool audit".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn create_case_assistant_pending_output(
+    connection: &rusqlite::Connection,
+    output: &NewCaseAssistantPendingOutputRow,
+) -> rusqlite::Result<CaseAssistantPendingOutputRow> {
+    if !is_lower_hex_sha256(&output.project_binding_sha256)
+        || !is_lower_hex_sha256(&output.workspace_base_digest)
+        || output.output_version < 1
+        || output.output_preview.len() > MAX_CASE_ASSISTANT_OUTPUT_PREVIEW_BYTES
+        || output.output_preview.contains('\0')
+    {
+        return Err(user_schema_migration_error(
+            "case assistant pending output metadata is invalid".to_owned(),
+        ));
+    }
+    validate_case_assistant_source_snapshots_json(
+        &output.source_snapshots_json,
+        &output.source_snapshots_sha256,
+    )?;
+    validate_case_assistant_expected_proposal_source_refs(
+        &output.output_kind,
+        &output.expected_proposal_source_refs_json,
+        &output.expected_proposal_source_refs_sha256,
+    )?;
+    validate_case_assistant_output_payload_json(
+        &output.output_kind,
+        &output.output_payload_json,
+        &output.output_sha256,
+    )?;
+    validate_case_assistant_pending_output_audit_contract(connection, output)?;
+
+    connection
+        .execute(
+            "INSERT INTO case_assistant_pending_outputs (
+             pending_output_id, project_id, conversation_id, run_id,
+             assistant_message_id, project_binding_sha256,
+             source_snapshots_json, source_snapshots_sha256,
+             expected_proposal_source_refs_json,
+             expected_proposal_source_refs_sha256, output_kind,
+             output_payload_json, output_preview, output_sha256, output_version,
+             workspace_base_digest, status
+         )
+         SELECT
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+             ?15, ?16, 'pending'
+         FROM conversations AS conversation
+         JOIN projects AS project ON project.project_id = conversation.project_id
+         WHERE conversation.conversation_id = ?3
+           AND conversation.project_id = ?2
+           AND conversation.scope = 'case_work'
+           AND conversation.status = 'open'
+           AND project.status = 'active'",
+            params![
+                output.pending_output_id,
+                output.project_id,
+                output.conversation_id,
+                output.run_id,
+                output.assistant_message_id,
+                output.project_binding_sha256,
+                output.source_snapshots_json,
+                output.source_snapshots_sha256,
+                output.expected_proposal_source_refs_json,
+                output.expected_proposal_source_refs_sha256,
+                output.output_kind,
+                output.output_payload_json,
+                output.output_preview,
+                output.output_sha256,
+                output.output_version,
+                output.workspace_base_digest,
+            ],
+        )
+        .and_then(|changed| {
+            if changed == 1 {
+                Ok(changed)
+            } else {
+                Err(user_schema_migration_error(
+                    "case assistant pending output requires an active open case-work scope"
+                        .to_owned(),
+                ))
+            }
+        })?;
+    get_case_assistant_pending_output(connection, &output.pending_output_id, &output.project_id)?
+        .ok_or_else(|| {
+            user_schema_migration_error(
+                "created case assistant pending output could not be reloaded".to_owned(),
+            )
+        })
+}
+
+pub fn get_case_assistant_pending_output(
+    connection: &rusqlite::Connection,
+    pending_output_id: &str,
+    project_id: &str,
+) -> rusqlite::Result<Option<CaseAssistantPendingOutputRow>> {
+    connection
+        .query_row(
+            "SELECT
+                 output.pending_output_id, output.project_id, output.conversation_id,
+                 output.run_id, output.assistant_message_id,
+                 output.project_binding_sha256, output.source_snapshots_json,
+                 output.source_snapshots_sha256,
+                 output.expected_proposal_source_refs_json,
+                 output.expected_proposal_source_refs_sha256, output.output_kind,
+                 output.output_payload_json, output.output_preview, output.output_sha256,
+                 output.output_version, output.workspace_base_digest, output.status,
+                 output.confirmed_artifact_id, output.confirmed_proposal_id,
+                 output.confirmation_request_sha256, output.row_version,
+                 output.created_at, output.confirmed_at
+             FROM case_assistant_pending_outputs AS output
+             WHERE output.pending_output_id = ?1 AND output.project_id = ?2",
+            params![pending_output_id, project_id],
+            case_assistant_pending_output_from_row,
+        )
+        .optional()
+}
+
+pub fn list_case_assistant_pending_outputs(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    conversation_id: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<CaseAssistantPendingOutputRow>> {
+    let limit = i64::from(limit.clamp(1, 500));
+    let mut statement = connection.prepare(
+        "SELECT
+             output.pending_output_id, output.project_id, output.conversation_id,
+             output.run_id, output.assistant_message_id,
+             output.project_binding_sha256, output.source_snapshots_json,
+             output.source_snapshots_sha256,
+             output.expected_proposal_source_refs_json,
+             output.expected_proposal_source_refs_sha256, output.output_kind,
+             output.output_payload_json, output.output_preview, output.output_sha256,
+             output.output_version, output.workspace_base_digest, output.status,
+             output.confirmed_artifact_id, output.confirmed_proposal_id,
+             output.confirmation_request_sha256, output.row_version,
+             output.created_at, output.confirmed_at
+         FROM case_assistant_pending_outputs AS output
+         WHERE output.project_id = ?1 AND output.conversation_id = ?2
+         ORDER BY output.created_at DESC, output.pending_output_id DESC
+         LIMIT ?3",
+    )?;
+    let rows = statement
+        .query_map(
+            params![project_id, conversation_id, limit],
+            case_assistant_pending_output_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Performs the one-way pending-to-confirmed CAS after the caller has applied
+/// the proposal or bound the artifact in the same SQLite transaction. This
+/// function intentionally neither opens nor commits a transaction.
+pub fn compare_and_set_case_assistant_pending_output_confirmed(
+    connection: &rusqlite::Connection,
+    confirmation: &ConfirmCaseAssistantPendingOutput<'_>,
+) -> rusqlite::Result<CaseAssistantPendingOutputConfirmResult> {
+    if confirmation.expected_output_version < 1
+        || !is_lower_hex_sha256(confirmation.expected_output_sha256)
+        || !is_lower_hex_sha256(confirmation.expected_workspace_base_digest)
+        || !is_lower_hex_sha256(confirmation.confirmation_request_sha256)
+    {
+        return Err(user_schema_migration_error(
+            "case assistant confirmation CAS metadata is invalid".to_owned(),
+        ));
+    }
+    validate_case_assistant_expected_proposal_source_refs(
+        "case_analysis",
+        confirmation.expected_proposal_source_refs_json,
+        confirmation.expected_proposal_source_refs_sha256,
+    )?;
+    let (confirmed_artifact_id, confirmed_proposal_id) = match confirmation.target {
+        CaseAssistantConfirmationTarget::Artifact(artifact_id) if !artifact_id.is_empty() => {
+            (Some(artifact_id.as_str()), None)
+        }
+        CaseAssistantConfirmationTarget::Proposal(proposal_id) if !proposal_id.is_empty() => {
+            (None, Some(proposal_id.as_str()))
+        }
+        _ => {
+            return Err(user_schema_migration_error(
+                "case assistant confirmation target is invalid".to_owned(),
+            ));
+        }
+    };
+    let changed = connection.execute(
+        "UPDATE case_assistant_pending_outputs
+         SET status = 'confirmed',
+             confirmed_artifact_id = ?7,
+             confirmed_proposal_id = ?8,
+             confirmation_request_sha256 = ?6,
+             row_version = row_version + 1,
+             confirmed_at = CURRENT_TIMESTAMP
+         WHERE pending_output_id = ?1
+           AND project_id = ?2
+           AND output_version = ?3
+           AND output_sha256 = ?4
+           AND workspace_base_digest = ?5
+           AND expected_proposal_source_refs_json = ?9
+           AND expected_proposal_source_refs_sha256 = ?10
+           AND status = 'pending'",
+        params![
+            confirmation.pending_output_id,
+            confirmation.project_id,
+            confirmation.expected_output_version,
+            confirmation.expected_output_sha256,
+            confirmation.expected_workspace_base_digest,
+            confirmation.confirmation_request_sha256,
+            confirmed_artifact_id,
+            confirmed_proposal_id,
+            confirmation.expected_proposal_source_refs_json,
+            confirmation.expected_proposal_source_refs_sha256,
+        ],
+    )?;
+    let persisted = get_case_assistant_pending_output(
+        connection,
+        confirmation.pending_output_id,
+        confirmation.project_id,
+    )?;
+    Ok(match (changed, persisted) {
+        (1, Some(row)) => CaseAssistantPendingOutputConfirmResult::Confirmed(row),
+        (_, Some(row)) => CaseAssistantPendingOutputConfirmResult::Conflict(row),
+        (_, None) => CaseAssistantPendingOutputConfirmResult::NotFound,
     })
 }
 
@@ -2757,11 +4019,177 @@ pub fn insert_case_project_if_absent(
 pub fn delete_case_project(
     connection: &rusqlite::Connection,
     project_id: &str,
+    privacy_deletion_id: &str,
 ) -> rusqlite::Result<bool> {
-    let affected_rows =
-        connection.execute("DELETE FROM projects WHERE project_id = ?1", [project_id])?;
+    if !is_project_deletion_journal_id(privacy_deletion_id) {
+        return Err(user_schema_migration_error(
+            "case project retirement requires a valid Privacy deletion journal id".to_owned(),
+        ));
+    }
+    with_case_retirement_authority(
+        connection,
+        project_id,
+        CASE_PROJECT_DELETED_RETIREMENT_REASON,
+        Some(privacy_deletion_id),
+        || {
+            const SAVEPOINT: &str = "delete_case_project_atomic";
+            connection.execute_batch(&format!("SAVEPOINT {SAVEPOINT}"))?;
+            let deletion = (|| {
+                let retired = connection.execute(
+                    "INSERT INTO retired_case_project_ids(
+                         project_id,retirement_reason,privacy_deletion_id
+                     )
+                     SELECT project_id,'case_project_deleted',?2
+                     FROM projects
+                     WHERE project_id=?1",
+                    params![project_id, privacy_deletion_id],
+                )?;
+                let deleted =
+                    connection.execute("DELETE FROM projects WHERE project_id=?1", [project_id])?;
+                let retirement_matches = case_project_retirement_matches_privacy_deletion(
+                    connection,
+                    project_id,
+                    privacy_deletion_id,
+                )?;
+                if retired != deleted || deleted > 1 || (deleted == 1 && !retirement_matches) {
+                    return Err(user_schema_migration_error(
+                        "case project retirement and physical deletion must be atomic".to_owned(),
+                    ));
+                }
+                Ok(deleted == 1)
+            })();
+            match deletion {
+                Ok(deleted) => match connection.execute_batch(&format!("RELEASE {SAVEPOINT}")) {
+                    Ok(()) => Ok(deleted),
+                    Err(error) => {
+                        let _ = connection.execute_batch(&format!(
+                            "ROLLBACK TO {SAVEPOINT}; RELEASE {SAVEPOINT}"
+                        ));
+                        Err(error)
+                    }
+                },
+                Err(error) => {
+                    connection
+                        .execute_batch(&format!("ROLLBACK TO {SAVEPOINT}; RELEASE {SAVEPOINT}"))?;
+                    Err(error)
+                }
+            }
+        },
+    )
+}
 
-    Ok(affected_rows > 0)
+/// Proves that the exact canonical project delete, including all cascades,
+/// can commit while leaving the caller's transaction byte-for-byte unchanged.
+///
+/// Cross-database lifecycle coordination calls this while holding an IMMEDIATE
+/// user-database transaction and before committing any Privacy revocation.
+pub fn preflight_delete_case_project(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    privacy_deletion_id: &str,
+) -> rusqlite::Result<bool> {
+    const SAVEPOINT: &str = "preflight_delete_case_project";
+    connection.execute_batch(&format!("SAVEPOINT {SAVEPOINT}"))?;
+    let deletion = delete_case_project(connection, project_id, privacy_deletion_id);
+    let rollback =
+        connection.execute_batch(&format!("ROLLBACK TO {SAVEPOINT}; RELEASE {SAVEPOINT}"));
+    match (deletion, rollback) {
+        (Ok(deleted), Ok(())) => Ok(deleted),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
+}
+
+/// Records retirement after recovering a journal state in which Privacy was
+/// durably revoked but an older process had already removed the user project.
+/// A live project is never retired through this recovery-only entry point.
+pub fn retire_absent_case_project_id_after_privacy_revocation(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    privacy_deletion_id: &str,
+) -> rusqlite::Result<bool> {
+    if !is_project_deletion_journal_id(privacy_deletion_id) {
+        return Err(user_schema_migration_error(
+            "case project recovery requires a valid Privacy deletion journal id".to_owned(),
+        ));
+    }
+    if case_project_id_is_retired(connection, project_id)? {
+        return case_project_retirement_matches_privacy_deletion(
+            connection,
+            project_id,
+            privacy_deletion_id,
+        );
+    }
+    with_case_retirement_authority(
+        connection,
+        project_id,
+        PRIVACY_JOURNAL_RECOVERY_RETIREMENT_REASON,
+        Some(privacy_deletion_id),
+        || {
+            connection.execute(
+                "INSERT INTO retired_case_project_ids(
+                     project_id,retirement_reason,privacy_deletion_id
+                 )
+                 SELECT ?1,'privacy_journal_recovery',?2
+                 WHERE NOT EXISTS(
+                     SELECT 1 FROM projects WHERE project_id=?1
+                 )
+                 ON CONFLICT(project_id) DO NOTHING",
+                params![project_id, privacy_deletion_id],
+            )?;
+            case_project_retirement_matches_privacy_deletion(
+                connection,
+                project_id,
+                privacy_deletion_id,
+            )
+        },
+    )
+}
+
+pub fn case_project_id_is_retired(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM retired_case_project_ids WHERE project_id=?1
+         )",
+        [project_id],
+        |row| row.get(0),
+    )
+}
+
+pub fn case_project_retirement_matches_privacy_deletion(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    privacy_deletion_id: &str,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM retired_case_project_ids AS retired
+             WHERE retired.project_id=?1
+               AND retired.privacy_deletion_id=?2
+               AND retired.retirement_reason IN (
+                   'case_project_deleted',
+                   'privacy_journal_recovery'
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM projects WHERE project_id=retired.project_id
+               )
+         )",
+        params![project_id, privacy_deletion_id],
+        |row| row.get(0),
+    )
+}
+
+fn is_project_deletion_journal_id(value: &str) -> bool {
+    value.len() == 37
+        && value.starts_with("pdel_")
+        && value[5..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value[5..]
+            .bytes()
+            .all(|byte| !byte.is_ascii_alphabetic() || byte.is_ascii_lowercase())
 }
 
 pub fn upsert_case_file(
@@ -4309,13 +5737,53 @@ fn legal_answer_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Leg
 }
 
 fn conversation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRow> {
+    let scope = match row.get::<_, String>(2)?.as_str() {
+        "assistant" => ConversationScope::Assistant,
+        "case_work" => ConversationScope::CaseWork,
+        _ => {
+            return Err(user_schema_migration_error(
+                "conversation has an invalid authoritative scope".to_owned(),
+            ));
+        }
+    };
     Ok(ConversationRow {
         conversation_id: row.get(0)?,
         project_id: row.get(1)?,
-        title: row.get(2)?,
-        status: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
+        scope,
+        title: row.get(3)?,
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn case_assistant_pending_output_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CaseAssistantPendingOutputRow> {
+    Ok(CaseAssistantPendingOutputRow {
+        pending_output_id: row.get(0)?,
+        project_id: row.get(1)?,
+        conversation_id: row.get(2)?,
+        run_id: row.get(3)?,
+        assistant_message_id: row.get(4)?,
+        project_binding_sha256: row.get(5)?,
+        source_snapshots_json: row.get(6)?,
+        source_snapshots_sha256: row.get(7)?,
+        expected_proposal_source_refs_json: row.get(8)?,
+        expected_proposal_source_refs_sha256: row.get(9)?,
+        output_kind: row.get(10)?,
+        output_payload_json: row.get(11)?,
+        output_preview: row.get(12)?,
+        output_sha256: row.get(13)?,
+        output_version: row.get(14)?,
+        workspace_base_digest: row.get(15)?,
+        status: row.get(16)?,
+        confirmed_artifact_id: row.get(17)?,
+        confirmed_proposal_id: row.get(18)?,
+        confirmation_request_sha256: row.get(19)?,
+        row_version: row.get(20)?,
+        created_at: row.get(21)?,
+        confirmed_at: row.get(22)?,
     })
 }
 
@@ -4515,6 +5983,21 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
         required_legacy_columns: &["project_id", "title", "status"],
     },
     UserTableMigrationSpec {
+        name: "retired_case_project_ids",
+        canonical_columns: &[
+            "project_id",
+            "retired_at",
+            "retirement_reason",
+            "privacy_deletion_id",
+        ],
+        required_legacy_columns: &[
+            "project_id",
+            "retired_at",
+            "retirement_reason",
+            "privacy_deletion_id",
+        ],
+    },
+    UserTableMigrationSpec {
         name: "case_files",
         canonical_columns: &[
             "file_id",
@@ -4697,6 +6180,7 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
         canonical_columns: &[
             "conversation_id",
             "project_id",
+            "scope",
             "title",
             "status",
             "created_at",
@@ -4921,6 +6405,57 @@ const USER_TABLE_MIGRATION_SPECS: &[UserTableMigrationSpec] = &[
         ],
     },
     UserTableMigrationSpec {
+        name: "case_assistant_pending_outputs",
+        canonical_columns: &[
+            "pending_output_id",
+            "project_id",
+            "conversation_id",
+            "run_id",
+            "assistant_message_id",
+            "project_binding_sha256",
+            "source_snapshots_json",
+            "source_snapshots_sha256",
+            "expected_proposal_source_refs_json",
+            "expected_proposal_source_refs_sha256",
+            "output_kind",
+            "output_payload_json",
+            "output_preview",
+            "output_sha256",
+            "output_version",
+            "workspace_base_digest",
+            "status",
+            "confirmed_artifact_id",
+            "confirmed_proposal_id",
+            "confirmation_request_sha256",
+            "row_version",
+            "created_at",
+            "confirmed_at",
+        ],
+        required_legacy_columns: &[
+            "pending_output_id",
+            "project_id",
+            "conversation_id",
+            "run_id",
+            "assistant_message_id",
+            "project_binding_sha256",
+            "source_snapshots_json",
+            "source_snapshots_sha256",
+            "output_kind",
+            "output_payload_json",
+            "output_preview",
+            "output_sha256",
+            "output_version",
+            "workspace_base_digest",
+            "status",
+            "confirmed_artifact_id",
+            "confirmed_proposal_id",
+            "confirmation_request_sha256",
+            "row_version",
+            "created_at",
+            "confirmed_at",
+        ],
+    },
+    UserTableMigrationSpec {
         name: "operation_audit",
         canonical_columns: &[
             "audit_id",
@@ -5030,6 +6565,8 @@ const USER_SCHEMA_INDEX_NAMES: &[&str] = &[
     "idx_tool_calls_status",
     "idx_case_change_proposals_conversation_created",
     "idx_case_change_proposals_project_status",
+    "idx_case_assistant_pending_outputs_conversation_created",
+    "idx_case_assistant_pending_outputs_project_status",
     "idx_operation_audit_idempotency",
     "idx_operation_audit_project_created",
     "idx_legal_answer_records_created",
@@ -5039,6 +6576,11 @@ const USER_SCHEMA_INDEX_NAMES: &[&str] = &[
 ];
 
 const USER_SCHEMA_TRIGGER_NAMES: &[&str] = &[
+    "trg_retired_case_project_ids_authorized_insert",
+    "trg_retired_case_project_ids_no_update",
+    "trg_retired_case_project_ids_no_delete",
+    "trg_projects_reject_retired_id",
+    "trg_projects_require_retirement_before_delete",
     "trg_legal_basis_issue_project_insert",
     "trg_legal_basis_issue_project_update",
     "trg_projects_detach_assistant_data_before_delete",
@@ -5050,11 +6592,38 @@ const USER_SCHEMA_TRIGGER_NAMES: &[&str] = &[
     "trg_agent_runs_message_scope_update",
     "trg_case_change_proposals_scope_insert",
     "trg_case_change_proposals_scope_update",
+    "trg_conversations_scope_immutable",
+    "trg_case_assistant_pending_outputs_closed_contract_insert",
+    "trg_case_assistant_pending_outputs_scope_insert",
+    "trg_case_assistant_pending_outputs_append_preserving",
+    "trg_case_assistant_pending_outputs_confirmation_target",
+    "trg_case_assistant_pending_outputs_no_delete",
+    "trg_case_assistant_run_provider_audit_insert",
+    "trg_case_assistant_run_provider_audit_update",
+    "trg_case_assistant_tool_audit_insert",
+    "trg_case_assistant_tool_audit_update",
+    "trg_case_assistant_live_conversation_no_delete",
+    "trg_case_assistant_live_run_no_delete",
+    "trg_case_assistant_live_run_lineage_immutable",
+    "trg_case_assistant_live_message_no_delete",
+    "trg_case_assistant_live_message_lineage_immutable",
+    "trg_case_assistant_live_message_attachment_no_insert",
+    "trg_case_assistant_live_message_attachment_no_update",
+    "trg_case_assistant_live_tool_call_no_insert",
+    "trg_case_assistant_live_tool_call_no_delete",
+    "trg_case_assistant_live_tool_call_immutable",
+    "trg_case_assistant_confirmed_artifact_scope_immutable",
+    "trg_case_assistant_confirmed_artifact_no_delete",
+    "trg_case_assistant_confirmed_artifact_v1_immutable",
+    "trg_case_assistant_confirmed_artifact_v1_no_delete",
+    "trg_case_assistant_confirmed_proposal_scope_immutable",
+    "trg_case_assistant_confirmed_proposal_no_delete",
     "trg_legal_answer_records_scope_insert",
     "trg_legal_answer_records_scope_update",
 ];
 
 const LEGACY_USER_TABLE_DROP_ORDER: &[&str] = &[
+    "case_assistant_pending_outputs",
     "tool_calls",
     "case_change_proposals",
     "operation_audit",
@@ -5080,6 +6649,7 @@ const LEGACY_USER_TABLE_DROP_ORDER: &[&str] = &[
     "legal_issues",
     "conversations",
     "projects",
+    "retired_case_project_ids",
     "provider_profiles",
 ];
 
@@ -5336,6 +6906,87 @@ fn copy_legacy_user_table(
     Ok(())
 }
 
+fn copy_legacy_retired_case_project_ids(
+    transaction: &rusqlite::Transaction<'_>,
+    spec: &UserTableMigrationSpec,
+) -> rusqlite::Result<()> {
+    debug_assert_eq!(spec.name, "retired_case_project_ids");
+    let legacy_name = legacy_user_table_name(spec.name);
+    let source_columns = table_columns(transaction, &legacy_name)?;
+    let canonical_columns = spec
+        .canonical_columns
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = source_columns
+        .iter()
+        .find(|column| !canonical_columns.contains(column.as_str()))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} contains unsupported column {unknown}; refusing to drop user data",
+            spec.name
+        )));
+    }
+    if let Some(missing) = spec
+        .required_legacy_columns
+        .iter()
+        .find(|column| !source_columns.contains(**column))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} is missing required column {missing}",
+            spec.name
+        )));
+    }
+
+    let retired_rows = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT project_id,retired_at,retirement_reason,privacy_deletion_id
+             FROM \"{legacy_name}\"
+             ORDER BY project_id"
+        ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (project_id, retired_at, retirement_reason, privacy_deletion_id) in &retired_rows {
+        let copied = with_case_retirement_authority(
+            transaction,
+            project_id,
+            retirement_reason,
+            privacy_deletion_id.as_deref(),
+            || {
+                transaction.execute(
+                    "INSERT INTO retired_case_project_ids(
+                         project_id,retired_at,retirement_reason,privacy_deletion_id
+                     )
+                     VALUES (?1,?2,?3,?4)",
+                    params![
+                        project_id,
+                        retired_at,
+                        retirement_reason,
+                        privacy_deletion_id
+                    ],
+                )
+            },
+        )?;
+        if copied != 1 {
+            return Err(user_schema_migration_error(format!(
+                "legacy retirement tombstone {project_id} was not copied exactly once"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn copy_legacy_messages_without_runs(
     transaction: &rusqlite::Transaction<'_>,
     spec: &UserTableMigrationSpec,
@@ -5390,6 +7041,501 @@ fn copy_legacy_messages_without_runs(
         return Err(user_schema_migration_error(
             "legacy messages row count changed during migration".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn legacy_case_assistant_expected_proposal_source_refs(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    output_kind: &str,
+) -> rusqlite::Result<String> {
+    let pending_table = legacy_user_table_name("case_assistant_pending_outputs");
+    if !sqlite_table_exists(transaction, &pending_table)? {
+        return Ok("[]".to_owned());
+    }
+    let pending_columns = table_columns(transaction, &pending_table)?;
+    let has_expected_refs = pending_columns.contains("expected_proposal_source_refs_json");
+    let has_expected_refs_sha = pending_columns.contains("expected_proposal_source_refs_sha256");
+    if has_expected_refs != has_expected_refs_sha {
+        return Err(user_schema_migration_error(
+            "legacy case assistant pending output has a partial proposal provenance binding"
+                .to_owned(),
+        ));
+    }
+
+    if has_expected_refs {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT
+                 expected_proposal_source_refs_json,
+                 expected_proposal_source_refs_sha256
+             FROM \"{pending_table}\"
+             WHERE run_id = ?1 AND output_kind = ?2
+             ORDER BY pending_output_id"
+        ))?;
+        let bindings = statement
+            .query_map(params![run_id, output_kind], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut expected: Option<String> = None;
+        for (source_refs_json, source_refs_sha256) in bindings {
+            validate_case_assistant_expected_proposal_source_refs(
+                output_kind,
+                &source_refs_json,
+                &source_refs_sha256,
+            )?;
+            if expected
+                .as_deref()
+                .is_some_and(|expected| expected != source_refs_json)
+            {
+                return Err(user_schema_migration_error(
+                    "legacy case assistant run has ambiguous proposal provenance bindings"
+                        .to_owned(),
+                ));
+            }
+            expected = Some(source_refs_json);
+        }
+        return Ok(expected.unwrap_or_else(|| "[]".to_owned()));
+    }
+
+    if output_kind != "case_analysis" {
+        return Ok("[]".to_owned());
+    }
+
+    let proposal_table = legacy_user_table_name("case_change_proposals");
+    let confirmed_outputs = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT
+                 pending_output_id, confirmed_proposal_id, project_id,
+                 conversation_id, workspace_base_digest, output_payload_json
+             FROM \"{pending_table}\"
+             WHERE run_id = ?1
+               AND output_kind = 'case_analysis'
+               AND status = 'confirmed'
+             ORDER BY pending_output_id"
+        ))?;
+        let rows = statement
+            .query_map([run_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    if confirmed_outputs.is_empty() {
+        return Ok("[]".to_owned());
+    }
+    if !sqlite_table_exists(transaction, &proposal_table)? {
+        return Err(user_schema_migration_error(
+            "confirmed legacy case assistant analysis is missing its proposal table".to_owned(),
+        ));
+    }
+
+    let mut expected: Option<String> = None;
+    for (
+        pending_output_id,
+        proposal_id,
+        project_id,
+        conversation_id,
+        workspace_base_digest,
+        output_payload_json,
+    ) in confirmed_outputs
+    {
+        let proposal_id = proposal_id.ok_or_else(|| {
+            user_schema_migration_error(format!(
+                "confirmed legacy case assistant analysis {pending_output_id} is missing its proposal"
+            ))
+        })?;
+        let matches = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT source_refs_json
+                 FROM \"{proposal_table}\"
+                 WHERE proposal_id = ?1
+                   AND project_id = ?2
+                   AND conversation_id = ?3
+                   AND run_id = ?4
+                   AND status = 'applied'
+                   AND base_case_digest = ?5
+                   AND json(changes_json) =
+                       json(json_extract(?6, '$.content'))"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        proposal_id,
+                        project_id,
+                        conversation_id,
+                        run_id,
+                        workspace_base_digest,
+                        output_payload_json,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let [source_refs_json] = matches.as_slice() else {
+            return Err(user_schema_migration_error(format!(
+                "confirmed legacy case assistant analysis {pending_output_id} has a missing or ambiguous applied proposal"
+            )));
+        };
+        validate_case_assistant_expected_proposal_source_refs(
+            "case_analysis",
+            source_refs_json,
+            &sha256_hex(source_refs_json.as_bytes()),
+        )?;
+        if expected
+            .as_deref()
+            .is_some_and(|expected| expected != source_refs_json)
+        {
+            return Err(user_schema_migration_error(
+                "legacy case assistant run has ambiguous applied proposal provenance".to_owned(),
+            ));
+        }
+        expected = Some(source_refs_json.clone());
+    }
+    Ok(expected.unwrap_or_else(|| "[]".to_owned()))
+}
+
+fn migrate_legacy_case_assistant_tool_output_audit(
+    transaction: &rusqlite::Transaction<'_>,
+    tool_call: &ToolCallRow,
+) -> rusqlite::Result<String> {
+    if tool_call.capability_name != "assistant.case_work" || tool_call.status != "succeeded" {
+        return Ok(tool_call.output_audit_json.clone());
+    }
+    let mut output = canonical_json_value(
+        &tool_call.output_audit_json,
+        MAX_CASE_ASSISTANT_TOOL_AUDIT_BYTES,
+    )?;
+    let output_object = output
+        .as_object_mut()
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    let output_kind = output_object
+        .get("outputIds")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|output_ids| output_ids.get("pendingOutputKind"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid_case_assistant_tool_audit)?
+        .to_owned();
+    let output_hashes = output_object
+        .get_mut("outputHashes")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(invalid_case_assistant_tool_audit)?;
+    if output_hashes.contains_key("proposalSourceRefsSha256") {
+        return Ok(tool_call.output_audit_json.clone());
+    }
+    let expected_refs = legacy_case_assistant_expected_proposal_source_refs(
+        transaction,
+        &tool_call.run_id,
+        &output_kind,
+    )?;
+    output_hashes.insert(
+        "proposalSourceRefsSha256".to_owned(),
+        serde_json::Value::String(sha256_hex(expected_refs.as_bytes())),
+    );
+    serde_json::to_string(&output).map_err(|_| {
+        user_schema_migration_error(
+            "legacy case assistant tool audit could not be canonically encoded".to_owned(),
+        )
+    })
+}
+
+fn copy_legacy_tool_calls(
+    transaction: &rusqlite::Transaction<'_>,
+    spec: &UserTableMigrationSpec,
+) -> rusqlite::Result<()> {
+    debug_assert_eq!(spec.name, "tool_calls");
+    let legacy_name = legacy_user_table_name(spec.name);
+    let source_columns = table_columns(transaction, &legacy_name)?;
+    let canonical_columns = spec
+        .canonical_columns
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = source_columns
+        .iter()
+        .find(|column| !canonical_columns.contains(column.as_str()))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} contains unsupported column {unknown}; refusing to drop user data",
+            spec.name
+        )));
+    }
+    if let Some(missing) = spec
+        .required_legacy_columns
+        .iter()
+        .find(|column| !source_columns.contains(**column))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} is missing required column {missing}",
+            spec.name
+        )));
+    }
+
+    let tool_calls = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT
+                 tool_call_id, run_id, ordinal, capability_name, status,
+                 access_mode, requires_confirmation, input_audit_json,
+                 output_audit_json, source_audit_json, error_type,
+                 started_at, finished_at
+             FROM \"{legacy_name}\"
+             ORDER BY tool_call_id"
+        ))?;
+        let rows = statement
+            .query_map([], tool_call_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for tool_call in tool_calls {
+        let migrated_output_audit =
+            migrate_legacy_case_assistant_tool_output_audit(transaction, &tool_call)?;
+        let copied = transaction.execute(
+            "INSERT INTO tool_calls (
+                 tool_call_id, run_id, ordinal, capability_name, status,
+                 access_mode, requires_confirmation, input_audit_json,
+                 output_audit_json, source_audit_json, error_type,
+                 started_at, finished_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                tool_call.tool_call_id,
+                tool_call.run_id,
+                tool_call.ordinal,
+                tool_call.capability_name,
+                tool_call.status,
+                tool_call.access_mode,
+                tool_call.requires_confirmation,
+                tool_call.input_audit_json,
+                migrated_output_audit,
+                tool_call.source_audit_json,
+                tool_call.error_type,
+                tool_call.started_at,
+                tool_call.finished_at,
+            ],
+        )?;
+        if copied != 1 {
+            return Err(user_schema_migration_error(format!(
+                "legacy tool call {} was not copied exactly once",
+                tool_call.tool_call_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn copy_legacy_case_assistant_pending_outputs(
+    transaction: &rusqlite::Transaction<'_>,
+    spec: &UserTableMigrationSpec,
+) -> rusqlite::Result<()> {
+    let legacy_name = legacy_user_table_name(spec.name);
+    let source_columns = table_columns(transaction, &legacy_name)?;
+    let canonical_columns = spec
+        .canonical_columns
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = source_columns
+        .iter()
+        .find(|column| !canonical_columns.contains(column.as_str()))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} contains unsupported column {unknown}; refusing to drop user data",
+            spec.name
+        )));
+    }
+    if let Some(missing) = spec
+        .required_legacy_columns
+        .iter()
+        .find(|column| !source_columns.contains(**column))
+    {
+        return Err(user_schema_migration_error(format!(
+            "legacy table {} is missing required column {missing}",
+            spec.name
+        )));
+    }
+    let has_expected_refs = source_columns.contains("expected_proposal_source_refs_json");
+    let has_expected_refs_sha = source_columns.contains("expected_proposal_source_refs_sha256");
+    if has_expected_refs != has_expected_refs_sha {
+        return Err(user_schema_migration_error(
+            "legacy case assistant pending output has a partial proposal provenance binding"
+                .to_owned(),
+        ));
+    }
+    let migrated_expected_refs = if has_expected_refs {
+        "source.expected_proposal_source_refs_json".to_owned()
+    } else {
+        "CASE
+             WHEN source.output_kind = 'case_analysis'
+              AND source.status = 'confirmed'
+             THEN (
+                 SELECT proposal.source_refs_json
+                 FROM case_change_proposals AS proposal
+                 WHERE proposal.proposal_id = source.confirmed_proposal_id
+                   AND proposal.project_id = source.project_id
+                    AND proposal.conversation_id = source.conversation_id
+                    AND proposal.run_id = source.run_id
+                    AND proposal.status = 'applied'
+                    AND proposal.base_case_digest =
+                        source.workspace_base_digest
+                    AND json(proposal.changes_json) =
+                        json(json_extract(
+                            source.output_payload_json,
+                            '$.content'
+                        ))
+              )
+             ELSE '[]'
+         END"
+        .to_owned()
+    };
+    let migrated_expected_refs_sha = if has_expected_refs_sha {
+        "source.expected_proposal_source_refs_sha256".to_owned()
+    } else {
+        format!("case_assistant_sha256({migrated_expected_refs})")
+    };
+
+    let source_count: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM \"{legacy_name}\""),
+        [],
+        |row| row.get(0),
+    )?;
+    let inserted = transaction.execute(
+        &format!(
+            "INSERT INTO case_assistant_pending_outputs (
+                 pending_output_id, project_id, conversation_id, run_id,
+                 assistant_message_id, project_binding_sha256,
+                 source_snapshots_json, source_snapshots_sha256,
+                 expected_proposal_source_refs_json,
+                 expected_proposal_source_refs_sha256, output_kind,
+                 output_payload_json, output_preview, output_sha256, output_version,
+                 workspace_base_digest, status, row_version, created_at
+             )
+             SELECT
+                 pending_output_id, project_id, conversation_id, run_id,
+                 assistant_message_id, project_binding_sha256,
+                 source_snapshots_json, source_snapshots_sha256,
+                 {migrated_expected_refs},
+                 {migrated_expected_refs_sha}, output_kind,
+                 output_payload_json, output_preview, output_sha256, output_version,
+                 workspace_base_digest, 'pending', 1, created_at
+             FROM \"{legacy_name}\" AS source"
+        ),
+        [],
+    )?;
+    if i64::try_from(inserted).ok() != Some(source_count) {
+        return Err(user_schema_migration_error(
+            "legacy case assistant pending output count changed during migration".to_owned(),
+        ));
+    }
+
+    transaction.execute(
+        &format!(
+            "UPDATE case_assistant_pending_outputs AS destination
+             SET status = 'confirmed',
+                 confirmed_artifact_id = (
+                     SELECT source.confirmed_artifact_id
+                     FROM \"{legacy_name}\" AS source
+                     WHERE source.pending_output_id = destination.pending_output_id
+                 ),
+                 confirmed_proposal_id = (
+                     SELECT source.confirmed_proposal_id
+                     FROM \"{legacy_name}\" AS source
+                     WHERE source.pending_output_id = destination.pending_output_id
+                 ),
+                 confirmation_request_sha256 = (
+                     SELECT source.confirmation_request_sha256
+                     FROM \"{legacy_name}\" AS source
+                     WHERE source.pending_output_id = destination.pending_output_id
+                 ),
+                 row_version = row_version + 1,
+                 confirmed_at = (
+                     SELECT source.confirmed_at
+                     FROM \"{legacy_name}\" AS source
+                     WHERE source.pending_output_id = destination.pending_output_id
+                 )
+             WHERE pending_output_id IN (
+                 SELECT pending_output_id
+                 FROM \"{legacy_name}\"
+                 WHERE status = 'confirmed'
+             )"
+        ),
+        [],
+    )?;
+
+    let differences = spec
+        .canonical_columns
+        .iter()
+        .map(|column| match *column {
+            "expected_proposal_source_refs_json" if !has_expected_refs => format!(
+                "destination.expected_proposal_source_refs_json IS NOT ({migrated_expected_refs})"
+            ),
+            "expected_proposal_source_refs_sha256" if !has_expected_refs_sha => format!(
+                "destination.expected_proposal_source_refs_sha256 IS NOT \
+                 ({migrated_expected_refs_sha})"
+            ),
+            _ => format!("destination.\"{column}\" IS NOT source.\"{column}\""),
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let changed: bool = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM \"{legacy_name}\" AS source
+                 LEFT JOIN case_assistant_pending_outputs AS destination
+                   ON destination.pending_output_id = source.pending_output_id
+                 WHERE destination.pending_output_id IS NULL OR {differences}
+             )"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if changed {
+        return Err(user_schema_migration_error(
+            "legacy case assistant pending output lineage changed during migration".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+const CASE_ASSISTANT_PENDING_OUTPUT_MIGRATION_TRIGGER_NAMES: [&str; 4] = [
+    "trg_case_assistant_pending_outputs_closed_contract_insert",
+    "trg_case_assistant_pending_outputs_scope_insert",
+    "trg_case_assistant_pending_outputs_append_preserving",
+    "trg_case_assistant_pending_outputs_confirmation_target",
+];
+
+fn suspend_case_assistant_pending_output_migration_triggers(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<Vec<String>> {
+    let mut definitions =
+        Vec::with_capacity(CASE_ASSISTANT_PENDING_OUTPUT_MIGRATION_TRIGGER_NAMES.len());
+    for trigger_name in CASE_ASSISTANT_PENDING_OUTPUT_MIGRATION_TRIGGER_NAMES {
+        let definition = transaction.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [trigger_name],
+            |row| row.get::<_, String>(0),
+        )?;
+        transaction.execute(&format!("DROP TRIGGER \"{trigger_name}\""), [])?;
+        definitions.push(definition);
+    }
+    Ok(definitions)
+}
+
+fn restore_case_assistant_pending_output_migration_triggers(
+    transaction: &rusqlite::Transaction<'_>,
+    definitions: &[String],
+) -> rusqlite::Result<()> {
+    for definition in definitions {
+        transaction.execute_batch(definition)?;
     }
     Ok(())
 }
@@ -5743,25 +7889,57 @@ fn migrate_precise_legacy_answer_quarantines(
         )?;
 
         if !quarantine_project_has_other_business_children(transaction, &project_id)? {
-            let deleted = transaction.execute(
-                "DELETE FROM projects
-                 WHERE project_id = ?1
-                   AND title = ?2
-                   AND case_type = 'migration_quarantine'
-                   AND status = 'archived'
-                   AND opened_on IS NULL
-                   AND summary = ?3",
-                params![
-                    project_id,
-                    LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE,
-                    LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
-                ],
+            with_case_retirement_authority(
+                transaction,
+                &project_id,
+                LEGACY_MIGRATION_CLEANUP_RETIREMENT_REASON,
+                None,
+                || {
+                    let retired = transaction.execute(
+                        "INSERT INTO retired_case_project_ids(
+                             project_id,retirement_reason
+                         )
+                         SELECT project_id,'legacy_migration_cleanup'
+                         FROM projects
+                         WHERE project_id = ?1
+                           AND title = ?2
+                           AND case_type = 'migration_quarantine'
+                           AND status = 'archived'
+                           AND opened_on IS NULL
+                           AND summary = ?3",
+                        params![
+                            project_id,
+                            LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE,
+                            LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
+                        ],
+                    )?;
+                    if retired != 1 {
+                        return Err(user_schema_migration_error(format!(
+                            "legacy quarantine project {project_id} changed before retirement"
+                        )));
+                    }
+                    let deleted = transaction.execute(
+                        "DELETE FROM projects
+                         WHERE project_id = ?1
+                           AND title = ?2
+                           AND case_type = 'migration_quarantine'
+                           AND status = 'archived'
+                           AND opened_on IS NULL
+                           AND summary = ?3",
+                        params![
+                            project_id,
+                            LEGACY_ANSWER_QUARANTINE_PROJECT_TITLE,
+                            LEGACY_ANSWER_QUARANTINE_PROJECT_SUMMARY
+                        ],
+                    )?;
+                    if deleted != 1 {
+                        return Err(user_schema_migration_error(format!(
+                            "legacy quarantine project {project_id} changed during migration"
+                        )));
+                    }
+                    Ok(())
+                },
             )?;
-            if deleted != 1 {
-                return Err(user_schema_migration_error(format!(
-                    "legacy quarantine project {project_id} changed during migration"
-                )));
-            }
         }
     }
 
@@ -5772,18 +7950,32 @@ fn migrate_staged_user_tables(
     transaction: &rusqlite::Transaction<'_>,
     staged: &HashSet<&str>,
 ) -> rusqlite::Result<()> {
+    let mut message_runs_restored = false;
     for spec in USER_TABLE_MIGRATION_SPECS {
         if staged.contains(spec.name) {
+            if spec.name == "case_assistant_pending_outputs"
+                && staged.contains("messages")
+                && !message_runs_restored
+            {
+                restore_legacy_message_runs(transaction)?;
+                message_runs_restored = true;
+            }
             if spec.name == "legal_answer_records" {
                 copy_legacy_legal_answers(transaction, spec)?;
             } else if spec.name == "messages" {
                 copy_legacy_messages_without_runs(transaction, spec)?;
+            } else if spec.name == "tool_calls" {
+                copy_legacy_tool_calls(transaction, spec)?;
+            } else if spec.name == "case_assistant_pending_outputs" {
+                copy_legacy_case_assistant_pending_outputs(transaction, spec)?;
+            } else if spec.name == "retired_case_project_ids" {
+                copy_legacy_retired_case_project_ids(transaction, spec)?;
             } else {
                 copy_legacy_user_table(transaction, spec)?;
             }
         }
     }
-    if staged.contains("messages") {
+    if staged.contains("messages") && !message_runs_restored {
         restore_legacy_message_runs(transaction)?;
     }
 
@@ -5878,6 +8070,22 @@ fn validate_project_scoped_relations(connection: &rusqlite::Connection) -> rusql
     if invalid_legal_basis {
         return Err(user_schema_migration_error(
             "legal basis issue must belong to the same project".to_owned(),
+        ));
+    }
+
+    let reused_retired_project_id: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM retired_case_project_ids AS retired
+             JOIN projects AS project
+               ON project.project_id = retired.project_id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if reused_retired_project_id {
+        return Err(user_schema_migration_error(
+            "retired case project ids cannot have a live project".to_owned(),
         ));
     }
 
@@ -6045,6 +8253,402 @@ fn validate_assistant_scoped_relations(connection: &rusqlite::Connection) -> rus
         ));
     }
 
+    validate_case_assistant_pending_output_relations(connection)?;
+
+    Ok(())
+}
+
+fn validate_case_assistant_pending_output_relations(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    validate_case_assistant_closed_audit_contracts(connection)?;
+    let invalid_scope: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM case_assistant_pending_outputs AS output
+             LEFT JOIN retired_case_project_ids AS retired
+               ON retired.project_id = output.project_id
+             WHERE NOT (
+                 (
+                     retired.project_id IS NULL
+                     AND EXISTS (
+                         SELECT 1 FROM projects
+                         WHERE project_id = output.project_id
+                     )
+                     AND EXISTS (
+                         SELECT 1
+                         FROM conversations AS conversation
+                         JOIN agent_runs AS run
+                           ON run.run_id = output.run_id
+                          AND run.conversation_id = conversation.conversation_id
+                         JOIN tool_calls AS tool_call
+                           ON tool_call.run_id = run.run_id
+                          AND tool_call.ordinal = 0
+                          AND tool_call.capability_name = 'assistant.case_work'
+                          AND tool_call.status = 'succeeded'
+                          AND tool_call.access_mode = 'write'
+                          AND tool_call.requires_confirmation = 0
+                          AND tool_call.error_type IS NULL
+                          AND tool_call.finished_at IS NOT NULL
+                         JOIN messages AS user_message
+                           ON user_message.message_id = run.user_message_id
+                          AND user_message.conversation_id =
+                              conversation.conversation_id
+                          AND user_message.role = 'user'
+                          AND user_message.kind = 'text'
+                          AND user_message.artifact_id IS NULL
+                          AND user_message.run_id IS NULL
+                         JOIN messages AS message
+                           ON message.message_id = output.assistant_message_id
+                          AND message.conversation_id = conversation.conversation_id
+                          AND message.run_id = run.run_id
+                          AND message.role = 'assistant'
+                          AND message.kind = 'text'
+                          AND message.artifact_id IS NULL
+                          AND message.text_summary = output.output_preview
+                         WHERE conversation.conversation_id = output.conversation_id
+                           AND conversation.project_id = output.project_id
+                           AND conversation.scope = 'case_work'
+                           AND run.assistant_message_id =
+                               output.assistant_message_id
+                           AND run.intent = 'interactive_case_work'
+                           AND run.status = 'succeeded'
+                           AND run.error_type IS NULL
+                           AND run.finished_at IS NOT NULL
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM tool_calls AS other_tool_call
+                               WHERE other_tool_call.run_id = run.run_id
+                                 AND other_tool_call.tool_call_id
+                                     <> tool_call.tool_call_id
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM message_attachments AS attachment
+                               WHERE attachment.message_id IN (
+                                   run.user_message_id,
+                                   output.assistant_message_id
+                               )
+                           )
+                     )
+                     AND (
+                         (
+                             output.status = 'pending'
+                             AND output.row_version = 1
+                         )
+                         OR (
+                             output.status = 'confirmed'
+                             AND output.row_version = 2
+                             AND (
+                                 (
+                                     output.output_kind = 'case_analysis'
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM case_change_proposals AS proposal
+                                         WHERE proposal.proposal_id =
+                                                   output.confirmed_proposal_id
+                                           AND proposal.project_id = output.project_id
+                                           AND proposal.conversation_id =
+                                                   output.conversation_id
+                                           AND proposal.run_id = output.run_id
+                                           AND proposal.status = 'applied'
+                                           AND proposal.base_case_digest =
+                                               output.workspace_base_digest
+                                            AND json(proposal.changes_json) =
+                                                json(json_extract(
+                                                    output.output_payload_json,
+                                                    '$.content'
+                                                ))
+                                            AND proposal.source_refs_json =
+                                                output.expected_proposal_source_refs_json
+                                            AND NOT EXISTS (
+                                               SELECT 1
+                                               FROM json_each(
+                                                   proposal.source_refs_json
+                                               ) AS source
+                                               WHERE source.type <> 'text'
+                                                  OR length(source.value) = 0
+                                           )
+                                           AND NOT EXISTS (
+                                               SELECT 1
+                                               FROM json_each(
+                                                   proposal.source_refs_json
+                                               ) AS current
+                                               JOIN json_each(
+                                                   proposal.source_refs_json
+                                               ) AS previous
+                                                 ON CAST(previous.key AS INTEGER) =
+                                                    CAST(current.key AS INTEGER) - 1
+                                               WHERE CAST(
+                                                   previous.value AS TEXT
+                                               ) >= CAST(current.value AS TEXT)
+                                           )
+                                           AND NOT EXISTS (
+                                               SELECT 1
+                                               FROM json_tree(
+                                                   proposal.changes_json
+                                               ) AS referenced
+                                               LEFT JOIN json_tree(
+                                                   proposal.changes_json
+                                               ) AS container
+                                                 ON container.id =
+                                                    referenced.parent
+                                               WHERE (
+                                                       referenced.key =
+                                                           'sourceRef'
+                                                       OR referenced.key IN (
+                                                           'attachmentId',
+                                                           'artifactId'
+                                                       )
+                                                       OR (
+                                                           container.key =
+                                                               'sourceRefs'
+                                                           AND container.type =
+                                                               'array'
+                                                       )
+                                                     )
+                                                 AND referenced.type = 'text'
+                                                 AND NOT EXISTS (
+                                                     SELECT 1
+                                                     FROM json_each(
+                                                         proposal.source_refs_json
+                                                     ) AS canonical_source
+                                                     WHERE canonical_source.value =
+                                                           referenced.value
+                                                 )
+                                           )
+                                     )
+                                 )
+                                 OR (
+                                     output.output_kind IN (
+                                         'case_document',
+                                         'case_diagram'
+                                     )
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM artifacts AS artifact
+                                         JOIN artifact_versions AS version
+                                           ON version.artifact_id =
+                                              artifact.artifact_id
+                                          AND version.version_number = 1
+                                         JOIN agent_runs AS confirmed_run
+                                           ON confirmed_run.run_id =
+                                              output.run_id
+                                         WHERE artifact.artifact_id =
+                                                   output.confirmed_artifact_id
+                                           AND artifact.project_id = output.project_id
+                                           AND artifact.conversation_id =
+                                                   output.conversation_id
+                                           AND artifact.status <> 'archived'
+                                           AND artifact.kind =
+                                               CASE output.output_kind
+                                                   WHEN 'case_document' THEN 'document'
+                                                   WHEN 'case_diagram' THEN 'map'
+                                               END
+                                           AND version.rendered_text =
+                                               output.output_preview
+                                           AND json(version.content_json) =
+                                               json(json_extract(
+                                                   output.output_payload_json,
+                                                   '$.content'
+                                               ))
+                                           AND json(
+                                               version.provider_snapshot_json
+                                           ) = json(
+                                               confirmed_run.provider_snapshot_json
+                                           )
+                                     )
+                                 )
+                             )
+                         )
+                     )
+                 )
+                 OR (
+                     retired.project_id IS NOT NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM projects
+                         WHERE project_id = output.project_id
+                     )
+                     AND (
+                         (output.status = 'pending' AND output.row_version = 1)
+                         OR (output.status = 'confirmed' AND output.row_version = 2)
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM conversations
+                         WHERE conversation_id = output.conversation_id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM agent_runs
+                         WHERE run_id = output.run_id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tool_calls
+                         WHERE run_id = output.run_id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM messages
+                         WHERE message_id = output.assistant_message_id
+                     )
+                     AND (
+                         output.confirmed_artifact_id IS NULL
+                         OR NOT EXISTS (
+                             SELECT 1 FROM artifacts
+                             WHERE artifact_id = output.confirmed_artifact_id
+                         )
+                     )
+                     AND (
+                         output.confirmed_proposal_id IS NULL
+                         OR NOT EXISTS (
+                             SELECT 1 FROM case_change_proposals
+                             WHERE proposal_id = output.confirmed_proposal_id
+                         )
+                     )
+                 )
+             )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_scope {
+        return Err(user_schema_migration_error(
+            "case assistant pending output lineage is outside its case-work scope".to_owned(),
+        ));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT
+             pending_output_id, project_id, conversation_id, run_id,
+             assistant_message_id, project_binding_sha256, source_snapshots_json,
+             source_snapshots_sha256, expected_proposal_source_refs_json,
+             expected_proposal_source_refs_sha256, output_kind, output_payload_json,
+             output_preview, output_sha256, output_version, workspace_base_digest, status,
+             confirmed_artifact_id, confirmed_proposal_id, confirmation_request_sha256,
+             row_version, created_at, confirmed_at
+         FROM case_assistant_pending_outputs
+         ORDER BY pending_output_id",
+    )?;
+    let outputs = statement
+        .query_map([], case_assistant_pending_output_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for output in outputs {
+        if !is_lower_hex_sha256(&output.project_binding_sha256)
+            || !is_lower_hex_sha256(&output.workspace_base_digest)
+            || output.output_version < 1
+            || output.output_preview.len() > MAX_CASE_ASSISTANT_OUTPUT_PREVIEW_BYTES
+            || output.output_preview.contains('\0')
+            || output
+                .confirmation_request_sha256
+                .as_deref()
+                .is_some_and(|hash| !is_lower_hex_sha256(hash))
+        {
+            return Err(user_schema_migration_error(
+                "case assistant pending output contains invalid bounded metadata".to_owned(),
+            ));
+        }
+        validate_case_assistant_source_snapshots_json(
+            &output.source_snapshots_json,
+            &output.source_snapshots_sha256,
+        )?;
+        validate_case_assistant_expected_proposal_source_refs(
+            &output.output_kind,
+            &output.expected_proposal_source_refs_json,
+            &output.expected_proposal_source_refs_sha256,
+        )?;
+        validate_case_assistant_output_payload_json(
+            &output.output_kind,
+            &output.output_payload_json,
+            &output.output_sha256,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_case_assistant_closed_audit_contracts(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let mut run_statement = connection.prepare(
+        "SELECT provider_snapshot_json
+         FROM agent_runs
+         WHERE intent = 'interactive_case_work'",
+    )?;
+    let provider_snapshots = run_statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for provider_snapshot in provider_snapshots {
+        validate_provider_audit_snapshot_json(&provider_snapshot)?;
+    }
+
+    let mut tool_statement = connection.prepare(
+        "SELECT
+             tool.tool_call_id, tool.run_id, tool.ordinal, tool.capability_name,
+             tool.status, tool.access_mode, tool.requires_confirmation,
+             tool.input_audit_json, tool.output_audit_json, tool.source_audit_json,
+             tool.error_type, tool.started_at, tool.finished_at
+         FROM tool_calls AS tool
+         WHERE tool.capability_name = 'assistant.case_work'",
+    )?;
+    let tool_calls = tool_statement
+        .query_map([], tool_call_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for tool_call in tool_calls {
+        let run = get_agent_run(connection, &tool_call.run_id)?.ok_or_else(|| {
+            user_schema_migration_error("case assistant tool audit is missing its run".to_owned())
+        })?;
+        validate_case_assistant_tool_audit_contract(
+            &tool_call.run_id,
+            &run.provider_snapshot_json,
+            &tool_call.status,
+            &tool_call.input_audit_json,
+            &tool_call.output_audit_json,
+            &tool_call.source_audit_json,
+            tool_call.error_type.as_deref(),
+        )?;
+    }
+
+    let mut output_statement = connection.prepare(
+        "SELECT
+             output.pending_output_id, output.project_id, output.conversation_id,
+             output.run_id, output.assistant_message_id,
+             output.project_binding_sha256, output.source_snapshots_json,
+             output.source_snapshots_sha256,
+             output.expected_proposal_source_refs_json,
+             output.expected_proposal_source_refs_sha256, output.output_kind,
+             output.output_payload_json, output.output_preview, output.output_sha256,
+             output.output_version, output.workspace_base_digest, output.status,
+             output.confirmed_artifact_id, output.confirmed_proposal_id,
+             output.confirmation_request_sha256, output.row_version,
+             output.created_at, output.confirmed_at
+         FROM case_assistant_pending_outputs AS output
+         LEFT JOIN retired_case_project_ids AS retired
+           ON retired.project_id = output.project_id
+         WHERE retired.project_id IS NULL",
+    )?;
+    let outputs = output_statement
+        .query_map([], case_assistant_pending_output_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for output in outputs {
+        validate_case_assistant_pending_output_audit_contract(
+            connection,
+            &NewCaseAssistantPendingOutputRow {
+                pending_output_id: output.pending_output_id,
+                project_id: output.project_id,
+                conversation_id: output.conversation_id,
+                run_id: output.run_id,
+                assistant_message_id: output.assistant_message_id,
+                project_binding_sha256: output.project_binding_sha256,
+                source_snapshots_json: output.source_snapshots_json,
+                source_snapshots_sha256: output.source_snapshots_sha256,
+                expected_proposal_source_refs_json: output.expected_proposal_source_refs_json,
+                expected_proposal_source_refs_sha256: output.expected_proposal_source_refs_sha256,
+                output_kind: output.output_kind,
+                output_payload_json: output.output_payload_json,
+                output_preview: output.output_preview,
+                output_sha256: output.output_sha256,
+                output_version: output.output_version,
+                workspace_base_digest: output.workspace_base_digest,
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -6116,8 +8720,7 @@ fn validate_exact_canonical_user_schema(
     // trigger bodies; matching column names or object names alone is not
     // sufficient for a restore trust boundary.
     let mut canonical = rusqlite::Connection::open_in_memory()?;
-    canonical.pragma_update(None, "foreign_keys", "ON")?;
-    canonical.pragma_update(None, "trusted_schema", "OFF")?;
+    configure_user_database_connection(&canonical)?;
     run_user_migrations(&mut canonical)?;
 
     if user_schema_objects(connection)? != user_schema_objects(&canonical)? {
@@ -6191,6 +8794,717 @@ fn user_database_metadata_value(
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn install_case_assistant_closed_audit_triggers(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    const PROVIDER_AUDIT_INVALID_SQL: &str = r#"
+        length(CAST(NEW.provider_snapshot_json AS BLOB)) > 65536
+        OR NOT json_valid(NEW.provider_snapshot_json)
+        OR json_type(NEW.provider_snapshot_json) <> 'object'
+        OR json(NEW.provider_snapshot_json) <> NEW.provider_snapshot_json
+        OR json_remove(
+               NEW.provider_snapshot_json,
+               '$.kind', '$.modelId', '$.baseUrl',
+               '$.capabilities', '$.options'
+           ) <> '{}'
+        OR COALESCE(json_type(NEW.provider_snapshot_json, '$.kind') <> 'text', 1)
+        OR json_extract(NEW.provider_snapshot_json, '$.kind') NOT IN (
+               'silicon_flow', 'volcengine_ark', 'deep_seek', 'qwen', 'custom'
+           )
+        OR COALESCE(json_type(NEW.provider_snapshot_json, '$.modelId') <> 'text', 1)
+        OR length(CAST(json_extract(
+               NEW.provider_snapshot_json, '$.modelId'
+           ) AS BLOB)) NOT BETWEEN 1 AND 512
+        OR instr(json_extract(NEW.provider_snapshot_json, '$.modelId'), char(0)) > 0
+        OR instr(json_extract(NEW.provider_snapshot_json, '$.modelId'), char(10)) > 0
+        OR instr(json_extract(NEW.provider_snapshot_json, '$.modelId'), char(13)) > 0
+        OR COALESCE(json_type(NEW.provider_snapshot_json, '$.baseUrl') <> 'text', 1)
+        OR length(CAST(json_extract(
+               NEW.provider_snapshot_json, '$.baseUrl'
+           ) AS BLOB)) NOT BETWEEN 1 AND 2048
+        OR instr(json_extract(NEW.provider_snapshot_json, '$.baseUrl'), char(0)) > 0
+        OR instr(json_extract(NEW.provider_snapshot_json, '$.baseUrl'), char(10)) > 0
+        OR instr(json_extract(NEW.provider_snapshot_json, '$.baseUrl'), char(13)) > 0
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.capabilities') <> 'object',
+               1
+           )
+        OR json_remove(
+               json_extract(NEW.provider_snapshot_json, '$.capabilities'),
+               '$.chat', '$.streaming', '$.customModelId',
+               '$.customBaseUrl', '$.reasoning'
+           ) <> '{}'
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.capabilities.chat')
+                   NOT IN ('true', 'false'),
+               1
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.capabilities.streaming')
+                   NOT IN ('true', 'false'),
+               1
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.capabilities.customModelId')
+                   NOT IN ('true', 'false'),
+               1
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.capabilities.customBaseUrl')
+                   NOT IN ('true', 'false'),
+               1
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.capabilities.reasoning')
+                   NOT IN ('true', 'false'),
+               1
+           )
+        OR COALESCE(json_type(NEW.provider_snapshot_json, '$.options') <> 'object', 1)
+        OR json_remove(
+               json_extract(NEW.provider_snapshot_json, '$.options'),
+               '$.thinking', '$.enableThinking', '$.thinkingBudget',
+               '$.reasoningEffort', '$.endpointId', '$.workspaceId',
+               '$.allowPrivateNetwork'
+           ) <> '{}'
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.options.thinking')
+                   NOT IN ('null', 'true', 'false'),
+               1
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.options.enableThinking')
+                   NOT IN ('null', 'true', 'false'),
+               1
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.options.thinkingBudget')
+                   NOT IN ('null', 'integer'),
+               1
+           )
+        OR (
+               json_type(NEW.provider_snapshot_json, '$.options.thinkingBudget') = 'integer'
+               AND (
+                   json_extract(
+                       NEW.provider_snapshot_json, '$.options.thinkingBudget'
+                   ) < 0
+                   OR json_extract(
+                       NEW.provider_snapshot_json, '$.options.thinkingBudget'
+                   ) > 4294967295
+               )
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.options.reasoningEffort')
+                   NOT IN ('null', 'text'),
+               1
+           )
+        OR (
+               json_type(NEW.provider_snapshot_json, '$.options.reasoningEffort') = 'text'
+               AND json_extract(
+                   NEW.provider_snapshot_json, '$.options.reasoningEffort'
+               ) NOT IN ('low', 'medium', 'high', 'max')
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.options.endpointId')
+                   NOT IN ('null', 'text'),
+               1
+           )
+        OR (
+               json_type(NEW.provider_snapshot_json, '$.options.endpointId') = 'text'
+               AND length(CAST(json_extract(
+                   NEW.provider_snapshot_json, '$.options.endpointId'
+               ) AS BLOB)) NOT BETWEEN 1 AND 512
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.options.workspaceId')
+                   NOT IN ('null', 'text'),
+               1
+           )
+        OR (
+               json_type(NEW.provider_snapshot_json, '$.options.workspaceId') = 'text'
+               AND length(CAST(json_extract(
+                   NEW.provider_snapshot_json, '$.options.workspaceId'
+               ) AS BLOB)) NOT BETWEEN 1 AND 512
+           )
+        OR COALESCE(
+               json_type(NEW.provider_snapshot_json, '$.options.allowPrivateNetwork')
+                   NOT IN ('null', 'true', 'false'),
+               1
+           )
+    "#;
+    for (name, event) in [
+        ("trg_case_assistant_run_provider_audit_insert", "INSERT"),
+        ("trg_case_assistant_run_provider_audit_update", "UPDATE"),
+    ] {
+        transaction.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {name}
+             BEFORE {event} ON agent_runs
+             WHEN NEW.intent = 'interactive_case_work'
+              AND ({PROVIDER_AUDIT_INVALID_SQL})
+             BEGIN
+                 SELECT RAISE(
+                     ABORT,
+                     'case assistant provider audit must use the fixed no-credential schema'
+                 );
+             END;"
+        ))?;
+    }
+
+    const TOOL_AUDIT_INVALID_SQL: &str = r#"
+        length(CAST(NEW.input_audit_json AS BLOB)) > 65536
+        OR length(CAST(NEW.output_audit_json AS BLOB)) > 65536
+        OR length(CAST(NEW.source_audit_json AS BLOB)) > 65536
+        OR NOT json_valid(NEW.input_audit_json)
+        OR json_type(NEW.input_audit_json) <> 'object'
+        OR json(NEW.input_audit_json) <> NEW.input_audit_json
+        OR json_remove(
+               NEW.input_audit_json,
+               '$.requestId', '$.runId', '$.capability', '$.classification',
+               '$.inputIds', '$.inputHashes', '$.inputCounts',
+               '$.providerSnapshot', '$.confirmation', '$.status'
+           ) <> '{}'
+        OR EXISTS (
+               SELECT 1
+               FROM (
+                   SELECT '$.requestId' AS path, 'text' AS expected_type
+                   UNION ALL SELECT '$.runId', 'text'
+                   UNION ALL SELECT '$.capability', 'text'
+                   UNION ALL SELECT '$.classification', 'text'
+                   UNION ALL SELECT '$.inputIds', 'object'
+                   UNION ALL SELECT '$.inputIds.projectId', 'text'
+                   UNION ALL SELECT '$.inputIds.conversationId', 'text'
+                   UNION ALL SELECT '$.inputIds.redactionGenerationIds', 'array'
+                   UNION ALL SELECT '$.inputHashes', 'object'
+                   UNION ALL SELECT '$.inputHashes.promptSha256', 'text'
+                   UNION ALL SELECT '$.inputHashes.historySha256', 'text'
+                   UNION ALL SELECT '$.inputHashes.minimalContextSha256', 'text'
+                   UNION ALL SELECT '$.inputHashes.generationSetSha256', 'text'
+                   UNION ALL SELECT '$.inputHashes.workspaceDigest', 'text'
+                   UNION ALL SELECT '$.inputCounts', 'object'
+                   UNION ALL SELECT '$.inputCounts.promptBytes', 'integer'
+                   UNION ALL SELECT '$.inputCounts.historyMessages', 'integer'
+                   UNION ALL SELECT '$.inputCounts.historyBytes', 'integer'
+                   UNION ALL SELECT '$.inputCounts.generationCount', 'integer'
+                   UNION ALL SELECT '$.inputCounts.knownBodyBytes', 'integer'
+                   UNION ALL SELECT '$.providerSnapshot', 'object'
+                   UNION ALL SELECT '$.confirmation', 'object'
+                   UNION ALL SELECT '$.confirmation.writebackRequired', 'true'
+                   UNION ALL SELECT '$.confirmation.received', 'false'
+                   UNION ALL SELECT '$.status', 'text'
+               ) AS required
+               WHERE COALESCE(
+                   json_type(NEW.input_audit_json, required.path)
+                       <> required.expected_type,
+                   1
+               )
+           )
+        OR COALESCE(json_type(NEW.input_audit_json, '$.requestId') <> 'text', 1)
+        OR json_extract(NEW.input_audit_json, '$.requestId') <> NEW.run_id
+        OR COALESCE(json_type(NEW.input_audit_json, '$.runId') <> 'text', 1)
+        OR json_extract(NEW.input_audit_json, '$.runId') <> NEW.run_id
+        OR json_extract(NEW.input_audit_json, '$.capability') <> 'assistant.case_work'
+        OR json_extract(
+               NEW.input_audit_json, '$.classification'
+           ) <> 'case_redacted_approved'
+        OR json_extract(NEW.input_audit_json, '$.status') <> 'running'
+        OR COALESCE(json_type(NEW.input_audit_json, '$.inputIds') <> 'object', 1)
+        OR json_remove(
+               json_extract(NEW.input_audit_json, '$.inputIds'),
+               '$.projectId', '$.conversationId', '$.redactionGenerationIds'
+           ) <> '{}'
+        OR COALESCE(
+               json_type(NEW.input_audit_json, '$.inputIds.projectId') <> 'text',
+               1
+           )
+        OR length(CAST(json_extract(
+               NEW.input_audit_json, '$.inputIds.projectId'
+           ) AS BLOB)) NOT BETWEEN 1 AND 128
+        OR instr(json_extract(
+               NEW.input_audit_json, '$.inputIds.projectId'
+           ), '/') > 0
+        OR instr(json_extract(
+               NEW.input_audit_json, '$.inputIds.projectId'
+           ), char(92)) > 0
+        OR COALESCE(
+               json_type(NEW.input_audit_json, '$.inputIds.conversationId') <> 'text',
+               1
+           )
+        OR length(CAST(json_extract(
+               NEW.input_audit_json, '$.inputIds.conversationId'
+           ) AS BLOB)) NOT BETWEEN 1 AND 128
+        OR instr(json_extract(
+               NEW.input_audit_json, '$.inputIds.conversationId'
+           ), '/') > 0
+        OR instr(json_extract(
+               NEW.input_audit_json, '$.inputIds.conversationId'
+           ), char(92)) > 0
+        OR COALESCE(
+               json_type(
+                   NEW.input_audit_json,
+                   '$.inputIds.redactionGenerationIds'
+               ) <> 'array',
+               1
+           )
+        OR json_array_length(
+               NEW.input_audit_json,
+               '$.inputIds.redactionGenerationIds'
+           ) NOT BETWEEN 1 AND 16
+        OR EXISTS (
+               SELECT 1
+               FROM json_each(
+                   NEW.input_audit_json,
+                   '$.inputIds.redactionGenerationIds'
+               ) AS identifier
+               WHERE identifier.type <> 'text'
+                  OR length(CAST(identifier.value AS BLOB)) NOT BETWEEN 1 AND 128
+                  OR instr(CAST(identifier.value AS TEXT), '/') > 0
+                  OR instr(CAST(identifier.value AS TEXT), char(92)) > 0
+                  OR instr(CAST(identifier.value AS TEXT), char(0)) > 0
+           )
+        OR EXISTS (
+               SELECT 1
+               FROM json_each(
+                   NEW.input_audit_json,
+                   '$.inputIds.redactionGenerationIds'
+               ) AS current
+               JOIN json_each(
+                   NEW.input_audit_json,
+                   '$.inputIds.redactionGenerationIds'
+               ) AS previous
+                 ON CAST(previous.key AS INTEGER) =
+                    CAST(current.key AS INTEGER) - 1
+               WHERE CAST(previous.value AS TEXT) >= CAST(current.value AS TEXT)
+           )
+        OR COALESCE(
+               json_type(NEW.input_audit_json, '$.inputHashes') <> 'object',
+               1
+           )
+        OR json_remove(
+               json_extract(NEW.input_audit_json, '$.inputHashes'),
+               '$.promptSha256', '$.historySha256', '$.minimalContextSha256',
+               '$.generationSetSha256', '$.workspaceDigest'
+           ) <> '{}'
+        OR EXISTS (
+               SELECT 1
+               FROM json_each(NEW.input_audit_json, '$.inputHashes') AS hash
+               WHERE hash.type <> 'text'
+                  OR length(CAST(hash.value AS TEXT)) <> 64
+                  OR CAST(hash.value AS TEXT) GLOB '*[^0-9a-f]*'
+           )
+        OR COALESCE(
+               json_type(NEW.input_audit_json, '$.inputCounts') <> 'object',
+               1
+           )
+        OR json_remove(
+               json_extract(NEW.input_audit_json, '$.inputCounts'),
+               '$.promptBytes', '$.historyMessages', '$.historyBytes',
+               '$.generationCount', '$.knownBodyBytes'
+           ) <> '{}'
+        OR EXISTS (
+               SELECT 1
+               FROM json_each(NEW.input_audit_json, '$.inputCounts') AS count
+               WHERE count.type <> 'integer'
+                  OR CAST(count.value AS INTEGER) < 0
+                  OR CAST(count.value AS INTEGER) > 16777216
+           )
+        OR json_extract(
+               NEW.input_audit_json, '$.inputCounts.generationCount'
+           ) <> json_array_length(
+               NEW.input_audit_json,
+               '$.inputIds.redactionGenerationIds'
+           )
+        OR COALESCE(
+               json_type(NEW.input_audit_json, '$.providerSnapshot') <> 'object',
+               1
+           )
+        OR EXISTS (
+               SELECT fullkey, type, atom
+               FROM json_tree(json_extract(
+                   NEW.input_audit_json, '$.providerSnapshot'
+               ))
+               EXCEPT
+               SELECT fullkey, type, atom
+               FROM json_tree((
+                   SELECT run.provider_snapshot_json
+                   FROM agent_runs AS run
+                   WHERE run.run_id = NEW.run_id
+               ))
+           )
+        OR EXISTS (
+               SELECT fullkey, type, atom
+               FROM json_tree((
+                   SELECT run.provider_snapshot_json
+                   FROM agent_runs AS run
+                   WHERE run.run_id = NEW.run_id
+               ))
+               EXCEPT
+               SELECT fullkey, type, atom
+               FROM json_tree(json_extract(
+                   NEW.input_audit_json, '$.providerSnapshot'
+               ))
+           )
+        OR COALESCE(
+               json_type(NEW.input_audit_json, '$.confirmation') <> 'object',
+               1
+           )
+        OR json_remove(
+               json_extract(NEW.input_audit_json, '$.confirmation'),
+               '$.writebackRequired', '$.received'
+           ) <> '{}'
+        OR json_type(
+               NEW.input_audit_json, '$.confirmation.writebackRequired'
+           ) <> 'true'
+        OR json_type(
+               NEW.input_audit_json, '$.confirmation.received'
+           ) <> 'false'
+        OR NOT COALESCE((
+            (
+                NEW.status = 'running'
+                AND NEW.output_audit_json = '{}'
+                AND NEW.source_audit_json = '{}'
+                AND NEW.error_type IS NULL
+            )
+            OR
+            (
+                NEW.status = 'succeeded'
+                AND NEW.error_type IS NULL
+                AND json_valid(NEW.output_audit_json)
+                AND json_type(NEW.output_audit_json) = 'object'
+                AND json(NEW.output_audit_json) = NEW.output_audit_json
+                AND json_remove(
+                    NEW.output_audit_json,
+                    '$.outputIds', '$.outputHashes', '$.outputCounts',
+                    '$.status', '$.confirmation'
+                ) = '{}'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT '$.outputIds' AS path, 'object' AS expected_type
+                        UNION ALL SELECT '$.outputIds.pendingOutputKind', 'text'
+                        UNION ALL SELECT '$.outputHashes', 'object'
+                        UNION ALL SELECT '$.outputHashes.providerOutputSha256', 'text'
+                        UNION ALL SELECT '$.outputHashes.typedOutputSha256', 'text'
+                        UNION ALL SELECT '$.outputHashes.approvedEnvelopeSha256', 'text'
+                        UNION ALL SELECT '$.outputHashes.proposalSourceRefsSha256', 'text'
+                        UNION ALL SELECT '$.outputCounts', 'object'
+                        UNION ALL SELECT '$.outputCounts.approvedEnvelopeBytes', 'integer'
+                        UNION ALL SELECT '$.outputCounts.bytes', 'integer'
+                        UNION ALL SELECT '$.outputCounts.items', 'integer'
+                        UNION ALL SELECT '$.status', 'text'
+                        UNION ALL SELECT '$.confirmation', 'object'
+                        UNION ALL SELECT '$.confirmation.writebackRequired', 'true'
+                        UNION ALL SELECT '$.confirmation.received', 'false'
+                    ) AS required
+                    WHERE COALESCE(
+                        json_type(NEW.output_audit_json, required.path)
+                            <> required.expected_type,
+                        1
+                    )
+                )
+                AND json_extract(
+                    NEW.output_audit_json, '$.status'
+                ) = 'succeeded'
+                AND json_remove(
+                    json_extract(NEW.output_audit_json, '$.outputIds'),
+                    '$.pendingOutputKind'
+                ) = '{}'
+                AND json_extract(
+                    NEW.output_audit_json, '$.outputIds.pendingOutputKind'
+                ) IN ('case_analysis', 'case_document', 'case_diagram')
+                AND json_remove(
+                    json_extract(NEW.output_audit_json, '$.outputHashes'),
+                    '$.providerOutputSha256', '$.typedOutputSha256',
+                    '$.approvedEnvelopeSha256',
+                    '$.proposalSourceRefsSha256'
+                ) = '{}'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        NEW.output_audit_json, '$.outputHashes'
+                    ) AS hash
+                    WHERE hash.type <> 'text'
+                       OR length(CAST(hash.value AS TEXT)) <> 64
+                       OR CAST(hash.value AS TEXT) GLOB '*[^0-9a-f]*'
+                )
+                AND json_remove(
+                    json_extract(NEW.output_audit_json, '$.outputCounts'),
+                    '$.approvedEnvelopeBytes', '$.bytes', '$.items'
+                ) = '{}'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        NEW.output_audit_json, '$.outputCounts'
+                    ) AS count
+                    WHERE count.type <> 'integer'
+                       OR CAST(count.value AS INTEGER) < 0
+                       OR CAST(count.value AS INTEGER) > 16777216
+                )
+                AND json_extract(
+                    NEW.output_audit_json, '$.outputCounts.items'
+                ) = 1
+                AND json_remove(
+                    json_extract(NEW.output_audit_json, '$.confirmation'),
+                    '$.writebackRequired', '$.received'
+                ) = '{}'
+                AND json_type(
+                    NEW.output_audit_json,
+                    '$.confirmation.writebackRequired'
+                ) = 'true'
+                AND json_type(
+                    NEW.output_audit_json,
+                    '$.confirmation.received'
+                ) = 'false'
+                AND json_valid(NEW.source_audit_json)
+                AND json_type(NEW.source_audit_json) = 'object'
+                AND json(NEW.source_audit_json) = NEW.source_audit_json
+                AND json_remove(
+                    NEW.source_audit_json,
+                    '$.classification', '$.sourceRefs', '$.inputHashes',
+                    '$.providerSnapshot', '$.confirmation'
+                ) = '{}'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT '$.classification' AS path, 'text' AS expected_type
+                        UNION ALL SELECT '$.sourceRefs', 'array'
+                        UNION ALL SELECT '$.inputHashes', 'object'
+                        UNION ALL SELECT '$.inputHashes.projectBindingSha256', 'text'
+                        UNION ALL SELECT '$.inputHashes.sourceSnapshotsSha256', 'text'
+                        UNION ALL SELECT '$.inputHashes.aggregateSourceSha256', 'text'
+                        UNION ALL SELECT '$.inputHashes.aggregateExtractionSha256', 'text'
+                        UNION ALL SELECT '$.inputHashes.aggregateRedactedContentSha256', 'text'
+                        UNION ALL SELECT '$.providerSnapshot', 'object'
+                        UNION ALL SELECT '$.confirmation', 'object'
+                        UNION ALL SELECT '$.confirmation.writebackRequired', 'true'
+                        UNION ALL SELECT '$.confirmation.received', 'false'
+                    ) AS required
+                    WHERE COALESCE(
+                        json_type(NEW.source_audit_json, required.path)
+                            <> required.expected_type,
+                        1
+                    )
+                )
+                AND json_extract(
+                    NEW.source_audit_json, '$.classification'
+                ) = 'case_redacted_approved'
+                AND json_type(
+                    NEW.source_audit_json, '$.sourceRefs'
+                ) = 'array'
+                AND json_array_length(
+                    NEW.source_audit_json, '$.sourceRefs'
+                ) BETWEEN 1 AND 16
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        NEW.source_audit_json, '$.sourceRefs'
+                    ) AS identifier
+                    WHERE identifier.type <> 'text'
+                       OR length(CAST(identifier.value AS BLOB))
+                          NOT BETWEEN 1 AND 128
+                       OR instr(CAST(identifier.value AS TEXT), '/') > 0
+                       OR instr(CAST(identifier.value AS TEXT), char(92)) > 0
+                       OR instr(CAST(identifier.value AS TEXT), char(0)) > 0
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        NEW.source_audit_json, '$.sourceRefs'
+                    ) AS current
+                    JOIN json_each(
+                        NEW.source_audit_json, '$.sourceRefs'
+                    ) AS previous
+                      ON CAST(previous.key AS INTEGER) =
+                         CAST(current.key AS INTEGER) - 1
+                    WHERE CAST(previous.value AS TEXT) >=
+                          CAST(current.value AS TEXT)
+                )
+                AND json_remove(
+                    json_extract(NEW.source_audit_json, '$.inputHashes'),
+                    '$.projectBindingSha256', '$.sourceSnapshotsSha256',
+                    '$.aggregateSourceSha256', '$.aggregateExtractionSha256',
+                    '$.aggregateRedactedContentSha256'
+                ) = '{}'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        NEW.source_audit_json, '$.inputHashes'
+                    ) AS hash
+                    WHERE hash.type <> 'text'
+                       OR length(CAST(hash.value AS TEXT)) <> 64
+                       OR CAST(hash.value AS TEXT) GLOB '*[^0-9a-f]*'
+                )
+                AND NOT EXISTS (
+                    SELECT fullkey, type, atom
+                    FROM json_tree(json_extract(
+                        NEW.source_audit_json, '$.providerSnapshot'
+                    ))
+                    EXCEPT
+                    SELECT fullkey, type, atom
+                    FROM json_tree((
+                        SELECT run.provider_snapshot_json
+                        FROM agent_runs AS run
+                        WHERE run.run_id = NEW.run_id
+                    ))
+                )
+                AND NOT EXISTS (
+                    SELECT fullkey, type, atom
+                    FROM json_tree((
+                        SELECT run.provider_snapshot_json
+                        FROM agent_runs AS run
+                        WHERE run.run_id = NEW.run_id
+                    ))
+                    EXCEPT
+                    SELECT fullkey, type, atom
+                    FROM json_tree(json_extract(
+                        NEW.source_audit_json, '$.providerSnapshot'
+                    ))
+                )
+                AND json_remove(
+                    json_extract(NEW.source_audit_json, '$.confirmation'),
+                    '$.writebackRequired', '$.received'
+                ) = '{}'
+                AND json_type(
+                    NEW.source_audit_json,
+                    '$.confirmation.writebackRequired'
+                ) = 'true'
+                AND json_type(
+                    NEW.source_audit_json,
+                    '$.confirmation.received'
+                ) = 'false'
+            )
+            OR
+            (
+                NEW.status IN ('failed', 'cancelled')
+                AND NEW.error_type IS NOT NULL
+                AND length(CAST(NEW.error_type AS BLOB)) BETWEEN 1 AND 128
+                AND json_valid(NEW.output_audit_json)
+                AND json_type(NEW.output_audit_json) = 'object'
+                AND json(NEW.output_audit_json) = NEW.output_audit_json
+                AND json_remove(
+                    NEW.output_audit_json,
+                    '$.outputCounts', '$.status', '$.errorType'
+                ) = '{}'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT '$.outputCounts' AS path, 'object' AS expected_type
+                        UNION ALL SELECT '$.outputCounts.items', 'integer'
+                        UNION ALL SELECT '$.status', 'text'
+                        UNION ALL SELECT '$.errorType', 'text'
+                    ) AS required
+                    WHERE COALESCE(
+                        json_type(NEW.output_audit_json, required.path)
+                            <> required.expected_type,
+                        1
+                    )
+                )
+                AND json_extract(
+                    NEW.output_audit_json, '$.status'
+                ) = NEW.status
+                AND json_extract(
+                    NEW.output_audit_json, '$.errorType'
+                ) = NEW.error_type
+                AND json_remove(
+                    json_extract(NEW.output_audit_json, '$.outputCounts'),
+                    '$.items'
+                ) = '{}'
+                AND json_extract(
+                    NEW.output_audit_json, '$.outputCounts.items'
+                ) = 0
+                AND json_valid(NEW.source_audit_json)
+                AND json_type(NEW.source_audit_json) = 'object'
+                AND json(NEW.source_audit_json) = NEW.source_audit_json
+                AND json_remove(
+                    NEW.source_audit_json,
+                    '$.sourceRefs', '$.providerSnapshot', '$.confirmation'
+                ) = '{}'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT '$.sourceRefs' AS path, 'array' AS expected_type
+                        UNION ALL SELECT '$.providerSnapshot', 'object'
+                        UNION ALL SELECT '$.confirmation', 'object'
+                        UNION ALL SELECT '$.confirmation.received', 'false'
+                    ) AS required
+                    WHERE COALESCE(
+                        json_type(NEW.source_audit_json, required.path)
+                            <> required.expected_type,
+                        1
+                    )
+                )
+                AND json_type(
+                    NEW.source_audit_json, '$.sourceRefs'
+                ) = 'array'
+                AND json_array_length(
+                    NEW.source_audit_json, '$.sourceRefs'
+                ) BETWEEN 1 AND 16
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        NEW.source_audit_json, '$.sourceRefs'
+                    ) AS identifier
+                    WHERE identifier.type <> 'text'
+                       OR length(CAST(identifier.value AS BLOB))
+                          NOT BETWEEN 1 AND 128
+                       OR instr(CAST(identifier.value AS TEXT), '/') > 0
+                       OR instr(CAST(identifier.value AS TEXT), char(92)) > 0
+                       OR instr(CAST(identifier.value AS TEXT), char(0)) > 0
+                )
+                AND NOT EXISTS (
+                    SELECT fullkey, type, atom
+                    FROM json_tree(json_extract(
+                        NEW.source_audit_json, '$.providerSnapshot'
+                    ))
+                    EXCEPT
+                    SELECT fullkey, type, atom
+                    FROM json_tree((
+                        SELECT run.provider_snapshot_json
+                        FROM agent_runs AS run
+                        WHERE run.run_id = NEW.run_id
+                    ))
+                )
+                AND NOT EXISTS (
+                    SELECT fullkey, type, atom
+                    FROM json_tree((
+                        SELECT run.provider_snapshot_json
+                        FROM agent_runs AS run
+                        WHERE run.run_id = NEW.run_id
+                    ))
+                    EXCEPT
+                    SELECT fullkey, type, atom
+                    FROM json_tree(json_extract(
+                        NEW.source_audit_json, '$.providerSnapshot'
+                    ))
+                )
+                AND json_remove(
+                    json_extract(NEW.source_audit_json, '$.confirmation'),
+                    '$.received'
+                ) = '{}'
+                AND json_type(
+                    NEW.source_audit_json, '$.confirmation.received'
+                ) = 'false'
+            )
+        ), 0)
+    "#;
+    for (name, event) in [
+        ("trg_case_assistant_tool_audit_insert", "INSERT"),
+        ("trg_case_assistant_tool_audit_update", "UPDATE"),
+    ] {
+        transaction.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {name}
+             BEFORE {event} ON tool_calls
+             WHEN NEW.capability_name = 'assistant.case_work'
+              AND ({TOOL_AUDIT_INVALID_SQL})
+             BEGIN
+                 SELECT RAISE(
+                     ABORT,
+                     'case assistant tool audit must use the fixed no-body schema'
+                 );
+             END;"
+        ))?;
+    }
+    Ok(())
 }
 
 fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), DatabaseInitError> {
@@ -6274,6 +9588,87 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS retired_case_project_ids (
+            project_id TEXT PRIMARY KEY CHECK (length(project_id) > 0),
+            retired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            retirement_reason TEXT NOT NULL CHECK (
+                retirement_reason IN (
+                    'case_project_deleted',
+                    'legacy_migration_cleanup',
+                    'privacy_journal_recovery'
+                )
+            ),
+            privacy_deletion_id TEXT UNIQUE,
+            CHECK (
+                (
+                    retirement_reason = 'legacy_migration_cleanup'
+                    AND privacy_deletion_id IS NULL
+                )
+                OR
+                (
+                    retirement_reason IN (
+                        'case_project_deleted',
+                        'privacy_journal_recovery'
+                    )
+                    AND length(privacy_deletion_id) = 37
+                    AND substr(privacy_deletion_id,1,5) = 'pdel_'
+                    AND substr(privacy_deletion_id,6)
+                        NOT GLOB '*[^0-9a-f]*'
+                )
+            )
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_retired_case_project_ids_authorized_insert
+        BEFORE INSERT ON retired_case_project_ids
+        WHEN COALESCE(
+            case_retirement_authorized(
+                NEW.project_id,
+                NEW.retirement_reason,
+                NEW.privacy_deletion_id
+            ),
+            0
+        ) <> 1
+        BEGIN
+            SELECT RAISE(ABORT, 'case project retirement is not authorized');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_retired_case_project_ids_no_update
+        BEFORE UPDATE ON retired_case_project_ids
+        BEGIN
+            SELECT RAISE(ABORT, 'retired case project id is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_retired_case_project_ids_no_delete
+        BEFORE DELETE ON retired_case_project_ids
+        BEGIN
+            SELECT RAISE(ABORT, 'retired case project id is append only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_projects_reject_retired_id
+        BEFORE INSERT ON projects
+        WHEN EXISTS (
+            SELECT 1 FROM retired_case_project_ids AS retired
+            WHERE retired.project_id = NEW.project_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'retired case project id cannot be reused');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_projects_require_retirement_before_delete
+        BEFORE DELETE ON projects
+        WHEN NOT EXISTS (
+            SELECT 1 FROM retired_case_project_ids AS retired
+            WHERE retired.project_id = OLD.project_id
+              AND case_retirement_authorized(
+                    retired.project_id,
+                    retired.retirement_reason,
+                    retired.privacy_deletion_id
+                  ) = 1
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'case project must be retired before physical deletion');
+        END;
 
         CREATE TABLE IF NOT EXISTS case_files (
             file_id TEXT PRIMARY KEY CHECK (length(file_id) > 0),
@@ -6495,13 +9890,25 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
         CREATE TABLE IF NOT EXISTS conversations (
             conversation_id TEXT PRIMARY KEY CHECK (length(conversation_id) > 0),
             project_id TEXT,
+            scope TEXT NOT NULL DEFAULT 'assistant' CHECK (
+                scope IN ('assistant', 'case_work')
+            ),
             title TEXT NOT NULL CHECK (length(title) > 0),
             status TEXT NOT NULL CHECK (status IN ('open', 'archived')),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE SET NULL,
-            CHECK (project_id IS NULL OR length(project_id) > 0)
+            CHECK (project_id IS NULL OR length(project_id) > 0),
+            CHECK (scope = 'assistant' OR project_id IS NOT NULL)
         );
+
+        CREATE TRIGGER IF NOT EXISTS trg_conversations_scope_immutable
+        BEFORE UPDATE OF scope, project_id ON conversations
+        WHEN NEW.scope IS NOT OLD.scope
+          OR (OLD.scope = 'case_work' AND NEW.project_id IS NOT OLD.project_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'conversation scope and case-work ownership are immutable');
+        END;
 
         CREATE TABLE IF NOT EXISTS artifacts (
             artifact_id TEXT PRIMARY KEY CHECK (length(artifact_id) > 0),
@@ -6685,6 +10092,1000 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
                 OR (status = 'applied' AND decided_at IS NOT NULL AND applied_at IS NOT NULL)
             )
         );
+
+        CREATE TABLE IF NOT EXISTS case_assistant_pending_outputs (
+            pending_output_id TEXT PRIMARY KEY CHECK (
+                length(pending_output_id) BETWEEN 1 AND 128
+            ),
+            project_id TEXT NOT NULL CHECK (length(project_id) BETWEEN 1 AND 128),
+            conversation_id TEXT NOT NULL CHECK (
+                length(conversation_id) BETWEEN 1 AND 128
+            ),
+            run_id TEXT NOT NULL UNIQUE CHECK (length(run_id) BETWEEN 1 AND 128),
+            assistant_message_id TEXT NOT NULL UNIQUE CHECK (
+                length(assistant_message_id) BETWEEN 1 AND 128
+            ),
+            project_binding_sha256 TEXT NOT NULL CHECK (
+                length(project_binding_sha256) = 64
+                AND project_binding_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            source_snapshots_json TEXT NOT NULL CHECK (
+                json_valid(source_snapshots_json)
+                AND json_type(source_snapshots_json) = 'array'
+                AND length(CAST(source_snapshots_json AS BLOB)) BETWEEN 1 AND 262144
+            ),
+            source_snapshots_sha256 TEXT NOT NULL CHECK (
+                length(source_snapshots_sha256) = 64
+                AND source_snapshots_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            expected_proposal_source_refs_json TEXT NOT NULL CHECK (
+                json_valid(expected_proposal_source_refs_json)
+                AND json_type(expected_proposal_source_refs_json) = 'array'
+                AND length(CAST(expected_proposal_source_refs_json AS BLOB))
+                    BETWEEN 2 AND 262144
+            ),
+            expected_proposal_source_refs_sha256 TEXT NOT NULL CHECK (
+                length(expected_proposal_source_refs_sha256) = 64
+                AND expected_proposal_source_refs_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            output_kind TEXT NOT NULL CHECK (
+                output_kind IN ('case_analysis', 'case_document', 'case_diagram')
+            ),
+            output_payload_json TEXT NOT NULL CHECK (
+                json_valid(output_payload_json)
+                AND json_type(output_payload_json) = 'object'
+                AND length(CAST(output_payload_json AS BLOB)) BETWEEN 1 AND 2097152
+            ),
+            output_preview TEXT NOT NULL DEFAULT '' CHECK (
+                length(CAST(output_preview AS BLOB)) <= 16384
+                AND instr(output_preview, char(0)) = 0
+            ),
+            output_sha256 TEXT NOT NULL CHECK (
+                length(output_sha256) = 64
+                AND output_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            output_version INTEGER NOT NULL CHECK (output_version > 0),
+            workspace_base_digest TEXT NOT NULL CHECK (
+                length(workspace_base_digest) = 64
+                AND workspace_base_digest NOT GLOB '*[^0-9a-f]*'
+            ),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'confirmed')),
+            confirmed_artifact_id TEXT,
+            confirmed_proposal_id TEXT,
+            confirmation_request_sha256 TEXT CHECK (
+                confirmation_request_sha256 IS NULL
+                OR (
+                    length(confirmation_request_sha256) = 64
+                    AND confirmation_request_sha256 NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            row_version INTEGER NOT NULL DEFAULT 1 CHECK (row_version > 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            confirmed_at TEXT,
+            CHECK (
+                output_kind = 'case_analysis'
+                OR expected_proposal_source_refs_json = '[]'
+            ),
+            CHECK (
+                (status = 'pending'
+                 AND confirmed_artifact_id IS NULL
+                 AND confirmed_proposal_id IS NULL
+                 AND confirmation_request_sha256 IS NULL
+                 AND confirmed_at IS NULL)
+                OR
+                (status = 'confirmed'
+                 AND confirmation_request_sha256 IS NOT NULL
+                 AND confirmed_at IS NOT NULL
+                 AND (
+                     (output_kind = 'case_analysis'
+                      AND confirmed_artifact_id IS NULL
+                      AND confirmed_proposal_id IS NOT NULL)
+                     OR
+                     (output_kind IN ('case_document', 'case_diagram')
+                      AND confirmed_artifact_id IS NOT NULL
+                      AND confirmed_proposal_id IS NULL)
+                 ))
+            )
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_pending_outputs_closed_contract_insert
+        BEFORE INSERT ON case_assistant_pending_outputs
+        WHEN NOT json_valid(NEW.source_snapshots_json)
+          OR json_type(NEW.source_snapshots_json) <> 'array'
+          OR json(NEW.source_snapshots_json) <> NEW.source_snapshots_json
+          OR json_array_length(NEW.source_snapshots_json) NOT BETWEEN 1 AND 64
+          OR case_assistant_sha256(NEW.source_snapshots_json) <>
+             NEW.source_snapshots_sha256
+          OR EXISTS (
+              SELECT 1
+              FROM json_each(NEW.source_snapshots_json) AS snapshot
+              WHERE snapshot.type <> 'object'
+                 OR json_remove(
+                        snapshot.value,
+                        '$.approvedPayloadSha256', '$.extractionSha256',
+                        '$.generationId', '$.generationNumber',
+                        '$.generationRowVersion', '$.materialId', '$.ordinal',
+                        '$.redactedContentSha256', '$.riskRevision',
+                        '$.riskRevisionHash', '$.selectionId',
+                        '$.selectionRowVersion'
+                    ) <> '{}'
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.approvedPayloadSha256') <> 'text',
+                        1
+                    )
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.extractionSha256') <> 'text',
+                        1
+                    )
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.redactedContentSha256') <> 'text',
+                        1
+                    )
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.riskRevisionHash') <> 'text',
+                        1
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                        FROM (
+                            SELECT json_extract(
+                                snapshot.value, '$.approvedPayloadSha256'
+                            ) AS value
+                            UNION ALL SELECT json_extract(
+                                snapshot.value, '$.extractionSha256'
+                            )
+                            UNION ALL SELECT json_extract(
+                                snapshot.value, '$.redactedContentSha256'
+                            )
+                            UNION ALL SELECT json_extract(
+                                snapshot.value, '$.riskRevisionHash'
+                            )
+                        ) AS hash
+                        WHERE length(CAST(hash.value AS TEXT)) <> 64
+                           OR CAST(hash.value AS TEXT) GLOB '*[^0-9a-f]*'
+                    )
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.generationId') <> 'text',
+                        1
+                    )
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.materialId') <> 'text',
+                        1
+                    )
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.selectionId') <> 'text',
+                        1
+                    )
+                 OR length(CAST(json_extract(
+                        snapshot.value, '$.generationId'
+                    ) AS BLOB)) NOT BETWEEN 1 AND 128
+                 OR length(CAST(json_extract(
+                        snapshot.value, '$.materialId'
+                    ) AS BLOB)) NOT BETWEEN 1 AND 128
+                 OR length(CAST(json_extract(
+                        snapshot.value, '$.selectionId'
+                    ) AS BLOB)) NOT BETWEEN 1 AND 128
+                 OR COALESCE(
+                        json_type(snapshot.value, '$.ordinal') <> 'integer',
+                        1
+                    )
+                 OR json_extract(snapshot.value, '$.ordinal') <>
+                    CAST(snapshot.key AS INTEGER)
+                 OR EXISTS (
+                        SELECT 1
+                        FROM (
+                            SELECT '$.generationNumber' AS path
+                            UNION ALL SELECT '$.generationRowVersion'
+                            UNION ALL SELECT '$.riskRevision'
+                            UNION ALL SELECT '$.selectionRowVersion'
+                        ) AS positive_integer
+                        WHERE COALESCE(
+                            json_type(snapshot.value, positive_integer.path)
+                                <> 'integer',
+                            1
+                        )
+                           OR json_extract(
+                               snapshot.value, positive_integer.path
+                           ) <= 0
+                    )
+          )
+          OR EXISTS (
+              SELECT 1
+              FROM json_each(NEW.source_snapshots_json) AS left_snapshot
+              JOIN json_each(NEW.source_snapshots_json) AS right_snapshot
+                ON CAST(left_snapshot.key AS INTEGER) <
+                   CAST(right_snapshot.key AS INTEGER)
+              WHERE json_extract(left_snapshot.value, '$.generationId') =
+                    json_extract(right_snapshot.value, '$.generationId')
+                 OR json_extract(left_snapshot.value, '$.materialId') =
+                    json_extract(right_snapshot.value, '$.materialId')
+                 OR json_extract(left_snapshot.value, '$.selectionId') =
+                    json_extract(right_snapshot.value, '$.selectionId')
+          )
+          OR NOT json_valid(NEW.expected_proposal_source_refs_json)
+          OR json_type(NEW.expected_proposal_source_refs_json) <> 'array'
+          OR json(NEW.expected_proposal_source_refs_json) <>
+             NEW.expected_proposal_source_refs_json
+          OR case_assistant_sha256(
+                 NEW.expected_proposal_source_refs_json
+             ) <> NEW.expected_proposal_source_refs_sha256
+          OR (
+              NEW.output_kind <> 'case_analysis'
+              AND NEW.expected_proposal_source_refs_json <> '[]'
+          )
+          OR EXISTS (
+              WITH RECURSIVE control_code(value) AS (
+                  SELECT 0
+                  UNION ALL
+                  SELECT value + 1 FROM control_code WHERE value < 31
+              )
+              SELECT 1
+              FROM json_each(
+                  NEW.expected_proposal_source_refs_json
+              ) AS source_ref
+              WHERE source_ref.type <> 'text'
+                 OR length(CAST(source_ref.value AS BLOB))
+                    NOT BETWEEN 1 AND 256
+                 OR instr(
+                        CAST(source_ref.value AS TEXT),
+                        char(127)
+                    ) > 0
+                 OR EXISTS (
+                        SELECT 1
+                        FROM control_code
+                        WHERE instr(
+                            CAST(source_ref.value AS TEXT),
+                            char(control_code.value)
+                        ) > 0
+                    )
+          )
+          OR EXISTS (
+              SELECT 1
+              FROM json_each(
+                  NEW.expected_proposal_source_refs_json
+              ) AS current
+              JOIN json_each(
+                  NEW.expected_proposal_source_refs_json
+              ) AS previous
+                ON CAST(previous.key AS INTEGER) =
+                   CAST(current.key AS INTEGER) - 1
+              WHERE CAST(previous.value AS TEXT) >=
+                    CAST(current.value AS TEXT)
+          )
+          OR NOT json_valid(NEW.output_payload_json)
+          OR json_type(NEW.output_payload_json) <> 'object'
+          OR json(NEW.output_payload_json) <> NEW.output_payload_json
+          OR json_remove(
+                 NEW.output_payload_json,
+                 '$.content', '$.outputKind', '$.schemaVersion'
+             ) <> '{}'
+          OR COALESCE(
+                 json_type(NEW.output_payload_json, '$.outputKind') <> 'text',
+                 1
+             )
+          OR json_extract(NEW.output_payload_json, '$.outputKind') <>
+             NEW.output_kind
+          OR COALESCE(
+                 json_type(NEW.output_payload_json, '$.schemaVersion') <> 'integer',
+                 1
+             )
+          OR json_extract(NEW.output_payload_json, '$.schemaVersion') <> 1
+          OR json_type(NEW.output_payload_json, '$.content') IS NULL
+          OR json_type(NEW.output_payload_json, '$.content') = 'null'
+          OR case_assistant_sha256(NEW.output_payload_json) <> NEW.output_sha256
+          OR NOT EXISTS (
+              SELECT 1
+              FROM tool_calls AS tool_call
+              WHERE tool_call.run_id = NEW.run_id
+                AND tool_call.ordinal = 0
+                AND tool_call.capability_name = 'assistant.case_work'
+                AND json_extract(
+                    tool_call.input_audit_json,
+                    '$.inputIds.projectId'
+                ) = NEW.project_id
+                AND json_extract(
+                    tool_call.input_audit_json,
+                    '$.inputIds.conversationId'
+                ) = NEW.conversation_id
+                AND json_extract(
+                    tool_call.input_audit_json,
+                    '$.inputHashes.workspaceDigest'
+                ) = NEW.workspace_base_digest
+                AND json_extract(
+                    tool_call.output_audit_json,
+                    '$.outputIds.pendingOutputKind'
+                ) = NEW.output_kind
+                AND json_extract(
+                    tool_call.output_audit_json,
+                    '$.outputHashes.typedOutputSha256'
+                ) = NEW.output_sha256
+                AND json_extract(
+                    tool_call.output_audit_json,
+                    '$.outputHashes.proposalSourceRefsSha256'
+                ) = NEW.expected_proposal_source_refs_sha256
+                AND json_extract(
+                    tool_call.source_audit_json,
+                    '$.inputHashes.projectBindingSha256'
+                ) = NEW.project_binding_sha256
+                AND json_extract(
+                    tool_call.source_audit_json,
+                    '$.inputHashes.sourceSnapshotsSha256'
+                ) = NEW.source_snapshots_sha256
+                AND json_array_length(
+                    tool_call.input_audit_json,
+                    '$.inputIds.redactionGenerationIds'
+                ) = json_array_length(NEW.source_snapshots_json)
+                AND json_array_length(
+                    tool_call.source_audit_json,
+                    '$.sourceRefs'
+                ) = json_array_length(NEW.source_snapshots_json)
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(NEW.source_snapshots_json) AS snapshot
+                    WHERE json_extract(
+                              tool_call.input_audit_json,
+                              '$.inputIds.redactionGenerationIds[' ||
+                                  snapshot.key || ']'
+                          ) <> json_extract(snapshot.value, '$.generationId')
+                       OR json_extract(
+                              tool_call.source_audit_json,
+                              '$.sourceRefs[' || snapshot.key || ']'
+                          ) <> json_extract(snapshot.value, '$.generationId')
+                )
+          )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'case assistant pending output must match its closed hashed audit'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_pending_outputs_scope_insert
+        BEFORE INSERT ON case_assistant_pending_outputs
+        WHEN NEW.status <> 'pending'
+          OR NEW.row_version <> 1
+          OR NEW.confirmed_artifact_id IS NOT NULL
+          OR NEW.confirmed_proposal_id IS NOT NULL
+          OR NEW.confirmation_request_sha256 IS NOT NULL
+          OR NEW.confirmed_at IS NOT NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM conversations AS conversation
+              JOIN agent_runs AS run
+                ON run.run_id = NEW.run_id
+               AND run.conversation_id = conversation.conversation_id
+              JOIN tool_calls AS tool_call
+                ON tool_call.run_id = run.run_id
+               AND tool_call.ordinal = 0
+               AND tool_call.capability_name = 'assistant.case_work'
+               AND tool_call.status = 'succeeded'
+               AND tool_call.access_mode = 'write'
+               AND tool_call.requires_confirmation = 0
+               AND tool_call.error_type IS NULL
+               AND tool_call.finished_at IS NOT NULL
+              JOIN messages AS user_message
+                ON user_message.message_id = run.user_message_id
+               AND user_message.conversation_id = conversation.conversation_id
+               AND user_message.role = 'user'
+               AND user_message.kind = 'text'
+               AND user_message.artifact_id IS NULL
+               AND user_message.run_id IS NULL
+              JOIN messages AS message
+                ON message.message_id = NEW.assistant_message_id
+               AND message.conversation_id = conversation.conversation_id
+               AND message.run_id = run.run_id
+               AND message.role = 'assistant'
+               AND message.kind = 'text'
+               AND message.artifact_id IS NULL
+               AND message.text_summary = NEW.output_preview
+              WHERE conversation.conversation_id = NEW.conversation_id
+                AND conversation.project_id = NEW.project_id
+                AND conversation.scope = 'case_work'
+                AND run.assistant_message_id = NEW.assistant_message_id
+                AND run.intent = 'interactive_case_work'
+                AND run.status = 'succeeded'
+                AND run.error_type IS NULL
+                AND run.finished_at IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM tool_calls AS other_tool_call
+                    WHERE other_tool_call.run_id = run.run_id
+                      AND other_tool_call.tool_call_id <> tool_call.tool_call_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM message_attachments AS attachment
+                    WHERE attachment.message_id IN (
+                        run.user_message_id,
+                        NEW.assistant_message_id
+                    )
+                )
+          )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'case assistant pending output must match a successful case-work run'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_pending_outputs_append_preserving
+        BEFORE UPDATE ON case_assistant_pending_outputs
+        WHEN NEW.pending_output_id IS NOT OLD.pending_output_id
+          OR NEW.project_id IS NOT OLD.project_id
+          OR NEW.conversation_id IS NOT OLD.conversation_id
+          OR NEW.run_id IS NOT OLD.run_id
+          OR NEW.assistant_message_id IS NOT OLD.assistant_message_id
+          OR NEW.project_binding_sha256 IS NOT OLD.project_binding_sha256
+          OR NEW.source_snapshots_json IS NOT OLD.source_snapshots_json
+          OR NEW.source_snapshots_sha256 IS NOT OLD.source_snapshots_sha256
+          OR NEW.expected_proposal_source_refs_json IS NOT
+             OLD.expected_proposal_source_refs_json
+          OR NEW.expected_proposal_source_refs_sha256 IS NOT
+             OLD.expected_proposal_source_refs_sha256
+          OR NEW.output_kind IS NOT OLD.output_kind
+          OR NEW.output_payload_json IS NOT OLD.output_payload_json
+          OR NEW.output_preview IS NOT OLD.output_preview
+          OR NEW.output_sha256 IS NOT OLD.output_sha256
+          OR NEW.output_version IS NOT OLD.output_version
+          OR NEW.workspace_base_digest IS NOT OLD.workspace_base_digest
+          OR NEW.created_at IS NOT OLD.created_at
+          OR OLD.status <> 'pending'
+          OR NEW.status <> 'confirmed'
+          OR NEW.confirmation_request_sha256 IS NULL
+          OR NEW.confirmed_at IS NULL
+          OR NEW.row_version <> OLD.row_version + 1
+        BEGIN
+            SELECT RAISE(ABORT, 'case assistant pending output history is append preserving');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_pending_outputs_confirmation_target
+        BEFORE UPDATE OF status, confirmed_artifact_id, confirmed_proposal_id
+        ON case_assistant_pending_outputs
+        WHEN NEW.status = 'confirmed' AND (
+            (
+                NEW.output_kind = 'case_analysis'
+                AND NOT EXISTS (
+                    SELECT 1 FROM case_change_proposals AS proposal
+                    WHERE proposal.proposal_id = NEW.confirmed_proposal_id
+                      AND proposal.project_id = NEW.project_id
+                      AND proposal.conversation_id = NEW.conversation_id
+                      AND proposal.run_id = NEW.run_id
+                      AND proposal.status = 'applied'
+                      AND proposal.base_case_digest =
+                          NEW.workspace_base_digest
+                      AND json(proposal.changes_json) =
+                          json(json_extract(
+                              NEW.output_payload_json,
+                              '$.content'
+                          ))
+                      AND proposal.source_refs_json =
+                          NEW.expected_proposal_source_refs_json
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM json_each(proposal.source_refs_json) AS source
+                          WHERE source.type <> 'text'
+                             OR length(source.value) = 0
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM json_each(proposal.source_refs_json) AS current
+                          JOIN json_each(proposal.source_refs_json) AS previous
+                            ON CAST(previous.key AS INTEGER) =
+                               CAST(current.key AS INTEGER) - 1
+                          WHERE CAST(previous.value AS TEXT) >=
+                                CAST(current.value AS TEXT)
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM json_tree(proposal.changes_json) AS referenced
+                          LEFT JOIN json_tree(proposal.changes_json) AS container
+                            ON container.id = referenced.parent
+                          WHERE (
+                                  referenced.key = 'sourceRef'
+                                  OR referenced.key IN (
+                                      'attachmentId',
+                                      'artifactId'
+                                  )
+                                  OR (
+                                      container.key = 'sourceRefs'
+                                      AND container.type = 'array'
+                                  )
+                                )
+                            AND referenced.type = 'text'
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM json_each(
+                                    proposal.source_refs_json
+                                ) AS canonical_source
+                                WHERE canonical_source.value =
+                                      referenced.value
+                            )
+                      )
+                )
+            )
+            OR
+            (
+                NEW.output_kind IN ('case_document', 'case_diagram')
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM artifacts AS artifact
+                    JOIN artifact_versions AS version
+                      ON version.artifact_id = artifact.artifact_id
+                     AND version.version_number = 1
+                    JOIN agent_runs AS run ON run.run_id = NEW.run_id
+                    WHERE artifact.artifact_id = NEW.confirmed_artifact_id
+                      AND artifact.project_id = NEW.project_id
+                      AND artifact.conversation_id = NEW.conversation_id
+                      AND artifact.status <> 'archived'
+                      AND artifact.current_version = 1
+                      AND artifact.kind = CASE NEW.output_kind
+                          WHEN 'case_document' THEN 'document'
+                          WHEN 'case_diagram' THEN 'map'
+                      END
+                      AND version.rendered_text = NEW.output_preview
+                      AND json(version.content_json) =
+                          json(json_extract(
+                              NEW.output_payload_json,
+                              '$.content'
+                          ))
+                      AND json(version.provider_snapshot_json) =
+                          json(run.provider_snapshot_json)
+                )
+            )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'case assistant confirmation target does not match its pending output'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_pending_outputs_no_delete
+        BEFORE DELETE ON case_assistant_pending_outputs
+        BEGIN
+            SELECT RAISE(ABORT, 'case assistant pending output history is append preserving');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_conversation_no_delete
+        BEFORE DELETE ON conversations
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.conversation_id = OLD.conversation_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'live case assistant conversation lineage cannot be deleted'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_run_no_delete
+        BEFORE DELETE ON agent_runs
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.run_id = OLD.run_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'live case assistant run lineage cannot be deleted');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_run_lineage_immutable
+        BEFORE UPDATE OF
+            run_id, conversation_id, user_message_id, assistant_message_id,
+            provider_snapshot_json, intent, status, budget_json, error_type,
+            created_at, finished_at
+        ON agent_runs
+        WHEN (
+            NEW.run_id IS NOT OLD.run_id
+            OR NEW.conversation_id IS NOT OLD.conversation_id
+            OR NEW.user_message_id IS NOT OLD.user_message_id
+            OR NEW.assistant_message_id IS NOT OLD.assistant_message_id
+            OR NEW.provider_snapshot_json IS NOT OLD.provider_snapshot_json
+            OR NEW.intent IS NOT OLD.intent
+            OR NEW.status IS NOT OLD.status
+            OR NEW.budget_json IS NOT OLD.budget_json
+            OR NEW.error_type IS NOT OLD.error_type
+            OR NEW.created_at IS NOT OLD.created_at
+            OR NEW.finished_at IS NOT OLD.finished_at
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.run_id = OLD.run_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'live case assistant run lineage is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_message_no_delete
+        BEFORE DELETE ON messages
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            JOIN agent_runs AS run ON run.run_id = output.run_id
+            WHERE (
+                    output.assistant_message_id = OLD.message_id
+                    OR run.user_message_id = OLD.message_id
+                    OR run.assistant_message_id = OLD.message_id
+                  )
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'live case assistant message lineage cannot be deleted');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_message_lineage_immutable
+        BEFORE UPDATE OF
+            message_id, conversation_id, role, kind, text_summary,
+            artifact_id, run_id, created_at
+        ON messages
+        WHEN (
+            NEW.message_id IS NOT OLD.message_id
+            OR NEW.conversation_id IS NOT OLD.conversation_id
+            OR NEW.role IS NOT OLD.role
+            OR NEW.kind IS NOT OLD.kind
+            OR NEW.text_summary IS NOT OLD.text_summary
+            OR NEW.artifact_id IS NOT OLD.artifact_id
+            OR NEW.run_id IS NOT OLD.run_id
+            OR NEW.created_at IS NOT OLD.created_at
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            JOIN agent_runs AS run ON run.run_id = output.run_id
+            WHERE (
+                    output.assistant_message_id = OLD.message_id
+                    OR run.user_message_id = OLD.message_id
+                    OR run.assistant_message_id = OLD.message_id
+                  )
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'live case assistant message lineage is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_message_attachment_no_insert
+        BEFORE INSERT ON message_attachments
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            JOIN agent_runs AS run ON run.run_id = output.run_id
+            WHERE NEW.message_id IN (
+                    run.user_message_id,
+                    output.assistant_message_id
+                  )
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'live case assistant messages cannot gain attachments'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_message_attachment_no_update
+        BEFORE UPDATE ON message_attachments
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            JOIN agent_runs AS run ON run.run_id = output.run_id
+            WHERE NEW.message_id IN (
+                    run.user_message_id,
+                    output.assistant_message_id
+                  )
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'live case assistant messages cannot gain attachments'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_tool_call_no_insert
+        BEFORE INSERT ON tool_calls
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.run_id = NEW.run_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'live case assistant run cannot gain tool audits');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_tool_call_no_delete
+        BEFORE DELETE ON tool_calls
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.run_id = OLD.run_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'live case assistant tool audit cannot be deleted');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_live_tool_call_immutable
+        BEFORE UPDATE ON tool_calls
+        WHEN (
+            NEW.tool_call_id IS NOT OLD.tool_call_id
+            OR NEW.run_id IS NOT OLD.run_id
+            OR NEW.ordinal IS NOT OLD.ordinal
+            OR NEW.capability_name IS NOT OLD.capability_name
+            OR NEW.status IS NOT OLD.status
+            OR NEW.access_mode IS NOT OLD.access_mode
+            OR NEW.requires_confirmation IS NOT OLD.requires_confirmation
+            OR NEW.input_audit_json IS NOT OLD.input_audit_json
+            OR NEW.output_audit_json IS NOT OLD.output_audit_json
+            OR NEW.source_audit_json IS NOT OLD.source_audit_json
+            OR NEW.error_type IS NOT OLD.error_type
+            OR NEW.started_at IS NOT OLD.started_at
+            OR NEW.finished_at IS NOT OLD.finished_at
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.run_id = OLD.run_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'live case assistant tool audit is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_confirmed_artifact_scope_immutable
+        BEFORE UPDATE OF artifact_id, conversation_id, project_id, kind, status ON artifacts
+        WHEN EXISTS (
+            SELECT 1 FROM case_assistant_pending_outputs AS output
+            WHERE output.confirmed_artifact_id = OLD.artifact_id
+              AND output.status = 'confirmed'
+              AND (
+                  NEW.artifact_id IS NOT OLD.artifact_id
+                  OR NEW.conversation_id IS NOT OLD.conversation_id
+                  OR NEW.project_id IS NOT OLD.project_id
+                  OR NEW.kind IS NOT OLD.kind
+                  OR NEW.status = 'archived'
+              )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'confirmed case assistant artifact scope is immutable'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_confirmed_artifact_no_delete
+        BEFORE DELETE ON artifacts
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.confirmed_artifact_id = OLD.artifact_id
+              AND output.status = 'confirmed'
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'live confirmed case assistant artifact cannot be deleted'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_confirmed_artifact_v1_immutable
+        BEFORE UPDATE ON artifact_versions
+        WHEN OLD.version_number = 1
+          AND (
+              NEW.version_id IS NOT OLD.version_id
+              OR NEW.artifact_id IS NOT OLD.artifact_id
+              OR NEW.version_number IS NOT OLD.version_number
+              OR NEW.content_json IS NOT OLD.content_json
+              OR NEW.rendered_text IS NOT OLD.rendered_text
+              OR NEW.source_refs_json IS NOT OLD.source_refs_json
+              OR NEW.citation_report_json IS NOT OLD.citation_report_json
+              OR NEW.provider_snapshot_json IS NOT OLD.provider_snapshot_json
+              OR NEW.created_at IS NOT OLD.created_at
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM case_assistant_pending_outputs AS output
+              WHERE output.confirmed_artifact_id = OLD.artifact_id
+                AND output.status = 'confirmed'
+                AND NOT EXISTS (
+                    SELECT 1 FROM retired_case_project_ids AS retired
+                    WHERE retired.project_id = output.project_id
+                      AND case_retirement_authorized(
+                            retired.project_id,
+                            retired.retirement_reason,
+                            retired.privacy_deletion_id
+                          ) = 1
+                )
+          )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'confirmed case assistant artifact version one is immutable'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_confirmed_artifact_v1_no_delete
+        BEFORE DELETE ON artifact_versions
+        WHEN OLD.version_number = 1
+          AND EXISTS (
+              SELECT 1
+              FROM case_assistant_pending_outputs AS output
+              WHERE output.confirmed_artifact_id = OLD.artifact_id
+                AND output.status = 'confirmed'
+                AND NOT EXISTS (
+                    SELECT 1 FROM retired_case_project_ids AS retired
+                    WHERE retired.project_id = output.project_id
+                      AND case_retirement_authorized(
+                            retired.project_id,
+                            retired.retirement_reason,
+                            retired.privacy_deletion_id
+                          ) = 1
+                )
+          )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'confirmed case assistant artifact version one cannot be deleted'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_confirmed_proposal_scope_immutable
+        BEFORE UPDATE OF
+            proposal_id, conversation_id, project_id, run_id, base_case_digest,
+            status, changes_json, source_refs_json, created_at, decided_at, applied_at
+        ON case_change_proposals
+        WHEN EXISTS (
+            SELECT 1 FROM case_assistant_pending_outputs AS output
+            WHERE output.confirmed_proposal_id = OLD.proposal_id
+              AND output.status = 'confirmed'
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+              AND (
+                  NEW.proposal_id IS NOT OLD.proposal_id
+                  OR NEW.conversation_id IS NOT OLD.conversation_id
+                  OR NEW.project_id IS NOT OLD.project_id
+                  OR NEW.run_id IS NOT OLD.run_id
+                  OR NEW.base_case_digest IS NOT OLD.base_case_digest
+                  OR NEW.status IS NOT OLD.status
+                  OR NEW.changes_json IS NOT OLD.changes_json
+                  OR NEW.source_refs_json IS NOT OLD.source_refs_json
+                  OR NEW.created_at IS NOT OLD.created_at
+                  OR NEW.decided_at IS NOT OLD.decided_at
+                  OR NEW.applied_at IS NOT OLD.applied_at
+              )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'confirmed case assistant proposal scope is immutable'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_case_assistant_confirmed_proposal_no_delete
+        BEFORE DELETE ON case_change_proposals
+        WHEN EXISTS (
+            SELECT 1
+            FROM case_assistant_pending_outputs AS output
+            WHERE output.confirmed_proposal_id = OLD.proposal_id
+              AND output.status = 'confirmed'
+              AND NOT EXISTS (
+                  SELECT 1 FROM retired_case_project_ids AS retired
+                  WHERE retired.project_id = output.project_id
+                    AND case_retirement_authorized(
+                          retired.project_id,
+                          retired.retirement_reason,
+                          retired.privacy_deletion_id
+                        ) = 1
+              )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'live confirmed case assistant proposal cannot be deleted'
+            );
+        END;
 
         CREATE TABLE IF NOT EXISTS operation_audit (
             audit_id TEXT PRIMARY KEY CHECK (length(audit_id) > 0),
@@ -6891,6 +11292,10 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             ON case_change_proposals(conversation_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_case_change_proposals_project_status
             ON case_change_proposals(project_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_case_assistant_pending_outputs_conversation_created
+            ON case_assistant_pending_outputs(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_case_assistant_pending_outputs_project_status
+            ON case_assistant_pending_outputs(project_id, status, created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_audit_idempotency
             ON operation_audit(origin, operation, idempotency_key_hash)
             WHERE idempotency_key_hash IS NOT NULL;
@@ -6947,9 +11352,17 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
         CREATE TRIGGER IF NOT EXISTS trg_projects_detach_assistant_data_before_delete
         BEFORE DELETE ON projects
         BEGIN
+            DELETE FROM artifacts
+            WHERE conversation_id IN (
+                SELECT conversation_id
+                FROM conversations
+                WHERE project_id = OLD.project_id AND scope = 'case_work'
+            );
+            DELETE FROM conversations
+            WHERE project_id = OLD.project_id AND scope = 'case_work';
             UPDATE conversations
             SET project_id = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE project_id = OLD.project_id;
+            WHERE project_id = OLD.project_id AND scope = 'assistant';
             UPDATE legal_answer_records SET project_id = NULL WHERE project_id = OLD.project_id;
         END;
 
@@ -6975,10 +11388,21 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
             ON document_generation_records(project_id, exported_at);
         ",
     )?;
+    install_case_assistant_closed_audit_triggers(&transaction)?;
 
+    let suspended_pending_output_triggers =
+        if staged_tables.contains("case_assistant_pending_outputs") {
+            suspend_case_assistant_pending_output_migration_triggers(&transaction)?
+        } else {
+            Vec::new()
+        };
     if !staged_tables.is_empty() {
         migrate_staged_user_tables(&transaction, &staged_tables)?;
     }
+    restore_case_assistant_pending_output_migration_triggers(
+        &transaction,
+        &suspended_pending_output_triggers,
+    )?;
 
     transaction.execute(
         "
@@ -7036,6 +11460,156 @@ fn existing_user_schema_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_PRIVACY_DELETION_ID: &str = "pdel_00000000000000000000000000000000";
+
+    fn retirement_authorized(
+        connection: &rusqlite::Connection,
+        project_id: &str,
+        retirement_reason: &str,
+        privacy_deletion_id: Option<&str>,
+    ) -> i64 {
+        connection
+            .query_row(
+                "SELECT case_retirement_authorized(?1,?2,?3)",
+                params![project_id, retirement_reason, privacy_deletion_id],
+                |row| row.get(0),
+            )
+            .expect("retirement authority UDF evaluates")
+    }
+
+    #[test]
+    fn case_retirement_authority_is_exact_connection_scoped_and_raii_cleared() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let first = open_user_database(&database_path).expect("first database connection opens");
+        let second = open_user_database(&database_path).expect("second database connection opens");
+        let first_nonce =
+            case_retirement_connection_nonce(&first).expect("first connection nonce reads");
+        let second_nonce =
+            case_retirement_connection_nonce(&second).expect("second connection nonce reads");
+        assert!(second_nonce > first_nonce);
+        assert_eq!(
+            retirement_authorized(
+                &first,
+                "authority-project",
+                "case_project_deleted",
+                Some(TEST_PRIVACY_DELETION_ID)
+            ),
+            0
+        );
+
+        with_case_retirement_authority(
+            &first,
+            "authority-project",
+            "case_project_deleted",
+            Some(TEST_PRIVACY_DELETION_ID),
+            || {
+                assert_eq!(
+                    retirement_authorized(
+                        &first,
+                        "authority-project",
+                        "case_project_deleted",
+                        Some(TEST_PRIVACY_DELETION_ID)
+                    ),
+                    1
+                );
+                assert_eq!(
+                    retirement_authorized(
+                        &first,
+                        "other-project",
+                        "case_project_deleted",
+                        Some(TEST_PRIVACY_DELETION_ID)
+                    ),
+                    0
+                );
+                assert_eq!(
+                    retirement_authorized(
+                        &first,
+                        "authority-project",
+                        "privacy_journal_recovery",
+                        Some(TEST_PRIVACY_DELETION_ID)
+                    ),
+                    0
+                );
+                assert_eq!(
+                    retirement_authorized(
+                        &first,
+                        "authority-project",
+                        "case_project_deleted",
+                        None
+                    ),
+                    0
+                );
+                assert_eq!(
+                    retirement_authorized(
+                        &second,
+                        "authority-project",
+                        "case_project_deleted",
+                        Some(TEST_PRIVACY_DELETION_ID)
+                    ),
+                    0,
+                    "authority from connection A must not authorize connection B"
+                );
+                Ok(())
+            },
+        )
+        .expect("exact authority scope succeeds");
+        assert_eq!(
+            retirement_authorized(
+                &first,
+                "authority-project",
+                "case_project_deleted",
+                Some(TEST_PRIVACY_DELETION_ID)
+            ),
+            0
+        );
+
+        let forced_error = with_case_retirement_authority(
+            &first,
+            "authority-project",
+            "case_project_deleted",
+            Some(TEST_PRIVACY_DELETION_ID),
+            || -> rusqlite::Result<()> {
+                Err(user_schema_migration_error(
+                    "forced retirement authority error".to_owned(),
+                ))
+            },
+        );
+        assert!(forced_error.is_err());
+        assert_eq!(
+            retirement_authorized(
+                &first,
+                "authority-project",
+                "case_project_deleted",
+                Some(TEST_PRIVACY_DELETION_ID)
+            ),
+            0,
+            "error return must clear retirement authority"
+        );
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_case_retirement_authority::<()>(
+                &first,
+                "authority-project",
+                "case_project_deleted",
+                Some(TEST_PRIVACY_DELETION_ID),
+                || panic!("forced retirement authority unwind"),
+            )
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            retirement_authorized(
+                &first,
+                "authority-project",
+                "case_project_deleted",
+                Some(TEST_PRIVACY_DELETION_ID)
+            ),
+            0,
+            "panic unwind must clear retirement authority"
+        );
+    }
 
     #[test]
     fn user_database_is_created_under_app_local_data_dir() {
@@ -7766,12 +12340,10 @@ mod tests {
             .expect_err("canonical evidence UNIQUE rejects duplicate project number");
         assert!(matches!(unique_error, rusqlite::Error::SqliteFailure(_, _)));
 
-        connection
-            .execute(
-                "DELETE FROM projects WHERE project_id = 'legacy-project'",
-                [],
-            )
-            .expect("canonical project cascade deletes migrated children");
+        assert!(
+            delete_case_project(&connection, "legacy-project", TEST_PRIVACY_DELETION_ID)
+                .expect("canonical project cascade deletes migrated children")
+        );
         for table in [
             "case_files",
             "case_parties",
@@ -8807,7 +13379,10 @@ mod tests {
             .expect("workspace still exists");
         assert_eq!(updated.facts[0].title, "Contract executed");
 
-        assert!(delete_case_project(&connection, "project-1").expect("project deletes"));
+        assert!(
+            delete_case_project(&connection, "project-1", TEST_PRIVACY_DELETION_ID)
+                .expect("project deletes")
+        );
         for table in [
             "case_files",
             "case_extraction_confirmations",
@@ -10090,7 +14665,10 @@ mod tests {
         assert!(!project_records[0]
             .answer_text
             .contains("full provider response"));
-        assert!(delete_case_project(&connection, "project-answer").expect("project deletes"));
+        assert!(
+            delete_case_project(&connection, "project-answer", TEST_PRIVACY_DELETION_ID)
+                .expect("project deletes")
+        );
         assert!(
             list_legal_answer_records_for_project(&connection, "project-answer", 10)
                 .expect("deleted project records list")
@@ -10359,11 +14937,12 @@ mod tests {
     }
 
     #[test]
-    fn v10_schema_exposes_exact_assistant_and_operation_audit_objects() {
+    fn v11_schema_exposes_exact_assistant_case_lineage_and_operation_audit_objects() {
         let directory = tempfile::tempdir().expect("tempdir exists");
         let database_path = ensure_user_database(directory.path()).expect("database is created");
         let connection = open_user_database(&database_path).expect("database opens");
         for table in [
+            "retired_case_project_ids",
             "conversations",
             "artifacts",
             "artifact_versions",
@@ -10374,12 +14953,13 @@ mod tests {
             "agent_runs",
             "tool_calls",
             "case_change_proposals",
+            "case_assistant_pending_outputs",
             "operation_audit",
         ] {
             assert_eq!(
                 sqlite_master_count(&connection, table),
                 1,
-                "v10 table {table} must exist exactly once"
+                "v11 table {table} must exist exactly once"
             );
         }
         for index in [
@@ -10398,6 +14978,8 @@ mod tests {
             "idx_tool_calls_status",
             "idx_case_change_proposals_conversation_created",
             "idx_case_change_proposals_project_status",
+            "idx_case_assistant_pending_outputs_conversation_created",
+            "idx_case_assistant_pending_outputs_project_status",
             "idx_operation_audit_idempotency",
             "idx_operation_audit_project_created",
             "idx_legal_answer_records_conversation_created",
@@ -10405,10 +14987,15 @@ mod tests {
             assert_eq!(
                 sqlite_master_count(&connection, index),
                 1,
-                "v10 index {index} must exist exactly once"
+                "v11 index {index} must exist exactly once"
             );
         }
         for trigger in [
+            "trg_retired_case_project_ids_authorized_insert",
+            "trg_retired_case_project_ids_no_update",
+            "trg_retired_case_project_ids_no_delete",
+            "trg_projects_reject_retired_id",
+            "trg_projects_require_retirement_before_delete",
             "trg_projects_detach_assistant_data_before_delete",
             "trg_artifacts_scope_insert",
             "trg_artifacts_scope_update",
@@ -10418,13 +15005,39 @@ mod tests {
             "trg_agent_runs_message_scope_update",
             "trg_case_change_proposals_scope_insert",
             "trg_case_change_proposals_scope_update",
+            "trg_conversations_scope_immutable",
+            "trg_case_assistant_pending_outputs_closed_contract_insert",
+            "trg_case_assistant_pending_outputs_scope_insert",
+            "trg_case_assistant_pending_outputs_append_preserving",
+            "trg_case_assistant_pending_outputs_confirmation_target",
+            "trg_case_assistant_pending_outputs_no_delete",
+            "trg_case_assistant_run_provider_audit_insert",
+            "trg_case_assistant_run_provider_audit_update",
+            "trg_case_assistant_tool_audit_insert",
+            "trg_case_assistant_tool_audit_update",
+            "trg_case_assistant_live_conversation_no_delete",
+            "trg_case_assistant_live_run_no_delete",
+            "trg_case_assistant_live_run_lineage_immutable",
+            "trg_case_assistant_live_message_no_delete",
+            "trg_case_assistant_live_message_lineage_immutable",
+            "trg_case_assistant_live_message_attachment_no_insert",
+            "trg_case_assistant_live_message_attachment_no_update",
+            "trg_case_assistant_live_tool_call_no_insert",
+            "trg_case_assistant_live_tool_call_no_delete",
+            "trg_case_assistant_live_tool_call_immutable",
+            "trg_case_assistant_confirmed_artifact_scope_immutable",
+            "trg_case_assistant_confirmed_artifact_no_delete",
+            "trg_case_assistant_confirmed_artifact_v1_immutable",
+            "trg_case_assistant_confirmed_artifact_v1_no_delete",
+            "trg_case_assistant_confirmed_proposal_scope_immutable",
+            "trg_case_assistant_confirmed_proposal_no_delete",
             "trg_legal_answer_records_scope_insert",
             "trg_legal_answer_records_scope_update",
         ] {
             assert_eq!(
                 sqlite_master_count(&connection, trigger),
                 1,
-                "v10 trigger {trigger} must exist exactly once"
+                "v11 trigger {trigger} must exist exactly once"
             );
         }
 
@@ -10464,12 +15077,18 @@ mod tests {
         assert!(proposal_fks.iter().any(|contract| {
             contract.target_table == "conversations" && contract.on_delete == "CASCADE"
         }));
+        assert!(
+            table_foreign_key_contracts(&connection, "case_assistant_pending_outputs")
+                .expect("pending output foreign keys read")
+                .is_empty(),
+            "pending output audit identifiers must remain opaque after retirement"
+        );
         let audit_fks = table_foreign_key_contracts(&connection, "operation_audit")
             .expect("operation audit foreign keys read");
         assert!(audit_fks.iter().any(|contract| {
             contract.target_table == "projects" && contract.on_delete == "SET NULL"
         }));
-        validate_user_database_read_only(&database_path).expect("v10 schema is canonical");
+        validate_user_database_read_only(&database_path).expect("v11 schema is canonical");
     }
 
     #[test]
@@ -10555,12 +15174,10 @@ mod tests {
             "idempotency key must be unique per operation"
         );
 
-        connection
-            .execute(
-                "DELETE FROM projects WHERE project_id = 'audit-project'",
-                [],
-            )
-            .expect("project deletion succeeds");
+        assert!(
+            delete_case_project(&connection, "audit-project", TEST_PRIVACY_DELETION_ID)
+                .expect("project deletion succeeds")
+        );
         let detached = get_operation_audit(&connection, "audit-1")
             .expect("audit reload succeeds")
             .expect("audit remains after project deletion");
@@ -10890,8 +15507,12 @@ mod tests {
             "conversation-project"
         )
         .expect("conversation binds"));
-        assert!(delete_case_project(&connection, "conversation-project")
-            .expect("bound project deletes"));
+        assert!(delete_case_project(
+            &connection,
+            "conversation-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("bound project deletes"));
         assert_eq!(
             get_conversation(&connection, "conversation-free")
                 .expect("conversation reads")
@@ -11460,8 +16081,10 @@ mod tests {
             .to_string()
             .contains("message artifact and run must remain"));
 
-        assert!(delete_case_project(&connection, "scope-project-a")
-            .expect("project deletion succeeds with strict scope triggers"));
+        assert!(
+            delete_case_project(&connection, "scope-project-a", TEST_PRIVACY_DELETION_ID)
+                .expect("project deletion succeeds with strict scope triggers")
+        );
         assert_eq!(
             get_conversation(&connection, "scope-conversation-a")
                 .unwrap()
@@ -12130,6 +16753,2211 @@ mod tests {
     }
 
     #[test]
+    fn v10_conversations_migrate_to_authoritative_assistant_scope_without_inference() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path = directory.path().join(USER_DB_FILE_NAME);
+        let connection = rusqlite::Connection::open(&database_path).expect("legacy opens");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE user_database_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO user_database_metadata(key, value)
+                VALUES('schema_version', '10');
+                INSERT INTO user_database_metadata(key, value)
+                VALUES('canonical_schema_version', 'v10-operation-audit-20260717');
+                CREATE TABLE projects (
+                    project_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                INSERT INTO projects(project_id, title, status)
+                VALUES('legacy-project', 'Legacy project', 'active');
+                CREATE TABLE conversations (
+                    conversation_id TEXT PRIMARY KEY,
+                    project_id TEXT,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO conversations(
+                    conversation_id, project_id, title, status, created_at, updated_at
+                ) VALUES(
+                    'legacy-project-conversation', 'legacy-project', 'Legacy project chat',
+                    'open', '2026-07-01 01:02:03', '2026-07-02 04:05:06'
+                );
+                ",
+            )
+            .expect("v10 rows seed");
+        drop(connection);
+
+        validate_and_migrate_user_database(&database_path).expect("v10 migrates");
+        let connection = open_user_database(&database_path).expect("migrated database opens");
+        let conversation = get_conversation(&connection, "legacy-project-conversation")
+            .expect("assistant read succeeds")
+            .expect("legacy conversation remains");
+        assert_eq!(conversation.scope, ConversationScope::Assistant);
+        assert_eq!(conversation.project_id.as_deref(), Some("legacy-project"));
+        assert_eq!(conversation.created_at, "2026-07-01 01:02:03");
+        assert_eq!(conversation.updated_at, "2026-07-02 04:05:06");
+        assert!(get_case_work_conversation(
+            &connection,
+            "legacy-project-conversation",
+            "legacy-project"
+        )
+        .expect("case-work read stays isolated")
+        .is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM user_database_metadata WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("schema version reads"),
+            "11"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM case_assistant_pending_outputs",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("pending table reads"),
+            0
+        );
+    }
+
+    #[test]
+    fn conversation_scope_repository_apis_are_backend_isolated_and_transactional() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "scope-project-a");
+        seed_project(&connection, "scope-project-b");
+
+        create_conversation(
+            &connection,
+            "assistant-scoped",
+            Some("scope-project-a"),
+            "Assistant",
+        )
+        .expect("assistant conversation creates");
+        create_case_work_conversation(
+            &connection,
+            "case-work-scoped",
+            "scope-project-a",
+            "Case work",
+        )
+        .expect("case-work conversation creates");
+
+        assert_eq!(
+            list_conversations(&connection, 100)
+                .expect("assistant list succeeds")
+                .iter()
+                .map(|row| row.conversation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["assistant-scoped"]
+        );
+        assert_eq!(
+            list_case_work_conversations_for_project(&connection, "scope-project-a", 100)
+                .expect("case-work list succeeds")
+                .iter()
+                .map(|row| row.conversation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["case-work-scoped"]
+        );
+        assert!(get_conversation(&connection, "case-work-scoped")
+            .expect("assistant read is isolated")
+            .is_none());
+        assert!(
+            get_case_work_conversation(&connection, "assistant-scoped", "scope-project-a")
+                .expect("case-work read is isolated")
+                .is_none()
+        );
+        assert!(
+            get_case_work_conversation(&connection, "case-work-scoped", "scope-project-b")
+                .expect("cross-project case-work read is isolated")
+                .is_none()
+        );
+        connection
+            .execute(
+                "UPDATE conversations SET scope='assistant'
+                 WHERE conversation_id='case-work-scoped'",
+                [],
+            )
+            .expect_err("scope conversion is forbidden");
+
+        {
+            let transaction = connection.transaction().expect("transaction begins");
+            create_case_work_conversation(
+                &transaction,
+                "case-work-rolled-back",
+                "scope-project-b",
+                "Rollback",
+            )
+            .expect("repository API joins caller transaction");
+            assert!(get_case_work_conversation(
+                &transaction,
+                "case-work-rolled-back",
+                "scope-project-b"
+            )
+            .expect("transactional read succeeds")
+            .is_some());
+        }
+        assert!(get_case_work_conversation(
+            &connection,
+            "case-work-rolled-back",
+            "scope-project-b"
+        )
+        .expect("rolled-back read succeeds")
+        .is_none());
+
+        connection
+            .execute(
+                "UPDATE projects SET status='archived' WHERE project_id='scope-project-b'",
+                [],
+            )
+            .expect("project archives");
+        create_case_work_conversation(
+            &connection,
+            "case-work-archived",
+            "scope-project-b",
+            "Archived",
+        )
+        .expect_err("archived project cannot create case-work conversation");
+    }
+
+    #[test]
+    fn case_assistant_canonical_payload_and_source_contracts_fail_closed() {
+        let snapshots = case_assistant_source_snapshots_json();
+        let snapshots_hash = sha256_hex(snapshots.as_bytes());
+        validate_case_assistant_source_snapshots_json(&snapshots, &snapshots_hash)
+            .expect("closed canonical snapshots validate");
+
+        let with_private_identity = snapshots.replacen(
+            "\"riskRevisionHash\"",
+            "\"privacyCaseId\":\"case_forbidden\",\"riskRevisionHash\"",
+            1,
+        );
+        validate_case_assistant_source_snapshots_json(
+            &with_private_identity,
+            &sha256_hex(with_private_identity.as_bytes()),
+        )
+        .expect_err("unknown privacy identity field is rejected");
+        validate_case_assistant_source_snapshots_json(
+            &format!(" {snapshots}"),
+            &sha256_hex(format!(" {snapshots}").as_bytes()),
+        )
+        .expect_err("non-canonical source JSON is rejected");
+        validate_case_assistant_source_snapshots_json(&snapshots, &"f".repeat(64))
+            .expect_err("source hash drift is rejected");
+
+        let payload = case_assistant_output_payload_json("case_document");
+        validate_case_assistant_output_payload_json(
+            "case_document",
+            &payload,
+            &sha256_hex(payload.as_bytes()),
+        )
+        .expect("typed output validates");
+        validate_case_assistant_output_payload_json(
+            "case_diagram",
+            &payload,
+            &sha256_hex(payload.as_bytes()),
+        )
+        .expect_err("row kind and typed payload kind must match");
+    }
+
+    #[test]
+    fn pending_output_requires_one_closed_case_work_tool_audit() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "tool-contract-project");
+        seed_case_assistant_successful_run(
+            &connection,
+            "tool-contract-project",
+            "tool-contract-conversation",
+            "tool-contract-run",
+            "tool-contract-user-message",
+            "tool-contract-assistant-message",
+        );
+        let workspace_base_digest = case_workspace_digest(&connection, "tool-contract-project")
+            .expect("workspace digest computes")
+            .expect("project exists");
+        let snapshots = case_assistant_source_snapshots_json();
+        let payload = case_assistant_output_payload_json("case_document");
+        let output = NewCaseAssistantPendingOutputRow {
+            pending_output_id: "tool-contract-output".to_owned(),
+            project_id: "tool-contract-project".to_owned(),
+            conversation_id: "tool-contract-conversation".to_owned(),
+            run_id: "tool-contract-run".to_owned(),
+            assistant_message_id: "tool-contract-assistant-message".to_owned(),
+            project_binding_sha256: "a".repeat(64),
+            source_snapshots_sha256: sha256_hex(snapshots.as_bytes()),
+            source_snapshots_json: snapshots,
+            expected_proposal_source_refs_json: "[]".to_owned(),
+            expected_proposal_source_refs_sha256: sha256_hex(b"[]"),
+            output_kind: "case_document".to_owned(),
+            output_sha256: sha256_hex(payload.as_bytes()),
+            output_payload_json: payload,
+            output_preview: "Answer".to_owned(),
+            output_version: 1,
+            workspace_base_digest,
+        };
+        set_case_assistant_tool_audit_for_pending_output(&connection, &output);
+
+        let mut secret_provider =
+            serde_json::from_str::<serde_json::Value>(&provider_snapshot_json())
+                .expect("provider snapshot parses");
+        secret_provider
+            .as_object_mut()
+            .expect("provider snapshot is an object")
+            .insert(
+                "apiKey".to_owned(),
+                serde_json::Value::String("must-not-persist".to_owned()),
+            );
+        let secret_provider =
+            serde_json::to_string(&secret_provider).expect("secret provider serializes");
+        create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "tool-contract-invalid-run-user".to_owned(),
+                conversation_id: "tool-contract-conversation".to_owned(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "invalid run".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("invalid run user message creates");
+        let invalid_provider_insert = connection
+            .execute(
+                "INSERT INTO agent_runs(
+                     run_id,conversation_id,user_message_id,provider_snapshot_json,
+                     intent,status,budget_json
+                 ) VALUES(?1,?2,?3,?4,'interactive_case_work','queued','{}')",
+                params![
+                    "tool-contract-invalid-run",
+                    "tool-contract-conversation",
+                    "tool-contract-invalid-run-user",
+                    secret_provider
+                ],
+            )
+            .expect_err("case-work run insert rejects secret provider fields");
+        assert!(!invalid_provider_insert
+            .to_string()
+            .contains("must-not-persist"));
+        connection
+            .execute(
+                "UPDATE agent_runs SET provider_snapshot_json=?2 WHERE run_id=?1",
+                params!["tool-contract-run", secret_provider],
+            )
+            .expect_err("case-work run update rejects secret provider fields");
+
+        let mut secret_input =
+            serde_json::from_str::<serde_json::Value>(&case_assistant_tool_input_audit_json(
+                "tool-contract-run",
+                "tool-contract-project",
+                "tool-contract-conversation",
+                &["generation-one".to_owned()],
+                &output.workspace_base_digest,
+            ))
+            .expect("input audit parses");
+        secret_input
+            .as_object_mut()
+            .expect("input audit is an object")
+            .insert(
+                "apiKey".to_owned(),
+                serde_json::Value::String("must-not-persist".to_owned()),
+            );
+        let secret_input =
+            serde_json::to_string(&secret_input).expect("secret input audit serializes");
+        connection
+            .execute(
+                "INSERT INTO tool_calls(
+                     tool_call_id,run_id,ordinal,capability_name,status,access_mode,
+                     requires_confirmation,input_audit_json,output_audit_json,
+                     source_audit_json
+                 ) VALUES(
+                     'tool-contract-invalid-insert','tool-contract-run',1,
+                     'assistant.case_work','running','write',0,?1,'{}','{}'
+                 )",
+                [secret_input.as_str()],
+            )
+            .expect_err("case-work tool insert rejects unknown secret fields");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET input_audit_json=json_set(input_audit_json,'$.apiKey','secret')
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work input audit update rejects unknown keys");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET output_audit_json=json_set(
+                     output_audit_json,'$.rawBody','must-not-persist'
+                 )
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work output audit update rejects raw provider bodies");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET source_audit_json=json_set(
+                     source_audit_json,'$.sourceRefs[0]','C:\\secret\\source.txt'
+                 )
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work source audit update rejects filesystem paths");
+        let oversized_audit = serde_json::to_string(&serde_json::json!({
+            "rawBody": "x".repeat(MAX_CASE_ASSISTANT_TOOL_AUDIT_BYTES + 1)
+        }))
+        .expect("oversized audit serializes");
+        connection
+            .execute(
+                "UPDATE tool_calls SET input_audit_json=?2 WHERE tool_call_id=?1",
+                params!["tool-contract-run-case-work-tool", oversized_audit],
+            )
+            .expect_err("case-work audit update rejects oversized JSON");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET input_audit_json=json_remove(
+                     input_audit_json,'$.inputHashes.historySha256'
+                 )
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work input audit rejects a missing nested required key");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET output_audit_json=json_remove(
+                     output_audit_json,'$.outputCounts.bytes'
+                 )
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work output audit rejects a missing nested required key");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET output_audit_json=json_remove(
+                     output_audit_json,
+                     '$.outputHashes.proposalSourceRefsSha256'
+                 )
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work output audit rejects a missing proposal provenance hash");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET output_audit_json=json_set(
+                     output_audit_json,
+                     '$.outputHashes.proposalSourceRefsSha256',
+                     1
+                 )
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work output audit rejects a non-text proposal provenance hash");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET source_audit_json=json_remove(
+                     source_audit_json,'$.inputHashes.aggregateSourceSha256'
+                 )
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect_err("case-work source audit rejects a missing nested required key");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT case_assistant_sha256(?1)",
+                    [&output.output_payload_json],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("registered SHA-256 function evaluates"),
+            output.output_sha256
+        );
+
+        create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "tool-contract-second-assistant".to_owned(),
+                conversation_id: "tool-contract-conversation".to_owned(),
+                role: "assistant".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: output.output_preview.clone(),
+                artifact_id: None,
+                run_id: Some("tool-contract-run".to_owned()),
+            },
+        )
+        .expect("same-run second assistant message creates before pending");
+        let mut second_message_output = output.clone();
+        second_message_output.pending_output_id = "tool-contract-second-output".to_owned();
+        second_message_output.assistant_message_id = "tool-contract-second-assistant".to_owned();
+        create_case_assistant_pending_output(&connection, &second_message_output)
+            .expect_err("pending output cannot select a second assistant message from the run");
+        connection
+            .execute(
+                "DELETE FROM messages WHERE message_id='tool-contract-second-assistant'",
+                [],
+            )
+            .expect("unselected pre-pending assistant message deletes");
+
+        connection
+            .execute(
+                "UPDATE messages SET run_id='tool-contract-run'
+                 WHERE message_id='tool-contract-user-message'",
+                [],
+            )
+            .expect("pre-pending prompt can be made impure");
+        create_case_assistant_pending_output(&connection, &output)
+            .expect_err("run-linked user message cannot seed pending output");
+        connection
+            .execute(
+                "UPDATE messages SET run_id=NULL
+                 WHERE message_id='tool-contract-user-message'",
+                [],
+            )
+            .expect("pure user prompt restores");
+
+        connection
+            .execute(
+                "UPDATE messages SET text_summary='mismatched preview'
+                 WHERE message_id='tool-contract-assistant-message'",
+                [],
+            )
+            .expect("pre-pending assistant preview can drift");
+        create_case_assistant_pending_output(&connection, &output)
+            .expect_err("assistant summary must equal the pending output preview");
+        connection
+            .execute(
+                "UPDATE messages SET text_summary='Answer'
+                 WHERE message_id='tool-contract-assistant-message'",
+                [],
+            )
+            .expect("assistant preview restores");
+
+        let raw_insert = |candidate: &NewCaseAssistantPendingOutputRow| {
+            connection.execute(
+                "INSERT INTO case_assistant_pending_outputs(
+                     pending_output_id,project_id,conversation_id,run_id,
+                     assistant_message_id,project_binding_sha256,
+                     source_snapshots_json,source_snapshots_sha256,
+                     expected_proposal_source_refs_json,
+                     expected_proposal_source_refs_sha256,output_kind,
+                     output_payload_json,output_preview,output_sha256,
+                     output_version,workspace_base_digest,status
+                 ) VALUES(
+                     ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                     'pending'
+                 )",
+                params![
+                    candidate.pending_output_id,
+                    candidate.project_id,
+                    candidate.conversation_id,
+                    candidate.run_id,
+                    candidate.assistant_message_id,
+                    candidate.project_binding_sha256,
+                    candidate.source_snapshots_json,
+                    candidate.source_snapshots_sha256,
+                    candidate.expected_proposal_source_refs_json,
+                    candidate.expected_proposal_source_refs_sha256,
+                    candidate.output_kind,
+                    candidate.output_payload_json,
+                    candidate.output_preview,
+                    candidate.output_sha256,
+                    candidate.output_version,
+                    candidate.workspace_base_digest,
+                ],
+            )
+        };
+        let mut forged_source = output.clone();
+        forged_source.pending_output_id = "tool-contract-forged-source".to_owned();
+        let mut forged_source_json =
+            serde_json::from_str::<serde_json::Value>(&forged_source.source_snapshots_json)
+                .expect("source snapshots parse");
+        forged_source_json[0]["riskRevision"] = serde_json::json!(99);
+        forged_source.source_snapshots_json =
+            serde_json::to_string(&forged_source_json).expect("forged source serializes");
+        raw_insert(&forged_source)
+            .expect_err("raw pending insert cannot forge the source snapshot hash");
+
+        let mut forged_output = output.clone();
+        forged_output.pending_output_id = "tool-contract-forged-output".to_owned();
+        let mut forged_output_json =
+            serde_json::from_str::<serde_json::Value>(&forged_output.output_payload_json)
+                .expect("output payload parses");
+        forged_output_json["content"] = serde_json::json!({"body": "forged"});
+        forged_output.output_payload_json =
+            serde_json::to_string(&forged_output_json).expect("forged output serializes");
+        raw_insert(&forged_output)
+            .expect_err("raw pending insert cannot forge the typed output hash");
+
+        let mut noncanonical_proposal_refs = output.clone();
+        noncanonical_proposal_refs.pending_output_id =
+            "tool-contract-noncanonical-proposal-refs".to_owned();
+        noncanonical_proposal_refs.expected_proposal_source_refs_json = "[ ]".to_owned();
+        noncanonical_proposal_refs.expected_proposal_source_refs_sha256 = sha256_hex(
+            noncanonical_proposal_refs
+                .expected_proposal_source_refs_json
+                .as_bytes(),
+        );
+        raw_insert(&noncanonical_proposal_refs)
+            .expect_err("raw pending insert rejects non-canonical proposal provenance JSON");
+
+        let mut forged_proposal_refs_hash = output.clone();
+        forged_proposal_refs_hash.pending_output_id =
+            "tool-contract-forged-proposal-refs-hash".to_owned();
+        forged_proposal_refs_hash.expected_proposal_source_refs_sha256 = "e".repeat(64);
+        raw_insert(&forged_proposal_refs_hash)
+            .expect_err("raw pending insert rejects proposal provenance JSON/SHA drift");
+
+        let mut forged_cross_binding = output.clone();
+        forged_cross_binding.pending_output_id = "tool-contract-forged-binding".to_owned();
+        forged_cross_binding.project_binding_sha256 = "e".repeat(64);
+        raw_insert(&forged_cross_binding)
+            .expect_err("raw pending insert must match the exact closed tool audit");
+
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET output_audit_json=json_set(
+                     output_audit_json,
+                     '$.outputHashes.proposalSourceRefsSha256',
+                     ?2
+                 )
+                 WHERE tool_call_id=?1",
+                params!["tool-contract-run-case-work-tool", "f".repeat(64)],
+            )
+            .expect("well-shaped but wrong proposal provenance hash can be staged");
+        create_case_assistant_pending_output(&connection, &output)
+            .expect_err("pending output rejects a well-shaped mismatched tool provenance hash");
+        set_case_assistant_tool_audit_for_pending_output(&connection, &output);
+
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET status='running',output_audit_json='{}',source_audit_json='{}',
+                     error_type=NULL,finished_at=NULL
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect("pre-pending fixture can reopen tool audit");
+        create_case_assistant_pending_output(&connection, &output)
+            .expect_err("non-terminal case-work tool audit rejects pending output");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET status='succeeded',
+                     output_audit_json=?1,source_audit_json=?2,
+                     error_type=NULL,finished_at=CURRENT_TIMESTAMP
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                params![
+                    case_assistant_tool_output_audit_json(
+                        &output.output_kind,
+                        &output.output_sha256,
+                        &output.expected_proposal_source_refs_sha256,
+                    ),
+                    case_assistant_tool_source_audit_json(
+                        &["generation-one".to_owned()],
+                        &output.project_binding_sha256,
+                        &output.source_snapshots_sha256
+                    )
+                ],
+            )
+            .expect("tool audit closes again");
+
+        create_tool_call(
+            &connection,
+            &NewToolCallRow {
+                tool_call_id: "tool-contract-extra".to_owned(),
+                run_id: "tool-contract-run".to_owned(),
+                ordinal: 1,
+                capability_name: "assistant.case_work".to_owned(),
+                status: "running".to_owned(),
+                access_mode: "write".to_owned(),
+                requires_confirmation: false,
+                input_audit_json: case_assistant_tool_input_audit_json(
+                    "tool-contract-run",
+                    "tool-contract-project",
+                    "tool-contract-conversation",
+                    &["generation-one".to_owned()],
+                    &output.workspace_base_digest,
+                ),
+                output_audit_json: "{}".to_owned(),
+                source_audit_json: "{}".to_owned(),
+            },
+        )
+        .expect("extra tool audit creates");
+        assert!(matches!(
+            compare_and_set_tool_call_status(
+                &connection,
+                "tool-contract-extra",
+                "running",
+                "succeeded",
+                &case_assistant_tool_output_audit_json(
+                    &output.output_kind,
+                    &output.output_sha256,
+                    &output.expected_proposal_source_refs_sha256,
+                ),
+                &case_assistant_tool_source_audit_json(
+                    &["generation-one".to_owned()],
+                    &output.project_binding_sha256,
+                    &output.source_snapshots_sha256,
+                ),
+                None,
+            )
+            .expect("extra tool audit closes"),
+            ToolCallStatusUpdateResult::Updated(_)
+        ));
+        create_case_assistant_pending_output(&connection, &output)
+            .expect_err("multiple case-work tool audits reject pending output");
+        connection
+            .execute(
+                "DELETE FROM tool_calls WHERE tool_call_id='tool-contract-extra'",
+                [],
+            )
+            .expect("pre-pending extra tool audit deletes");
+
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET capability_name='assistant.chat'
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect("pre-pending capability can change");
+        create_case_assistant_pending_output(&connection, &output)
+            .expect_err("wrong case-work capability rejects pending output");
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET capability_name='assistant.case_work'
+                 WHERE tool_call_id='tool-contract-run-case-work-tool'",
+                [],
+            )
+            .expect("case-work capability restores");
+        create_case_assistant_pending_output(&connection, &output)
+            .expect("one exact closed tool audit permits pending output");
+        validate_user_database_read_only(&database_path)
+            .expect("exact tool audit contract remains canonical");
+    }
+
+    #[test]
+    fn pending_outputs_are_append_preserving_case_scoped_and_confirm_with_cas() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "pending-project");
+        seed_case_assistant_successful_run(
+            &connection,
+            "pending-project",
+            "pending-conversation",
+            "pending-run",
+            "pending-user-message",
+            "pending-assistant-message",
+        );
+        let workspace_base_digest = case_workspace_digest(&connection, "pending-project")
+            .expect("workspace digest computes")
+            .expect("project exists");
+        let snapshots = case_assistant_source_snapshots_json();
+        let payload = case_assistant_output_payload_json("case_document");
+        let new_output = NewCaseAssistantPendingOutputRow {
+            pending_output_id: "pending-output".to_owned(),
+            project_id: "pending-project".to_owned(),
+            conversation_id: "pending-conversation".to_owned(),
+            run_id: "pending-run".to_owned(),
+            assistant_message_id: "pending-assistant-message".to_owned(),
+            project_binding_sha256: "a".repeat(64),
+            source_snapshots_sha256: sha256_hex(snapshots.as_bytes()),
+            source_snapshots_json: snapshots,
+            expected_proposal_source_refs_json: "[]".to_owned(),
+            expected_proposal_source_refs_sha256: sha256_hex(b"[]"),
+            output_kind: "case_document".to_owned(),
+            output_sha256: sha256_hex(payload.as_bytes()),
+            output_payload_json: payload,
+            output_preview: "Answer".to_owned(),
+            output_version: 1,
+            workspace_base_digest: workspace_base_digest.clone(),
+        };
+        set_case_assistant_tool_audit_for_pending_output(&connection, &new_output);
+        {
+            let transaction = connection.transaction().expect("transaction begins");
+            let created = create_case_assistant_pending_output(&transaction, &new_output)
+                .expect("pending output creates in caller transaction");
+            assert_eq!(created.status, "pending");
+            assert_eq!(created.workspace_base_digest, workspace_base_digest);
+            assert_eq!(
+                list_case_assistant_pending_outputs(
+                    &transaction,
+                    "pending-project",
+                    "pending-conversation",
+                    100
+                )
+                .expect("pending output lists")
+                .len(),
+                1
+            );
+            transaction.commit().expect("pending transaction commits");
+        }
+
+        create_tool_call(
+            &connection,
+            &NewToolCallRow {
+                tool_call_id: "pending-post-insert-tool".to_owned(),
+                run_id: "pending-run".to_owned(),
+                ordinal: 1,
+                capability_name: "assistant.chat".to_owned(),
+                status: "queued".to_owned(),
+                access_mode: "read".to_owned(),
+                requires_confirmation: false,
+                input_audit_json: "{}".to_owned(),
+                output_audit_json: "{}".to_owned(),
+                source_audit_json: "{}".to_owned(),
+            },
+        )
+        .expect_err("live pending run cannot gain a second tool audit");
+        create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "pending-ordinary-message".to_owned(),
+                conversation_id: "pending-conversation".to_owned(),
+                role: "system".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "ordinary message".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("ordinary message creates");
+        insert_attachment(
+            &connection,
+            &NewAttachmentRow {
+                attachment_id: "pending-ordinary-attachment".to_owned(),
+                project_id: Some("pending-project".to_owned()),
+                original_name: "ordinary.txt".to_owned(),
+                extension: "txt".to_owned(),
+                detected_mime: "text/plain".to_owned(),
+                sha256: "f".repeat(64),
+                size_bytes: 0,
+                content_blob: Vec::new(),
+                extraction_status: "succeeded".to_owned(),
+                extracted_text: Some(String::new()),
+                segments_json: "[]".to_owned(),
+                error_code: None,
+            },
+        )
+        .expect("ordinary attachment creates");
+        attach_to_message(
+            &connection,
+            "pending-ordinary-message",
+            "pending-ordinary-attachment",
+            0,
+        )
+        .expect("ordinary attachment links");
+        connection
+            .execute(
+                "UPDATE message_attachments
+                 SET message_id='pending-assistant-message'
+                 WHERE message_id='pending-ordinary-message'
+                   AND attachment_id='pending-ordinary-attachment'",
+                [],
+            )
+            .expect_err("attachment update cannot target protected assistant message");
+
+        assert!(get_case_assistant_pending_output(
+            &connection,
+            "pending-output",
+            "different-project"
+        )
+        .expect("cross-project read stays opaque")
+        .is_none());
+        connection
+            .execute(
+                "UPDATE case_assistant_pending_outputs
+                 SET output_preview='mutated'
+                 WHERE pending_output_id='pending-output'",
+                [],
+            )
+            .expect_err("pending output content is immutable");
+        connection
+            .execute(
+                "UPDATE case_assistant_pending_outputs
+                 SET expected_proposal_source_refs_json='[\"extra-valid-ref\"]'
+                 WHERE pending_output_id='pending-output'",
+                [],
+            )
+            .expect_err("pending proposal provenance JSON is immutable");
+        connection
+            .execute(
+                "UPDATE case_assistant_pending_outputs
+                 SET expected_proposal_source_refs_sha256=?1
+                 WHERE pending_output_id='pending-output'",
+                ["e".repeat(64)],
+            )
+            .expect_err("pending proposal provenance hash is immutable");
+        connection
+            .execute(
+                "DELETE FROM case_assistant_pending_outputs
+                 WHERE pending_output_id='pending-output'",
+                [],
+            )
+            .expect_err("pending output history cannot be deleted");
+
+        let confirmed = {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("confirmation transaction begins");
+            create_artifact(
+                &transaction,
+                &NewArtifactRow {
+                    artifact_id: "pending-document-artifact".to_owned(),
+                    conversation_id: Some("pending-conversation".to_owned()),
+                    project_id: None,
+                    kind: "document".to_owned(),
+                    title: "Confirmed document".to_owned(),
+                    status: "draft".to_owned(),
+                },
+                &NewArtifactVersionRow {
+                    version_id: "pending-document-artifact-v1".to_owned(),
+                    artifact_id: "pending-document-artifact".to_owned(),
+                    content_json: r#"{"body":"Confirmed provider result"}"#.to_owned(),
+                    rendered_text: new_output.output_preview.clone(),
+                    source_refs_json: "[]".to_owned(),
+                    citation_report_json: "{}".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                },
+            )
+            .expect("unbound artifact creates");
+            assert!(bind_artifact_to_case(
+                &transaction,
+                "pending-document-artifact",
+                "pending-project"
+            )
+            .expect("artifact bind checks"));
+            assert!(matches!(
+                compare_and_set_case_assistant_pending_output_confirmed(
+                    &transaction,
+                    &ConfirmCaseAssistantPendingOutput {
+                        pending_output_id: "pending-output",
+                        project_id: "pending-project",
+                        expected_output_version: 1,
+                        expected_output_sha256: &new_output.output_sha256,
+                        expected_workspace_base_digest: &workspace_base_digest,
+                        expected_proposal_source_refs_json: r#"["extra-valid-ref"]"#,
+                        expected_proposal_source_refs_sha256: &sha256_hex(
+                            br#"["extra-valid-ref"]"#
+                        ),
+                        confirmation_request_sha256: &"a".repeat(64),
+                        target: &CaseAssistantConfirmationTarget::Artifact(
+                            "pending-document-artifact".to_owned(),
+                        ),
+                    },
+                )
+                .expect("proposal provenance CAS mismatch returns a conflict"),
+                CaseAssistantPendingOutputConfirmResult::Conflict(_)
+            ));
+            transaction
+                .execute(
+                    "UPDATE case_assistant_pending_outputs
+                     SET status='confirmed',
+                         confirmed_artifact_id='pending-document-artifact',
+                         confirmation_request_sha256=?2,
+                         row_version=row_version+1,
+                         confirmed_at=CURRENT_TIMESTAMP,
+                         created_at='forged'
+                     WHERE pending_output_id=?1 AND status='pending'",
+                    params!["pending-output", "d".repeat(64)],
+                )
+                .expect_err("confirmation cannot rewrite pending creation time");
+            let result = compare_and_set_case_assistant_pending_output_confirmed(
+                &transaction,
+                &ConfirmCaseAssistantPendingOutput {
+                    pending_output_id: "pending-output",
+                    project_id: "pending-project",
+                    expected_output_version: 1,
+                    expected_output_sha256: &new_output.output_sha256,
+                    expected_workspace_base_digest: &workspace_base_digest,
+                    expected_proposal_source_refs_json: &new_output
+                        .expected_proposal_source_refs_json,
+                    expected_proposal_source_refs_sha256: &new_output
+                        .expected_proposal_source_refs_sha256,
+                    confirmation_request_sha256: &"b".repeat(64),
+                    target: &CaseAssistantConfirmationTarget::Artifact(
+                        "pending-document-artifact".to_owned(),
+                    ),
+                },
+            )
+            .expect("confirmation CAS succeeds");
+            let CaseAssistantPendingOutputConfirmResult::Confirmed(row) = result else {
+                panic!("pending output must become confirmed");
+            };
+            transaction.commit().expect("confirmation commits");
+            row
+        };
+        assert_eq!(confirmed.status, "confirmed");
+        assert_eq!(confirmed.row_version, 2);
+        assert_eq!(
+            confirmed.confirmed_artifact_id.as_deref(),
+            Some("pending-document-artifact")
+        );
+        assert!(matches!(
+            compare_and_set_case_assistant_pending_output_confirmed(
+                &connection,
+                &ConfirmCaseAssistantPendingOutput {
+                    pending_output_id: "pending-output",
+                    project_id: "pending-project",
+                    expected_output_version: 1,
+                    expected_output_sha256: &new_output.output_sha256,
+                    expected_workspace_base_digest: &workspace_base_digest,
+                    expected_proposal_source_refs_json: &new_output
+                        .expected_proposal_source_refs_json,
+                    expected_proposal_source_refs_sha256: &new_output
+                        .expected_proposal_source_refs_sha256,
+                    confirmation_request_sha256: &"c".repeat(64),
+                    target: &CaseAssistantConfirmationTarget::Artifact(
+                        "pending-document-artifact".to_owned(),
+                    ),
+                },
+            )
+            .expect("double confirmation returns a CAS result"),
+            CaseAssistantPendingOutputConfirmResult::Conflict(_)
+        ));
+        connection
+            .execute(
+                "UPDATE artifacts SET project_id=NULL
+                 WHERE artifact_id='pending-document-artifact'",
+                [],
+            )
+            .expect_err("confirmed artifact scope is immutable");
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO case_assistant_pending_outputs
+                 SELECT * FROM case_assistant_pending_outputs
+                 WHERE pending_output_id='pending-output'",
+                [],
+            )
+            .expect_err("replace cannot bypass append-preserving triggers");
+
+        let before_rebuild =
+            get_case_assistant_pending_output(&connection, "pending-output", "pending-project")
+                .expect("confirmed output reads")
+                .expect("confirmed output exists");
+        connection
+            .execute(
+                "UPDATE user_database_metadata
+                 SET value='v11-rebuild-test'
+                 WHERE key='canonical_schema_version'",
+                [],
+            )
+            .expect("marker makes a controlled rebuild necessary");
+        drop(connection);
+        validate_and_migrate_user_database(&database_path)
+            .expect("confirmed lineage survives canonical rebuild");
+        let connection = open_user_database(&database_path).expect("rebuilt database opens");
+        assert_eq!(
+            get_case_assistant_pending_output(&connection, "pending-output", "pending-project")
+                .expect("rebuilt output reads")
+                .expect("rebuilt output remains"),
+            before_rebuild
+        );
+        validate_user_database_read_only(&database_path)
+            .expect("rebuilt case assistant lineage remains canonical");
+    }
+
+    #[test]
+    fn v11_proposal_provenance_migration_is_exact_for_every_output_state() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        let document = seed_case_assistant_pending_output_fixture(
+            &connection,
+            "migration-document",
+            "case_document",
+        );
+        let diagram = seed_case_assistant_pending_output_fixture(
+            &connection,
+            "migration-diagram",
+            "case_diagram",
+        );
+        let unconfirmed_analysis = seed_case_assistant_pending_output_fixture(
+            &connection,
+            "migration-unconfirmed-analysis",
+            "case_analysis",
+        );
+        let confirmed_refs = r#"["legal-dataset-snapshot","proposal-legal-snapshot"]"#;
+        let confirmed_analysis = seed_case_assistant_pending_output_fixture_with_refs(
+            &connection,
+            "migration-confirmed-analysis",
+            "case_analysis",
+            confirmed_refs,
+        );
+        confirm_case_assistant_analysis_fixture(
+            &mut connection,
+            &confirmed_analysis,
+            "migration-confirmed-analysis-proposal",
+        );
+        downgrade_case_assistant_proposal_provenance_fixture(&connection);
+        drop(connection);
+
+        validate_and_migrate_user_database(&database_path)
+            .expect("legacy proposal provenance migrates deterministically");
+        let connection = open_user_database(&database_path).expect("migrated database opens");
+        for output in [&document, &diagram, &unconfirmed_analysis] {
+            let migrated = get_case_assistant_pending_output(
+                &connection,
+                &output.pending_output_id,
+                &output.project_id,
+            )
+            .expect("migrated pending output reads")
+            .expect("migrated pending output exists");
+            assert_eq!(migrated.expected_proposal_source_refs_json, "[]");
+            assert_eq!(
+                migrated.expected_proposal_source_refs_sha256,
+                sha256_hex(b"[]")
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT json_extract(
+                             output_audit_json,
+                             '$.outputHashes.proposalSourceRefsSha256'
+                         )
+                         FROM tool_calls WHERE run_id=?1",
+                        [&output.run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .expect("migrated tool proposal provenance hash reads"),
+                sha256_hex(b"[]")
+            );
+        }
+        let migrated_confirmed = get_case_assistant_pending_output(
+            &connection,
+            &confirmed_analysis.pending_output_id,
+            &confirmed_analysis.project_id,
+        )
+        .expect("migrated confirmed analysis reads")
+        .expect("migrated confirmed analysis exists");
+        assert_eq!(
+            migrated_confirmed.expected_proposal_source_refs_json,
+            confirmed_refs
+        );
+        assert_eq!(
+            migrated_confirmed.expected_proposal_source_refs_sha256,
+            sha256_hex(confirmed_refs.as_bytes())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT json_extract(
+                         output_audit_json,
+                         '$.outputHashes.proposalSourceRefsSha256'
+                     )
+                     FROM tool_calls WHERE run_id=?1",
+                    [&confirmed_analysis.run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("migrated confirmed tool provenance hash reads"),
+            sha256_hex(confirmed_refs.as_bytes())
+        );
+        validate_user_database_read_only(&database_path)
+            .expect("migrated proposal provenance remains canonical");
+    }
+
+    #[test]
+    fn v11_confirmed_analysis_missing_proposal_rolls_back_without_inference() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        let refs = r#"["legal-dataset-snapshot","proposal-legal-snapshot"]"#;
+        let output = seed_case_assistant_pending_output_fixture_with_refs(
+            &connection,
+            "migration-missing-proposal",
+            "case_analysis",
+            refs,
+        );
+        confirm_case_assistant_analysis_fixture(
+            &mut connection,
+            &output,
+            "migration-proposal-that-will-be-missing",
+        );
+        downgrade_case_assistant_proposal_provenance_fixture(&connection);
+        connection
+            .execute(
+                "DELETE FROM case_change_proposals
+                 WHERE proposal_id='migration-proposal-that-will-be-missing'",
+                [],
+            )
+            .expect("legacy fixture removes the confirmed proposal");
+        drop(connection);
+
+        validate_and_migrate_user_database(&database_path)
+            .expect_err("missing confirmed proposal must abort the entire migration");
+        let connection =
+            rusqlite::Connection::open(&database_path).expect("rolled-back legacy database opens");
+        assert!(
+            !table_columns(&connection, "case_assistant_pending_outputs")
+                .expect("rolled-back pending columns read")
+                .contains("expected_proposal_source_refs_json")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM case_assistant_pending_outputs
+                     WHERE pending_output_id=?1",
+                    [&output.pending_output_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("legacy confirmed output survives the failed migration"),
+            "confirmed"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT json_type(
+                         output_audit_json,
+                         '$.outputHashes.proposalSourceRefsSha256'
+                     )
+                     FROM tool_calls WHERE run_id=?1",
+                    [&output.run_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("legacy tool audit survives the failed migration"),
+            None
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM user_database_metadata WHERE key=?1",
+                    [USER_CANONICAL_SCHEMA_MARKER_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("legacy schema marker survives the failed migration"),
+            "v11-before-exact-proposal-provenance"
+        );
+    }
+
+    #[test]
+    fn retirement_tombstones_and_cleanup_require_live_exact_connection_authority() {
+        const FORGED_PRIVACY_DELETION_ID: &str = "pdel_22222222222222222222222222222222";
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "raw-retirement-project");
+
+        let raw_tombstone_error = connection
+            .execute(
+                "INSERT INTO retired_case_project_ids(
+                     project_id,retirement_reason,privacy_deletion_id
+                 )
+                 VALUES (?1,'case_project_deleted',?2)",
+                params!["raw-retirement-project", TEST_PRIVACY_DELETION_ID],
+            )
+            .expect_err("raw SQL cannot create a retirement tombstone");
+        assert!(raw_tombstone_error
+            .to_string()
+            .contains("case project retirement is not authorized"));
+        connection
+            .execute(
+                "DELETE FROM projects WHERE project_id='raw-retirement-project'",
+                [],
+            )
+            .expect_err("raw SQL cannot physically delete a project");
+
+        seed_case_assistant_pending_output_fixture(
+            &connection,
+            "forged-retirement",
+            "case_document",
+        );
+        with_case_retirement_authority(
+            &connection,
+            "forged-retirement-project",
+            CASE_PROJECT_DELETED_RETIREMENT_REASON,
+            Some(FORGED_PRIVACY_DELETION_ID),
+            || {
+                connection.execute(
+                    "INSERT INTO retired_case_project_ids(
+                         project_id,retirement_reason,privacy_deletion_id
+                     )
+                     VALUES (?1,'case_project_deleted',?2)",
+                    params!["forged-retirement-project", FORGED_PRIVACY_DELETION_ID],
+                )
+            },
+        )
+        .expect("test fixture installs a tombstone under exact internal authority");
+
+        connection
+            .execute(
+                "DELETE FROM conversations
+                 WHERE conversation_id='forged-retirement-conversation'",
+                [],
+            )
+            .expect_err("a tombstone without live authority cannot disable child guards");
+        connection
+            .execute(
+                "DELETE FROM projects
+                 WHERE project_id='forged-retirement-project'",
+                [],
+            )
+            .expect_err("a tombstone without live authority cannot authorize project deletion");
+
+        let second = open_user_database(&database_path).expect("second database connection opens");
+        with_case_retirement_authority(
+            &connection,
+            "forged-retirement-project",
+            CASE_PROJECT_DELETED_RETIREMENT_REASON,
+            Some(FORGED_PRIVACY_DELETION_ID),
+            || {
+                second
+                    .execute(
+                        "DELETE FROM agent_runs
+                         WHERE run_id='forged-retirement-run'",
+                        [],
+                    )
+                    .expect_err("connection A authority cannot disable connection B child guards");
+                second
+                    .execute(
+                        "DELETE FROM projects
+                         WHERE project_id='forged-retirement-project'",
+                        [],
+                    )
+                    .expect_err("connection A authority cannot authorize connection B deletion");
+                Ok(())
+            },
+        )
+        .expect("cross-connection denial leaves the authority scope healthy");
+    }
+
+    #[test]
+    fn project_delete_preflight_retires_empty_case_work_and_preserves_assistant_history() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let connection = open_user_database(&database_path).expect("database opens");
+        seed_project(&connection, "retire-empty-project");
+        create_case_work_conversation(
+            &connection,
+            "retire-empty-case-work",
+            "retire-empty-project",
+            "Case work",
+        )
+        .expect("empty case-work conversation creates");
+        create_conversation(
+            &connection,
+            "retire-preserved-assistant",
+            Some("retire-empty-project"),
+            "Assistant history",
+        )
+        .expect("assistant conversation creates");
+        create_message(
+            &connection,
+            &NewMessageRow {
+                message_id: "retire-preserved-message".to_owned(),
+                conversation_id: "retire-preserved-assistant".to_owned(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "Preserve me".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("assistant history message creates");
+
+        assert!(preflight_delete_case_project(
+            &connection,
+            "retire-empty-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("exact project delete preflight succeeds"));
+        assert!(
+            !case_project_id_is_retired(&connection, "retire-empty-project")
+                .expect("preflight tombstone rollback reads")
+        );
+        assert_eq!(
+            retirement_authorized(
+                &connection,
+                "retire-empty-project",
+                CASE_PROJECT_DELETED_RETIREMENT_REASON,
+                Some(TEST_PRIVACY_DELETION_ID)
+            ),
+            0,
+            "preflight rollback must also leave no live retirement authority"
+        );
+        connection
+            .execute(
+                "DELETE FROM projects WHERE project_id='retire-empty-project'",
+                [],
+            )
+            .expect_err("preflight cannot leak authority to a later raw delete");
+        assert!(get_case_work_conversation(
+            &connection,
+            "retire-empty-case-work",
+            "retire-empty-project"
+        )
+        .expect("case-work conversation reads after preflight")
+        .is_some());
+        assert!(delete_case_project(
+            &connection,
+            "retire-empty-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("project deletion succeeds"));
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM projects
+                     WHERE project_id='retire-empty-project'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("project lookup succeeds"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM conversations
+                     WHERE conversation_id='retire-empty-case-work'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("case-work lookup succeeds"),
+            0
+        );
+        let assistant = get_conversation(&connection, "retire-preserved-assistant")
+            .expect("assistant conversation reads")
+            .expect("assistant conversation is preserved");
+        assert_eq!(assistant.scope, ConversationScope::Assistant);
+        assert!(assistant.project_id.is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM messages
+                     WHERE message_id='retire-preserved-message'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("preserved message count reads"),
+            1
+        );
+        assert!(
+            case_project_id_is_retired(&connection, "retire-empty-project")
+                .expect("retirement tombstone reads")
+        );
+        assert!(case_project_retirement_matches_privacy_deletion(
+            &connection,
+            "retire-empty-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("retirement journal binding reads"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT privacy_deletion_id
+                     FROM retired_case_project_ids
+                     WHERE project_id='retire-empty-project'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("retirement journal id reads"),
+            TEST_PRIVACY_DELETION_ID
+        );
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO retired_case_project_ids
+                 SELECT * FROM retired_case_project_ids
+                 WHERE project_id='retire-empty-project'",
+                [],
+            )
+            .expect_err("replace cannot mutate an append-only retirement tombstone");
+
+        let retired_project = CaseProjectRow {
+            project_id: "retire-empty-project".to_owned(),
+            title: "Cannot recreate".to_owned(),
+            case_type: "civil".to_owned(),
+            status: "active".to_owned(),
+            opened_on: None,
+            summary: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        upsert_case_project(&connection, &retired_project)
+            .expect_err("upsert cannot resurrect a retired project id");
+        insert_case_project_if_absent(&connection, &retired_project)
+            .expect_err("insert-if-absent cannot resurrect a retired project id");
+        validate_user_database_read_only(&database_path)
+            .expect("retired empty case-work deletion remains canonical");
+    }
+
+    #[test]
+    fn retirement_recovery_is_concurrently_idempotent_and_journal_scoped() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let worker_count = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(worker_count));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let worker_path = database_path.clone();
+            let worker_barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let connection = open_user_database(&worker_path).expect("worker database opens");
+                worker_barrier.wait();
+                retire_absent_case_project_id_after_privacy_revocation(
+                    &connection,
+                    "retire-recovery-project",
+                    TEST_PRIVACY_DELETION_ID,
+                )
+                .expect("concurrent retirement recovery succeeds")
+            }));
+        }
+        for worker in workers {
+            assert!(worker.join().expect("retirement worker joins"));
+        }
+
+        let connection = open_user_database(&database_path).expect("database reopens");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM retired_case_project_ids
+                     WHERE project_id='retire-recovery-project'
+                       AND privacy_deletion_id=?1",
+                    [TEST_PRIVACY_DELETION_ID],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("retirement row count reads"),
+            1
+        );
+        assert!(!retire_absent_case_project_id_after_privacy_revocation(
+            &connection,
+            "retire-recovery-project",
+            "pdel_11111111111111111111111111111111",
+        )
+        .expect("mismatched journal recovery is rejected"));
+        validate_user_database_read_only(&database_path)
+            .expect("concurrent retirement recovery remains canonical");
+        connection
+            .execute(
+                "UPDATE user_database_metadata
+                 SET value='v11-retirement-recovery-rebuild-test'
+                 WHERE key='canonical_schema_version'",
+                [],
+            )
+            .expect("marker makes a controlled recovery tombstone rebuild necessary");
+        drop(connection);
+        validate_and_migrate_user_database(&database_path)
+            .expect("recovery retirement tombstone rebuilds under row authority");
+        let rebuilt = open_user_database(&database_path).expect("rebuilt database reopens");
+        assert!(case_project_retirement_matches_privacy_deletion(
+            &rebuilt,
+            "retire-recovery-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("rebuilt recovery retirement binding reads"));
+        validate_user_database_read_only(&database_path)
+            .expect("rebuilt recovery retirement remains canonical");
+    }
+
+    #[test]
+    fn project_delete_retains_pending_output_as_opaque_audit_across_rebuild() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let connection = open_user_database(&database_path).expect("database opens");
+        seed_case_assistant_pending_output_fixture(&connection, "retire-pending", "case_document");
+        connection
+            .execute(
+                "DELETE FROM conversations
+                 WHERE conversation_id='retire-pending-conversation'",
+                [],
+            )
+            .expect_err("live pending lineage blocks conversation deletion");
+        connection
+            .execute(
+                "UPDATE agent_runs SET status='failed'
+                 WHERE run_id='retire-pending-run'",
+                [],
+            )
+            .expect_err("live pending lineage blocks run mutation");
+        let run_snapshot_before = connection
+            .query_row(
+                "SELECT provider_snapshot_json,budget_json,error_type,created_at,finished_at
+                 FROM agent_runs WHERE run_id='retire-pending-run'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .expect("live run audit reads");
+        connection
+            .execute(
+                "UPDATE agent_runs SET provider_snapshot_json='{\"forged\":true}'
+                 WHERE run_id='retire-pending-run'",
+                [],
+            )
+            .expect_err("live pending lineage blocks provider snapshot mutation");
+        let run_snapshot_after = connection
+            .query_row(
+                "SELECT provider_snapshot_json,budget_json,error_type,created_at,finished_at
+                 FROM agent_runs WHERE run_id='retire-pending-run'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .expect("guarded live run audit reads");
+        assert_eq!(run_snapshot_after, run_snapshot_before);
+        connection
+            .execute(
+                "UPDATE messages SET role='system'
+                 WHERE message_id='retire-pending-assistant-message'",
+                [],
+            )
+            .expect_err("live pending lineage blocks assistant message mutation");
+        let history_before = connection
+            .query_row(
+                "SELECT
+                     (SELECT text_summary FROM messages
+                      WHERE message_id='retire-pending-user-message'),
+                     (SELECT text_summary FROM messages
+                      WHERE message_id='retire-pending-assistant-message')",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("live message history reads");
+        connection
+            .execute(
+                "UPDATE messages SET text_summary='forged user history'
+                 WHERE message_id='retire-pending-user-message'",
+                [],
+            )
+            .expect_err("live pending lineage blocks user text mutation");
+        connection
+            .execute(
+                "UPDATE messages SET text_summary='forged assistant history'
+                 WHERE message_id='retire-pending-assistant-message'",
+                [],
+            )
+            .expect_err("live pending lineage blocks assistant text mutation");
+        let history_after = connection
+            .query_row(
+                "SELECT
+                     (SELECT text_summary FROM messages
+                      WHERE message_id='retire-pending-user-message'),
+                     (SELECT text_summary FROM messages
+                      WHERE message_id='retire-pending-assistant-message')",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("guarded live message history reads");
+        assert_eq!(history_after, history_before);
+        connection
+            .execute(
+                "DELETE FROM agent_runs WHERE run_id='retire-pending-run'",
+                [],
+            )
+            .expect_err("live pending lineage blocks run deletion");
+        let tool_audit_before = get_tool_call(&connection, "retire-pending-run-case-work-tool")
+            .expect("live tool audit reads")
+            .expect("live tool audit exists");
+        connection
+            .execute(
+                "UPDATE tool_calls SET output_audit_json='{\"forged\":true}'
+                 WHERE tool_call_id='retire-pending-run-case-work-tool'",
+                [],
+            )
+            .expect_err("live pending lineage blocks tool audit mutation");
+        connection
+            .execute(
+                "DELETE FROM tool_calls
+                 WHERE tool_call_id='retire-pending-run-case-work-tool'",
+                [],
+            )
+            .expect_err("live pending lineage blocks tool audit deletion");
+        assert_eq!(
+            get_tool_call(&connection, "retire-pending-run-case-work-tool")
+                .expect("guarded live tool audit reads")
+                .expect("guarded live tool audit exists"),
+            tool_audit_before
+        );
+        connection
+            .execute(
+                "DELETE FROM messages
+                 WHERE message_id='retire-pending-assistant-message'",
+                [],
+            )
+            .expect_err("live pending lineage blocks assistant message deletion");
+
+        assert!(delete_case_project(
+            &connection,
+            "retire-pending-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("project with pending output deletes"));
+        let audit_before_rebuild = connection
+            .query_row(
+                "SELECT project_id,conversation_id,run_id,assistant_message_id,status,row_version
+                 FROM case_assistant_pending_outputs
+                 WHERE pending_output_id='retire-pending-output'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .expect("pending audit remains");
+        assert_eq!(audit_before_rebuild.4, "pending");
+        assert_eq!(audit_before_rebuild.5, 1);
+        assert!(get_case_assistant_pending_output(
+            &connection,
+            "retire-pending-output",
+            "retire-pending-project"
+        )
+        .expect("retired pending output repository read succeeds")
+        .is_some());
+        assert_eq!(
+            list_case_assistant_pending_outputs(
+                &connection,
+                "retire-pending-project",
+                "retire-pending-conversation",
+                100
+            )
+            .expect("retired pending output repository list succeeds")
+            .len(),
+            1
+        );
+        for (table, column, id) in [
+            ("projects", "project_id", "retire-pending-project"),
+            (
+                "conversations",
+                "conversation_id",
+                "retire-pending-conversation",
+            ),
+            ("agent_runs", "run_id", "retire-pending-run"),
+            ("messages", "message_id", "retire-pending-assistant-message"),
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE {column}=?1"),
+                        [id],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .expect("retired live lineage count reads"),
+                0,
+                "{table} live lineage must be physically deleted"
+            );
+        }
+        connection
+            .execute(
+                "UPDATE case_assistant_pending_outputs
+                 SET output_preview='forged'
+                 WHERE pending_output_id='retire-pending-output'",
+                [],
+            )
+            .expect_err("retired pending audit remains immutable");
+        connection
+            .execute(
+                "DELETE FROM case_assistant_pending_outputs
+                 WHERE pending_output_id='retire-pending-output'",
+                [],
+            )
+            .expect_err("retired pending audit remains append only");
+        connection
+            .execute(
+                "UPDATE user_database_metadata
+                 SET value='retired-pending-rebuild-test'
+                 WHERE key='canonical_schema_version'",
+                [],
+            )
+            .expect("marker requests canonical rebuild");
+        drop(connection);
+
+        validate_and_migrate_user_database(&database_path)
+            .expect("retired orphan audit survives canonical rebuild");
+        let connection = open_user_database(&database_path).expect("rebuilt database opens");
+        let audit_after_rebuild = connection
+            .query_row(
+                "SELECT project_id,conversation_id,run_id,assistant_message_id,status,row_version
+                 FROM case_assistant_pending_outputs
+                 WHERE pending_output_id='retire-pending-output'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .expect("rebuilt pending audit remains");
+        assert_eq!(audit_after_rebuild, audit_before_rebuild);
+        validate_user_database_read_only(&database_path)
+            .expect("retired pending audit remains canonical");
+    }
+
+    #[test]
+    fn project_delete_removes_confirmed_proposal_but_retains_confirmation_audit() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        let output = seed_case_assistant_pending_output_fixture(
+            &connection,
+            "retire-proposal",
+            "case_analysis",
+        );
+        {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("proposal confirmation transaction begins");
+            create_case_change_proposal(
+                &transaction,
+                &NewCaseChangeProposalRow {
+                    proposal_id: "retire-wrong-proposal".to_owned(),
+                    conversation_id: "retire-proposal-conversation".to_owned(),
+                    project_id: "retire-proposal-project".to_owned(),
+                    run_id: Some("retire-proposal-run".to_owned()),
+                    base_case_digest: output.workspace_base_digest.clone(),
+                    changes_json: r#"{"changes":[{"op":"wrong"}]}"#.to_owned(),
+                    source_refs_json: "[]".to_owned(),
+                },
+            )
+            .expect("wrong same-scope proposal creates");
+            assert!(matches!(
+                compare_and_set_case_change_proposal_status(
+                    &transaction,
+                    "retire-wrong-proposal",
+                    "retire-proposal-project",
+                    &output.workspace_base_digest,
+                    "applied",
+                )
+                .expect("wrong same-scope proposal applies"),
+                CaseChangeProposalStatusUpdateResult::Updated(_)
+            ));
+            compare_and_set_case_assistant_pending_output_confirmed(
+                &transaction,
+                &ConfirmCaseAssistantPendingOutput {
+                    pending_output_id: "retire-proposal-output",
+                    project_id: "retire-proposal-project",
+                    expected_output_version: 1,
+                    expected_output_sha256: &output.output_sha256,
+                    expected_workspace_base_digest: &output.workspace_base_digest,
+                    expected_proposal_source_refs_json: &output.expected_proposal_source_refs_json,
+                    expected_proposal_source_refs_sha256: &output
+                        .expected_proposal_source_refs_sha256,
+                    confirmation_request_sha256: &"1".repeat(64),
+                    target: &CaseAssistantConfirmationTarget::Proposal(
+                        "retire-wrong-proposal".to_owned(),
+                    ),
+                },
+            )
+            .expect_err("wrong same-scope proposal cannot satisfy confirmation");
+            create_case_change_proposal(
+                &transaction,
+                &NewCaseChangeProposalRow {
+                    proposal_id: "retire-extra-source-proposal".to_owned(),
+                    conversation_id: "retire-proposal-conversation".to_owned(),
+                    project_id: "retire-proposal-project".to_owned(),
+                    run_id: Some("retire-proposal-run".to_owned()),
+                    base_case_digest: output.workspace_base_digest.clone(),
+                    changes_json: r#"{"changes":[]}"#.to_owned(),
+                    source_refs_json: r#"["extra-but-valid-source-ref"]"#.to_owned(),
+                },
+            )
+            .expect("extra-source same-scope proposal creates");
+            assert!(matches!(
+                compare_and_set_case_change_proposal_status(
+                    &transaction,
+                    "retire-extra-source-proposal",
+                    "retire-proposal-project",
+                    &output.workspace_base_digest,
+                    "applied",
+                )
+                .expect("extra-source same-scope proposal applies"),
+                CaseChangeProposalStatusUpdateResult::Updated(_)
+            ));
+            compare_and_set_case_assistant_pending_output_confirmed(
+                &transaction,
+                &ConfirmCaseAssistantPendingOutput {
+                    pending_output_id: "retire-proposal-output",
+                    project_id: "retire-proposal-project",
+                    expected_output_version: 1,
+                    expected_output_sha256: &output.output_sha256,
+                    expected_workspace_base_digest: &output.workspace_base_digest,
+                    expected_proposal_source_refs_json: &output.expected_proposal_source_refs_json,
+                    expected_proposal_source_refs_sha256: &output
+                        .expected_proposal_source_refs_sha256,
+                    confirmation_request_sha256: &"2".repeat(64),
+                    target: &CaseAssistantConfirmationTarget::Proposal(
+                        "retire-extra-source-proposal".to_owned(),
+                    ),
+                },
+            )
+            .expect_err("an extra but valid proposal source ref cannot satisfy confirmation");
+            create_case_change_proposal(
+                &transaction,
+                &NewCaseChangeProposalRow {
+                    proposal_id: "retire-confirmed-proposal".to_owned(),
+                    conversation_id: "retire-proposal-conversation".to_owned(),
+                    project_id: "retire-proposal-project".to_owned(),
+                    run_id: Some("retire-proposal-run".to_owned()),
+                    base_case_digest: output.workspace_base_digest.clone(),
+                    changes_json: r#"{"changes":[]}"#.to_owned(),
+                    source_refs_json: "[]".to_owned(),
+                },
+            )
+            .expect("proposal creates");
+            assert!(matches!(
+                compare_and_set_case_change_proposal_status(
+                    &transaction,
+                    "retire-confirmed-proposal",
+                    "retire-proposal-project",
+                    &output.workspace_base_digest,
+                    "applied",
+                )
+                .expect("proposal applies"),
+                CaseChangeProposalStatusUpdateResult::Updated(_)
+            ));
+            let target =
+                CaseAssistantConfirmationTarget::Proposal("retire-confirmed-proposal".to_owned());
+            assert!(matches!(
+                compare_and_set_case_assistant_pending_output_confirmed(
+                    &transaction,
+                    &ConfirmCaseAssistantPendingOutput {
+                        pending_output_id: "retire-proposal-output",
+                        project_id: "retire-proposal-project",
+                        expected_output_version: 1,
+                        expected_output_sha256: &output.output_sha256,
+                        expected_workspace_base_digest: &output.workspace_base_digest,
+                        expected_proposal_source_refs_json: &output
+                            .expected_proposal_source_refs_json,
+                        expected_proposal_source_refs_sha256: &output
+                            .expected_proposal_source_refs_sha256,
+                        confirmation_request_sha256: &"b".repeat(64),
+                        target: &target,
+                    },
+                )
+                .expect("proposal confirmation succeeds"),
+                CaseAssistantPendingOutputConfirmResult::Confirmed(_)
+            ));
+            transaction.commit().expect("proposal confirmation commits");
+        }
+        let proposal_before = get_case_change_proposal(&connection, "retire-confirmed-proposal")
+            .expect("confirmed proposal reads")
+            .expect("confirmed proposal exists");
+        connection
+            .execute(
+                "UPDATE case_change_proposals SET changes_json='{\"forged\":true}'
+                 WHERE proposal_id='retire-confirmed-proposal'",
+                [],
+            )
+            .expect_err("live confirmed proposal audit cannot be changed");
+        assert_eq!(
+            get_case_change_proposal(&connection, "retire-confirmed-proposal")
+                .expect("guarded confirmed proposal reads")
+                .expect("guarded confirmed proposal exists"),
+            proposal_before
+        );
+        connection
+            .execute(
+                "DELETE FROM case_change_proposals
+                 WHERE proposal_id='retire-confirmed-proposal'",
+                [],
+            )
+            .expect_err("live confirmed proposal cannot be deleted outside retirement");
+
+        assert!(delete_case_project(
+            &connection,
+            "retire-proposal-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("confirmed proposal project deletes"));
+        assert!(
+            get_case_change_proposal(&connection, "retire-confirmed-proposal")
+                .expect("proposal lookup succeeds")
+                .is_none()
+        );
+        let (status, proposal_id, row_version) = connection
+            .query_row(
+                "SELECT status,confirmed_proposal_id,row_version
+                 FROM case_assistant_pending_outputs
+                 WHERE pending_output_id='retire-proposal-output'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("confirmed proposal audit remains");
+        assert_eq!(status, "confirmed");
+        assert_eq!(proposal_id, "retire-confirmed-proposal");
+        assert_eq!(row_version, 2);
+        validate_user_database_read_only(&database_path)
+            .expect("confirmed proposal retirement remains canonical");
+    }
+
+    #[test]
+    fn project_delete_removes_confirmed_artifact_but_retains_confirmation_audit() {
+        let directory = tempfile::tempdir().expect("tempdir exists");
+        let database_path =
+            ensure_user_database(directory.path()).expect("user database initializes");
+        let mut connection = open_user_database(&database_path).expect("database opens");
+        let output = seed_case_assistant_pending_output_fixture(
+            &connection,
+            "retire-artifact",
+            "case_document",
+        );
+        {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("artifact confirmation transaction begins");
+            create_artifact(
+                &transaction,
+                &NewArtifactRow {
+                    artifact_id: "retire-wrong-artifact".to_owned(),
+                    conversation_id: Some("retire-artifact-conversation".to_owned()),
+                    project_id: None,
+                    kind: "document".to_owned(),
+                    title: "Wrong same-scope artifact".to_owned(),
+                    status: "draft".to_owned(),
+                },
+                &NewArtifactVersionRow {
+                    version_id: "retire-wrong-artifact-v1".to_owned(),
+                    artifact_id: "retire-wrong-artifact".to_owned(),
+                    content_json: r#"{"body":"wrong provider result"}"#.to_owned(),
+                    rendered_text: output.output_preview.clone(),
+                    source_refs_json: "[]".to_owned(),
+                    citation_report_json: "{}".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                },
+            )
+            .expect("wrong same-scope artifact creates");
+            assert!(bind_artifact_to_case(
+                &transaction,
+                "retire-wrong-artifact",
+                "retire-artifact-project"
+            )
+            .expect("wrong same-scope artifact binds"));
+            compare_and_set_case_assistant_pending_output_confirmed(
+                &transaction,
+                &ConfirmCaseAssistantPendingOutput {
+                    pending_output_id: "retire-artifact-output",
+                    project_id: "retire-artifact-project",
+                    expected_output_version: 1,
+                    expected_output_sha256: &output.output_sha256,
+                    expected_workspace_base_digest: &output.workspace_base_digest,
+                    expected_proposal_source_refs_json: &output.expected_proposal_source_refs_json,
+                    expected_proposal_source_refs_sha256: &output
+                        .expected_proposal_source_refs_sha256,
+                    confirmation_request_sha256: &"2".repeat(64),
+                    target: &CaseAssistantConfirmationTarget::Artifact(
+                        "retire-wrong-artifact".to_owned(),
+                    ),
+                },
+            )
+            .expect_err("wrong same-scope artifact cannot satisfy confirmation");
+            create_artifact(
+                &transaction,
+                &NewArtifactRow {
+                    artifact_id: "retire-confirmed-artifact".to_owned(),
+                    conversation_id: Some("retire-artifact-conversation".to_owned()),
+                    project_id: None,
+                    kind: "document".to_owned(),
+                    title: "Confirmed artifact".to_owned(),
+                    status: "draft".to_owned(),
+                },
+                &NewArtifactVersionRow {
+                    version_id: "retire-confirmed-artifact-v1".to_owned(),
+                    artifact_id: "retire-confirmed-artifact".to_owned(),
+                    content_json: r#"{"body":"Confirmed provider result"}"#.to_owned(),
+                    rendered_text: output.output_preview.clone(),
+                    source_refs_json: "[]".to_owned(),
+                    citation_report_json: "{}".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                },
+            )
+            .expect("artifact creates");
+            assert!(bind_artifact_to_case(
+                &transaction,
+                "retire-confirmed-artifact",
+                "retire-artifact-project"
+            )
+            .expect("artifact binds"));
+            let target =
+                CaseAssistantConfirmationTarget::Artifact("retire-confirmed-artifact".to_owned());
+            assert!(matches!(
+                compare_and_set_case_assistant_pending_output_confirmed(
+                    &transaction,
+                    &ConfirmCaseAssistantPendingOutput {
+                        pending_output_id: "retire-artifact-output",
+                        project_id: "retire-artifact-project",
+                        expected_output_version: 1,
+                        expected_output_sha256: &output.output_sha256,
+                        expected_workspace_base_digest: &output.workspace_base_digest,
+                        expected_proposal_source_refs_json: &output
+                            .expected_proposal_source_refs_json,
+                        expected_proposal_source_refs_sha256: &output
+                            .expected_proposal_source_refs_sha256,
+                        confirmation_request_sha256: &"c".repeat(64),
+                        target: &target,
+                    },
+                )
+                .expect("artifact confirmation succeeds"),
+                CaseAssistantPendingOutputConfirmResult::Confirmed(_)
+            ));
+            transaction.commit().expect("artifact confirmation commits");
+        }
+        let version_one = get_artifact_version(&connection, "retire-confirmed-artifact", 1)
+            .expect("confirmed artifact version reads")
+            .expect("confirmed artifact version exists");
+        connection
+            .execute(
+                "UPDATE artifact_versions SET rendered_text='forged'
+                 WHERE version_id='retire-confirmed-artifact-v1'",
+                [],
+            )
+            .expect_err("confirmed artifact version one cannot be mutated");
+        connection
+            .execute(
+                "DELETE FROM artifact_versions
+                 WHERE version_id='retire-confirmed-artifact-v1'",
+                [],
+            )
+            .expect_err("confirmed artifact version one cannot be deleted");
+        assert_eq!(
+            get_artifact_version(&connection, "retire-confirmed-artifact", 1)
+                .expect("guarded artifact version reads")
+                .expect("guarded artifact version exists"),
+            version_one
+        );
+        assert!(matches!(
+            create_artifact_version(
+                &connection,
+                &NewArtifactVersionRow {
+                    version_id: "retire-confirmed-artifact-v2".to_owned(),
+                    artifact_id: "retire-confirmed-artifact".to_owned(),
+                    content_json: r#"{"body":"later user revision"}"#.to_owned(),
+                    rendered_text: "Later user revision".to_owned(),
+                    source_refs_json: "[]".to_owned(),
+                    citation_report_json: "{}".to_owned(),
+                    provider_snapshot_json: provider_snapshot_json(),
+                },
+                1,
+            )
+            .expect("later artifact version appends"),
+            ArtifactVersionCreateResult::Created(ArtifactVersionRow {
+                version_number: 2,
+                ..
+            })
+        ));
+        validate_user_database_read_only(&database_path)
+            .expect("confirmed artifact remains canonical after a later version");
+        connection
+            .execute(
+                "UPDATE artifacts SET status='archived'
+                 WHERE artifact_id='retire-confirmed-artifact'",
+                [],
+            )
+            .expect_err("live confirmed artifact cannot be archived");
+        connection
+            .execute(
+                "DELETE FROM artifacts
+                 WHERE artifact_id='retire-confirmed-artifact'",
+                [],
+            )
+            .expect_err("live confirmed artifact cannot be deleted outside retirement");
+
+        assert!(delete_case_project(
+            &connection,
+            "retire-artifact-project",
+            TEST_PRIVACY_DELETION_ID
+        )
+        .expect("confirmed artifact project deletes"));
+        assert!(get_artifact(&connection, "retire-confirmed-artifact")
+            .expect("artifact lookup succeeds")
+            .is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_versions
+                     WHERE artifact_id='retire-confirmed-artifact'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("artifact version count reads"),
+            0
+        );
+        let (status, artifact_id, row_version) = connection
+            .query_row(
+                "SELECT status,confirmed_artifact_id,row_version
+                 FROM case_assistant_pending_outputs
+                 WHERE pending_output_id='retire-artifact-output'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("confirmed artifact audit remains");
+        assert_eq!(status, "confirmed");
+        assert_eq!(artifact_id, "retire-confirmed-artifact");
+        assert_eq!(row_version, 2);
+        validate_user_database_read_only(&database_path)
+            .expect("confirmed artifact retirement remains canonical");
+    }
+
+    #[test]
     fn provider_audit_snapshot_schema_rejects_unknown_secret_fields_and_partial_shapes() {
         validate_provider_audit_snapshot_json(&provider_snapshot_json())
             .expect("fixed provider audit snapshot is accepted");
@@ -12157,8 +18985,487 @@ mod tests {
         }
     }
 
+    fn case_assistant_source_snapshots_json() -> String {
+        serde_json::to_string(&serde_json::json!([
+            {
+                "approvedPayloadSha256": "1".repeat(64),
+                "extractionSha256": "2".repeat(64),
+                "generationId": "generation-one",
+                "generationNumber": 3,
+                "generationRowVersion": 7,
+                "materialId": "material-one",
+                "ordinal": 0,
+                "redactedContentSha256": "3".repeat(64),
+                "riskRevision": 2,
+                "riskRevisionHash": "4".repeat(64),
+                "selectionId": "selection-one",
+                "selectionRowVersion": 1
+            }
+        ]))
+        .expect("source snapshots serialize")
+    }
+
+    fn case_assistant_output_payload_json(output_kind: &str) -> String {
+        let content = if output_kind == "case_analysis" {
+            serde_json::json!({"changes": []})
+        } else {
+            serde_json::json!({"body": "Confirmed provider result"})
+        };
+        serde_json::to_string(&serde_json::json!({
+            "content": content,
+            "outputKind": output_kind,
+            "schemaVersion": 1
+        }))
+        .expect("typed output serializes")
+    }
+
+    fn case_assistant_tool_input_audit_json(
+        run_id: &str,
+        project_id: &str,
+        conversation_id: &str,
+        generation_ids: &[String],
+        workspace_digest: &str,
+    ) -> String {
+        let provider_snapshot =
+            serde_json::from_str::<serde_json::Value>(&provider_snapshot_json())
+                .expect("provider snapshot parses");
+        serde_json::to_string(&serde_json::json!({
+            "requestId": run_id,
+            "runId": run_id,
+            "capability": "assistant.case_work",
+            "classification": "case_redacted_approved",
+            "inputIds": {
+                "projectId": project_id,
+                "conversationId": conversation_id,
+                "redactionGenerationIds": generation_ids,
+            },
+            "inputHashes": {
+                "promptSha256": "1".repeat(64),
+                "historySha256": "2".repeat(64),
+                "minimalContextSha256": "3".repeat(64),
+                "generationSetSha256": "4".repeat(64),
+                "workspaceDigest": workspace_digest,
+            },
+            "inputCounts": {
+                "promptBytes": 1,
+                "historyMessages": 0,
+                "historyBytes": 0,
+                "generationCount": generation_ids.len(),
+                "knownBodyBytes": 1,
+            },
+            "providerSnapshot": provider_snapshot,
+            "confirmation": {
+                "writebackRequired": true,
+                "received": false,
+            },
+            "status": "running",
+        }))
+        .expect("case assistant input audit serializes")
+    }
+
+    fn case_assistant_tool_output_audit_json(
+        output_kind: &str,
+        output_sha256: &str,
+        proposal_source_refs_sha256: &str,
+    ) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "outputIds": {"pendingOutputKind": output_kind},
+            "outputHashes": {
+                "providerOutputSha256": "5".repeat(64),
+                "typedOutputSha256": output_sha256,
+                "approvedEnvelopeSha256": "6".repeat(64),
+                "proposalSourceRefsSha256": proposal_source_refs_sha256,
+            },
+            "outputCounts": {
+                "approvedEnvelopeBytes": 1,
+                "bytes": 1,
+                "items": 1,
+            },
+            "status": "succeeded",
+            "confirmation": {
+                "writebackRequired": true,
+                "received": false,
+            },
+        }))
+        .expect("case assistant output audit serializes")
+    }
+
+    fn case_assistant_tool_source_audit_json(
+        generation_ids: &[String],
+        project_binding_sha256: &str,
+        source_snapshots_sha256: &str,
+    ) -> String {
+        let provider_snapshot =
+            serde_json::from_str::<serde_json::Value>(&provider_snapshot_json())
+                .expect("provider snapshot parses");
+        serde_json::to_string(&serde_json::json!({
+            "classification": "case_redacted_approved",
+            "sourceRefs": generation_ids,
+            "inputHashes": {
+                "projectBindingSha256": project_binding_sha256,
+                "sourceSnapshotsSha256": source_snapshots_sha256,
+                "aggregateSourceSha256": "7".repeat(64),
+                "aggregateExtractionSha256": "8".repeat(64),
+                "aggregateRedactedContentSha256": "9".repeat(64),
+            },
+            "providerSnapshot": provider_snapshot,
+            "confirmation": {
+                "writebackRequired": true,
+                "received": false,
+            },
+        }))
+        .expect("case assistant source audit serializes")
+    }
+
+    fn set_case_assistant_tool_audit_for_pending_output(
+        connection: &rusqlite::Connection,
+        output: &NewCaseAssistantPendingOutputRow,
+    ) {
+        let generation_ids =
+            serde_json::from_str::<Vec<serde_json::Value>>(&output.source_snapshots_json)
+                .expect("source snapshots parse")
+                .into_iter()
+                .map(|snapshot| {
+                    snapshot
+                        .get("generationId")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("generation id exists")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+        let input = case_assistant_tool_input_audit_json(
+            &output.run_id,
+            &output.project_id,
+            &output.conversation_id,
+            &generation_ids,
+            &output.workspace_base_digest,
+        );
+        let result = case_assistant_tool_output_audit_json(
+            &output.output_kind,
+            &output.output_sha256,
+            &output.expected_proposal_source_refs_sha256,
+        );
+        let source = case_assistant_tool_source_audit_json(
+            &generation_ids,
+            &output.project_binding_sha256,
+            &output.source_snapshots_sha256,
+        );
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET input_audit_json=?2,output_audit_json=?3,source_audit_json=?4
+                 WHERE tool_call_id=?1",
+                params![
+                    format!("{}-case-work-tool", output.run_id),
+                    input,
+                    result,
+                    source
+                ],
+            )
+            .expect("case assistant tool audit binds to pending output");
+    }
+
+    fn seed_case_assistant_successful_run(
+        connection: &rusqlite::Connection,
+        project_id: &str,
+        conversation_id: &str,
+        run_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+    ) {
+        create_case_work_conversation(connection, conversation_id, project_id, "Case assistant")
+            .expect("case-work conversation creates");
+        create_message(
+            connection,
+            &NewMessageRow {
+                message_id: user_message_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                role: "user".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "Question".to_owned(),
+                artifact_id: None,
+                run_id: None,
+            },
+        )
+        .expect("case assistant user message creates");
+        create_agent_run(
+            connection,
+            &NewAgentRunRow {
+                run_id: run_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                user_message_id: user_message_id.to_owned(),
+                provider_id: None,
+                provider_snapshot_json: provider_snapshot_json(),
+                intent: "interactive_case_work".to_owned(),
+                status: "queued".to_owned(),
+                budget_json: "{}".to_owned(),
+            },
+        )
+        .expect("case assistant run creates");
+        create_message(
+            connection,
+            &NewMessageRow {
+                message_id: assistant_message_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                role: "assistant".to_owned(),
+                kind: "text".to_owned(),
+                text_summary: "Answer".to_owned(),
+                artifact_id: None,
+                run_id: Some(run_id.to_owned()),
+            },
+        )
+        .expect("case assistant response message creates");
+        let tool_call_id = format!("{run_id}-case-work-tool");
+        let generation_ids = vec!["generation-one".to_owned()];
+        let placeholder_output_sha256 = "a".repeat(64);
+        let initial_input_audit = case_assistant_tool_input_audit_json(
+            run_id,
+            project_id,
+            conversation_id,
+            &generation_ids,
+            &"b".repeat(64),
+        );
+        create_tool_call(
+            connection,
+            &NewToolCallRow {
+                tool_call_id: tool_call_id.clone(),
+                run_id: run_id.to_owned(),
+                ordinal: 0,
+                capability_name: "assistant.case_work".to_owned(),
+                status: "running".to_owned(),
+                access_mode: "write".to_owned(),
+                requires_confirmation: false,
+                input_audit_json: initial_input_audit,
+                output_audit_json: "{}".to_owned(),
+                source_audit_json: "{}".to_owned(),
+            },
+        )
+        .expect("case assistant tool audit creates");
+        assert!(matches!(
+            compare_and_set_tool_call_status(
+                connection,
+                &tool_call_id,
+                "running",
+                "succeeded",
+                &case_assistant_tool_output_audit_json(
+                    "case_document",
+                    &placeholder_output_sha256,
+                    &sha256_hex(b"[]"),
+                ),
+                &case_assistant_tool_source_audit_json(
+                    &generation_ids,
+                    &"c".repeat(64),
+                    &"d".repeat(64),
+                ),
+                None,
+            )
+            .expect("case assistant tool audit succeeds"),
+            ToolCallStatusUpdateResult::Updated(_)
+        ));
+        assert!(matches!(
+            compare_and_set_agent_run_status(
+                connection,
+                run_id,
+                "queued",
+                "succeeded",
+                Some(assistant_message_id),
+                None,
+            )
+            .expect("case assistant run succeeds"),
+            AgentRunStatusUpdateResult::Updated(_)
+        ));
+    }
+
+    fn seed_case_assistant_pending_output_fixture(
+        connection: &rusqlite::Connection,
+        fixture_prefix: &str,
+        output_kind: &str,
+    ) -> NewCaseAssistantPendingOutputRow {
+        seed_case_assistant_pending_output_fixture_with_refs(
+            connection,
+            fixture_prefix,
+            output_kind,
+            "[]",
+        )
+    }
+
+    fn seed_case_assistant_pending_output_fixture_with_refs(
+        connection: &rusqlite::Connection,
+        fixture_prefix: &str,
+        output_kind: &str,
+        expected_proposal_source_refs_json: &str,
+    ) -> NewCaseAssistantPendingOutputRow {
+        let project_id = format!("{fixture_prefix}-project");
+        let conversation_id = format!("{fixture_prefix}-conversation");
+        let run_id = format!("{fixture_prefix}-run");
+        let user_message_id = format!("{fixture_prefix}-user-message");
+        let assistant_message_id = format!("{fixture_prefix}-assistant-message");
+        let pending_output_id = format!("{fixture_prefix}-output");
+        seed_project(connection, &project_id);
+        seed_case_assistant_successful_run(
+            connection,
+            &project_id,
+            &conversation_id,
+            &run_id,
+            &user_message_id,
+            &assistant_message_id,
+        );
+        let workspace_base_digest = case_workspace_digest(connection, &project_id)
+            .expect("workspace digest computes")
+            .expect("project exists");
+        let snapshots = case_assistant_source_snapshots_json();
+        let payload = case_assistant_output_payload_json(output_kind);
+        let output = NewCaseAssistantPendingOutputRow {
+            pending_output_id,
+            project_id,
+            conversation_id,
+            run_id,
+            assistant_message_id,
+            project_binding_sha256: "a".repeat(64),
+            source_snapshots_sha256: sha256_hex(snapshots.as_bytes()),
+            source_snapshots_json: snapshots,
+            expected_proposal_source_refs_json: expected_proposal_source_refs_json.to_owned(),
+            expected_proposal_source_refs_sha256: sha256_hex(
+                expected_proposal_source_refs_json.as_bytes(),
+            ),
+            output_kind: output_kind.to_owned(),
+            output_sha256: sha256_hex(payload.as_bytes()),
+            output_payload_json: payload,
+            output_preview: "Answer".to_owned(),
+            output_version: 1,
+            workspace_base_digest,
+        };
+        set_case_assistant_tool_audit_for_pending_output(connection, &output);
+        create_case_assistant_pending_output(connection, &output)
+            .expect("case assistant pending output creates");
+        output
+    }
+
+    fn confirm_case_assistant_analysis_fixture(
+        connection: &mut rusqlite::Connection,
+        output: &NewCaseAssistantPendingOutputRow,
+        proposal_id: &str,
+    ) {
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("analysis fixture confirmation transaction begins");
+        create_case_change_proposal(
+            &transaction,
+            &NewCaseChangeProposalRow {
+                proposal_id: proposal_id.to_owned(),
+                conversation_id: output.conversation_id.clone(),
+                project_id: output.project_id.clone(),
+                run_id: Some(output.run_id.clone()),
+                base_case_digest: output.workspace_base_digest.clone(),
+                changes_json: r#"{"changes":[]}"#.to_owned(),
+                source_refs_json: output.expected_proposal_source_refs_json.clone(),
+            },
+        )
+        .expect("analysis fixture proposal creates");
+        assert!(matches!(
+            compare_and_set_case_change_proposal_status(
+                &transaction,
+                proposal_id,
+                &output.project_id,
+                &output.workspace_base_digest,
+                "applied",
+            )
+            .expect("analysis fixture proposal applies"),
+            CaseChangeProposalStatusUpdateResult::Updated(_)
+        ));
+        assert!(matches!(
+            compare_and_set_case_assistant_pending_output_confirmed(
+                &transaction,
+                &ConfirmCaseAssistantPendingOutput {
+                    pending_output_id: &output.pending_output_id,
+                    project_id: &output.project_id,
+                    expected_output_version: output.output_version,
+                    expected_output_sha256: &output.output_sha256,
+                    expected_workspace_base_digest: &output.workspace_base_digest,
+                    expected_proposal_source_refs_json: &output.expected_proposal_source_refs_json,
+                    expected_proposal_source_refs_sha256: &output
+                        .expected_proposal_source_refs_sha256,
+                    confirmation_request_sha256: &"a".repeat(64),
+                    target: &CaseAssistantConfirmationTarget::Proposal(proposal_id.to_owned()),
+                },
+            )
+            .expect("analysis fixture confirmation succeeds"),
+            CaseAssistantPendingOutputConfirmResult::Confirmed(_)
+        ));
+        transaction
+            .commit()
+            .expect("analysis fixture confirmation commits");
+    }
+
+    fn downgrade_case_assistant_proposal_provenance_fixture(connection: &rusqlite::Connection) {
+        for trigger in USER_SCHEMA_TRIGGER_NAMES {
+            connection
+                .execute(&format!("DROP TRIGGER IF EXISTS \"{trigger}\""), [])
+                .expect("canonical trigger drops for legacy provenance fixture");
+        }
+        connection
+            .execute(
+                "UPDATE tool_calls
+                 SET output_audit_json=json_remove(
+                     output_audit_json,
+                     '$.outputHashes.proposalSourceRefsSha256'
+                 )
+                 WHERE capability_name='assistant.case_work'
+                   AND status='succeeded'",
+                [],
+            )
+            .expect("legacy tool audits omit exact proposal provenance hash");
+        connection
+            .execute_batch(
+                "CREATE TABLE case_assistant_pending_outputs_legacy_fixture AS
+                 SELECT
+                     pending_output_id, project_id, conversation_id, run_id,
+                     assistant_message_id, project_binding_sha256,
+                     source_snapshots_json, source_snapshots_sha256,
+                     output_kind, output_payload_json, output_preview,
+                     output_sha256, output_version, workspace_base_digest,
+                     status, confirmed_artifact_id, confirmed_proposal_id,
+                     confirmation_request_sha256, row_version, created_at,
+                     confirmed_at
+                 FROM case_assistant_pending_outputs;
+                 DROP TABLE case_assistant_pending_outputs;
+                 ALTER TABLE case_assistant_pending_outputs_legacy_fixture
+                 RENAME TO case_assistant_pending_outputs;",
+            )
+            .expect("legacy pending-output table omits exact proposal provenance columns");
+        connection
+            .execute(
+                "UPDATE user_database_metadata
+                 SET value='v11-before-exact-proposal-provenance'
+                 WHERE key=?1",
+                [USER_CANONICAL_SCHEMA_MARKER_KEY],
+            )
+            .expect("legacy provenance fixture requests canonical rebuild");
+    }
+
     fn provider_snapshot_json() -> String {
-        r#"{"kind":"deep_seek","modelId":"test-model","baseUrl":"https://api.example.invalid/v1","capabilities":{"chat":true,"streaming":true,"customModelId":true,"customBaseUrl":true,"reasoning":true},"options":{"thinking":false,"enableThinking":null,"thinkingBudget":null,"reasoningEffort":null,"endpointId":null,"workspaceId":null,"allowPrivateNetwork":false}}"#.to_owned()
+        serde_json::to_string(&serde_json::json!({
+            "kind": "deep_seek",
+            "modelId": "test-model",
+            "baseUrl": "https://api.example.invalid/v1",
+            "capabilities": {
+                "chat": true,
+                "streaming": true,
+                "customModelId": true,
+                "customBaseUrl": true,
+                "reasoning": true,
+            },
+            "options": {
+                "thinking": false,
+                "enableThinking": null,
+                "thinkingBudget": null,
+                "reasoningEffort": null,
+                "endpointId": null,
+                "workspaceId": null,
+                "allowPrivateNetwork": false,
+            },
+        }))
+        .expect("provider snapshot serializes")
     }
 
     fn seed_project(connection: &rusqlite::Connection, project_id: &str) {

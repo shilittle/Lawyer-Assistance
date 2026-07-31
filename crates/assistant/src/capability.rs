@@ -7,7 +7,7 @@ pub const MAX_INPUT_BODY_BYTES_PER_RUN: usize = 2 * 1024 * 1024;
 pub const MAX_MODEL_VISIBLE_ATTACHMENTS_PER_RUN: usize = 2;
 pub const MAX_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
-pub const CAPABILITY_COUNT: usize = 11;
+pub const CAPABILITY_COUNT: usize = 12;
 pub const MAX_CAPABILITY_VERSION_BYTES: usize = 16;
 pub const MAX_AUDIT_FIELDS_PER_CAPABILITY: usize = 16;
 pub const MAX_ALLOWED_ERRORS_PER_CAPABILITY: usize = 12;
@@ -36,6 +36,8 @@ pub enum CapabilityName {
     MapBuild,
     #[serde(rename = "assistant.interactive_chat")]
     AssistantInteractiveChat,
+    #[serde(rename = "assistant.case_work")]
+    AssistantCaseWork,
 }
 
 impl CapabilityName {
@@ -52,6 +54,7 @@ impl CapabilityName {
             Self::DocumentRender => "document.render",
             Self::MapBuild => "map.build",
             Self::AssistantInteractiveChat => "assistant.interactive_chat",
+            Self::AssistantCaseWork => "assistant.case_work",
         }
     }
 }
@@ -267,6 +270,24 @@ const INTERACTIVE_CHAT_AUDIT: &[AuditField] = &[
     AuditField::Timing,
     AuditField::ErrorType,
 ];
+const CASE_WORK_AUDIT: &[AuditField] = &[
+    AuditField::RequestId,
+    AuditField::RunId,
+    AuditField::Capability,
+    AuditField::Classification,
+    AuditField::InputIds,
+    AuditField::InputHashes,
+    AuditField::InputCounts,
+    AuditField::OutputIds,
+    AuditField::OutputHashes,
+    AuditField::OutputCounts,
+    AuditField::SourceRefs,
+    AuditField::ProviderSnapshot,
+    AuditField::Confirmation,
+    AuditField::Status,
+    AuditField::Timing,
+    AuditField::ErrorType,
+];
 
 const READ_ONLY: CapabilityAccess = CapabilityAccess {
     read: true,
@@ -365,6 +386,14 @@ pub static CAPABILITY_REGISTRY: [CapabilityDescriptor; CAPABILITY_COUNT] = [
         limits(1, MAX_INPUT_BODY_BYTES_PER_RUN, MAX_MODEL_RESPONSE_BYTES),
         INTERACTIVE_CHAT_ERRORS,
         INTERACTIVE_CHAT_AUDIT,
+    ),
+    descriptor(
+        CapabilityName::AssistantCaseWork,
+        READ_WRITE,
+        false,
+        limits(1, MAX_INPUT_BODY_BYTES_PER_RUN, MAX_MODEL_RESPONSE_BYTES),
+        INTERACTIVE_CHAT_ERRORS,
+        CASE_WORK_AUDIT,
     ),
 ];
 

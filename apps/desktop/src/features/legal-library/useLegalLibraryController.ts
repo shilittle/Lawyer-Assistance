@@ -92,7 +92,7 @@ export interface UseLegalLibraryControllerOptions {
   assistantActiveProject: CaseProject | null;
   onNavigateToSearch: () => void;
   onOpenLawGraph: (documentId: string) => void;
-  onContinueInAssistant: () => void;
+  onOpenCaseAssistant: () => void;
   onOpenAssistant: () => void;
   onLegacyApprovedProviderRequest: (
     task: ApprovedProviderTask,
@@ -975,7 +975,7 @@ export function useLegalLibraryController(
       bridgeState,
       addSelectedArticleToAssistant,
       proposeSelectedArticleForCase,
-      continueInAssistant: options.onContinueInAssistant,
+      openCaseAssistant: options.onOpenCaseAssistant,
       openAssistant: options.onOpenAssistant,
     },
     qa: {

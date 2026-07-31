@@ -393,6 +393,7 @@ fn map_summary_rejects_engineering_text_and_internal_references() {
         "C:\\cases\\internal.json",
         "019f6e74-d8f3-7771-82a8-715331d4ae45",
         "a1b2c3d4e5f60789",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ] {
         let mut polluted = map.clone();
         polluted.nodes[0].summary = leaked_text.to_owned();

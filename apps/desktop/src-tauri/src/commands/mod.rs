@@ -3,6 +3,7 @@ pub mod approved_mcp;
 pub mod assistant;
 pub mod assistant_run;
 pub mod case;
+pub mod case_assistant;
 pub mod document;
 pub mod graph;
 pub mod legal;

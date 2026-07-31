@@ -2748,14 +2748,14 @@ fn proposal_conflict_error() -> AssistantIpcError {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ValidatedLegalBasisSource {
+pub(super) struct ValidatedLegalBasisSource {
     source: LegalSource,
     status: CitationStatus,
     invalid_reason: Option<CitationInvalidReason>,
     case_date: Option<String>,
 }
 
-fn validate_case_change_spec(
+pub(super) fn validate_case_change_spec(
     state: &AppState,
     changes: &assistant::CaseChangeSpec,
     scope: &AssistantValidationScope,

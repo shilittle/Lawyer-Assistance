@@ -78,6 +78,10 @@ const PROVIDER_SETTINGS_ROUTE = {
   area: "settings",
   page: "providers",
 } as const satisfies AppRoute;
+const CASE_ASSISTANT_ROUTE = {
+  area: "cases",
+  page: "work",
+} as const satisfies AppRoute;
 const CASE_GRAPH_ROUTE = {
   area: "cases",
   page: "outputs",
@@ -124,7 +128,7 @@ export function App() {
     assistantActiveProject,
     onNavigateToSearch: () => navigateFromShell(LEGAL_LIBRARY_ROUTE),
     onOpenLawGraph: openLawGraph,
-    onContinueInAssistant: continueSelectedCaseInAssistant,
+    onOpenCaseAssistant: openSelectedCaseAssistant,
     onOpenAssistant: () => navigateFromShell(ASSISTANT_ROUTE),
     onLegacyApprovedProviderRequest:
       redirectLegacyEgressToApprovedProvider,
@@ -244,14 +248,9 @@ export function App() {
     );
   }
 
-  function continueSelectedCaseInAssistant(): void {
+  function openSelectedCaseAssistant(): void {
     if (!assistantActiveProject) return;
-    completeNavigation(
-      navigation.handoffAssistantCase({
-        projectId: assistantActiveProject.projectId,
-        title: assistantActiveProject.title,
-      }),
-    );
+    navigateFromShell(CASE_ASSISTANT_ROUTE);
   }
 
   function openCaseGraph(): void {
@@ -318,10 +317,9 @@ export function App() {
   );
 
   const slots: AppRouterSlots = {
-    assistant: ({ route }) => (
+    assistant: () => (
       <AssistantWorkspace
         activeProject={assistantActiveProject}
-        caseHandoff={route.state?.request ?? null}
         externalRefreshKey={assistantController.refreshKey}
         providerProfiles={providerSettings.profiles}
         proposalApplyBlockedReason={assistantProposalApplyBlockedReason}
@@ -360,7 +358,6 @@ export function App() {
         controller={caseController}
         graphTarget={route.state?.request ?? null}
         legalSources={legalLibrary.activeSources}
-        onContinueInAssistant={continueSelectedCaseInAssistant}
         onGraphTargetConsumed={consumeGraphTarget}
         onOpenCaseGraph={openCaseGraph}
         providerProfiles={providerSettings.profiles}

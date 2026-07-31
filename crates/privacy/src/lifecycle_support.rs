@@ -1082,6 +1082,9 @@ fn validate_backup_envelope(
     context: &BackupVerificationExpectation<'_>,
     registry: &(String, i64, i64, i64, String),
 ) -> Result<(), LifecycleError> {
+    let maximum_database_bytes =
+        max_backup_database_bytes_for_schema(envelope.privacy_store_schema_version)
+            .ok_or(LifecycleError::BackupInvalid)?;
     if envelope.schema_version != ENCRYPTED_BACKUP_SCHEMA_VERSION
         || envelope.crypto_suite != BACKUP_CRYPTO_SUITE
         || envelope.backup_id != backup_id
@@ -1096,7 +1099,7 @@ fn validate_backup_envelope(
         || envelope.created_at_unix >= envelope.expires_at_unix
         || envelope.database_bytes == 0
         || envelope.database_bytes
-            > u64::try_from(MAX_BACKUP_DATABASE_BYTES).map_err(|_| LifecycleError::BackupInvalid)?
+            > u64::try_from(maximum_database_bytes).map_err(|_| LifecycleError::BackupInvalid)?
     {
         return Err(LifecycleError::EnvironmentMismatch);
     }
@@ -1135,7 +1138,13 @@ fn verify_sqlite_snapshot_bytes(
     root: &FixedLocalStorageRoot,
     backup_id: &str,
 ) -> Result<(), LifecycleError> {
-    if bytes.len() < 100 || !bytes.starts_with(b"SQLite format 3\0") {
+    let maximum_database_bytes =
+        max_backup_database_bytes_for_schema(expected_privacy_store_schema_version)
+            .ok_or(LifecycleError::BackupInvalid)?;
+    if bytes.len() < 100
+        || bytes.len() > maximum_database_bytes
+        || !bytes.starts_with(b"SQLite format 3\0")
+    {
         return Err(LifecycleError::BackupInvalid);
     }
     let mut random = [0_u8; 8];

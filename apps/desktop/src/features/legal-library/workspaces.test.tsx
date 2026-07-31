@@ -151,7 +151,7 @@ function controllerFor(patch: ControllerPatch = {}): LegalLibraryController {
     bridgeState: { kind: "idle" },
     addSelectedArticleToAssistant: vi.fn(async () => undefined),
     proposeSelectedArticleForCase: vi.fn(async () => undefined),
-    continueInAssistant: vi.fn(),
+    openCaseAssistant: vi.fn(),
     openAssistant: vi.fn(),
     ...patch.search,
   };

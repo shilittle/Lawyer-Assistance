@@ -38,6 +38,7 @@ const MATERIAL_ID_DOMAIN: &[u8] = b"case-material-migration-v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"case-material-source-fingerprint-v1\0";
 const RISK_REVISION_PROFILE: &str = "privacy-risk-review-revision-v1";
 const MAX_SOURCE_ID_BYTES: usize = 256;
+const CASE_MATERIAL_TARGET_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CaseMaterialMigrationReport {
@@ -289,12 +290,11 @@ impl PrivacyWorkflowManager {
             if !self.startup_vault_present() {
                 preflight_missing_vault_privacy_identity(&privacy)?;
             }
-            if matches!(
-                schema_status,
-                PrivacyStoreSchemaStatus::UpgradeRequired { .. }
-            ) {
-                preflight_privacy_integrity_and_cleanup(&privacy)?;
-                return Ok(true);
+            if let PrivacyStoreSchemaStatus::UpgradeRequired { found_version } = schema_status {
+                if found_version != CASE_MATERIAL_TARGET_SCHEMA_VERSION {
+                    preflight_privacy_integrity_and_cleanup(&privacy)?;
+                    return Ok(true);
+                }
             }
             preflight_privacy_store(&privacy)?;
             if self.vault_startup_write_required() {
@@ -399,7 +399,15 @@ impl PrivacyWorkflowManager {
         expected_source_fingerprint: &str,
     ) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
         let _operation_guard = self.gate();
-        if self.privacy_store_schema_upgrade_required() || self.vault_startup_write_required() {
+        let schema_status = self.preflight_privacy_store_schema_read_only()?;
+        let privacy_schema_ready = matches!(
+            schema_status,
+            PrivacyStoreSchemaStatus::Current
+                | PrivacyStoreSchemaStatus::UpgradeRequired {
+                    found_version: CASE_MATERIAL_TARGET_SCHEMA_VERSION
+                }
+        );
+        if !privacy_schema_ready || self.vault_startup_write_required() {
             return Err(migration_error(
                 "privacy_store_backup_required",
                 "The case-material migration cannot run before the coordinated backup and all required storage schema upgrades.",
@@ -433,7 +441,19 @@ impl PrivacyWorkflowManager {
                 ));
             }
             let snapshot = UserSnapshot::load(&user)?;
-            let mut privacy = self.open_connection()?;
+            let mut privacy = match schema_status {
+                PrivacyStoreSchemaStatus::Current => self.open_connection()?,
+                PrivacyStoreSchemaStatus::UpgradeRequired {
+                    found_version: CASE_MATERIAL_TARGET_SCHEMA_VERSION,
+                } => self.open_raw_connection()?,
+                PrivacyStoreSchemaStatus::Empty
+                | PrivacyStoreSchemaStatus::UpgradeRequired { .. } => {
+                    return Err(migration_error(
+                        "privacy_store_backup_required",
+                        "The case-material migration cannot run before the coordinated backup and all required storage schema upgrades.",
+                    ));
+                }
+            };
             preflight_privacy_store(&privacy)?;
             preflight_vault_state(self)?;
 
@@ -657,9 +677,13 @@ fn assert_read_only_source(connection: &Connection) -> Result<(), PrivacyWorkflo
 }
 
 fn preflight_privacy_store(connection: &Connection) -> Result<(), PrivacyWorkflowError> {
-    if PrivacyStore::preflight_schema(connection).map_err(PrivacyWorkflowError::store)?
-        != PrivacyStoreSchemaStatus::Current
-    {
+    if !matches!(
+        PrivacyStore::preflight_schema(connection).map_err(PrivacyWorkflowError::store)?,
+        PrivacyStoreSchemaStatus::Current
+            | PrivacyStoreSchemaStatus::UpgradeRequired {
+                found_version: CASE_MATERIAL_TARGET_SCHEMA_VERSION
+            }
+    ) {
         return Err(migration_error(
             "privacy_store_schema_upgrade_required",
             "The case-material coordinator accepts only the backed-up unified Privacy schema.",
@@ -4584,6 +4608,15 @@ mod tests {
         }
     }
 
+    fn complete_approved_projection_migration(manager: &PrivacyWorkflowManager) {
+        let source_fingerprint = manager
+            .approved_projection_migration_source_fingerprint()
+            .expect("approved-projection source fingerprint");
+        manager
+            .run_approved_projection_migration_after_backup_for_source(&source_fingerprint)
+            .expect("approved-projection migration");
+    }
+
     fn expire_project_generation(fixture: &Fixture, redaction_id: &str, cleanup_id: &str) {
         let mut connection = fixture.manager.open_connection().expect("privacy store");
         let changed = connection
@@ -5579,6 +5612,7 @@ mod tests {
         manager
             .run_case_material_migration_after_backup()
             .expect("valid history backfill");
+        complete_approved_projection_migration(&manager);
         assert_eq!(
             fs::read(&user_database_path).expect("user source after"),
             user_before
@@ -5667,6 +5701,7 @@ mod tests {
         manager
             .run_case_material_migration_after_backup()
             .expect("migrate retention fixture");
+        complete_approved_projection_migration(&manager);
 
         let mut connection = manager.open_connection().expect("privacy store");
         let lifecycle =

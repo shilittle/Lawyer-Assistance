@@ -33,7 +33,6 @@ export interface CaseWorkbenchPanelProps {
   controller: CaseWorkspaceController;
   legalSources: readonly LegalSource[];
   graphTarget: GraphTargetRequest | null;
-  onContinueInAssistant: () => void;
   onOpenCaseGraph: () => void;
 }
 
@@ -41,7 +40,6 @@ export function CaseWorkbenchPanel({
   controller,
   legalSources,
   graphTarget,
-  onContinueInAssistant,
   onOpenCaseGraph,
 }: CaseWorkbenchPanelProps) {
   const {
@@ -88,7 +86,6 @@ export function CaseWorkbenchPanel({
     editingFact,
     editingEvidence,
     editingIssue,
-    assistantActiveProject,
     startCaseEntityEdit,
     cancelCaseEntityEdit,
     saveCaseProject,
@@ -114,15 +111,6 @@ export function CaseWorkbenchPanel({
             <div className="panel-heading">
               <h2 id="case-workbench-title">案件工作台 β</h2>
               <span>{caseState.kind === "loading" ? "处理中" : "本地"}</span>
-            </div>
-            <div className="provider-create-row">
-              <button
-                disabled={!assistantActiveProject || caseNavigationLocked}
-                type="button"
-                onClick={onContinueInAssistant}
-              >
-                在助理中继续
-              </button>
             </div>
             <div className="case-scroll">
               {caseState.kind === "error" ? (

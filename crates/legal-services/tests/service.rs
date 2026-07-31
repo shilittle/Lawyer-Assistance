@@ -205,7 +205,7 @@ fn status_and_legal_tools_use_validated_external_databases() {
     assert_eq!(status.status, "ready");
     assert_eq!(status.legal_database.schema_version.as_deref(), Some("4"));
     assert_eq!(status.legal_database.runtime_schema_version, None);
-    assert_eq!(status.user_database.schema_version.as_deref(), Some("10"));
+    assert_eq!(status.user_database.schema_version.as_deref(), Some("11"));
     assert_eq!(status.file_policy.allowed_file_root_count, 1);
 
     let search = fixture
