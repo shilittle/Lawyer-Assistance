@@ -1,7 +1,5 @@
 import {
-  useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
   type FormEvent,
@@ -75,14 +73,6 @@ export type LegalLibraryLoadState =
 export type LegalSourceBridgeState =
   | { kind: "idle" | "loading" }
   | { kind: "success" | "error"; message: string };
-
-export interface LegalLibraryProviderBridge {
-  selectInitialProvider: (providerId: string) => void;
-  handleProviderDeleted: (
-    deletedProviderId: string,
-    fallbackProviderId: string | null,
-  ) => void;
-}
 
 export interface UseLegalLibraryControllerOptions {
   qaActive: boolean;
@@ -180,7 +170,6 @@ export function useLegalLibraryController(
   const [qaIncludeExpired, setQaIncludeExpired] = useState(
     DEFAULT_QA_FORM_DRAFT.includeExpired,
   );
-  const [qaProviderId, setQaProviderId] = useState("");
   const [qaContext, setQaContext] = useState<LegalAnswerContext | null>(null);
   const [qaAnswer, setQaAnswer] = useState<LegalAnswerResponse | null>(null);
   const [qaHistoryState, setQaHistoryState] =
@@ -767,25 +756,6 @@ export function useLegalLibraryController(
     }
   }
 
-  const selectInitialProvider = useCallback((providerId: string) => {
-    setQaProviderId(providerId);
-  }, []);
-  const handleProviderDeleted = useCallback(
-    (
-      deletedProviderId: string,
-      fallbackProviderId: string | null,
-    ) => {
-      setQaProviderId((current) =>
-        current === deletedProviderId ? (fallbackProviderId ?? "") : current,
-      );
-    },
-    [],
-  );
-  const providerBridge = useMemo<LegalLibraryProviderBridge>(
-    () => ({ selectInitialProvider, handleProviderDeleted }),
-    [handleProviderDeleted, selectInitialProvider],
-  );
-
   useEffect(() => {
     setBridgeState({ kind: "idle" });
   }, [selectedArticleId]);
@@ -981,8 +951,6 @@ export function useLegalLibraryController(
       setEffectivenessLevels: setQaEffectivenessLevels,
       includeExpired: qaIncludeExpired,
       setIncludeExpired: setQaIncludeExpired,
-      providerId: qaProviderId,
-      setProviderId: setQaProviderId,
       context: qaContext,
       answer: qaAnswer,
       historyState: qaHistoryState,
@@ -1010,7 +978,6 @@ export function useLegalLibraryController(
     graphDocumentId,
     activeSources: activeQaContext?.sources ?? [],
     bridgeMutationInFlightRef,
-    providerBridge,
     openDocumentCitation,
     consumeDocumentCitation,
     openLawDocumentFromGraph,

@@ -144,7 +144,6 @@ export function CaseWorkspaceCompatibilityOutlet({
       />
       <CaseGapExtractionPanel
         controller={controller}
-        providerProfiles={providerProfiles}
       />
       {section === "work" ? (
         <CaseAssistantWorkspace

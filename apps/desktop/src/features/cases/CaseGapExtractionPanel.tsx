@@ -4,33 +4,26 @@ import {
   formatGapSeverity,
 } from "../../ipc/case/format";
 import type { PartyRole } from "../../ipc/case/types";
-import type { ProviderProfile } from "../../ipc/provider/types";
 import { publicErrorMessage } from "../../publicOutput";
 import { publicCaseBusinessText } from "./model";
 import type { CaseWorkspaceController } from "./useCaseWorkspaceController";
 
 export interface CaseGapExtractionPanelProps {
   controller: CaseWorkspaceController;
-  providerProfiles: readonly ProviderProfile[];
 }
 
 export function CaseGapExtractionPanel({
   controller,
-  providerProfiles,
 }: CaseGapExtractionPanelProps) {
   const {
     caseWorkspace,
     selectedCaseProjectId,
-    caseValidationTargetId,
     caseMutationInFlight,
     activeCaseEntityEditor,
     caseNavigationLocked,
-    caseProjectMutationLocked,
     removeCaseEntity,
   } = controller;
   const {
-    providerId: extractionProviderId,
-    setProviderId: setExtractionProviderId,
     state: extractionState,
     confirmPreparing: extractionConfirmPreparing,
     discarding: extractionDiscarding,
@@ -136,28 +129,6 @@ export function CaseGapExtractionPanel({
                   </button>
                 </div>
               ) : null}
-              <label>
-                <span>Provider</span>
-                <select
-                  id="extraction-provider"
-                  aria-describedby="case-workbench-error"
-                  aria-invalid={
-                    caseValidationTargetId === "extraction-provider"
-                  }
-                  disabled={caseProjectMutationLocked}
-                  value={extractionProviderId}
-                  onChange={(event) =>
-                    setExtractionProviderId(event.target.value)
-                  }
-                >
-                  <option value="">选择已保存 Provider</option>
-                  {providerProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.displayName} · {profile.modelId}
-                    </option>
-                  ))}
-                </select>
-              </label>
               {extractionState.kind === "reviewing" ||
               extractionState.kind === "committing" ? (
                 <div

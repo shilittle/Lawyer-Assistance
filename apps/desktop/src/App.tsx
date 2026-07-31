@@ -140,37 +140,7 @@ export function App() {
   const {
     deletionBlockedProviderId: providerDeletionBlockedProviderId,
     closeGuard: caseCloseGuard,
-    selectInitialProvider: selectInitialExtractionProvider,
-    handleProviderSaved: handleExtractionProviderSaved,
-    handleProviderDeleted: handleExtractionProviderDeleted,
   } = caseController.extraction;
-
-  const handleInitialProviderSelected = useCallback(
-    (providerId: string) => {
-      legalLibrary.providerBridge.selectInitialProvider(providerId);
-      selectInitialExtractionProvider(providerId);
-    },
-    [legalLibrary.providerBridge, selectInitialExtractionProvider],
-  );
-  const handleProviderSaved = useCallback(
-    (providerId: string) => {
-      handleExtractionProviderSaved(providerId);
-    },
-    [handleExtractionProviderSaved],
-  );
-  const handleProviderDeleted = useCallback(
-    (deletedProviderId: string, fallbackProviderId: string | null) => {
-      legalLibrary.providerBridge.handleProviderDeleted(
-        deletedProviderId,
-        fallbackProviderId,
-      );
-      handleExtractionProviderDeleted(
-        deletedProviderId,
-        fallbackProviderId,
-      );
-    },
-    [handleExtractionProviderDeleted, legalLibrary.providerBridge],
-  );
   const providerSettings = useProviderSettingsController({
     policies: {
       hasUnsavedChanges: providerNavigationHasUnsavedChanges,
@@ -182,9 +152,6 @@ export function App() {
       confirmAction: confirmDiscard,
     },
     deletionBlockedProviderId: providerDeletionBlockedProviderId,
-    onInitialProviderSelected: handleInitialProviderSelected,
-    onProviderSaved: handleProviderSaved,
-    onProviderDeleted: handleProviderDeleted,
   });
   const providerActivity = useMemo(
     () => ({
@@ -325,7 +292,6 @@ export function App() {
       <LegacyQaWorkspace
         caseWorkspace={caseWorkspace}
         controller={legalLibrary}
-        providerProfiles={providerSettings.profiles}
       />
     ),
     cases: ({ route }) => (

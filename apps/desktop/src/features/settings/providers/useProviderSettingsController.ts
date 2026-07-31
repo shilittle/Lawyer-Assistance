@@ -68,12 +68,6 @@ export interface ProviderSettingsPolicies {
 export interface UseProviderSettingsControllerOptions {
   policies: ProviderSettingsPolicies;
   deletionBlockedProviderId: string | null;
-  onInitialProviderSelected: (providerId: string) => void;
-  onProviderSaved: (providerId: string) => void;
-  onProviderDeleted: (
-    deletedProviderId: string,
-    fallbackProviderId: string | null,
-  ) => void;
 }
 
 export interface ProviderSettingsController {
@@ -119,9 +113,6 @@ function createProviderProfile(kind: ProviderKind): ProviderProfile {
 export function useProviderSettingsController({
   policies,
   deletionBlockedProviderId,
-  onInitialProviderSelected,
-  onProviderSaved,
-  onProviderDeleted,
 }: UseProviderSettingsControllerOptions): ProviderSettingsController {
   const [state, setState] = useState<ProviderSettingsLoadState>({
     kind: "idle",
@@ -179,7 +170,6 @@ export function useProviderSettingsController({
           setSelectedProviderId(firstProfile.id);
           setDraft(firstProfile);
           draftBaseline.current = firstProfile;
-          onInitialProviderSelected(firstProfile.id);
         }
 
         const statusResult = await loadProviderKeyStatusesSettled(
@@ -215,7 +205,7 @@ export function useProviderSettingsController({
     return () => {
       isMounted = false;
     };
-  }, [onInitialProviderSelected]);
+  }, []);
 
   function blockNavigationForDirtyDraft(action: string): boolean {
     if (!hasUnsavedChangesRef.current) {
@@ -322,7 +312,6 @@ export function useProviderSettingsController({
       setDraft(response.profile);
       draftBaseline.current = response.profile;
       setSelectedProviderId(response.profile.id);
-      onProviderSaved(response.profile.id);
       clearConnectionResult(response.profile.id);
       await refreshKeyStatus(response.profile);
       setState({ kind: "idle" });
@@ -468,8 +457,6 @@ export function useProviderSettingsController({
             delete next[profileId];
             return next;
           });
-          onProviderDeleted(profileId, remaining[0]?.id ?? null);
-
           if (remaining[0]) {
             setSelectedProviderId(remaining[0].id);
             setDraft(remaining[0]);

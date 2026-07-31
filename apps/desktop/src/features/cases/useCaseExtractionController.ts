@@ -2,7 +2,6 @@ import {
   type Dispatch,
   type MutableRefObject,
   type SetStateAction,
-  useCallback,
   useEffect,
   useReducer,
   useRef,
@@ -94,7 +93,6 @@ export function useCaseExtractionController({
   workspace,
   confirmAction,
 }: UseCaseExtractionControllerOptions) {
-  const [providerId, setProviderId] = useState("");
   const [fileIds, setFileIds] = useState<string[]>([]);
   const [state, dispatch] = useReducer(extractionReducer, {
     kind: "idle",
@@ -374,7 +372,6 @@ export function useCaseExtractionController({
         restorableFileIds,
         pending.providerSnapshot,
       );
-      setProviderId(pending.providerId);
       setFileIds(restorableFileIds);
       lifecycleLock.current = true;
       beginDraftSaveSession(
@@ -737,33 +734,10 @@ export function useCaseExtractionController({
     );
   }
 
-  const selectInitialProvider = useCallback((selectedProviderId: string) => {
-    setProviderId(selectedProviderId);
-  }, []);
-
-  const handleProviderSaved = useCallback((savedProviderId: string) => {
-    setProviderId((current) => current || savedProviderId);
-  }, []);
-
-  const handleProviderDeleted = useCallback(
-    (deletedProviderId: string, fallbackProviderId: string | null) => {
-      if (fallbackProviderId) {
-        setProviderId((current) =>
-          current === deletedProviderId ? fallbackProviderId : current,
-        );
-      } else {
-        setProviderId("");
-      }
-    },
-    [],
-  );
-
   const deletionBlockedProviderId =
     sourcesLocked && "context" in state ? state.context.providerId : null;
 
   return {
-    providerId,
-    setProviderId,
     fileIds,
     setFileIds,
     state,
@@ -790,9 +764,6 @@ export function useCaseExtractionController({
     confirmReview,
     interactionIsLocked,
     blocksCaseMutation,
-    selectInitialProvider,
-    handleProviderSaved,
-    handleProviderDeleted,
   };
 }
 

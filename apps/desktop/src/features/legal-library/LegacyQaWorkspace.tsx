@@ -18,7 +18,6 @@ import {
   sanitizePublicGeneratedText,
 } from "../../publicOutput";
 import type { CaseWorkspace } from "../../ipc/case/types";
-import type { ProviderProfile } from "../../ipc/provider/types";
 import {
   citationHasTrustedSource,
   formatCitationValidationSummary,
@@ -27,13 +26,11 @@ import type { LegalLibraryController } from "./useLegalLibraryController";
 
 export interface LegacyQaWorkspaceProps {
   controller: LegalLibraryController;
-  providerProfiles: readonly ProviderProfile[];
   caseWorkspace: CaseWorkspace | null;
 }
 
 export function LegacyQaWorkspace({
   controller,
-  providerProfiles,
   caseWorkspace,
 }: LegacyQaWorkspaceProps) {
   const {
@@ -52,8 +49,6 @@ export function LegacyQaWorkspace({
     setEffectivenessLevels,
     includeExpired,
     setIncludeExpired,
-    providerId,
-    setProviderId,
     answer,
     historyState,
     historyRecords,
@@ -139,20 +134,6 @@ export function LegacyQaWorkspace({
                 <small>
                   留空按当前有效性检索；不会以立案/接案日期代替案件事实日期。
                 </small>
-              </label>
-              <label>
-                <span>Provider</span>
-                <select
-                  value={providerId}
-                  onChange={(event) => setProviderId(event.target.value)}
-                >
-                  <option value="">选择 Provider</option>
-                  {providerProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.displayName}
-                    </option>
-                  ))}
-                </select>
               </label>
             </div>
             <fieldset className="qa-effectiveness-filter">
