@@ -1450,9 +1450,7 @@ export function AssistantWorkspace({
       <ArtifactPanel
         activeProject={activeProject}
         artifacts={detail?.artifacts ?? []}
-        messages={detail?.messages ?? []}
         proposals={detail?.proposals ?? []}
-        runs={detail?.runs ?? []}
         selectedArtifactId={selectedArtifactId}
         sources={detail?.sources ?? []}
         onConversationRefresh={refreshConversation}

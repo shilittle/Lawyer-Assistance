@@ -77,7 +77,7 @@ impl EgressError {
         match self {
             Self::PayloadTooLarge => "privacy_payload_too_large",
             Self::NonUtf8Payload => "privacy_payload_non_utf8",
-            Self::ClassificationForbidden => "raw_material_forbidden",
+            Self::ClassificationForbidden => "classification_forbidden",
             Self::ReceiptRequired => "redaction_required",
             Self::ResidualSensitiveContent => "residual_sensitive_content",
             Self::InvalidPolicy => "privacy_policy_invalid",
@@ -471,6 +471,10 @@ mod tests {
             let (result, audit) = authorize_and_maybe_send(&engine, &candidate, &transport);
 
             assert_eq!(result.err(), Some(EgressError::ClassificationForbidden));
+            assert_eq!(
+                EgressError::ClassificationForbidden.code(),
+                "classification_forbidden"
+            );
             assert_eq!(transport.send_count(), 0);
             assert_eq!(audit.classification, classification);
             assert_eq!(audit.destination_kind, DestinationKind::ExternalMcpHost);
@@ -481,10 +485,7 @@ mod tests {
             assert_eq!(audit.payload_sha256, sha256_hex(payload.as_bytes()));
             assert_eq!(audit.payload_bytes, payload.len());
             assert!(!audit.allowed);
-            assert_eq!(
-                audit.reason_code,
-                EgressError::ClassificationForbidden.code()
-            );
+            assert_eq!(audit.reason_code, "classification_forbidden");
 
             let wire = serde_json::to_string(&audit).expect("audit JSON");
             assert!(!wire.contains(&payload));
