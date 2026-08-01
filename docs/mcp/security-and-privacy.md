@@ -2,9 +2,11 @@
 
 ## 当前强制边界
 
-所有案件原件、附件、粘贴文本、OCR、截图、文件名或路径、当事人及关联人信息、案号、联系方式、地址、证件或账户、签名印章、事实、证据、草稿、摘要、翻译和派生内容一律视为 `CASE_RAW`。`CASE_REDACTED_PENDING`、待复核内容，以及仅有 `CASE_REDACTED_APPROVED` 标签、文件名或口头声明的内容同样不得进入宿主、MCP、Provider、网络或文件工具。
+所有来自案件工作区、案件材料、Vault 或宿主案件任务的原件、附件、粘贴文本、OCR、截图、文件名或路径、当事人及关联人信息、案号、联系方式、地址、证件或账户、签名印章、事实、证据、草稿、摘要、翻译和派生内容一律视为 `CASE_RAW`。`CASE_REDACTED_PENDING`、待复核内容，以及仅有 `CASE_REDACTED_APPROVED` 标签、文件名或口头声明的内容同样不得进入宿主、MCP 或未经批准的 Provider。
 
-App 内的本地批准产物并不自动获得 MCP/Provider 外发资格。批准 MCP 和批准 Provider 的正向链已分别实现，但每次使用仍要求当前资格、精确 generation、目的地/实例、工具或固定用途、canonical request/payload、短期有效期、撤销 epoch 和防重放全部匹配。默认 public-only 集成仍只允许不含案件事实的公开法律检索。用户同意、紧急情况、宽泛的宿主权限、其他 prompt 或宿主文件读取不能替代这些技术证据。
+应用内普通聊天可以发送用户主动输入的非案件文本，以及本次显式选择、属于当前普通会话且本地提取成功的非案件附件正文；后端将其构造为 `InteractiveUserProvided`，不是公开数据。该能力不适用于案件文件、宿主附件或来源不明的内容。无法确认是否包含案件或客户信息时，必须按 `CASE_RAW` 处理并回到“案件工作台 → 材料与脱敏”。
+
+App 内的本地批准产物并不自动获得 MCP/Provider 外发资格。案件助理只使用本次明确选择的 approved-only 投影和最小已确认案件数据；批准 MCP 和自动化 Provider 正向链则继续要求当前资格、精确 generation、目的地/实例、工具或固定用途、canonical request/payload、短期有效期、撤销 epoch 和防重放全部匹配。三者不能互相借用 authority、receipt、grant 或 ticket。默认 public-only 宿主集成仍只允许不含案件事实的公开法律检索。用户同意、紧急情况、宽泛的宿主权限、其他 prompt 或宿主文件读取不能替代这些技术证据。
 
 ## 宿主在规则加载前的披露
 
@@ -25,9 +27,17 @@ WorkBuddy、Codex、OpenCode 或其他宿主可能在 Skill/Agent/prompt 规则�
 - 旧案件状态/patch、任意材料导入、缺口分析、文书生成和路径导出工具在所有 profile 中隐藏；新 work-product 只能通过精确的 case write/update 或 approved diagram render/update 业务工具写入。
 - 原件已进入任务时必须停止并新建干净任务；Skill 不能撤回加载前披露。
 
+`CASE_RAW` 和 `CASE_REDACTED_PENDING` 指向 `ExternalMcpHost` 时必须返回 `classification_forbidden`，且 transport 保持零调用。拒绝审计只保存分类、内容 hash、字节数和拒绝原因，不保存正文或 destination 明文。普通聊天允许 `InteractiveUserProvided` 到所选 Provider，不改变这条 MCP 负向边界。
+
 ## Provider 边界
 
-Provider transport 在序列化前要求明确数据分类。公开路径只放行代码内固定、且不插入用户内容的公开法律或产品请求；旧助理入口的全部用户自由文本（包括表面上不含个人信息的法律问题）以及旧案件分析、法律文书入口都必须在读取凭据、持久化或网络调用前 fail closed，并转入 Approved Provider 固定任务。独立批准路径从 Rust 受保护存储恢复逐字节批准正文和回执，重验 Provider/endpoint/model/固定用途/策略/探测器/OCR provenance/generation/期限/撤销，再发送并保护输出。前端标签、意图字段、空会话或裸 `ChatRequest` 不能构造该类型，也不能证明公开来源。
+Provider transport 在序列化前要求明确数据分类，并区分三个闭合入口：
+
+- 普通聊天只通过 `start_interactive_assistant_run` 发送 `InteractiveUserProvided`。请求只接受 run、普通会话、Provider、prompt、本次显式附件和可选预算；authority/classification 由可信后端构造，不接受 project、Privacy、generation、receipt、MCP 或客户端声明的 authority/classification。
+- 案件助理只通过 `start_case_assistant_run` 发送 `CaseRedactedApproved`。每次请求明确列出当前案件 generation，后端从 approved-only 投影恢复正文并在 socket write 前重验归属、版本、risk 和撤销；不读取原件、完整 review blob、普通聊天附件或 MCP 授权。
+- 自动化 Provider 在“设置 → MCP 与自动化 → 自动化出站批准”执行固定任务。Rust 从受保护存储恢复批准 payload 和 receipt，重验 Provider/endpoint/model/固定用途/策略/探测器/OCR provenance/generation/期限/撤销，再发送并保护输出。
+
+普通聊天不得伪装成公开法律或 `ProductPublic`，案件助理不得降级为普通聊天，自动化 receipt 也不得替代案件助理的显式选择。旧多意图入口和裸案件 `ChatRequest` 仍必须在读取凭据、持久化或网络调用前 fail closed。
 
 ## PDF、OCR 与 MinerU
 

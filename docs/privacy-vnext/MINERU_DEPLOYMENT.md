@@ -45,7 +45,7 @@ v0.3.1 只有 CLI runner 的描述是历史基线。beta.2 已有自包含 worke
 
 ### 安装
 
-1. 推荐用户先在 App 外通过 GitHub 认证下载 catalog、同名 `.minisig`、`.laocrparts` descriptor 与全部 parts，再选择本地离线导入；仅当运行环境本身能访问 private GitHub Release 时，才可从已导入并验证签名的固定项目 catalog 显式选择 App 下载。应用不接受任意 URL，也不接收 GitHub token 或案件数据。
+1. 推荐用户先在 App 外从项目公开 GitHub Release 下载完整 catalog、同名 `.minisig`、`.laocrparts` descriptor 与全部 parts，再选择本地离线导入；也可先导入并验证签名的固定项目 catalog，再在界面核对固定 URL、大小和 hash 后显式选择 App 下载。公开可达只说明资产可下载，不证明签名、完整性、来源审批或当前机器资格。应用不接受任意 URL，也不接收 GitHub token 或案件数据。
 2. 在 staging 中校验签名或受信发布 key、包 hash、manifest schema、exact file set、每个文件的大小和 SHA-256。
 3. 拒绝额外文件、链接、重解析点、稀疏/占位文件、非本地固定磁盘和可执行入口漂移。
 4. 安装到新的不可变版本目录，执行无材料 health check。
@@ -138,7 +138,7 @@ worker 返回的成功退出码不等于文档完整。后端必须独立验证�
 
 应用不执行隐式下载，也不允许用户输入任意下载地址。用户可选择两种显式安装方式：导入本机 `.laocrpkg`，或者先导入受发布密钥签名的组件目录，再在界面完整查看固定 HTTPS 来源、精确字节数、包 SHA-256 与 manifest SHA-256 后点击下载。联网命令的输入只有目录内的 `packageId`；它没有案件 ID、材料路径、正文、附件、OCR 文本、Provider 凭证或删除防火墙规则的字段。
 
-受信目录只接受项目 GitHub Release 的固定命名 URL，并限制跳转到 GitHub 发布资产域名。项目仓库实际为 private，未认证客户端访问这些 URL 会失败；catalog 中存在合法固定 URL 不代表资产公开可下载，也不证明资产已经发布。推荐使用浏览器或 `gh` 在 App 外完成 GitHub 认证并下载 catalog、detached signature、descriptor 与全部 parts，再走 App 本地导入。App 自动下载仅适用于运行环境已能访问该 private Release 的情况；不得把 GitHub token 填入 catalog、组件配置、案件 metadata 或普通日志。目录原文与 detached minisign 签名被保存在同一个原子 envelope 中；`issuedAt` 高水位由 DPAPI 保护的本机密钥进行 HMAC 认证，拒绝回滚以及同一 epoch 的不同内容。组件下载采用流式写入，要求响应 `Content-Length`、最终字节数和 SHA-256 全部精确匹配；任何失败都只清理本次随机 `.download-<UUID>` 暂存目录。
+受信目录只接受项目公开 GitHub Release 的固定命名 URL，并限制跳转到 GitHub 发布资产域名。仓库公开并不把 URL 可达性变成完整性或资格证据；catalog 中存在合法固定 URL，也不证明完整签名集已发布、已通过 provenance/licensing 审批或适用于当前机器。推荐使用浏览器或 `gh` 在 App 外下载 catalog、detached signature、descriptor 与全部 parts，再走 App 本地导入。App 自动下载也只能从已经本地导入并验签的固定 catalog 选择 `packageId`；不需要、也不得把 GitHub token 填入 catalog、组件配置、案件 metadata 或普通日志。目录原文与 detached minisign 签名被保存在同一个原子 envelope 中；`issuedAt` 高水位由 DPAPI 保护的本机密钥进行 HMAC 认证，拒绝回滚以及同一 epoch 的不同内容。组件下载采用流式写入，要求响应 `Content-Length`、最终字节数和 SHA-256 全部精确匹配；任何失败都只清理本次随机 `.download-<UUID>` 暂存目录。
 
 `.laocrpkg` 是严格的流式包格式：固定 magic、长度前缀 JSON manifest、按 manifest 顺序拼接的 payload。manifest 拒绝未知字段，绑定 package/component/MinerU/protocol/platform、worker、运行时可执行文件、pipeline/vlm 模型目录以及每个文件的精确大小和 SHA-256。安装拒绝绝对路径、`..`、反斜杠、ADS、Windows 保留名、大小写折叠重复、额外文件、symlink/reparse point、hardlink、cloud recall/offline 占位文件和非固定本机磁盘。worker 与运行时入口必须是 PE/MZ `.exe`。安装前同时检查包上限与可用磁盘空间。
 
@@ -152,9 +152,9 @@ worker 返回的成功退出码不等于文档完整。后端必须独立验证�
 
 ### 运维顺序
 
-1. 先在 App 外通过 GitHub 认证下载完整私有资产集：签名 catalog、同名 `.minisig`、`.laocrparts` descriptor 和全部 parts。未经认证的客户端不得假设 catalog URL 可达。
-2. 在 App 内先导入 catalog 与 signature，再选择本地 descriptor 安装；只有运行环境已具备 private Release 访问能力时，才可在核对 URL、大小和两个 SHA-256 后显式使用自动下载。等待 staging、exact-tree 校验和原子激活完成。
-3. 在隐私设置中选择 `auto_local`、`force_local` 和目标 `cuda:<index>`；保存后建立安装信任、安装并复测防火墙规则、运行无案件材料的 canary，再显式授权生产案卷 OCR。
+1. 先在 App 外从项目公开 GitHub Release 下载完整签名资产集：catalog、同名 `.minisig`、`.laocrparts` descriptor 和全部 parts。缺少任一成员时不得导入或拼接其他来源的同名文件。
+2. 在 App 内先导入 catalog 与 signature，再选择本地 descriptor 安装；也可在验签后的 catalog 中核对 URL、大小和两个 SHA-256 后显式使用自动下载。等待 staging、exact-tree 校验和原子激活完成。公开下载成功本身不代表组件受信或已取得 OCR 资格。
+3. 在“设置 → 本地处理环境与 OCR 组件”中选择 `auto_local`、`force_local` 和目标 `cuda:<index>`；保存后建立安装信任、安装并复测防火墙规则、运行无案件材料的 canary，再显式授权生产案卷 OCR。
 4. 升级或回滚后必须重新执行第 3 步。资格未重新建立前，App 与 approved MCP 都不得处理真实扫描案卷。
 5. 卸载前勾选明确确认；卸载完成后保留防火墙规则。若状态为 `drifted`、`quarantined` 或出现签名/HMAC/目录/hash 错误，先保留现场并按 reason code 排查，不得绕过门禁。
 
@@ -176,4 +176,4 @@ python scripts/build_mineru_component_package.py `
   --issued-at <unix-seconds> --expires-at <unix-seconds>
 ```
 
-`worker` 始终必需；`--runtime-executable` 仅用于 worker 之外确实会启动的额外 EXE，可重复零到 32 次。组件中每个额外 EXE 都必须声明，且 App 会把 worker 与全部已声明额外 EXE 一并纳入防火墙和资格 inventory。成功输出同时给出包 SHA-256、manifest SHA-256、精确字节数、catalog SHA-256 和绑定 exact catalog 文件名/epoch 的 PowerShell minisign 命令。catalog 此时明确是 **unsigned**。候选资产必须同时满足：外部保管的对应私钥完成离线签名、App 内置公钥验证通过、provenance/third-party licensing audit 完成、路径/安装/资格 release gates 通过，之后才可上传固定 private `mineru-components-v<semver>` Release。没有私钥时不得生成占位签名；没有 provenance/licensing approval 时即使签名有效也不得发布；不得把合成测试包或空模型冒充发布资产。发布新 epoch 时应传 `--previous-catalog` 做本地 rollback/equivocation 预检。
+`worker` 始终必需；`--runtime-executable` 仅用于 worker 之外确实会启动的额外 EXE，可重复零到 32 次。组件中每个额外 EXE 都必须声明，且 App 会把 worker 与全部已声明额外 EXE 一并纳入防火墙和资格 inventory。成功输出同时给出包 SHA-256、manifest SHA-256、精确字节数、catalog SHA-256 和绑定 exact catalog 文件名/epoch 的 PowerShell minisign 命令。catalog 此时明确是 **unsigned**。候选资产必须同时满足：外部保管的对应私钥完成离线签名、App 内置公钥验证通过、provenance/third-party licensing audit 完成、路径/安装/资格 release gates 通过，之后才可上传固定公开 `mineru-components-v<semver>` Release。没有私钥时不得生成占位签名；没有 provenance/licensing approval 时即使签名有效也不得发布；不得把合成测试包或空模型冒充发布资产。发布新 epoch 时应传 `--previous-catalog` 做本地 rollback/equivocation 预检。

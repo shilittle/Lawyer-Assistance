@@ -1,7 +1,5 @@
 import {
-  useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
   type FormEvent,
@@ -42,7 +40,6 @@ import type {
   LegalAnswerRecord,
   LegalAnswerResponse,
 } from "../../ipc/legal/types";
-import type { ApprovedProviderTask } from "../../ipc/privacy/types";
 import { publicErrorMessage, publicTitle } from "../../publicOutput";
 import {
   articleMatchesDocumentCitation,
@@ -77,14 +74,6 @@ export type LegalSourceBridgeState =
   | { kind: "idle" | "loading" }
   | { kind: "success" | "error"; message: string };
 
-export interface LegalLibraryProviderBridge {
-  selectInitialProvider: (providerId: string) => void;
-  handleProviderDeleted: (
-    deletedProviderId: string,
-    fallbackProviderId: string | null,
-  ) => void;
-}
-
 export interface UseLegalLibraryControllerOptions {
   qaActive: boolean;
   selectedCaseProjectId: string | null;
@@ -94,10 +83,6 @@ export interface UseLegalLibraryControllerOptions {
   onOpenLawGraph: (documentId: string) => void;
   onOpenCaseAssistant: () => void;
   onOpenAssistant: () => void;
-  onLegacyApprovedProviderRequest: (
-    task: ApprovedProviderTask,
-    notice: string,
-  ) => void;
   onAddAssistantLegalSource: (sourceId: string) => Promise<void>;
   onProposeAssistantLegalBasis: (sourceId: string) => Promise<void>;
 }
@@ -185,7 +170,6 @@ export function useLegalLibraryController(
   const [qaIncludeExpired, setQaIncludeExpired] = useState(
     DEFAULT_QA_FORM_DRAFT.includeExpired,
   );
-  const [qaProviderId, setQaProviderId] = useState("");
   const [qaContext, setQaContext] = useState<LegalAnswerContext | null>(null);
   const [qaAnswer, setQaAnswer] = useState<LegalAnswerResponse | null>(null);
   const [qaHistoryState, setQaHistoryState] =
@@ -642,14 +626,6 @@ export function useLegalLibraryController(
     }
   }
 
-  function submitLegalAnswer(event?: FormEvent<HTMLFormElement>) {
-    event?.preventDefault();
-    options.onLegacyApprovedProviderRequest(
-      "case_legal_qa",
-      "案件法律问答必须先完成本地脱敏和人工批准；已为你切换到 Approved Provider 的固定任务“案件法律问答”。",
-    );
-  }
-
   async function cancelCurrentLegalAnswer() {
     const requestId = activeQaRequestId.current;
     const stream = qaStreamRef.current;
@@ -779,25 +755,6 @@ export function useLegalLibraryController(
       bridgeMutationInFlightRef.current = false;
     }
   }
-
-  const selectInitialProvider = useCallback((providerId: string) => {
-    setQaProviderId(providerId);
-  }, []);
-  const handleProviderDeleted = useCallback(
-    (
-      deletedProviderId: string,
-      fallbackProviderId: string | null,
-    ) => {
-      setQaProviderId((current) =>
-        current === deletedProviderId ? (fallbackProviderId ?? "") : current,
-      );
-    },
-    [],
-  );
-  const providerBridge = useMemo<LegalLibraryProviderBridge>(
-    () => ({ selectInitialProvider, handleProviderDeleted }),
-    [handleProviderDeleted, selectInitialProvider],
-  );
 
   useEffect(() => {
     setBridgeState({ kind: "idle" });
@@ -994,8 +951,6 @@ export function useLegalLibraryController(
       setEffectivenessLevels: setQaEffectivenessLevels,
       includeExpired: qaIncludeExpired,
       setIncludeExpired: setQaIncludeExpired,
-      providerId: qaProviderId,
-      setProviderId: setQaProviderId,
       context: qaContext,
       answer: qaAnswer,
       historyState: qaHistoryState,
@@ -1010,7 +965,6 @@ export function useLegalLibraryController(
       answeredScope: answeredQaScope,
       requestLocked: qaRequestLocked,
       preview: previewLegalAnswerContext,
-      submit: submitLegalAnswer,
       cancel: cancelCurrentLegalAnswer,
       restoreRecord: restoreLegalAnswerRecord,
       refreshHistory: refreshLegalAnswerHistory,
@@ -1024,7 +978,6 @@ export function useLegalLibraryController(
     graphDocumentId,
     activeSources: activeQaContext?.sources ?? [],
     bridgeMutationInFlightRef,
-    providerBridge,
     openDocumentCitation,
     consumeDocumentCitation,
     openLawDocumentFromGraph,

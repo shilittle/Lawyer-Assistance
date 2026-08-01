@@ -45,7 +45,7 @@ describe("typed application routes", () => {
     expect(LEGAL_LIBRARY_ROUTE_PAGES).toEqual(["library"]);
     expect(SETTINGS_ROUTE_PAGES).toEqual([
       "providers",
-      "privacy",
+      "local-processing",
       "mcp",
       "maintenance",
     ]);
@@ -64,7 +64,10 @@ describe("typed application routes", () => {
       graph: { area: "cases", page: "outputs", output: "graph" },
       search: { area: "legal-library", page: "library" },
       providers: { area: "settings", page: "providers" },
-      privacy: { area: "settings", page: "privacy" },
+      "local-processing": {
+        area: "settings",
+        page: "local-processing",
+      },
       mcp: { area: "settings", page: "mcp" },
       release: { area: "settings", page: "maintenance" },
     };
@@ -91,19 +94,29 @@ describe("typed application routes", () => {
     expect(
       sameRouteLocation(
         {
-          area: "assistant",
-          page: "chat",
+          area: "legal-library",
+          page: "library",
           state: {
-            kind: "assistant-case-handoff",
-            request: { projectId: "case-1", title: "案件一", requestId: 1 },
+            kind: "legal-citation",
+            request: {
+              sourceId: "citation-1",
+              documentId: "document-1",
+              versionId: "version-1",
+              articleId: "article-1",
+            },
           },
         },
         {
-          area: "assistant",
-          page: "chat",
+          area: "legal-library",
+          page: "library",
           state: {
-            kind: "assistant-case-handoff",
-            request: { projectId: "case-2", title: "案件二", requestId: 2 },
+            kind: "legal-citation",
+            request: {
+              sourceId: "citation-2",
+              documentId: "document-2",
+              versionId: "version-2",
+              articleId: "article-2",
+            },
           },
         },
       ),
@@ -122,32 +135,19 @@ describe("typed application routes", () => {
     ).toBe(false);
   });
 
-  it("owns the compatibility approved Provider request on MCP and automation", () => {
-    const route = {
+  it("keeps Assistant chat and MCP as state-free destinations", () => {
+    expect({ area: "assistant", page: "chat" } satisfies AppRoute).toEqual({
+      area: "assistant",
+      page: "chat",
+    });
+    expect({ area: "settings", page: "mcp" } satisfies AppRoute).toEqual({
       area: "settings",
       page: "mcp",
-      state: {
-        kind: "approved-provider-task",
-        request: {
-          task: "summary",
-          notice: "显式兼容请求",
-          requestId: 4,
-        },
-      },
-    } as const satisfies AppRoute;
-
-    expect(route.state.request.requestId).toBe(4);
-    expect(
-      sameRouteLocation(route, { area: "settings", page: "mcp" }),
-    ).toBe(true);
+    });
   });
 });
 
 describe("route-state request identity", () => {
-  const assistantRequest: RouteState = {
-    kind: "assistant-case-handoff",
-    request: { projectId: "case-1", title: "案件一", requestId: 7 },
-  };
   const citationRequest: RouteState = {
     kind: "legal-citation",
     request: {
@@ -161,44 +161,6 @@ describe("route-state request identity", () => {
     kind: "graph-target",
     request: { sourceKind: "case_fact", sourceId: "fact-1" },
   };
-  const providerRequest: RouteState = {
-    kind: "approved-provider-task",
-    request: {
-      task: "case_legal_qa",
-      notice: "当前提示",
-      requestId: 11,
-    },
-  };
-
-  it("uses the existing sequence id for assistant and approved Provider requests", () => {
-    expect(
-      sameRouteStateRequest(assistantRequest, {
-        kind: "assistant-case-handoff",
-        request: {
-          projectId: "case-changed",
-          title: "标题变化不改变请求身份",
-          requestId: 7,
-        },
-      }),
-    ).toBe(true);
-    expect(
-      sameRouteStateRequest(providerRequest, {
-        kind: "approved-provider-task",
-        request: {
-          task: "summary",
-          notice: "提示变化不改变请求身份",
-          requestId: 11,
-        },
-      }),
-    ).toBe(true);
-    expect(
-      sameRouteStateRequest(assistantRequest, {
-        kind: "assistant-case-handoff",
-        request: { projectId: "case-1", title: "案件一", requestId: 8 },
-      }),
-    ).toBe(false);
-  });
-
   it("uses exact source identities for citations and graph targets", () => {
     expect(
       sameRouteStateRequest(citationRequest, {
@@ -237,10 +199,8 @@ describe("route-state request identity", () => {
   });
 
   it("does not confuse request kinds or missing requests", () => {
-    expect(sameRouteStateRequest(assistantRequest, providerRequest)).toBe(
-      false,
-    );
+    expect(sameRouteStateRequest(citationRequest, graphRequest)).toBe(false);
     expect(sameRouteStateRequest(undefined, null)).toBe(true);
-    expect(sameRouteStateRequest(undefined, assistantRequest)).toBe(false);
+    expect(sameRouteStateRequest(undefined, citationRequest)).toBe(false);
   });
 });

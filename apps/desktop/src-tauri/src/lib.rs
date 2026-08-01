@@ -569,7 +569,6 @@ pub fn run() {
             commands::assistant::create_assistant_case_change_proposal,
             commands::assistant::reject_assistant_case_change_proposal,
             commands::assistant::apply_assistant_case_change_proposal,
-            commands::assistant_run::start_assistant_run,
             commands::assistant_run::start_interactive_assistant_run,
             commands::assistant::cancel_assistant_run,
             commands::case_assistant::create_case_assistant_conversation,
@@ -770,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_registers_only_project_scoped_review_commands() {
+    fn renderer_registers_only_current_assistant_and_project_scoped_review_commands() {
         let source = include_str!("lib.rs");
         let registrations = source
             .split(".invoke_handler(tauri::generate_handler![")
@@ -803,6 +802,7 @@ mod tests {
             );
         }
         for unscoped in [
+            "commands::assistant_run::start_assistant_run,",
             "commands::privacy_workflow::load_privacy_review,",
             "commands::privacy_workflow::load_latest_privacy_review,",
             "commands::privacy_workflow::load_privacy_risk_review,",

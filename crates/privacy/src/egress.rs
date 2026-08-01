@@ -77,7 +77,7 @@ impl EgressError {
         match self {
             Self::PayloadTooLarge => "privacy_payload_too_large",
             Self::NonUtf8Payload => "privacy_payload_non_utf8",
-            Self::ClassificationForbidden => "raw_material_forbidden",
+            Self::ClassificationForbidden => "classification_forbidden",
             Self::ReceiptRequired => "redaction_required",
             Self::ResidualSensitiveContent => "residual_sensitive_content",
             Self::InvalidPolicy => "privacy_policy_invalid",
@@ -313,6 +313,37 @@ impl EgressPolicyEngine {
 mod tests {
     use super::*;
     use crate::receipt::{RedactionReceiptClaims, ReviewState};
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct CountingTransport {
+        sends: Cell<usize>,
+    }
+
+    impl CountingTransport {
+        fn send(&self, _payload: &ApprovedOutboundPayload) {
+            self.sends.set(self.sends.get() + 1);
+        }
+
+        fn send_count(&self) -> usize {
+            self.sends.get()
+        }
+    }
+
+    fn authorize_and_maybe_send(
+        engine: &EgressPolicyEngine,
+        candidate: &EgressCandidate<'_>,
+        transport: &CountingTransport,
+    ) -> (
+        Result<ApprovedOutboundPayload, EgressError>,
+        PrivacyEgressAuditRecord,
+    ) {
+        let (result, audit) = engine.authorize_with_audit(candidate);
+        if let Ok(approved) = result.as_ref() {
+            transport.send(approved);
+        }
+        (result, audit)
+    }
 
     fn signer() -> ReceiptSigner {
         ReceiptSigner::new([3u8; 32]).expect("key")
@@ -413,6 +444,55 @@ mod tests {
                 Some(EgressError::ClassificationForbidden)
             );
         }
+    }
+
+    #[test]
+    fn raw_and_pending_case_data_never_reach_external_mcp_transport_or_audit_content() {
+        let engine = EgressPolicyEngine::new(signer(), "cn-legal-default", 1).expect("engine");
+        let destination = destination(DestinationKind::ExternalMcpHost);
+        let transport = CountingTransport::default();
+
+        for (index, classification) in [
+            DataClassification::CaseRaw,
+            DataClassification::CaseRedactedPending,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let payload = format!("phase7-mcp-classification-canary-{index}");
+            let candidate = EgressCandidate {
+                payload: payload.as_bytes(),
+                classification,
+                destination: &destination,
+                purpose: "approved_case_workspace",
+                receipt: None,
+                now_unix: 500,
+            };
+            let (result, audit) = authorize_and_maybe_send(&engine, &candidate, &transport);
+
+            assert_eq!(result.err(), Some(EgressError::ClassificationForbidden));
+            assert_eq!(
+                EgressError::ClassificationForbidden.code(),
+                "classification_forbidden"
+            );
+            assert_eq!(transport.send_count(), 0);
+            assert_eq!(audit.classification, classification);
+            assert_eq!(audit.destination_kind, DestinationKind::ExternalMcpHost);
+            assert_eq!(
+                audit.destination_identifier_sha256,
+                sha256_hex(destination.identifier.as_bytes())
+            );
+            assert_eq!(audit.payload_sha256, sha256_hex(payload.as_bytes()));
+            assert_eq!(audit.payload_bytes, payload.len());
+            assert!(!audit.allowed);
+            assert_eq!(audit.reason_code, "classification_forbidden");
+
+            let wire = serde_json::to_string(&audit).expect("audit JSON");
+            assert!(!wire.contains(&payload));
+            assert!(!wire.contains(&destination.identifier));
+        }
+
+        assert_eq!(transport.send_count(), 0);
     }
 
     #[test]

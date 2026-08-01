@@ -11,30 +11,76 @@ import {
   getLocalOcrStatus,
   getPrivacyConfig,
   savePrivacyConfig,
-} from "../../ipc/privacy/client";
+} from "../../../ipc/privacy/client";
 import {
   PRIVACY_CONFIG_SCHEMA_VERSION,
   type LocalMineruDiscoveryResult,
   type PrivacyConfig,
   type PrivacyConfigDraft,
   type PrivacyConfigResponse,
-} from "../../ipc/privacy/types";
-import "./privacy.css";
-import { MineruComponentManagerPanel } from "./MineruComponentManagerPanel";
-import { PrivacyLifecyclePanel } from "./PrivacyLifecyclePanel";
-import { PrivacyQualificationControls } from "./PrivacyQualificationControls";
+} from "../../../ipc/privacy/types";
+import "../../privacy/privacy.css";
+import { MineruComponentManagerPanel } from "../../privacy/MineruComponentManagerPanel";
+import { PrivacyQualificationControls } from "../../privacy/PrivacyQualificationControls";
 
-type PrivacyOperation = "loading" | "idle" | "discovering" | "saving" | "refreshing";
+export type LocalProcessingOperation =
+  | "loading"
+  | "idle"
+  | "discovering"
+  | "saving"
+  | "refreshing";
 
-export interface PrivacyWorkspaceProps {
+// eslint-disable-next-line react-refresh/only-export-components
+export function localProcessingMutationIsActive(
+  operation: LocalProcessingOperation,
+  componentActive: boolean,
+  qualificationActive: boolean,
+): boolean {
+  return (
+    operation === "discovering" ||
+    operation === "saving" ||
+    componentActive ||
+    qualificationActive
+  );
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function localProcessingConfigIsDisabled(
+  operation: LocalProcessingOperation,
+  componentActive: boolean,
+  qualificationActive: boolean,
+): boolean {
+  return operation !== "idle" || componentActive || qualificationActive;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function localProcessingComponentIsDisabled(
+  dirty: boolean,
+  operation: LocalProcessingOperation,
+  qualificationActive: boolean,
+): boolean {
+  return dirty || operation !== "idle" || qualificationActive;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function localProcessingQualificationIsDisabled(
+  dirty: boolean,
+  operation: LocalProcessingOperation,
+  componentActive: boolean,
+): boolean {
+  return dirty || operation !== "idle" || componentActive;
+}
+
+export interface LocalProcessingWorkspaceProps {
   onDraftDirtyChange?: (dirty: boolean) => void;
   onMutationActivityChange?: (active: boolean) => void;
 }
 
-export interface PrivacyWorkspaceViewProps {
+export interface LocalProcessingWorkspaceViewProps {
   configResponse: PrivacyConfigResponse;
   draft: PrivacyConfigDraft;
-  operation: PrivacyOperation;
+  operation: LocalProcessingOperation;
+  disabled?: boolean;
   dirty: boolean;
   notice: string;
   error: string;
@@ -215,10 +261,11 @@ function displayError(error: unknown): string {
   return "隐私配置操作失败。";
 }
 
-export function PrivacyWorkspaceView({
+export function LocalProcessingWorkspaceView({
   configResponse,
   draft,
   operation,
+  disabled = false,
   dirty,
   notice,
   error,
@@ -227,8 +274,8 @@ export function PrivacyWorkspaceView({
   onSave,
   onReset,
   onRefreshStatus,
-}: PrivacyWorkspaceViewProps) {
-  const busy = operation !== "idle";
+}: LocalProcessingWorkspaceViewProps) {
+  const busy = disabled || operation !== "idle";
   const ocrEnabled = draft.ocrMode !== "off";
   const status = configResponse.ocrStatus;
   const qualificationChecks = [
@@ -276,7 +323,7 @@ export function PrivacyWorkspaceView({
       <header className="privacy-heading">
         <div>
           <p className="eyebrow">本机策略与组件检查</p>
-          <h2>隐私与本地处理</h2>
+          <h2>本地处理环境与 OCR 组件</h2>
         </div>
         <span className={`privacy-config-state ${configResponse.configValid ? "is-valid" : "is-invalid"}`}>
           {configResponse.configValid ? "配置有效" : "配置失效，外发应保持关闭"}
@@ -568,17 +615,17 @@ export function PrivacyWorkspaceView({
   );
 }
 
-export function PrivacyWorkspace({
+export function LocalProcessingWorkspace({
   onDraftDirtyChange,
   onMutationActivityChange,
-}: PrivacyWorkspaceProps) {
+}: LocalProcessingWorkspaceProps) {
   const [configResponse, setConfigResponse] =
     useState<PrivacyConfigResponse | null>(null);
   const [draft, setDraft] = useState<PrivacyConfigDraft | null>(null);
-  const [operation, setOperation] = useState<PrivacyOperation>("loading");
+  const [operation, setOperation] =
+    useState<LocalProcessingOperation>("loading");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [lifecycleActive, setLifecycleActive] = useState(false);
   const [componentActive, setComponentActive] = useState(false);
   const [qualificationActive, setQualificationActive] = useState(false);
 
@@ -614,19 +661,26 @@ export function PrivacyWorkspace({
     return () => onDraftDirtyChange?.(false);
   }, [dirty, onDraftDirtyChange]);
 
-  const mutationActive =
-    operation === "discovering" ||
-    operation === "saving" ||
-    lifecycleActive ||
-    componentActive ||
-    qualificationActive;
+  const mutationActive = localProcessingMutationIsActive(
+    operation,
+    componentActive,
+    qualificationActive,
+  );
   useEffect(() => {
     onMutationActivityChange?.(mutationActive);
     return () => onMutationActivityChange?.(false);
   }, [mutationActive, onMutationActivityChange]);
 
   const save = useCallback(async () => {
-    if (!configResponse || !draft || operation !== "idle") return;
+    if (
+      !configResponse ||
+      !draft ||
+      operation !== "idle" ||
+      componentActive ||
+      qualificationActive
+    ) {
+      return;
+    }
     let config: PrivacyConfig;
     try {
       config = privacyDraftToConfig(draft);
@@ -647,17 +701,38 @@ export function PrivacyWorkspace({
     } finally {
       setOperation("idle");
     }
-  }, [configResponse, draft, operation]);
+  }, [
+    componentActive,
+    configResponse,
+    draft,
+    operation,
+    qualificationActive,
+  ]);
 
   const reset = useCallback(() => {
-    if (!configResponse || operation !== "idle") return;
+    if (
+      !configResponse ||
+      operation !== "idle" ||
+      componentActive ||
+      qualificationActive
+    ) {
+      return;
+    }
     setDraft(privacyConfigToDraft(configResponse.config));
     setError("");
     setNotice("已放弃未保存修改。");
-  }, [configResponse, operation]);
+  }, [componentActive, configResponse, operation, qualificationActive]);
 
   const refreshStatus = useCallback(async () => {
-    if (!configResponse || operation !== "idle" || dirty) return;
+    if (
+      !configResponse ||
+      operation !== "idle" ||
+      dirty ||
+      componentActive ||
+      qualificationActive
+    ) {
+      return;
+    }
     setOperation("refreshing");
     setError("");
     setNotice("");
@@ -672,10 +747,24 @@ export function PrivacyWorkspace({
     } finally {
       setOperation("idle");
     }
-  }, [configResponse, dirty, operation]);
+  }, [
+    componentActive,
+    configResponse,
+    dirty,
+    operation,
+    qualificationActive,
+  ]);
 
   const discover = useCallback(async () => {
-    if (!configResponse || !draft || operation !== "idle") return;
+    if (
+      !configResponse ||
+      !draft ||
+      operation !== "idle" ||
+      componentActive ||
+      qualificationActive
+    ) {
+      return;
+    }
     setOperation("discovering");
     setError("");
     setNotice("");
@@ -692,11 +781,17 @@ export function PrivacyWorkspace({
     } finally {
       setOperation("idle");
     }
-  }, [configResponse, draft, operation]);
+  }, [
+    componentActive,
+    configResponse,
+    draft,
+    operation,
+    qualificationActive,
+  ]);
   if (!configResponse || !draft) {
     return (
       <section className="privacy-workspace" aria-busy={operation === "loading"}>
-        <h2>隐私与本地处理</h2>
+        <h2>本地处理环境与 OCR 组件</h2>
         {error ? (
           <p className="error-text" role="alert">{error}</p>
         ) : (
@@ -708,10 +803,15 @@ export function PrivacyWorkspace({
 
   return (
     <>
-      <PrivacyWorkspaceView
+      <LocalProcessingWorkspaceView
         configResponse={configResponse}
         draft={draft}
         operation={operation}
+        disabled={localProcessingConfigIsDisabled(
+          operation,
+          componentActive,
+          qualificationActive,
+        )}
         dirty={dirty}
         notice={notice}
         error={error}
@@ -723,12 +823,11 @@ export function PrivacyWorkspace({
       />
       <MineruComponentManagerPanel
         snapshot={configResponse}
-        disabled={
-          dirty ||
-          operation !== "idle" ||
-          lifecycleActive ||
-          qualificationActive
-        }
+        disabled={localProcessingComponentIsDisabled(
+          dirty,
+          operation,
+          qualificationActive,
+        )}
         onSnapshot={(next) => {
           setConfigResponse(next);
           setDraft(privacyConfigToDraft(next.config));
@@ -737,13 +836,13 @@ export function PrivacyWorkspace({
       />
       <PrivacyQualificationControls
         snapshot={configResponse}
-        disabled={dirty || operation !== "idle" || componentActive}
+        disabled={localProcessingQualificationIsDisabled(
+          dirty,
+          operation,
+          componentActive,
+        )}
         onSnapshot={setConfigResponse}
         onActivityChange={setQualificationActive}
-      />
-      <PrivacyLifecyclePanel
-        disabled={dirty || operation !== "idle" || componentActive || qualificationActive}
-        onActivityChange={setLifecycleActive}
       />
     </>
   );

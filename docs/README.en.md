@@ -1,13 +1,24 @@
 # Lawyer Assistance Documentation
 
-Lawyer Assistance is a local legal-assistance application for Windows x86_64. It provides offline public-law research, case-material organization, controlled AI-assisted workflows, legal diagrams, work-product management, and encrypted backup. Local processing is the default data boundary; every Provider or host integration requires explicit configuration and its corresponding authorization chain.
+Lawyer Assistance is a local legal-assistance application for Windows x86_64. Its four top-level product areas are **Assistant**, **Cases**, **Legal Library**, and **Settings**. It provides ordinary Provider chat, offline public-law research, case-material organization and redaction, approved-only case work, controlled automation, legal diagrams, protected work products, and encrypted backup. Local processing is the default data boundary; every Provider or host integration requires the authorization chain for its exact execution mode.
 
 The current version is `0.4.0-beta.2`, an unsigned technical prerelease. It is not a formal release that has completed Authenticode signing, automatic-update, production OCR, and full archival-data delivery acceptance. Read the [current release status](release-status.en.md) before use.
 
+The source repository is public. That makes the source and any actually published files inspectable; it does not establish a trusted Windows publisher, a usable updater signature, OCR qualification, clean-machine acceptance, or a formal release.
+
+## Product map
+
+- **Assistant:** case-free ordinary chat, Provider selection, explicit ordinary attachments, and a continuously visible Provider-server disclosure. It does not read the case workspace or Vault.
+- **Cases:** Overview; **Materials & Redaction** for import, local extraction or qualified OCR, review, approval, revocation, and history; **Case Work** for confirmed case data and the approved-only Case Assistant; and Outputs.
+- **Legal Library:** offline laws, articles, versions, effectiveness, relations, and source review.
+- **Settings:** **Provider services and credentials**; **Local processing environment and OCR components**; **MCP and automation**; and **Version, backup, and diagnostics**. Case text and human redaction review do not belong in Settings.
+
+The trust model keeps `interactive_chat`, `interactive_case_work`, and `approved_automation` separate. Authorization never carries from one mode into another. See [Security and privacy](security-and-privacy.en.md).
+
 ## User documentation
 
-- [Getting started](getting-started.en.md): installation, first launch, public-law research, case workspaces, BYOK Providers, MCP, and backup.
-- [Security and privacy](security-and-privacy.en.md): local data, outbound authorization, OCR, host integrations, and backup boundaries.
+- [Getting started](getting-started.en.md): installation, the four product areas, ordinary chat and explicit attachments, Materials & Redaction, approved-only Case Assistant, BYOK Providers, MCP, and backup.
+- [Security and privacy](security-and-privacy.en.md): the three non-interchangeable execution modes, local data, outbound authorization, OCR, host integrations, and backup boundaries.
 - [Current release status](release-status.en.md): implemented `0.4.0-beta.2` capabilities, disabled-by-default features, and formal-release gates.
 - [中文文档](README.md)
 
@@ -19,7 +30,7 @@ The current version is `0.4.0-beta.2`, an unsigned technical prerelease. It is n
 - [Approved case workspace](mcp/approved-case-workspace.md)
 - [Diagram architecture](diagrams/architecture.md)
 - [Diagram security model](diagrams/security-model.md)
-- [Privacy workspace and MCP boundary](privacy-vnext/WORKSPACE_AND_MCP.md)
+- [Privacy and MCP boundary](privacy-vnext/WORKSPACE_AND_MCP.md)
 - [Privacy operations](privacy-vnext/OPERATIONS.md)
 - [Legal corpus and runtime database](data/legal-corpus.md)
 - [Repository layout](development/repository-layout.md)

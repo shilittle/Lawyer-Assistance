@@ -2,20 +2,25 @@
 
 ## 中文概览
 
-这是一个面向 Windows x86_64 的隐私功能技术预发行版。默认仅开放只读公共法律检索；案件材料、工作成果、图表和 Provider 调用只有在当前电脑通过精确资格校验并取得短时授权后才可使用。
+这是一个面向 Windows x86_64 的信息架构与隐私工作流技术预发行版。默认 MCP 表面仍只开放只读公共法律检索，但应用内三种执行模式各自使用独立边界：普通聊天无需案件或资格授权，只向所选 BYOK Provider 发送用户主动输入和本次显式选择的普通附件；案件助理只使用当前案件本次显式选择的 approved/current generation 和最小已确认数据；只有 approved automation/MCP 继续要求完整 qualification、grant、ticket 与受保护成果链。
 
 - 安装包和便携包内置 runtime-slim 法律数据库，可直接完成公共法律检索；完整归档数据库不随桌面发行版分发。
 - 本地 MinerU OCR 已接入资格校验流程，但本版本不声明生产级 OCR 资格。
 - 安装包尚未经过受信任发布者的 Authenticode 签名，Windows 可能显示未知发布者提示；本版本也不发布自动更新签名文件。
 - 仓库验收只使用合成数据。真实或待审核案件材料不得进入 GitHub、浏览器/搜索引擎、远程 OCR、云存储或任何未经批准的 Provider、MCP 与自动化上下文。
-- 请通过发布页提供的 SHA-256 文件核对下载完整性，并阅读 [发布状态](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/release-status.md) 与 [入门指南](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/getting-started.md) 了解支持边界和安装步骤。
+- 请通过发布页提供的 SHA-256 文件核对下载完整性，并阅读[发布状态](docs/release-status.md)与[入门指南](docs/getting-started.md)了解支持边界和安装步骤。
 
-> **Privacy vNext functional prerelease.** This release replaces the earlier fail-closed-only privacy skeleton with an implemented local-OCR qualification path, approved MCP, approved Provider, safe derived-file, lifecycle, mapping, and five-component encrypted-backup paths. No production-OCR qualification is shipped with this prerelease. The default external surface remains public-law-only. Case workflows become usable only through an exact current App qualification and short-lived authorization; documentation, consent, broad host permission, or a host allowlist cannot turn a failed gate into permission.
+> **Information-architecture and Privacy vNext functional prerelease.** This release separates `interactive_chat`, `interactive_case_work`, and `approved_automation`. Ordinary chat needs a configured BYOK Provider but no case, redaction approval, MCP grant, or OCR qualification. Case Assistant restores only the current request's explicitly selected approved generations and revalidates their project binding and revocation before transport; it does not reuse automation grants or tickets. Approved Provider automation and approved MCP retain exact qualification, publication, destination/purpose, grant, ticket, expiry, revocation, and protected-output gates. No production-OCR qualification is shipped with this prerelease.
 
 > **Acceptance uses synthetic data only.** Repository tests and machine canaries must never contain real client or case material. Raw or pending material must not enter GitHub, WorkBuddy, Codex, OpenCode, a browser/search engine, remote OCR, cloud storage, another MCP/Skill, memory, subagent, screenshot, terminal output, or log.
 
 ## What changed
 
+- Phase 7 completes the planned information-architecture cutover: the product now has four top-level areas—Assistant, Cases, Legal Library, and Settings—and no longer exposes the legacy Privacy aggregate page or compatibility redirects.
+- Ordinary chat, approved-only Case Assistant, and approved automation now have separate execution contracts. Ordinary chat does not require a case and can send only the explicitly selected ordinary attachments; Case Assistant sends only the current request's explicitly selected approved generations and confirmed case data; approved automation remains behind qualification, grants, exact tickets, and protected outputs.
+- Settings now has four explicit owners: Provider services and credentials; Local processing environment and OCR components; MCP and automation; and Version, backup, and diagnostics. Case material text and human redaction review remain only under Cases → Materials & Redaction.
+- The audited `ProjectId ↔ PrivacyCaseId` relationship is a persistent, immutable one-to-one backend binding. Project IDs and Privacy/Vault IDs retain their distinct formats and responsibilities; conflicts and ambiguous historical associations fail closed instead of deriving or rebinding identities.
+- Legacy `assistant-case-handoff`, `approvedProviderTaskRequest`, compatibility-only buttons, the hidden `settings:privacy` route, and the fail-closed `start_assistant_run` execution graph have been physically removed while historical display/recovery types and all approved Provider/MCP security capabilities remain intact.
 - Local MinerU is connected to App ingestion. `auto_local` routes only PDFs/pages needing visual OCR and `force_local` routes all PDF pages, but only while the signed current-machine qualification remains valid.
 - The App builds and signs a complete worker/tools/runtime/model inventory, installs and remeasures exact Windows Firewall outbound-block rules, runs the fixed synthetic canary, persists qualification, reloads it on restart, and invalidates it on expiry, revocation or environment/hash/version drift.
 - Approved material publication and all 16 non-public `approved_case_workspace` handlers execute against immutable signed generations or fixed public template/schema data. The profile now lists exactly 21 tools: five public-law, ten approved material/work-product, and six approved-diagram tools. Work products use immutable versions, optimistic concurrency, idempotency, journal recovery, exact source binding, and residual scanning.
@@ -31,7 +36,20 @@
 - `.lavbackup` V3 authenticates and encrypts five components as one DPAPI-current-user set: the `user.sqlite` snapshot, encrypted privacy bundle, ciphertext-only case Vault archive, approved-workspace archive, and encrypted work-products archive. Every component uses independent chunk AAD under the same fresh backup key. Restore is staged, reverified on restart, installed as one transaction and rolls back all five components on any failure. V2 three-component bundles are accepted only for read/restore compatibility; new complete backups are V3. V1 fails closed. `.lavprivacy` remains a privacy-only maintenance format.
 - WorkBuddy, Codex and OpenCode keep separate public and approved packages. Approved packages are Windows stdio only, begin with opaque IDs, stop on contaminated context, and explicitly forbid attachments, paste, host files, browser/search, remote OCR, another MCP/Skill, memory, subagents and unapproved Providers.
 
-The public release status and supported boundaries are maintained in the versioned [release status](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/release-status.md). Packaging success does not qualify production OCR, establish a trusted Windows publisher, or replace clean-machine acceptance.
+The public release status and supported boundaries are maintained in the [release status](docs/release-status.md). Packaging success does not qualify production OCR, establish a trusted Windows publisher, or replace clean-machine acceptance.
+
+## Phase 7 synthetic UI evidence
+
+All images below were captured on 2026-08-01 from production UI components with synthetic data and blocked external transports. They contain no real case material, local path, credential, Bearer token, ticket, receipt, hash, or authoritative Privacy CaseId.
+
+- [Ordinary chat](docs/screenshots/2026-08-01-phase-7-ordinary-chat.png)
+- [Explicit ordinary attachment and cancellation](docs/screenshots/2026-08-01-phase-7-ordinary-attachment.png)
+- [Case materials and redaction](docs/screenshots/2026-08-01-phase-7-case-materials-and-redaction.png)
+- [Approved-only Case Assistant](docs/screenshots/2026-08-01-phase-7-case-assistant-approved.png)
+- [Revoked generation fail-closed state](docs/screenshots/2026-08-01-phase-7-case-assistant-revoked.png)
+- [Local processing environment and OCR components](docs/screenshots/2026-08-01-phase-7-local-processing.png)
+- [MCP and automation](docs/screenshots/2026-08-01-phase-7-mcp-and-automation.png)
+- [Version, backup, and diagnostics](docs/screenshots/2026-08-01-phase-7-maintenance.png)
 
 ## Compatibility contract
 
@@ -42,7 +60,7 @@ The public release status and supported boundaries are maintained in the version
 | Public service schema | `1` |
 | Legal archive schema | `4` |
 | Legal runtime schema | `1` when present |
-| User database schema | `10` |
+| User database schema | `11` |
 | Default profile | `public_law_only` |
 | Default tools | 5 read-only public-law tools |
 | Experimental profile | `redacted_case`: public five plus receipt-gated `citation_validate`; it remains separate from approved workspace sessions |
@@ -111,7 +129,7 @@ Every gate has its own evidence, expiry/revocation/invalidation condition and an
 - Component installation, signature verification or synthetic diagnostics do not authorize production-case OCR. Continue only when the App currently reports every production qualification gate as valid.
 - Download component assets only as a complete signed set from an official Release. URL availability is not integrity or qualification evidence, and GitHub credentials must never enter component or case metadata.
 
-See the versioned [privacy operations guide](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/privacy-vnext/OPERATIONS.md) for the end-user sequence and [`docs/mcp/approved-case-workspace.md`](docs/mcp/approved-case-workspace.md) for the host contract.
+See the [privacy operations guide](docs/privacy-vnext/OPERATIONS.md) for the end-user sequence and [`docs/mcp/approved-case-workspace.md`](docs/mcp/approved-case-workspace.md) for the host contract.
 
 ## Install and migration
 
@@ -121,7 +139,7 @@ See the versioned [privacy operations guide](https://github.com/shilittle/Lawyer
 2. For the unsigned technical prerelease, confirm the filename contains `unsigned`, the manifest says `signed=false`, and no updater artifact is present. Windows publisher identity is not established for that artifact.
 3. Install or unpack under the current Windows user. Do not copy a real `user.sqlite`, privacy store, `.lavbackup`, `.lavprivacy`, case material, Provider credential or session descriptor into the installation tree.
 4. On first start, let the App migrate the local databases and initialize the encrypted case Vault, approved workspace, and encrypted work-product store. Create a new five-component `.lavbackup` V3 before relying on restart restore. V2 three-component bundles remain read/restore-compatible but are not newly emitted as the complete format; legacy single-database and V1 bundles fail closed.
-5. Use **隐私与本地处理** to discover, save, trust, isolate and qualify the local OCR installation. Do not process a visual case PDF until all required backend gates are current.
+5. Use **设置 → 本地处理环境与 OCR 组件** to discover, save, trust, isolate and qualify the local OCR installation. Do not process a visual case PDF until all required backend gates are current.
 
 ### Public-law MCP
 
@@ -178,7 +196,7 @@ MCP archives contain no legal/user/privacy database, case material, exported doc
 
 This technical prerelease is published without an Authenticode code-signing certificate or updater private key. These secrets are intentionally outside the repository. Final installer `.sig` and `latest.json` remain pending because they must bind the exact final Authenticode-signed installer.
 
-Missing signing credentials block the trusted-publisher installer and installer-bound updater outputs. They do not block privacy functionality, automated tests, portable/MCP archives, or the explicitly named unsigned installer. The stable signing workflow is documented in the versioned [release-signing guide](https://github.com/shilittle/Lawyer-Assistance/blob/v0.4.0-beta.2/docs/development/release-signing.md).
+Missing signing credentials block the trusted-publisher installer and installer-bound updater outputs. They do not block privacy functionality, automated tests, portable/MCP archives, or the explicitly named unsigned installer. The stable signing workflow is documented in the [release-signing guide](docs/development/release-signing.md).
 
 ## Known limits
 

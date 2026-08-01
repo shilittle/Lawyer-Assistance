@@ -139,8 +139,7 @@ try {
     Pop-Location
   }
 } finally {
-  New-Item -ItemType Directory -Path (Split-Path -Parent $frontendKeep) -Force | Out-Null
-  [IO.File]::WriteAllBytes($frontendKeep, [byte[]]@(0x0A))
+  Restore-LawyerAssistanceFrontendPlaceholder $frontendKeep
   if ($null -eq $previousSourceDateEpoch) {
     Remove-Item Env:SOURCE_DATE_EPOCH -ErrorAction SilentlyContinue
   } else {

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 export interface SettingsWorkspaceProps {
   busy?: boolean;
-  mode: "providers" | "mcp" | "privacy" | "maintenance";
+  mode: "providers" | "mcp" | "local-processing" | "maintenance";
   children: ReactNode;
 }
 
@@ -24,8 +24,8 @@ export function SettingsWorkspace({
           ? "Provider 与凭据设置"
           : mode === "mcp"
             ? "MCP 与自动化设置"
-            : mode === "privacy"
-              ? "隐私与本地处理设置"
+            : mode === "local-processing"
+              ? "本地处理环境与 OCR 组件设置"
               : "版本、备份与诊断"
       }
     >

@@ -10,8 +10,8 @@ import type {
   LegalAnswerContext,
   LegalSource,
 } from "../../ipc/legal/types";
-import { createProviderProfileDraft } from "../../ipc/provider/catalog";
 import { LegacyQaWorkspace } from "./LegacyQaWorkspace";
+import legacyQaWorkspaceSource from "./LegacyQaWorkspace.tsx?raw";
 import { LegalLibrarySearchWorkspace } from "./LegalLibrarySearchWorkspace";
 import searchWorkspaceSource from "./LegalLibrarySearchWorkspace.tsx?raw";
 import type { LegalLibraryController } from "./useLegalLibraryController";
@@ -171,8 +171,6 @@ function controllerFor(patch: ControllerPatch = {}): LegalLibraryController {
     setEffectivenessLevels: vi.fn(),
     includeExpired: false,
     setIncludeExpired: vi.fn(),
-    providerId: "",
-    setProviderId: vi.fn(),
     context: null,
     answer: null,
     historyState: { kind: "idle" },
@@ -187,7 +185,6 @@ function controllerFor(patch: ControllerPatch = {}): LegalLibraryController {
     answeredScope: "",
     requestLocked: false,
     preview: vi.fn(async () => undefined),
-    submit: vi.fn(),
     cancel: vi.fn(async () => undefined),
     restoreRecord: vi.fn(),
     refreshHistory: vi.fn(async () => undefined),
@@ -208,10 +205,6 @@ function controllerFor(patch: ControllerPatch = {}): LegalLibraryController {
     graphDocumentId: null,
     activeSources: qa.activeContext?.sources ?? [],
     bridgeMutationInFlightRef: { current: false },
-    providerBridge: {
-      selectInitialProvider: vi.fn(),
-      handleProviderDeleted: vi.fn(),
-    },
     openDocumentCitation: vi.fn(async () => undefined),
     consumeDocumentCitation: vi.fn(async () => undefined),
     openLawDocumentFromGraph: vi.fn(async () => undefined),
@@ -268,32 +261,31 @@ describe("LegalLibrarySearchWorkspace", () => {
 });
 
 describe("LegacyQaWorkspace", () => {
-  it("renders explicit case/provider ownership and the unchanged approval redirect", () => {
+  it("renders explicit case ownership without the removed provider workflow", () => {
     const project = caseProject();
     const context = legalContext();
     const selectedSource = context.sources[0];
-    const provider = createProviderProfileDraft("deep_seek", "provider-1");
     const markup = renderToStaticMarkup(
       <LegacyQaWorkspace
         caseWorkspace={caseWorkspace(project)}
         controller={controllerFor({
           qa: {
             question: context.query.legalIssue,
-            providerId: provider.id,
             activeContext: context,
             selectedSourceId: selectedSource.sourceId,
             selectedSource,
           },
           context: { selectedCaseProjectId: project.projectId },
         })}
-        providerProfiles={[provider]}
       />,
     );
 
     expect(markup).toContain("回答归属：");
     expect(markup).toContain(project.title);
-    expect(markup).toContain(provider.displayName);
-    expect(markup).toContain("转到脱敏批准后问答");
+    expect(legacyQaWorkspaceSource).not.toContain("<span>Provider</span>");
+    expect(legalControllerSource).not.toContain("providerBridge");
+    expect(legalControllerSource).not.toContain("qaProviderId");
+    expect(markup).not.toContain("转到脱敏批准后问答");
     expect(markup).toContain("请核对候选法律资料后再使用回答");
     expect(markup).toContain(selectedSource.canonicalLabel);
     expect(markup).toContain("当前案件暂无已保存回答");
@@ -304,7 +296,6 @@ describe("LegacyQaWorkspace", () => {
       <LegacyQaWorkspace
         caseWorkspace={null}
         controller={controllerFor()}
-        providerProfiles={[]}
       />,
     );
 

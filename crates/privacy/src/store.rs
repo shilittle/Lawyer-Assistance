@@ -5114,7 +5114,7 @@ mod tests {
             receipt_id: None,
             residual_counts: BTreeMap::from([("person_name".to_owned(), 1)]),
             allowed: false,
-            reason_code: "raw_material_forbidden".to_owned(),
+            reason_code: "classification_forbidden".to_owned(),
         };
         let event_hash =
             PrivacyStore::append_egress_audit(&mut connection, "event-1", &audit).expect("audit");

@@ -2,18 +2,13 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import type {
-  AssistantArtifact,
   AssistantArtifactVersion,
   AssistantCaseChangeProposal,
   AssistantConversationSource,
-  AssistantMessage,
-  AssistantRun,
 } from "../../ipc/assistant/types";
+import artifactPanelSource from "./ArtifactPanel.tsx?raw";
 import { ArtifactPanel } from "./ArtifactPanel";
-import {
-  artifactHasTrustedRegenerationOrigin,
-  mapArtifactEditHasUnsavedChanges,
-} from "./artifactGuards";
+import { mapArtifactEditHasUnsavedChanges } from "./artifactGuards";
 
 const PROPOSAL: AssistantCaseChangeProposal = {
   proposalId: "proposal-1",
@@ -69,32 +64,6 @@ const PROPOSAL: AssistantCaseChangeProposal = {
   appliedAt: null,
 };
 
-const RUN: AssistantRun = {
-  runId: "run-1",
-  conversationId: "conversation-1",
-  userMessageId: "message-1",
-  assistantMessageId: "message-2",
-  providerId: "provider-1",
-  providerSnapshot: {
-    kind: "openai-compatible",
-    modelId: "model-1",
-    baseUrl: "https://provider.example/v1",
-  },
-  intent: "case_analysis",
-  status: "succeeded",
-  budget: {
-    maxToolCalls: 8,
-    maxProviderRoundTrips: 2,
-    maxInputBodyBytes: 100_000,
-    maxVisibleAttachments: 2,
-    maxModelResponseBytes: 100_000,
-  },
-  errorType: null,
-  createdAt: "2026-07-17T00:00:00Z",
-  finishedAt: "2026-07-17T00:01:00Z",
-  toolCalls: [],
-};
-
 const SOURCE: AssistantConversationSource = {
   sourceId: "source-1",
   createdAt: "2026-07-17T00:00:00Z",
@@ -114,30 +83,6 @@ const SOURCE: AssistantConversationSource = {
     effectiveTo: null,
     versionStatus: "effective",
   },
-};
-
-const ARTIFACT: AssistantArtifact = {
-  artifactId: "artifact-1",
-  conversationId: "conversation-1",
-  projectId: "case-1",
-  kind: "map",
-  title: "案件关系图",
-  status: "draft",
-  currentVersion: 1,
-  createdAt: "2026-07-16T00:00:00Z",
-  updatedAt: "2026-07-16T00:01:00Z",
-};
-
-const ARTIFACT_MESSAGE: AssistantMessage = {
-  messageId: "message-2",
-  conversationId: "conversation-1",
-  role: "assistant",
-  kind: "artifact_ref",
-  textSummary: "已生成关系图",
-  artifactId: "artifact-1",
-  runId: "run-1",
-  createdAt: "2026-07-16T00:01:00Z",
-  attachments: [],
 };
 
 const MAP_VERSION: AssistantArtifactVersion = {
@@ -170,36 +115,11 @@ const MAP_VERSION: AssistantArtifactVersion = {
 };
 
 describe("ArtifactPanel proposal review", () => {
-  it("enables regeneration only for a matching trusted artifact-producing run", () => {
-    const mapRun = { ...RUN, intent: "map_build" };
-    expect(
-      artifactHasTrustedRegenerationOrigin(
-        ARTIFACT,
-        [ARTIFACT_MESSAGE],
-        [mapRun],
-      ),
-    ).toBe(true);
-    expect(
-      artifactHasTrustedRegenerationOrigin(
-        { ...ARTIFACT, artifactId: "renamed-copy" },
-        [ARTIFACT_MESSAGE],
-        [mapRun],
-      ),
-    ).toBe(false);
-    expect(
-      artifactHasTrustedRegenerationOrigin(
-        ARTIFACT,
-        [ARTIFACT_MESSAGE],
-        [{ ...mapRun, intent: "document_draft" }],
-      ),
-    ).toBe(false);
-    expect(
-      artifactHasTrustedRegenerationOrigin(
-        ARTIFACT,
-        [ARTIFACT_MESSAGE],
-        [{ ...mapRun, status: "failed" }],
-      ),
-    ).toBe(false);
+  it("physically removes the obsolete artifact-regeneration redirect surface", () => {
+    expect(artifactPanelSource).not.toContain("ArtifactRegenerationRequest");
+    expect(artifactPanelSource).not.toContain("onRegenerateArtifact");
+    expect(artifactPanelSource).not.toContain("按原任务重新生成");
+    expect(artifactPanelSource).not.toContain("主工作区尚未接入重新生成回调");
   });
 
   it("reports only actual Map editor changes as an unsaved draft", () => {
@@ -237,7 +157,6 @@ describe("ArtifactPanel proposal review", () => {
         activeProject={{ projectId: "case-1", title: "示例案件" }}
         artifacts={[]}
         proposals={[PROPOSAL]}
-        runs={[RUN]}
         selectedArtifactId={null}
         sources={[SOURCE]}
         onConversationRefresh={vi.fn()}
@@ -274,7 +193,6 @@ describe("ArtifactPanel proposal review", () => {
         activeProject={{ projectId: "case-1", title: "示例案件" }}
         artifacts={[]}
         proposals={[{ ...PROPOSAL, proposalId: "manual", runId: null }]}
-        runs={[RUN]}
         selectedArtifactId={null}
         sources={[SOURCE]}
         onConversationRefresh={vi.fn()}
@@ -293,7 +211,6 @@ describe("ArtifactPanel proposal review", () => {
         activeProject={{ projectId: "case-1", title: "service-deadbeef-1" }}
         artifacts={[]}
         proposals={[PROPOSAL]}
-        runs={[RUN]}
         selectedArtifactId={null}
         sources={[SOURCE]}
         onConversationRefresh={vi.fn()}

@@ -21,8 +21,6 @@ import type {
   AssistantArtifactVersion,
   AssistantCaseChangeProposal,
   AssistantConversationSource,
-  AssistantMessage,
-  AssistantRun,
   GetAssistantArtifactResponse,
   JsonValue,
 } from "../../ipc/assistant/types";
@@ -32,9 +30,6 @@ import {
   publicTitle,
   sanitizePublicGeneratedText,
 } from "../../publicOutput";
-import {
-  artifactHasTrustedRegenerationOrigin,
-} from "./artifactGuards";
 import { mapSpecFromArtifactVersion } from "./mapModel";
 import { applyProposalAfterExplicitConfirmation } from "./proposalActions";
 import { SafeArtifactMarkdown } from "./SafeArtifactMarkdown";
@@ -51,22 +46,10 @@ export interface ArtifactPanelActiveProject {
   title: string;
 }
 
-export interface ArtifactRegenerationRequest {
-  artifactId: string;
-  conversationId: string;
-  kind: AssistantArtifact["kind"];
-  projectId: string | null;
-  sourceVersionNumber: number;
-}
-
 export interface ArtifactPanelProps {
   sources: AssistantConversationSource[];
   artifacts: AssistantArtifact[];
   proposals: AssistantCaseChangeProposal[];
-  /** Runs are optional during rollout; pass conversation runs to resolve proposal provenance. */
-  runs?: AssistantRun[];
-  /** Messages are required to prove that a selected artifact came from a trusted run. */
-  messages?: AssistantMessage[];
   selectedArtifactId: string | null;
   activeProject: ArtifactPanelActiveProject | null;
   onSelectArtifact: (artifactId: string) => void;
@@ -74,9 +57,6 @@ export interface ArtifactPanelProps {
   onDraftDirtyChange?: (dirty: boolean) => void;
   onMutationActivityChange?: (active: boolean) => void;
   onProposalApplied?: (projectId: string) => void;
-  onRegenerateArtifact?: (
-    request: ArtifactRegenerationRequest,
-  ) => boolean | Promise<boolean>;
   proposalApplyBlockedReason?: string | null;
 }
 
@@ -535,8 +515,6 @@ export function ArtifactPanel({
   sources,
   artifacts,
   proposals,
-  runs = [],
-  messages = [],
   selectedArtifactId,
   activeProject,
   onSelectArtifact,
@@ -544,13 +522,10 @@ export function ArtifactPanel({
   onDraftDirtyChange,
   onMutationActivityChange,
   onProposalApplied,
-  onRegenerateArtifact,
   proposalApplyBlockedReason,
 }: ArtifactPanelProps) {
   const loadEpoch = useRef(0);
-  const reloadReason = useRef<"regenerate" | "bind" | "conflict" | null>(
-    null,
-  );
+  const reloadReason = useRef<"bind" | "conflict" | null>(null);
   const selectedArtifactIdRef = useRef(selectedArtifactId);
   const [load, setLoad] = useState<ArtifactLoadState>({
     phase: "idle",
@@ -560,9 +535,7 @@ export function ArtifactPanel({
   });
   const [versionNumber, setVersionNumber] = useState<number | null>(null);
   const [format, setFormat] = useState<AssistantArtifactExportFormat | null>(null);
-  const [operation, setOperation] = useState<
-    "export" | "bind" | "regenerate" | null
-  >(null);
+  const [operation, setOperation] = useState<"export" | "bind" | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [activeProposalOperations, setActiveProposalOperations] = useState<
     ReadonlySet<string>
@@ -637,9 +610,7 @@ export function ArtifactPanel({
         });
         setVersionNumber(detail.artifact.currentVersion);
         setFormat(exportFormats(detail.artifact.kind)[0].value);
-        if (reason === "regenerate") {
-          setStatus(`重新生成已完成，当前为第 ${detail.artifact.currentVersion} 版。`);
-        } else if (reason === "bind") {
+        if (reason === "bind") {
           setStatus("成果已关联到当前案件；它不会因此变成已确认案件事实。");
         } else if (reason === "conflict") {
           setStatus("已重新加载最新版本，请重新开始编辑。");
@@ -677,46 +648,10 @@ export function ArtifactPanel({
     versions[0] ??
     null;
   const citationAudit = version ? jsonRecord(version.citationReport) : null;
-  const trustedRegenerationOrigin = artifactDetail
-    ? artifactHasTrustedRegenerationOrigin(
-        artifactDetail.artifact,
-        messages,
-        runs,
-      )
-    : false;
-
   function selectArtifactWithDraftProtection(artifactId: string) {
     if (artifactId === selectedArtifactId) return;
     onDraftDirtyChange?.(false);
     onSelectArtifact(artifactId);
-  }
-
-  async function regenerateArtifact() {
-    if (!artifactDetail || !version || !onRegenerateArtifact) return;
-    const conversationId = artifactDetail.artifact.conversationId;
-    if (!conversationId) {
-      setStatus("该成果没有可用于重新生成的助理会话。");
-      return;
-    }
-    setOperation("regenerate");
-    setStatus("");
-    try {
-      const started = await onRegenerateArtifact({
-        artifactId: artifactDetail.artifact.artifactId,
-        conversationId,
-        kind: artifactDetail.artifact.kind,
-        projectId: artifactDetail.artifact.projectId,
-        sourceVersionNumber: version.versionNumber,
-      });
-      if (!started) return;
-      onConversationRefresh();
-      reloadReason.current = "regenerate";
-      setReloadNonce((current) => current + 1);
-    } catch (error: unknown) {
-      setStatus(`重新生成失败：${displayError(error)}`);
-    } finally {
-      setOperation(null);
-    }
   }
 
   async function exportArtifact() {
@@ -910,30 +845,6 @@ export function ArtifactPanel({
               >
                 {operation === "export" ? "正在导出…" : "导出此版本"}
               </button>
-              <button
-                disabled={
-                  operation !== null ||
-                  !onRegenerateArtifact ||
-                  !artifactDetail.artifact.conversationId ||
-                  !trustedRegenerationOrigin
-                }
-                title={
-                  !onRegenerateArtifact
-                    ? "主工作区尚未接入重新生成回调"
-                    : !trustedRegenerationOrigin
-                      ? "该成果没有可信的成功生成记录；手工创建或改标题后另存的副本不能按原任务重新生成"
-                      : undefined
-                }
-                type="button"
-                onClick={() => void regenerateArtifact()}
-              >
-                {operation === "regenerate" ? "正在提交…" : "按原任务重新生成"}
-              </button>
-              {onRegenerateArtifact && !trustedRegenerationOrigin ? (
-                <small className="assistant-muted">
-                  该成果没有可信的成功生成记录；手工创建或改标题后另存的副本不能按原任务重新生成。
-                </small>
-              ) : null}
               {artifactDetail.artifact.projectId === activeProject?.projectId ? (
                 <span className="assistant-positive">已关联当前案件</span>
               ) : artifactDetail.artifact.projectId ? (

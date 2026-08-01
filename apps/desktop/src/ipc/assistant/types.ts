@@ -1,4 +1,3 @@
-import type { CitationValidationReport } from "../legal/types";
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue =
@@ -551,24 +550,13 @@ export interface CancelAssistantRunResponse {
   cancelled: boolean;
 }
 
+/** Historical multi-intent values retained only for rendering persisted runs. */
 export type AssistantRunIntent =
   | "legal_research"
   | "file_analysis"
   | "document_draft"
   | "map_build"
   | "case_analysis";
-
-export interface StartAssistantRunRequest {
-  runId: string;
-  conversationId: string;
-  providerId: string;
-  intent: AssistantRunIntent;
-  prompt: string;
-  attachmentIds: string[];
-  budget?: AssistantRunBudget | null;
-  saveResearchArtifact?: boolean | null;
-  regenerationTarget?: AssistantRegenerationTarget | null;
-}
 
 /**
  * Closed ordinary-chat boundary. Case, approval, authority, classification,
@@ -581,12 +569,6 @@ export interface StartInteractiveAssistantRunRequest {
   prompt: string;
   attachmentIds: string[];
   budget?: AssistantRunBudget | null;
-}
-
-export interface AssistantRegenerationTarget {
-  artifactId: string;
-  sourceVersionNumber: number;
-  expectedCurrentVersion: number;
 }
 
 export interface AssistantRunStreamUsage {
@@ -639,13 +621,6 @@ export type AssistantRunEvent =
       errorType: string;
       message: string;
     });
-
-export interface StartAssistantRunResponse {
-  run: AssistantRun;
-  artifact: AssistantArtifact | null;
-  proposal: AssistantCaseChangeProposal | null;
-  citationReport: CitationValidationReport | null;
-}
 
 export interface StartInteractiveAssistantRunResponse {
   run: AssistantRun;

@@ -116,8 +116,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Tauri signed build failed with exit code $LASTEXITCODE" }
 } finally {
   Pop-Location
-  New-Item -ItemType Directory -Path (Split-Path -Parent $frontendKeep) -Force | Out-Null
-  [IO.File]::WriteAllBytes($frontendKeep, [byte[]]@(0x0A))
+  Restore-LawyerAssistanceFrontendPlaceholder $frontendKeep
   Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
   Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
   if ($null -eq $previousSourceDateEpoch) {

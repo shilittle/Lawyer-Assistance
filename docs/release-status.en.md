@@ -8,22 +8,38 @@ The current target version is `0.4.0-beta.2`, with this release classification:
 
 This conclusion does not negate the implemented local legal research, case workspace, privacy approval, protected work-product, MCP, and backup capabilities. It means that signing, automatic update, production OCR, full archival resources, and final-environment acceptance remain incomplete.
 
+The GitHub repository is public. Repository visibility and the ability to download an asset are distribution facts only; they do not establish trusted-publisher signing, updater readiness, OCR qualification, clean-machine acceptance, or formal-release status.
+
 ## Currently available capabilities
 
 | Capability | Status |
 |---|---|
 | Windows x86_64 desktop application | Implemented; the technical prerelease has no trusted publisher identity |
+| Four-area information architecture | Implemented as Assistant, Cases, Legal Library, and Settings |
+| Ordinary Assistant chat | Implemented without a case prerequisite; uses the selected BYOK Provider and keeps the Provider-server warning visible |
+| Explicit ordinary attachments | Implemented; only attachments selected for the current send contribute locally extracted text, and they do not become case materials automatically |
 | `runtime-slim-v1` legal database | Used as an application resource for current query and citation workflows |
 | Local case, evidence, issue, and legal-authority management | Implemented |
 | Local PDF, DOCX, UTF-8 TXT, and Markdown import | Implemented; visual pages remain subject to OCR qualification |
-| Redaction review, immutable approved generations, Vault, and mappings | Implemented |
+| Cases → Materials & Redaction | Implemented for import, text-layer extraction, redaction review, immutable approval, revocation, and version history; OCR remains gated and currently unqualified for production |
+| Approved-only Case Assistant | Implemented under Case Work; each request explicitly selects current approved generations and excludes raw files and Vault objects |
+| Audited `ProjectId ↔ PrivacyCaseId` binding | Implemented as a persistent, immutable one-to-one backend binding; the frontend does not derive or receive the authoritative Privacy identity |
 | Protected work products and safe derived files | Implemented |
 | Five-component authenticated and encrypted `.lavbackup` | Implemented |
-| BYOK Providers | Implemented; public-law and approved-case channels are separate |
+| BYOK Providers | Implemented; `interactive_chat`, `interactive_case_work`, and `approved_automation` are separate channels |
+| Four Settings owners | Provider services and credentials; Local processing environment and OCR components; MCP and automation; Version, backup, and diagnostics |
 | `public_law_only` | Default five-tool read-only public-law MCP surface |
 | `approved_case_workspace` | Exactly 21 tools; disabled by default and constrained by App qualification, session, grants, and tickets |
 | `diagram_authoring` | Exactly 11 tools; permanently limited to synthetic or public data |
 | Approved-case diagrams | Stored through the approved workspace as encrypted protected HTML work products |
+
+## Current workflow boundaries
+
+- `interactive_chat` supports ordinary case-free messages and explicit ordinary attachments. It cannot read the case workspace, Privacy store, Vault, approved generations, or MCP authorization state.
+- `interactive_case_work` supports the in-App Case Assistant with only the current case's explicitly selected approved/current generations and confirmed case data. Revoked, stale, raw, pending, foreign-case, and unselected sources fail closed.
+- `approved_automation` retains the separate external-host boundary: opaque IDs, clean-task controls, qualification, approved source references, grants, exact tickets, destination/purpose binding, revocation checks, and protected work-product sinks.
+
+These modes are not interchangeable, and no blocked mode falls back to another one. Case text and human review remain in **Cases → Materials & Redaction**; Settings contains only its four configuration and maintenance owners.
 
 ## Not delivered or not qualified
 
@@ -59,7 +75,9 @@ A formal release still requires:
 Acceptable descriptions:
 
 - “Lawyer Assistance `0.4.0-beta.2` unsigned technical prerelease”
+- “The Lawyer Assistance source repository is public”
 - “Provides local public-law research, case organization, privacy approval, protected work products, and controlled MCP”
+- “Provides case-free ordinary Provider chat and an approved-only Case Assistant through separate execution modes”
 - “Production OCR is blocked by default”
 - “Uses a runtime legal database; the full archival database is not included”
 
@@ -69,7 +87,8 @@ Do not describe it as:
 - production-qualified for scanned-document OCR;
 - Authenticode-signed or backed by a trusted Windows publisher;
 - currently supporting automatic updates;
-- including the full archival database; or
+- including the full archival database;
+- signed, updater-ready, OCR-qualified, or release-accepted merely because the repository or an asset is public; or
 - fully accepted across clean Windows 10/11 machines.
 
 ## User guidance

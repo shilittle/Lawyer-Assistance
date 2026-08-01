@@ -355,9 +355,11 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --check
 
-      - name: Test release filename mapping and PowerShell syntax
+      - name: Test release file operations, filename mapping, and PowerShell syntax
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_filename_mapping.ps1
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_file_ops.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_filename_mapping.ps1
 
       - name: Lint Rust
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

@@ -11,7 +11,6 @@ import {
 
 import {
   ArtifactPanel,
-  type ArtifactRegenerationRequest,
 } from "../artifacts/ArtifactPanel";
 import { SafeArtifactMarkdown } from "../artifacts/SafeArtifactMarkdown";
 import {
@@ -70,14 +69,12 @@ export interface AssistantProjectContext {
 
 export interface AssistantWorkspaceProps {
   activeProject: AssistantProjectContext | null;
-  caseHandoff?: (AssistantProjectContext & { requestId: number }) | null;
   externalRefreshKey?: number;
   providerProfiles?: readonly ProviderProfile[];
   onConversationChange?: (conversation: AssistantConversation | null) => void;
   onDraftDirtyChange?: (dirty: boolean) => void;
   onCaseProposalApplied?: (projectId: string) => void;
   onMutationActivityChange?: (active: boolean) => void;
-  onOpenProtectedArtifactRegeneration?: (notice: string) => void;
   onOpenProviderSettings?: () => void;
   onRunActivityChange?: (active: boolean) => void;
   proposalApplyBlockedReason?: string | null;
@@ -211,22 +208,6 @@ export async function deleteAttachmentWithConfirmation(options: {
 
 export function attachmentDeletionFailureText(error: unknown): string {
   return `附件删除失败：${displayError(error)}`;
-}
-
-export function buildArtifactRegenerationConfirmation(options: {
-  artifactTitle: string;
-  sourceVersionNumber: number;
-  provider: Pick<ProviderProfile, "displayName">;
-}): string {
-  const { artifactTitle, sourceVersionNumber, provider } = options;
-  return `将把“${artifactTitle}”第 ${sourceVersionNumber} 版的正文、当前会话的必要摘要以及该任务依法需要的材料发送到模型服务“${provider.displayName}”。这些内容会离开本机；留存及是否用于训练由该服务条款决定。成功后只追加新版本，不覆盖或删除旧版。继续吗？`;
-}
-
-export function confirmArtifactRegeneration(
-  options: Parameters<typeof buildArtifactRegenerationConfirmation>[0],
-  confirmAction: ConfirmationAction = (message) => window.confirm(message),
-): boolean {
-  return confirmAction(buildArtifactRegenerationConfirmation(options));
 }
 
 function displayError(error: unknown): string {
@@ -407,14 +388,12 @@ function LiveRunProgress({ run }: { run: ActiveAssistantRun }) {
 
 export function AssistantWorkspace({
   activeProject,
-  caseHandoff = null,
   externalRefreshKey = 0,
   providerProfiles,
   onConversationChange,
   onDraftDirtyChange,
   onCaseProposalApplied,
   onMutationActivityChange,
-  onOpenProtectedArtifactRegeneration,
   onOpenProviderSettings,
   onRunActivityChange,
   proposalApplyBlockedReason,
@@ -451,14 +430,11 @@ export function AssistantWorkspace({
   const [artifactMutationActive, setArtifactMutationActive] = useState(false);
   const detailEpoch = useRef(0);
   const runEpoch = useRef(0);
-  const handledCaseHandoff = useRef<number | null>(null);
-  const latestCaseHandoffRequest = useRef<number | null>(null);
   const lastExternalRefreshKey = useRef(externalRefreshKey);
   const selectedConversationRef = useRef<string | null>(null);
   const selectedArtifactIdRef = useRef<string | null>(selectedArtifactId);
   const artifactDraftDirtyRef = useRef(false);
   const mounted = useRef(true);
-  latestCaseHandoffRequest.current = caseHandoff?.requestId ?? null;
   selectedArtifactIdRef.current = selectedArtifactId;
 
   const updateArtifactDraftDirty = useCallback((dirty: boolean) => {
@@ -674,80 +650,6 @@ export function AssistantWorkspace({
     refreshConversation();
   }, [externalRefreshKey, refreshConversation]);
 
-  useEffect(() => {
-    if (
-      !caseHandoff ||
-      !conversationListLoaded ||
-      operation !== null ||
-      handledCaseHandoff.current === caseHandoff.requestId
-    ) {
-      return;
-    }
-    handledCaseHandoff.current = caseHandoff.requestId;
-    const existing = state.conversations.find(
-      (conversation) => conversation.projectId === caseHandoff.projectId,
-    );
-    if (existing) {
-      if (!loadConversation(existing.conversationId)) {
-        setNotice({
-          conversationId: selectedConversationRef.current,
-          kind: "status",
-          text: `已取消打开案件“${publicTitle(caseHandoff.title, "当前案件")}”的助理会话；未保存的成果编辑仍保留。`,
-        });
-        return;
-      }
-      setNotice({
-        conversationId: existing.conversationId,
-        kind: "status",
-        text: `已打开案件“${publicTitle(caseHandoff.title, "当前案件")}”的助理会话。`,
-      });
-      return;
-    }
-
-    setOperation("create");
-    setNotice(null);
-    void createAssistantConversation({
-      title: truncateUtf8(`${publicTitle(caseHandoff.title, "当前案件")} · 助理`, 256),
-      projectId: caseHandoff.projectId,
-    })
-      .then((response) => {
-        if (!mounted.current) return;
-        dispatch({ type: "upsert_conversation", conversation: response.conversation });
-        if (latestCaseHandoffRequest.current !== caseHandoff.requestId) return;
-        if (!loadConversation(response.conversation.conversationId)) {
-          setNotice({
-            conversationId: selectedConversationRef.current,
-            kind: "status",
-            text: `已为案件“${publicTitle(caseHandoff.title, "当前案件")}”创建助理会话；因保留未保存的成果编辑，仍停留在当前会话。`,
-          });
-          return;
-        }
-        setNotice({
-          conversationId: response.conversation.conversationId,
-          kind: "status",
-          text: `已创建并绑定案件“${publicTitle(caseHandoff.title, "当前案件")}”的助理会话。`,
-        });
-      })
-      .catch((error: unknown) => {
-        if (!mounted.current) return;
-        setNotice({
-          conversationId: null,
-          kind: "error",
-          text: `打开案件助理会话失败：${displayError(error)}`,
-        });
-      })
-      .finally(() => {
-        if (mounted.current) {
-          setOperation((current) => (current === "create" ? null : current));
-        }
-      });
-  }, [
-    caseHandoff,
-    conversationListLoaded,
-    loadConversation,
-    operation,
-    state.conversations,
-  ]);
   const attachments = useMemo(
     () => (detail ? uniqueAttachments(detail) : []),
     [detail],
@@ -1120,67 +1022,6 @@ export function AssistantWorkspace({
     });
   }
 
-  async function openProtectedArtifactRegeneration(
-    request: ArtifactRegenerationRequest,
-  ): Promise<boolean> {
-    if (
-      !detail ||
-      detail.conversation.conversationId !== request.conversationId ||
-      activeRun !== null ||
-      operation !== null
-    ) {
-      throw new Error("当前会话尚未准备好，不能重新生成。");
-    }
-    const artifact = detail.artifacts.find(
-      (candidate) => candidate.artifactId === request.artifactId,
-    );
-    if (
-      !artifact ||
-      artifact.kind !== request.kind ||
-      artifact.projectId !== request.projectId
-    ) {
-      throw new Error("成果已变化，请重新加载后再试。");
-    }
-    const originRun = [...detail.messages]
-      .reverse()
-      .filter(
-        (message) =>
-          message.artifactId === request.artifactId && message.runId !== null,
-      )
-      .map((message) =>
-        detail.runs.find(
-          (run) =>
-            run.runId === message.runId &&
-            run.status === "succeeded" &&
-            run.assistantMessageId === message.messageId,
-        ),
-      )
-      .find((run): run is AssistantRun => run !== undefined);
-    if (
-      !originRun ||
-      !RUN_INTENTS.includes(originRun.intent as AssistantRunIntent)
-    ) {
-      throw new Error("该成果没有可信的成功生成记录，不能自动重新生成。");
-    }
-    const regenerationIntent = originRun.intent as AssistantRunIntent;
-    const kindMatches =
-      (request.kind === "research" &&
-        (regenerationIntent === "legal_research" ||
-          regenerationIntent === "file_analysis")) ||
-      (request.kind === "document" && regenerationIntent === "document_draft") ||
-      (request.kind === "map" && regenerationIntent === "map_build");
-    if (!kindMatches) {
-      throw new Error("成果类型与原生成任务不一致，已停止重新生成。");
-    }
-    if (!onOpenProtectedArtifactRegeneration) {
-      throw new Error("受保护的成果重新生成工作流当前不可用。");
-    }
-    onOpenProtectedArtifactRegeneration(
-      "重新生成只允许使用当前有效的脱敏 generation 和受保护历史输出；已切换到 Approved Provider 固定任务“重新生成”。",
-    );
-    return false;
-  }
-
   async function cancelRun() {
     if (!activeRun) return;
     const run = activeRun;
@@ -1514,20 +1355,13 @@ export function AssistantWorkspace({
       <ArtifactPanel
         activeProject={activeProject}
         artifacts={detail?.artifacts ?? []}
-        messages={detail?.messages ?? []}
         proposals={detail?.proposals ?? []}
-        runs={detail?.runs ?? []}
         selectedArtifactId={selectedArtifactId}
         sources={detail?.sources ?? []}
         onConversationRefresh={refreshConversation}
         onDraftDirtyChange={updateArtifactDraftDirty}
         onMutationActivityChange={setArtifactMutationActive}
         onProposalApplied={onCaseProposalApplied}
-        onRegenerateArtifact={
-          onOpenProtectedArtifactRegeneration
-            ? openProtectedArtifactRegeneration
-            : undefined
-        }
         onSelectArtifact={selectArtifact}
         proposalApplyBlockedReason={proposalApplyBlockedReason}
       />

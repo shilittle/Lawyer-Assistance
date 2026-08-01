@@ -5,8 +5,9 @@ import {
   canBypassDirtyDraftsForWorkspaceRecovery,
   decideCaseMaterialContextChange,
   decideCaseMaterialRouteNavigation,
+  decideLocalProcessingRouteNavigation,
+  decideMaintenanceRouteNavigation,
   decideMcpRouteNavigation,
-  decidePrivacyRouteNavigation,
   decideWorkspaceClose,
   workspaceCloseWasApproved,
   type CaseDraftKind,
@@ -47,12 +48,13 @@ describe("navigation guards", () => {
         extractionMutationInFlight: true,
         assistantMutationInFlight: true,
         mcpMutationInFlight: true,
-        privacyMutationInFlight: true,
+        localProcessingMutationInFlight: true,
+        maintenanceMutationInFlight: true,
       }),
     ).toEqual({
       kind: "block",
       message:
-        "案件数据写入、Provider 或 API Key 写入、材料审阅保存、助理保存、导入、导出、法律库桥接或已确认建议写入、MCP 服务配置或生命周期变更、隐私与本地处理配置写入尚未完成；为避免结果不明，已阻止关闭窗口。请等待当前操作完成后重试。",
+        "案件数据写入、Provider 或 API Key 写入、材料审阅保存、助理保存、导入、导出、法律库桥接或已确认建议写入、MCP 服务配置或生命周期变更、本地处理配置或组件操作、应用更新、诊断或隐私生命周期维护尚未完成；为避免结果不明，已阻止关闭窗口。请等待当前操作完成后重试。",
     });
 
     const allCaseDrafts: readonly CaseDraftKind[] = [
@@ -73,12 +75,12 @@ describe("navigation guards", () => {
         providerDraftDirty: true,
         assistantDraftDirty: true,
         mcpDraftDirty: true,
-        privacyDraftDirty: true,
+        localProcessingDraftDirty: true,
       }),
     ).toEqual({
       kind: "confirm_discard",
       message:
-        "关闭窗口将永久丢弃这些未保存内容：案件基本信息、案件材料、当事人、事实、证据、争点、事实—证据关联、事实—争点关联、法律依据、Provider Profile 或 API Key 输入、助理中未发送的任务草稿、MCP 服务配置或待写入 Bearer Token、隐私与本地 OCR 配置。确定继续关闭吗？",
+        "关闭窗口将永久丢弃这些未保存内容：案件基本信息、案件材料、当事人、事实、证据、争点、事实—证据关联、事实—争点关联、法律依据、Provider Profile 或 API Key 输入、助理中未发送的任务草稿、MCP 服务配置或待写入 Bearer Token、本地处理与 OCR 配置。确定继续关闭吗？",
     });
 
     expect(decideWorkspaceClose(cleanCloseState)).toEqual({
@@ -129,30 +131,14 @@ describe("navigation guards", () => {
     ).toEqual({ kind: "proceed" });
   });
 
-  it("treats route-state changes at one location as non-navigation", () => {
+  it("treats a repeated state-free location as non-navigation", () => {
     const currentMcpRoute = {
       area: "settings",
       page: "mcp",
-      state: {
-        kind: "approved-provider-task",
-        request: {
-          task: "case_legal_qa",
-          notice: "第一次请求",
-          requestId: 1,
-        },
-      },
     } as const;
     const nextMcpRoute = {
       area: "settings",
       page: "mcp",
-      state: {
-        kind: "approved-provider-task",
-        request: {
-          task: "document_generation",
-          notice: "第二次请求",
-          requestId: 2,
-        },
-      },
     } as const;
 
     expect(
@@ -164,7 +150,7 @@ describe("navigation guards", () => {
       ),
     ).toEqual({ kind: "proceed" });
     expect(
-      decidePrivacyRouteNavigation(
+      decideLocalProcessingRouteNavigation(
         currentMcpRoute,
         nextMcpRoute,
         true,
@@ -210,17 +196,17 @@ describe("navigation guards", () => {
     ).toEqual({ kind: "proceed" });
   });
 
-  it("preserves privacy protection only when leaving the privacy route", () => {
+  it("preserves local-processing protection only when leaving its route", () => {
     expect(
-      decidePrivacyRouteNavigation(
-        { area: "settings", page: "privacy" },
-        { area: "settings", page: "privacy" },
+      decideLocalProcessingRouteNavigation(
+        { area: "settings", page: "local-processing" },
+        { area: "settings", page: "local-processing" },
         true,
         true,
       ),
     ).toEqual({ kind: "proceed" });
     expect(
-      decidePrivacyRouteNavigation(
+      decideLocalProcessingRouteNavigation(
         { area: "settings", page: "providers" },
         { area: "assistant", page: "chat" },
         true,
@@ -228,8 +214,8 @@ describe("navigation guards", () => {
       ),
     ).toEqual({ kind: "proceed" });
     expect(
-      decidePrivacyRouteNavigation(
-        { area: "settings", page: "privacy" },
+      decideLocalProcessingRouteNavigation(
+        { area: "settings", page: "local-processing" },
         { area: "settings", page: "mcp" },
         true,
         true,
@@ -237,11 +223,11 @@ describe("navigation guards", () => {
     ).toEqual({
       kind: "block",
       message:
-        "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
+        "本地处理配置或组件操作尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
     });
     expect(
-      decidePrivacyRouteNavigation(
-        { area: "settings", page: "privacy" },
+      decideLocalProcessingRouteNavigation(
+        { area: "settings", page: "local-processing" },
         { area: "settings", page: "maintenance" },
         false,
         true,
@@ -249,11 +235,11 @@ describe("navigation guards", () => {
     ).toEqual({
       kind: "confirm_discard",
       message:
-        "切换工作区将永久丢弃未保存的隐私与本地 OCR 配置。确定继续吗？",
+        "切换工作区将永久丢弃未保存的本地处理与 OCR 配置。确定继续吗？",
     });
     expect(
-      decidePrivacyRouteNavigation(
-        { area: "settings", page: "privacy" },
+      decideLocalProcessingRouteNavigation(
+        { area: "settings", page: "local-processing" },
         { area: "assistant", page: "chat" },
         false,
         false,
@@ -317,47 +303,39 @@ describe("navigation guards", () => {
     );
   });
 
-  it("protects typed navigation only when leaving settings/privacy", () => {
+  it("protects maintenance activity only when leaving maintenance", () => {
     expect(
-      decidePrivacyRouteNavigation(
+      decideMaintenanceRouteNavigation(
         { area: "settings", page: "providers" },
         { area: "assistant", page: "chat" },
-        true,
         true,
       ),
     ).toEqual({ kind: "proceed" });
 
     expect(
-      decidePrivacyRouteNavigation(
-        { area: "settings", page: "privacy" },
-        { area: "settings", page: "mcp" },
+      decideMaintenanceRouteNavigation(
+        { area: "settings", page: "maintenance" },
+        { area: "settings", page: "maintenance" },
         true,
+      ),
+    ).toEqual({ kind: "proceed" });
+
+    expect(
+      decideMaintenanceRouteNavigation(
+        { area: "settings", page: "maintenance" },
+        { area: "settings", page: "mcp" },
         true,
       ),
     ).toEqual({
       kind: "block",
       message:
-        "隐私与本地处理配置正在写入；为避免结果不明，已阻止切换工作区。请等待保存完成后重试。",
+        "应用更新、诊断或隐私生命周期维护尚未完成；为避免结果不明，已阻止切换工作区。请等待当前操作完成后重试。",
     });
 
     expect(
-      decidePrivacyRouteNavigation(
-        { area: "settings", page: "privacy" },
+      decideMaintenanceRouteNavigation(
         { area: "settings", page: "maintenance" },
-        false,
-        true,
-      ),
-    ).toEqual({
-      kind: "confirm_discard",
-      message:
-        "切换工作区将永久丢弃未保存的隐私与本地 OCR 配置。确定继续吗？",
-    });
-
-    expect(
-      decidePrivacyRouteNavigation(
-        { area: "settings", page: "privacy" },
         { area: "assistant", page: "chat" },
-        false,
         false,
       ),
     ).toEqual({ kind: "proceed" });

@@ -2,7 +2,6 @@ import {
   type Dispatch,
   type MutableRefObject,
   type SetStateAction,
-  useCallback,
   useEffect,
   useReducer,
   useRef,
@@ -31,7 +30,6 @@ import type {
   CaseWorkspace,
   StructuredCaseExtraction,
 } from "../../ipc/case/types";
-import type { ApprovedProviderTask } from "../../ipc/privacy/types";
 import { publicErrorMessage } from "../../publicOutput";
 import type { CaseDraftKind } from "../../app/navigationGuards";
 import {
@@ -73,10 +71,6 @@ export interface CaseExtractionWorkspacePort {
 
 export interface UseCaseExtractionControllerOptions {
   workspace: CaseExtractionWorkspacePort;
-  onLegacyApprovedProviderRequest: (
-    task: ApprovedProviderTask,
-    notice: string,
-  ) => void;
   confirmAction: (message: string) => boolean;
 }
 
@@ -97,10 +91,8 @@ async function runConfirmedAction<T>(
 
 export function useCaseExtractionController({
   workspace,
-  onLegacyApprovedProviderRequest,
   confirmAction,
 }: UseCaseExtractionControllerOptions) {
-  const [providerId, setProviderId] = useState("");
   const [fileIds, setFileIds] = useState<string[]>([]);
   const [state, dispatch] = useReducer(extractionReducer, {
     kind: "idle",
@@ -380,7 +372,6 @@ export function useCaseExtractionController({
         restorableFileIds,
         pending.providerSnapshot,
       );
-      setProviderId(pending.providerId);
       setFileIds(restorableFileIds);
       lifecycleLock.current = true;
       beginDraftSaveSession(
@@ -411,13 +402,6 @@ export function useCaseExtractionController({
     setDiscardError(null);
     beginDraftSaveSession();
     dispatch({ type: "reset" });
-  }
-
-  function runStructuredExtraction() {
-    onLegacyApprovedProviderRequest(
-      "structured_extraction",
-      "案件材料整理不得从旧入口发送原文；已为你切换到 Approved Provider 的固定任务“结构化提取”。",
-    );
   }
 
   function updateDraft(
@@ -750,33 +734,10 @@ export function useCaseExtractionController({
     );
   }
 
-  const selectInitialProvider = useCallback((selectedProviderId: string) => {
-    setProviderId(selectedProviderId);
-  }, []);
-
-  const handleProviderSaved = useCallback((savedProviderId: string) => {
-    setProviderId((current) => current || savedProviderId);
-  }, []);
-
-  const handleProviderDeleted = useCallback(
-    (deletedProviderId: string, fallbackProviderId: string | null) => {
-      if (fallbackProviderId) {
-        setProviderId((current) =>
-          current === deletedProviderId ? fallbackProviderId : current,
-        );
-      } else {
-        setProviderId("");
-      }
-    },
-    [],
-  );
-
   const deletionBlockedProviderId =
     sourcesLocked && "context" in state ? state.context.providerId : null;
 
   return {
-    providerId,
-    setProviderId,
     fileIds,
     setFileIds,
     state,
@@ -795,7 +756,6 @@ export function useCaseExtractionController({
     syncWorkspaceFiles,
     restorePendingReview,
     resetForNewProject,
-    runStructuredExtraction,
     updateDraft,
     cancelReview,
     discardUnrestorablePendingReview,
@@ -804,9 +764,6 @@ export function useCaseExtractionController({
     confirmReview,
     interactionIsLocked,
     blocksCaseMutation,
-    selectInitialProvider,
-    handleProviderSaved,
-    handleProviderDeleted,
   };
 }
 

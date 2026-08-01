@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import appSource from "../../App.tsx?raw";
 import gapPanelSource from "./CaseGapExtractionPanel.tsx?raw";
+import extractionControllerSource from "./useCaseExtractionController.ts?raw";
 import listPanelSource from "./CaseProjectListPanel.tsx?raw";
 import materialWorkspaceSource from "./materials/CaseMaterialsWorkspace.tsx?raw";
 import activityChannelSource from "./materials/useCaseMaterialActivityChannel.ts?raw";
@@ -30,6 +31,14 @@ describe("CaseWorkspaceCompatibilityOutlet source boundary", () => {
       /setActiveGraphTarget\(graphTarget\);[\s\S]*onGraphTargetConsumed\(graphTarget\);/u,
     );
     expect(outletSource).toContain("}, 4000)");
+  });
+
+  it("removes the obsolete extraction provider selector but preserves pending-review ownership", () => {
+    expect(gapPanelSource).not.toContain("extraction-provider");
+    expect(gapPanelSource).not.toContain("<span>Provider</span>");
+    expect(extractionControllerSource).not.toContain("setProviderId");
+    expect(extractionControllerSource).toContain("state.context.providerId");
+    expect(extractionControllerSource).toContain("deletionBlockedProviderId");
   });
 
   it("leaves App as assembly without case forms or draft setters", () => {

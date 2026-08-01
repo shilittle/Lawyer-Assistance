@@ -624,6 +624,79 @@ approved workspace 或 MCP 后端安全契约，也不得提前执行 Phase 7 �
 * 更新用户文档、截图和发布说明。
 * 运行完整 Rust、TypeScript、integration、MCP 和迁移测试。
 
+#### Phase 7 实施澄清（2026-08-01）
+
+本节固定 Phase 7 的物理清理、能力归属、依赖顺序、安全保留项和验收证据。
+清理基线为已完成 Phase 6 的实现提交
+`119614b348c0a302fce1e551f80b56bc4d05d017`，对应主干合并提交为
+`414009f4675a8a8746e36dd7b31971d16591885a`。Phase 7 是兼容入口清理和产品验收，
+不是数据重写、Provider/MCP 协议重设计或新安全模型阶段；第一提交只允许修改本计划，
+生产代码和测试只能从后续提交开始变化。
+
+* 旧 `PrivacyWorkspace` 物理删除前，能力归属固定如下：
+  * `PrivacyConfig.privacyMode`、OCR 配置、MinerU 自动发现、本地 OCR 状态、
+    `MineruComponentManagerPanel` 和 `PrivacyQualificationControls` 统一迁入
+    `设置 → 本地处理环境与 OCR 组件`，目标 owner 位于
+    `features/settings/local-processing/`。typed route 固定为
+    `settings:local-processing`，不得保留隐藏的 `settings:privacy` 产品路由。
+  * 保存、发现、状态刷新、组件导入/安装/回滚/卸载、信任、防火墙隔离、资格运行与
+    撤销能力原样保留。配置写入、组件 mutation 和资格 mutation 必须分别聚合 activity，
+    并在任一 mutation 运行时互相禁用；配置草稿仍是该页面唯一 dirty 状态，导航和
+    关窗保护不得因某一子操作结束而清除另一子操作仍在进行的保护。
+  * `PrivacyLifecyclePanel` 是无案件参数的全局保留、映射、密钥、清理、五组件备份与
+    恢复维护面板，按第 8 节允许的“高级维护”归入
+    `设置 → 版本、备份与诊断`，目标 owner 位于
+    `features/settings/maintenance/`。应用更新/诊断与 Privacy 生命周期 mutation 使用
+    独立 activity bit 后取逻辑或，并在同页互相禁用；该页面没有可丢弃的 Privacy
+    草稿，活动写入必须阻止导航和关窗。
+  * Review Workbench、脱敏正文、人工复核、approved generation、撤销和版本历史继续
+    只属于 `案件工作台 → 材料与脱敏`，不得迁回设置。共享
+    `features/privacy/privacy.css`、Review/risk 组件和案件材料使用的 Privacy 模块不得
+    因删除旧聚合页而删除。
+  * Provider approved automation、历史输出和 Approved MCP 继续只属于
+    `设置 → MCP 与自动化`；删除前端 handoff 不得删除后端任务类型、审批、派发、
+    qualification、publication、grant、exact ticket、撤销或 protected work-product
+    能力。
+* Phase 7 获准删除的 compatibility 表面严格限于：
+  1. `assistant-case-handoff` route state、request sequence、导航 API 和普通 Assistant
+     中自动创建或打开 project-bound 普通会话的消费逻辑；用户显式创建且带 project
+     元数据的普通会话继续保留。
+  2. `redirectLegacyEgressToApprovedProvider` 及案件结构化提取、旧法律问答和旧成果
+     重新生成中只为该跳转存在的按钮、props 和调用链；不得恢复
+     `answer_legal_question`、`generate_structured_case_extraction` 或 Approved Provider
+     作为普通聊天/案件工作的 fallback，也不得顺带删除这些未获本阶段授权的旧 IPC。
+  3. `approved-provider-task` / `approvedProviderTaskRequest` 一次性 route handoff、
+     request sequence、消费回调和自动复制固定任务的 effect；
+     `AutomationOutboundApprovalPanel` 的手工任务选择、批准、派发和历史主体必须保留。
+  4. fail-closed 的旧 `start_assistant_run` Tauri command、注册、前端 IPC wrapper、
+     wire 类型，以及经引用和编译证明只服务于旧五意图执行图的实现与测试。
+* 旧 command 清理必须保留 `start_interactive_assistant_run`、
+  `start_case_assistant_run`、Provider transport、取消、预算、审计、错误脱敏、输出限额、
+  interactive 附件 TOCTOU 和 `recover_interrupted_assistant_runs`。旧会话中的 intent、
+  artifact、proposal、source 和 automation lineage 继续可读和可恢复但不得自动重发；
+  仍服务历史显示或启动恢复的类型和字符串 fixture 不得仅因旧 command 删除而移除。
+* 物理清理顺序固定为：先补齐五组验收的组合与负向安全测试；再删除
+  `assistant-case-handoff`；再删除三个 compatibility redirect 来源及旧按钮；随后删除
+  `approvedProviderTaskRequest` handoff；完成本地处理和高级维护两个 owner 的归位、互斥、
+  activity/dirty/导航/关窗测试后删除旧 Privacy 页面与路由；最后删除旧
+  `start_assistant_run` 暴露面和专属执行图。用户文档、日期化截图与发布说明在生产路径
+  固定后更新。
+* Phase 7 不新增、修改或回退 user、Privacy、Vault、audit 或 approved workspace
+  schema，不删除历史行，不执行 down-migration，也不改变 ADR-0001 的不可变一对一绑定
+  或五组件备份/恢复门槛。如实现必须改变数据模型，应先停止对应步骤并追加 docs-only
+  授权，不得夹带在清理提交中。
+* 完整验证至少包括 UTF-8/中文完整性、全部 Python 数据构建与审计、MinerU worker/
+  builder/qualification、Provider security audit、Rust fmt/clippy/workspace tests、
+  standalone approved MCP stdio/HTTP、第三方 notices、前端 lint/test/production build、
+  Tauri packaging smoke，以及适用的主 CI 和 MCP Linux/Windows/macOS 矩阵。
+  application backup、project/privacy binding、case material、case assistant、Privacy
+  migration、lifecycle 和 Vault lifecycle 测试不得过滤；真实计费 Provider、真实案件、
+  真实 OCR/GPU 和明确标记的外部环境 ignored tests 继续按既定安全规则禁止冒充通过。
+* 回滚只逆序恢复 Phase 7 的代码、路由、文档和构建；不得回滚 Phase 3–6 数据迁移，
+  不得删除或覆盖用户、Privacy、Vault、audit、approved output 或历史会话数据。若恢复
+  旧 `start_assistant_run`，也只能恢复其 Phase 6 的 fail-closed 状态，不能恢复旧多意图
+  Provider 执行。
+
 ## 10. 必须通过的端到端验收
 
 ### 普通聊天
@@ -670,6 +743,28 @@ approved workspace 或 MCP 后端安全契约，也不得提前执行 Phase 7 �
 2. Approved generation 必须匹配 publication、grant 和 ticket。
 3. 来源撤销后 update/export 失败。
 4. MCP 的严格边界不得因普通聊天放宽而改变。
+
+### Phase 7 新增自动化与合成验收证据
+
+* 普通聊天与普通附件新增组合契约测试：使用唯一合成 Provider、独立会话、精确问题
+  “合同解除的一般条件是什么？”和显式合成附件，覆盖选择、取消、发送、连续 delta、
+  路由不变和持续外发提示；请求只能调用 `start_interactive_assistant_run`，不得包含
+  project/Privacy/generation/receipt/MCP/authority/classification 字段，不得触发
+  CaseMaterial 或 approved Provider handoff。
+* 案件工作新增命令级正向 mock transport 测试：只发送本次显式选择的 approved-only
+  投影和已确认案件数据，不包含原文 canary、路径、原文件名、权威 Privacy CaseId、
+  Vault/attachment/internal IDs 或未确认数据。撤销同一 generation 后使用新 run ID
+  重试，必须在 Provider transport 前失败，不产生成功消息、pending output 或案件写回；
+  前端刷新必须清除失效选择、禁止继续发送，并持续显示“请重新选择材料”而不是被刷新
+  成功提示覆盖。
+* MCP 新增精确负向测试：`CaseRaw` 与 `CaseRedactedPending` 指向
+  `ExternalMcpHost` 时均返回 `classification_forbidden`，计数 transport 保持零调用，
+  audit 只保存分类、hash、字节数和拒绝原因，不保存正文或 destination 明文。
+* 五组验收还必须使用合成、无隐私数据的当前 Phase 7 UI 证据和日期化截图；截图不得
+  包含真实案件、路径、credential、Bearer、ticket、receipt、哈希或权威
+  Privacy CaseId。仓库没有现成浏览器 E2E 框架，因此自动化证据沿用 Vitest、Rust
+  integration 和 standalone MCP harness，并以本机安全 View/UI walkthrough 补足用户
+  操作证据；不得为此调用真实或计费 Provider、真实 OCR 或外部 MCP host。
 
 ## 11. 提交与 PR 规则
 

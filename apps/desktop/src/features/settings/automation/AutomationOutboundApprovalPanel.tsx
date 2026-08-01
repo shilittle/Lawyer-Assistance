@@ -2,7 +2,6 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
 } from "react";
 
@@ -80,15 +79,7 @@ export const APPROVED_PROVIDER_TASK_OPTIONS: readonly ApprovedProviderTaskOption
 
 export interface AutomationOutboundApprovalPanelProps {
   disabled?: boolean;
-  taskRequest?: ProviderTaskRequest | null;
-  onTaskRequestConsumed?: (request: ProviderTaskRequest) => void;
   onActivityChange?: (active: boolean) => void;
-}
-
-export interface ProviderTaskRequest {
-  task: ApprovedProviderTask;
-  notice: string;
-  requestId: number;
 }
 
 export interface AutomationOutboundApprovalPanelViewProps {
@@ -729,8 +720,6 @@ export function AutomationOutboundApprovalPanelView({
 
 export function AutomationOutboundApprovalPanel({
   disabled = false,
-  taskRequest = null,
-  onTaskRequestConsumed,
   onActivityChange,
 }: AutomationOutboundApprovalPanelProps) {
   const [operation, setOperation] = useState<ProviderOperation>("loading");
@@ -757,7 +746,6 @@ export function AutomationOutboundApprovalPanel({
     useState<ApprovedProviderOutput | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const handledTaskRequestId = useRef<number | null>(null);
 
   const invalidateBoundState = useCallback(() => {
     setApproval(null);
@@ -766,35 +754,6 @@ export function AutomationOutboundApprovalPanel({
     setLoadedOutput(null);
     setConfirmed(false);
   }, []);
-
-  useEffect(() => {
-    if (!taskRequest || disabled || operation !== "idle") return;
-    if (
-      handledTaskRequestId.current !== null &&
-      taskRequest.requestId <= handledTaskRequestId.current
-    ) {
-      return;
-    }
-    handledTaskRequestId.current = taskRequest.requestId;
-    setTask(taskRequest.task);
-    setInstruction("");
-    setPriorOutputId("");
-    setNotice(taskRequest.notice);
-    setError("");
-    invalidateBoundState();
-    onTaskRequestConsumed?.(taskRequest);
-    globalThis.requestAnimationFrame?.(() => {
-      document
-        .getElementById("automation-outbound-approval")
-        ?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-  }, [
-    disabled,
-    invalidateBoundState,
-    onTaskRequestConsumed,
-    operation,
-    taskRequest,
-  ]);
 
   const installSnapshot = useCallback(
     (snapshot: PanelSnapshot) => {

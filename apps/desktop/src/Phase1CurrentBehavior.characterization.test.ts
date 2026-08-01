@@ -6,13 +6,17 @@ import assistantWorkspaceSource from "./features/assistant/AssistantWorkspace.ts
 import caseAssistantWorkspaceSource from "./features/cases/assistant/CaseAssistantWorkspace.tsx?raw";
 import providerEgressNoticeSource from "./features/assistant/ProviderEgressNotice.tsx?raw";
 import redactionWorkbenchSource from "./features/cases/materials/RedactionWorkbench.tsx?raw";
-import privacyWorkspaceSource from "./features/privacy/PrivacyWorkspace.tsx?raw";
+import localProcessingWorkspaceSource from "./features/settings/local-processing/LocalProcessingWorkspace.tsx?raw";
+import maintenanceWorkspaceSource from "./features/settings/maintenance/MaintenanceWorkspace.tsx?raw";
 import automationWorkspaceSource from "./features/settings/automation/McpAndAutomationWorkspace.tsx?raw";
 
 describe("Phase 1 current application workflow characterization", () => {
   it("sends ordinary Assistant messages through the independent interactive boundary", () => {
     expect(assistantClientSource).toContain(
       'invokeAssistant("start_interactive_assistant_run"',
+    );
+    expect(assistantClientSource).not.toContain(
+      'invokeAssistant("start_assistant_run"',
     );
     expect(assistantWorkspaceSource).toContain("<ProviderEgressNotice");
     expect(providerEgressNoticeSource).toContain(
@@ -23,16 +27,21 @@ describe("Phase 1 current application workflow characterization", () => {
     );
     expect(assistantWorkspaceSource).not.toContain("onOpenApprovedProvider");
     expect(assistantWorkspaceSource).not.toContain("前往脱敏批准");
+    expect(assistantWorkspaceSource).not.toContain("caseHandoff");
+    expect(assistantWorkspaceSource).not.toContain("handledCaseHandoff");
+    expect(assistantWorkspaceSource).not.toContain(
+      "latestCaseHandoffRequest",
+    );
     expect(assistantWorkspaceSource).toMatch(
       /<form className="assistant-composer"[\s\S]*?<ProviderEgressNotice/u,
     );
-    expect(assistantWorkspaceSource).toContain(
+    expect(assistantWorkspaceSource).not.toContain(
       "onOpenProtectedArtifactRegeneration",
     );
     expect(appSource).not.toMatch(
       /<AssistantWorkspace[\s\S]*?onOpenApprovedProvider=/u,
     );
-    expect(appSource).toContain("onOpenProtectedArtifactRegeneration=");
+    expect(appSource).not.toContain("onOpenProtectedArtifactRegeneration=");
   });
 
   it("routes case material preparation through the required ProjectId boundary", () => {
@@ -48,15 +57,16 @@ describe("Phase 1 current application workflow characterization", () => {
   });
 
   it("keeps local processing separate from the MCP and automation settings owner", () => {
-    const workspaceImplementation = privacyWorkspaceSource.slice(
-      privacyWorkspaceSource.indexOf("export function PrivacyWorkspace("),
+    const workspaceImplementation = localProcessingWorkspaceSource.slice(
+      localProcessingWorkspaceSource.indexOf(
+        "export function LocalProcessingWorkspace(",
+      ),
     );
 
     for (const panel of [
-      "PrivacyWorkspaceView",
+      "LocalProcessingWorkspaceView",
       "MineruComponentManagerPanel",
       "PrivacyQualificationControls",
-      "PrivacyLifecyclePanel",
     ]) {
       expect(workspaceImplementation).toContain(`<${panel}`);
     }
@@ -68,6 +78,8 @@ describe("Phase 1 current application workflow characterization", () => {
     expect(workspaceImplementation).not.toContain(
       "<PrivacyReviewWorkbench",
     );
+    expect(workspaceImplementation).not.toContain("<PrivacyLifecyclePanel");
+    expect(maintenanceWorkspaceSource).toContain("<PrivacyLifecyclePanel");
 
     for (const panel of [
       "McpWorkspace",

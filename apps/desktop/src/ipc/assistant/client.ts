@@ -40,8 +40,6 @@ import type {
   SaveAssistantArtifactResponse,
   StartInteractiveAssistantRunRequest,
   StartInteractiveAssistantRunResponse,
-  StartAssistantRunRequest,
-  StartAssistantRunResponse,
   AssistantRunEvent,
 } from "./types";
 
@@ -447,48 +445,6 @@ export function cancelAssistantRun(
 ): Promise<CancelAssistantRunResponse> {
   return invokeAssistant("cancel_assistant_run", {
     request: { runId: request.runId },
-  });
-}
-
-export function startAssistantRun(
-  request: StartAssistantRunRequest,
-  onEvent: (event: AssistantRunEvent) => void,
-): Promise<StartAssistantRunResponse> {
-  const closedRequest: StartAssistantRunRequest = {
-    runId: request.runId,
-    conversationId: request.conversationId,
-    providerId: request.providerId,
-    intent: request.intent,
-    prompt: request.prompt,
-    attachmentIds: copyStrings(request.attachmentIds),
-  };
-  if (request.budget !== undefined) {
-    closedRequest.budget = request.budget === null
-      ? null
-      : {
-          maxToolCalls: request.budget.maxToolCalls,
-          maxProviderRoundTrips: request.budget.maxProviderRoundTrips,
-          maxInputBodyBytes: request.budget.maxInputBodyBytes,
-          maxVisibleAttachments: request.budget.maxVisibleAttachments,
-          maxModelResponseBytes: request.budget.maxModelResponseBytes,
-        };
-  }
-  if (request.saveResearchArtifact !== undefined) {
-    closedRequest.saveResearchArtifact = request.saveResearchArtifact;
-  }
-  if (request.regenerationTarget !== undefined) {
-    closedRequest.regenerationTarget = request.regenerationTarget === null
-      ? null
-      : {
-          artifactId: request.regenerationTarget.artifactId,
-          sourceVersionNumber: request.regenerationTarget.sourceVersionNumber,
-          expectedCurrentVersion: request.regenerationTarget.expectedCurrentVersion,
-        };
-  }
-  const eventChannel = new Channel<AssistantRunEvent>(onEvent);
-  return invokeAssistant("start_assistant_run", {
-    request: closedRequest,
-    onEvent: eventChannel,
   });
 }
 

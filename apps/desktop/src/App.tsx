@@ -10,7 +10,6 @@ import { AppRouter, type AppRouterSlots } from "./app/AppRouter";
 import { AppShell } from "./app/AppShell";
 import type {
   AppRoute,
-  ApprovedProviderTaskRequest,
   GraphTargetRequest,
   LegalCitationRequest,
 } from "./app/routes";
@@ -57,14 +56,14 @@ const McpAndAutomationWorkspace = lazy(() =>
     }),
   ),
 );
-const PrivacyWorkspace = lazy(() =>
-  import("./features/privacy/PrivacyWorkspace").then((module) => ({
-    default: module.PrivacyWorkspace,
+const LocalProcessingWorkspace = lazy(() =>
+  import("./features/settings/local-processing/LocalProcessingWorkspace").then((module) => ({
+    default: module.LocalProcessingWorkspace,
   })),
 );
-const ReleaseWorkspace = lazy(() =>
-  import("./ReleaseWorkspace").then((module) => ({
-    default: module.ReleaseWorkspace,
+const MaintenanceWorkspace = lazy(() =>
+  import("./features/settings/maintenance/MaintenanceWorkspace").then((module) => ({
+    default: module.MaintenanceWorkspace,
   })),
 );
 
@@ -94,7 +93,8 @@ export function App() {
   const health = useHealthStatus();
   const graphOutput = useGraphOutputController();
   const mcpActivity = useWorkspaceActivityChannel();
-  const privacyActivity = useWorkspaceActivityChannel();
+  const localProcessingActivity = useWorkspaceActivityChannel();
+  const maintenanceActivity = useWorkspaceActivityChannel();
   const caseMaterialsActivity = useCaseMaterialActivityChannel();
   const confirmDiscard = useCallback(
     (message: string) => window.confirm(message),
@@ -102,16 +102,14 @@ export function App() {
   );
   const navigation = useAppNavigationController({
     mcp: mcpActivity,
-    privacy: privacyActivity,
+    localProcessing: localProcessingActivity,
+    maintenance: maintenanceActivity,
     caseMaterials: caseMaterialsActivity,
     confirmDiscard,
   });
   const consumeRouteState = navigation.consumeRouteState;
   const assistantController = useAssistantController();
-  const caseController = useCaseWorkspaceController({
-    onLegacyApprovedProviderRequest:
-      redirectLegacyEgressToApprovedProvider,
-  });
+  const caseController = useCaseWorkspaceController();
   const {
     selectedCaseProjectId,
     caseWorkspace,
@@ -132,8 +130,6 @@ export function App() {
     onOpenLawGraph: openLawGraph,
     onOpenCaseAssistant: openSelectedCaseAssistant,
     onOpenAssistant: () => navigateFromShell(ASSISTANT_ROUTE),
-    onLegacyApprovedProviderRequest:
-      redirectLegacyEgressToApprovedProvider,
     onAddAssistantLegalSource: assistantController.addLegalSource,
     onProposeAssistantLegalBasis: (sourceId) =>
       assistantController.proposeLegalBasisForCase(
@@ -144,37 +140,7 @@ export function App() {
   const {
     deletionBlockedProviderId: providerDeletionBlockedProviderId,
     closeGuard: caseCloseGuard,
-    selectInitialProvider: selectInitialExtractionProvider,
-    handleProviderSaved: handleExtractionProviderSaved,
-    handleProviderDeleted: handleExtractionProviderDeleted,
   } = caseController.extraction;
-
-  const handleInitialProviderSelected = useCallback(
-    (providerId: string) => {
-      legalLibrary.providerBridge.selectInitialProvider(providerId);
-      selectInitialExtractionProvider(providerId);
-    },
-    [legalLibrary.providerBridge, selectInitialExtractionProvider],
-  );
-  const handleProviderSaved = useCallback(
-    (providerId: string) => {
-      handleExtractionProviderSaved(providerId);
-    },
-    [handleExtractionProviderSaved],
-  );
-  const handleProviderDeleted = useCallback(
-    (deletedProviderId: string, fallbackProviderId: string | null) => {
-      legalLibrary.providerBridge.handleProviderDeleted(
-        deletedProviderId,
-        fallbackProviderId,
-      );
-      handleExtractionProviderDeleted(
-        deletedProviderId,
-        fallbackProviderId,
-      );
-    },
-    [handleExtractionProviderDeleted, legalLibrary.providerBridge],
-  );
   const providerSettings = useProviderSettingsController({
     policies: {
       hasUnsavedChanges: providerNavigationHasUnsavedChanges,
@@ -186,9 +152,6 @@ export function App() {
       confirmAction: confirmDiscard,
     },
     deletionBlockedProviderId: providerDeletionBlockedProviderId,
-    onInitialProviderSelected: handleInitialProviderSelected,
-    onProviderSaved: handleProviderSaved,
-    onProviderDeleted: handleProviderDeleted,
   });
   const providerActivity = useMemo(
     () => ({
@@ -211,7 +174,8 @@ export function App() {
     caseCloseGuard,
     provider: providerActivity,
     mcp: mcpActivity,
-    privacy: privacyActivity,
+    localProcessing: localProcessingActivity,
+    maintenance: maintenanceActivity,
     caseMaterials: caseMaterialsActivity,
     readLegalBridgeMutationInFlight,
     onCaseCloseBlocked: reportCaseError,
@@ -239,15 +203,6 @@ export function App() {
       );
     }
     return true;
-  }
-
-  function redirectLegacyEgressToApprovedProvider(
-    task: ApprovedProviderTaskRequest["task"],
-    notice: string,
-  ): void {
-    completeNavigation(
-      navigation.handoffApprovedProvider({ task, notice }),
-    );
   }
 
   function openSelectedCaseAssistant(): void {
@@ -307,17 +262,6 @@ export function App() {
     },
     [consumeRouteState],
   );
-  const consumeApprovedProviderTask = useCallback(
-    (request: ApprovedProviderTaskRequest) => {
-      consumeRouteState({
-        area: "settings",
-        page: "mcp",
-        state: { kind: "approved-provider-task", request },
-      });
-    },
-    [consumeRouteState],
-  );
-
   const slots: AppRouterSlots = {
     assistant: () => (
       <AssistantWorkspace
@@ -336,9 +280,6 @@ export function App() {
           assistantController.workspaceCallbacks
             .onMutationActivityChange
         }
-        onOpenProtectedArtifactRegeneration={(notice) =>
-          redirectLegacyEgressToApprovedProvider("regenerate", notice)
-        }
         onOpenProviderSettings={() =>
           navigateFromShell(PROVIDER_SETTINGS_ROUTE)
         }
@@ -351,7 +292,6 @@ export function App() {
       <LegacyQaWorkspace
         caseWorkspace={caseWorkspace}
         controller={legalLibrary}
-        providerProfiles={providerSettings.profiles}
       />
     ),
     cases: ({ route }) => (
@@ -412,25 +352,25 @@ export function App() {
     providers: () => (
       <ProviderSettingsWorkspace controller={providerSettings} />
     ),
-    privacy: () => (
-      <SettingsWorkspace mode="privacy">
+    localProcessing: () => (
+      <SettingsWorkspace mode="local-processing">
         <Suspense
           fallback={
-            <p className="empty-state">正在加载隐私设置…</p>
+            <p className="empty-state">正在加载本地处理环境…</p>
           }
         >
-          <PrivacyWorkspace
+          <LocalProcessingWorkspace
             onDraftDirtyChange={
-              privacyActivity.onDraftDirtyChange
+              localProcessingActivity.onDraftDirtyChange
             }
             onMutationActivityChange={
-              privacyActivity.onMutationActivityChange
+              localProcessingActivity.onMutationActivityChange
             }
           />
         </Suspense>
       </SettingsWorkspace>
     ),
-    mcp: ({ route }) => (
+    mcp: () => (
       <SettingsWorkspace mode="mcp">
         <Suspense
           fallback={
@@ -440,10 +380,6 @@ export function App() {
           }
         >
           <McpAndAutomationWorkspace
-            providerTaskRequest={route.state?.request ?? null}
-            onProviderTaskRequestConsumed={
-              consumeApprovedProviderTask
-            }
             onDraftDirtyChange={mcpActivity.onDraftDirtyChange}
             onMutationActivityChange={
               mcpActivity.onMutationActivityChange
@@ -452,14 +388,18 @@ export function App() {
         </Suspense>
       </SettingsWorkspace>
     ),
-    release: () => (
+    maintenance: () => (
       <SettingsWorkspace mode="maintenance">
         <Suspense
           fallback={
-            <p className="empty-state">正在加载版本信息…</p>
+            <p className="empty-state">正在加载版本、备份与诊断…</p>
           }
         >
-          <ReleaseWorkspace />
+          <MaintenanceWorkspace
+            onMutationActivityChange={
+              maintenanceActivity.onMutationActivityChange
+            }
+          />
         </Suspense>
       </SettingsWorkspace>
     ),
@@ -481,7 +421,6 @@ export function App() {
         ) : null}
         <AppRouter
           route={navigation.route}
-          assistantHostRoute={navigation.assistantHostRoute}
           slots={slots}
           onNavigate={navigateFromShell}
         />

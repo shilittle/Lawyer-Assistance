@@ -85,6 +85,54 @@ export function selectedGenerationIdsFromProjection(
     .map((generation) => generation.redactionGenerationId);
 }
 
+export function reconcileCaseAssistantGenerationIds(
+  currentIds: readonly string[],
+  generations: readonly CaseAssistantGeneration[],
+): string[] {
+  const availableIds = new Set(
+    generations.map((generation) => generation.redactionGenerationId),
+  );
+  return [
+    ...new Set([
+      ...currentIds.filter((generationId) =>
+        availableIds.has(generationId),
+      ),
+      ...selectedGenerationIdsFromProjection(generations),
+    ]),
+  ];
+}
+
+const CASE_ASSISTANT_RESELECTION_ERROR_TYPES = new Set([
+  "generation_revoked",
+  "case_assistant_source_conflict",
+  "privacy_store_conflict",
+  "case_material_unavailable",
+  "redaction_not_approved",
+]);
+
+export function caseAssistantRunFailureMessage(
+  publicMessage: string,
+  errorType?: string,
+): string {
+  const reselection =
+    errorType !== undefined &&
+    CASE_ASSISTANT_RESELECTION_ERROR_TYPES.has(errorType);
+  return `案件助理运行失败：${publicMessage}${
+    reselection ? " 请重新选择材料后再试。" : ""
+  }`;
+}
+
+export function failCaseAssistantStreamState(
+  current: CaseAssistantStreamState,
+  message: string,
+): CaseAssistantStreamState {
+  return {
+    ...current,
+    status: "failed",
+    error: message,
+  };
+}
+
 export function toggleCaseAssistantGeneration(
   generations: readonly CaseAssistantGeneration[],
   selectedIds: readonly string[],

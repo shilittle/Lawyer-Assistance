@@ -18,7 +18,6 @@ import {
   sanitizePublicGeneratedText,
 } from "../../publicOutput";
 import type { CaseWorkspace } from "../../ipc/case/types";
-import type { ProviderProfile } from "../../ipc/provider/types";
 import {
   citationHasTrustedSource,
   formatCitationValidationSummary,
@@ -27,13 +26,11 @@ import type { LegalLibraryController } from "./useLegalLibraryController";
 
 export interface LegacyQaWorkspaceProps {
   controller: LegalLibraryController;
-  providerProfiles: readonly ProviderProfile[];
   caseWorkspace: CaseWorkspace | null;
 }
 
 export function LegacyQaWorkspace({
   controller,
-  providerProfiles,
   caseWorkspace,
 }: LegacyQaWorkspaceProps) {
   const {
@@ -52,8 +49,6 @@ export function LegacyQaWorkspace({
     setEffectivenessLevels,
     includeExpired,
     setIncludeExpired,
-    providerId,
-    setProviderId,
     answer,
     historyState,
     historyRecords,
@@ -66,7 +61,6 @@ export function LegacyQaWorkspace({
     answeredScope,
     requestLocked,
     preview,
-    submit,
     cancel,
     restoreRecord,
     refreshHistory,
@@ -84,7 +78,10 @@ export function LegacyQaWorkspace({
           <h2 id="qa-control-title">问题</h2>
           <span>{formatLegalAnswerStreamStatus(stream)}</span>
         </div>
-        <form className="qa-form" onSubmit={submit}>
+        <form
+          className="qa-form"
+          onSubmit={(event) => event.preventDefault()}
+        >
           <p className="privacy-note">
             回答归属：
             {caseWorkspace && selectedCaseProjectId
@@ -138,20 +135,6 @@ export function LegacyQaWorkspace({
                   留空按当前有效性检索；不会以立案/接案日期代替案件事实日期。
                 </small>
               </label>
-              <label>
-                <span>Provider</span>
-                <select
-                  value={providerId}
-                  onChange={(event) => setProviderId(event.target.value)}
-                >
-                  <option value="">选择 Provider</option>
-                  {providerProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.displayName}
-                    </option>
-                  ))}
-                </select>
-              </label>
             </div>
             <fieldset className="qa-effectiveness-filter">
               <legend>效力层级（可多选）</legend>
@@ -190,9 +173,6 @@ export function LegacyQaWorkspace({
               onClick={() => void preview()}
             >
               本地检索来源
-            </button>
-            <button type="submit" disabled={requestLocked}>
-              转到脱敏批准后问答
             </button>
             {isLegalAnswerStreamCancellable(stream) ? (
               <button type="button" onClick={() => void cancel()}>

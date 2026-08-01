@@ -3,37 +3,27 @@ import {
   formatGapKind,
   formatGapSeverity,
 } from "../../ipc/case/format";
-import { extractionLocksSources } from "../../ipc/case/extractionReview";
 import type { PartyRole } from "../../ipc/case/types";
-import type { ProviderProfile } from "../../ipc/provider/types";
 import { publicErrorMessage } from "../../publicOutput";
 import { publicCaseBusinessText } from "./model";
 import type { CaseWorkspaceController } from "./useCaseWorkspaceController";
 
 export interface CaseGapExtractionPanelProps {
   controller: CaseWorkspaceController;
-  providerProfiles: readonly ProviderProfile[];
 }
 
 export function CaseGapExtractionPanel({
   controller,
-  providerProfiles,
 }: CaseGapExtractionPanelProps) {
   const {
     caseWorkspace,
     selectedCaseProjectId,
-    caseValidationTargetId,
     caseMutationInFlight,
     activeCaseEntityEditor,
     caseNavigationLocked,
-    caseProjectMutationLocked,
-    caseChildrenReady,
     removeCaseEntity,
   } = controller;
   const {
-    providerId: extractionProviderId,
-    setProviderId: setExtractionProviderId,
-    fileIds: extractionFileIds,
     state: extractionState,
     confirmPreparing: extractionConfirmPreparing,
     discarding: extractionDiscarding,
@@ -43,7 +33,6 @@ export function CaseGapExtractionPanel({
     closePreparing: extractionClosePreparing,
     pendingReviewRecoveryBlock,
     reviewRef: extractionReviewRef,
-    runStructuredExtraction,
     updateDraft: updateExtractionDraft,
     cancelReview: cancelExtractionReview,
     discardUnrestorablePendingReview,
@@ -140,43 +129,6 @@ export function CaseGapExtractionPanel({
                   </button>
                 </div>
               ) : null}
-              <label>
-                <span>Provider</span>
-                <select
-                  id="extraction-provider"
-                  aria-describedby="case-workbench-error"
-                  aria-invalid={
-                    caseValidationTargetId === "extraction-provider"
-                  }
-                  disabled={caseProjectMutationLocked}
-                  value={extractionProviderId}
-                  onChange={(event) =>
-                    setExtractionProviderId(event.target.value)
-                  }
-                >
-                  <option value="">选择已保存 Provider</option>
-                  {providerProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.displayName} · {profile.modelId}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                disabled={
-                  !caseChildrenReady ||
-                  caseProjectMutationLocked ||
-                  activeCaseEntityEditor !== null ||
-                  extractionLocksSources(extractionState)
-                }
-                type="button"
-                onClick={() => void runStructuredExtraction()}
-              >
-                {extractionState.kind === "generating"
-                  ? "正在请求并严格校验…"
-                  : `生成待审阅内容（已选 ${extractionFileIds.length} 份材料）`}
-              </button>
-
               {extractionState.kind === "reviewing" ||
               extractionState.kind === "committing" ? (
                 <div

@@ -1,6 +1,6 @@
 # Lawyer Assistance MCP
 
-当前生产契约是隐私收紧后的 `public_law_only`，只提供五个公开法律只读工具：
+当前默认 MCP 生产契约是隐私收紧后的 `public_law_only`，只提供五个公开法律只读工具：
 
 - `system_status`
 - `legal_search`
@@ -16,7 +16,9 @@
 
 `diagram_authoring` 是另一个永久仅限合成/公开数据的 profile；它生成明文本地 HTML bundle，不能处理真实案件。批准案件图示只走 `approved_case_workspace`：render/update 发布加密 protected HTML，export 只返回 descriptor metadata，不返回 path、URI 或 HTML。
 
-旧的 `case_get_state`、patch、任意材料导入、缺口分析、文书生成和路径导出能力在所有 profile 中仍隐藏且不可调用。Provider transport 的独立批准正向链也已实现，但只接受 Rust 后端恢复并验证的精确批准 payload；旧入口和裸案件请求仍在网络前 fail closed。
+旧的 `case_get_state`、patch、任意材料导入、缺口分析、文书生成和路径导出能力在所有 profile 中仍隐藏且不可调用。
+
+应用内普通聊天、案件助理和 MCP/自动化是三个独立边界：普通聊天通过 `start_interactive_assistant_run` 发送用户主动提供的非案件内容；案件助理通过 `start_case_assistant_run` 只发送本次明确选择的 approved-only 投影和最小已确认案件数据；自动化 Provider 与 Approved MCP 位于“设置 → MCP 与自动化”，继续使用独立资格和精确授权。普通聊天的恢复不增加任何 MCP 工具，也不允许 `CASE_RAW` 或 `CASE_REDACTED_PENDING` 进入 `ExternalMcpHost`。旧多意图入口已经物理删除；任何绕过当前闭合入口的裸案件请求仍在网络前 fail closed。
 
 ## 文档
 

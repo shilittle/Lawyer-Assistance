@@ -8,22 +8,38 @@
 
 该结论不否定已经实现的本地法律检索、案件工作区、隐私审批、受保护成果、MCP 和备份能力；它表示签名、自动更新、生产 OCR、完整归档资源和最终环境验收仍未完成。
 
+GitHub 仓库当前为公开仓库。仓库可见性和资产可下载性只属于分发事实，并不等于已建立可信发布者签名、可用自动更新、OCR 资格、干净机器验收或正式发布状态。
+
 ## 当前可用能力
 
 | 能力 | 状态 |
 |---|---|
 | Windows x86_64 桌面应用 | 已实现；技术预发布尚未建立可信发布者身份 |
+| 四区域信息架构 | 已实现为助理、案件、法律资料库和设置 |
+| 普通助理聊天 | 已实现；无需先创建案件，使用用户选择的 BYOK Provider，并持续显示 Provider 服务器外发提示 |
+| 显式普通附件 | 已实现；只有当前发送明确选择的附件会贡献本地提取正文，且不会自动登记为案件材料 |
 | `runtime-slim-v1` 运行时法律库 | 随应用资源使用；服务于当前查询和引用流程 |
 | 本地案件、证据、问题与法律依据管理 | 已实现 |
 | PDF、DOCX、UTF-8 TXT、Markdown 本地导入 | 已实现；视觉页受 OCR 资格门限制 |
-| 脱敏复核、不可变批准 generation、Vault 与映射 | 已实现 |
+| 案件 → 材料与脱敏 | 已实现导入、文本层提取、脱敏复核、不可变批准、撤销和版本历史；OCR 仍受门禁且当前未取得生产资格 |
+| approved-only 案件助理 | 已在案件工作中实现；每次请求显式选择当前批准 generation，并排除原件和 Vault 对象 |
+| 审计型 `ProjectId ↔ PrivacyCaseId` 绑定 | 已实现为后端持久化、不可变的一对一绑定；前端不推导也不接收权威 Privacy 身份 |
 | 受保护 work products 与安全派生文件 | 已实现 |
 | 五组件认证加密 `.lavbackup` | 已实现 |
-| BYOK Provider | 已实现；公开与批准案件通道分离 |
+| BYOK Provider | 已实现；`interactive_chat`、`interactive_case_work` 和 `approved_automation` 三条通道相互独立 |
+| 四个设置 owner | Provider 服务与凭据；本地处理环境与 OCR 组件；MCP 与自动化；版本、备份与诊断 |
 | `public_law_only` | 默认五个公开法律只读 MCP 工具 |
 | `approved_case_workspace` | 精确 21 工具；默认禁用并受 App 资格、session、grant 和 ticket 约束 |
 | `diagram_authoring` | 精确 11 工具；永久仅限纯合成或公开数据 |
 | 批准案件图示 | 经 approved workspace 保存为加密受保护 HTML work product |
+
+## 当前工作流边界
+
+- `interactive_chat` 支持不绑定案件的普通消息和显式普通附件。它不能读取案件工作区、Privacy store、Vault、approved generation 或 MCP 授权状态。
+- `interactive_case_work` 只允许应用内案件助理使用当前案件中本次显式选择、仍为批准且当前有效的 generation 和已确认案件数据。已撤销、过期、原始、待复核、其他案件或未选择的来源全部 fail closed。
+- `approved_automation` 保留独立的外部宿主边界：opaque ID、干净任务控制、qualification、批准来源引用、grant、exact ticket、目的地/用途绑定、撤销校验和受保护成果落点。
+
+三种模式不可互换，任何受阻模式都不得回退到另一种模式。案件正文和人工复核只存在于 **案件 → 材料与脱敏**；设置只承载四个配置与维护 owner。
 
 ## 当前未交付或未资格化
 
@@ -59,7 +75,9 @@
 可以使用：
 
 - “Lawyer Assistance `0.4.0-beta.2` 未签名技术预发布”
+- “Lawyer Assistance 源代码仓库为公开仓库”
 - “提供本地公开法律检索、案件整理、隐私审批、受保护成果和受控 MCP”
+- “通过相互独立的执行模式提供无案件前提的普通 Provider 聊天和 approved-only 案件助理”
 - “生产 OCR 默认阻断”
 - “使用运行时精简法律库，完整归档库不随包提供”
 
@@ -70,6 +88,7 @@
 - “已签名”或“已建立可信 Windows publisher”
 - “支持当前自动更新”
 - “安装包包含完整归档数据库”
+- “因为仓库或资产公开，所以已经完成签名、updater、OCR 资格或发布验收”
 - “已完成 Windows 10/11 clean-machine 全覆盖”
 
 ## 用户建议

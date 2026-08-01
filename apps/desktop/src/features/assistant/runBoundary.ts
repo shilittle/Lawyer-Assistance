@@ -67,28 +67,6 @@ export const ASSISTANT_RUN_INTENT_LABELS: Readonly<
   case_analysis: "案件分析",
 };
 
-export interface AssistantAttachmentPolicy {
-  accepts: boolean;
-  requires: boolean;
-}
-
-/** Mirrors the Rust fixed plan so invalid attachment combinations never leave the UI. */
-export function assistantAttachmentPolicy(
-  intent: AssistantRunIntent,
-  hasProject: boolean,
-): AssistantAttachmentPolicy {
-  switch (intent) {
-    case "legal_research":
-    case "case_analysis":
-      return { accepts: false, requires: false };
-    case "file_analysis":
-      return { accepts: true, requires: true };
-    case "document_draft":
-    case "map_build":
-      return { accepts: true, requires: !hasProject };
-  }
-}
-
 /** Keeps the component testable and prevents run-command details spreading. */
 export const defaultAssistantRunBoundary: AssistantRunBoundary = {
   start: startInteractiveAssistantRun,

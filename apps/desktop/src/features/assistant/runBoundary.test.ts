@@ -12,7 +12,6 @@ vi.mock("../../ipc/assistant/client", () => ({
 import {
   advanceAssistantRunEventCursor,
   applyAssistantCancellationResult,
-  assistantAttachmentPolicy,
   defaultAssistantRunBoundary,
 } from "./runBoundary";
 
@@ -63,26 +62,6 @@ describe("defaultAssistantRunBoundary", () => {
     );
     expect(events).toEqual(["第一段", "第二段"]);
     await expect(defaultAssistantRunBoundary.cancel("run-1")).resolves.toBe(true);
-  });
-});
-
-describe("assistantAttachmentPolicy", () => {
-  it.each([
-    ["legal_research", false, { accepts: false, requires: false }],
-    ["file_analysis", false, { accepts: true, requires: true }],
-    ["document_draft", false, { accepts: true, requires: true }],
-    ["map_build", true, { accepts: true, requires: false }],
-    ["case_analysis", true, { accepts: false, requires: false }],
-  ] as const)(
-    "matches the fixed Rust plan for %s (hasProject=%s)",
-    (intent, hasProject, expected) => {
-      expect(assistantAttachmentPolicy(intent, hasProject)).toEqual(expected);
-    },
-  );
-
-  it("requires material for document and map work only when no case is bound", () => {
-    expect(assistantAttachmentPolicy("document_draft", true).requires).toBe(false);
-    expect(assistantAttachmentPolicy("map_build", false).requires).toBe(true);
   });
 });
 

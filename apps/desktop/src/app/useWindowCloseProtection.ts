@@ -20,7 +20,8 @@ export interface WindowCloseProtectionOptions {
   readonly caseCloseGuard: CaseCloseGuardPort;
   readonly provider: BooleanActivityReader;
   readonly mcp: BooleanActivityReader;
-  readonly privacy: BooleanActivityReader;
+  readonly localProcessing: BooleanActivityReader;
+  readonly maintenance: BooleanActivityReader;
   readonly caseMaterials: BooleanActivityReader;
   readonly readLegalBridgeMutationInFlight: () => boolean;
   readonly onCaseCloseBlocked: (message: string) => void;
@@ -36,7 +37,8 @@ export function useWindowCloseProtection({
   caseCloseGuard,
   provider,
   mcp,
-  privacy,
+  localProcessing,
+  maintenance,
   caseMaterials,
   readLegalBridgeMutationInFlight,
   onCaseCloseBlocked,
@@ -50,7 +52,8 @@ export function useWindowCloseProtection({
     caseCloseGuard,
     provider,
     mcp,
-    privacy,
+    localProcessing,
+    maintenance,
     caseMaterials,
     readLegalBridgeMutationInFlight,
     onCaseCloseBlocked,
@@ -62,7 +65,8 @@ export function useWindowCloseProtection({
       caseCloseGuard,
       provider,
       mcp,
-      privacy,
+      localProcessing,
+      maintenance,
       caseMaterials,
       readLegalBridgeMutationInFlight,
       onCaseCloseBlocked,
@@ -72,7 +76,8 @@ export function useWindowCloseProtection({
     caseCloseGuard,
     mcp,
     onCaseCloseBlocked,
-    privacy,
+    localProcessing,
+    maintenance,
     caseMaterials,
     provider,
     readLegalBridgeMutationInFlight,
@@ -106,9 +111,12 @@ export function useWindowCloseProtection({
         assistantDraftDirty: assistantSnapshot.draftDirty,
         mcpMutationInFlight: current.mcp.readMutationInFlight(),
         mcpDraftDirty: current.mcp.readDraftDirty(),
-        privacyMutationInFlight:
-          current.privacy.readMutationInFlight(),
-        privacyDraftDirty: current.privacy.readDraftDirty(),
+        localProcessingMutationInFlight:
+          current.localProcessing.readMutationInFlight(),
+        localProcessingDraftDirty:
+          current.localProcessing.readDraftDirty(),
+        maintenanceMutationInFlight:
+          current.maintenance.readMutationInFlight(),
         caseMaterialMutationInFlight:
           current.caseMaterials.readMutationInFlight(),
         caseMaterialDraftDirty:

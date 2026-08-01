@@ -5,14 +5,18 @@ import type {
   LocalMineruDiscoveryResult,
   PrivacyConfig,
   PrivacyConfigResponse,
-} from "../../ipc/privacy/types";
+} from "../../../ipc/privacy/types";
 import {
-  PrivacyWorkspaceView,
+  LocalProcessingWorkspaceView,
   applyLocalMineruDiscoveryToDraft,
+  localProcessingComponentIsDisabled,
+  localProcessingConfigIsDisabled,
+  localProcessingMutationIsActive,
+  localProcessingQualificationIsDisabled,
   privacyConfigDraftIsDirty,
   privacyConfigToDraft,
   privacyDraftToConfig,
-} from "./PrivacyWorkspace";
+} from "./LocalProcessingWorkspace";
 
 const config: PrivacyConfig = {
   schemaVersion: 1,
@@ -84,7 +88,43 @@ const response: PrivacyConfigResponse = {
   },
 };
 
-describe("PrivacyWorkspace configuration", () => {
+describe("LocalProcessingWorkspace configuration", () => {
+  it("keeps configuration, component, and qualification operations mutually exclusive", () => {
+    expect(localProcessingConfigIsDisabled("idle", false, false)).toBe(false);
+    expect(localProcessingConfigIsDisabled("idle", true, false)).toBe(true);
+    expect(localProcessingConfigIsDisabled("idle", false, true)).toBe(true);
+    expect(localProcessingComponentIsDisabled(false, "idle", false)).toBe(
+      false,
+    );
+    expect(localProcessingComponentIsDisabled(true, "idle", false)).toBe(
+      true,
+    );
+    expect(localProcessingComponentIsDisabled(false, "saving", false)).toBe(
+      true,
+    );
+    expect(localProcessingComponentIsDisabled(false, "idle", true)).toBe(
+      true,
+    );
+    expect(
+      localProcessingQualificationIsDisabled(false, "idle", false),
+    ).toBe(false);
+    expect(
+      localProcessingQualificationIsDisabled(false, "idle", true),
+    ).toBe(true);
+  });
+
+  it("aggregates independent mutation bits without treating status refresh as a write", () => {
+    expect(localProcessingMutationIsActive("idle", false, false)).toBe(false);
+    expect(localProcessingMutationIsActive("refreshing", false, false)).toBe(
+      false,
+    );
+    expect(localProcessingMutationIsActive("discovering", false, false)).toBe(
+      true,
+    );
+    expect(localProcessingMutationIsActive("idle", true, false)).toBe(true);
+    expect(localProcessingMutationIsActive("idle", false, true)).toBe(true);
+  });
+
   it("round-trips normalized strict settings", () => {
     const draft = privacyConfigToDraft(config);
     draft.languages = "ZH, en, zh";
@@ -162,10 +202,10 @@ describe("PrivacyWorkspace configuration", () => {
   });
 });
 
-describe("PrivacyWorkspaceView", () => {
+describe("LocalProcessingWorkspaceView", () => {
   it("shows strict fixed boundaries, versions and hashes without a raw-cloud switch", () => {
     const markup = renderToStaticMarkup(
-      <PrivacyWorkspaceView
+      <LocalProcessingWorkspaceView
         configResponse={response}
         draft={privacyConfigToDraft(config)}
         operation="idle"
@@ -180,7 +220,7 @@ describe("PrivacyWorkspaceView", () => {
       />,
     );
 
-    expect(markup).toContain("隐私与本地处理");
+    expect(markup).toContain("本地处理环境与 OCR 组件");
     expect(markup).toContain("自动发现本机 MinerU");
     expect(markup).toContain("不执行 MinerU、Python、shell");
     expect(markup).toContain("任何网络命令");
@@ -216,7 +256,7 @@ describe("PrivacyWorkspaceView", () => {
 
   it("locks status refresh while an unsaved configuration is visible", () => {
     const markup = renderToStaticMarkup(
-      <PrivacyWorkspaceView
+      <LocalProcessingWorkspaceView
         configResponse={response}
         draft={{ ...privacyConfigToDraft(config), device: "cuda:1" }}
         operation="idle"

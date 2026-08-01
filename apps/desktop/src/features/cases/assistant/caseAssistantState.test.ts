@@ -6,7 +6,10 @@ import type {
 } from "../../../ipc/case-assistant/types";
 import {
   caseAssistantConfirmationMessage,
+  caseAssistantRunFailureMessage,
+  failCaseAssistantStreamState,
   initialCaseAssistantStreamState,
+  reconcileCaseAssistantGenerationIds,
   reduceCaseAssistantRunEvent,
   selectedGenerationIdsFromProjection,
   toggleCaseAssistantGeneration,
@@ -51,6 +54,44 @@ describe("case assistant frontend state", () => {
       "generation-a2",
       "generation-b1",
     ]);
+  });
+
+  it("drops a revoked generation after refresh and leaves no implicit selection", () => {
+    expect(
+      reconcileCaseAssistantGenerationIds(
+        ["generation-revoked"],
+        generations.filter(
+          (generation) => generation.redactionGenerationId !== "generation-a1",
+        ),
+      ),
+    ).toEqual(["generation-a2", "generation-b1"]);
+    expect(
+      reconcileCaseAssistantGenerationIds(["generation-revoked"], []),
+    ).toEqual([]);
+  });
+
+  it("requires a new material selection after a revoked source failure", () => {
+    expect(
+      caseAssistantRunFailureMessage(
+        "所选脱敏版本不再可用。",
+        "privacy_store_conflict",
+      ),
+    ).toContain("请重新选择材料");
+    expect(
+      caseAssistantRunFailureMessage("模型服务暂时不可用。", "provider_http_error"),
+    ).toBe("案件助理运行失败：模型服务暂时不可用。");
+  });
+
+  it("marks the visible stream as failed instead of leaving an accepted state behind", () => {
+    const current = initialCaseAssistantStreamState("run-revoked");
+
+    expect(
+      failCaseAssistantStreamState(current, "请重新选择材料后再试。"),
+    ).toEqual({
+      ...current,
+      status: "failed",
+      error: "请重新选择材料后再试。",
+    });
   });
 
   it("keeps at most one explicitly selected generation per material", () => {
