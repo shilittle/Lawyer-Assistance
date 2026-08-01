@@ -59,7 +59,11 @@ pub fn unprotect_local(ciphertext: &[u8]) -> Result<Vec<u8>, ProtectedBlobError>
 #[cfg(windows)]
 mod platform {
     use super::{ProtectedBlobError, OPTIONAL_ENTROPY};
-    use std::{ffi::c_void, ptr, slice};
+    use std::{
+        ffi::c_void,
+        ptr, slice,
+        sync::atomic::{compiler_fence, Ordering},
+    };
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{
@@ -96,10 +100,10 @@ mod platform {
             )
         };
         if ok == 0 {
-            free_output(&mut output);
+            free_output(&mut output, false);
             return Err(ProtectedBlobError::ProtectFailed);
         }
-        copy_and_free(&mut output)
+        copy_and_free(&mut output, false)
     }
 
     pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, ProtectedBlobError> {
@@ -131,26 +135,36 @@ mod platform {
             )
         };
         if ok == 0 {
-            free_output(&mut output);
+            free_output(&mut output, true);
             return Err(ProtectedBlobError::UnprotectFailed);
         }
-        copy_and_free(&mut output)
+        copy_and_free(&mut output, true)
     }
 
-    fn copy_and_free(output: &mut CRYPT_INTEGER_BLOB) -> Result<Vec<u8>, ProtectedBlobError> {
+    fn copy_and_free(
+        output: &mut CRYPT_INTEGER_BLOB,
+        clear_before_free: bool,
+    ) -> Result<Vec<u8>, ProtectedBlobError> {
         if output.pbData.is_null() || output.cbData == 0 {
-            free_output(output);
+            free_output(output, clear_before_free);
             return Err(ProtectedBlobError::InvalidOutput);
         }
-        let length =
-            usize::try_from(output.cbData).map_err(|_| ProtectedBlobError::InvalidOutput)?;
+        let length = output.cbData as usize;
         let bytes = unsafe { slice::from_raw_parts(output.pbData, length) }.to_vec();
-        free_output(output);
+        free_output(output, clear_before_free);
         Ok(bytes)
     }
 
-    fn free_output(output: &mut CRYPT_INTEGER_BLOB) {
+    fn free_output(output: &mut CRYPT_INTEGER_BLOB, clear_before_free: bool) {
         if !output.pbData.is_null() {
+            if clear_before_free {
+                for index in 0..output.cbData as usize {
+                    unsafe {
+                        ptr::write_volatile(output.pbData.add(index), 0);
+                    }
+                }
+                compiler_fence(Ordering::SeqCst);
+            }
             let _ = unsafe { LocalFree(output.pbData.cast::<c_void>()) };
             output.pbData = ptr::null_mut();
             output.cbData = 0;

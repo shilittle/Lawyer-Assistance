@@ -14,6 +14,7 @@ pub mod finding_engine;
 pub mod lifecycle;
 pub mod local_ner;
 pub mod mcp_ticket;
+mod migration_source;
 pub mod project_case_binding;
 pub mod protected_blob;
 pub mod qualification;
@@ -66,6 +67,14 @@ pub use mcp_ticket::{
     McpAccessTargetV1, McpAccessTicketClaimsV1, McpAccessTicketRequestV1, McpAccessTicketStore,
     McpTicketError, McpTicketSigningKey, McpTicketVerificationContextV1, McpTransportBindingV1,
     SignedMcpAccessTicketV1, MCP_ACCESS_TICKET_PROFILE, MCP_ACCESS_TICKET_VERSION,
+};
+pub use migration_source::{
+    validate_privacy_v1_migration_source_read_only,
+    with_validated_privacy_v1_migration_source_read_only, PrivacyV1BusinessManifest,
+    PrivacyV1BusinessTableManifest, PrivacyV1LogicalManifest, PrivacyV1LogicalTableManifest,
+    PrivacyV1SchemaProvenance, PrivacyV1SourceFileProof, PrivacyV1SourceValidationError,
+    ValidatedPrivacyV1ReadOnlySession, ValidatedPrivacyV1Source, PRIVACY_V1_SCHEMA_PROVENANCE,
+    PRIVACY_V1_SCHEMA_VERSION,
 };
 pub use project_case_binding::{
     BindingCreationSource, BindingLifecycleContext, PrivacyCaseId, ProjectId,
