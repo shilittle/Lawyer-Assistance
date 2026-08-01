@@ -8,7 +8,7 @@
 - approved workspace/work-product store：只保存不可变已批准 generation、最小公开元数据和脱敏成果。work product 每个版本的 exact file set 是 `content.envelope.json`、签名 `manifest.json` 与 `commit.json`；正文使用 fresh AES-256-GCM key/nonce 加密，数据 key 由 DPAPI CurrentUser 包装。只允许 scoped `WorkProductService` 在 manifest/commit/hash/source/revocation/filesystem/residual 全部通过后鉴权解密；MCP 不取得 Vault、mapping、root 或通用解密能力，旧明文 `content.bin` fail closed。撤销会阻断后续 list/read/update/export。
 - 票据/session 状态：实验 `redacted_case` 第六项仍要求其独立票据，但 App 不签发该 legacy purpose。`approved_case_workspace` 使用 App 生产签发的 DPAPI-protected descriptor、Credential Manager session secret、持久化单次 ticket consumption 和 revocation state；密钥不存明文数据库，缺任一条件都拒绝。
 
-当前 schema 兼容值为：法律归档 `4`，法律运行时 `1`（存在该元数据时），用户库 `10`，MCP 服务 schema `1`。
+当前 schema 兼容值为：法律归档 `4`，法律运行时 `1`（存在该元数据时），用户库 `11`，MCP 服务 schema `1`。
 
 ## 启动与迁移
 

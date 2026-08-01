@@ -8,7 +8,7 @@
 | 服务 schema | `1` | `unsupported_schema_version` |
 | 法律归档 schema | `4` | 拒绝不兼容法律库 |
 | 法律运行时 schema | `1`（存在该元数据时） | 拒绝不兼容法律库 |
-| 用户库 schema | `10` | 新版本拒绝降级打开；旧版本只走显式迁移 |
+| 用户库 schema | `11` | 新版本拒绝降级打开；旧版本只走显式迁移 |
 | 默认生产 profile | `public_law_only` | 非精确匹配停止默认部署 |
 | 默认生产工具数 | `5` | CI、配置验证和宿主验收失败 |
 | 实验 profile | `redacted_case`，工具数 `6` | App 无正向票据签发，生产不可用 |

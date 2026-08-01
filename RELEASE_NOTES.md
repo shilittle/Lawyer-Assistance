@@ -60,7 +60,7 @@ All images below were captured on 2026-08-01 from production UI components with 
 | Public service schema | `1` |
 | Legal archive schema | `4` |
 | Legal runtime schema | `1` when present |
-| User database schema | `10` |
+| User database schema | `11` |
 | Default profile | `public_law_only` |
 | Default tools | 5 read-only public-law tools |
 | Experimental profile | `redacted_case`: public five plus receipt-gated `citation_validate`; it remains separate from approved workspace sessions |
