@@ -934,3 +934,11 @@ WHERE r.material_id <> s.material_id
 - 迁移具备可重入 ledger、分阶段读兼容、fail-closed 边界和完整备份回滚；
 - 首次迁移不删除任何源数据库行、Vault object、attachment blob 或外部文件；
 - 只有用户显式选择且运行时重新验证通过的 approved generation 才能进入案件助手。
+
+## 12. v0.3.1 发布升级补充
+
+真实 v0.3.1 user schema 10、Privacy schema 1、其余三个目标组件不存在时，必须先建立认证的
+原态五槽回滚点；随后 Privacy 1→5、身份绑定、材料 backfill 和 projection 5→6 全程把
+`user.sqlite` 作为 exact v10 只读源，最后才在独立事务中迁移 user 10→11。详细的唯一顺序、
+中断恢复、`apply-and-exit`、旧二进制重开与发布门禁见
+[`2026-08-01-v0.4.0-upgrade-release-and-publication.md`](2026-08-01-v0.4.0-upgrade-release-and-publication.md)。
