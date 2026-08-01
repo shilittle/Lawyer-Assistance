@@ -39,7 +39,7 @@
 | Approved Provider 正向链 | `E2E_COMPLETE` | 最终合并后复跑 loopback wire 与 network-zero negatives |
 | PDF/DOCX/TXT/Markdown 安全派生、encrypted work products、mapping、lifecycle、five-component backup V3 | `CODE_COMPLETE` | 最终构建 App 的选择器、暂存、重启、五组件重开与回滚验收；V2 三组件只读/恢复兼容，V1 fail closed |
 | WorkBuddy/Codex/OpenCode approved assets | `CODE_COMPLETE` | validator 复跑；闭源宿主 UI/账号只作为独立环境资格 |
-| Windows/GitHub release | `PENDING_FINAL_ACCEPTANCE` | unsigned artifacts、安装/启动 smoke、最终 commit/tag/release；updater key/password 可用，最终 updater artifacts 等待精确 signed installer，唯一已知外部凭据阻断是 Authenticode certificate |
+| Windows/GitHub release | `PENDING_FINAL_ACCEPTANCE` | unsigned artifacts、安装/启动 smoke、最终 commit/tag/release；当前发布机缺少 Authenticode certificate/private key 与 updater key/password，最终 updater artifacts 还必须绑定精确 signed installer |
 
 这些状态不能替代下表的资格证据；缺少 exact 环境证据时，生产后端仍 fail closed。
 ## 3. 资格矩阵
