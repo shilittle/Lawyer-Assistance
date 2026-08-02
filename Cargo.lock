@@ -2690,6 +2690,7 @@ dependencies = [
  "reqwest 0.12.28",
  "retrieval",
  "rusqlite",
+ "rustls",
  "semver 1.0.28",
  "serde",
  "serde_json",

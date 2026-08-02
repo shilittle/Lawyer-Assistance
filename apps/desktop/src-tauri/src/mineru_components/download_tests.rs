@@ -1,151 +1,145 @@
 use super::{catalog, package};
 use reqwest::{redirect, Certificate, Client, Url};
+use rustls::{
+    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    ServerConfig, ServerConnection, StreamOwned,
+};
 use std::{
     fs,
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
-const LOCAL_HTTPS_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const LOCAL_HTTPS_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
-const LOCAL_HTTPS_SERVER: &str = r#"
-import http.server
-import pathlib
-import ssl
-import sys
-
-certificate, key, body_file, port_file = sys.argv[1:5]
-body = pathlib.Path(body_file).read_bytes()
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/component.laocrpkg":
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, _format, *args):
-        pass
-
-server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-context.load_cert_chain(certificate, key)
-server.socket = context.wrap_socket(server.socket, server_side=True)
-pathlib.Path(port_file).write_text(str(server.server_address[1]), encoding="ascii")
-server.handle_request()
-server.server_close()
-"#;
-
-struct ChildGuard {
-    child: Option<Child>,
-}
-
-impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
-        self.child
-            .as_mut()
-            .expect("local HTTPS child is owned")
-            .try_wait()
-            .unwrap_or_else(|_| panic!("local HTTPS fixture status could not be observed"))
-    }
-
-    fn into_child(mut self) -> Child {
-        self.child.take().expect("local HTTPS child is owned")
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-    }
-}
+const LOCAL_HTTPS_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const LOCAL_HTTPS_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LOCAL_HTTPS_REQUEST_BYTES: usize = 16 * 1024;
 
 struct LocalHttpsServer {
-    child: Child,
+    worker: Option<JoinHandle<Result<(), String>>>,
+    stop: Arc<AtomicBool>,
     certificate_pem: Vec<u8>,
     url: Url,
 }
 
-impl Drop for LocalHttpsServer {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+impl LocalHttpsServer {
+    fn finish(mut self) -> Result<(), String> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.worker
+            .take()
+            .expect("local HTTPS worker is owned")
+            .join()
+            .map_err(|_| "local HTTPS worker panicked".to_owned())?
     }
 }
 
-fn spawn_local_https_once(root: &Path, body: &[u8]) -> LocalHttpsServer {
-    fs::create_dir(root).unwrap();
-    let certificate = root.join("certificate.pem");
-    let key = root.join("key.pem");
-    let body_file = root.join("component.laocrpkg");
-    let port_file = root.join("port.txt");
-    fs::write(&body_file, body).unwrap();
+impl Drop for LocalHttpsServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
+fn spawn_local_https_once(body: &[u8]) -> LocalHttpsServer {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()])
             .expect("generate the ephemeral local HTTPS certificate");
-    fs::write(&certificate, cert.pem()).expect("write the local HTTPS certificate");
-    fs::write(&key, signing_key.serialize_pem()).expect("write the local HTTPS private key");
-    let certificate_pem =
-        fs::read(&certificate).expect("read the local HTTPS certificate for pinning");
-
-    let mut child = ChildGuard::new(
-        Command::new("python")
-            .arg("-c")
-            .arg(LOCAL_HTTPS_SERVER)
-            .arg(&certificate)
-            .arg(&key)
-            .arg(&body_file)
-            .arg(&port_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Python must be available for the real local HTTPS test"),
-    );
-
-    let ready_deadline = Instant::now() + LOCAL_HTTPS_READY_TIMEOUT;
-    let port = loop {
-        if let Ok(value) = fs::read_to_string(&port_file) {
-            if let Ok(parsed) = value.trim().parse::<u16>() {
-                break parsed;
-            }
-        }
-        if let Some(status) = child.try_wait() {
-            panic!("local HTTPS fixture exited before readiness: {status}");
-        }
-        assert!(
-            Instant::now() < ready_deadline,
-            "local HTTPS fixture did not become ready within 30 seconds"
-        );
-        thread::sleep(LOCAL_HTTPS_READY_POLL_INTERVAL);
-    };
+    let certificate_pem = cert.pem().into_bytes();
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], private_key)
+        .expect("ephemeral local HTTPS certificate and key match");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local HTTPS fixture");
+    let port = listener
+        .local_addr()
+        .expect("read local HTTPS fixture address")
+        .port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_worker = Arc::clone(&stop);
+    let body = body.to_vec();
+    let worker = thread::spawn(move || {
+        serve_local_https_once(listener, Arc::new(server_config), body, stop_for_worker)
+    });
 
     LocalHttpsServer {
-        child: child.into_child(),
+        worker: Some(worker),
+        stop,
         certificate_pem,
         url: Url::parse(&format!("https://127.0.0.1:{port}/component.laocrpkg")).unwrap(),
     }
+}
+
+fn serve_local_https_once(
+    listener: TcpListener,
+    server_config: Arc<ServerConfig>,
+    body: Vec<u8>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("local HTTPS listener nonblocking mode failed: {error}"))?;
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                thread::sleep(LOCAL_HTTPS_ACCEPT_POLL_INTERVAL);
+            }
+            Err(error) => return Err(format!("local HTTPS accept failed: {error}")),
+        }
+    };
+    configure_local_https_stream(&stream)?;
+    let connection = ServerConnection::new(server_config)
+        .map_err(|error| format!("local HTTPS TLS state failed: {error}"))?;
+    let mut tls = StreamOwned::new(connection, stream);
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        if request.len() >= MAX_LOCAL_HTTPS_REQUEST_BYTES {
+            return Err("local HTTPS request exceeded the fixed bound".to_owned());
+        }
+        let read = tls
+            .read(&mut buffer)
+            .map_err(|error| format!("local HTTPS request read failed: {error}"))?;
+        if read == 0 {
+            return Err("local HTTPS request ended before its headers".to_owned());
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.len() > MAX_LOCAL_HTTPS_REQUEST_BYTES {
+            return Err("local HTTPS request exceeded the fixed bound".to_owned());
+        }
+    }
+    if !request.starts_with(b"GET /component.laocrpkg HTTP/1.1\r\n") {
+        return Err("local HTTPS request path or method differed".to_owned());
+    }
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    tls.write_all(response.as_bytes())
+        .and_then(|()| tls.write_all(&body))
+        .and_then(|()| tls.flush())
+        .map_err(|error| format!("local HTTPS response write failed: {error}"))
+}
+
+fn configure_local_https_stream(stream: &TcpStream) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(Some(LOCAL_HTTPS_SOCKET_TIMEOUT)))
+        .and_then(|()| stream.set_write_timeout(Some(LOCAL_HTTPS_SOCKET_TIMEOUT)))
+        .and_then(|()| stream.set_nodelay(true))
+        .map_err(|error| format!("local HTTPS socket configuration failed: {error}"))
 }
 
 fn pinned_local_client(certificate_pem: &[u8]) -> Client {
@@ -166,11 +160,11 @@ async fn real_local_https_download_streams_exact_bytes_and_cleans_integrity_fail
     let body = vec![0x5a; 2 * 1024 * 1024 + 17];
     let expected_hash = package::sha256_bytes(&body);
 
-    let success_server = spawn_local_https_once(&temporary.path().join("success-server"), &body);
+    let success_server = spawn_local_https_once(&body);
     let success_directory = temporary.path().join("success-download");
     fs::create_dir(&success_directory).unwrap();
     let success_destination = success_directory.join("component.laocrpkg");
-    catalog::download_exact(
+    let success = catalog::download_exact(
         &pinned_local_client(&success_server.certificate_pem),
         success_server.url.clone(),
         &success_destination,
@@ -178,12 +172,15 @@ async fn real_local_https_download_streams_exact_bytes_and_cleans_integrity_fail
         &expected_hash,
         false,
     )
-    .await
-    .unwrap();
+    .await;
+    let success_server_result = success_server.finish();
+    assert!(
+        success.is_ok() && success_server_result.is_ok(),
+        "local HTTPS success path failed: client={success:?}, server={success_server_result:?}"
+    );
     assert_eq!(fs::read(&success_destination).unwrap(), body);
-    drop(success_server);
 
-    let failure_server = spawn_local_https_once(&temporary.path().join("failure-server"), &body);
+    let failure_server = spawn_local_https_once(&body);
     let failure_directory = temporary.path().join("failure-download");
     fs::create_dir(&failure_directory).unwrap();
     let failure_destination = failure_directory.join("component.laocrpkg");
@@ -198,6 +195,9 @@ async fn real_local_https_download_streams_exact_bytes_and_cleans_integrity_fail
     .await
     .unwrap_err();
     assert_eq!(failure.code(), "download_integrity_mismatch");
+    failure_server
+        .finish()
+        .expect("integrity-failure server serves the exact bytes");
     package::cleanup_exact_transient(&failure_directory, &[PathBuf::from(&failure_destination)])
         .unwrap();
     assert!(!failure_directory.exists());
