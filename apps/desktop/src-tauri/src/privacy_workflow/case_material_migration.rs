@@ -10,10 +10,28 @@ use super::{
     PrivacyWorkflowManager, StoredReviewPayload, APPROVED_PAYLOAD_SCHEMA_VERSION,
     REVIEW_PAYLOAD_SCHEMA_VERSION,
 };
+use crate::{
+    commands::{
+        original_migration_backup::OriginalRollbackVerifiedGate,
+        v031_migration_checkpoint::{
+            V031CheckpointCandidateEvidence, V031MigrationCheckpointProof,
+        },
+        v031_target_components::V031TargetComponentsPreparedGate,
+    },
+    v031_upgrade_r2::V031CheckpointKind,
+};
+use database::{
+    UserMigrationSourceProof, ValidatedUserMigrationSourceSession, ValidatedUserSourceSchema,
+};
 use privacy::{
-    protect_local, sha256_hex, unprotect_local, BindingCreationSource, BindingLifecycleContext,
-    PrivacyCaseId, PrivacyLifecycle, PrivacyStore, PrivacyStoreSchemaStatus, ProjectId,
-    ProjectPrivacyCaseBindingError, ProjectPrivacyCaseBindingStore, LOCAL_PROTECTION_SCHEME,
+    classify_privacy_v5_partial_in_transaction, classify_privacy_v5_partial_read_only,
+    compute_privacy_v5_manifests_read_only, protect_local, sha256_hex, unprotect_local,
+    verify_initial_privacy_v5_before_receipt4_read_only,
+    with_validated_privacy_v1_migration_source_read_only, BindingCreationSource,
+    BindingLifecycleContext, PrivacyCaseId, PrivacyLifecycle, PrivacyStore,
+    PrivacyStoreSchemaStatus, PrivacyV5InitialFullExpectation, PrivacyV5ManifestProof,
+    PrivacyV5PartialProof, PrivacyV5PartialStage, ProjectId, ProjectPrivacyCaseBindingError,
+    ProjectPrivacyCaseBindingStore, ValidatedPrivacyV1Source, LOCAL_PROTECTION_SCHEME,
 };
 use rusqlite::{
     params, types::ValueRef, Connection, OpenFlags, OptionalExtension, Transaction,
@@ -23,8 +41,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     fs::File,
-    io::Read,
+    io::{Cursor, Read},
     path::Path,
 };
 use uuid::Uuid;
@@ -39,6 +58,13 @@ const FINGERPRINT_DOMAIN: &[u8] = b"case-material-source-fingerprint-v1\0";
 const RISK_REVISION_PROFILE: &str = "privacy-risk-review-revision-v1";
 const MAX_SOURCE_ID_BYTES: usize = 256;
 const CASE_MATERIAL_TARGET_SCHEMA_VERSION: i64 = 5;
+const CASE_MATERIAL_SOURCE_SCHEMA_CONTRACT: &str = concat!(
+    "case-material-read-contract-v1\0",
+    "projects(project_id,title,case_type,status,opened_on,summary,created_at,updated_at)\0",
+    "case_files(file_id,project_id,title,file_type,storage_reference,summary,created_at)\0",
+    "attachments(attachment_id,project_id,original_name,extension,detected_mime,sha256,",
+    "size_bytes,extraction_status,extracted_text,segments_json,error_code,created_at)"
+);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CaseMaterialMigrationReport {
@@ -52,9 +78,202 @@ pub(crate) struct CaseMaterialMigrationReport {
     pub source_unchanged_verified: bool,
 }
 
+/// Opaque, gate-bound source identity for the frozen v0.3.1 Step-5 writer.
+/// Callers can persist the path-free hash but cannot construct a token from a
+/// raw string or use it with the ordinary current-schema migration API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V031CaseMaterialSourceFingerprint {
+    evidence_sha256: String,
+    migration_source_fingerprint: String,
+}
+
+impl V031CaseMaterialSourceFingerprint {
+    pub(crate) fn evidence_sha256(&self) -> &str {
+        &self.evidence_sha256
+    }
+}
+
+/// Opaque Step-4 source/candidate proof captured before the live Privacy-v1
+/// source is upgraded.  It deliberately exposes only path-free hashes and
+/// counts: project identifiers, historical Privacy CaseIds, and the outcome
+/// attached to an individual project never cross this capability boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct V031CaseMigrationCheckpointSourceProof {
+    evidence_sha256: String,
+    source_fingerprint: String,
+    binding_candidate_manifest_sha256: String,
+    binding_candidate_count: u64,
+    material_candidate_manifest_sha256: String,
+    material_candidate_count: u64,
+    original_user_physical_file_set_sha256: String,
+    original_privacy_physical_file_set_sha256: String,
+    privacy_v1_logical_manifest_sha256: String,
+    privacy_v1_business_manifest_sha256: String,
+    privacy_v1_total_rows: u64,
+    target_gate_manifest_sha256: String,
+}
+
+impl fmt::Debug for V031CaseMigrationCheckpointSourceProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("V031CaseMigrationCheckpointSourceProof")
+            .field("evidence_sha256", &self.evidence_sha256)
+            .field("source_fingerprint", &self.source_fingerprint)
+            .field(
+                "binding_candidate_manifest_sha256",
+                &self.binding_candidate_manifest_sha256,
+            )
+            .field("binding_candidate_count", &self.binding_candidate_count)
+            .field(
+                "material_candidate_manifest_sha256",
+                &self.material_candidate_manifest_sha256,
+            )
+            .field("material_candidate_count", &self.material_candidate_count)
+            .field(
+                "original_user_physical_file_set_sha256",
+                &self.original_user_physical_file_set_sha256,
+            )
+            .field(
+                "original_privacy_physical_file_set_sha256",
+                &self.original_privacy_physical_file_set_sha256,
+            )
+            .field(
+                "target_gate_manifest_sha256",
+                &self.target_gate_manifest_sha256,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl V031CaseMigrationCheckpointSourceProof {
+    pub(crate) fn evidence_sha256(&self) -> &str {
+        &self.evidence_sha256
+    }
+
+    pub(crate) fn source_fingerprint(&self) -> &str {
+        &self.source_fingerprint
+    }
+
+    pub(crate) fn binding_checkpoint_candidate_evidence(&self) -> V031CheckpointCandidateEvidence {
+        V031CheckpointCandidateEvidence {
+            source_fingerprint: self.source_fingerprint.clone(),
+            candidate_manifest_sha256: self.binding_candidate_manifest_sha256.clone(),
+            candidate_count: self.binding_candidate_count,
+        }
+    }
+
+    pub(crate) fn material_checkpoint_candidate_evidence(&self) -> V031CheckpointCandidateEvidence {
+        V031CheckpointCandidateEvidence {
+            source_fingerprint: self.source_fingerprint.clone(),
+            candidate_manifest_sha256: self.material_candidate_manifest_sha256.clone(),
+            candidate_count: self.material_candidate_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V031CandidateManifests {
+    binding_manifest_sha256: String,
+    binding_count: u64,
+    material_manifest_sha256: String,
+    material_count: u64,
+}
+
+/// Private authorization consumed only after an IMMEDIATE Privacy-v5
+/// transaction has recomputed both frozen candidate sets.  Keeping this type
+/// private prevents the ordinary current-schema migration entry point from
+/// being used as a Step-5 writer capability.
+struct V031BindingMaterialWriterGate {
+    source: V031CaseMaterialSourceFingerprint,
+    candidates: V031CandidateManifests,
+    binding_checkpoint_identity_sha256: String,
+    material_checkpoint_identity_sha256: String,
+}
+
+/// Opaque, one-use authorization for resuming one of the two exact durable
+/// pre-binding v5 prefixes.  It is constructed only after both authenticated
+/// Step-4 checkpoints, the target workspace gate, the frozen User-v10 source,
+/// and the complete partial-store proof agree.  The writer reclassifies the
+/// live store and compares this value immediately before its first mutation.
+#[derive(Clone, PartialEq, Eq)]
+struct V031PrivacyV5PartialResumeCapability {
+    checkpoint_source_evidence_sha256: String,
+    workspace_instance_id: String,
+    partial: PrivacyV5PartialProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V031BindingMaterialTerminalProof {
+    source_evidence_sha256: String,
+    privacy_v5: PrivacyV5ManifestProof,
+    binding_ledger_rows: u64,
+    material_ledger_rows: u64,
+    terminal_rows: u64,
+    blocked_rows: u64,
+    privacy_migration_batches: u64,
+    bindings_verified: u64,
+    terminal_manifest_sha256: String,
+}
+
+impl V031BindingMaterialTerminalProof {
+    pub(crate) fn source_evidence_sha256(&self) -> &str {
+        &self.source_evidence_sha256
+    }
+
+    pub(crate) fn privacy_v5(&self) -> &PrivacyV5ManifestProof {
+        &self.privacy_v5
+    }
+
+    pub(crate) const fn binding_ledger_rows(&self) -> u64 {
+        self.binding_ledger_rows
+    }
+
+    pub(crate) const fn material_ledger_rows(&self) -> u64 {
+        self.material_ledger_rows
+    }
+
+    pub(crate) const fn terminal_rows(&self) -> u64 {
+        self.terminal_rows
+    }
+
+    pub(crate) const fn blocked_rows(&self) -> u64 {
+        self.blocked_rows
+    }
+
+    pub(crate) const fn privacy_migration_batches(&self) -> u64 {
+        self.privacy_migration_batches
+    }
+
+    pub(crate) const fn bindings_verified(&self) -> u64 {
+        self.bindings_verified
+    }
+
+    pub(crate) fn terminal_manifest_sha256(&self) -> &str {
+        &self.terminal_manifest_sha256
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_projection_test(privacy_v5: PrivacyV5ManifestProof) -> Self {
+        Self {
+            source_evidence_sha256: "8".repeat(64),
+            privacy_v5,
+            binding_ledger_rows: 1,
+            material_ledger_rows: 1,
+            terminal_rows: 1,
+            blocked_rows: 0,
+            privacy_migration_batches: 1,
+            bindings_verified: 1,
+            terminal_manifest_sha256: "9".repeat(64),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceProof {
     file_sha256: String,
+    // Capture first validates the exact whole-database v10 or v11 profile.
+    // Those two allowlisted profiles then map to the same frozen `UserSnapshot`
+    // read contract so the canonical rebuild after Step 5 is restart-stable.
     schema_manifest_sha256: String,
     project_primary_keys_sha256: String,
     case_file_primary_keys_sha256: String,
@@ -62,6 +281,34 @@ struct SourceProof {
     source_rows_sha256: String,
     wal_file_sha256: Option<String>,
     data_version: i64,
+}
+
+struct V031UserCheckpointImageExpectations<'a> {
+    database_sha256: &'a str,
+    schema_manifest_sha256: &'a str,
+    logical_manifest_sha256: &'a str,
+    business_manifest_sha256: &'a str,
+    total_rows: u64,
+    rollback_semantic_proof: &'a UserMigrationSourceProof,
+}
+
+/// Private capability returned only when one self-contained checkpoint image
+/// has passed the byte-level exact-v10 validator and all checkpoint/rollback
+/// semantic bindings. Raw hashes and arbitrary in-memory connections cannot
+/// construct this authorization.
+struct VerifiedV031UserCheckpointImage {
+    connection: Connection,
+    proof: UserMigrationSourceProof,
+}
+
+impl VerifiedV031UserCheckpointImage {
+    fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    fn capture_source_proof(&self) -> Result<SourceProof, PrivacyWorkflowError> {
+        SourceProof::capture_verified_image(self)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +474,14 @@ struct LedgerEntry {
     result_state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalLedgerKey {
+    migration_id: String,
+    source_store: String,
+    source_table: String,
+    source_key: String,
+}
+
 struct BindingCandidateGraph {
     projects_by_case: BTreeMap<String, BTreeSet<String>>,
     cases_by_project: BTreeMap<String, BTreeSet<String>>,
@@ -238,6 +493,21 @@ enum LedgerWrite {
     Inserted,
     EventAppended,
     Noop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackfillFailurePoint {
+    BeforeTransaction,
+    AfterProjectBindings,
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V031PrivacyV5UpgradeFailurePoint {
+    AfterSchemaCommitBeforeLifecycleInitialize,
+    AfterLifecycleCommitBeforeBindingInitialize,
 }
 
 #[derive(Debug)]
@@ -265,6 +535,38 @@ struct CanonicalApprovedPage<'a> {
 }
 
 impl PrivacyWorkflowManager {
+    /// Revalidates the complete active user-v10 source proof against the
+    /// authenticated Original rollback gate without opening a writable user
+    /// handle. Later coordinated stages call this immediately around every
+    /// independently committed target batch.
+    pub(super) fn revalidate_v031_user_source_read_only(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+    ) -> Result<(), PrivacyWorkflowError> {
+        super::validate_ordinary_database_file(&self.shared.user_database_path)?;
+        let expected = gate.original_user_source_proof();
+        let (post_source, nested) =
+            database::with_validated_user_database_migration_source_read_only(
+                &self.shared.user_database_path,
+                |source_session| {
+                    if gate.authenticates_user_physical_file_set(source_session.proof())
+                        && same_v031_user_source_content(expected, source_session.proof())
+                    {
+                        Ok(())
+                    } else {
+                        Err(v031_user_source_gate_error())
+                    }
+                },
+            )
+            .map_err(|_| v031_user_source_gate_error())?;
+        if !gate.authenticates_user_physical_file_set(&post_source)
+            || !same_v031_user_source_content(expected, &post_source)
+        {
+            return Err(v031_user_source_gate_error());
+        }
+        nested
+    }
+
     /// Strictly read-only startup probe. It returns `false` only when the
     /// persisted source manifest, all source-row fingerprints, terminal ledger
     /// targets, and project/case bindings still satisfy the migration contract.
@@ -278,68 +580,7 @@ impl PrivacyWorkflowManager {
         user.execute_batch("BEGIN DEFERRED TRANSACTION")
             .map_err(|_| source_snapshot_error())?;
         let before = SourceProof::capture(&self.shared.user_database_path, &user)?;
-        let result = (|| {
-            let snapshot = UserSnapshot::load(&user)?;
-            preflight_vault_state(self)?;
-            let schema_status = self.preflight_privacy_store_schema_read_only()?;
-            if schema_status == PrivacyStoreSchemaStatus::Empty {
-                preflight_empty_privacy_vault_inventory(self)?;
-                return Ok(true);
-            }
-            let privacy = open_privacy_read_only(&self.shared.database_path)?;
-            if !self.startup_vault_present() {
-                preflight_missing_vault_privacy_identity(&privacy)?;
-            }
-            if let PrivacyStoreSchemaStatus::UpgradeRequired { found_version } = schema_status {
-                if found_version != CASE_MATERIAL_TARGET_SCHEMA_VERSION {
-                    preflight_privacy_integrity_and_cleanup(&privacy)?;
-                    return Ok(true);
-                }
-            }
-            preflight_privacy_store(&privacy)?;
-            if self.vault_startup_write_required() {
-                return Ok(true);
-            }
-            if !source_manifest_terminal_matches(&privacy, &before.persistent_fingerprint())? {
-                return Ok(true);
-            }
-
-            let cleanup = load_cleanup_authorization_snapshot(self, &privacy)?;
-            let plans = load_migration_plans(self, &privacy, &snapshot, &cleanup)?;
-            let graph = binding_candidate_graph(&snapshot, &plans);
-            for plan in &plans {
-                if !privacy_plan_terminal_matches(
-                    &privacy,
-                    &snapshot,
-                    plan,
-                    &graph.blocked_projects,
-                )? {
-                    return Ok(true);
-                }
-            }
-            for case_file in &snapshot.case_files {
-                if !case_file_terminal_matches(
-                    self,
-                    &privacy,
-                    &snapshot,
-                    self.shared.workspace_instance_id.as_str(),
-                    case_file,
-                )? {
-                    return Ok(true);
-                }
-            }
-            for source in snapshot.projects.values() {
-                if !project_binding_terminal_matches(
-                    &privacy,
-                    source,
-                    graph.cases_by_project.get(source.project_id.as_str()),
-                )? {
-                    return Ok(true);
-                }
-            }
-            validate_target_invariants(&privacy, &snapshot, &cleanup)?;
-            Ok(false)
-        })();
+        let result = case_material_migration_required_for_pinned_user(self, &user, &before);
         let after = SourceProof::capture(&self.shared.user_database_path, &user);
         let _ = user.execute_batch("ROLLBACK");
         match (result, after) {
@@ -473,19 +714,1937 @@ impl PrivacyWorkflowManager {
         let _ = user.execute_batch("ROLLBACK");
         result
     }
+
+    /// Captures the frozen Step-4 source and both candidate sets while the live
+    /// User-v10 and Privacy-v1 sources are simultaneously pinned read-only.
+    /// Privacy-v1 is upgraded only inside a private SQLite Backup-API copy so
+    /// the exact Step-5 planner can be reused without touching the live source.
+    pub(crate) fn v031_case_migration_checkpoint_source_proof(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+    ) -> Result<V031CaseMigrationCheckpointSourceProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        validate_v031_target_components_gate(self, gate, target_gate)?;
+        with_v031_pinned_user_snapshot(self, gate, |user, _snapshot_path, source| {
+            compute_v031_pre_v5_checkpoint_source_proof(self, gate, target_gate, user, source)
+        })
+    }
+
+    /// Reconstructs the non-secret Step-4 proof after a process restart from
+    /// two already authenticated checkpoint proofs.  This never inspects a
+    /// post-upgrade Privacy-v5 store as if it were the original v1 source.
+    pub(crate) fn v031_case_migration_checkpoint_source_proof_from_verified_checkpoints(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<V031CaseMigrationCheckpointSourceProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        validate_v031_target_components_gate(self, gate, target_gate)?;
+        reconstruct_v031_step4_source_proof_from_authenticated_checkpoints_read_only(
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+        )
+    }
+
+    /// Executes the frozen Privacy v1->v5 transition only after the two Step-4
+    /// checkpoints have authenticated the exact pre-v5 proof.  On the initial
+    /// path the simultaneous live sources are recomputed immediately before
+    /// the schema write; schema-v5 is accepted only as an idempotent restart.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        source_proof: &V031CaseMigrationCheckpointSourceProof,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        self.upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints_inner(
+            gate,
+            target_gate,
+            source_proof,
+            binding_checkpoint,
+            material_checkpoint,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints_with_failure(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        source_proof: &V031CaseMigrationCheckpointSourceProof,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+        failure_point: V031PrivacyV5UpgradeFailurePoint,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        self.upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints_inner(
+            gate,
+            target_gate,
+            source_proof,
+            binding_checkpoint,
+            material_checkpoint,
+            Some(failure_point),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_schema_for_test(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        source_proof: &V031CaseMigrationCheckpointSourceProof,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        self.upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints_with_failure(
+            gate,
+            target_gate,
+            source_proof,
+            binding_checkpoint,
+            material_checkpoint,
+            V031PrivacyV5UpgradeFailurePoint::AfterSchemaCommitBeforeLifecycleInitialize,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_lifecycle_for_test(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        source_proof: &V031CaseMigrationCheckpointSourceProof,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        self.upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints_with_failure(
+            gate,
+            target_gate,
+            source_proof,
+            binding_checkpoint,
+            material_checkpoint,
+            V031PrivacyV5UpgradeFailurePoint::AfterLifecycleCommitBeforeBindingInitialize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints_inner(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        source_proof: &V031CaseMigrationCheckpointSourceProof,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+        #[cfg(test)] failure_point: Option<V031PrivacyV5UpgradeFailurePoint>,
+        #[cfg(not(test))] _failure_point: Option<()>,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        let reconstructed = reconstruct_v031_step4_source_proof_from_checkpoints(
+            self,
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+        )?;
+        if &reconstructed != source_proof {
+            return Err(v031_checkpoint_source_proof_error());
+        }
+
+        match self.preflight_privacy_store_schema_read_only()? {
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 1 } => {
+                with_v031_pinned_user_snapshot(self, gate, |user, _snapshot_path, source| {
+                    let live = compute_v031_pre_v5_checkpoint_source_proof(
+                        self,
+                        gate,
+                        target_gate,
+                        user,
+                        source,
+                    )?;
+                    if &live != source_proof {
+                        return Err(v031_checkpoint_source_proof_error());
+                    }
+                    upgrade_and_initialize_v031_privacy_v5(
+                        self,
+                        gate,
+                        source_proof,
+                        #[cfg(test)]
+                        failure_point,
+                        #[cfg(not(test))]
+                        None,
+                    )
+                })
+            }
+            PrivacyStoreSchemaStatus::Empty
+            | PrivacyStoreSchemaStatus::Current
+            | PrivacyStoreSchemaStatus::UpgradeRequired { .. } => {
+                Err(v031_privacy_v5_proof_error())
+            }
+        }
+    }
+
+    /// Resumes only a strictly classified pre-binding schema-5 prefix.  The
+    /// opaque capability is created and consumed inside this manager gate, so
+    /// callers cannot authorize a raw schema-version-5 store or replay a proof
+    /// across a workspace/checkpoint identity.
+    pub(crate) fn resume_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        source_proof: &V031CaseMigrationCheckpointSourceProof,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        self.resume_v031_privacy_store_to_v5_after_binding_material_checkpoints_inner(
+            gate,
+            target_gate,
+            source_proof,
+            binding_checkpoint,
+            material_checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_v031_privacy_store_to_v5_after_binding_material_checkpoints_inner(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        source_proof: &V031CaseMigrationCheckpointSourceProof,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        let capability = authorize_v031_privacy_v5_partial_resume(
+            self,
+            gate,
+            target_gate,
+            source_proof,
+            binding_checkpoint,
+            material_checkpoint,
+        )?;
+        resume_and_initialize_v031_privacy_v5(self, &capability, |_| Ok(()))
+    }
+
+    /// Executes only the frozen schema-1 to schema-5 portion of the Privacy
+    /// upgrade while the exact v0.3.1 user source remains pinned and read-only.
+    /// This compatibility helper is test-only; production Step 5 must present
+    /// both authenticated Step-4 checkpoints through the method above.
+    #[cfg(test)]
+    pub(crate) fn upgrade_v031_privacy_store_to_v5_after_original_rollback(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        with_v031_pinned_user_snapshot(self, gate, |_user, _path, _proof| {
+            let mut privacy = self.open_raw_connection()?;
+            PrivacyStore::upgrade_exact_v031_schema_to_v5_after_backup(&privacy)
+                .map_err(PrivacyWorkflowError::store)?;
+            PrivacyLifecycle::initialize(
+                &mut privacy,
+                self.shared.workspace_instance_id.clone(),
+                self.current_unix()?,
+            )
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+            ProjectPrivacyCaseBindingStore::initialize(&mut privacy)
+                .map_err(PrivacyWorkflowError::project_case_binding)?;
+            compute_privacy_v5_manifests_read_only(&privacy)
+                .map_err(|_| v031_privacy_v5_proof_error())
+        })
+    }
+
+    /// Strict Step-5 probe. The active user database is validated and pinned by
+    /// the database crate, copied with SQLite Backup API to a private snapshot,
+    /// and never opened through a writable handle.
+    #[cfg(test)]
+    pub(crate) fn v031_case_material_migration_required(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+    ) -> Result<bool, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        with_v031_pinned_user_snapshot(self, gate, |user, _path, source| {
+            require_exact_privacy_v5(self)?;
+            case_material_migration_required_for_pinned_user(self, user, source)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v031_case_material_migration_source_fingerprint(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+    ) -> Result<V031CaseMaterialSourceFingerprint, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        with_v031_pinned_user_snapshot(self, gate, |_user, _path, source| {
+            require_exact_privacy_v5(self)?;
+            Ok(v031_source_fingerprint(
+                gate,
+                gate.original_user_source_proof(),
+                source,
+            ))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_v031_case_material_migration_after_backup_for_source(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        expected: &V031CaseMaterialSourceFingerprint,
+    ) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
+        self.run_v031_case_material_migration_inner(gate, expected)
+    }
+
+    #[cfg(test)]
+    fn run_v031_case_material_migration_inner(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        expected: &V031CaseMaterialSourceFingerprint,
+    ) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        with_v031_pinned_user_snapshot(self, gate, |user, snapshot_path, source| {
+            require_exact_privacy_v5(self)?;
+            let current = v031_source_fingerprint(gate, gate.original_user_source_proof(), source);
+            if &current != expected {
+                return Err(migration_error(
+                    "case_material_backup_source_mismatch",
+                    "The exact v0.3.1 migration source no longer matches the authenticated Step-5 checkpoint.",
+                ));
+            }
+            let snapshot = UserSnapshot::load(user)?;
+            let mut privacy = self.open_raw_connection()?;
+            preflight_privacy_store(&privacy)?;
+            preflight_vault_state(self)?;
+            let mut report = run_backfill_inner(
+                self,
+                &mut privacy,
+                user,
+                snapshot_path,
+                source,
+                &snapshot,
+                &self.shared.workspace_instance_id,
+                None,
+                None,
+            )?;
+            compute_privacy_v5_manifests_read_only(&privacy)
+                .map_err(|_| v031_privacy_v5_proof_error())?;
+            report.source_unchanged_verified = true;
+            Ok(report)
+        })
+    }
+
+    /// Strict Step-5 writer. Both authenticated Step-4 checkpoint proofs are
+    /// bound to the Original/target gates and the stable user source before a
+    /// writable Privacy handle is opened. Their candidate commitments are
+    /// then recomputed inside the IMMEDIATE transaction before its first row
+    /// mutation.
+    pub(crate) fn run_v031_case_material_migration_after_checkpoints(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
+        self.run_v031_case_material_migration_after_checkpoints_inner(
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+            None,
+        )
+    }
+
+    /// Test-only entry into the exact production checkpoint-gated writer. The
+    /// injected boundary is carried through the same gate reconstruction,
+    /// preflight, transaction, and committed-state path as production.
+    #[cfg(test)]
+    pub(crate) fn run_v031_case_material_migration_after_checkpoints_with_failure(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+        failure_point: BackfillFailurePoint,
+    ) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
+        self.run_v031_case_material_migration_after_checkpoints_inner(
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+            Some(failure_point),
+        )
+    }
+
+    fn run_v031_case_material_migration_after_checkpoints_inner(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+        failure_point: Option<BackfillFailurePoint>,
+    ) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        let checkpoint_source = reconstruct_v031_step4_source_proof_from_checkpoints(
+            self,
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+        )?;
+        with_v031_pinned_user_snapshot(self, gate, |user, snapshot_path, source| {
+            require_exact_privacy_v5(self)?;
+            let current = v031_source_fingerprint(gate, gate.original_user_source_proof(), source);
+            if current.evidence_sha256 != checkpoint_source.source_fingerprint {
+                return Err(v031_checkpoint_source_proof_error());
+            }
+            let writer_gate = V031BindingMaterialWriterGate {
+                source: current,
+                candidates: V031CandidateManifests {
+                    binding_manifest_sha256: checkpoint_source
+                        .binding_candidate_manifest_sha256
+                        .clone(),
+                    binding_count: checkpoint_source.binding_candidate_count,
+                    material_manifest_sha256: checkpoint_source
+                        .material_candidate_manifest_sha256
+                        .clone(),
+                    material_count: checkpoint_source.material_candidate_count,
+                },
+                binding_checkpoint_identity_sha256: binding_checkpoint
+                    .identity_protected_sha256()
+                    .to_owned(),
+                material_checkpoint_identity_sha256: material_checkpoint
+                    .identity_protected_sha256()
+                    .to_owned(),
+            };
+            let snapshot = UserSnapshot::load(user)?;
+            let privacy = open_privacy_read_only(&self.shared.database_path)?;
+            compute_privacy_v5_manifests_read_only(&privacy)
+                .map_err(|_| v031_privacy_v5_proof_error())?;
+            preflight_privacy_store(&privacy)?;
+            preflight_vault_state(self)?;
+
+            // The production seam validates the complete candidate commitment
+            // before the first Privacy IMMEDIATE transaction. The transaction
+            // repeats the same validation below to close the TOCTOU window.
+            let cleanup = load_cleanup_authorization_snapshot(self, &privacy)?;
+            let plans = load_migration_plans(self, &privacy, &snapshot, &cleanup)?;
+            let pre_transaction_source = SourceProof::capture(snapshot_path, user)?;
+            let pre_transaction_candidates = compute_v031_candidate_manifests(
+                &snapshot,
+                &pre_transaction_source,
+                &plans,
+                self.shared.workspace_instance_id.as_str(),
+            )?;
+            validate_v031_writer_gate(
+                &writer_gate,
+                &pre_transaction_source,
+                &pre_transaction_candidates,
+            )?;
+
+            // A crash immediately after commit returns here on restart. Prove
+            // terminal state from read-only handles and return without opening
+            // a writable Privacy connection or starting another transaction.
+            if !case_material_migration_required_for_validated_target(
+                self, &privacy, source, &snapshot,
+            )? {
+                let terminal = compute_v031_terminal_proof_with_privacy_connection(
+                    self,
+                    user,
+                    source,
+                    &writer_gate.source,
+                    &privacy,
+                )?;
+                let idempotent_noops = terminal
+                    .binding_ledger_rows()
+                    .checked_add(terminal.material_ledger_rows())
+                    .ok_or_else(v031_terminal_proof_error)?;
+                return Ok(CaseMaterialMigrationReport {
+                    idempotent_noops,
+                    source_unchanged_verified: true,
+                    ..CaseMaterialMigrationReport::default()
+                });
+            }
+
+            inject_backfill_failure(failure_point, BackfillFailurePoint::BeforeTransaction)?;
+            drop(privacy);
+
+            let mut privacy = self.open_raw_connection()?;
+            compute_privacy_v5_manifests_read_only(&privacy)
+                .map_err(|_| v031_privacy_v5_proof_error())?;
+            preflight_privacy_store(&privacy)?;
+            preflight_vault_state(self)?;
+
+            let mut report = run_backfill_inner(
+                self,
+                &mut privacy,
+                user,
+                snapshot_path,
+                source,
+                &snapshot,
+                &self.shared.workspace_instance_id,
+                failure_point,
+                Some(&writer_gate),
+            )?;
+            compute_privacy_v5_manifests_read_only(&privacy)
+                .map_err(|_| v031_privacy_v5_proof_error())?;
+            report.source_unchanged_verified = true;
+            Ok(report)
+        })
+    }
+
+    /// Proves the one exact full-v5 state that may be authenticated by Receipt
+    /// 4. Unlike the general v5 manifest loader, this also binds the evolved
+    /// rows back to Original V2, requires the target workspace's initial
+    /// lifecycle, and rejects every post-v1/binding row before any receipt
+    /// write is authorized.
+    pub(crate) fn v031_initial_privacy_v5_proof_before_receipt4_read_only(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        let checkpoint_source = reconstruct_v031_step4_source_proof_from_checkpoints(
+            self,
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+        )?;
+        if checkpoint_source.privacy_v1_business_manifest_sha256
+            != gate.original_privacy_business_manifest_sha256()
+            || checkpoint_source.privacy_v1_total_rows != gate.original_privacy_total_rows()
+        {
+            return Err(v031_checkpoint_source_proof_error());
+        }
+        with_v031_pinned_user_snapshot(self, gate, |_user, _snapshot_path, source| {
+            let current = v031_source_fingerprint(gate, gate.original_user_source_proof(), source);
+            if current.evidence_sha256 != checkpoint_source.source_fingerprint {
+                return Err(v031_checkpoint_source_proof_error());
+            }
+            let privacy = open_privacy_read_only(&self.shared.database_path)?;
+            verify_initial_privacy_v5_before_receipt4_read_only(
+                &privacy,
+                &PrivacyV5InitialFullExpectation {
+                    expected_workspace_instance_id: &self.shared.workspace_instance_id,
+                    expected_source_business_manifest_sha256: &checkpoint_source
+                        .privacy_v1_business_manifest_sha256,
+                    expected_source_total_row_count: checkpoint_source.privacy_v1_total_rows,
+                    expected_protected_review_payload_count: gate
+                        .original_privacy_protected_review_payload_count(),
+                },
+            )
+            .map(privacy::PrivacyV5InitialFullProof::into_manifest)
+            .map_err(|_| v031_privacy_v5_proof_error())
+        })
+    }
+
+    /// Rebuilds the general exact Privacy-v5 manifest under the same
+    /// authenticated Step-4 checkpoint chain without opening either live
+    /// database writable. This remains necessary after Receipt 4 because the
+    /// authorized binding/material stage legitimately adds v5 business rows.
+    pub(crate) fn v031_privacy_v5_manifest_proof_after_checkpoints_read_only(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        let checkpoint_source = reconstruct_v031_step4_source_proof_from_checkpoints(
+            self,
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+        )?;
+        with_v031_pinned_user_snapshot(self, gate, |_user, _snapshot_path, source| {
+            let current = v031_source_fingerprint(gate, gate.original_user_source_proof(), source);
+            if current.evidence_sha256 != checkpoint_source.source_fingerprint {
+                return Err(v031_checkpoint_source_proof_error());
+            }
+            require_exact_privacy_v5(self)
+        })
+    }
+
+    /// Reconstructs the historical Step-5 terminal and Step-6 source proofs
+    /// from the DPAPI/V3-authenticated Projection checkpoint images. Both
+    /// SQLite images are deserialized read-only into SQLite-owned memory; the
+    /// active User/Privacy slots are never consulted as historical v10/v5
+    /// sources and are never mutated.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn v031_projection_recovery_proofs_from_verified_checkpoint_images(
+        &self,
+        rollback_gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+        projection_checkpoint: &V031MigrationCheckpointProof,
+        user_v10_image: &[u8],
+        privacy_v5_image: &[u8],
+    ) -> Result<
+        (
+            V031BindingMaterialTerminalProof,
+            super::approved_case_projection::V031ApprovedProjectionSourceProof,
+        ),
+        PrivacyWorkflowError,
+    > {
+        let _operation_guard = self.gate();
+        let step4_source = reconstruct_v031_step4_source_proof_from_checkpoints(
+            self,
+            rollback_gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+        )?;
+        if projection_checkpoint.kind() != V031CheckpointKind::Projection
+            || projection_checkpoint.lineage_id() != rollback_gate.lineage_id()
+            || projection_checkpoint.original_identity_sha256()
+                != rollback_gate.original_identity_sha256()
+            || projection_checkpoint.workspace_instance_id()
+                != target_gate.workspace_instance_id().as_str()
+            || projection_checkpoint.user_database_sha256() != sha256_hex(user_v10_image)
+            || projection_checkpoint.privacy_database_sha256() != sha256_hex(privacy_v5_image)
+        {
+            return Err(v031_checkpoint_source_proof_error());
+        }
+
+        let verified_user_image = open_verified_v031_user_checkpoint_image_read_only(
+            user_v10_image,
+            V031UserCheckpointImageExpectations {
+                database_sha256: projection_checkpoint.user_database_sha256(),
+                schema_manifest_sha256: projection_checkpoint.user_schema_manifest_sha256(),
+                logical_manifest_sha256: projection_checkpoint.user_logical_manifest_sha256(),
+                business_manifest_sha256: projection_checkpoint.user_business_manifest_sha256(),
+                total_rows: projection_checkpoint.user_total_rows(),
+                rollback_semantic_proof: rollback_gate.original_user_source_proof(),
+            },
+        )?;
+        let user = verified_user_image.connection();
+
+        let validated_privacy_v5 =
+            privacy::validate_privacy_v5_sqlite_image_read_only(privacy_v5_image)
+                .map_err(|_| v031_privacy_v5_proof_error())?;
+        if validated_privacy_v5.schema_version != 5
+            || validated_privacy_v5.logical_manifest.sha256
+                != projection_checkpoint.privacy_logical_manifest_sha256()
+            || validated_privacy_v5.business_manifest.sha256
+                != projection_checkpoint.privacy_business_manifest_sha256()
+            || validated_privacy_v5.total_row_count != projection_checkpoint.privacy_total_rows()
+        {
+            return Err(v031_privacy_v5_proof_error());
+        }
+
+        let source = verified_user_image.capture_source_proof()?;
+        let source_fingerprint = v031_source_fingerprint(
+            rollback_gate,
+            rollback_gate.original_user_source_proof(),
+            &source,
+        );
+        if source_fingerprint.evidence_sha256 != step4_source.source_fingerprint {
+            return Err(v031_checkpoint_source_proof_error());
+        }
+
+        let privacy = open_verified_checkpoint_image_read_only(privacy_v5_image)?;
+        let observed_privacy_v5 = compute_privacy_v5_manifests_read_only(&privacy)
+            .map_err(|_| v031_privacy_v5_proof_error())?;
+        if observed_privacy_v5 != validated_privacy_v5 {
+            return Err(v031_privacy_v5_proof_error());
+        }
+        let step5_terminal = compute_v031_terminal_proof_with_privacy_connection(
+            self,
+            user,
+            &source,
+            &source_fingerprint,
+            &privacy,
+        )?;
+        let projection_source = super::approved_case_projection::
+            v031_projection_source_proof_from_verified_v5_connection(
+                self,
+                rollback_gate,
+                &step5_terminal,
+                projection_checkpoint,
+                &privacy,
+            )?;
+
+        let post_source = verified_user_image.capture_source_proof()?;
+        let post_privacy_v5 = compute_privacy_v5_manifests_read_only(&privacy)
+            .map_err(|_| v031_privacy_v5_proof_error())?;
+        if post_source.persistent_fingerprint() != source.persistent_fingerprint()
+            || post_privacy_v5 != observed_privacy_v5
+        {
+            return Err(v031_checkpoint_source_proof_error());
+        }
+        Ok((step5_terminal, projection_source))
+    }
+
+    /// Reconstructs receipt-5 counts and evidence exclusively from committed
+    /// schema-5 state. Invocation counters are intentionally not accepted.
+    #[cfg(test)]
+    pub(crate) fn v031_binding_material_terminal_proof(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        expected: &V031CaseMaterialSourceFingerprint,
+    ) -> Result<V031BindingMaterialTerminalProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        with_v031_pinned_user_snapshot(self, gate, |user, _snapshot_path, source| {
+            let current = v031_source_fingerprint(gate, gate.original_user_source_proof(), source);
+            if &current != expected {
+                return Err(migration_error(
+                    "case_material_backup_source_mismatch",
+                    "The exact v0.3.1 source does not match the terminal-proof checkpoint.",
+                ));
+            }
+            require_exact_privacy_v5(self)?;
+            if case_material_migration_required_for_pinned_user(self, user, source)? {
+                return Err(v031_terminal_proof_error());
+            }
+            compute_v031_terminal_proof(self, user, source, expected)
+        })
+    }
+
+    /// Restart-safe receipt-5 proof reconstruction using the two authenticated
+    /// Step-4 checkpoints rather than an invocation counter or caller-created
+    /// raw source string.
+    pub(crate) fn v031_binding_material_terminal_proof_after_checkpoints(
+        &self,
+        gate: &OriginalRollbackVerifiedGate,
+        target_gate: &V031TargetComponentsPreparedGate,
+        binding_checkpoint: &V031MigrationCheckpointProof,
+        material_checkpoint: &V031MigrationCheckpointProof,
+    ) -> Result<V031BindingMaterialTerminalProof, PrivacyWorkflowError> {
+        let _operation_guard = self.gate();
+        let checkpoint_source = reconstruct_v031_step4_source_proof_from_checkpoints(
+            self,
+            gate,
+            target_gate,
+            binding_checkpoint,
+            material_checkpoint,
+        )?;
+        with_v031_pinned_user_snapshot(self, gate, |user, _snapshot_path, source| {
+            let current = v031_source_fingerprint(gate, gate.original_user_source_proof(), source);
+            if current.evidence_sha256 != checkpoint_source.source_fingerprint {
+                return Err(v031_checkpoint_source_proof_error());
+            }
+            require_exact_privacy_v5(self)?;
+            if case_material_migration_required_for_pinned_user(self, user, source)? {
+                return Err(v031_terminal_proof_error());
+            }
+            compute_v031_terminal_proof(self, user, source, &current)
+        })
+    }
+}
+
+fn upgrade_and_initialize_v031_privacy_v5(
+    manager: &PrivacyWorkflowManager,
+    gate: &OriginalRollbackVerifiedGate,
+    source_proof: &V031CaseMigrationCheckpointSourceProof,
+    #[cfg(test)] failure_point: Option<V031PrivacyV5UpgradeFailurePoint>,
+    #[cfg(not(test))] _failure_point: Option<()>,
+) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+    let privacy = manager.open_raw_connection()?;
+    PrivacyStore::upgrade_exact_v031_schema_to_v5_after_backup(&privacy)
+        .map_err(PrivacyWorkflowError::store)?;
+    #[cfg(test)]
+    inject_v031_privacy_v5_upgrade_failure(
+        failure_point,
+        V031PrivacyV5UpgradeFailurePoint::AfterSchemaCommitBeforeLifecycleInitialize,
+    )?;
+    let partial =
+        classify_privacy_v5_partial_read_only(&privacy, &manager.shared.workspace_instance_id)
+            .map_err(|_| v031_privacy_v5_proof_error())?;
+    validate_v031_partial_source(gate, source_proof, &partial)?;
+    let capability = V031PrivacyV5PartialResumeCapability {
+        checkpoint_source_evidence_sha256: source_proof.evidence_sha256.clone(),
+        workspace_instance_id: manager.shared.workspace_instance_id.as_str().to_owned(),
+        partial,
+    };
+    drop(privacy);
+    resume_and_initialize_v031_privacy_v5(manager, &capability, |stage| {
+        #[cfg(test)]
+        if stage == PrivacyV5PartialStage::LifecycleCommittedBeforeBinding
+            && failure_point
+                == Some(
+                    V031PrivacyV5UpgradeFailurePoint::AfterLifecycleCommitBeforeBindingInitialize,
+                )
+        {
+            return Err(v031_privacy_v5_proof_error());
+        }
+        #[cfg(not(test))]
+        let _ = stage;
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authorize_v031_privacy_v5_partial_resume(
+    manager: &PrivacyWorkflowManager,
+    gate: &OriginalRollbackVerifiedGate,
+    target_gate: &V031TargetComponentsPreparedGate,
+    source_proof: &V031CaseMigrationCheckpointSourceProof,
+    binding_checkpoint: &V031MigrationCheckpointProof,
+    material_checkpoint: &V031MigrationCheckpointProof,
+) -> Result<V031PrivacyV5PartialResumeCapability, PrivacyWorkflowError> {
+    let reconstructed = reconstruct_v031_step4_source_proof_from_checkpoints(
+        manager,
+        gate,
+        target_gate,
+        binding_checkpoint,
+        material_checkpoint,
+    )?;
+    if &reconstructed != source_proof
+        || source_proof.privacy_v1_business_manifest_sha256
+            != gate.original_privacy_business_manifest_sha256()
+        || source_proof.privacy_v1_total_rows != gate.original_privacy_total_rows()
+    {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+
+    with_v031_pinned_user_snapshot(manager, gate, |_user, _snapshot_path, source| {
+        let current = v031_source_fingerprint(gate, gate.original_user_source_proof(), source);
+        if current.evidence_sha256 != source_proof.source_fingerprint {
+            return Err(v031_checkpoint_source_proof_error());
+        }
+        let privacy = open_privacy_read_only(&manager.shared.database_path)?;
+        let partial =
+            classify_privacy_v5_partial_read_only(&privacy, &manager.shared.workspace_instance_id)
+                .map_err(|_| v031_privacy_v5_proof_error())?;
+        validate_v031_partial_source(gate, source_proof, &partial)?;
+        Ok(V031PrivacyV5PartialResumeCapability {
+            checkpoint_source_evidence_sha256: source_proof.evidence_sha256.clone(),
+            workspace_instance_id: manager.shared.workspace_instance_id.as_str().to_owned(),
+            partial,
+        })
+    })
+}
+
+fn validate_v031_partial_source(
+    gate: &OriginalRollbackVerifiedGate,
+    source_proof: &V031CaseMigrationCheckpointSourceProof,
+    partial: &PrivacyV5PartialProof,
+) -> Result<(), PrivacyWorkflowError> {
+    if partial.source_business_manifest_sha256() != source_proof.privacy_v1_business_manifest_sha256
+        || partial.source_total_row_count() != source_proof.privacy_v1_total_rows
+        || partial.protected_review_payload_count()
+            != gate.original_privacy_protected_review_payload_count()
+    {
+        return Err(v031_privacy_v5_proof_error());
+    }
+    Ok(())
+}
+
+fn resume_and_initialize_v031_privacy_v5<F>(
+    manager: &PrivacyWorkflowManager,
+    capability: &V031PrivacyV5PartialResumeCapability,
+    mut before_write: F,
+) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError>
+where
+    F: FnMut(PrivacyV5PartialStage) -> Result<(), PrivacyWorkflowError>,
+{
+    if capability.workspace_instance_id != manager.shared.workspace_instance_id.as_str()
+        || capability.checkpoint_source_evidence_sha256.len() != 64
+        || !capability
+            .checkpoint_source_evidence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    let mut privacy = manager.open_raw_connection()?;
+    let mut expected = capability.partial.clone();
+    if expected.stage() == PrivacyV5PartialStage::SchemaCommittedBeforeLifecycle {
+        let transaction = privacy
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| v031_privacy_v5_proof_error())?;
+        let observed = classify_privacy_v5_partial_in_transaction(
+            &transaction,
+            &manager.shared.workspace_instance_id,
+        )
+        .map_err(|_| v031_privacy_v5_proof_error())?;
+        if observed != expected {
+            return Err(v031_privacy_v5_proof_error());
+        }
+        before_write(PrivacyV5PartialStage::SchemaCommittedBeforeLifecycle)?;
+        PrivacyLifecycle::initialize_state_in_transaction(
+            &transaction,
+            manager.shared.workspace_instance_id.clone(),
+            manager.current_unix()?,
+        )
+        .map_err(PrivacyWorkflowError::lifecycle)?;
+        expected = classify_privacy_v5_partial_in_transaction(
+            &transaction,
+            &manager.shared.workspace_instance_id,
+        )
+        .map_err(|_| v031_privacy_v5_proof_error())?;
+        if expected.stage() != PrivacyV5PartialStage::LifecycleCommittedBeforeBinding
+            || expected.source_business_manifest_sha256()
+                != capability.partial.source_business_manifest_sha256()
+            || expected.source_total_row_count() != capability.partial.source_total_row_count()
+            || expected.protected_review_payload_count()
+                != capability.partial.protected_review_payload_count()
+        {
+            return Err(v031_privacy_v5_proof_error());
+        }
+        transaction
+            .commit()
+            .map_err(|_| v031_privacy_v5_proof_error())?;
+    }
+
+    let transaction = privacy
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| v031_privacy_v5_proof_error())?;
+    let observed = classify_privacy_v5_partial_in_transaction(
+        &transaction,
+        &manager.shared.workspace_instance_id,
+    )
+    .map_err(|_| v031_privacy_v5_proof_error())?;
+    if observed != expected
+        || observed.stage() != PrivacyV5PartialStage::LifecycleCommittedBeforeBinding
+    {
+        return Err(v031_privacy_v5_proof_error());
+    }
+    before_write(PrivacyV5PartialStage::LifecycleCommittedBeforeBinding)?;
+    ProjectPrivacyCaseBindingStore::initialize_in_transaction(&transaction)
+        .map_err(PrivacyWorkflowError::project_case_binding)?;
+    transaction
+        .commit()
+        .map_err(|_| v031_privacy_v5_proof_error())?;
+
+    verify_initial_privacy_v5_before_receipt4_read_only(
+        &privacy,
+        &PrivacyV5InitialFullExpectation {
+            expected_workspace_instance_id: &manager.shared.workspace_instance_id,
+            expected_source_business_manifest_sha256: capability
+                .partial
+                .source_business_manifest_sha256(),
+            expected_source_total_row_count: capability.partial.source_total_row_count(),
+            expected_protected_review_payload_count: capability
+                .partial
+                .protected_review_payload_count(),
+        },
+    )
+    .map(privacy::PrivacyV5InitialFullProof::into_manifest)
+    .map_err(|_| v031_privacy_v5_proof_error())
+}
+
+#[cfg(test)]
+fn inject_v031_privacy_v5_upgrade_failure(
+    requested: Option<V031PrivacyV5UpgradeFailurePoint>,
+    boundary: V031PrivacyV5UpgradeFailurePoint,
+) -> Result<(), PrivacyWorkflowError> {
+    if requested == Some(boundary) {
+        Err(v031_privacy_v5_proof_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_v031_target_components_gate(
+    manager: &PrivacyWorkflowManager,
+    rollback: &OriginalRollbackVerifiedGate,
+    target: &V031TargetComponentsPreparedGate,
+) -> Result<(), PrivacyWorkflowError> {
+    if target.workspace_instance_id() != &manager.shared.workspace_instance_id {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    validate_v031_target_components_gate_path_free(rollback, target)
+}
+
+fn validate_v031_target_components_gate_path_free(
+    rollback: &OriginalRollbackVerifiedGate,
+    target: &V031TargetComponentsPreparedGate,
+) -> Result<(), PrivacyWorkflowError> {
+    let approved = target.approved_gate();
+    let vault = target.vault_gate();
+    let hashes = [
+        target.target_components_evidence_sha256(),
+        target.target_components_receipt_sha256(),
+        approved.rollback_gate_binding_sha256(),
+        approved.credential_manifest_sha256(),
+        approved.approved_workspace_schema_sha256(),
+        approved.work_products_schema_sha256(),
+        approved.approved_workspace_manifest_sha256(),
+        approved.work_products_manifest_sha256(),
+        approved.evidence_sha256(),
+        vault.rollback_gate_binding_sha256(),
+        vault.approved_target_components_evidence_sha256(),
+        vault.vault_schema_sha256(),
+        vault.vault_database_sha256(),
+        vault.vault_layout_sha256(),
+        vault.vault_component_manifest_sha256(),
+        vault.evidence_sha256(),
+    ];
+    if !target
+        .rollback_gate()
+        .authenticates_same_original_rollback(rollback)
+        || target.receipt_context() != &rollback.receipt_context()
+        || approved.workspace_instance_id() != target.workspace_instance_id()
+        || vault.workspace_instance_id() != target.workspace_instance_id()
+        || approved.rollback_gate_binding_sha256() != vault.rollback_gate_binding_sha256()
+        || approved.evidence_sha256() != vault.approved_target_components_evidence_sha256()
+        || approved.credential_count() != 4
+        || approved.approved_business_rows() != 0
+        || approved.work_product_business_rows() != 0
+        || vault.metadata_rows() == 0
+        || vault.business_rows() != 0
+        || vault.key_record_count() != 0
+        || vault.object_root_entry_count() != 0
+        || hashes.into_iter().any(|hash| !valid_hash(hash))
+    {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    Ok(())
+}
+
+fn v031_target_gate_manifest_sha256(target: &V031TargetComponentsPreparedGate) -> String {
+    let approved = target.approved_gate();
+    let vault = target.vault_gate();
+    let mut manifest = Fingerprint::new(b"v031-target-components-gate-manifest-v1");
+    for value in [
+        target.target_components_evidence_sha256(),
+        target.target_components_receipt_sha256(),
+        approved.rollback_gate_binding_sha256(),
+        approved.credential_manifest_sha256(),
+        approved.approved_workspace_schema_sha256(),
+        approved.work_products_schema_sha256(),
+        approved.approved_workspace_manifest_sha256(),
+        approved.work_products_manifest_sha256(),
+        approved.evidence_sha256(),
+        vault.vault_schema_sha256(),
+        vault.vault_database_sha256(),
+        vault.vault_layout_sha256(),
+        vault.vault_component_manifest_sha256(),
+        vault.evidence_sha256(),
+    ] {
+        manifest.text(value);
+    }
+    manifest.finish()
+}
+
+fn compute_v031_pre_v5_checkpoint_source_proof(
+    manager: &PrivacyWorkflowManager,
+    rollback: &OriginalRollbackVerifiedGate,
+    target: &V031TargetComponentsPreparedGate,
+    user_connection: &Connection,
+    user_source: &SourceProof,
+) -> Result<V031CaseMigrationCheckpointSourceProof, PrivacyWorkflowError> {
+    let user = UserSnapshot::load(user_connection)?;
+    let source =
+        v031_source_fingerprint(rollback, rollback.original_user_source_proof(), user_source);
+    let (post_privacy, nested) = with_validated_privacy_v1_migration_source_read_only(
+        &manager.shared.database_path,
+        |privacy_session| {
+            if !v031_privacy_v1_source_matches_original(rollback, privacy_session.proof()) {
+                return Err(v031_checkpoint_source_proof_error());
+            }
+            compute_v031_candidates_from_isolated_privacy_v1(
+                manager,
+                privacy_session,
+                &user,
+                user_source,
+            )
+        },
+    )
+    .map_err(|_| v031_checkpoint_source_proof_error())?;
+    if !v031_privacy_v1_source_matches_original(rollback, &post_privacy) {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    let candidates = nested?;
+    Ok(build_v031_checkpoint_source_proof(
+        rollback,
+        target,
+        source.evidence_sha256,
+        &candidates,
+        post_privacy.logical_manifest.sha256,
+        post_privacy.business_manifest.sha256,
+        post_privacy.logical_manifest.total_row_count,
+    ))
+}
+
+fn compute_v031_candidates_from_isolated_privacy_v1(
+    manager: &PrivacyWorkflowManager,
+    privacy_session: &privacy::ValidatedPrivacyV1ReadOnlySession<'_>,
+    user: &UserSnapshot,
+    user_source: &SourceProof,
+) -> Result<V031CandidateManifests, PrivacyWorkflowError> {
+    let directory = tempfile::Builder::new()
+        .prefix("lawyer-assistance-v031-privacy-planner-")
+        .tempdir()
+        .map_err(|_| v031_checkpoint_source_proof_error())?;
+    let snapshot_path = directory.path().join("privacy-v1-planner.sqlite");
+    let mut snapshot = Connection::open_with_flags(
+        &snapshot_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| v031_checkpoint_source_proof_error())?;
+    privacy_session
+        .backup_to(&mut snapshot)
+        .map_err(|_| v031_checkpoint_source_proof_error())?;
+    PrivacyStore::upgrade_exact_v031_schema_to_v5_after_backup(&snapshot)
+        .map_err(PrivacyWorkflowError::store)?;
+    PrivacyLifecycle::initialize(
+        &mut snapshot,
+        manager.shared.workspace_instance_id.clone(),
+        manager.current_unix()?,
+    )
+    .map_err(PrivacyWorkflowError::lifecycle)?;
+    ProjectPrivacyCaseBindingStore::initialize(&mut snapshot)
+        .map_err(PrivacyWorkflowError::project_case_binding)?;
+    compute_privacy_v5_manifests_read_only(&snapshot).map_err(|_| v031_privacy_v5_proof_error())?;
+    let cleanup = load_cleanup_authorization_snapshot(manager, &snapshot)?;
+    if !cleanup.redactions.is_empty() || !cleanup.tombstoned_material_ids.is_empty() {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    let plans = load_migration_plans(manager, &snapshot, user, &cleanup)?;
+    compute_v031_candidate_manifests(
+        user,
+        user_source,
+        &plans,
+        manager.shared.workspace_instance_id.as_str(),
+    )
+}
+
+fn v031_privacy_v1_source_matches_original(
+    rollback: &OriginalRollbackVerifiedGate,
+    source: &ValidatedPrivacyV1Source,
+) -> bool {
+    source.schema_version == 1
+        && rollback.authenticates_privacy_physical_file_set(source)
+        && source.logical_manifest.sha256 == rollback.original_privacy_logical_manifest_sha256()
+        && source.business_manifest.sha256 == rollback.original_privacy_business_manifest_sha256()
+        && source.logical_manifest.total_row_count == rollback.original_privacy_total_rows()
+        && u64::try_from(source.logical_manifest.tables.len()).ok()
+            == Some(rollback.original_privacy_table_count())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_v031_checkpoint_source_proof(
+    rollback: &OriginalRollbackVerifiedGate,
+    target: &V031TargetComponentsPreparedGate,
+    source_fingerprint: String,
+    candidates: &V031CandidateManifests,
+    privacy_v1_logical_manifest_sha256: String,
+    privacy_v1_business_manifest_sha256: String,
+    privacy_v1_total_rows: u64,
+) -> V031CaseMigrationCheckpointSourceProof {
+    let target_gate_manifest_sha256 = v031_target_gate_manifest_sha256(target);
+    let mut evidence = Fingerprint::new(b"v031-step4-checkpoint-source-proof-v1");
+    for value in [
+        rollback.lineage_id(),
+        rollback.source_profile_proof_sha256(),
+        rollback.original_identity_sha256(),
+        rollback.original_user_physical_file_set_sha256(),
+        rollback.original_privacy_physical_file_set_sha256(),
+        source_fingerprint.as_str(),
+        candidates.binding_manifest_sha256.as_str(),
+        candidates.material_manifest_sha256.as_str(),
+        privacy_v1_logical_manifest_sha256.as_str(),
+        privacy_v1_business_manifest_sha256.as_str(),
+        target_gate_manifest_sha256.as_str(),
+    ] {
+        evidence.text(value);
+    }
+    evidence.text(target.workspace_instance_id().as_str());
+    evidence.text(&candidates.binding_count.to_string());
+    evidence.text(&candidates.material_count.to_string());
+    evidence.text(&privacy_v1_total_rows.to_string());
+    V031CaseMigrationCheckpointSourceProof {
+        evidence_sha256: evidence.finish(),
+        source_fingerprint,
+        binding_candidate_manifest_sha256: candidates.binding_manifest_sha256.clone(),
+        binding_candidate_count: candidates.binding_count,
+        material_candidate_manifest_sha256: candidates.material_manifest_sha256.clone(),
+        material_candidate_count: candidates.material_count,
+        original_user_physical_file_set_sha256: rollback
+            .original_user_physical_file_set_sha256()
+            .to_owned(),
+        original_privacy_physical_file_set_sha256: rollback
+            .original_privacy_physical_file_set_sha256()
+            .to_owned(),
+        privacy_v1_logical_manifest_sha256,
+        privacy_v1_business_manifest_sha256,
+        privacy_v1_total_rows,
+        target_gate_manifest_sha256,
+    }
+}
+
+fn reconstruct_v031_step4_source_proof_from_checkpoints(
+    manager: &PrivacyWorkflowManager,
+    rollback: &OriginalRollbackVerifiedGate,
+    target: &V031TargetComponentsPreparedGate,
+    binding: &V031MigrationCheckpointProof,
+    materials: &V031MigrationCheckpointProof,
+) -> Result<V031CaseMigrationCheckpointSourceProof, PrivacyWorkflowError> {
+    validate_v031_target_components_gate(manager, rollback, target)?;
+    reconstruct_v031_step4_source_proof_from_authenticated_checkpoints_read_only(
+        rollback, target, binding, materials,
+    )
+}
+
+/// Reconstructs the exact historical Step-4 source proof from two fully
+/// authenticated checkpoint capabilities without consulting a manager or any
+/// evolved live component. The target capability must already be rebound to
+/// receipt 2 by the startup/checkpoint boundary.
+pub(crate) fn reconstruct_v031_step4_source_proof_from_authenticated_checkpoints_read_only(
+    rollback: &OriginalRollbackVerifiedGate,
+    target: &V031TargetComponentsPreparedGate,
+    binding: &V031MigrationCheckpointProof,
+    materials: &V031MigrationCheckpointProof,
+) -> Result<V031CaseMigrationCheckpointSourceProof, PrivacyWorkflowError> {
+    validate_v031_target_components_gate_path_free(rollback, target)?;
+    validate_v031_step4_checkpoint_common(rollback, target, binding, V031CheckpointKind::Binding)?;
+    validate_v031_step4_checkpoint_common(
+        rollback,
+        target,
+        materials,
+        V031CheckpointKind::Materials,
+    )?;
+    if binding.source_fingerprint() != materials.source_fingerprint()
+        || binding.identity_protected_sha256() == materials.identity_protected_sha256()
+    {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    let candidates = V031CandidateManifests {
+        binding_manifest_sha256: binding.candidate_manifest_sha256().to_owned(),
+        binding_count: binding.candidate_count(),
+        material_manifest_sha256: materials.candidate_manifest_sha256().to_owned(),
+        material_count: materials.candidate_count(),
+    };
+    Ok(build_v031_checkpoint_source_proof(
+        rollback,
+        target,
+        binding.source_fingerprint().to_owned(),
+        &candidates,
+        binding.privacy_logical_manifest_sha256().to_owned(),
+        binding.privacy_business_manifest_sha256().to_owned(),
+        binding.privacy_total_rows(),
+    ))
+}
+
+fn validate_v031_step4_checkpoint_common(
+    rollback: &OriginalRollbackVerifiedGate,
+    target: &V031TargetComponentsPreparedGate,
+    checkpoint: &V031MigrationCheckpointProof,
+    expected_kind: V031CheckpointKind,
+) -> Result<(), PrivacyWorkflowError> {
+    let user = rollback.original_user_source_proof();
+    let hash_fields = [
+        checkpoint.identity_protected_sha256(),
+        checkpoint.bundle_sha256(),
+        checkpoint.user_database_sha256(),
+        checkpoint.user_schema_manifest_sha256(),
+        checkpoint.user_logical_manifest_sha256(),
+        checkpoint.user_business_manifest_sha256(),
+        checkpoint.privacy_database_sha256(),
+        checkpoint.privacy_logical_manifest_sha256(),
+        checkpoint.privacy_business_manifest_sha256(),
+        checkpoint.vault_bundle_sha256(),
+        checkpoint.approved_workspace_bundle_sha256(),
+        checkpoint.work_products_bundle_sha256(),
+        checkpoint.source_fingerprint(),
+        checkpoint.candidate_manifest_sha256(),
+    ];
+    if checkpoint.kind() != expected_kind
+        || checkpoint.lineage_id() != rollback.lineage_id()
+        || checkpoint.original_identity_sha256() != rollback.original_identity_sha256()
+        || checkpoint.workspace_instance_id() != target.workspace_instance_id().as_str()
+        || checkpoint.user_schema_manifest_sha256() != user.schema_manifest_sha256
+        || checkpoint.user_logical_manifest_sha256() != user.logical_database_manifest_sha256
+        || checkpoint.user_business_manifest_sha256() != user.business_manifest_sha256
+        || checkpoint.user_total_rows() != user.total_rows
+        || checkpoint.privacy_schema_version() != 1
+        || checkpoint.privacy_logical_manifest_sha256()
+            != rollback.original_privacy_logical_manifest_sha256()
+        || checkpoint.privacy_business_manifest_sha256()
+            != rollback.original_privacy_business_manifest_sha256()
+        || checkpoint.privacy_total_rows() != rollback.original_privacy_total_rows()
+        || hash_fields.into_iter().any(|hash| !valid_hash(hash))
+    {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    Ok(())
+}
+
+fn opaque_candidate_key_commitment(
+    profile: &[u8],
+    source_fingerprint: &str,
+    value: &str,
+) -> String {
+    let mut commitment = Fingerprint::new(profile);
+    commitment.text(source_fingerprint);
+    commitment.text(value);
+    commitment.finish()
+}
+
+fn compute_v031_candidate_manifests(
+    user: &UserSnapshot,
+    source: &SourceProof,
+    plans: &[PrivacyMaterialPlan],
+    workspace_instance_id: &str,
+) -> Result<V031CandidateManifests, PrivacyWorkflowError> {
+    let source_fingerprint = source.persistent_fingerprint();
+    let graph = binding_candidate_graph(user, plans);
+    let mut privacy_state_projects = graph.blocked_projects.clone();
+    for plan in plans {
+        privacy_state_projects.extend(plan.provenance_projects.iter().cloned());
+        if let Some(project_id) = plan.source.project_id.as_ref() {
+            privacy_state_projects.insert(project_id.clone());
+        }
+    }
+
+    let mut binding = Fingerprint::new(b"v031-binding-candidate-manifest-v1");
+    for project in user.projects.values() {
+        ProjectId::parse(project.project_id.clone())
+            .map_err(PrivacyWorkflowError::project_case_binding)?;
+        let cases = graph.cases_by_project.get(project.project_id.as_str());
+        let (outcome, historical_case) = if graph.blocked_projects.contains(&project.project_id) {
+            ("blocked:ambiguous_legacy_binding", None)
+        } else if let Some(case_id) = cases.and_then(|values| {
+            (values.len() == 1).then(|| values.first().expect("one historical case was checked"))
+        }) {
+            ("trusted_historical_binding", Some(case_id.as_str()))
+        } else if privacy_state_projects.contains(&project.project_id) {
+            ("blocked:project_privacy_case_unbound", None)
+        } else {
+            // No PrivacyCaseId is generated or derived here. The real writer
+            // creates it with the binding store's CSPRNG inside the same
+            // transaction that persists the binding, audit, and ledger.
+            ("new_random_required", None)
+        };
+        binding.text("project");
+        binding.text(&opaque_candidate_key_commitment(
+            b"v031-binding-project-key-v1",
+            &source_fingerprint,
+            &project.project_id,
+        ));
+        binding.text(&project_binding_fingerprint(project, cases));
+        binding.text(outcome);
+        binding.optional_text(
+            historical_case
+                .map(|case_id| {
+                    opaque_candidate_key_commitment(
+                        b"v031-binding-historical-case-v1",
+                        &source_fingerprint,
+                        case_id,
+                    )
+                })
+                .as_deref(),
+        );
+        binding.text(&opaque_candidate_key_commitment(
+            b"v031-binding-ledger-target-v1",
+            &source_fingerprint,
+            &binding_target_id(&project.project_id),
+        ));
+    }
+
+    let mut material = Fingerprint::new(b"v031-material-candidate-manifest-v1");
+    let mut material_count = 1_u64;
+    material.text("source_manifest");
+    material.text(&source_fingerprint);
+    material.text("migrated");
+    for plan in plans {
+        material_count = material_count
+            .checked_add(1)
+            .and_then(|value| value.checked_add(plan.redactions.len() as u64))
+            .ok_or_else(v031_checkpoint_source_proof_error)?;
+        material.text("privacy_materials");
+        material.text(&opaque_candidate_key_commitment(
+            b"v031-material-source-key-v1",
+            &source_fingerprint,
+            &plan.source.material_id,
+        ));
+        material.text(&privacy_material_fingerprint(&plan.source));
+        material.text(plan.validation_error.unwrap_or("candidate"));
+        for redaction in &plan.redactions {
+            material.text("privacy_redactions");
+            material.text(&opaque_candidate_key_commitment(
+                b"v031-redaction-source-key-v1",
+                &source_fingerprint,
+                &redaction.source.redaction_id,
+            ));
+            material.text(&privacy_redaction_fingerprint(redaction));
+            material.text(redaction.generation_status);
+            material.optional_text(redaction.error_code);
+        }
+    }
+    for case_file in &user.case_files {
+        material_count = material_count
+            .checked_add(1)
+            .ok_or_else(v031_checkpoint_source_proof_error)?;
+        let resolution = user.resolve_attachment(case_file);
+        let outcome = match &resolution {
+            AttachmentResolution::Exact(_) => "attachment_exact",
+            AttachmentResolution::Legacy(error) => error,
+            AttachmentResolution::Blocked(error) => error,
+        };
+        material.text("case_files");
+        material.text(&opaque_candidate_key_commitment(
+            b"v031-case-file-source-key-v1",
+            &source_fingerprint,
+            &case_file.file_id,
+        ));
+        material.text(&case_file_fingerprint(case_file, user, &resolution));
+        material.text(outcome);
+        material.text(&opaque_candidate_key_commitment(
+            b"v031-case-file-target-v1",
+            &source_fingerprint,
+            &deterministic_case_file_material_id(workspace_instance_id, &case_file.file_id),
+        ));
+    }
+
+    Ok(V031CandidateManifests {
+        binding_manifest_sha256: binding.finish(),
+        binding_count: u64::try_from(user.projects.len())
+            .map_err(|_| v031_checkpoint_source_proof_error())?,
+        material_manifest_sha256: material.finish(),
+        material_count,
+    })
+}
+
+fn case_material_migration_required_for_pinned_user(
+    manager: &PrivacyWorkflowManager,
+    user: &Connection,
+    source: &SourceProof,
+) -> Result<bool, PrivacyWorkflowError> {
+    let snapshot = UserSnapshot::load(user)?;
+    preflight_vault_state(manager)?;
+    let schema_status = manager.preflight_privacy_store_schema_read_only()?;
+    if schema_status == PrivacyStoreSchemaStatus::Empty {
+        preflight_empty_privacy_vault_inventory(manager)?;
+        return Ok(true);
+    }
+    let privacy = open_privacy_read_only(&manager.shared.database_path)?;
+    if !manager.startup_vault_present() {
+        preflight_missing_vault_privacy_identity(&privacy)?;
+    }
+    if let PrivacyStoreSchemaStatus::UpgradeRequired { found_version } = schema_status {
+        if found_version != CASE_MATERIAL_TARGET_SCHEMA_VERSION {
+            preflight_privacy_integrity_and_cleanup(&privacy)?;
+            return Ok(true);
+        }
+    }
+    case_material_migration_required_for_validated_target(manager, &privacy, source, &snapshot)
+}
+
+fn case_material_migration_required_for_validated_target(
+    manager: &PrivacyWorkflowManager,
+    privacy: &Connection,
+    source: &SourceProof,
+    snapshot: &UserSnapshot,
+) -> Result<bool, PrivacyWorkflowError> {
+    preflight_privacy_store(privacy)?;
+    if manager.vault_startup_write_required() {
+        return Ok(true);
+    }
+    if !source_manifest_terminal_matches(privacy, &source.persistent_fingerprint())? {
+        return Ok(true);
+    }
+
+    let cleanup = load_cleanup_authorization_snapshot(manager, privacy)?;
+    let plans = load_migration_plans(manager, privacy, snapshot, &cleanup)?;
+    let graph = binding_candidate_graph(snapshot, &plans);
+    for plan in &plans {
+        if !privacy_plan_terminal_matches(privacy, snapshot, plan, &graph.blocked_projects)? {
+            return Ok(true);
+        }
+    }
+    for case_file in &snapshot.case_files {
+        if !case_file_terminal_matches(
+            manager,
+            privacy,
+            snapshot,
+            manager.shared.workspace_instance_id.as_str(),
+            case_file,
+        )? {
+            return Ok(true);
+        }
+    }
+    for project in snapshot.projects.values() {
+        if !project_binding_terminal_matches(
+            privacy,
+            project,
+            graph.cases_by_project.get(project.project_id.as_str()),
+        )? {
+            return Ok(true);
+        }
+    }
+    validate_target_invariants(privacy, snapshot, &cleanup)?;
+    Ok(false)
+}
+
+fn with_v031_pinned_user_snapshot<T>(
+    manager: &PrivacyWorkflowManager,
+    gate: &OriginalRollbackVerifiedGate,
+    operation: impl FnOnce(&Connection, &Path, &SourceProof) -> Result<T, PrivacyWorkflowError>,
+) -> Result<T, PrivacyWorkflowError> {
+    super::validate_ordinary_database_file(&manager.shared.user_database_path)?;
+    let expected = gate.original_user_source_proof();
+    let (post_source, nested) = database::with_validated_user_database_migration_source_read_only(
+        &manager.shared.user_database_path,
+        |source_session| {
+            if !gate.authenticates_user_physical_file_set(source_session.proof())
+                || !same_v031_user_source_content(expected, source_session.proof())
+            {
+                return Err(v031_user_source_gate_error());
+            }
+            with_isolated_v031_user_snapshot(source_session, operation)
+        },
+    )
+    .map_err(|_| v031_user_source_gate_error())?;
+    if !gate.authenticates_user_physical_file_set(&post_source)
+        || !same_v031_user_source_content(expected, &post_source)
+    {
+        return Err(v031_user_source_gate_error());
+    }
+    nested
+}
+
+fn with_isolated_v031_user_snapshot<T>(
+    source_session: &ValidatedUserMigrationSourceSession<'_>,
+    operation: impl FnOnce(&Connection, &Path, &SourceProof) -> Result<T, PrivacyWorkflowError>,
+) -> Result<T, PrivacyWorkflowError> {
+    let directory = tempfile::Builder::new()
+        .prefix("lawyer-assistance-v031-user-snapshot-")
+        .tempdir()
+        .map_err(|_| source_snapshot_error())?;
+    let snapshot_path = directory.path().join("user-v031.sqlite");
+    let mut destination = Connection::open_with_flags(
+        &snapshot_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| source_snapshot_error())?;
+    source_session
+        .backup_to(&mut destination)
+        .map_err(|_| source_snapshot_error())?;
+    drop(destination);
+    super::validate_ordinary_database_file(&snapshot_path)?;
+    if ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| sqlite_sidecar_sha256(&snapshot_path, suffix))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|proof| proof.is_some())
+    {
+        return Err(source_snapshot_error());
+    }
+
+    let snapshot = Connection::open_with_flags(
+        &snapshot_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| source_snapshot_error())?;
+    snapshot
+        .execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA foreign_keys=ON;
+             PRAGMA trusted_schema=OFF;",
+        )
+        .map_err(|_| source_snapshot_error())?;
+    if database::validate_open_user_database_migration_source_read_only(&snapshot)
+        .map_err(|_| v031_user_source_gate_error())?
+        != ValidatedUserSourceSchema::V031V10
+    {
+        return Err(v031_user_source_gate_error());
+    }
+    assert_read_only_source(&snapshot)?;
+    snapshot
+        .execute_batch("BEGIN DEFERRED TRANSACTION")
+        .map_err(|_| source_snapshot_error())?;
+    let before = SourceProof::capture(&snapshot_path, &snapshot)?;
+    let result = operation(&snapshot, &snapshot_path, &before);
+    let after = SourceProof::capture(&snapshot_path, &snapshot);
+    let _ = snapshot.execute_batch("ROLLBACK");
+    match (result, after) {
+        (Ok(value), Ok(after)) if after == before => Ok(value),
+        (Ok(_), Ok(_)) => Err(migration_error(
+            "case_material_source_changed",
+            "The isolated exact-v0.3.1 user snapshot changed during Step 5.",
+        )),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn same_v031_user_source_content(
+    expected: &UserMigrationSourceProof,
+    actual: &UserMigrationSourceProof,
+) -> bool {
+    expected.schema == ValidatedUserSourceSchema::V031V10
+        && actual.schema == ValidatedUserSourceSchema::V031V10
+        && expected.schema_manifest_sha256 == actual.schema_manifest_sha256
+        && expected.logical_database_manifest_sha256 == actual.logical_database_manifest_sha256
+        && expected.business_manifest_sha256 == actual.business_manifest_sha256
+        && expected.business_primary_key_manifest_sha256
+            == actual.business_primary_key_manifest_sha256
+        && expected.business_row_manifest_sha256 == actual.business_row_manifest_sha256
+        && expected.tables == actual.tables
+        && expected.total_rows == actual.total_rows
+}
+
+fn v031_source_fingerprint(
+    gate: &OriginalRollbackVerifiedGate,
+    user_source: &UserMigrationSourceProof,
+    case_source: &SourceProof,
+) -> V031CaseMaterialSourceFingerprint {
+    let migration_source_fingerprint = case_source.persistent_fingerprint();
+    let mut fingerprint = Fingerprint::new(b"v031-case-material-source-gate-v1");
+    fingerprint.text(gate.lineage_id());
+    fingerprint.text(gate.source_profile_proof_sha256());
+    fingerprint.text(gate.original_identity_sha256());
+    fingerprint.text(gate.original_user_physical_file_set_sha256());
+    fingerprint.text(gate.original_privacy_physical_file_set_sha256());
+    fingerprint.text(&user_source.schema_manifest_sha256);
+    fingerprint.text(&user_source.logical_database_manifest_sha256);
+    fingerprint.text(&user_source.business_manifest_sha256);
+    fingerprint.text(&user_source.business_primary_key_manifest_sha256);
+    fingerprint.text(&user_source.business_row_manifest_sha256);
+    fingerprint.text(&user_source.total_rows.to_string());
+    // `PRAGMA data_version` is scoped to the observing SQLite connection. A
+    // fresh read-only connection after process restart can therefore report a
+    // different value for the exact same durable source. It remains useful as
+    // an in-connection change detector while capturing the proof, but it must
+    // not be sealed into a restart-persistent checkpoint identity.
+    fingerprint.text(&migration_source_fingerprint);
+    V031CaseMaterialSourceFingerprint {
+        evidence_sha256: fingerprint.finish(),
+        migration_source_fingerprint,
+    }
+}
+
+fn require_exact_privacy_v5(
+    manager: &PrivacyWorkflowManager,
+) -> Result<PrivacyV5ManifestProof, PrivacyWorkflowError> {
+    let privacy = open_privacy_read_only(&manager.shared.database_path)?;
+    compute_privacy_v5_manifests_read_only(&privacy).map_err(|_| v031_privacy_v5_proof_error())
+}
+
+fn compute_v031_terminal_proof(
+    manager: &PrivacyWorkflowManager,
+    user_connection: &Connection,
+    source: &SourceProof,
+    source_fingerprint: &V031CaseMaterialSourceFingerprint,
+) -> Result<V031BindingMaterialTerminalProof, PrivacyWorkflowError> {
+    let privacy = open_privacy_read_only(&manager.shared.database_path)?;
+    compute_v031_terminal_proof_with_privacy_connection(
+        manager,
+        user_connection,
+        source,
+        source_fingerprint,
+        &privacy,
+    )
+}
+
+fn compute_v031_terminal_proof_with_privacy_connection(
+    manager: &PrivacyWorkflowManager,
+    user_connection: &Connection,
+    source: &SourceProof,
+    source_fingerprint: &V031CaseMaterialSourceFingerprint,
+    privacy: &Connection,
+) -> Result<V031BindingMaterialTerminalProof, PrivacyWorkflowError> {
+    let user = UserSnapshot::load(user_connection)?;
+    let privacy_v5 = compute_privacy_v5_manifests_read_only(privacy)
+        .map_err(|_| v031_privacy_v5_proof_error())?;
+    let cleanup = load_cleanup_authorization_snapshot(manager, privacy)?;
+    if !cleanup.redactions.is_empty() || !cleanup.tombstoned_material_ids.is_empty() {
+        return Err(v031_terminal_proof_error());
+    }
+    let plans = load_migration_plans(manager, privacy, &user, &cleanup)?;
+
+    let expected_binding = user
+        .projects
+        .keys()
+        .map(|project_id| TerminalLedgerKey {
+            migration_id: PROJECT_CASE_BINDING_MIGRATION_ID.to_owned(),
+            source_store: SOURCE_STORE_USER.to_owned(),
+            source_table: "projects".to_owned(),
+            source_key: project_id.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    let mut expected_material = BTreeSet::from([TerminalLedgerKey {
+        migration_id: CASE_MATERIAL_MIGRATION_ID.to_owned(),
+        source_store: SOURCE_STORE_USER.to_owned(),
+        source_table: "source_manifest".to_owned(),
+        source_key: SOURCE_STORE_USER.to_owned(),
+    }]);
+    for plan in &plans {
+        expected_material.insert(TerminalLedgerKey {
+            migration_id: CASE_MATERIAL_MIGRATION_ID.to_owned(),
+            source_store: SOURCE_STORE_PRIVACY.to_owned(),
+            source_table: "privacy_materials".to_owned(),
+            source_key: plan.source.material_id.clone(),
+        });
+        for redaction in &plan.redactions {
+            expected_material.insert(TerminalLedgerKey {
+                migration_id: CASE_MATERIAL_MIGRATION_ID.to_owned(),
+                source_store: SOURCE_STORE_PRIVACY.to_owned(),
+                source_table: "privacy_redactions".to_owned(),
+                source_key: redaction.source.redaction_id.clone(),
+            });
+        }
+    }
+    for case_file in &user.case_files {
+        expected_material.insert(TerminalLedgerKey {
+            migration_id: CASE_MATERIAL_MIGRATION_ID.to_owned(),
+            source_store: SOURCE_STORE_USER.to_owned(),
+            source_table: "case_files".to_owned(),
+            source_key: case_file.file_id.clone(),
+        });
+    }
+
+    let actual = load_all_terminal_ledger_keys(privacy)?;
+    let actual_binding = actual
+        .iter()
+        .filter(|key| key.migration_id == PROJECT_CASE_BINDING_MIGRATION_ID)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let actual_material = actual
+        .iter()
+        .filter(|key| key.migration_id == CASE_MATERIAL_MIGRATION_ID)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if actual_binding != expected_binding
+        || actual_material != expected_material
+        || actual.len() != actual_binding.len() + actual_material.len()
+    {
+        return Err(v031_terminal_proof_error());
+    }
+
+    let mut blocked_rows = 0_u64;
+    for key in &actual_binding {
+        let (_, effective_result) = effective_ledger_state(
+            privacy,
+            &key.migration_id,
+            &key.source_store,
+            &key.source_table,
+            &key.source_key,
+        )?
+        .ok_or_else(v031_terminal_proof_error)?;
+        if !matches!(effective_result.as_str(), "migrated" | "blocked") {
+            return Err(v031_terminal_proof_error());
+        }
+    }
+    for key in &actual_material {
+        let (_, effective_result) = effective_ledger_state(
+            privacy,
+            &key.migration_id,
+            &key.source_store,
+            &key.source_table,
+            &key.source_key,
+        )?
+        .ok_or_else(v031_terminal_proof_error)?;
+        match effective_result.as_str() {
+            "migrated" | "legacy_reference" => {}
+            "blocked" => {
+                blocked_rows = blocked_rows
+                    .checked_add(1)
+                    .ok_or_else(v031_terminal_proof_error)?;
+            }
+            _ => return Err(v031_terminal_proof_error()),
+        }
+    }
+
+    let bindings_verified = validate_all_audited_bindings_read_only(privacy)?;
+    let binding_ledger_rows =
+        u64::try_from(actual_binding.len()).map_err(|_| v031_terminal_proof_error())?;
+    let material_ledger_rows =
+        u64::try_from(actual_material.len()).map_err(|_| v031_terminal_proof_error())?;
+    let terminal_rows = material_ledger_rows;
+    if blocked_rows > terminal_rows || bindings_verified > binding_ledger_rows {
+        return Err(v031_terminal_proof_error());
+    }
+
+    let ledger_manifest_sha256 = query_manifest(
+        privacy,
+        "SELECT migration_id,source_store,source_table,source_key,source_fingerprint,
+                target_material_id,target_redaction_id,assigned_generation_number,
+                result_state,error_code,started_at,completed_at
+         FROM case_material_migration_ledger
+         ORDER BY migration_id,source_store,source_table,source_key",
+        12,
+    )?;
+    let event_manifest_sha256 = query_manifest(
+        privacy,
+        "SELECT migration_event_id,migration_id,source_store,source_table,source_key,
+                event_type,source_fingerprint,target_material_id,target_redaction_id,
+                assigned_generation_number,result_state,error_code,occurred_at
+         FROM case_material_migration_events
+         ORDER BY migration_id,source_store,source_table,source_key,rowid",
+        13,
+    )?;
+    let binding_manifest_sha256 = query_manifest(
+        privacy,
+        "SELECT project_id,privacy_case_id,binding_version,creation_source,
+                creation_audit_id,migration_id,created_at,updated_at
+         FROM project_privacy_case_bindings
+         ORDER BY project_id",
+        8,
+    )?;
+    let audit_manifest_sha256 = query_manifest(
+        privacy,
+        "SELECT creation_audit_id,project_id,privacy_case_id,binding_version,
+                creation_source,migration_id,result,created_at
+         FROM project_privacy_case_binding_audit
+         ORDER BY creation_audit_id",
+        8,
+    )?;
+    let mut terminal = Fingerprint::new(b"v031-binding-material-terminal-proof-v1");
+    terminal.text(source_fingerprint.evidence_sha256());
+    terminal.text(&source.persistent_fingerprint());
+    terminal.text(&privacy_v5.schema_manifest_sha256);
+    terminal.text(&privacy_v5.logical_manifest.sha256);
+    terminal.text(&privacy_v5.business_manifest.sha256);
+    terminal.text(&ledger_manifest_sha256);
+    terminal.text(&event_manifest_sha256);
+    terminal.text(&binding_manifest_sha256);
+    terminal.text(&audit_manifest_sha256);
+    for count in [
+        binding_ledger_rows,
+        material_ledger_rows,
+        terminal_rows,
+        blocked_rows,
+        1,
+        bindings_verified,
+    ] {
+        let count = i64::try_from(count).map_err(|_| v031_terminal_proof_error())?;
+        terminal.integer(count);
+    }
+
+    Ok(V031BindingMaterialTerminalProof {
+        source_evidence_sha256: source_fingerprint.evidence_sha256.clone(),
+        privacy_v5,
+        binding_ledger_rows,
+        material_ledger_rows,
+        terminal_rows,
+        blocked_rows,
+        privacy_migration_batches: 1,
+        bindings_verified,
+        terminal_manifest_sha256: terminal.finish(),
+    })
+}
+
+fn load_all_terminal_ledger_keys(
+    connection: &Connection,
+) -> Result<BTreeSet<TerminalLedgerKey>, PrivacyWorkflowError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT migration_id,source_store,source_table,source_key
+             FROM case_material_migration_ledger
+             ORDER BY migration_id,source_store,source_table,source_key",
+        )
+        .map_err(|_| v031_terminal_proof_error())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(TerminalLedgerKey {
+                migration_id: row.get(0)?,
+                source_store: row.get(1)?,
+                source_table: row.get(2)?,
+                source_key: row.get(3)?,
+            })
+        })
+        .map_err(|_| v031_terminal_proof_error())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| v031_terminal_proof_error())?;
+    let set = rows.iter().cloned().collect::<BTreeSet<_>>();
+    if set.len() != rows.len() {
+        return Err(v031_terminal_proof_error());
+    }
+    Ok(set)
+}
+
+fn validate_all_audited_bindings_read_only(
+    connection: &Connection,
+) -> Result<u64, PrivacyWorkflowError> {
+    let bindings = {
+        let mut statement = connection
+            .prepare(
+                "SELECT project_id,privacy_case_id
+                 FROM project_privacy_case_bindings
+                 ORDER BY project_id",
+            )
+            .map_err(|_| v031_terminal_proof_error())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| v031_terminal_proof_error())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| v031_terminal_proof_error())?;
+        rows
+    };
+    for (project_value, case_value) in &bindings {
+        let project =
+            ProjectId::parse(project_value.clone()).map_err(|_| v031_terminal_proof_error())?;
+        let case_id =
+            PrivacyCaseId::parse(case_value.clone()).map_err(|_| v031_terminal_proof_error())?;
+        if ProjectPrivacyCaseBindingStore::resolve(connection, &project)
+            .map_err(|_| v031_terminal_proof_error())?
+            .as_ref()
+            != Some(&case_id)
+            || ProjectPrivacyCaseBindingStore::reverse_resolve(connection, &case_id)
+                .map_err(|_| v031_terminal_proof_error())?
+                .as_ref()
+                != Some(&project)
+            || ProjectPrivacyCaseBindingStore::validate_pair(connection, &project, &case_id)
+                .is_err()
+        {
+            return Err(v031_terminal_proof_error());
+        }
+    }
+    let (binding_count, distinct_projects, distinct_cases, distinct_audits, audit_count, orphaned) =
+        connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM project_privacy_case_bindings),
+                   (SELECT COUNT(DISTINCT project_id) FROM project_privacy_case_bindings),
+                   (SELECT COUNT(DISTINCT privacy_case_id) FROM project_privacy_case_bindings),
+                   (SELECT COUNT(DISTINCT creation_audit_id) FROM project_privacy_case_bindings),
+                   (SELECT COUNT(*) FROM project_privacy_case_binding_audit),
+                   (SELECT COUNT(*)
+                    FROM project_privacy_case_binding_audit AS audit
+                    LEFT JOIN project_privacy_case_bindings AS binding
+                      ON binding.creation_audit_id=audit.creation_audit_id
+                     AND binding.project_id=audit.project_id
+                     AND binding.privacy_case_id=audit.privacy_case_id
+                    WHERE binding.project_id IS NULL)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| v031_terminal_proof_error())?;
+    if binding_count < 0
+        || binding_count != distinct_projects
+        || binding_count != distinct_cases
+        || binding_count != distinct_audits
+        || binding_count != audit_count
+        || orphaned != 0
+        || usize::try_from(binding_count).ok() != Some(bindings.len())
+    {
+        return Err(v031_terminal_proof_error());
+    }
+    u64::try_from(binding_count).map_err(|_| v031_terminal_proof_error())
 }
 
 impl SourceProof {
     fn capture(path: &Path, connection: &Connection) -> Result<Self, PrivacyWorkflowError> {
         Ok(Self {
             file_sha256: file_sha256(path)?,
-            schema_manifest_sha256: query_manifest(
-                connection,
-                "SELECT type,name,tbl_name,COALESCE(sql,'')
-                 FROM sqlite_master
-                 ORDER BY type,name,tbl_name,COALESCE(sql,'')",
-                4,
-            )?,
+            schema_manifest_sha256: case_material_source_schema_manifest(connection)?,
             project_primary_keys_sha256: primary_key_manifest(
                 connection,
                 "SELECT project_id FROM projects ORDER BY project_id",
@@ -500,6 +2659,50 @@ impl SourceProof {
             )?,
             source_rows_sha256: source_rows_manifest(connection)?,
             wal_file_sha256: sqlite_sidecar_sha256(path, "-wal")?,
+            data_version: connection
+                .pragma_query_value(None, "data_version", |row| row.get(0))
+                .map_err(|_| source_snapshot_error())?,
+        })
+    }
+
+    fn capture_verified_image(
+        verified_image: &VerifiedV031UserCheckpointImage,
+    ) -> Result<Self, PrivacyWorkflowError> {
+        let proof = &verified_image.proof;
+        let connection = &verified_image.connection;
+        if proof.schema != ValidatedUserSourceSchema::V031V10
+            || !valid_hash(&proof.database_file.sha256)
+            || proof.schema_manifest_sha256 != database::V031_USER_SCHEMA_MANIFEST_SHA256
+            || proof.database_file.modified_unix_nanos.is_some()
+            || proof.wal.is_some()
+            || proof.shm.is_some()
+            || proof.journal.is_some()
+        {
+            return Err(source_snapshot_error());
+        }
+        let query_only = connection
+            .pragma_query_value(None, "query_only", |row| row.get::<_, i64>(0))
+            .map_err(|_| source_snapshot_error())?;
+        if query_only != 1 {
+            return Err(source_snapshot_error());
+        }
+        Ok(Self {
+            file_sha256: proof.database_file.sha256.clone(),
+            schema_manifest_sha256: case_material_source_schema_contract(proof.schema)?,
+            project_primary_keys_sha256: primary_key_manifest(
+                connection,
+                "SELECT project_id FROM projects ORDER BY project_id",
+            )?,
+            case_file_primary_keys_sha256: primary_key_manifest(
+                connection,
+                "SELECT file_id FROM case_files ORDER BY file_id",
+            )?,
+            attachment_primary_keys_sha256: primary_key_manifest(
+                connection,
+                "SELECT attachment_id FROM attachments ORDER BY attachment_id",
+            )?,
+            source_rows_sha256: source_rows_manifest(connection)?,
+            wal_file_sha256: None,
             data_version: connection
                 .pragma_query_value(None, "data_version", |row| row.get(0))
                 .map_err(|_| source_snapshot_error())?,
@@ -703,23 +2906,28 @@ fn preflight_privacy_store(connection: &Connection) -> Result<(), PrivacyWorkflo
             |row| row.get(0),
         )
         .map_err(|_| privacy_preflight_error())?;
-    let vault_conflict: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM privacy_vault_material_refs AS vault
-                JOIN privacy_materials AS material
-                  ON material.material_id=vault.material_id
-                WHERE vault.source_sha256<>material.source_sha256
-                   OR vault.object_version<=0
-                   OR vault.import_state NOT IN(
-                       'vault_committed','review_ready','processing_failed','revoked'
-                   )
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| privacy_preflight_error())?;
+    let vault_conflict =
+        if optional_v5_auxiliary_table_present(connection, "privacy_vault_material_refs")? {
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                    SELECT 1
+                    FROM privacy_vault_material_refs AS vault
+                    JOIN privacy_materials AS material
+                      ON material.material_id=vault.material_id
+                    WHERE vault.source_sha256<>material.source_sha256
+                       OR vault.object_version<=0
+                       OR vault.import_state NOT IN(
+                           'vault_committed','review_ready','processing_failed','revoked'
+                       )
+                 )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| privacy_preflight_error())?
+        } else {
+            false
+        };
     if orphaned || vault_conflict {
         return Err(privacy_preflight_error());
     }
@@ -902,6 +3110,63 @@ fn open_privacy_read_only(path: &Path) -> Result<Connection, PrivacyWorkflowErro
     Ok(connection)
 }
 
+fn open_verified_checkpoint_image_read_only(
+    sqlite_image: &[u8],
+) -> Result<Connection, PrivacyWorkflowError> {
+    let mut connection = Connection::open_in_memory().map_err(|_| source_snapshot_error())?;
+    connection
+        .deserialize_read_exact(
+            rusqlite::MAIN_DB,
+            Cursor::new(sqlite_image),
+            sqlite_image.len(),
+            true,
+        )
+        .map_err(|_| source_snapshot_error())?;
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA query_only=ON;
+             PRAGMA trusted_schema=OFF;",
+        )
+        .map_err(|_| source_snapshot_error())?;
+    let query_only: i64 = connection
+        .pragma_query_value(None, "query_only", |row| row.get(0))
+        .map_err(|_| source_snapshot_error())?;
+    if query_only != 1 {
+        return Err(source_snapshot_error());
+    }
+    Ok(connection)
+}
+
+fn open_verified_v031_user_checkpoint_image_read_only(
+    sqlite_image: &[u8],
+    expected: V031UserCheckpointImageExpectations<'_>,
+) -> Result<VerifiedV031UserCheckpointImage, PrivacyWorkflowError> {
+    let proof = database::validate_v031_user_sqlite_image_read_only(sqlite_image)
+        .map_err(|_| v031_user_source_gate_error())?;
+    let image_length = u64::try_from(sqlite_image.len()).map_err(|_| source_snapshot_error())?;
+    if proof.schema != ValidatedUserSourceSchema::V031V10
+        || proof.database_file.sha256 != expected.database_sha256
+        || proof.database_file.sha256 != sha256_hex(sqlite_image)
+        || proof.database_file.length != image_length
+        || proof.database_file.modified_unix_nanos.is_some()
+        || !valid_hash(&proof.database_file.identity_sha256)
+        || proof.wal.is_some()
+        || proof.shm.is_some()
+        || proof.journal.is_some()
+        || proof.schema_manifest_sha256 != database::V031_USER_SCHEMA_MANIFEST_SHA256
+        || proof.schema_manifest_sha256 != expected.schema_manifest_sha256
+        || proof.logical_database_manifest_sha256 != expected.logical_manifest_sha256
+        || proof.business_manifest_sha256 != expected.business_manifest_sha256
+        || proof.total_rows != expected.total_rows
+        || !same_v031_user_source_content(expected.rollback_semantic_proof, &proof)
+    {
+        return Err(v031_user_source_gate_error());
+    }
+    let connection = open_verified_checkpoint_image_read_only(sqlite_image)?;
+    Ok(VerifiedV031UserCheckpointImage { connection, proof })
+}
+
 fn run_backfill(
     manager: &PrivacyWorkflowManager,
     privacy: &mut Connection,
@@ -911,11 +3176,64 @@ fn run_backfill(
     user: &UserSnapshot,
     workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
 ) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
+    run_backfill_inner(
+        manager,
+        privacy,
+        user_connection,
+        user_database_path,
+        expected_source_proof,
+        user,
+        workspace_instance_id,
+        None,
+        None,
+    )
+}
+
+fn validate_v031_writer_gate(
+    writer_gate: &V031BindingMaterialWriterGate,
+    current_source: &SourceProof,
+    current_candidates: &V031CandidateManifests,
+) -> Result<(), PrivacyWorkflowError> {
+    if current_candidates != &writer_gate.candidates
+        || current_source.persistent_fingerprint()
+            != writer_gate.source.migration_source_fingerprint
+        || !valid_hash(&writer_gate.binding_checkpoint_identity_sha256)
+        || !valid_hash(&writer_gate.material_checkpoint_identity_sha256)
+        || writer_gate.binding_checkpoint_identity_sha256
+            == writer_gate.material_checkpoint_identity_sha256
+    {
+        return Err(v031_checkpoint_source_proof_error());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_backfill_inner(
+    manager: &PrivacyWorkflowManager,
+    privacy: &mut Connection,
+    user_connection: &Connection,
+    user_database_path: &Path,
+    expected_source_proof: &SourceProof,
+    user: &UserSnapshot,
+    workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
+    failure_point: Option<BackfillFailurePoint>,
+    v031_writer_gate: Option<&V031BindingMaterialWriterGate>,
+) -> Result<CaseMaterialMigrationReport, PrivacyWorkflowError> {
     let transaction = privacy
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| privacy_migration_store_error())?;
     let cleanup = load_cleanup_authorization_snapshot(manager, &transaction)?;
     let mut plans = load_migration_plans(manager, &transaction, user, &cleanup)?;
+    if let Some(writer_gate) = v031_writer_gate {
+        let current_source = SourceProof::capture(user_database_path, user_connection)?;
+        let current = compute_v031_candidate_manifests(
+            user,
+            &current_source,
+            &plans,
+            workspace_instance_id.as_str(),
+        )?;
+        validate_v031_writer_gate(writer_gate, &current_source, &current)?;
+    }
     let mut report = CaseMaterialMigrationReport::default();
 
     let blocked_binding_projects =
@@ -939,6 +3257,7 @@ fn run_backfill(
         &blocked_binding_projects,
         &mut report,
     )?;
+    inject_backfill_failure(failure_point, BackfillFailurePoint::AfterProjectBindings)?;
 
     for case_file in &user.case_files {
         migrate_case_file(
@@ -966,15 +3285,21 @@ fn run_backfill(
         ));
     }
     record_source_manifest(&transaction, &final_source_proof, &mut report)?;
+    inject_backfill_failure(failure_point, BackfillFailurePoint::BeforeCommit)?;
     transaction
         .commit()
         .map_err(|_| privacy_migration_store_error())?;
+    // Keep this boundary immediately adjacent to commit: an injected error is
+    // returned to the command coordinator before it can append Receipt 5.
+    inject_backfill_failure(failure_point, BackfillFailurePoint::AfterCommit)?;
     Ok(report)
 }
 
 fn load_privacy_sources(
     connection: &Connection,
 ) -> Result<Vec<PrivacyMaterialSource>, PrivacyWorkflowError> {
+    let vault_links_present =
+        optional_v5_auxiliary_table_present(connection, "privacy_vault_material_refs")?;
     let mut material_statement = connection
         .prepare(
             "SELECT material_id,project_id,legacy_case_id,attachment_id,
@@ -1019,9 +3344,12 @@ fn load_privacy_sources(
 
     let mut sources = Vec::with_capacity(material_rows.len());
     for mut material in material_rows {
-        material.vault_binding =
+        material.vault_binding = if vault_links_present {
             vault_broker::load_vault_binding_for_material(connection, &material.material_id)
-                .map_err(PrivacyWorkflowError::vault)?;
+                .map_err(PrivacyWorkflowError::vault)?
+        } else {
+            None
+        };
         let mut redaction_statement = connection
             .prepare(
                 "SELECT redaction_id,material_id,generation_number,generation_status,
@@ -1125,6 +3453,9 @@ fn historical_vault_ref(
     connection: &Connection,
     material_id: &str,
 ) -> Result<Option<HistoricalVaultRef>, PrivacyWorkflowError> {
+    if !optional_v5_auxiliary_table_present(connection, "privacy_vault_material_refs")? {
+        return Ok(None);
+    }
     connection
         .query_row(
             "SELECT case_id,object_id,object_version,source_sha256,envelope_sha256,
@@ -1263,6 +3594,9 @@ fn completed_project_deletion_tombstone(
         return Ok(false);
     };
     if user.projects.contains_key(project_value) {
+        return Ok(false);
+    }
+    if !optional_v5_auxiliary_table_present(connection, "project_deletion_journal")? {
         return Ok(false);
     }
     let journal = connection
@@ -3402,6 +5736,9 @@ fn reusable_privacy_material(
     case_file: &CaseFileSource,
     attachment: &AttachmentSource,
 ) -> Result<Option<String>, PrivacyWorkflowError> {
+    if !optional_v5_auxiliary_table_present(connection, "privacy_vault_material_refs")? {
+        return Ok(None);
+    }
     let mut statement = connection
         .prepare(
             "SELECT material.material_id
@@ -4221,25 +6558,61 @@ fn validate_target_invariants(
         let case_id = ProjectPrivacyCaseBindingStore::resolve(connection, &project)
             .map_err(PrivacyWorkflowError::project_case_binding)?
             .ok_or_else(migration_target_mismatch)?;
-        let conflict: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1
-                    FROM privacy_materials AS material
-                    JOIN privacy_vault_material_refs AS vault
-                      ON vault.material_id=material.material_id
-                    WHERE material.project_id=?1 AND material.migration_status='ready'
-                      AND material.source_kind='vault' AND vault.case_id<>?2
-                 )",
-                params![project.as_str(), case_id.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|_| privacy_migration_store_error())?;
+        let conflict =
+            if optional_v5_auxiliary_table_present(connection, "privacy_vault_material_refs")? {
+                connection
+                    .query_row(
+                        "SELECT EXISTS(
+                        SELECT 1
+                        FROM privacy_materials AS material
+                        JOIN privacy_vault_material_refs AS vault
+                          ON vault.material_id=material.material_id
+                        WHERE material.project_id=?1 AND material.migration_status='ready'
+                          AND material.source_kind='vault' AND vault.case_id<>?2
+                     )",
+                        params![project.as_str(), case_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| privacy_migration_store_error())?
+            } else {
+                false
+            };
         if conflict {
             return Err(migration_target_mismatch());
         }
     }
     Ok(())
+}
+
+fn optional_v5_auxiliary_table_present(
+    connection: &Connection,
+    table_name: &'static str,
+) -> Result<bool, PrivacyWorkflowError> {
+    let present = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1
+             )",
+            [table_name],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|_| privacy_preflight_error())?;
+    if present {
+        return Ok(true);
+    }
+    let version = connection
+        .query_row(
+            "SELECT value FROM privacy_schema_metadata WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| privacy_preflight_error())?;
+    if version.as_deref() == Some("5") {
+        Ok(false)
+    } else {
+        Err(privacy_preflight_error())
+    }
 }
 
 fn query_manifest(
@@ -4263,6 +6636,24 @@ fn query_manifest(
         }
     }
     Ok(fingerprint.finish())
+}
+
+fn case_material_source_schema_manifest(
+    connection: &Connection,
+) -> Result<String, PrivacyWorkflowError> {
+    let exact_schema = database::validate_open_user_database_migration_source_read_only(connection)
+        .map_err(|_| source_snapshot_error())?;
+    case_material_source_schema_contract(exact_schema)
+}
+
+fn case_material_source_schema_contract(
+    exact_schema: ValidatedUserSourceSchema,
+) -> Result<String, PrivacyWorkflowError> {
+    match exact_schema {
+        ValidatedUserSourceSchema::V031V10 | ValidatedUserSourceSchema::CurrentV11 => {
+            Ok(sha256_hex(CASE_MATERIAL_SOURCE_SCHEMA_CONTRACT.as_bytes()))
+        }
+    }
 }
 
 fn primary_key_manifest(
@@ -4386,6 +6777,51 @@ fn source_snapshot_error() -> PrivacyWorkflowError {
     )
 }
 
+fn v031_user_source_gate_error() -> PrivacyWorkflowError {
+    migration_error(
+        "v031_case_material_user_source_invalid",
+        "Step 5 requires the exact user schema-10 source authenticated by the original rollback gate.",
+    )
+}
+
+fn v031_privacy_v5_proof_error() -> PrivacyWorkflowError {
+    migration_error(
+        "v031_case_material_privacy_v5_invalid",
+        "The Privacy schema-5 checkpoint failed its exact read-only manifest proof.",
+    )
+}
+
+fn v031_checkpoint_source_proof_error() -> PrivacyWorkflowError {
+    migration_error(
+        "v031_case_material_checkpoint_source_invalid",
+        "The authenticated pre-v5 source or Binding/Materials checkpoint commitments no longer match Step 5.",
+    )
+}
+
+fn v031_terminal_proof_error() -> PrivacyWorkflowError {
+    migration_error(
+        "v031_binding_material_terminal_proof_invalid",
+        "Committed Privacy schema-5 state is not an exact terminal binding/material migration.",
+    )
+}
+
+fn inject_backfill_failure(
+    requested: Option<BackfillFailurePoint>,
+    current: BackfillFailurePoint,
+) -> Result<(), PrivacyWorkflowError> {
+    if requested == Some(current) {
+        return Err(injected_backfill_failure());
+    }
+    Ok(())
+}
+
+fn injected_backfill_failure() -> PrivacyWorkflowError {
+    migration_error(
+        "v031_case_material_injected_failure",
+        "The test-only Step-5 failure was injected at a durable migration boundary.",
+    )
+}
+
 fn privacy_preflight_error() -> PrivacyWorkflowError {
     migration_error(
         "case_material_privacy_preflight_failed",
@@ -4418,10 +6854,11 @@ fn missing_vault_history_error() -> PrivacyWorkflowError {
 mod tests {
     use super::*;
     use crate::{
+        commands::v031_migration_checkpoint::V031MigrationCheckpointProof,
         privacy_manager::{LocalOcrStatus, LocalOcrStatusCode, PrivacyConfig},
         privacy_workflow::{
-            test_workspace_instance_id, ApprovedPublicationInvalidator, LocalOcrExecutionContext,
-            PrivacyReviewView,
+            approved_case_projection::ProjectionFailurePoint, test_workspace_instance_id,
+            ApprovedPublicationInvalidator, LocalOcrExecutionContext, PrivacyReviewView,
         },
     };
     use privacy::{
@@ -4473,6 +6910,502 @@ mod tests {
         _directory: tempfile::TempDir,
         user_database_path: PathBuf,
         manager: PrivacyWorkflowManager,
+    }
+
+    struct V031Fixture {
+        _directory: tempfile::TempDir,
+        user_database_path: PathBuf,
+        manager: PrivacyWorkflowManager,
+        gate: OriginalRollbackVerifiedGate,
+    }
+
+    impl V031Fixture {
+        fn new(projects: &[&str]) -> Self {
+            let directory = tempfile::tempdir().expect("v0.3.1 migration fixture directory");
+            let user_database_path = database::user_database_path(directory.path());
+            create_exact_v031_user_database(&user_database_path, projects);
+            let original_user_source =
+                database::with_validated_user_database_migration_source_read_only(
+                    &user_database_path,
+                    |_| (),
+                )
+                .expect("exact v0.3.1 user source")
+                .0;
+            let mut gate =
+                OriginalRollbackVerifiedGate::from_user_source_for_test(original_user_source);
+
+            let privacy_directory = directory
+                .path()
+                .join(crate::privacy_workflow::PRIVACY_DIRECTORY_NAME);
+            fs::create_dir_all(&privacy_directory).expect("privacy fixture directory");
+            let privacy_database =
+                privacy_directory.join(crate::privacy_workflow::PRIVACY_DATABASE_NAME);
+            let privacy = Connection::open(&privacy_database).expect("privacy v1 database");
+            privacy
+                .execute_batch(privacy::PRIVACY_V1_SCHEMA_MANIFEST_DDL)
+                .expect("privacy v1 schema");
+            privacy
+                .execute(
+                    "INSERT INTO privacy_schema_metadata(key,value,updated_at)
+                     VALUES('schema_version','1','2026-07-19 15:41:29')",
+                    [],
+                )
+                .expect("privacy v1 marker");
+            drop(privacy);
+            let original_privacy_source =
+                privacy::validate_privacy_v1_migration_source_read_only(&privacy_database)
+                    .expect("exact v0.3.1 Privacy source");
+            gate = gate.with_privacy_source_for_checkpoint_test(original_privacy_source);
+
+            let manager = PrivacyWorkflowManager::new_with_approved_publication_invalidator(
+                directory.path().to_path_buf(),
+                test_workspace_instance_id(),
+                Arc::new(NoopPublicationInvalidator),
+            )
+            .expect("deferred v0.3.1 privacy manager");
+            manager.set_test_runtime(
+                ReceiptSigner::new([31_u8; 32]).expect("v0.3.1 migration test signer"),
+                1_800_000_000,
+            );
+            Self {
+                _directory: directory,
+                user_database_path,
+                manager,
+                gate,
+            }
+        }
+
+        fn upgrade_to_v5(&self) -> PrivacyV5ManifestProof {
+            self.manager
+                .upgrade_v031_privacy_store_to_v5_after_original_rollback(&self.gate)
+                .expect("exact Privacy v1 to v5 upgrade")
+        }
+
+        fn target_gate(&self) -> V031TargetComponentsPreparedGate {
+            V031TargetComponentsPreparedGate::for_case_material_checkpoint_test(
+                self.gate.clone(),
+                self.manager.shared.workspace_instance_id.clone(),
+            )
+        }
+    }
+
+    #[test]
+    fn v031_source_fingerprint_ignores_connection_local_data_version_only() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        let user_source = fixture.gate.original_user_source_proof().clone();
+        let case_source = SourceProof {
+            file_sha256: "1".repeat(64),
+            schema_manifest_sha256: "2".repeat(64),
+            project_primary_keys_sha256: "3".repeat(64),
+            case_file_primary_keys_sha256: "4".repeat(64),
+            attachment_primary_keys_sha256: "5".repeat(64),
+            source_rows_sha256: "6".repeat(64),
+            wal_file_sha256: Some("7".repeat(64)),
+            data_version: 11,
+        };
+        let expected = v031_source_fingerprint(&fixture.gate, &user_source, &case_source);
+
+        let mut reopened_user_source = user_source.clone();
+        reopened_user_source.data_version += 1;
+        let mut reopened_case_source = case_source.clone();
+        reopened_case_source.data_version += 1;
+        assert_eq!(
+            v031_source_fingerprint(&fixture.gate, &reopened_user_source, &reopened_case_source,),
+            expected,
+            "connection-local SQLite data_version values are not durable checkpoint identity",
+        );
+
+        let mut user_manifest_drift = user_source.clone();
+        user_manifest_drift.business_row_manifest_sha256 = "8".repeat(64);
+        assert_ne!(
+            v031_source_fingerprint(&fixture.gate, &user_manifest_drift, &case_source),
+            expected,
+            "durable user-row manifest drift must change checkpoint identity",
+        );
+
+        let mut case_manifest_drift = case_source.clone();
+        case_manifest_drift.source_rows_sha256 = "9".repeat(64);
+        assert_ne!(
+            v031_source_fingerprint(&fixture.gate, &user_source, &case_manifest_drift),
+            expected,
+            "durable case-material row drift must change checkpoint identity",
+        );
+    }
+
+    #[test]
+    fn case_material_source_schema_survives_v10_to_v11_but_detects_source_table_ddl_drift() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        complete_v031_step5(&fixture);
+
+        let full_schema_manifest = |connection: &Connection| {
+            query_manifest(
+                connection,
+                "SELECT type,name,tbl_name,COALESCE(sql,'')
+                 FROM sqlite_master
+                 ORDER BY type,name,tbl_name,COALESCE(sql,'')",
+                4,
+            )
+            .expect("whole user schema manifest")
+        };
+        fn source_schema_details(connection: &Connection) -> Vec<String> {
+            let mut details = Vec::new();
+            for table in ["projects", "case_files", "attachments"] {
+                let ddl = connection
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .expect("source table DDL");
+                details.push(format!("DDL|{table}|{ddl}"));
+                for (label, sql) in [
+                    (
+                        "table_xinfo",
+                        format!(
+                            "SELECT printf('%d|%s|%s|%d|%s|%d|%d',cid,name,type,\"notnull\",COALESCE(quote(dflt_value),'NULL'),pk,hidden) FROM pragma_table_xinfo('{table}') ORDER BY cid"
+                        ),
+                    ),
+                    (
+                        "foreign_key_list",
+                        format!(
+                            "SELECT printf('%d|%d|%s|%s|%s|%s|%s|%s',id,seq,\"table\",\"from\",\"to\",on_update,on_delete,match) FROM pragma_foreign_key_list('{table}') ORDER BY id,seq"
+                        ),
+                    ),
+                    (
+                        "index_list",
+                        format!(
+                            "SELECT printf('%d|%s|%d|%s|%d',seq,name,\"unique\",origin,partial) FROM pragma_index_list('{table}') ORDER BY seq"
+                        ),
+                    ),
+                ] {
+                    let mut statement = connection.prepare(&sql).expect("schema PRAGMA prepares");
+                    let rows = statement
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .expect("schema PRAGMA queries")
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .expect("schema PRAGMA collects");
+                    for row in rows {
+                        details.push(format!("{label}|{table}|{row}"));
+                    }
+                }
+            }
+            details
+        }
+        let source_proof_before = {
+            let connection = database::open_user_database_read_only(&fixture.user_database_path)
+                .expect("open exact user v10 source read-only");
+            (
+                SourceProof::capture(&fixture.user_database_path, &connection)
+                    .expect("capture user v10 case-material source"),
+                full_schema_manifest(&connection),
+                source_schema_details(&connection),
+            )
+        };
+
+        let mut connection = database::open_existing_user_database(&fixture.user_database_path)
+            .expect("open configured exact user v10 upgrade target");
+        database::migrate_exact_v031_user_to_v11_with_upgrade_audit(
+            &mut connection,
+            fixture.gate.original_user_source_proof(),
+            &database::V031UserUpgradeAuditEvidence {
+                lineage_id: "1".repeat(64),
+                source_profile_proof_sha256: "2".repeat(64),
+                source_privacy_logical_manifest_sha256: "3".repeat(64),
+                source_privacy_business_manifest_sha256: "4".repeat(64),
+                original_rollback_identity_sha256: "5".repeat(64),
+                target_privacy_pre_audit_logical_manifest_sha256: "6".repeat(64),
+                target_privacy_pre_audit_business_manifest_sha256: "7".repeat(64),
+                previous_receipt_sha256: "8".repeat(64),
+                source_privacy_table_count: 5,
+                source_privacy_total_rows: 0,
+                target_privacy_table_count: privacy::PRIVACY_V6_APPLICATION_TABLES.len() as u64,
+                target_privacy_total_rows: 1,
+                original_rollback_slot_count: 5,
+            },
+        )
+        .expect("migrate exact user v10 to canonical v11");
+        drop(connection);
+
+        let source_proof_after = {
+            let connection = database::open_user_database_read_only(&fixture.user_database_path)
+                .expect("open canonical user v11 source read-only");
+            (
+                SourceProof::capture(&fixture.user_database_path, &connection)
+                    .expect("capture user v11 case-material source"),
+                full_schema_manifest(&connection),
+                source_schema_details(&connection),
+            )
+        };
+        assert_ne!(
+            source_proof_before.1, source_proof_after.1,
+            "the canonical v10 -> v11 migration must exercise a real whole-schema change",
+        );
+        let source_table_ddl = |details: &[String]| {
+            details
+                .iter()
+                .filter(|detail| detail.starts_with("DDL|"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let source_table_semantics = |details: &[String]| {
+            details
+                .iter()
+                .filter(|detail| !detail.starts_with("DDL|"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            source_table_ddl(&source_proof_before.2),
+            source_table_ddl(&source_proof_after.2),
+            "canonical rebuild records differently formatted sqlite_master DDL",
+        );
+        assert_eq!(
+            source_table_semantics(&source_proof_before.2),
+            source_table_semantics(&source_proof_after.2),
+            "source table columns, defaults, keys, foreign keys, and indexes remain exact",
+        );
+        assert_eq!(
+            source_proof_before.0.schema_manifest_sha256,
+            source_proof_after.0.schema_manifest_sha256,
+            "exact v10 and v11 profiles map to one frozen case-material read contract",
+        );
+        assert_eq!(
+            source_proof_before.0.persistent_fingerprint(),
+            source_proof_after.0.persistent_fingerprint(),
+            "unrelated canonical v11 schema objects must not invalidate committed Step 5",
+        );
+        assert!(
+            !fixture
+                .manager
+                .case_material_migration_required()
+                .expect("canonical user v11 remains a valid no-op probe"),
+            "a legal user v10 -> v11 migration must remain a Step-9 no-op",
+        );
+
+        let connection = database::open_existing_user_database(&fixture.user_database_path)
+            .expect("open configured canonical user v11 for source-table drift");
+        connection
+            .execute_batch("ALTER TABLE projects ADD COLUMN migration_drift TEXT;")
+            .expect("inject source-table DDL drift");
+        drop(connection);
+
+        let source = database::open_user_database_read_only(&fixture.user_database_path)
+            .expect("open drifted user source read-only");
+        source
+            .execute_batch("BEGIN DEFERRED TRANSACTION;")
+            .expect("pin drifted user source");
+        let error = SourceProof::capture(&fixture.user_database_path, &source)
+            .expect_err("source-table DDL drift must fail exact-profile capture");
+        assert_eq!(error.code(), "case_material_source_snapshot_failed");
+        source
+            .execute_batch("ROLLBACK")
+            .expect("release drifted source");
+        let error = fixture
+            .manager
+            .case_material_migration_required()
+            .expect_err("the public exact-schema gate must fail closed on source DDL drift");
+        assert_eq!(error.code(), "case_material_source_snapshot_failed");
+    }
+
+    #[test]
+    fn checkpoint_image_source_contract_requires_byte_validated_capability() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        let image = serialized_sqlite_checkpoint_image_for_test(&fixture.user_database_path);
+        let image_sha256 = sha256_hex(&image);
+        let original = fixture.gate.original_user_source_proof();
+
+        let generic_memory = open_verified_checkpoint_image_read_only(&image)
+            .expect("generic checkpoint image opens query-only");
+        let error = case_material_source_schema_manifest(&generic_memory)
+            .expect_err("an arbitrary in-memory connection cannot use the live-file exact gate");
+        assert_eq!(error.code(), "case_material_source_snapshot_failed");
+
+        let expected = || V031UserCheckpointImageExpectations {
+            database_sha256: &image_sha256,
+            schema_manifest_sha256: &original.schema_manifest_sha256,
+            logical_manifest_sha256: &original.logical_database_manifest_sha256,
+            business_manifest_sha256: &original.business_manifest_sha256,
+            total_rows: original.total_rows,
+            rollback_semantic_proof: original,
+        };
+        let verified = open_verified_v031_user_checkpoint_image_read_only(&image, expected())
+            .expect("byte-validated v10 image returns the private source capability");
+        let detached = verified
+            .capture_source_proof()
+            .expect("capability captures detached source proof");
+
+        let live = database::open_user_database_read_only(&fixture.user_database_path)
+            .expect("live exact v10 source opens read-only");
+        live.execute_batch("BEGIN DEFERRED TRANSACTION;")
+            .expect("pin live exact v10 source");
+        let live_source = SourceProof::capture(&fixture.user_database_path, &live)
+            .expect("live exact-v10 source proof");
+        live.execute_batch("ROLLBACK")
+            .expect("release live exact-v10 source");
+        assert_eq!(
+            detached.persistent_fingerprint(),
+            live_source.persistent_fingerprint(),
+            "the capability maps the validated checkpoint to the frozen live read contract",
+        );
+
+        let wrong_image_sha256 = "f".repeat(64);
+        assert!(open_verified_v031_user_checkpoint_image_read_only(
+            &image,
+            V031UserCheckpointImageExpectations {
+                database_sha256: &wrong_image_sha256,
+                ..expected()
+            },
+        )
+        .is_err());
+        let wrong_schema_manifest = "e".repeat(64);
+        assert!(open_verified_v031_user_checkpoint_image_read_only(
+            &image,
+            V031UserCheckpointImageExpectations {
+                schema_manifest_sha256: &wrong_schema_manifest,
+                ..expected()
+            },
+        )
+        .is_err());
+        let mut tampered_image = image;
+        let last = tampered_image.len() - 1;
+        tampered_image[last] ^= 0x01;
+        assert!(
+            open_verified_v031_user_checkpoint_image_read_only(&tampered_image, expected())
+                .is_err()
+        );
+    }
+
+    fn step4_checkpoint_proofs_for_test(
+        fixture: &V031Fixture,
+        target: &V031TargetComponentsPreparedGate,
+        source: &V031CaseMigrationCheckpointSourceProof,
+    ) -> (V031MigrationCheckpointProof, V031MigrationCheckpointProof) {
+        let user = fixture.gate.original_user_source_proof();
+        let binding = source.binding_checkpoint_candidate_evidence();
+        let materials = source.material_checkpoint_candidate_evidence();
+        let checkpoint = |kind, candidate: V031CheckpointCandidateEvidence, discriminator| {
+            V031MigrationCheckpointProof::binding_material_for_test(
+                kind,
+                fixture.gate.lineage_id().to_owned(),
+                fixture.gate.original_identity_sha256().to_owned(),
+                target.workspace_instance_id().as_str().to_owned(),
+                "3".repeat(64),
+                user.schema_manifest_sha256.clone(),
+                user.logical_database_manifest_sha256.clone(),
+                user.business_manifest_sha256.clone(),
+                user.total_rows,
+                "4".repeat(64),
+                source.privacy_v1_logical_manifest_sha256.clone(),
+                source.privacy_v1_business_manifest_sha256.clone(),
+                source.privacy_v1_total_rows,
+                candidate.source_fingerprint,
+                candidate.candidate_manifest_sha256,
+                candidate.candidate_count,
+                discriminator,
+            )
+        };
+        (
+            checkpoint(V031CheckpointKind::Binding, binding, 11),
+            checkpoint(V031CheckpointKind::Materials, materials, 12),
+        )
+    }
+
+    fn sqlite_file_set_bytes_for_test(path: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .map(|suffix| {
+                let mut value = path.as_os_str().to_os_string();
+                value.push(suffix);
+                let slot = PathBuf::from(value);
+                (
+                    suffix.to_owned(),
+                    match fs::read(slot) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => panic!("read SQLite file-set slot {suffix}: {error}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn serialized_sqlite_checkpoint_image_for_test(path: &Path) -> Vec<u8> {
+        let source = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("checkpoint source opens read-only");
+        source
+            .execute_batch(
+                "PRAGMA query_only=ON;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA trusted_schema=OFF;
+                 BEGIN DEFERRED TRANSACTION;",
+            )
+            .expect("checkpoint source snapshot pins");
+        let mut destination = Connection::open_in_memory().expect("checkpoint image opens");
+        rusqlite::backup::Backup::new(&source, &mut destination)
+            .expect("checkpoint Backup API starts")
+            .run_to_completion(64, std::time::Duration::from_millis(1), None)
+            .expect("checkpoint Backup API completes");
+        let mut image = destination
+            .serialize(rusqlite::MAIN_DB)
+            .expect("checkpoint image serializes")
+            .to_vec();
+        assert!(image.len() >= 100);
+        assert!(image.starts_with(b"SQLite format 3\0"));
+        match (image[18], image[19]) {
+            (1, 1) => {}
+            (2, 2) => {
+                image[18] = 1;
+                image[19] = 1;
+            }
+            header => panic!("unexpected checkpoint SQLite header mode: {header:?}"),
+        }
+        image
+    }
+
+    fn create_exact_v031_user_database(database_path: &Path, projects: &[&str]) {
+        let connection = Connection::open(database_path).expect("v0.3.1 user database");
+        let objects =
+            include_str!("../../../../../crates/database/schema/v031-user-sqlite-master.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("schema object"))
+                .collect::<Vec<_>>();
+        for object_type in ["table", "index", "trigger", "view"] {
+            for object in objects
+                .iter()
+                .filter(|object| object["object_type"] == object_type)
+            {
+                connection
+                    .execute_batch(object["sql"].as_str().expect("schema sql"))
+                    .expect("v0.3.1 schema object");
+            }
+        }
+        connection
+            .execute(
+                "INSERT INTO user_database_metadata(key,value,updated_at)
+                 VALUES('schema_version',?1,'2026-07-19 15:41:29')",
+                [database::V031_USER_SCHEMA_VERSION.to_string()],
+            )
+            .expect("v0.3.1 schema version");
+        connection
+            .execute(
+                "INSERT INTO user_database_metadata(key,value,updated_at)
+                 VALUES('canonical_schema_version',?1,'2026-07-19 15:41:29')",
+                [database::V031_USER_CANONICAL_SCHEMA_MARKER],
+            )
+            .expect("v0.3.1 canonical marker");
+        for project_id in projects {
+            connection
+                .execute(
+                    "INSERT INTO projects(
+                       project_id,title,case_type,status,opened_on,summary,created_at,updated_at
+                     ) VALUES(?1,?2,'civil','active',NULL,'','2026-07-19','2026-07-19')",
+                    params![project_id, format!("Project {project_id}")],
+                )
+                .expect("v0.3.1 project");
+        }
     }
 
     impl Fixture {
@@ -4905,6 +7838,1880 @@ mod tests {
             },
         )
         .expect("insert project");
+    }
+
+    fn complete_v031_step5(
+        fixture: &V031Fixture,
+    ) -> (
+        V031CaseMaterialSourceFingerprint,
+        V031BindingMaterialTerminalProof,
+    ) {
+        fixture.upgrade_to_v5();
+        let source = fixture
+            .manager
+            .v031_case_material_migration_source_fingerprint(&fixture.gate)
+            .expect("Step-5 source fingerprint");
+        fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("Step-5 migration");
+        let terminal = fixture
+            .manager
+            .v031_binding_material_terminal_proof(&fixture.gate, &source)
+            .expect("Step-5 terminal proof");
+        (source, terminal)
+    }
+
+    fn projection_checkpoint_for_test(
+        fixture: &V031Fixture,
+        source: &super::super::approved_case_projection::V031ApprovedProjectionSourceProof,
+    ) -> V031MigrationCheckpointProof {
+        let user = fixture.gate.original_user_source_proof();
+        V031MigrationCheckpointProof::projection_for_test(
+            fixture.gate.lineage_id().to_owned(),
+            fixture.gate.original_identity_sha256().to_owned(),
+            test_workspace_instance_id().as_str().to_owned(),
+            "3".repeat(64),
+            user.schema_manifest_sha256.clone(),
+            user.logical_database_manifest_sha256.clone(),
+            user.business_manifest_sha256.clone(),
+            user.total_rows,
+            source.source_fingerprint().to_owned(),
+            source.candidate_manifest_sha256().to_owned(),
+            source.candidate_count(),
+            source.privacy_v5().logical_manifest.sha256.clone(),
+            source.privacy_v5().business_manifest.sha256.clone(),
+            source.privacy_v5().total_row_count,
+        )
+    }
+
+    fn insert_invalid_approved_projection_candidate(fixture: &V031Fixture) {
+        let connection = fixture
+            .manager
+            .open_raw_connection()
+            .expect("Privacy v5 writer");
+        connection
+            .execute(
+                "INSERT INTO privacy_materials(
+                   material_id,project_id,legacy_case_id,attachment_id,
+                   source_sha256,source_name_sha256,media_type,page_count,
+                   source_kind,extraction_status,migration_status,state,
+                   created_at,updated_at
+                 ) VALUES(
+                   'projection-material',?1,NULL,NULL,?2,?3,'text/plain',1,
+                   'local_review','approved','ready','approved',
+                   '2026-07-19 15:41:29','2026-07-19 15:41:29'
+                 )",
+                params![
+                    PROJECT_A,
+                    sha256_hex(b"projection source"),
+                    sha256_hex(b"projection source name")
+                ],
+            )
+            .expect("projection material");
+        connection
+            .execute(
+                "INSERT INTO privacy_redactions(
+                   redaction_id,material_id,generation_number,generation_status,
+                   extraction_sha256,redacted_content_sha256,approved_payload_sha256,
+                   policy_id,policy_version,detector_version,
+                   unresolved_high_risk_count,review_state,risk_revision,
+                   protected_review_blob,protection_scheme,reviewed_by_sha256,
+                   approved_at,revocation_state,revoked_at,row_version,
+                   created_at,reviewed_at
+                 ) VALUES(
+                   'projection-redaction','projection-material',1,'ready',
+                   ?1,?2,?3,'projection-policy',1,'projection-detector',
+                   0,'approved',1,x'00',?4,?5,
+                   '2026-07-19 15:41:29','active',NULL,1,
+                   '2026-07-19 15:41:29','2026-07-19 15:41:29'
+                 )",
+                params![
+                    sha256_hex(b"projection extraction"),
+                    sha256_hex(b"projection redacted"),
+                    sha256_hex(b"projection approved"),
+                    privacy::LOCAL_PROTECTION_SCHEME,
+                    sha256_hex(b"projection reviewer"),
+                ],
+            )
+            .expect("invalid historical approved source");
+    }
+
+    #[test]
+    fn v031_projection_checkpoint_images_rebuild_step5_and_step6_source_without_active_sources() {
+        let fixture = V031Fixture::new(&[PROJECT_A, PROJECT_B]);
+        let target = fixture.target_gate();
+        let step4_source = fixture
+            .manager
+            .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+            .expect("Step-4 source proof");
+        let (binding_checkpoint, material_checkpoint) =
+            step4_checkpoint_proofs_for_test(&fixture, &target, &step4_source);
+        fixture
+            .manager
+            .upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                &fixture.gate,
+                &target,
+                &step4_source,
+                &binding_checkpoint,
+                &material_checkpoint,
+            )
+            .expect("Privacy v5 initializes after exact checkpoints");
+        fixture
+            .manager
+            .run_v031_case_material_migration_after_checkpoints(
+                &fixture.gate,
+                &target,
+                &binding_checkpoint,
+                &material_checkpoint,
+            )
+            .expect("Step-5 migration completes");
+        let expected_terminal = fixture
+            .manager
+            .v031_binding_material_terminal_proof_after_checkpoints(
+                &fixture.gate,
+                &target,
+                &binding_checkpoint,
+                &material_checkpoint,
+            )
+            .expect("Step-5 terminal proves");
+        let expected_projection_source = fixture
+            .manager
+            .v031_approved_projection_source_proof(&fixture.gate, &expected_terminal)
+            .expect("Step-6 source proves");
+
+        let privacy_path = fixture.manager.shared.database_path.clone();
+        let user_image = serialized_sqlite_checkpoint_image_for_test(&fixture.user_database_path);
+        let privacy_image = serialized_sqlite_checkpoint_image_for_test(&privacy_path);
+        let user_image_sha256 = sha256_hex(&user_image);
+        let original_user = fixture.gate.original_user_source_proof();
+        let verified_user_image = open_verified_v031_user_checkpoint_image_read_only(
+            &user_image,
+            V031UserCheckpointImageExpectations {
+                database_sha256: &user_image_sha256,
+                schema_manifest_sha256: &original_user.schema_manifest_sha256,
+                logical_manifest_sha256: &original_user.logical_database_manifest_sha256,
+                business_manifest_sha256: &original_user.business_manifest_sha256,
+                total_rows: original_user.total_rows,
+                rollback_semantic_proof: original_user,
+            },
+        )
+        .expect("detached User image validates and opens as one capability");
+        let detached_source = verified_user_image
+            .capture_source_proof()
+            .expect("detached source proof captures");
+        let detached_source_fingerprint = v031_source_fingerprint(
+            &fixture.gate,
+            fixture.gate.original_user_source_proof(),
+            &detached_source,
+        );
+        assert_eq!(
+            detached_source_fingerprint.evidence_sha256,
+            step4_source.source_fingerprint,
+        );
+        privacy::validate_privacy_v5_sqlite_image_read_only(&privacy_image)
+            .expect("detached Privacy-v5 image validates");
+        let projection_checkpoint =
+            projection_checkpoint_for_test(&fixture, &expected_projection_source)
+                .with_database_image_hashes_for_test(user_image_sha256, sha256_hex(&privacy_image));
+
+        let recovered = fixture
+            .manager
+            .v031_projection_recovery_proofs_from_verified_checkpoint_images(
+                &fixture.gate,
+                &target,
+                &binding_checkpoint,
+                &material_checkpoint,
+                &projection_checkpoint,
+                &user_image,
+                &privacy_image,
+            )
+            .expect("offline checkpoint images rebuild both capabilities");
+        assert_eq!(recovered.0, expected_terminal);
+        assert_eq!(recovered.1, expected_projection_source);
+
+        fixture
+            .manager
+            .run_v031_approved_projection_migration_after_checkpoint(
+                &fixture.gate,
+                &expected_terminal,
+                &expected_projection_source,
+                &projection_checkpoint,
+            )
+            .expect("active Privacy advances to v6");
+        let displaced_user = fixture._directory.path().join("displaced-user-v10.sqlite");
+        let displaced_privacy = fixture
+            ._directory
+            .path()
+            .join("displaced-privacy-v6.sqlite");
+        fs::rename(&fixture.user_database_path, &displaced_user)
+            .expect("active User source is displaced");
+        fs::rename(&privacy_path, &displaced_privacy).expect("active Privacy source is displaced");
+
+        let recovered_after_advance = fixture
+            .manager
+            .v031_projection_recovery_proofs_from_verified_checkpoint_images(
+                &fixture.gate,
+                &target,
+                &binding_checkpoint,
+                &material_checkpoint,
+                &projection_checkpoint,
+                &user_image,
+                &privacy_image,
+            )
+            .expect("checkpoint recovery never consults displaced active sources");
+        assert_eq!(recovered_after_advance.0, expected_terminal);
+        assert_eq!(recovered_after_advance.1, expected_projection_source);
+
+        let mut tampered_privacy = privacy_image.clone();
+        let last = tampered_privacy
+            .last_mut()
+            .expect("non-empty checkpoint image");
+        *last ^= 1;
+        assert!(fixture
+            .manager
+            .v031_projection_recovery_proofs_from_verified_checkpoint_images(
+                &fixture.gate,
+                &target,
+                &binding_checkpoint,
+                &material_checkpoint,
+                &projection_checkpoint,
+                &user_image,
+                &tampered_privacy,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v031_step6_projection_is_exact_user_read_only_idempotent_and_proves_v6() {
+        let fixture = V031Fixture::new(&[PROJECT_A, PROJECT_B]);
+        let user_bytes_before =
+            fs::read(&fixture.user_database_path).expect("user v10 bytes before Step 6");
+        let user_proof_before = fixture.gate.original_user_source_proof().clone();
+        let (_step5_source, step5_terminal) = complete_v031_step5(&fixture);
+        let source = fixture
+            .manager
+            .v031_approved_projection_source_proof(&fixture.gate, &step5_terminal)
+            .expect("Step-6 source proof");
+        assert_eq!(source.candidate_count(), 0);
+        let checkpoint = projection_checkpoint_for_test(&fixture, &source);
+
+        let first = fixture
+            .manager
+            .run_v031_approved_projection_migration_after_checkpoint(
+                &fixture.gate,
+                &step5_terminal,
+                &source,
+                &checkpoint,
+            )
+            .expect("Step-6 projection migration");
+        assert_eq!(first.approved_generation_count(), 0);
+        assert_eq!(first.projection_rows(), 0);
+        assert_eq!(first.blocked_rows(), 0);
+        assert_eq!(first.risk_head_rows(), 0);
+        assert_eq!(first.binding_verified_rows(), 0);
+        assert_eq!(first.security_trigger_count(), 8);
+        assert_eq!(first.privacy_v6().schema_version, 6);
+        assert_eq!(
+            first.privacy_v6().logical_manifest.tables.len(),
+            privacy::PRIVACY_V6_APPLICATION_TABLES.len()
+        );
+        assert_eq!(first.terminal_manifest_sha256().len(), 64);
+        assert_eq!(first.source_evidence_sha256(), source.evidence_sha256());
+        assert_eq!(first.v5_source_fingerprint(), source.source_fingerprint());
+        assert_eq!(
+            first.candidate_manifest_sha256(),
+            source.candidate_manifest_sha256()
+        );
+
+        let second = fixture
+            .manager
+            .run_v031_approved_projection_migration_after_checkpoint(
+                &fixture.gate,
+                &step5_terminal,
+                &source,
+                &checkpoint,
+            )
+            .expect("idempotent Step-6 rerun");
+        let reconstructed = fixture
+            .manager
+            .v031_privacy_v6_terminal_proof(&fixture.gate, &step5_terminal, &source, &checkpoint)
+            .expect("pure committed-state terminal proof");
+        assert_eq!(second, first);
+        assert_eq!(reconstructed, first);
+        assert_eq!(
+            fs::read(&fixture.user_database_path).expect("user v10 bytes after Step 6"),
+            user_bytes_before
+        );
+        let user_proof_after = database::with_validated_user_database_migration_source_read_only(
+            &fixture.user_database_path,
+            |_| (),
+        )
+        .expect("user v10 semantic proof after Step 6")
+        .0;
+        assert_eq!(user_proof_after, user_proof_before);
+    }
+
+    #[test]
+    fn v031_step6_failure_points_resume_prepare_batch_and_finalize() {
+        for failure_point in [
+            ProjectionFailurePoint::BeforePrepare,
+            ProjectionFailurePoint::AfterPrepare,
+            ProjectionFailurePoint::BeforeFinalize,
+            ProjectionFailurePoint::AfterFinalize,
+        ] {
+            let fixture = V031Fixture::new(&[PROJECT_A]);
+            let user_before =
+                fs::read(&fixture.user_database_path).expect("user v10 before failure");
+            let (_step5_source, step5_terminal) = complete_v031_step5(&fixture);
+            let source = fixture
+                .manager
+                .v031_approved_projection_source_proof(&fixture.gate, &step5_terminal)
+                .expect("empty Step-6 source proof");
+            let checkpoint = projection_checkpoint_for_test(&fixture, &source);
+            let checkpoint_before = checkpoint.clone();
+            let privacy_v5_before = fixture
+                .manager
+                .open_raw_connection()
+                .and_then(|privacy| {
+                    compute_privacy_v5_manifests_read_only(&privacy)
+                        .map_err(|_| v031_privacy_v5_proof_error())
+                })
+                .expect("canonical Privacy v5 before projection failure");
+            let user_file_set_before = sqlite_file_set_bytes_for_test(&fixture.user_database_path);
+            let privacy_file_set_before =
+                sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path);
+            let error = fixture
+                .manager
+                .run_v031_approved_projection_migration_with_failure(
+                    &fixture.gate,
+                    &step5_terminal,
+                    &source,
+                    &checkpoint,
+                    failure_point,
+                )
+                .expect_err("injected projection failure");
+            assert_eq!(error.code(), "v031_projection_injected_failure");
+            assert_eq!(
+                fs::read(&fixture.user_database_path).expect("user v10 after failure"),
+                user_before
+            );
+            if failure_point == ProjectionFailurePoint::BeforePrepare {
+                assert_eq!(checkpoint, checkpoint_before);
+                assert_eq!(
+                    sqlite_file_set_bytes_for_test(&fixture.user_database_path),
+                    user_file_set_before,
+                    "BeforePrepare must not mutate any User-v10 SQLite slot",
+                );
+                assert_eq!(
+                    sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path),
+                    privacy_file_set_before,
+                    "BeforePrepare must precede the first Privacy-v5 file-set write",
+                );
+                let privacy = fixture
+                    .manager
+                    .open_raw_connection()
+                    .expect("Privacy v5 after BeforePrepare");
+                assert_eq!(
+                    compute_privacy_v5_manifests_read_only(&privacy)
+                        .expect("exact Privacy v5 survives BeforePrepare"),
+                    privacy_v5_before,
+                );
+                assert_eq!(
+                    database::validate_user_database_migration_source_read_only(
+                        &fixture.user_database_path,
+                    )
+                    .expect("User remains valid after BeforePrepare"),
+                    ValidatedUserSourceSchema::V031V10,
+                    "User must remain the exact frozen v0.3.1 schema-10 source",
+                );
+            }
+            let reconstructed_source = fixture
+                .manager
+                .v031_approved_projection_source_proof(&fixture.gate, &step5_terminal)
+                .expect("reconstruct source proof after process-style restart");
+            assert_eq!(reconstructed_source, source);
+            let terminal = fixture
+                .manager
+                .run_v031_approved_projection_migration_after_checkpoint(
+                    &fixture.gate,
+                    &step5_terminal,
+                    &reconstructed_source,
+                    &checkpoint,
+                )
+                .expect("projection retry after failure");
+            let repeated = fixture
+                .manager
+                .run_v031_approved_projection_migration_after_checkpoint(
+                    &fixture.gate,
+                    &step5_terminal,
+                    &reconstructed_source,
+                    &checkpoint,
+                )
+                .expect("projection terminal retry is a no-op");
+            assert_eq!(repeated, terminal);
+            let privacy = fixture
+                .manager
+                .open_raw_connection()
+                .expect("canonical Privacy v6 after projection retry");
+            let privacy_v6 = privacy::compute_privacy_v6_manifests_read_only(&privacy)
+                .expect("full canonical Privacy v6 manifest");
+            assert_eq!(&privacy_v6, terminal.privacy_v6(),);
+        }
+
+        for failure_point in [
+            ProjectionFailurePoint::BeforeBatch(0),
+            ProjectionFailurePoint::AfterBatch(0),
+        ] {
+            let fixture = V031Fixture::new(&[PROJECT_A]);
+            let (_step5_source, authentic_terminal) = complete_v031_step5(&fixture);
+            insert_invalid_approved_projection_candidate(&fixture);
+            let privacy = fixture
+                .manager
+                .open_raw_connection()
+                .expect("synthetic Privacy v5");
+            let v5 = compute_privacy_v5_manifests_read_only(&privacy)
+                .expect("synthetic exact Privacy v5 proof");
+            drop(privacy);
+            let step5_terminal = V031BindingMaterialTerminalProof::for_projection_test(v5.clone());
+            let source = fixture
+                .manager
+                .v031_approved_projection_source_proof(&fixture.gate, &step5_terminal)
+                .expect("one blocked projection candidate");
+            assert_eq!(source.candidate_count(), 1);
+            assert_ne!(step5_terminal, authentic_terminal);
+            let checkpoint = projection_checkpoint_for_test(&fixture, &source);
+            let error = fixture
+                .manager
+                .run_v031_approved_projection_migration_with_failure(
+                    &fixture.gate,
+                    &step5_terminal,
+                    &source,
+                    &checkpoint,
+                    failure_point,
+                )
+                .expect_err("injected per-batch failure");
+            assert_eq!(error.code(), "v031_projection_injected_failure");
+            let reconstructed_source = fixture
+                .manager
+                .v031_approved_projection_source_proof(&fixture.gate, &step5_terminal)
+                .expect("reconstruct candidate source after committed batch");
+            assert_eq!(reconstructed_source, source);
+            let terminal = fixture
+                .manager
+                .run_v031_approved_projection_migration_after_checkpoint(
+                    &fixture.gate,
+                    &step5_terminal,
+                    &reconstructed_source,
+                    &checkpoint,
+                )
+                .expect("batch retry reaches terminal state");
+            let repeated = fixture
+                .manager
+                .run_v031_approved_projection_migration_after_checkpoint(
+                    &fixture.gate,
+                    &step5_terminal,
+                    &reconstructed_source,
+                    &checkpoint,
+                )
+                .expect("committed projection batch retry is a no-op");
+            assert_eq!(repeated, terminal);
+            assert_eq!(terminal.approved_generation_count(), 1);
+            assert_eq!(terminal.projection_rows(), 0);
+            assert_eq!(terminal.blocked_rows(), 1);
+            assert_eq!(terminal.risk_head_rows(), 0);
+            let ledger = fixture
+                .manager
+                .open_raw_connection()
+                .expect("projection terminal ledger")
+                .query_row(
+                    "SELECT result_state,error_code,
+                            (SELECT COUNT(*) FROM case_material_migration_events
+                             WHERE migration_id=?1)
+                     FROM case_material_migration_ledger
+                     WHERE migration_id=?1 AND source_key='projection-redaction'",
+                    [privacy::APPROVED_CASE_PROJECTION_MIGRATION_ID],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .expect("one append-only blocked ledger row");
+            assert_eq!(ledger.0, "blocked");
+            assert_eq!(
+                ledger.1.as_deref(),
+                Some("approved_projection_full_blob_invalid")
+            );
+            assert_eq!(ledger.2, 1);
+        }
+    }
+
+    #[test]
+    fn v031_step6_rejects_wrong_checkpoint_and_source_or_user_drift_before_write() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        let (_step5_source, step5_terminal) = complete_v031_step5(&fixture);
+        let source = fixture
+            .manager
+            .v031_approved_projection_source_proof(&fixture.gate, &step5_terminal)
+            .expect("Step-6 source proof");
+        let user = fixture.gate.original_user_source_proof();
+        let wrong_checkpoint = V031MigrationCheckpointProof::projection_for_test(
+            fixture.gate.lineage_id().to_owned(),
+            fixture.gate.original_identity_sha256().to_owned(),
+            test_workspace_instance_id().as_str().to_owned(),
+            "3".repeat(64),
+            user.schema_manifest_sha256.clone(),
+            user.logical_database_manifest_sha256.clone(),
+            user.business_manifest_sha256.clone(),
+            user.total_rows,
+            source.source_fingerprint().to_owned(),
+            "0".repeat(64),
+            source.candidate_count(),
+            source.privacy_v5().logical_manifest.sha256.clone(),
+            source.privacy_v5().business_manifest.sha256.clone(),
+            source.privacy_v5().total_row_count,
+        );
+        let privacy_before =
+            fs::read(&fixture.manager.shared.database_path).expect("Privacy v5 before gate error");
+        let error = fixture
+            .manager
+            .run_v031_approved_projection_migration_after_checkpoint(
+                &fixture.gate,
+                &step5_terminal,
+                &source,
+                &wrong_checkpoint,
+            )
+            .expect_err("wrong projection checkpoint");
+        assert_eq!(error.code(), "v031_projection_checkpoint_gate_mismatch");
+        assert_eq!(
+            fs::read(&fixture.manager.shared.database_path).expect("Privacy after gate error"),
+            privacy_before
+        );
+
+        fixture
+            .manager
+            .open_raw_connection()
+            .expect("Privacy drift writer")
+            .execute(
+                "UPDATE privacy_schema_metadata SET updated_at='2030-01-01 00:00:00'
+                 WHERE key='schema_version'",
+                [],
+            )
+            .expect("Privacy v5 semantic drift");
+        let checkpoint = projection_checkpoint_for_test(&fixture, &source);
+        let error = fixture
+            .manager
+            .run_v031_approved_projection_migration_after_checkpoint(
+                &fixture.gate,
+                &step5_terminal,
+                &source,
+                &checkpoint,
+            )
+            .expect_err("complete v5 manifest drift must close before prepare");
+        assert_eq!(error.code(), "v031_projection_v5_source_changed");
+
+        let user_drift = V031Fixture::new(&[PROJECT_A]);
+        let (_step5_source, user_step5_terminal) = complete_v031_step5(&user_drift);
+        let user_source = user_drift
+            .manager
+            .v031_approved_projection_source_proof(&user_drift.gate, &user_step5_terminal)
+            .expect("user-drift projection source");
+        let user_checkpoint = projection_checkpoint_for_test(&user_drift, &user_source);
+        Connection::open(&user_drift.user_database_path)
+            .expect("user drift writer")
+            .execute(
+                "UPDATE projects SET title='projection user drift' WHERE project_id=?1",
+                [PROJECT_A],
+            )
+            .expect("mutate active user v10");
+        let privacy_before = fs::read(&user_drift.manager.shared.database_path)
+            .expect("Privacy before user drift rejection");
+        let error = user_drift
+            .manager
+            .run_v031_approved_projection_migration_after_checkpoint(
+                &user_drift.gate,
+                &user_step5_terminal,
+                &user_source,
+                &user_checkpoint,
+            )
+            .expect_err("user v10 drift must close before Privacy write");
+        assert_eq!(error.code(), "v031_case_material_user_source_invalid");
+        assert_eq!(
+            fs::read(&user_drift.manager.shared.database_path)
+                .expect("Privacy after user drift rejection"),
+            privacy_before
+        );
+    }
+
+    #[test]
+    fn v031_step6_terminal_proof_rejects_extra_projection_ledger_and_event() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        let (_step5_source, step5_terminal) = complete_v031_step5(&fixture);
+        let source = fixture
+            .manager
+            .v031_approved_projection_source_proof(&fixture.gate, &step5_terminal)
+            .expect("Step-6 source proof");
+        let checkpoint = projection_checkpoint_for_test(&fixture, &source);
+        fixture
+            .manager
+            .run_v031_approved_projection_migration_after_checkpoint(
+                &fixture.gate,
+                &step5_terminal,
+                &source,
+                &checkpoint,
+            )
+            .expect("Step-6 terminal state");
+        let privacy = fixture
+            .manager
+            .open_raw_connection()
+            .expect("extra projection evidence writer");
+        privacy
+            .execute(
+                "INSERT INTO case_material_migration_ledger(
+                   migration_id,source_store,source_table,source_key,source_fingerprint,
+                   target_material_id,target_redaction_id,assigned_generation_number,
+                   result_state,error_code,started_at,completed_at
+                 ) VALUES(?1,'privacy-workflow.sqlite','privacy_redactions',
+                          'extra-projection-redaction',?2,'extra-projection-material',
+                          'extra-projection-redaction',1,'blocked','extra_projection_row',
+                          CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                params![
+                    privacy::APPROVED_CASE_PROJECTION_MIGRATION_ID,
+                    sha256_hex(b"extra projection source")
+                ],
+            )
+            .expect("extra projection ledger");
+        privacy
+            .execute(
+                "INSERT INTO case_material_migration_events(
+                   migration_event_id,migration_id,source_store,source_table,source_key,
+                   event_type,source_fingerprint,target_material_id,target_redaction_id,
+                   assigned_generation_number,result_state,error_code,occurred_at
+                 ) VALUES('extra-projection-event',?1,'privacy-workflow.sqlite',
+                          'privacy_redactions','extra-projection-redaction',
+                          'approved_projection_backfill',?2,'extra-projection-material',
+                          'extra-projection-redaction',1,'blocked','extra_projection_row',
+                          CURRENT_TIMESTAMP)",
+                params![
+                    privacy::APPROVED_CASE_PROJECTION_MIGRATION_ID,
+                    sha256_hex(b"extra projection source")
+                ],
+            )
+            .expect("extra projection event");
+        drop(privacy);
+        fixture
+            .manager
+            .v031_privacy_v6_terminal_proof(&fixture.gate, &step5_terminal, &source, &checkpoint)
+            .expect_err("extra/orphan projection evidence must fail terminal proof");
+    }
+
+    #[test]
+    fn v031_step4_pre_v5_proof_pins_both_live_sources_and_leaves_bytes_and_sidecars_unchanged() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        let target = fixture.target_gate();
+        let user_before = sqlite_file_set_bytes_for_test(&fixture.user_database_path);
+        let privacy_before = sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path);
+
+        let proof = fixture
+            .manager
+            .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+            .expect("simultaneous pre-v5 source proof");
+
+        assert_eq!(proof.evidence_sha256().len(), 64);
+        assert_eq!(proof.source_fingerprint().len(), 64);
+        assert_eq!(proof.binding_candidate_count, 1);
+        // The source-manifest ledger row is a real material candidate even
+        // when the legacy Privacy source contains no materials.
+        assert_eq!(proof.material_candidate_count, 1);
+        assert_ne!(
+            proof.binding_candidate_manifest_sha256,
+            proof.material_candidate_manifest_sha256
+        );
+        let diagnostic = format!("{proof:?}");
+        assert!(!diagnostic.contains(PROJECT_A));
+        assert!(!diagnostic.contains("case_"));
+        assert_eq!(
+            sqlite_file_set_bytes_for_test(&fixture.user_database_path),
+            user_before
+        );
+        assert_eq!(
+            sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path),
+            privacy_before
+        );
+        privacy::validate_privacy_v1_migration_source_read_only(
+            &fixture.manager.shared.database_path,
+        )
+        .expect("live Privacy remains exact v1");
+        database::validate_user_database_migration_source_read_only(&fixture.user_database_path)
+            .expect("live User remains exact v10");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v031_partial_v5_schema_and_lifecycle_crash_prefixes_reopen_and_resume_to_full_v5() {
+        for (index, after_lifecycle) in [false, true].into_iter().enumerate() {
+            let fixture = V031Fixture::new(&[PROJECT_A]);
+            let root = fixture._directory.path().to_path_buf();
+            let workspace = fixture.manager.shared.workspace_instance_id.clone();
+            let target = fixture.target_gate();
+            let source = fixture
+                .manager
+                .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+                .expect("pre-v5 checkpoint proof");
+            let (binding, materials) = step4_checkpoint_proofs_for_test(&fixture, &target, &source);
+            let failure = if after_lifecycle {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_lifecycle_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            } else {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_schema_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            };
+            assert!(failure.is_err(), "partial boundary {index} must interrupt");
+            let partial_connection = open_privacy_read_only(&fixture.manager.shared.database_path)
+                .expect("partial v5 opens read-only");
+            let partial = classify_privacy_v5_partial_read_only(&partial_connection, &workspace)
+                .expect("partial v5 classifies exactly");
+            assert_eq!(
+                partial.stage(),
+                if after_lifecycle {
+                    PrivacyV5PartialStage::LifecycleCommittedBeforeBinding
+                } else {
+                    PrivacyV5PartialStage::SchemaCommittedBeforeLifecycle
+                }
+            );
+            assert_eq!(
+                partial.source_business_manifest_sha256(),
+                source.privacy_v1_business_manifest_sha256
+            );
+            drop(partial_connection);
+
+            let V031Fixture {
+                _directory,
+                user_database_path,
+                manager,
+                gate,
+            } = fixture;
+            drop(manager);
+            let reopened = PrivacyWorkflowManager::new_with_approved_publication_invalidator(
+                root,
+                workspace,
+                Arc::new(NoopPublicationInvalidator),
+            )
+            .expect("fresh manager reopens partial v5");
+            reopened.set_test_runtime(
+                ReceiptSigner::new([31_u8; 32]).expect("restart signer"),
+                1_800_000_000,
+            );
+            let completed = reopened
+                .resume_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                    &gate, &target, &source, &binding, &materials,
+                )
+                .expect("fresh manager consumes opaque partial capability");
+            assert_eq!(completed.schema_version, 5);
+            assert_eq!(
+                completed.schema_object_count,
+                privacy::PRIVACY_V5_SCHEMA_OBJECT_COUNT
+            );
+            let readback = reopened
+                .v031_privacy_v5_manifest_proof_after_checkpoints_read_only(
+                    &gate, &target, &binding, &materials,
+                )
+                .expect("full canonical v5 readback");
+            assert_eq!(readback, completed);
+            database::validate_user_database_migration_source_read_only(&user_database_path)
+                .expect("restart leaves exact User-v10 source unchanged");
+            drop(_directory);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v031_partial_v5_tamper_profiles_fail_closed_before_resume_write() {
+        #[derive(Clone, Copy)]
+        enum Tamper {
+            ExtraObject,
+            ExtraRow,
+            WrongWorkspace,
+            HalfBinding,
+        }
+        for tamper in [
+            Tamper::ExtraObject,
+            Tamper::ExtraRow,
+            Tamper::WrongWorkspace,
+            Tamper::HalfBinding,
+        ] {
+            let fixture = V031Fixture::new(&[PROJECT_A]);
+            let target = fixture.target_gate();
+            let source = fixture
+                .manager
+                .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+                .expect("pre-v5 checkpoint proof");
+            let (binding, materials) = step4_checkpoint_proofs_for_test(&fixture, &target, &source);
+            let after_lifecycle = matches!(tamper, Tamper::ExtraRow | Tamper::WrongWorkspace);
+            let failure = if after_lifecycle {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_lifecycle_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            } else {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_schema_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            };
+            assert!(failure.is_err());
+            let privacy = fixture
+                .manager
+                .open_raw_connection()
+                .expect("partial tamper writer");
+            match tamper {
+                Tamper::ExtraObject => privacy
+                    .execute_batch("CREATE TABLE unexpected_partial_v5(id TEXT PRIMARY KEY);")
+                    .expect("extra object tamper"),
+                Tamper::ExtraRow => {
+                    privacy
+                        .execute(
+                            "INSERT INTO privacy_mapping_keys(
+                           key_version,protected_key,protected_key_sha256,state,
+                           created_at_unix,retired_at_unix,revoked_at_unix,destroyed_at_unix
+                         )
+                         SELECT 2,protected_key,protected_key_sha256,'retired',
+                                created_at_unix,created_at_unix,NULL,NULL
+                         FROM privacy_mapping_keys WHERE key_version=1",
+                            [],
+                        )
+                        .expect("extra lifecycle row tamper");
+                }
+                Tamper::WrongWorkspace => {
+                    privacy
+                        .execute(
+                            "UPDATE privacy_lifecycle_meta
+                             SET workspace_instance_id=?1 WHERE singleton=1",
+                            ["ws_ffffffffffffffffffffffffffffffff"],
+                        )
+                        .expect("workspace tamper");
+                }
+                Tamper::HalfBinding => privacy
+                    .execute_batch(
+                        "CREATE TABLE project_privacy_case_binding_audit(
+                           creation_audit_id TEXT PRIMARY KEY
+                         );",
+                    )
+                    .expect("half-binding tamper"),
+            }
+            drop(privacy);
+            let before_rejected_resume =
+                sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path);
+            fixture
+                .manager
+                .resume_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                    &fixture.gate,
+                    &target,
+                    &source,
+                    &binding,
+                    &materials,
+                )
+                .expect_err("tampered partial state must fail before resume write");
+            assert_eq!(
+                sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path),
+                before_rejected_resume
+            );
+            let binding_objects: i64 = Connection::open_with_flags(
+                &fixture.manager.shared.database_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("post-rejection reader")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN(
+                   'project_privacy_case_binding_audit',
+                   'project_privacy_case_bindings'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("binding object count");
+            assert!(binding_objects <= 1, "resume must not complete binding DDL");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v031_partial_v5_resume_reauthenticates_each_write_under_immediate_lock() {
+        fn is_busy(error: &rusqlite::Error) -> bool {
+            matches!(
+                error,
+                rusqlite::Error::SqliteFailure(inner, _)
+                    if matches!(
+                        inner.code,
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            )
+        }
+
+        for after_lifecycle in [false, true] {
+            let fixture = V031Fixture::new(&[PROJECT_A]);
+            let target = fixture.target_gate();
+            let source = fixture
+                .manager
+                .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+                .expect("pre-v5 checkpoint proof");
+            let (binding, materials) = step4_checkpoint_proofs_for_test(&fixture, &target, &source);
+            let failed = if after_lifecycle {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_lifecycle_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            } else {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_schema_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            };
+            assert!(
+                failed.is_err(),
+                "the requested partial boundary must persist"
+            );
+            let capability = authorize_v031_privacy_v5_partial_resume(
+                &fixture.manager,
+                &fixture.gate,
+                &target,
+                &source,
+                &binding,
+                &materials,
+            )
+            .expect("authenticated partial capability");
+            let privacy_path = fixture.manager.shared.database_path.clone();
+            let mut locked_stages = Vec::new();
+            let completed =
+                resume_and_initialize_v031_privacy_v5(&fixture.manager, &capability, |stage| {
+                    let competing =
+                        Connection::open(&privacy_path).expect("competing SQLite writer opens");
+                    competing
+                        .busy_timeout(std::time::Duration::ZERO)
+                        .expect("zero busy timeout configures");
+                    let write = match stage {
+                        PrivacyV5PartialStage::SchemaCommittedBeforeLifecycle => competing.execute(
+                            "UPDATE privacy_schema_metadata
+                             SET updated_at='2030-01-01 00:00:00'
+                             WHERE key='schema_version'",
+                            [],
+                        ),
+                        PrivacyV5PartialStage::LifecycleCommittedBeforeBinding => competing
+                            .execute(
+                                "UPDATE privacy_lifecycle_meta
+                             SET workspace_instance_id='ws_ffffffffffffffffffffffffffffffff'
+                             WHERE singleton=1",
+                                [],
+                            ),
+                    };
+                    let error = write.expect_err(
+                        "an external writer cannot cross strict reauthentication and first write",
+                    );
+                    assert!(
+                        is_busy(&error),
+                        "competing writer must fail specifically as busy"
+                    );
+                    locked_stages.push(stage);
+                    Ok(())
+                })
+                .expect("locked partial transitions complete");
+            assert_eq!(completed.schema_version, 5);
+            assert_eq!(
+                locked_stages,
+                if after_lifecycle {
+                    vec![PrivacyV5PartialStage::LifecycleCommittedBeforeBinding]
+                } else {
+                    vec![
+                        PrivacyV5PartialStage::SchemaCommittedBeforeLifecycle,
+                        PrivacyV5PartialStage::LifecycleCommittedBeforeBinding,
+                    ]
+                }
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v031_partial_v5_stale_capability_is_rejected_inside_immediate_transaction() {
+        for after_lifecycle in [false, true] {
+            let fixture = V031Fixture::new(&[PROJECT_A]);
+            let target = fixture.target_gate();
+            let source = fixture
+                .manager
+                .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+                .expect("pre-v5 checkpoint proof");
+            let (binding, materials) = step4_checkpoint_proofs_for_test(&fixture, &target, &source);
+            let failed = if after_lifecycle {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_lifecycle_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            } else {
+                fixture
+                    .manager
+                    .upgrade_v031_privacy_store_to_v5_after_checkpoints_fail_after_schema_for_test(
+                        &fixture.gate,
+                        &target,
+                        &source,
+                        &binding,
+                        &materials,
+                    )
+            };
+            assert!(
+                failed.is_err(),
+                "the requested partial boundary must persist"
+            );
+            let capability = authorize_v031_privacy_v5_partial_resume(
+                &fixture.manager,
+                &fixture.gate,
+                &target,
+                &source,
+                &binding,
+                &materials,
+            )
+            .expect("authenticated partial capability");
+
+            let tamper = Connection::open(&fixture.manager.shared.database_path)
+                .expect("stale-capability writer opens");
+            if after_lifecycle {
+                tamper
+                    .execute(
+                        "UPDATE privacy_lifecycle_meta
+                         SET workspace_instance_id='ws_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+                         WHERE singleton=1",
+                        [],
+                    )
+                    .expect("lifecycle prefix changes after authorization");
+            } else {
+                tamper
+                    .execute(
+                        "UPDATE privacy_schema_metadata
+                         SET updated_at='2031-01-01 00:00:00'
+                         WHERE key='schema_version'",
+                        [],
+                    )
+                    .expect("schema prefix changes after authorization");
+            }
+            drop(tamper);
+            let before_rejected_write =
+                sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path);
+            resume_and_initialize_v031_privacy_v5(&fixture.manager, &capability, |_| Ok(()))
+                .expect_err("stale capability must fail its in-transaction reclassification");
+            assert_eq!(
+                sqlite_file_set_bytes_for_test(&fixture.manager.shared.database_path),
+                before_rejected_write,
+                "stale rejection must not add lifecycle rows or binding DDL",
+            );
+        }
+    }
+
+    #[test]
+    fn v031_step4_zero_history_commits_new_random_required_and_never_preallocates_case_id() {
+        fn migrate_one() -> String {
+            let fixture = V031Fixture::new(&[PROJECT_A]);
+            let target = fixture.target_gate();
+            let proof = fixture
+                .manager
+                .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+                .expect("zero-history pre-v5 proof");
+
+            with_v031_pinned_user_snapshot(
+                &fixture.manager,
+                &fixture.gate,
+                |user_connection, _path, source| {
+                    let user = UserSnapshot::load(user_connection)?;
+                    let candidates = compute_v031_candidate_manifests(
+                        &user,
+                        source,
+                        &[],
+                        fixture.manager.shared.workspace_instance_id.as_str(),
+                    )?;
+                    let project = user.projects.get(PROJECT_A).expect("project candidate");
+                    let source_fingerprint = source.persistent_fingerprint();
+                    let mut expected = Fingerprint::new(b"v031-binding-candidate-manifest-v1");
+                    expected.text("project");
+                    expected.text(&opaque_candidate_key_commitment(
+                        b"v031-binding-project-key-v1",
+                        &source_fingerprint,
+                        &project.project_id,
+                    ));
+                    expected.text(&project_binding_fingerprint(project, None));
+                    expected.text("new_random_required");
+                    expected.optional_text(None);
+                    expected.text(&opaque_candidate_key_commitment(
+                        b"v031-binding-ledger-target-v1",
+                        &source_fingerprint,
+                        &binding_target_id(&project.project_id),
+                    ));
+                    assert_eq!(
+                        candidates.binding_manifest_sha256,
+                        expected.finish(),
+                        "the checkpoint commits the explicit random-allocation outcome"
+                    );
+                    assert_eq!(
+                        candidates.binding_manifest_sha256,
+                        proof.binding_candidate_manifest_sha256
+                    );
+                    Ok(())
+                },
+            )
+            .expect("inspect opaque zero-history commitment");
+
+            let (binding, materials) = step4_checkpoint_proofs_for_test(&fixture, &target, &proof);
+            fixture
+                .manager
+                .upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                    &fixture.gate,
+                    &target,
+                    &proof,
+                    &binding,
+                    &materials,
+                )
+                .expect("checkpoint-gated Privacy v5 upgrade");
+            let before_writer = fixture
+                .manager
+                .open_raw_connection()
+                .expect("pre-writer Privacy v5");
+            let preallocated: i64 = before_writer
+                .query_row(
+                    "SELECT COUNT(*) FROM project_privacy_case_bindings",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preallocated binding count");
+            assert_eq!(preallocated, 0);
+            drop(before_writer);
+
+            fixture
+                .manager
+                .run_v031_case_material_migration_after_checkpoints(
+                    &fixture.gate,
+                    &target,
+                    &binding,
+                    &materials,
+                )
+                .expect("strict Step-5 writer");
+            fixture
+                .manager
+                .open_raw_connection()
+                .expect("terminal binding reader")
+                .query_row(
+                    "SELECT privacy_case_id FROM project_privacy_case_bindings
+                     WHERE project_id=?1",
+                    [PROJECT_A],
+                    |row| row.get(0),
+                )
+                .expect("transactionally generated Privacy CaseId")
+        }
+
+        let first = migrate_one();
+        let second = migrate_one();
+        assert!(PrivacyCaseId::parse(first.clone()).is_ok());
+        assert!(PrivacyCaseId::parse(second.clone()).is_ok());
+        assert_ne!(
+            first, second,
+            "separate CSPRNG allocations must not derive identity"
+        );
+    }
+
+    #[test]
+    fn v031_step5_recomputes_pre_v5_manifests_and_rejects_tamper_before_first_write() {
+        let fixture = V031Fixture::new(&[PROJECT_A, PROJECT_B]);
+        let target = fixture.target_gate();
+        let source = fixture
+            .manager
+            .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+            .expect("pre-v5 source proof");
+        let (binding, materials) = step4_checkpoint_proofs_for_test(&fixture, &target, &source);
+        let reconstructed = fixture
+            .manager
+            .v031_case_migration_checkpoint_source_proof_from_verified_checkpoints(
+                &fixture.gate,
+                &target,
+                &binding,
+                &materials,
+            )
+            .expect("restart source-proof reconstruction");
+        assert_eq!(reconstructed, source);
+        fixture
+            .manager
+            .upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                &fixture.gate,
+                &target,
+                &source,
+                &binding,
+                &materials,
+            )
+            .expect("Privacy v1 to v5 after both checkpoints");
+
+        let before = fixture
+            .manager
+            .open_raw_connection()
+            .expect("pre-tamper Privacy");
+        let before_manifest =
+            compute_privacy_v5_manifests_read_only(&before).expect("pre-tamper v5 manifest");
+        drop(before);
+        let tampered_materials = materials
+            .clone()
+            .with_candidate_manifest_for_test("f".repeat(64));
+        fixture
+            .manager
+            .run_v031_case_material_migration_after_checkpoints(
+                &fixture.gate,
+                &target,
+                &binding,
+                &tampered_materials,
+            )
+            .expect_err("tampered material candidate must fail before first target row write");
+        let after_failure = fixture
+            .manager
+            .open_raw_connection()
+            .expect("post-failure Privacy");
+        assert_eq!(
+            compute_privacy_v5_manifests_read_only(&after_failure)
+                .expect("post-failure v5 manifest"),
+            before_manifest
+        );
+        let target_rows: i64 = after_failure
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM project_privacy_case_bindings) +
+                   (SELECT COUNT(*) FROM case_material_migration_ledger) +
+                   (SELECT COUNT(*) FROM case_material_migration_events)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("zero Step-5 rows after rejected proof");
+        assert_eq!(target_rows, 0);
+        drop(after_failure);
+
+        fixture
+            .manager
+            .run_v031_case_material_migration_after_checkpoints(
+                &fixture.gate,
+                &target,
+                &binding,
+                &materials,
+            )
+            .expect("untampered post-v5 candidate recomputation");
+        let terminal = fixture
+            .manager
+            .v031_binding_material_terminal_proof_after_checkpoints(
+                &fixture.gate,
+                &target,
+                &binding,
+                &materials,
+            )
+            .expect("checkpoint-bound terminal proof");
+        assert_eq!(terminal.binding_ledger_rows(), 2);
+        assert_eq!(terminal.material_ledger_rows(), 1);
+        assert_eq!(terminal.bindings_verified(), 2);
+    }
+
+    #[test]
+    fn v031_step4_user_or_privacy_drift_after_checkpoints_rejects_before_v5_write() {
+        let user_drift = V031Fixture::new(&[PROJECT_A]);
+        let user_target = user_drift.target_gate();
+        let user_source = user_drift
+            .manager
+            .v031_case_migration_checkpoint_source_proof(&user_drift.gate, &user_target)
+            .expect("user-drift pre-v5 proof");
+        let (user_binding, user_materials) =
+            step4_checkpoint_proofs_for_test(&user_drift, &user_target, &user_source);
+        Connection::open(&user_drift.user_database_path)
+            .expect("user drift writer")
+            .execute(
+                "UPDATE projects SET summary='drifted after checkpoint' WHERE project_id=?1",
+                [PROJECT_A],
+            )
+            .expect("mutate authenticated User source");
+        let privacy_before_user_rejection =
+            sqlite_file_set_bytes_for_test(&user_drift.manager.shared.database_path);
+        user_drift
+            .manager
+            .upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                &user_drift.gate,
+                &user_target,
+                &user_source,
+                &user_binding,
+                &user_materials,
+            )
+            .expect_err("User physical/semantic drift must reject the v1 to v5 write");
+        assert_eq!(
+            sqlite_file_set_bytes_for_test(&user_drift.manager.shared.database_path),
+            privacy_before_user_rejection
+        );
+        privacy::validate_privacy_v1_migration_source_read_only(
+            &user_drift.manager.shared.database_path,
+        )
+        .expect("Privacy remains v1 after User rejection");
+
+        let privacy_drift = V031Fixture::new(&[PROJECT_A]);
+        let privacy_target = privacy_drift.target_gate();
+        let privacy_source = privacy_drift
+            .manager
+            .v031_case_migration_checkpoint_source_proof(&privacy_drift.gate, &privacy_target)
+            .expect("Privacy-drift pre-v5 proof");
+        let (privacy_binding, privacy_materials) =
+            step4_checkpoint_proofs_for_test(&privacy_drift, &privacy_target, &privacy_source);
+        Connection::open(&privacy_drift.manager.shared.database_path)
+            .expect("Privacy physical drift writer")
+            .pragma_update(None, "user_version", 7_i64)
+            .expect("mutate Privacy physical file set without adding source rows");
+        let privacy_after_drift =
+            sqlite_file_set_bytes_for_test(&privacy_drift.manager.shared.database_path);
+        privacy_drift
+            .manager
+            .upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                &privacy_drift.gate,
+                &privacy_target,
+                &privacy_source,
+                &privacy_binding,
+                &privacy_materials,
+            )
+            .expect_err("Privacy physical drift must reject the v1 to v5 write");
+        assert_eq!(
+            sqlite_file_set_bytes_for_test(&privacy_drift.manager.shared.database_path),
+            privacy_after_drift
+        );
+        let drifted = Connection::open_with_flags(
+            &privacy_drift.manager.shared.database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("drifted Privacy reader");
+        assert_eq!(
+            PrivacyStore::preflight_schema(&drifted).expect("drifted schema preflight"),
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 1 }
+        );
+    }
+
+    #[test]
+    fn v031_step5_is_exact_read_only_idempotent_and_reconstructs_terminal_counts() {
+        let fixture = V031Fixture::new(&[PROJECT_A, PROJECT_B]);
+        let user_before = fs::read(&fixture.user_database_path).expect("v0.3.1 user before");
+        let v5 = fixture.upgrade_to_v5();
+        assert_eq!(v5.schema_version, 5);
+        assert!(fixture
+            .manager
+            .v031_case_material_migration_required(&fixture.gate)
+            .expect("initial v0.3.1 probe"));
+        let source = fixture
+            .manager
+            .v031_case_material_migration_source_fingerprint(&fixture.gate)
+            .expect("v0.3.1 source fingerprint");
+        assert_eq!(source.evidence_sha256().len(), 64);
+        let report = fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("v0.3.1 binding/material migration");
+        assert!(report.source_unchanged_verified);
+        assert_eq!(
+            fs::read(&fixture.user_database_path).expect("v0.3.1 user after"),
+            user_before
+        );
+        assert!(!fixture
+            .manager
+            .v031_case_material_migration_required(&fixture.gate)
+            .expect("terminal v0.3.1 probe"));
+
+        let first_terminal = fixture
+            .manager
+            .v031_binding_material_terminal_proof(&fixture.gate, &source)
+            .expect("first terminal proof");
+        assert_eq!(first_terminal.binding_ledger_rows, 2);
+        assert_eq!(first_terminal.material_ledger_rows, 1);
+        assert_eq!(first_terminal.terminal_rows, 1);
+        assert_eq!(first_terminal.blocked_rows, 0);
+        assert_eq!(first_terminal.privacy_migration_batches, 1);
+        assert_eq!(first_terminal.bindings_verified, 2);
+
+        let rerun = fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("idempotent v0.3.1 rerun");
+        assert!(rerun.idempotent_noops >= 3);
+        let second_terminal = fixture
+            .manager
+            .v031_binding_material_terminal_proof(&fixture.gate, &source)
+            .expect("second terminal proof");
+        assert_eq!(second_terminal, first_terminal);
+        assert_eq!(
+            fs::read(&fixture.user_database_path).expect("v0.3.1 user after rerun"),
+            user_before
+        );
+    }
+
+    #[test]
+    fn v031_gate_rejects_source_drift_before_privacy_schema_write() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        Connection::open(&fixture.user_database_path)
+            .expect("writable drift fixture")
+            .execute(
+                "UPDATE projects SET title='drifted source' WHERE project_id=?1",
+                [PROJECT_A],
+            )
+            .expect("source drift");
+        let error = fixture
+            .manager
+            .upgrade_v031_privacy_store_to_v5_after_original_rollback(&fixture.gate)
+            .expect_err("source drift must close the v5 writer gate");
+        assert_eq!(error.code(), "v031_case_material_user_source_invalid");
+        let privacy =
+            Connection::open(&fixture.manager.shared.database_path).expect("unchanged privacy v1");
+        assert_eq!(
+            PrivacyStore::preflight_schema(&privacy).expect("privacy v1 preflight"),
+            PrivacyStoreSchemaStatus::UpgradeRequired { found_version: 1 }
+        );
+    }
+
+    #[test]
+    fn v031_terminal_proof_rejects_extra_ledger_and_orphan_binding_audit() {
+        let fixture = V031Fixture::new(&[PROJECT_A]);
+        fixture.upgrade_to_v5();
+        let source = fixture
+            .manager
+            .v031_case_material_migration_source_fingerprint(&fixture.gate)
+            .expect("source fingerprint");
+        fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("terminal migration");
+        let privacy = fixture
+            .manager
+            .open_raw_connection()
+            .expect("privacy writer");
+        privacy
+            .execute(
+                "INSERT INTO case_material_migration_ledger(
+                   migration_id,source_store,source_table,source_key,source_fingerprint,
+                   target_material_id,result_state,started_at,completed_at
+                 ) VALUES(?1,?2,'source_manifest','unexpected-source',?3,
+                          'source_manifest_v1','migrated',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                params![
+                    CASE_MATERIAL_MIGRATION_ID,
+                    SOURCE_STORE_USER,
+                    sha256_hex(b"unexpected terminal source")
+                ],
+            )
+            .expect("extra ledger");
+        drop(privacy);
+        let error = fixture
+            .manager
+            .v031_binding_material_terminal_proof(&fixture.gate, &source)
+            .expect_err("extra ledger must fail closed");
+        assert_eq!(error.code(), "v031_binding_material_terminal_proof_invalid");
+
+        let clean = V031Fixture::new(&[PROJECT_A]);
+        clean.upgrade_to_v5();
+        let clean_source = clean
+            .manager
+            .v031_case_material_migration_source_fingerprint(&clean.gate)
+            .expect("clean source fingerprint");
+        clean
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&clean.gate, &clean_source)
+            .expect("clean terminal migration");
+        let privacy = clean.manager.open_raw_connection().expect("audit writer");
+        privacy
+            .execute(
+                "INSERT INTO project_privacy_case_binding_audit(
+                   creation_audit_id,project_id,privacy_case_id,binding_version,
+                   creation_source,migration_id,result,created_at
+                 ) VALUES(
+                   'orphan-audit','case-orphan-audit',
+                   'case_11111111111111111111111111111111',1,
+                   'legacy_migration',?1,'created',CURRENT_TIMESTAMP
+                 )",
+                [PROJECT_CASE_BINDING_MIGRATION_ID],
+            )
+            .expect("orphan binding audit");
+        drop(privacy);
+        let error = clean
+            .manager
+            .v031_binding_material_terminal_proof(&clean.gate, &clean_source)
+            .expect_err("orphan audit must fail closed");
+        assert_eq!(error.code(), "v031_binding_material_terminal_proof_invalid");
+    }
+
+    #[test]
+    fn v031_step5_checkpoint_gated_failure_windows_resume_without_duplicate_identity_or_evidence() {
+        fn prepare_checkpoint_gated_writer(
+            fixture: &V031Fixture,
+        ) -> (
+            V031TargetComponentsPreparedGate,
+            V031MigrationCheckpointProof,
+            V031MigrationCheckpointProof,
+        ) {
+            let target = fixture.target_gate();
+            let source = fixture
+                .manager
+                .v031_case_migration_checkpoint_source_proof(&fixture.gate, &target)
+                .expect("checkpoint-gated Step-5 source");
+            let (binding, materials) = step4_checkpoint_proofs_for_test(fixture, &target, &source);
+            fixture
+                .manager
+                .upgrade_v031_privacy_store_to_v5_after_binding_material_checkpoints(
+                    &fixture.gate,
+                    &target,
+                    &source,
+                    &binding,
+                    &materials,
+                )
+                .expect("checkpoint-gated Privacy v5 upgrade");
+            (target, binding, materials)
+        }
+
+        fn target_inventory(fixture: &V031Fixture) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+            fixture
+                .manager
+                .open_raw_connection()
+                .expect("Step-5 target inventory reader")
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM project_privacy_case_bindings),
+                       (SELECT COUNT(DISTINCT project_id)
+                          FROM project_privacy_case_bindings),
+                       (SELECT COUNT(DISTINCT privacy_case_id)
+                          FROM project_privacy_case_bindings),
+                       (SELECT COUNT(*) FROM project_privacy_case_binding_audit),
+                       (SELECT COUNT(*) FROM case_material_migration_ledger),
+                       (SELECT COUNT(*) FROM case_material_migration_events),
+                       (SELECT COUNT(*) FROM case_material_selections),
+                       (SELECT COUNT(*) FROM case_material_legacy_references)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .expect("Step-5 target inventory")
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn sqlite_file_set_state(
+            path: &std::path::Path,
+        ) -> Vec<(String, Option<(u64, u128, String)>)> {
+            ["", "-wal", "-shm", "-journal"]
+                .into_iter()
+                .map(|suffix| {
+                    let mut value = path.as_os_str().to_os_string();
+                    value.push(suffix);
+                    let slot = PathBuf::from(value);
+                    let state = match fs::metadata(&slot) {
+                        Ok(metadata) => {
+                            let modified = metadata
+                                .modified()
+                                .expect("SQLite slot mtime")
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .expect("SQLite slot mtime after Unix epoch")
+                                .as_nanos();
+                            let bytes = fs::read(&slot).expect("SQLite slot bytes");
+                            Some((metadata.len(), modified, sha256_hex(&bytes)))
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => panic!("inspect SQLite file-set slot {suffix}: {error}"),
+                    };
+                    (suffix.to_owned(), state)
+                })
+                .collect()
+        }
+
+        fn assert_production_retry_is_idempotent(
+            fixture: &V031Fixture,
+            target: &V031TargetComponentsPreparedGate,
+            binding: &V031MigrationCheckpointProof,
+            materials: &V031MigrationCheckpointProof,
+        ) -> V031BindingMaterialTerminalProof {
+            fixture
+                .manager
+                .run_v031_case_material_migration_after_checkpoints(
+                    &fixture.gate,
+                    target,
+                    binding,
+                    materials,
+                )
+                .expect("production checkpoint-gated retry");
+            let first = fixture
+                .manager
+                .v031_binding_material_terminal_proof_after_checkpoints(
+                    &fixture.gate,
+                    target,
+                    binding,
+                    materials,
+                )
+                .expect("first committed Step-5 terminal proof");
+            let inventory = target_inventory(fixture);
+            let repeated = fixture
+                .manager
+                .run_v031_case_material_migration_after_checkpoints(
+                    &fixture.gate,
+                    target,
+                    binding,
+                    materials,
+                )
+                .expect("second production checkpoint-gated retry");
+            assert!(repeated.source_unchanged_verified);
+            let second = fixture
+                .manager
+                .v031_binding_material_terminal_proof_after_checkpoints(
+                    &fixture.gate,
+                    target,
+                    binding,
+                    materials,
+                )
+                .expect("second committed Step-5 terminal proof");
+            assert_eq!(second, first);
+            assert_eq!(
+                target_inventory(fixture),
+                inventory,
+                "a normal retry must not create a second binding, material, ledger, or event",
+            );
+            first
+        }
+
+        let before_transaction = V031Fixture::new(&[PROJECT_A, PROJECT_B]);
+        let (target, binding, materials) = prepare_checkpoint_gated_writer(&before_transaction);
+        let binding_before = binding.clone();
+        let materials_before = materials.clone();
+        let privacy = before_transaction
+            .manager
+            .open_raw_connection()
+            .expect("Privacy v5 before transaction boundary");
+        let privacy_v5_before = compute_privacy_v5_manifests_read_only(&privacy)
+            .expect("exact Privacy v5 before transaction boundary");
+        drop(privacy);
+        let user_file_set_before =
+            sqlite_file_set_bytes_for_test(&before_transaction.user_database_path);
+        let privacy_file_set_before =
+            sqlite_file_set_bytes_for_test(&before_transaction.manager.shared.database_path);
+        let error = before_transaction
+            .manager
+            .run_v031_case_material_migration_after_checkpoints_with_failure(
+                &before_transaction.gate,
+                &target,
+                &binding,
+                &materials,
+                BackfillFailurePoint::BeforeTransaction,
+            )
+            .expect_err("BeforeTransaction must stop before the first Privacy write");
+        assert_eq!(error.code(), "v031_case_material_injected_failure");
+        assert_eq!(binding, binding_before);
+        assert_eq!(materials, materials_before);
+        assert_eq!(
+            sqlite_file_set_bytes_for_test(&before_transaction.user_database_path),
+            user_file_set_before,
+            "BeforeTransaction must preserve the complete User-v10 file set",
+        );
+        assert_eq!(
+            sqlite_file_set_bytes_for_test(&before_transaction.manager.shared.database_path),
+            privacy_file_set_before,
+            "BeforeTransaction must preserve the complete Privacy-v5 file set",
+        );
+        let privacy = before_transaction
+            .manager
+            .open_raw_connection()
+            .expect("Privacy v5 after BeforeTransaction");
+        assert_eq!(
+            compute_privacy_v5_manifests_read_only(&privacy)
+                .expect("exact Privacy v5 after BeforeTransaction"),
+            privacy_v5_before,
+        );
+        drop(privacy);
+        assert_eq!(
+            target_inventory(&before_transaction),
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            database::validate_user_database_migration_source_read_only(
+                &before_transaction.user_database_path,
+            )
+            .expect("User remains valid after BeforeTransaction"),
+            ValidatedUserSourceSchema::V031V10,
+            "User must remain the exact frozen v0.3.1 schema-10 source",
+        );
+        assert_production_retry_is_idempotent(&before_transaction, &target, &binding, &materials);
+
+        for failure_point in [
+            BackfillFailurePoint::AfterProjectBindings,
+            BackfillFailurePoint::BeforeCommit,
+        ] {
+            let fixture = V031Fixture::new(&[PROJECT_A, PROJECT_B]);
+            let (target, binding, materials) = prepare_checkpoint_gated_writer(&fixture);
+            let user_before = sqlite_file_set_bytes_for_test(&fixture.user_database_path);
+            let privacy = fixture
+                .manager
+                .open_raw_connection()
+                .expect("Privacy v5 before rollback boundary");
+            let privacy_v5_before = compute_privacy_v5_manifests_read_only(&privacy)
+                .expect("exact Privacy v5 before rollback boundary");
+            drop(privacy);
+
+            let error = fixture
+                .manager
+                .run_v031_case_material_migration_after_checkpoints_with_failure(
+                    &fixture.gate,
+                    &target,
+                    &binding,
+                    &materials,
+                    failure_point,
+                )
+                .expect_err("in-transaction Step-5 failure must roll back");
+            assert_eq!(error.code(), "v031_case_material_injected_failure");
+            assert_eq!(
+                sqlite_file_set_bytes_for_test(&fixture.user_database_path),
+                user_before,
+                "the pinned User-v10 source must remain byte-for-byte read-only",
+            );
+            let privacy = fixture
+                .manager
+                .open_raw_connection()
+                .expect("Privacy v5 rollback inspection");
+            assert_eq!(
+                compute_privacy_v5_manifests_read_only(&privacy)
+                    .expect("rolled-back Privacy remains exact v5"),
+                privacy_v5_before,
+                "the complete Privacy transaction must roll back",
+            );
+            drop(privacy);
+            assert_eq!(target_inventory(&fixture), (0, 0, 0, 0, 0, 0, 0, 0));
+            assert_production_retry_is_idempotent(&fixture, &target, &binding, &materials);
+        }
+
+        let after_commit = V031Fixture::new(&[PROJECT_A, PROJECT_B]);
+        let (target, binding, materials) = prepare_checkpoint_gated_writer(&after_commit);
+        let user_before = sqlite_file_set_bytes_for_test(&after_commit.user_database_path);
+        let error = after_commit
+            .manager
+            .run_v031_case_material_migration_after_checkpoints_with_failure(
+                &after_commit.gate,
+                &target,
+                &binding,
+                &materials,
+                BackfillFailurePoint::AfterCommit,
+            )
+            .expect_err("AfterCommit must expose the committed-before-receipt window");
+        assert_eq!(error.code(), "v031_case_material_injected_failure");
+        assert_eq!(
+            sqlite_file_set_bytes_for_test(&after_commit.user_database_path),
+            user_before,
+            "AfterCommit still leaves the User-v10 source byte-for-byte read-only",
+        );
+        let committed = after_commit
+            .manager
+            .v031_binding_material_terminal_proof_after_checkpoints(
+                &after_commit.gate,
+                &target,
+                &binding,
+                &materials,
+            )
+            .expect("committed rows expose a restart-safe proof for the receipt layer");
+        assert_eq!(committed.binding_ledger_rows(), 2);
+        assert_eq!(committed.material_ledger_rows(), 1);
+        assert_eq!(committed.bindings_verified(), 2);
+        let inventory_before_retry = target_inventory(&after_commit);
+        assert_eq!(inventory_before_retry.0, 2);
+        assert_eq!(inventory_before_retry.1, 2);
+        assert_eq!(inventory_before_retry.2, 2);
+        assert_eq!(inventory_before_retry.3, 2);
+        let user_before_read_only_resume = sqlite_file_set_state(&after_commit.user_database_path);
+        let privacy_before_read_only_resume =
+            sqlite_file_set_state(&after_commit.manager.shared.database_path);
+        let boundary_probe = after_commit
+            .manager
+            .run_v031_case_material_migration_after_checkpoints_with_failure(
+                &after_commit.gate,
+                &target,
+                &binding,
+                &materials,
+                BackfillFailurePoint::BeforeTransaction,
+            )
+            .expect("terminal restart returns before the transaction boundary");
+        assert!(boundary_probe.source_unchanged_verified);
+        assert!(boundary_probe.idempotent_noops >= 3);
+        let resume = after_commit
+            .manager
+            .run_v031_case_material_migration_after_checkpoints(
+                &after_commit.gate,
+                &target,
+                &binding,
+                &materials,
+            )
+            .expect("AfterCommit restart takes the read-only terminal branch");
+        assert!(resume.source_unchanged_verified);
+        assert!(resume.idempotent_noops >= 3);
+        let retried = after_commit
+            .manager
+            .v031_binding_material_terminal_proof_after_checkpoints(
+                &after_commit.gate,
+                &target,
+                &binding,
+                &materials,
+            )
+            .expect("receipt layer can rebuild proof without reopening the writer");
+        assert_eq!(retried, committed);
+        assert_eq!(
+            sqlite_file_set_state(&after_commit.user_database_path),
+            user_before_read_only_resume,
+            "the committed-before-Receipt5 resume must not touch User or its sidecars",
+        );
+        assert_eq!(
+            sqlite_file_set_state(&after_commit.manager.shared.database_path),
+            privacy_before_read_only_resume,
+            "the committed-before-Receipt5 resume must not touch Privacy or its sidecars",
+        );
+        assert_eq!(target_inventory(&after_commit), inventory_before_retry);
     }
 
     #[test]

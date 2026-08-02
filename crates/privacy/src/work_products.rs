@@ -14,8 +14,9 @@ use crate::{
         WORK_PRODUCT_MANIFEST_VERSION,
     },
     workspace::{
-        ApprovedWorkspaceOperationGuard, ApprovedWorkspaceService, ManifestSigningKey,
-        ManifestVerificationKey, WorkspaceError, USER_BOUNDARY_SIGNING_ALGORITHM,
+        open_existing_sqlite_read_only, ApprovedWorkspaceOperationGuard, ApprovedWorkspaceService,
+        ManifestSigningKey, ManifestVerificationKey, WorkspaceError,
+        USER_BOUNDARY_SIGNING_ALGORITHM,
     },
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -679,6 +680,22 @@ impl WorkProductService {
     ) -> Result<Self, WorkProductError> {
         let root = WorkProductRoot::open(root.as_ref())?;
         initialize_database(&root, &workspace_instance_id)?;
+        Ok(Self {
+            root,
+            workspace_instance_id,
+            verifier,
+        })
+    }
+
+    /// Opens an already initialized work-product store without creating or
+    /// repairing directories, schema objects, metadata rows, or journal state.
+    /// Database handles opened through the returned service are read-only.
+    pub fn open_read_only(
+        root: impl AsRef<Path>,
+        workspace_instance_id: WorkspaceInstanceId,
+        verifier: ManifestVerificationKey,
+    ) -> Result<Self, WorkProductError> {
+        let root = WorkProductRoot::open_read_only(root.as_ref())?;
         Ok(Self {
             root,
             workspace_instance_id,
@@ -1564,6 +1581,7 @@ fn map_crypto_read_error(error: VaultCryptoError) -> WorkProductError {
 struct WorkProductRoot {
     fixed: FixedLocalStorageRoot,
     database: PathBuf,
+    read_only: bool,
 }
 
 impl WorkProductRoot {
@@ -1577,7 +1595,11 @@ impl WorkProductRoot {
             fixed.ensure_directory(Path::new(relative))?;
         }
         let database = fixed.canonical_root().join("work-products.sqlite");
-        Ok(Self { fixed, database })
+        Ok(Self {
+            fixed,
+            database,
+            read_only: false,
+        })
     }
 
     fn open(root: &Path) -> Result<Self, WorkProductError> {
@@ -1590,7 +1612,28 @@ impl WorkProductRoot {
             fixed.validate_existing_directory(Path::new(relative))?;
         }
         let database = fixed.validate_existing_file(Path::new("work-products.sqlite"))?;
-        Ok(Self { fixed, database })
+        Ok(Self {
+            fixed,
+            database,
+            read_only: false,
+        })
+    }
+
+    fn open_read_only(root: &Path) -> Result<Self, WorkProductError> {
+        let fixed = FixedLocalStorageRoot::open(root)?;
+        for relative in [
+            "work-products",
+            ".work-product-staging",
+            ".work-product-quarantine",
+        ] {
+            fixed.validate_existing_directory(Path::new(relative))?;
+        }
+        let database = fixed.validate_existing_file(Path::new("work-products.sqlite"))?;
+        Ok(Self {
+            fixed,
+            database,
+            read_only: true,
+        })
     }
 }
 
@@ -1664,7 +1707,12 @@ fn open_database(root: &WorkProductRoot) -> Result<Connection, WorkProductError>
         root.fixed
             .validate_new_path(Path::new("work-products.sqlite"))?;
     }
-    let db = Connection::open(&root.database).map_err(|_| WorkProductError::DatabaseFailed)?;
+    let db = if root.read_only {
+        open_existing_sqlite_read_only(&root.database)
+            .map_err(|_| WorkProductError::DatabaseFailed)?
+    } else {
+        Connection::open(&root.database).map_err(|_| WorkProductError::DatabaseFailed)?
+    };
     db.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| WorkProductError::DatabaseFailed)?;
     Ok(db)

@@ -17,15 +17,15 @@ use privacy::vnext::{
 };
 use privacy::{
     scan_residual, sha256_hex, vault_store::VaultIsolationStatusV1, ActiveReceiptVerification,
-    BindingCreationSource, BindingLifecycleContext, DataClassification, DestinationKind,
-    DestinationScope, EgressCandidate, EgressPolicyEngine, LifecycleError, PrivacyCaseId,
-    PrivacyEgressAuditRecord, PrivacyLifecycle, PrivacyStore, PrivacyStoreError,
+    BindingCreationSource, BindingLifecycleContext, CleanupReportV1, DataClassification,
+    DestinationKind, DestinationScope, EgressCandidate, EgressPolicyEngine, LifecycleError,
+    PrivacyCaseId, PrivacyEgressAuditRecord, PrivacyLifecycle, PrivacyStore, PrivacyStoreError,
     PrivacyStoreSchemaStatus, ProjectId, ProjectPrivacyCaseBindingError,
     ProjectPrivacyCaseBindingStore, ReceiptSigner, RedactionOptions, RedactionReceiptClaims,
     RedactionSummary, Redactor, RegisterPrivacyMaterial, ReviewActionV1, ReviewSessionInputV1,
     ReviewSessionV1, ReviewState, ReviewStateViewV1, SaveReviewDraft, SaveRiskReviewRevision,
-    SensitiveMappingEntryV1, SensitiveMappingPayloadV1, VerifiedReviewActionContextV1,
-    REDACTION_VERSION,
+    SensitiveMappingEntryV1, SensitiveMappingPayloadV1, VaultCleanupReportV1,
+    VerifiedReviewActionContextV1, LOGICAL_ERASURE_DISCLOSURE, REDACTION_VERSION,
 };
 use providers::{
     windows_credentials::WindowsCredentialStore, ApiSecret, CredentialStore, ProviderCredentialKey,
@@ -64,6 +64,9 @@ mod project_deletion;
 mod provider_qualification;
 mod safe_derived;
 mod vault_broker;
+pub(crate) use approved_case_projection::{
+    V031ApprovedProjectionSourceProof, V031PrivacyV6TerminalProof,
+};
 #[allow(unused_imports)]
 pub use approved_provider::{
     ApproveApprovedProviderTaskRequest, ApproveApprovedProviderTaskResponse,
@@ -75,6 +78,13 @@ pub use approved_provider::{
 pub(crate) use case_assistant::{
     CaseAssistantDispatchOutputKind, CaseAssistantDispatchRequest, CaseAssistantDispatchResponse,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use case_material_migration::BackfillFailurePoint;
+pub(crate) use case_material_migration::{
+    reconstruct_v031_step4_source_proof_from_authenticated_checkpoints_read_only,
+    V031BindingMaterialTerminalProof, V031CaseMigrationCheckpointSourceProof,
+};
 pub use case_materials::{
     ApplyCaseRedactionRiskReviewActionRequest, ApproveCaseRedactionReviewRequest,
     AssignUnassignedCaseMaterialRequest, AssignUnassignedCaseMaterialResponse, CaseMaterialSummary,
@@ -84,6 +94,11 @@ pub use case_materials::{
     ListCaseRedactionGenerationsRequest, ListUnassignedCaseMaterialsRequest,
     LoadCaseRedactionReviewRequest, PrepareCaseMaterialRequest, PrepareCaseMaterialResponse,
     UnassignedCaseMaterialSummary,
+};
+pub(crate) use lifecycle_admin::{
+    apply_observed_pending_privacy_restore, observe_current_privacy_profile_read_only,
+    observe_pending_privacy_restore_read_only, CurrentPrivacyProfileObservation,
+    CurrentPrivacyProfileProof, PendingPrivacyRestoreGate, PendingPrivacyRestoreObservation,
 };
 pub use lifecycle_admin::{
     BackupIdRequest, CleanupReportView, DestroyMappingKeyRequest, LifecycleStatusRequest,
@@ -95,6 +110,21 @@ pub use provider_qualification::{
     ProviderQualificationRequest, ProviderQualificationRunRequest, ProviderQualificationStatus,
 };
 pub use safe_derived::{export_reason, ExportApprovedPrivacyReviewRequest, SafeExportFormat};
+#[allow(unused_imports)]
+pub(crate) use vault_broker::{
+    load_v031_vault_historical_target_from_checkpoint_read_only,
+    load_v031_vault_target_component_read_only, observe_current_vault_read_only,
+    observe_v031_vault_target_absent_read_only, observe_v031_vault_target_namespace_read_only,
+    prepare_v031_vault_target_component, verify_v031_vault_target_component_read_only,
+    CurrentVaultObservation, CurrentVaultProof, V031VaultHistoricalTargetRecord,
+    V031VaultTargetAbsentGate, V031VaultTargetComponentError, V031VaultTargetComponentGate,
+    V031VaultTargetIncompleteGate, V031VaultTargetNamespaceObservation,
+};
+#[cfg(test)]
+pub(crate) use vault_broker::{
+    prepare_v031_vault_target_component_with_writer_failure_for_test,
+    V031VaultTargetWriterFailurePoint,
+};
 
 const PRIVACY_DIRECTORY_NAME: &str = "privacy";
 const PRIVACY_DATABASE_NAME: &str = "privacy-workflow.sqlite";
@@ -529,6 +559,67 @@ pub struct PrivacyWorkflowManager {
     shared: Arc<PrivacyWorkflowShared>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V031Step8PrivacyMaintenanceReport {
+    pub(crate) cutoff_unix: u64,
+    pub(crate) retention_cleanup: CleanupReportV1,
+    pub(crate) vault_cleanup: VaultCleanupReportV1,
+    pub(crate) pending_project_deletions_after: u64,
+    pub(crate) pending_retention_cleanups_after: u64,
+    pub(crate) pending_vault_prepared_after: u64,
+    pub(crate) pending_vault_committed_after: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct V031Step8ExpiredVaultObjectFixture {
+    binding: vault_broker::VaultAuxBinding,
+    plaintext: Vec<u8>,
+}
+
+#[cfg(test)]
+impl V031Step8ExpiredVaultObjectFixture {
+    pub(crate) fn case_id(&self) -> &CaseId {
+        &self.binding.case_id
+    }
+
+    pub(crate) fn object_id(&self) -> &privacy::vnext::ObjectId {
+        &self.binding.object_id
+    }
+
+    pub(crate) const fn object_version(&self) -> u64 {
+        self.binding.object_version
+    }
+
+    pub(crate) fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// These names describe the frozen durable crash boundaries verbatim.
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum V031Step8MaintenanceFailurePoint {
+    AfterRetentionPreparedBeforeInvalidation,
+    AfterRetentionCommittedBeforeVault,
+    AfterVaultPreparedBeforeCommit,
+    AfterVaultCommittedBeforeFinalize,
+    AfterVaultPhysicalPurgeBeforeJournalCommit,
+}
+
+pub(crate) trait V031Step8MaintenanceFailureInjector: Send + Sync {
+    fn should_fail(&self, point: V031Step8MaintenanceFailurePoint) -> bool;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct NoopV031Step8MaintenanceFailureInjector;
+
+impl V031Step8MaintenanceFailureInjector for NoopV031Step8MaintenanceFailureInjector {
+    fn should_fail(&self, _point: V031Step8MaintenanceFailurePoint) -> bool {
+        false
+    }
+}
+
 pub(crate) trait ApprovedPublicationInvalidator: Send + Sync {
     fn invalidate_case(
         &self,
@@ -659,6 +750,16 @@ impl PrivacyWorkflowManager {
                 ))
             }
         };
+        if privacy_directory_present
+            && lifecycle_admin::observe_pending_privacy_restore_read_only(
+                &app_local_data_directory,
+            )? != lifecycle_admin::PendingPrivacyRestoreObservation::Absent
+        {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_restore_requires_startup_router",
+                "An authenticated Privacy restore must be applied by startup arbitration before a workflow manager is constructed.",
+            ));
+        }
         let vault_broker: Arc<dyn vault_broker::VaultBroker> = if defer_startup_maintenance {
             Arc::new(
                 vault_broker::LocalEncryptedVaultBroker::open_for_application_startup(
@@ -692,18 +793,6 @@ impl PrivacyWorkflowManager {
                 schema_upgrade_required: AtomicBool::new(false),
             }),
         };
-        if privacy_directory_present {
-            lifecycle_admin::apply_pending_privacy_restore(
-                &directory,
-                manager.shared.workspace_instance_id.as_str(),
-                || {
-                    ensure_standalone_restore_lineage_safe(&app_local_data_directory)?;
-                    manager
-                        .invalidate_all_publications("privacy_restore_startup_recovery")
-                        .map(|_| ())
-                },
-            )?;
-        }
         let schema_status = manager.preflight_privacy_store_schema_read_only()?;
         if matches!(
             schema_status,
@@ -760,7 +849,7 @@ impl PrivacyWorkflowManager {
         )?;
         self.shared
             .vault_broker
-            .run_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now_unix)
+            .run_or_resume_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now_unix)
             .map_err(PrivacyWorkflowError::vault)?;
         Ok(())
     }
@@ -938,6 +1027,36 @@ impl PrivacyWorkflowManager {
             .now_unix_override
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now_unix);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_v031_step8_expired_vault_object_for_test(
+        &self,
+        case_id: CaseId,
+        plaintext: Vec<u8>,
+    ) -> Result<V031Step8ExpiredVaultObjectFixture, PrivacyWorkflowError> {
+        let binding = self
+            .shared
+            .vault_broker
+            .seal_aux_payload(&case_id, "v031-step8-expired-fixture", &plaintext, 1)
+            .map_err(PrivacyWorkflowError::vault)?;
+        self.shared
+            .vault_broker
+            .bind_aux_retention(&binding, 2, false, 1, 1)
+            .map_err(PrivacyWorkflowError::vault)?;
+        Ok(V031Step8ExpiredVaultObjectFixture { binding, plaintext })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_v031_step8_vault_object_for_test(
+        &self,
+        fixture: &V031Step8ExpiredVaultObjectFixture,
+    ) -> Result<Vec<u8>, PrivacyWorkflowError> {
+        self.shared
+            .vault_broker
+            .read_aux_payload(&fixture.binding)
+            .map(|lease| lease.content().to_vec())
+            .map_err(PrivacyWorkflowError::vault)
     }
 
     #[cfg(test)]
@@ -1197,6 +1316,225 @@ impl PrivacyWorkflowManager {
         let _guard = self.gate();
         let mut connection = self.open_connection()?;
         self.run_startup_maintenance(&mut connection)
+    }
+
+    /// Performs the frozen Step-8 Privacy recovery/retention work with stable,
+    /// lineage-derived cleanup identifiers and cutoff. Re-entry resumes or
+    /// verifies the same durable journals and never creates a second cleanup.
+    #[cfg(test)]
+    pub(crate) fn complete_v031_step8_privacy_maintenance(
+        &self,
+        cutoff_unix: u64,
+        retention_cleanup_id: &str,
+        vault_cleanup_id: &str,
+    ) -> Result<V031Step8PrivacyMaintenanceReport, PrivacyWorkflowError> {
+        self.complete_v031_step8_privacy_maintenance_with_failure_injector(
+            cutoff_unix,
+            retention_cleanup_id,
+            vault_cleanup_id,
+            &NoopV031Step8MaintenanceFailureInjector,
+        )
+    }
+
+    pub(crate) fn complete_v031_step8_privacy_maintenance_with_failure_injector(
+        &self,
+        cutoff_unix: u64,
+        retention_cleanup_id: &str,
+        vault_cleanup_id: &str,
+        failure_injector: &dyn V031Step8MaintenanceFailureInjector,
+    ) -> Result<V031Step8PrivacyMaintenanceReport, PrivacyWorkflowError> {
+        if cutoff_unix == 0 {
+            return Err(v031_step8_maintenance_error());
+        }
+        let _guard = self.gate();
+        let mut connection = self.open_connection()?;
+        self.shared
+            .vault_broker
+            .recover_cleanups(cutoff_unix)
+            .map_err(PrivacyWorkflowError::vault)?;
+        let lifecycle = PrivacyLifecycle::initialize(
+            &mut connection,
+            self.shared.workspace_instance_id.clone(),
+            cutoff_unix,
+        )
+        .map_err(PrivacyWorkflowError::lifecycle)?;
+        self.recover_pending_project_deletions_unlocked(&mut connection)?;
+        self.recover_prepared_retention_sweeps(
+            &lifecycle,
+            &mut connection,
+            cutoff_unix,
+            "privacy_v031_step8_retention_recovery",
+        )?;
+        let retention_cleanup = self.run_or_resume_v031_step8_retention_cleanup(
+            &lifecycle,
+            &mut connection,
+            retention_cleanup_id,
+            cutoff_unix,
+            failure_injector,
+        )?;
+        if failure_injector
+            .should_fail(V031Step8MaintenanceFailurePoint::AfterRetentionCommittedBeforeVault)
+        {
+            return Err(v031_step8_maintenance_error());
+        }
+        let vault_cleanup = self
+            .shared
+            .vault_broker
+            .run_or_resume_expired_cleanup_with_failure_injector(
+                vault_cleanup_id,
+                cutoff_unix,
+                failure_injector,
+            )
+            .map_err(PrivacyWorkflowError::vault)?;
+
+        let pending_project_deletions_after =
+            self.recover_pending_project_deletions_unlocked(&mut connection)?;
+        let pending_retention_cleanups_after =
+            u64::try_from(prepared_retention_cleanup_ids(&connection)?.len())
+                .map_err(|_| v031_step8_maintenance_error())?;
+        let vault_status = self
+            .shared
+            .vault_broker
+            .inspect_cleanup_status_read_only()
+            .map_err(PrivacyWorkflowError::vault)?;
+        if pending_project_deletions_after != 0
+            || pending_retention_cleanups_after != 0
+            || vault_status.prepared_count != 0
+            || vault_status.committed_count != 0
+            || retention_cleanup.cleanup_id != retention_cleanup_id
+            || retention_cleanup.state != "committed"
+            || retention_cleanup.started_at_unix != cutoff_unix
+            || retention_cleanup.completed_at_unix != cutoff_unix
+            || vault_cleanup.cleanup_id != vault_cleanup_id
+            || vault_cleanup.state != "purged"
+            || vault_cleanup.started_at_unix != cutoff_unix
+            || vault_cleanup.completed_at_unix != cutoff_unix
+            || vault_cleanup.quarantine_paths_pending != 0
+        {
+            return Err(v031_step8_maintenance_error());
+        }
+        Ok(V031Step8PrivacyMaintenanceReport {
+            cutoff_unix,
+            retention_cleanup,
+            vault_cleanup,
+            pending_project_deletions_after,
+            pending_retention_cleanups_after,
+            pending_vault_prepared_after: vault_status.prepared_count,
+            pending_vault_committed_after: vault_status.committed_count,
+        })
+    }
+
+    fn run_or_resume_v031_step8_retention_cleanup(
+        &self,
+        lifecycle: &PrivacyLifecycle,
+        connection: &mut Connection,
+        cleanup_id: &str,
+        cutoff_unix: u64,
+        failure_injector: &dyn V031Step8MaintenanceFailureInjector,
+    ) -> Result<CleanupReportV1, PrivacyWorkflowError> {
+        let existing = connection
+            .query_row(
+                "SELECT state,started_at_unix,completed_at_unix,candidate_count,
+                        removed_count,keys_destroyed,event_hash,erasure_disclosure
+                 FROM privacy_cleanup_journal WHERE cleanup_id=?1",
+                [cleanup_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| v031_step8_maintenance_error())?;
+        let Some((
+            state,
+            started_at,
+            completed_at,
+            candidate_count,
+            removed_count,
+            keys_destroyed,
+            event_hash,
+            erasure_disclosure,
+        )) = existing
+        else {
+            lifecycle
+                .prepare_retention_sweep(connection, cleanup_id, cutoff_unix)
+                .map_err(PrivacyWorkflowError::lifecycle)?;
+            if failure_injector.should_fail(
+                V031Step8MaintenanceFailurePoint::AfterRetentionPreparedBeforeInvalidation,
+            ) {
+                return Err(v031_step8_maintenance_error());
+            }
+            let lifecycle_binding_ids = lifecycle
+                .revalidate_prepared_retention_sweep_for_external_invalidation(
+                    connection,
+                    cleanup_id,
+                    cutoff_unix,
+                )
+                .map_err(PrivacyWorkflowError::lifecycle)?
+                .ok_or_else(v031_step8_maintenance_error)?;
+            self.invalidate_lifecycle_bindings(
+                &lifecycle_binding_ids,
+                "privacy_v031_step8_retention_cleanup",
+            )?;
+            return lifecycle
+                .commit_retention_sweep(connection, cleanup_id, cutoff_unix)
+                .map_err(PrivacyWorkflowError::lifecycle);
+        };
+        if u64::try_from(started_at).ok() != Some(cutoff_unix) {
+            return Err(v031_step8_maintenance_error());
+        }
+        if state == "prepared" {
+            let lifecycle_binding_ids = lifecycle
+                .revalidate_prepared_retention_sweep_for_external_invalidation(
+                    connection,
+                    cleanup_id,
+                    cutoff_unix,
+                )
+                .map_err(PrivacyWorkflowError::lifecycle)?
+                .ok_or_else(v031_step8_maintenance_error)?;
+            self.invalidate_lifecycle_bindings(
+                &lifecycle_binding_ids,
+                "privacy_v031_step8_retention_cleanup",
+            )?;
+            return lifecycle
+                .commit_retention_sweep(connection, cleanup_id, cutoff_unix)
+                .map_err(PrivacyWorkflowError::lifecycle);
+        }
+        if state != "committed"
+            || completed_at.and_then(|value| u64::try_from(value).ok()) != Some(cutoff_unix)
+            || candidate_count < 0
+            || removed_count < 0
+            || keys_destroyed < 0
+            || removed_count > candidate_count
+            || event_hash.len() != 64
+            || erasure_disclosure != LOGICAL_ERASURE_DISCLOSURE
+        {
+            return Err(v031_step8_maintenance_error());
+        }
+        lifecycle
+            .verify_cleanup_journal(connection)
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+        Ok(CleanupReportV1 {
+            cleanup_id: cleanup_id.to_owned(),
+            state,
+            candidates: u64::try_from(candidate_count)
+                .map_err(|_| v031_step8_maintenance_error())?,
+            removed: u64::try_from(removed_count).map_err(|_| v031_step8_maintenance_error())?,
+            keys_destroyed: u64::try_from(keys_destroyed)
+                .map_err(|_| v031_step8_maintenance_error())?,
+            started_at_unix: cutoff_unix,
+            completed_at_unix: cutoff_unix,
+            event_hash,
+            erasure_disclosure: LOGICAL_ERASURE_DISCLOSURE,
+        })
     }
 
     fn parse_project_id(&self, value: String) -> Result<ProjectId, PrivacyWorkflowError> {
@@ -4169,6 +4507,13 @@ fn approved_publication_invalidation_error(code: &'static str) -> PrivacyWorkflo
     )
 }
 
+fn v031_step8_maintenance_error() -> PrivacyWorkflowError {
+    PrivacyWorkflowError::new(
+        "v031_step8_privacy_maintenance_failed",
+        "The frozen upgrade cleanup journal could not be resumed or verified.",
+    )
+}
+
 fn prepared_retention_cleanup_ids(
     connection: &Connection,
 ) -> Result<Vec<String>, PrivacyWorkflowError> {
@@ -5155,6 +5500,82 @@ mod tests {
         let signer = ReceiptSigner::new([7u8; 32]).expect("test receipt signer");
         manager.set_test_runtime(signer.clone(), TEST_NOW);
         (directory, manager, signer)
+    }
+
+    #[test]
+    fn v031_step8_privacy_maintenance_reuses_exact_lineage_journals() {
+        let (directory, manager, _signer) = manager_with_test_signer();
+        let cutoff = TEST_NOW;
+        let retention_id = "cln_dddddddddddddddddddddddddddddddd";
+        let vault_id = "cln_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+        let privacy_before = manager
+            .open_connection()
+            .expect("Privacy before Step-8 maintenance");
+        privacy::compute_privacy_v6_manifests_read_only(&privacy_before)
+            .expect("Step-8 starts from the exact full Privacy-v6 schema");
+        drop(privacy_before);
+
+        let first = manager
+            .complete_v031_step8_privacy_maintenance(cutoff, retention_id, vault_id)
+            .expect("first deterministic Step-8 maintenance");
+        let privacy_after = manager
+            .open_connection()
+            .expect("Privacy after Step-8 maintenance");
+        privacy::compute_privacy_v6_manifests_read_only(&privacy_after)
+            .expect("Step-8 preserves the exact full Privacy-v6 schema");
+        drop(privacy_after);
+        let repeated = manager
+            .complete_v031_step8_privacy_maintenance(cutoff, retention_id, vault_id)
+            .expect("repeated Step-8 maintenance verifies the same journals");
+        assert_eq!(repeated, first);
+        assert_eq!(first.retention_cleanup.cleanup_id, retention_id);
+        assert_eq!(first.retention_cleanup.state, "committed");
+        assert_eq!(first.vault_cleanup.cleanup_id, vault_id);
+        assert_eq!(first.vault_cleanup.state, "purged");
+        assert_eq!(first.pending_project_deletions_after, 0);
+        assert_eq!(first.pending_retention_cleanups_after, 0);
+        assert_eq!(first.pending_vault_prepared_after, 0);
+        assert_eq!(first.pending_vault_committed_after, 0);
+
+        let privacy = manager.open_connection().expect("Privacy journal database");
+        privacy::compute_privacy_v6_manifests_read_only(&privacy)
+            .expect("Step-8 replay preserves the exact full Privacy-v6 schema");
+        assert_eq!(
+            privacy
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_cleanup_journal WHERE cleanup_id=?1",
+                    [retention_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("Privacy cleanup journal cardinality"),
+            1
+        );
+        drop(privacy);
+        let vault_database = directory
+            .path()
+            .join(vault_broker::VAULT_ROOT_DIRECTORY)
+            .join("vault-state.sqlite");
+        let vault = Connection::open(vault_database).expect("Vault journal database");
+        assert_eq!(
+            vault
+                .query_row(
+                    "SELECT COUNT(*) FROM vault_cleanup_journal WHERE cleanup_id=?1",
+                    [vault_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("Vault cleanup journal cardinality"),
+            1
+        );
+        drop(vault);
+
+        assert_eq!(
+            manager
+                .complete_v031_step8_privacy_maintenance(cutoff + 1, retention_id, vault_id)
+                .expect_err("a lineage cleanup ID cannot be rebound to another cutoff")
+                .code(),
+            "v031_step8_privacy_maintenance_failed"
+        );
     }
 
     fn file_tree_hashes(root: &Path) -> BTreeMap<String, String> {

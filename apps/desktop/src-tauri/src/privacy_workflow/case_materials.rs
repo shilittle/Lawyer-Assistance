@@ -310,165 +310,14 @@ impl Drop for CaseProjectReadGuard {
     }
 }
 
-const CASE_MATERIAL_ASSIGNMENT_SCHEMA_VERSION: &str = "1";
-const CASE_MATERIAL_ASSIGNMENT_SCHEMA_KEY: &str = "case_material_assignment_schema_version";
-const ASSIGNMENT_AUDIT_NO_UPDATE_TRIGGER_SQL: &str = "
-    CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_no_update
-    BEFORE UPDATE ON case_material_assignment_audit
-    BEGIN
-        SELECT RAISE(ABORT, 'case material assignment audit is append only');
-    END
-";
-const ASSIGNMENT_AUDIT_NO_DELETE_TRIGGER_SQL: &str = "
-    CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_no_delete
-    BEFORE DELETE ON case_material_assignment_audit
-    BEGIN
-        SELECT RAISE(ABORT, 'case material assignment audit is append only');
-    END
-";
-const ASSIGNMENT_AUDIT_NO_REPLACE_TRIGGER_SQL: &str = "
-    CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_no_replace
-    BEFORE INSERT ON case_material_assignment_audit
-    WHEN EXISTS (
-        SELECT 1
-        FROM case_material_assignment_audit AS existing
-        WHERE existing.assignment_id=NEW.assignment_id
-           OR existing.material_id=NEW.material_id
-           OR existing.event_hash=NEW.event_hash
-    )
-    BEGIN
-        SELECT RAISE(ABORT, 'case material assignment audit is append only');
-    END
-";
-const ASSIGNMENT_AUDIT_SCOPE_MATCH_TRIGGER_SQL: &str = "
-    CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_scope_match
-    BEFORE INSERT ON case_material_assignment_audit
-    WHEN NOT EXISTS (
-        SELECT 1
-        FROM privacy_materials AS material
-        JOIN project_privacy_case_bindings AS binding
-          ON binding.project_id=NEW.project_id
-         AND binding.privacy_case_id=NEW.privacy_case_id
-        WHERE material.material_id=NEW.material_id
-          AND material.project_id=NEW.project_id
-          AND material.migration_status='ready'
-          AND material.row_version=NEW.assigned_material_row_version
-    )
-    BEGIN
-        SELECT RAISE(ABORT, 'case material assignment audit scope mismatch');
-    END
-";
-
 pub(super) fn initialize_assignment_schema(
     connection: &mut Connection,
 ) -> Result<(), PrivacyWorkflowError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| case_material_assignment_store_error())?;
-    transaction
-        .execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS case_material_assignment_audit (
-                assignment_id TEXT PRIMARY KEY NOT NULL CHECK(
-                    length(assignment_id) BETWEEN 1 AND 128
-                    AND assignment_id = trim(assignment_id)
-                ),
-                material_id TEXT UNIQUE NOT NULL CHECK(
-                    length(material_id) BETWEEN 1 AND 128
-                    AND material_id = trim(material_id)
-                ),
-                project_id TEXT NOT NULL CHECK(
-                    length(CAST(project_id AS BLOB)) BETWEEN 1 AND 256
-                    AND substr(project_id, 1, 5) = 'case-'
-                    AND project_id = trim(project_id)
-                ),
-                privacy_case_id TEXT NOT NULL CHECK(
-                    length(privacy_case_id) = 37
-                    AND substr(privacy_case_id, 1, 5) = 'case_'
-                    AND substr(privacy_case_id, 6) NOT GLOB '*[^0-9a-f]*'
-                ),
-                assignment_mode TEXT NOT NULL CHECK(
-                    assignment_mode IN ('initialize_null_case', 'preserve_historical_case')
-                ),
-                binding_action TEXT NOT NULL CHECK(
-                    binding_action IN ('created', 'reused')
-                ),
-                actor_sha256 TEXT NOT NULL CHECK(
-                    length(actor_sha256) = 64
-                    AND actor_sha256 NOT GLOB '*[^0-9a-f]*'
-                ),
-                expected_material_row_version INTEGER NOT NULL CHECK(
-                    expected_material_row_version >= 0
-                ),
-                assigned_material_row_version INTEGER NOT NULL CHECK(
-                    assigned_material_row_version = expected_material_row_version + 1
-                ),
-                previous_migration_status TEXT NOT NULL CHECK(
-                    previous_migration_status = 'unassigned'
-                ),
-                previous_state TEXT NOT NULL CHECK(length(previous_state) > 0),
-                previous_event_hash TEXT NOT NULL CHECK(
-                    previous_event_hash = ''
-                    OR (
-                        length(previous_event_hash) = 64
-                        AND previous_event_hash NOT GLOB '*[^0-9a-f]*'
-                    )
-                ),
-                event_hash TEXT UNIQUE NOT NULL CHECK(
-                    length(event_hash) = 64
-                    AND event_hash NOT GLOB '*[^0-9a-f]*'
-                ),
-                result TEXT NOT NULL CHECK(result = 'assigned'),
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP CHECK(length(created_at) > 0)
-            );
-
-            CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_no_update
-            BEFORE UPDATE ON case_material_assignment_audit
-            BEGIN
-                SELECT RAISE(ABORT, 'case material assignment audit is append only');
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_no_delete
-            BEFORE DELETE ON case_material_assignment_audit
-            BEGIN
-                SELECT RAISE(ABORT, 'case material assignment audit is append only');
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_no_replace
-            BEFORE INSERT ON case_material_assignment_audit
-            WHEN EXISTS (
-                SELECT 1
-                FROM case_material_assignment_audit AS existing
-                WHERE existing.assignment_id=NEW.assignment_id
-                   OR existing.material_id=NEW.material_id
-                   OR existing.event_hash=NEW.event_hash
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'case material assignment audit is append only');
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_case_material_assignment_audit_scope_match
-            BEFORE INSERT ON case_material_assignment_audit
-            WHEN NOT EXISTS (
-                SELECT 1
-                FROM privacy_materials AS material
-                JOIN project_privacy_case_bindings AS binding
-                  ON binding.project_id=NEW.project_id
-                 AND binding.privacy_case_id=NEW.privacy_case_id
-                WHERE material.material_id=NEW.material_id
-                  AND material.project_id=NEW.project_id
-                  AND material.migration_status='ready'
-                  AND material.row_version=NEW.assigned_material_row_version
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'case material assignment audit scope mismatch');
-            END;
-
-            INSERT OR IGNORE INTO privacy_schema_metadata(key,value)
-            VALUES('case_material_assignment_schema_version','1');
-            ",
-        )
-        .map_err(|_| case_material_assignment_store_error())?;
+    privacy::initialize_case_material_assignment_schema(&transaction)
+        .map_err(PrivacyWorkflowError::store)?;
     validate_assignment_schema(&transaction)?;
     transaction
         .commit()
@@ -479,12 +328,12 @@ fn validate_assignment_schema(connection: &Connection) -> Result<(), PrivacyWork
     let schema_version = connection
         .query_row(
             "SELECT value FROM privacy_schema_metadata WHERE key=?1",
-            [CASE_MATERIAL_ASSIGNMENT_SCHEMA_KEY],
+            [privacy::CASE_MATERIAL_ASSIGNMENT_SCHEMA_KEY],
             |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|_| case_material_assignment_store_error())?;
-    if schema_version.as_deref() != Some(CASE_MATERIAL_ASSIGNMENT_SCHEMA_VERSION) {
+    if schema_version.as_deref() != Some(privacy::CASE_MATERIAL_ASSIGNMENT_SCHEMA_VERSION) {
         return Err(case_material_assignment_store_error());
     }
     let object_count = connection
@@ -511,19 +360,19 @@ fn validate_assignment_schema(connection: &Connection) -> Result<(), PrivacyWork
     for (name, canonical_sql) in [
         (
             "trg_case_material_assignment_audit_no_update",
-            ASSIGNMENT_AUDIT_NO_UPDATE_TRIGGER_SQL,
+            privacy::ASSIGNMENT_AUDIT_NO_UPDATE_TRIGGER_SQL,
         ),
         (
             "trg_case_material_assignment_audit_no_delete",
-            ASSIGNMENT_AUDIT_NO_DELETE_TRIGGER_SQL,
+            privacy::ASSIGNMENT_AUDIT_NO_DELETE_TRIGGER_SQL,
         ),
         (
             "trg_case_material_assignment_audit_no_replace",
-            ASSIGNMENT_AUDIT_NO_REPLACE_TRIGGER_SQL,
+            privacy::ASSIGNMENT_AUDIT_NO_REPLACE_TRIGGER_SQL,
         ),
         (
             "trg_case_material_assignment_audit_scope_match",
-            ASSIGNMENT_AUDIT_SCOPE_MATCH_TRIGGER_SQL,
+            privacy::ASSIGNMENT_AUDIT_SCOPE_MATCH_TRIGGER_SQL,
         ),
     ] {
         let stored_sql = connection

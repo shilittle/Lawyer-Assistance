@@ -515,6 +515,26 @@ impl PrivacyLifecycle {
         let transaction = connection
             .transaction()
             .map_err(|_| LifecycleError::Database)?;
+        let lifecycle =
+            Self::initialize_state_in_transaction(&transaction, workspace_instance_id, now_unix)?;
+        transaction.commit().map_err(|_| LifecycleError::Database)?;
+        Ok(lifecycle)
+    }
+
+    /// Initializes the lifecycle rows inside a caller-owned write transaction.
+    ///
+    /// The schema must already exist. Coordinated migrations use this narrow
+    /// entry point only after acquiring `BEGIN IMMEDIATE` and reauthenticating
+    /// the exact pre-lifecycle state in the same transaction, so no external
+    /// SQLite writer can change the classified state before the first insert.
+    pub fn initialize_state_in_transaction(
+        transaction: &Transaction<'_>,
+        workspace_instance_id: WorkspaceInstanceId,
+        now_unix: u64,
+    ) -> Result<Self, LifecycleError> {
+        if now_unix == 0 {
+            return Err(LifecycleError::InvalidInput);
+        }
         let existing: Option<(String, i64, i64)> = transaction
             .query_row(
                 "SELECT workspace_instance_id,schema_version,key_epoch
@@ -559,10 +579,9 @@ impl PrivacyLifecycle {
                     )
                     .map_err(|_| LifecycleError::Database)?;
                 let policy = RetentionPolicyV1::default_at(now_unix)?;
-                insert_retention_policy(&transaction, &policy)?;
+                insert_retention_policy(transaction, &policy)?;
             }
         }
-        transaction.commit().map_err(|_| LifecycleError::Database)?;
         Ok(Self {
             workspace_instance_id,
         })

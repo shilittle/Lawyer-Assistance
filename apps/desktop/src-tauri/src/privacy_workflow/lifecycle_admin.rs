@@ -284,7 +284,7 @@ pub struct VerifiedBackupView {
     pub restart_required: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PendingPrivacyRestoreV1 {
     format_version: u16,
@@ -293,6 +293,106 @@ struct PendingPrivacyRestoreV1 {
     key_epoch: u64,
     incoming_sha256: String,
     envelope_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingPrivacyRestorePhase {
+    Prepared,
+    ActiveMovedToRollback,
+    InstalledPendingCleanup,
+}
+
+/// Path-free authorization produced by the pre-manager startup pass.  The
+/// marker is kept private and its `Debug` output never exposes workspace or
+/// backup identifiers.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PendingPrivacyRestoreGate {
+    marker: PendingPrivacyRestoreV1,
+    marker_protected_sha256: String,
+    phase: PendingPrivacyRestorePhase,
+}
+
+impl std::fmt::Debug for PendingPrivacyRestoreGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingPrivacyRestoreGate")
+            .field("marker_protected_sha256", &self.marker_protected_sha256)
+            .field("phase", &self.phase)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingPrivacyRestoreGate {
+    #[cfg(test)]
+    pub(crate) fn marker_protected_sha256(&self) -> &str {
+        &self.marker_protected_sha256
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn phase(&self) -> PendingPrivacyRestorePhase {
+        self.phase
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingPrivacyRestoreObservation {
+    Absent,
+    Authenticated(PendingPrivacyRestoreGate),
+}
+
+/// Path-free proof that the active Privacy database is the exact current v6
+/// schema and that its lifecycle workspace/key binding is internally valid.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CurrentPrivacyProfileProof {
+    workspace_instance_id: privacy::vnext::WorkspaceInstanceId,
+    key_epoch: u64,
+    schema_object_count: u64,
+    logical_manifest_sha256: String,
+    logical_rows: u64,
+    business_manifest_sha256: String,
+    business_rows: u64,
+}
+
+impl std::fmt::Debug for CurrentPrivacyProfileProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CurrentPrivacyProfileProof")
+            .field("workspace_instance_id", &"[AUTHENTICATED_WORKSPACE]")
+            .field("key_epoch", &self.key_epoch)
+            .field("schema_object_count", &self.schema_object_count)
+            .field("logical_manifest_sha256", &self.logical_manifest_sha256)
+            .field("logical_rows", &self.logical_rows)
+            .field("business_manifest_sha256", &self.business_manifest_sha256)
+            .field("business_rows", &self.business_rows)
+            .finish()
+    }
+}
+
+impl CurrentPrivacyProfileProof {
+    pub(crate) fn workspace_instance_id(&self) -> &privacy::vnext::WorkspaceInstanceId {
+        &self.workspace_instance_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn key_epoch(&self) -> u64 {
+        self.key_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_manifest_sha256(&self) -> &str {
+        &self.logical_manifest_sha256
+    }
+
+    #[cfg(test)]
+    pub(crate) fn business_manifest_sha256(&self) -> &str {
+        &self.business_manifest_sha256
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CurrentPrivacyProfileObservation {
+    Absent,
+    ExactCurrent(CurrentPrivacyProfileProof),
 }
 
 struct PrivacyRestorePaths {
@@ -776,7 +876,7 @@ impl PrivacyWorkflowManager {
         )?;
         self.shared
             .vault_broker
-            .run_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now)
+            .run_or_resume_expired_cleanup(&format!("cln_{}", Uuid::new_v4().simple()), now)
             .map_err(PrivacyWorkflowError::vault)?;
         Ok(CleanupReportView::from(report))
     }
@@ -1169,9 +1269,286 @@ pub(crate) fn application_privacy_restore_incoming(privacy_directory: &Path) -> 
     privacy_directory.join("privacy-workflow.sqlite.application-restore-incoming")
 }
 
-pub(super) fn apply_pending_privacy_restore<BeforeApply>(
+/// Performs the current-profile Privacy classification without constructing a
+/// workflow/Vault manager.  A present directory with a missing database is a
+/// partial state, not a fresh install.
+pub(crate) fn observe_current_privacy_profile_read_only(
+    app_local_data_directory: &Path,
+) -> Result<CurrentPrivacyProfileObservation, PrivacyWorkflowError> {
+    let privacy_directory = app_local_data_directory.join(super::PRIVACY_DIRECTORY_NAME);
+    match fs::symlink_metadata(&privacy_directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CurrentPrivacyProfileObservation::Absent);
+        }
+        Err(_) => {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_current_profile_io",
+                "The fixed current Privacy namespace could not be inspected.",
+            ));
+        }
+        Ok(_) => validate_ordinary_directory(&privacy_directory)?,
+    }
+    if observe_pending_privacy_restore_read_only(app_local_data_directory)?
+        != PendingPrivacyRestoreObservation::Absent
+    {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_current_profile_restore_pending",
+            "A pending Privacy restore must be applied before current-profile validation.",
+        ));
+    }
+
+    let database_path = privacy_directory.join(super::PRIVACY_DATABASE_NAME);
+    match fs::symlink_metadata(&database_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_current_profile_partial",
+                "The Privacy namespace exists without its canonical database.",
+            ));
+        }
+        Err(_) => {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_current_profile_io",
+                "The current Privacy database could not be inspected.",
+            ));
+        }
+        Ok(_) => validate_ordinary_database_file(&database_path)?,
+    }
+    let connection = Connection::open_with_flags(
+        &database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_current_profile_invalid",
+            "The current Privacy database could not be opened read-only.",
+        )
+    })?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_current_profile_invalid",
+                "The current Privacy database could not enter query-only mode.",
+            )
+        })?;
+    let workspace_value = connection
+        .query_row(
+            "SELECT workspace_instance_id FROM privacy_lifecycle_meta WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_current_profile_invalid",
+                "The current Privacy lifecycle workspace binding is unavailable.",
+            )
+        })?;
+    let workspace_instance_id = privacy::vnext::WorkspaceInstanceId::parse(workspace_value)
+        .map_err(|_| {
+            PrivacyWorkflowError::new(
+                "privacy_current_profile_invalid",
+                "The current Privacy lifecycle workspace binding is invalid.",
+            )
+        })?;
+    let lifecycle = PrivacyLifecycle::open(&connection, workspace_instance_id.clone())
+        .map_err(PrivacyWorkflowError::lifecycle)?;
+    let key_epoch = lifecycle
+        .current_key_epoch(&connection)
+        .map_err(PrivacyWorkflowError::lifecycle)?;
+    if key_epoch == 0 {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_current_profile_invalid",
+            "The current Privacy lifecycle key epoch is invalid.",
+        ));
+    }
+    let manifest = privacy::compute_privacy_v6_manifests_read_only(&connection).map_err(|_| {
+        PrivacyWorkflowError::new(
+            "privacy_current_profile_invalid",
+            "The current Privacy schema or data manifest is invalid.",
+        )
+    })?;
+    validate_ordinary_database_file(&database_path)?;
+    Ok(CurrentPrivacyProfileObservation::ExactCurrent(
+        CurrentPrivacyProfileProof {
+            workspace_instance_id,
+            key_epoch,
+            schema_object_count: u64::try_from(manifest.schema_object_count).map_err(|_| {
+                PrivacyWorkflowError::new(
+                    "privacy_current_profile_invalid",
+                    "The current Privacy schema object count is unsupported.",
+                )
+            })?,
+            logical_manifest_sha256: manifest.logical_manifest.sha256,
+            logical_rows: manifest.logical_manifest.total_row_count,
+            business_manifest_sha256: manifest.business_manifest.sha256,
+            business_rows: manifest.business_manifest.total_row_count,
+        },
+    ))
+}
+
+/// Classifies the complete fixed standalone-Privacy restore namespace without
+/// repairing, deleting, renaming, opening a writable database, or invoking a
+/// publication invalidator.  Any unmarked residue or impossible crash state is
+/// rejected rather than cleaned during startup arbitration.
+pub(crate) fn observe_pending_privacy_restore_read_only(
+    app_local_data_directory: &Path,
+) -> Result<PendingPrivacyRestoreObservation, PrivacyWorkflowError> {
+    let privacy_directory = app_local_data_directory.join(super::PRIVACY_DIRECTORY_NAME);
+    match fs::symlink_metadata(&privacy_directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PendingPrivacyRestoreObservation::Absent);
+        }
+        Err(_) => {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_restore_io",
+                "The fixed privacy restore namespace could not be inspected.",
+            ));
+        }
+        Ok(_) => validate_ordinary_directory(&privacy_directory)?,
+    }
+
+    let paths = privacy_restore_paths(&privacy_directory.join(super::PRIVACY_DATABASE_NAME))?;
+    let marker_present = restore_path_is_present(&paths.marker)?;
+    let incoming_present = restore_path_is_present(&paths.incoming)?;
+    let active_present = restore_path_is_present(&paths.active)?;
+    let rollback_present = restore_path_is_present(&paths.rollback)?;
+    let incoming_residue = restore_database_slot_has_any_path(&paths.incoming)?;
+    let rollback_residue = restore_database_slot_has_any_path(&paths.rollback)?;
+
+    if !marker_present {
+        if incoming_residue || rollback_residue {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_restore_conflict",
+                "An unmarked privacy restore residue requires explicit recovery.",
+            ));
+        }
+        return Ok(PendingPrivacyRestoreObservation::Absent);
+    }
+
+    ensure_standalone_restore_lineage_safe(app_local_data_directory)?;
+    let (marker, marker_protected_sha256) =
+        read_protected_restore_marker_with_sha256(&paths.marker)?;
+    validate_pending_privacy_restore_marker(&marker)?;
+
+    if !active_present && !rollback_present {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_restore_conflict",
+            "The pending privacy restore has neither an active nor rollback database.",
+        ));
+    }
+    if incoming_residue && !incoming_present {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_restore_conflict",
+            "The pending privacy restore has an orphaned incoming SQLite sidecar.",
+        ));
+    }
+    if rollback_residue && !rollback_present {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_restore_conflict",
+            "The pending privacy restore has an orphaned rollback SQLite sidecar.",
+        ));
+    }
+
+    let phase = match (incoming_present, active_present, rollback_present) {
+        (true, true, false) => {
+            validate_restore_file_identity(&paths.active)?;
+            ensure_no_database_sidecars(&paths.active)?;
+            validate_restore_database(
+                &paths.incoming,
+                &marker.workspace_instance_id,
+                marker.key_epoch,
+                &marker.incoming_sha256,
+            )?;
+            ensure_no_database_sidecars(&paths.incoming)?;
+            PendingPrivacyRestorePhase::Prepared
+        }
+        // Crash after active -> rollback but before incoming -> active.
+        (true, false, true) => {
+            validate_restore_file_identity(&paths.rollback)?;
+            ensure_no_database_sidecars(&paths.rollback)?;
+            validate_restore_database(
+                &paths.incoming,
+                &marker.workspace_instance_id,
+                marker.key_epoch,
+                &marker.incoming_sha256,
+            )?;
+            ensure_no_database_sidecars(&paths.incoming)?;
+            PendingPrivacyRestorePhase::ActiveMovedToRollback
+        }
+        // The incoming image is already active; only rollback/marker cleanup
+        // may remain.  A rollback file is optional because its removal and the
+        // marker removal are separate durable operations.
+        (false, true, _) => {
+            validate_restore_database(
+                &paths.active,
+                &marker.workspace_instance_id,
+                marker.key_epoch,
+                &marker.incoming_sha256,
+            )?;
+            ensure_no_database_sidecars(&paths.active)?;
+            if rollback_present {
+                validate_restore_file_identity(&paths.rollback)?;
+                ensure_no_database_sidecars(&paths.rollback)?;
+            }
+            PendingPrivacyRestorePhase::InstalledPendingCleanup
+        }
+        _ => {
+            return Err(PrivacyWorkflowError::new(
+                "privacy_restore_conflict",
+                "The pending privacy restore has an impossible component state.",
+            ));
+        }
+    };
+
+    Ok(PendingPrivacyRestoreObservation::Authenticated(
+        PendingPrivacyRestoreGate {
+            marker,
+            marker_protected_sha256,
+            phase,
+        },
+    ))
+}
+
+/// Consumes only a gate obtained by the read-only startup observation.  The
+/// entire namespace is observed again before the first mutation, closing the
+/// classification/apply race.
+pub(crate) fn apply_observed_pending_privacy_restore<BeforeApply>(
+    app_local_data_directory: &Path,
+    expected: &PendingPrivacyRestoreGate,
+    before_apply: BeforeApply,
+) -> Result<(), PrivacyWorkflowError>
+where
+    BeforeApply: FnOnce() -> Result<(), PrivacyWorkflowError>,
+{
+    let observed = observe_pending_privacy_restore_read_only(app_local_data_directory)?;
+    if observed != PendingPrivacyRestoreObservation::Authenticated(expected.clone()) {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_restore_conflict",
+            "The pending privacy restore changed after startup arbitration.",
+        ));
+    }
+    let privacy_directory = app_local_data_directory.join(super::PRIVACY_DIRECTORY_NAME);
+    apply_pending_privacy_restore_inner(
+        &privacy_directory,
+        &expected.marker.workspace_instance_id,
+        Some(expected),
+        before_apply,
+    )?;
+    if observe_pending_privacy_restore_read_only(app_local_data_directory)?
+        != PendingPrivacyRestoreObservation::Absent
+    {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_restore_conflict",
+            "The authenticated privacy restore did not reach a clean terminal state.",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_pending_privacy_restore_inner<BeforeApply>(
     privacy_directory: &Path,
     workspace_instance_id: &str,
+    expected_gate: Option<&PendingPrivacyRestoreGate>,
     before_apply: BeforeApply,
 ) -> Result<(), PrivacyWorkflowError>
 where
@@ -1179,17 +1556,26 @@ where
 {
     validate_ordinary_directory(privacy_directory)?;
     let paths = privacy_restore_paths(&privacy_directory.join(super::PRIVACY_DATABASE_NAME))?;
-    recover_stale_restore_files(&paths, workspace_instance_id)?;
-    if !restore_path_is_present(&paths.marker)? {
-        return Ok(());
+    if expected_gate.is_none() {
+        recover_stale_restore_files(&paths, workspace_instance_id)?;
     }
-    let marker = read_protected_restore_marker(&paths.marker)?;
-    if marker.format_version != RESTORE_FORMAT_VERSION
-        || marker.workspace_instance_id != workspace_instance_id
-        || marker.key_epoch == 0
-        || !marker.backup_id.starts_with("bkp_")
-        || !is_hash(&marker.incoming_sha256)
-        || !is_hash(&marker.envelope_sha256)
+    if !restore_path_is_present(&paths.marker)? {
+        return if expected_gate.is_none() {
+            Ok(())
+        } else {
+            Err(PrivacyWorkflowError::new(
+                "privacy_restore_conflict",
+                "The authenticated privacy restore marker disappeared before apply.",
+            ))
+        };
+    }
+    let (marker, marker_protected_sha256) =
+        read_protected_restore_marker_with_sha256(&paths.marker)?;
+    validate_pending_privacy_restore_marker(&marker)?;
+    if marker.workspace_instance_id != workspace_instance_id
+        || expected_gate.is_some_and(|expected| {
+            expected.marker != marker || expected.marker_protected_sha256 != marker_protected_sha256
+        })
     {
         return Err(PrivacyWorkflowError::new(
             "privacy_restore_invalid",
@@ -1198,10 +1584,12 @@ where
     }
     let incoming_present = restore_path_is_present(&paths.incoming)?;
     if incoming_present {
-        if restore_path_is_present(&paths.rollback)? {
+        let active_present = restore_path_is_present(&paths.active)?;
+        let rollback_present = restore_path_is_present(&paths.rollback)?;
+        if active_present == rollback_present {
             return Err(PrivacyWorkflowError::new(
                 "privacy_restore_conflict",
-                "A pending privacy restore has an unresolved rollback database.",
+                "A pending privacy restore has an impossible active/rollback state.",
             ));
         }
         let preparation = (|| {
@@ -1211,8 +1599,13 @@ where
                 marker.key_epoch,
                 &marker.incoming_sha256,
             )?;
-            validate_restore_file_identity(&paths.active)?;
-            ensure_no_database_sidecars(&paths.active)?;
+            if active_present {
+                validate_restore_file_identity(&paths.active)?;
+                ensure_no_database_sidecars(&paths.active)?;
+            } else {
+                validate_restore_file_identity(&paths.rollback)?;
+                ensure_no_database_sidecars(&paths.rollback)?;
+            }
             ensure_no_database_sidecars(&paths.incoming)
         })();
         if let Err(error) = preparation {
@@ -1235,16 +1628,20 @@ where
     before_apply()?;
 
     if incoming_present {
-        if let Err(error) = fs::rename(&paths.active, &paths.rollback) {
-            let original = PrivacyWorkflowError::new(
-                "privacy_restore_io",
-                format!("The active privacy database could not enter the rollback slot: {error}"),
-            );
-            return finish_privacy_restore_stage(&paths, Err(original));
-        }
-        if let Err(error) = validate_restore_file_identity(&paths.rollback) {
-            rollback_privacy_restore(&paths)?;
-            return Err(error);
+        if restore_path_is_present(&paths.active)? {
+            if let Err(error) = fs::rename(&paths.active, &paths.rollback) {
+                let original = PrivacyWorkflowError::new(
+                    "privacy_restore_io",
+                    format!(
+                        "The active privacy database could not enter the rollback slot: {error}"
+                    ),
+                );
+                return finish_privacy_restore_stage(&paths, Err(original));
+            }
+            if let Err(error) = validate_restore_file_identity(&paths.rollback) {
+                rollback_privacy_restore(&paths)?;
+                return Err(error);
+            }
         }
         if let Err(error) = fs::rename(&paths.incoming, &paths.active) {
             let original = PrivacyWorkflowError::new(
@@ -1434,6 +1831,19 @@ fn restore_path_is_present(path: &Path) -> Result<bool, PrivacyWorkflowError> {
     }
 }
 
+fn restore_database_slot_has_any_path(path: &Path) -> Result<bool, PrivacyWorkflowError> {
+    [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-journal"),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ]
+    .into_iter()
+    .try_fold(false, |present, candidate| {
+        restore_path_is_present(&candidate).map(|candidate_present| present || candidate_present)
+    })
+}
+
 fn validate_restore_file_identity(path: &Path) -> Result<(), PrivacyWorkflowError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| {
         PrivacyWorkflowError::new(
@@ -1610,9 +2020,9 @@ fn write_protected_restore_marker(
         .map_err(|_| PrivacyWorkflowError::new("privacy_restore_io", "隐私恢复标记无法同步。"))
 }
 
-fn read_protected_restore_marker(
+fn read_protected_restore_marker_with_sha256(
     path: &Path,
-) -> Result<PendingPrivacyRestoreV1, PrivacyWorkflowError> {
+) -> Result<(PendingPrivacyRestoreV1, String), PrivacyWorkflowError> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -1642,8 +2052,28 @@ fn read_protected_restore_marker(
     let plaintext = unprotect_local(&protected).map_err(|_| {
         PrivacyWorkflowError::new("privacy_restore_invalid", "隐私恢复标记认证失败。")
     })?;
-    serde_json::from_slice(&plaintext)
-        .map_err(|_| PrivacyWorkflowError::new("privacy_restore_invalid", "隐私恢复标记格式无效。"))
+    let marker = serde_json::from_slice(&plaintext).map_err(|_| {
+        PrivacyWorkflowError::new("privacy_restore_invalid", "隐私恢复标记格式无效。")
+    })?;
+    Ok((marker, sha256_hex(&protected)))
+}
+
+fn validate_pending_privacy_restore_marker(
+    marker: &PendingPrivacyRestoreV1,
+) -> Result<(), PrivacyWorkflowError> {
+    if marker.format_version != RESTORE_FORMAT_VERSION
+        || privacy::vnext::WorkspaceInstanceId::parse(&marker.workspace_instance_id).is_err()
+        || marker.key_epoch == 0
+        || !marker.backup_id.starts_with("bkp_")
+        || !is_hash(&marker.incoming_sha256)
+        || !is_hash(&marker.envelope_sha256)
+    {
+        return Err(PrivacyWorkflowError::new(
+            "privacy_restore_invalid",
+            "The pending privacy restore marker is invalid.",
+        ));
+    }
+    Ok(())
 }
 
 fn ordinary_single_link_file(path: &Path) -> bool {
@@ -2603,6 +3033,189 @@ mod tests {
     }
 
     #[test]
+    fn pre_manager_current_privacy_profile_is_exact_and_read_only() {
+        let absent = tempfile::tempdir().expect("absent app directory");
+        assert_eq!(
+            observe_current_privacy_profile_read_only(absent.path()).expect("absent observation"),
+            CurrentPrivacyProfileObservation::Absent
+        );
+
+        let partial = tempfile::tempdir().expect("partial app directory");
+        fs::create_dir(partial.path().join(super::super::PRIVACY_DIRECTORY_NAME))
+            .expect("partial privacy directory");
+        assert_eq!(
+            observe_current_privacy_profile_read_only(partial.path())
+                .expect_err("present directory without database is partial")
+                .code(),
+            "privacy_current_profile_partial"
+        );
+
+        let directory = tempfile::tempdir().expect("current app directory");
+        let workspace = test_workspace_instance_id();
+        let manager =
+            PrivacyWorkflowManager::new(directory.path().to_path_buf(), workspace.clone())
+                .expect("current manager");
+        let database_path = manager.shared.database_path.clone();
+        drop(manager);
+        let bytes_before = fs::read(&database_path).expect("Privacy bytes before observation");
+        let modified_before = fs::metadata(&database_path)
+            .expect("Privacy metadata before observation")
+            .modified()
+            .expect("Privacy mtime before observation");
+        let entries_before = fs::read_dir(database_path.parent().expect("Privacy parent"))
+            .expect("Privacy entries before observation")
+            .map(|entry| entry.expect("Privacy entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let CurrentPrivacyProfileObservation::ExactCurrent(proof) =
+            observe_current_privacy_profile_read_only(directory.path())
+                .expect("exact current Privacy observation")
+        else {
+            panic!("current Privacy must be exact");
+        };
+        assert_eq!(proof.workspace_instance_id(), &workspace);
+        assert!(proof.key_epoch() > 0);
+        assert!(is_hash(proof.logical_manifest_sha256()));
+        assert!(is_hash(proof.business_manifest_sha256()));
+        assert!(!format!("{proof:?}").contains(workspace.as_str()));
+        assert_eq!(
+            fs::read(&database_path).expect("Privacy bytes after observation"),
+            bytes_before
+        );
+        assert_eq!(
+            fs::metadata(&database_path)
+                .expect("Privacy metadata after observation")
+                .modified()
+                .expect("Privacy mtime after observation"),
+            modified_before
+        );
+        let entries_after = fs::read_dir(database_path.parent().expect("Privacy parent"))
+            .expect("Privacy entries after observation")
+            .map(|entry| entry.expect("Privacy entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(entries_after, entries_before);
+    }
+
+    #[test]
+    fn pre_manager_privacy_restore_observation_is_read_only_and_gate_bound() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let manager = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("manager");
+        let backup = manager.create_privacy_backup().expect("privacy backup");
+        manager
+            .set_retention_policy(one_day_policy())
+            .expect("mutate active state");
+        manager
+            .stage_privacy_restore(StagePrivacyRestoreRequest {
+                backup_id: backup.backup_id.clone(),
+                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
+            })
+            .expect("stage restore");
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+        drop(manager);
+        let active_before = fs::read(&paths.active).expect("active before observation");
+        let incoming_before = fs::read(&paths.incoming).expect("incoming before observation");
+        let marker_before = fs::read(&paths.marker).expect("marker before observation");
+
+        let PendingPrivacyRestoreObservation::Authenticated(gate) =
+            observe_pending_privacy_restore_read_only(directory.path())
+                .expect("authenticated read-only observation")
+        else {
+            panic!("pending restore must be observed");
+        };
+        assert_eq!(gate.phase(), PendingPrivacyRestorePhase::Prepared);
+        assert!(is_hash(gate.marker_protected_sha256()));
+        let debug = format!("{gate:?}");
+        assert!(!debug.contains(&backup.backup_id));
+        assert!(!debug.contains(test_workspace_instance_id().as_str()));
+        assert_eq!(
+            fs::read(&paths.active).expect("active after observation"),
+            active_before
+        );
+        assert_eq!(
+            fs::read(&paths.incoming).expect("incoming after observation"),
+            incoming_before
+        );
+        assert_eq!(
+            fs::read(&paths.marker).expect("marker after observation"),
+            marker_before
+        );
+
+        apply_observed_pending_privacy_restore(directory.path(), &gate, || Ok(()))
+            .expect("gate-bound apply");
+        assert_eq!(
+            observe_pending_privacy_restore_read_only(directory.path())
+                .expect("terminal observation"),
+            PendingPrivacyRestoreObservation::Absent
+        );
+        assert!(!paths.incoming.exists());
+        assert!(!paths.marker.exists());
+        assert!(!paths.rollback.exists());
+    }
+
+    #[test]
+    fn pre_manager_privacy_restore_resumes_active_to_rollback_crash_window() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let manager = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("manager");
+        let backup = manager.create_privacy_backup().expect("privacy backup");
+        manager
+            .set_retention_policy(one_day_policy())
+            .expect("mutate active state");
+        manager
+            .stage_privacy_restore(StagePrivacyRestoreRequest {
+                backup_id: backup.backup_id,
+                confirmation: RESTORE_BACKUP_CONFIRMATION.to_owned(),
+            })
+            .expect("stage restore");
+        let paths = privacy_restore_paths(&manager.shared.database_path).expect("restore paths");
+        drop(manager);
+        fs::rename(&paths.active, &paths.rollback).expect("inject active-to-rollback crash");
+
+        let PendingPrivacyRestoreObservation::Authenticated(gate) =
+            observe_pending_privacy_restore_read_only(directory.path())
+                .expect("crash window authenticates")
+        else {
+            panic!("crash window must be observed");
+        };
+        assert_eq!(
+            gate.phase(),
+            PendingPrivacyRestorePhase::ActiveMovedToRollback
+        );
+        apply_observed_pending_privacy_restore(directory.path(), &gate, || Ok(()))
+            .expect("crash window resumes");
+        assert!(paths.active.exists());
+        assert!(!paths.incoming.exists());
+        assert!(!paths.marker.exists());
+        assert!(!paths.rollback.exists());
+    }
+
+    #[test]
+    fn pre_manager_privacy_restore_rejects_unmarked_residue_without_cleanup() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let privacy_directory = directory.path().join(super::super::PRIVACY_DIRECTORY_NAME);
+        fs::create_dir(&privacy_directory).expect("privacy directory");
+        let paths =
+            privacy_restore_paths(&privacy_directory.join(super::super::PRIVACY_DATABASE_NAME))
+                .expect("restore paths");
+        fs::write(&paths.incoming, b"unmarked restore residue").expect("incoming residue");
+
+        let error = observe_pending_privacy_restore_read_only(directory.path())
+            .expect_err("unmarked residue must fail closed");
+        assert_eq!(error.code(), "privacy_restore_conflict");
+        assert_eq!(
+            fs::read(&paths.incoming).expect("residue remains for explicit recovery"),
+            b"unmarked restore residue"
+        );
+    }
+
+    #[test]
     fn startup_privacy_restore_apply_rechecks_lineage_before_any_database_swap() {
         let directory = tempfile::tempdir().expect("app directory");
         let invalidator = Arc::new(RecordingInvalidator::default());
@@ -2627,12 +3240,7 @@ mod tests {
         let active_before_apply =
             fs::read(&paths.active).expect("active Privacy after late lineage creation");
 
-        let error =
-            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
-                directory.path().to_path_buf(),
-                test_workspace_instance_id(),
-                invalidator.clone(),
-            )
+        let error = observe_pending_privacy_restore_read_only(directory.path())
             .expect_err("startup must recheck late lineage before any restore swap");
 
         assert_eq!(error.code(), "privacy_restore_requires_five_components");
@@ -2683,13 +3291,19 @@ mod tests {
             fs::read(&paths.active).expect("active Privacy before committed apply");
         drop(manager);
 
-        let error =
-            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
-                directory.path().to_path_buf(),
-                test_workspace_instance_id(),
-                invalidator.clone(),
-            )
-            .expect_err("post-marker publication invalidation failure must stop the swap");
+        let PendingPrivacyRestoreObservation::Authenticated(gate) =
+            observe_pending_privacy_restore_read_only(directory.path())
+                .expect("pending restore observation")
+        else {
+            panic!("pending restore must be observed");
+        };
+        let error = apply_observed_pending_privacy_restore(directory.path(), &gate, || {
+            invalidator
+                .invalidate_all("privacy_restore_startup_recovery")
+                .map(|_| ())
+                .map_err(|code| PrivacyWorkflowError::new(code, code))
+        })
+        .expect_err("post-marker publication invalidation failure must stop the swap");
         assert_eq!(error.code(), SYNTHETIC_INVALIDATION_FAILURE);
         assert_eq!(
             invalidator.take_calls(),
@@ -2731,7 +3345,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_cleans_unmarked_incoming_without_publication_invalidation() {
+    fn startup_router_rejects_unmarked_incoming_without_publication_invalidation() {
         let directory = tempfile::tempdir().expect("app directory");
         let invalidator = Arc::new(RecordingInvalidator::default());
         let manager = manager_with_invalidator(&directory, invalidator.clone());
@@ -2742,23 +3356,18 @@ mod tests {
         fs::write(&paths.incoming, b"unmarked synthetic restore residue")
             .expect("write unmarked incoming residue");
 
-        let restarted =
-            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
-                directory.path().to_path_buf(),
-                test_workspace_instance_id(),
-                invalidator.clone(),
-            )
-            .expect("unmarked residue is cleaned without changing business state");
+        let error = observe_pending_privacy_restore_read_only(directory.path())
+            .expect_err("unmarked residue requires explicit recovery");
 
+        assert_eq!(error.code(), "privacy_restore_conflict");
         assert!(invalidator.take_calls().is_empty());
-        assert!(!paths.incoming.exists());
+        assert!(paths.incoming.exists());
         assert!(!paths.marker.exists());
         assert!(!paths.rollback.exists());
         assert_eq!(
             fs::read(&paths.active).expect("active Privacy after residue cleanup"),
             active_before
         );
-        drop(restarted);
     }
 
     #[test]
@@ -2783,13 +3392,25 @@ mod tests {
         invalidator.take_calls();
         drop(manager);
 
-        let restarted =
-            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
-                directory.path().to_path_buf(),
-                test_workspace_instance_id(),
-                invalidator.clone(),
-            )
-            .expect("authenticated restore applies");
+        let PendingPrivacyRestoreObservation::Authenticated(gate) =
+            observe_pending_privacy_restore_read_only(directory.path())
+                .expect("pending restore observation")
+        else {
+            panic!("pending restore must be observed");
+        };
+        apply_observed_pending_privacy_restore(directory.path(), &gate, || {
+            invalidator
+                .invalidate_all("privacy_restore_startup_recovery")
+                .map(|_| ())
+                .map_err(|code| PrivacyWorkflowError::new(code, code))
+        })
+        .expect("authenticated restore applies");
+        let restarted = PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+            invalidator.clone(),
+        )
+        .expect("manager opens only after restore terminal state");
 
         assert_eq!(
             invalidator.take_calls(),
@@ -2832,12 +3453,7 @@ mod tests {
         *last ^= 0x01;
         fs::write(&paths.marker, marker).expect("tamper protected restore marker");
 
-        let error =
-            PrivacyWorkflowManager::new_for_application_startup_with_approved_publication_invalidator(
-                directory.path().to_path_buf(),
-                test_workspace_instance_id(),
-                invalidator.clone(),
-            )
+        let error = observe_pending_privacy_restore_read_only(directory.path())
             .expect_err("tampered marker must fail closed");
 
         assert_eq!(error.code(), "privacy_restore_invalid");
@@ -2883,8 +3499,16 @@ mod tests {
         assert!(staged.restart_required);
         drop(manager);
 
-        let restarted = PrivacyWorkflowManager::new(directory.path().to_path_buf(), workspace)
+        let PendingPrivacyRestoreObservation::Authenticated(gate) =
+            observe_pending_privacy_restore_read_only(directory.path())
+                .expect("pending restore observation")
+        else {
+            panic!("pending restore must be observed");
+        };
+        apply_observed_pending_privacy_restore(directory.path(), &gate, || Ok(()))
             .expect("startup applies pending restore");
+        let restarted = PrivacyWorkflowManager::new(directory.path().to_path_buf(), workspace)
+            .expect("manager opens after pending restore");
         let restored = restarted
             .lifecycle_status(LifecycleStatusRequest { redaction_id: None })
             .expect("restored status");

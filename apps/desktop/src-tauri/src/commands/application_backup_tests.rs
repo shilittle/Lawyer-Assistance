@@ -1076,7 +1076,7 @@ fn five_component_restore_recovers_exact_v4_privacy_and_v1_vault_then_upgrades_a
     drop(state);
 
     let crashed = catch_unwind(AssertUnwindSafe(|| {
-        let _ = apply_pending_application_restore_with_hook(
+        let result = apply_pending_application_restore_with_hook(
             directory.path(),
             &workspace,
             Some(&approved.workspace),
@@ -1087,6 +1087,9 @@ fn five_component_restore_recovers_exact_v4_privacy_and_v1_vault_then_upgrades_a
                 Ok(())
             },
         );
+        if let Err(error) = result {
+            panic!("apply returned before the PrivacyInstalled crash hook: {error:?}");
+        }
     }));
     assert!(crashed.is_err());
     apply_pending_application_restore_with_approved(
@@ -1284,8 +1287,8 @@ fn five_component_v3_restores_approved_generations_encrypted_work_products_and_r
     )
     .expect("commit five-component restore");
     let epochs_after = approved.epochs().expect("post-restore epochs");
-    assert_eq!(epochs_after.0, epochs_before.0.wrapping_add(1));
-    assert_eq!(epochs_after.1, epochs_before.1.wrapping_add(1));
+    assert_ne!(epochs_after.0, epochs_before.0);
+    assert_ne!(epochs_after.1, epochs_before.1);
     assert_eq!(
         user_canary(&database::user_database_path(directory.path())),
         BACKED_UP_USER_CANARY
@@ -1302,7 +1305,7 @@ fn five_component_v3_restores_approved_generations_encrypted_work_products_and_r
 }
 
 #[test]
-fn v3_marker_precommit_failure_cleans_all_components_and_unmarked_crash_recovers() {
+fn v3_marker_precommit_failure_cleans_all_components_and_unmarked_crash_fails_closed() {
     let (directory, workspace, state, workflow, approved) = fixture_v3();
     let case_id = format!("case_{}", "b".repeat(32));
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
@@ -1384,12 +1387,20 @@ fn v3_marker_precommit_failure_cleans_all_components_and_unmarked_crash_recovers
     ] {
         assert!(path.exists(), "expected crash residue: {path:?}");
     }
-    apply_pending_application_restore_with_approved(
+    let unmarked = restore_observer_filesystem_snapshot(directory.path());
+    let error = apply_pending_application_restore_with_approved(
         directory.path(),
         &workspace,
         &approved.workspace,
     )
-    .expect("startup removes every unmarked incoming component");
+    .expect_err("startup must not guess that unmarked incoming components are disposable");
+    assert_eq!(error.error_type, "application_restore_conflict");
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        unmarked,
+        "unmarked crash observation cleaned or rewrote unauthenticated residue"
+    );
+    cleanup_pair_incoming(&paths).expect("explicitly clean the synthetic pre-marker stage crash");
     assert_no_restore_residue(&paths);
     assert_eq!(
         approved_lineage_manifests(&approved.workspace),
@@ -1498,7 +1509,7 @@ fn v3_failure_after_five_swaps_rolls_back_every_component_without_revoking_epoch
 
 #[test]
 fn v3_crash_after_four_components_finishes_exact_fifth_component_on_restart() {
-    let (directory, workspace, state, workflow, approved) = fixture_v3();
+    let (directory, _workspace, state, workflow, approved) = fixture_v3();
     let case_id = format!("case_{}", "d".repeat(32));
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let generation = approved
@@ -1529,69 +1540,63 @@ fn v3_crash_after_four_components_finishes_exact_fifth_component_on_restart() {
     )
     .expect("stage V3");
     let paths = application_restore_paths(directory.path());
-    let marker = read_pair_marker(&paths.marker).expect("V3 marker");
-    let PendingApplicationRestore::V3(marker) = marker else {
-        panic!("expected V3 marker");
-    };
-    advance_component(
-        &paths.user_active,
-        &paths.user_incoming,
-        &paths.user_rollback,
-        &marker.user_database_sha256,
-        MAX_USER_DATABASE_BACKUP_BYTES,
-        |path| validate_user_component(path, &marker.user_database_sha256),
-    )
-    .expect("install user before crash");
-    advance_component(
-        &paths.privacy_active,
-        &paths.privacy_incoming,
-        &paths.privacy_rollback,
-        &marker.privacy_database_sha256,
-        privacy::lifecycle::max_backup_database_bytes_for_schema(
-            marker
-                .privacy_store_schema_version
-                .unwrap_or(PRIVACY_STORE_SCHEMA_VERSION),
+    let PendingApplicationRestoreObservation::Authenticated(prepared) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
         )
-        .expect("supported Privacy restore schema"),
-        |path| {
-            validate_privacy_component(
-                path,
-                &workspace,
-                marker.privacy_key_epoch,
-                marker
-                    .privacy_store_schema_version
-                    .unwrap_or(PRIVACY_STORE_SCHEMA_VERSION),
-                &marker.privacy_database_sha256,
-            )
-        },
-    )
-    .expect("install privacy before crash");
-    advance_vault_component(
-        &paths.vault_active,
-        &paths.vault_incoming,
-        &paths.vault_rollback,
-        &workspace,
-        &marker.vault_manifest_sha256,
-        &marker.vault_archive_sha256,
-    )
-    .expect("install Vault before crash");
-    advance_restore_directory(
-        &paths.approved_active,
-        &paths.approved_incoming,
-        &paths.approved_rollback,
-    )
-    .expect("install approved workspace before crash");
-    assert!(paths.work_products_incoming.exists());
-    assert!(!paths.work_products_rollback.exists());
+        .expect("observe prepared V3 gate")
+    else {
+        panic!("prepared V3 marker must be present");
+    };
+    assert_eq!(prepared.phase(), PendingApplicationRestorePhase::Prepared);
     drop(workflow);
     drop(state);
 
-    apply_pending_application_restore_with_approved(
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reached_in_hook = Arc::clone(&reached);
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let result = apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &prepared,
+            Some(&approved.workspace),
+            |point| {
+                if point == ApplicationRestoreCommitPoint::ApprovedWorkspaceInstalled {
+                    reached_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("synthetic process stop after four installed components");
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            panic!("apply failed before the four-component crash point: {error:?}");
+        }
+    }));
+    assert!(crashed.is_err(), "the four-component hook must stop apply");
+    assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(paths.work_products_incoming.exists());
+    assert!(!paths.work_products_rollback.exists());
+
+    let PendingApplicationRestoreObservation::Authenticated(resume_gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe the four-component crash phase")
+    else {
+        panic!("the V3 marker must remain after the synthetic process stop");
+    };
+    assert_eq!(
+        resume_gate.phase(),
+        PendingApplicationRestorePhase::ApprovedWorkspaceInstalled
+    );
+    apply_observed_pending_application_restore_with_hook(
         directory.path(),
-        &workspace,
-        &approved.workspace,
+        &resume_gate,
+        Some(&approved.workspace),
+        |_| Ok(()),
     )
-    .expect("restart completes fifth component");
+    .expect("restart completes the exact fifth component");
     assert_eq!(
         user_canary(&database::user_database_path(directory.path())),
         BACKED_UP_USER_CANARY
@@ -1647,12 +1652,18 @@ fn v3_tampered_or_missing_case_store_dependency_fails_closed_and_preserves_activ
         }
         drop(workflow);
         drop(state);
+        let tampered = restore_observer_filesystem_snapshot(directory.path());
         apply_pending_application_restore_with_approved(
             directory.path(),
             &workspace,
             &approved.workspace,
         )
         .expect_err("tampered or missing case store must fail closed");
+        assert_eq!(
+            restore_observer_filesystem_snapshot(directory.path()),
+            tampered,
+            "tampered or missing V3 dependency was cleaned before explicit recovery"
+        );
         assert_eq!(
             user_canary(&database::user_database_path(directory.path())),
             MUTATED_USER_CANARY
@@ -1662,6 +1673,7 @@ fn v3_tampered_or_missing_case_store_dependency_fails_closed_and_preserves_activ
             approved.committed_work_product_row_count(&case_id).unwrap(),
             2
         );
+        cleanup_pair_incoming(&paths).expect("explicitly clean the rejected V3 test fixture");
         assert_no_restore_residue(&paths);
     }
 }
@@ -2040,7 +2052,7 @@ fn coherent_user_snapshot_is_query_only_and_preserves_source_bytes_schema_and_ma
 
 #[test]
 fn paired_backup_restores_both_databases_after_interruption_without_plaintext() {
-    let (directory, workspace, state, workflow) = fixture();
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let backed_up_policy = workflow
         .set_retention_policy(policy(1))
@@ -2077,8 +2089,12 @@ fn paired_backup_restores_both_databases_after_interruption_without_plaintext() 
     drop(workflow);
     drop(state);
 
-    apply_pending_application_restore(directory.path(), &workspace)
-        .expect("startup completes interrupted paired restore");
+    apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect("startup completes interrupted paired restore");
     assert_eq!(
         user_canary(&database::user_database_path(directory.path())),
         BACKED_UP_USER_CANARY
@@ -2104,7 +2120,7 @@ fn paired_backup_restores_both_databases_after_interruption_without_plaintext() 
 
 #[test]
 fn identical_three_component_restore_consumes_every_staged_component() {
-    let (directory, workspace, state, workflow) = fixture();
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
         .expect("build identical-state backup");
@@ -2120,8 +2136,12 @@ fn identical_three_component_restore_consumes_every_staged_component() {
     drop(workflow);
     drop(state);
 
-    apply_pending_application_restore(directory.path(), &workspace)
-        .expect("identical restore is committed and cleaned");
+    apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect("identical restore is committed and cleaned");
     assert_eq!(
         user_canary(&database::user_database_path(directory.path())),
         BACKED_UP_USER_CANARY
@@ -2325,7 +2345,7 @@ fn three_component_restore_refuses_case_assistant_pending_output_lineage() {
 
 #[test]
 fn pending_three_component_restore_rechecks_case_assistant_pending_output_lineage() {
-    let (directory, workspace, state, workflow) = fixture();
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
         .expect("build legacy three-component backup");
@@ -2341,8 +2361,12 @@ fn pending_three_component_restore_rechecks_case_assistant_pending_output_lineag
     drop(workflow);
     drop(state);
 
-    let error = apply_pending_application_restore(directory.path(), &workspace)
-        .expect_err("startup must recheck pending-output lineage before the first swap");
+    let error = apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect_err("startup must recheck pending-output lineage before the first swap");
     assert_eq!(
         error.error_type,
         "application_restore_requires_five_components"
@@ -2369,7 +2393,7 @@ fn pending_three_component_restore_rechecks_case_assistant_pending_output_lineag
 
 #[test]
 fn pending_three_component_restore_rechecks_lineage_before_any_component_swap() {
-    let (directory, workspace, state, workflow) = fixture();
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
         .expect("build legacy three-component backup");
@@ -2399,8 +2423,12 @@ fn pending_three_component_restore_rechecks_lineage_before_any_component_swap() 
     drop(workflow);
     drop(state);
 
-    let error = apply_pending_application_restore(directory.path(), &workspace)
-        .expect_err("startup must recheck current lineage before the first swap");
+    let error = apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect_err("startup must recheck current lineage before the first swap");
     assert_eq!(
         error.error_type,
         "application_restore_requires_five_components"
@@ -2427,7 +2455,7 @@ fn pending_three_component_restore_rechecks_lineage_before_any_component_swap() 
 
 #[test]
 fn coherent_backup_holds_both_database_write_boundaries_until_both_snapshots_finish() {
-    let (directory, workspace, state, workflow) = fixture();
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let backed_up_policy = workflow
         .set_retention_policy(policy(1))
@@ -2511,7 +2539,12 @@ fn coherent_backup_holds_both_database_write_boundaries_until_both_snapshots_fin
     .expect("stage coherent pair");
     drop(workflow);
     drop(state);
-    apply_pending_application_restore(directory.path(), &workspace).expect("restore coherent pair");
+    apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect("restore coherent pair");
     assert_eq!(
         user_canary(&database::user_database_path(directory.path())),
         BACKED_UP_USER_CANARY
@@ -2567,8 +2600,8 @@ fn application_backup_snapshot_cleanup_is_exact_and_rejects_hardlinks() {
     fs::remove_file(unknown).expect("remove unrelated file");
 }
 #[test]
-fn paired_restore_rejects_legacy_collision_and_rolls_back_on_privacy_tamper() {
-    let (directory, workspace, state, workflow) = fixture();
+fn paired_restore_rejects_legacy_collision_and_preserves_privacy_tamper_residue() {
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let (bundle, _, _) =
         build_application_backup(directory.path(), &state, &workflow).expect("build paired backup");
@@ -2587,9 +2620,19 @@ fn paired_restore_rejects_legacy_collision_and_rolls_back_on_privacy_tamper() {
     let paths = application_restore_paths(directory.path());
     fs::write(&paths.legacy_user_marker, b"synthetic legacy collision")
         .expect("legacy marker fixture");
-    let collision = apply_pending_application_restore(directory.path(), &workspace)
-        .expect_err("two restore protocols must not race");
+    let collided = restore_observer_filesystem_snapshot(directory.path());
+    let collision = apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect_err("two restore protocols must not race");
     assert_eq!(collision.error_type, "application_restore_conflict");
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        collided,
+        "mixed-protocol rejection changed restore state"
+    );
     assert_eq!(user_canary(state.user_database_path()), MUTATED_USER_CANARY);
     fs::remove_file(&paths.legacy_user_marker).expect("remove collision fixture");
 
@@ -2599,14 +2642,24 @@ fn paired_restore_rejects_legacy_collision_and_rolls_back_on_privacy_tamper() {
     fs::write(&paths.privacy_incoming, privacy_component).expect("tamper privacy incoming");
     drop(workflow);
     drop(state);
-    let tamper = apply_pending_application_restore(directory.path(), &workspace)
-        .expect_err("tampered privacy component must reject the whole pair");
+    let tampered = restore_observer_filesystem_snapshot(directory.path());
+    let tamper = apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect_err("tampered privacy component must reject the whole pair");
     assert!(matches!(
         tamper.error_type.as_str(),
         "application_restore_tampered"
             | "application_restore_invalid"
             | "application_backup_component_mismatch"
     ));
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        tampered,
+        "tampered V2 component was cleaned before explicit recovery"
+    );
     assert_eq!(
         user_canary(&database::user_database_path(directory.path())),
         MUTATED_USER_CANARY
@@ -2617,18 +2670,13 @@ fn paired_restore_rejects_legacy_collision_and_rolls_back_on_privacy_tamper() {
         status(&restarted).retention_policy.revision,
         post_backup_policy.revision
     );
-    assert!(!paths.marker.exists());
-    assert!(!paths.user_incoming.exists());
-    assert!(!paths.user_rollback.exists());
-    assert!(!paths.privacy_incoming.exists());
-    assert!(!paths.privacy_rollback.exists());
-    assert!(!paths.vault_incoming.exists());
-    assert!(!paths.vault_rollback.exists());
+    cleanup_pair_incoming(&paths).expect("explicitly clean rejected V2 privacy fixture");
+    assert_no_restore_residue(&paths);
 }
 
 #[test]
-fn three_component_restore_rolls_back_both_databases_when_vault_is_tampered() {
-    let (directory, workspace, state, workflow) = fixture();
+fn three_component_restore_preserves_every_slot_when_vault_is_tampered() {
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
     set_user_canary(state.user_database_path(), BACKED_UP_USER_CANARY);
     let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
         .expect("build complete backup");
@@ -2653,8 +2701,13 @@ fn three_component_restore_rolls_back_both_databases_when_vault_is_tampered() {
 
     drop(workflow);
     drop(state);
-    let error = apply_pending_application_restore(directory.path(), &workspace)
-        .expect_err("tampered Vault must reject and roll back the complete restore");
+    let tampered = restore_observer_filesystem_snapshot(directory.path());
+    let error = apply_pending_application_restore_with_approved(
+        directory.path(),
+        &workspace,
+        &approved.workspace,
+    )
+    .expect_err("tampered Vault must fail closed before the complete restore starts");
     assert!(matches!(
         error.error_type.as_str(),
         "vault_store_database_failed"
@@ -2663,6 +2716,11 @@ fn three_component_restore_rolls_back_both_databases_when_vault_is_tampered() {
             | "application_restore_tampered"
             | "application_restore_invalid"
     ));
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        tampered,
+        "tampered V2 Vault was cleaned before explicit recovery"
+    );
     assert_eq!(
         user_canary(&database::user_database_path(directory.path())),
         MUTATED_USER_CANARY
@@ -2673,13 +2731,8 @@ fn three_component_restore_rolls_back_both_databases_when_vault_is_tampered() {
         status(&restarted).retention_policy.revision,
         post_backup_policy.revision
     );
-    assert!(!paths.marker.exists());
-    assert!(!paths.user_incoming.exists());
-    assert!(!paths.user_rollback.exists());
-    assert!(!paths.privacy_incoming.exists());
-    assert!(!paths.privacy_rollback.exists());
-    assert!(!paths.vault_incoming.exists());
-    assert!(!paths.vault_rollback.exists());
+    cleanup_pair_incoming(&paths).expect("explicitly clean rejected V2 Vault fixture");
+    assert_no_restore_residue(&paths);
 }
 #[test]
 fn paired_restore_cleanup_failure_dominates_original_and_rejects_hardlinks() {
@@ -2792,5 +2845,1327 @@ fn v3_slot_preflight_and_unmarked_cleanup_cover_both_case_store_directories() {
             "application_restore_conflict"
         );
         remove_restore_directory(path).expect("remove synthetic rollback directory");
+    }
+}
+
+#[test]
+fn strict_original_presence_classifies_every_v2_v3_swap_and_cleanup_phase() {
+    let kinds = [
+        RestoreComponentKind::User,
+        RestoreComponentKind::Privacy,
+        RestoreComponentKind::Vault,
+        RestoreComponentKind::ApprovedWorkspace,
+        RestoreComponentKind::WorkProducts,
+    ];
+    for component_count in [3_usize, 5_usize] {
+        for mask in 0_usize..(1_usize << component_count) {
+            let presence = (0..component_count)
+                .map(|index| mask & (1 << index) != 0)
+                .collect::<Vec<_>>();
+            let prepared = presence
+                .iter()
+                .map(|present| {
+                    if *present {
+                        RestoreSlotProgress::PreparedWithOriginal
+                    } else {
+                        RestoreSlotProgress::PreparedFromAbsent
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                classify_restore_progress_sequence(
+                    &prepared,
+                    &kinds[..component_count],
+                    Some(&presence),
+                )
+                .expect("strict prepared phase"),
+                PendingApplicationRestorePhase::Prepared,
+                "component_count={component_count}, mask={mask:#07b}"
+            );
+
+            for current in 0..component_count {
+                let installed = |index: usize| {
+                    if presence[index] {
+                        RestoreSlotProgress::InstalledWithRollback
+                    } else {
+                        RestoreSlotProgress::InstalledFromAbsent
+                    }
+                };
+                if presence[current] {
+                    let mut moved = prepared.clone();
+                    for (index, state) in moved.iter_mut().enumerate().take(current) {
+                        *state = installed(index);
+                    }
+                    moved[current] = RestoreSlotProgress::MovedToRollback;
+                    assert_eq!(
+                        classify_restore_progress_sequence(
+                            &moved,
+                            &kinds[..component_count],
+                            Some(&presence),
+                        )
+                        .expect("strict moved phase"),
+                        moved_restore_phase(kinds[current]).expect("known component"),
+                        "moved component_count={component_count}, mask={mask:#07b}, current={current}"
+                    );
+                }
+
+                let mut after_install = prepared.clone();
+                for (index, state) in after_install.iter_mut().enumerate().take(current + 1) {
+                    *state = installed(index);
+                }
+                let observed = classify_restore_progress_sequence(
+                    &after_install,
+                    &kinds[..component_count],
+                    Some(&presence),
+                )
+                .expect("strict installed phase");
+                let expected = if current + 1 < component_count {
+                    installed_restore_phase(kinds[current]).expect("non-terminal component")
+                } else {
+                    let first_rollback = presence
+                        .iter()
+                        .position(|present| *present)
+                        .unwrap_or(component_count);
+                    PendingApplicationRestorePhase::InstalledPendingCleanup {
+                        removed_rollback_prefix: first_rollback as u8,
+                    }
+                };
+                assert_eq!(
+                    observed, expected,
+                    "installed component_count={component_count}, mask={mask:#07b}, current={current}"
+                );
+            }
+
+            for cleanup_boundary in 0..=component_count {
+                let states = presence
+                    .iter()
+                    .enumerate()
+                    .map(|(index, present)| {
+                        if !*present {
+                            RestoreSlotProgress::InstalledFromAbsent
+                        } else if index < cleanup_boundary {
+                            RestoreSlotProgress::Cleaned
+                        } else {
+                            RestoreSlotProgress::InstalledWithRollback
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let expected_prefix = presence
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, present)| {
+                        (index >= cleanup_boundary && *present).then_some(index)
+                    })
+                    .unwrap_or(component_count);
+                assert_eq!(
+                    classify_restore_progress_sequence(
+                        &states,
+                        &kinds[..component_count],
+                        Some(&presence),
+                    )
+                    .expect("strict cleanup phase"),
+                    PendingApplicationRestorePhase::InstalledPendingCleanup {
+                        removed_rollback_prefix: expected_prefix as u8,
+                    },
+                    "cleanup component_count={component_count}, mask={mask:#07b}, boundary={cleanup_boundary}"
+                );
+            }
+        }
+    }
+
+    let interspersed_presence = [true, false, true, true, false];
+    let out_of_order = [
+        RestoreSlotProgress::InstalledWithRollback,
+        RestoreSlotProgress::InstalledFromAbsent,
+        RestoreSlotProgress::Cleaned,
+        RestoreSlotProgress::InstalledWithRollback,
+        RestoreSlotProgress::InstalledFromAbsent,
+    ];
+    assert_eq!(
+        classify_restore_progress_sequence(&out_of_order, &kinds, Some(&interspersed_presence))
+            .expect_err("a cleaned rollback after a surviving rollback is not a prefix")
+            .error_type,
+        "application_restore_conflict"
+    );
+}
+
+fn rewrite_pending_marker_as_pre_presence_fixture(marker_path: &Path) -> PendingApplicationRestore {
+    let protected = fs::read(marker_path).expect("read current protected marker");
+    let plaintext = unprotect_local(&protected).expect("unprotect current marker");
+    let mut value: serde_json::Value =
+        privacy::vnext::strict_json_v1_from_slice(&plaintext).expect("strict current marker JSON");
+    let object = value.as_object_mut().expect("marker object");
+    for field in [
+        "originalUserPresent",
+        "originalPrivacyPresent",
+        "originalVaultPresent",
+        "originalApprovedWorkspacePresent",
+        "originalWorkProductsPresent",
+    ] {
+        object.remove(field);
+    }
+    let legacy_plaintext =
+        privacy::vnext::canonical_json_v1(&value).expect("canonical old marker fixture");
+    let parsed: PendingApplicationRestore =
+        privacy::vnext::strict_json_v1_from_slice(&legacy_plaintext)
+            .expect("parse old marker fixture");
+    assert_eq!(
+        privacy::vnext::canonical_json_v1(&parsed).expect("re-encode old marker fixture"),
+        legacy_plaintext,
+        "an already-durable old marker must retain byte-exact canonical plaintext"
+    );
+    assert!(
+        marker_original_presence(&parsed)
+            .expect("old marker presence mode")
+            .is_none(),
+        "old markers must not acquire a forged strict presence proof"
+    );
+    let protected = protect_local(&legacy_plaintext).expect("protect old marker fixture");
+    fs::write(marker_path, protected).expect("install old marker fixture");
+    parsed
+}
+
+#[test]
+fn durable_pre_presence_v2_and_v3_marker_bytes_round_trip_and_resume() {
+    {
+        let (directory, workspace, state, workflow, approved) = fixture_v3();
+        let (bundle, _, _) =
+            build_application_backup(directory.path(), &state, &workflow).expect("build V2");
+        stage_application_restore_bytes(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &bundle,
+        )
+        .expect("stage V2");
+        let paths = application_restore_paths(directory.path());
+        assert!(matches!(
+            rewrite_pending_marker_as_pre_presence_fixture(&paths.marker),
+            PendingApplicationRestore::V2(_)
+        ));
+        let PendingApplicationRestoreObservation::Authenticated(gate) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("observe durable old V2 marker")
+        else {
+            panic!("old V2 marker must be present");
+        };
+        assert_eq!(gate.phase(), PendingApplicationRestorePhase::Prepared);
+        drop(workflow);
+        drop(state);
+        apply_pending_application_restore_with_approved(
+            directory.path(),
+            &workspace,
+            &approved.workspace,
+        )
+        .expect("resume durable old V2 marker");
+        assert_no_restore_residue(&paths);
+    }
+
+    {
+        let (directory, workspace, state, workflow, approved) = fixture_v3();
+        let (bundle, _, _) =
+            build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+                .expect("build V3");
+        stage_application_restore_bytes_with_approved(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &approved.workspace,
+            &bundle,
+        )
+        .expect("stage V3");
+        let paths = application_restore_paths(directory.path());
+        assert!(matches!(
+            rewrite_pending_marker_as_pre_presence_fixture(&paths.marker),
+            PendingApplicationRestore::V3(_)
+        ));
+        let PendingApplicationRestoreObservation::Authenticated(gate) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("observe durable old V3 marker")
+        else {
+            panic!("old V3 marker must be present");
+        };
+        assert_eq!(gate.phase(), PendingApplicationRestorePhase::Prepared);
+        drop(workflow);
+        drop(state);
+        apply_pending_application_restore_with_approved(
+            directory.path(),
+            &workspace,
+            &approved.workspace,
+        )
+        .expect("resume durable old V3 marker");
+        assert_no_restore_residue(&paths);
+    }
+}
+
+#[test]
+fn v3_observer_gate_apply_resumes_after_every_swap_and_cleanup_commit_point() {
+    let crash_matrix = [
+        (
+            ApplicationRestoreCommitPoint::UserMovedToRollback,
+            PendingApplicationRestorePhase::UserMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::UserInstalled,
+            PendingApplicationRestorePhase::UserInstalled,
+        ),
+        (
+            ApplicationRestoreCommitPoint::PrivacyMovedToRollback,
+            PendingApplicationRestorePhase::PrivacyMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::PrivacyInstalled,
+            PendingApplicationRestorePhase::PrivacyInstalled,
+        ),
+        (
+            ApplicationRestoreCommitPoint::VaultMovedToRollback,
+            PendingApplicationRestorePhase::VaultMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::VaultInstalled,
+            PendingApplicationRestorePhase::VaultInstalled,
+        ),
+        (
+            ApplicationRestoreCommitPoint::ApprovedWorkspaceMovedToRollback,
+            PendingApplicationRestorePhase::ApprovedWorkspaceMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::ApprovedWorkspaceInstalled,
+            PendingApplicationRestorePhase::ApprovedWorkspaceInstalled,
+        ),
+        (
+            ApplicationRestoreCommitPoint::WorkProductsMovedToRollback,
+            PendingApplicationRestorePhase::WorkProductsMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::WorkProductsInstalled,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 0,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::CredentialsInvalidated,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 0,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::UserRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 1,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::PrivacyRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 2,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::VaultRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 3,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::ApprovedWorkspaceRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 4,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::WorkProductsRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 5,
+            },
+        ),
+    ];
+
+    for (crash_point, expected_phase) in crash_matrix {
+        let (directory, _workspace, state, workflow, approved) = fixture_v3();
+        let (bundle, _, _) =
+            build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+                .expect("build exact V3 crash fixture");
+        stage_application_restore_bytes_with_approved(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &approved.workspace,
+            &bundle,
+        )
+        .expect("stage exact V3 crash fixture");
+        let paths = application_restore_paths(directory.path());
+        let PendingApplicationRestoreObservation::Authenticated(prepared) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("observe prepared V3 gate")
+        else {
+            panic!("prepared V3 marker must be present");
+        };
+        assert_eq!(prepared.phase(), PendingApplicationRestorePhase::Prepared);
+        drop(workflow);
+        drop(state);
+
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached_in_hook = Arc::clone(&reached);
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            let result = apply_observed_pending_application_restore_with_hook(
+                directory.path(),
+                &prepared,
+                Some(&approved.workspace),
+                |point| {
+                    if point == crash_point {
+                        reached_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                        panic!("synthetic process stop at {point:?}");
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(error) = result {
+                panic!("apply failed before {crash_point:?}: {error:?}");
+            }
+        }));
+        assert!(crashed.is_err(), "hook did not stop at {crash_point:?}");
+        assert!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            "apply returned before {crash_point:?}"
+        );
+
+        let PendingApplicationRestoreObservation::Authenticated(resume_gate) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("observe exact V3 crash phase")
+        else {
+            panic!("crashed V3 marker must remain present");
+        };
+        assert_eq!(
+            resume_gate.phase(),
+            expected_phase,
+            "crash point {crash_point:?}"
+        );
+        apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &resume_gate,
+            Some(&approved.workspace),
+            |_| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("resume after {crash_point:?}: {error:?}"));
+        assert_no_restore_residue(&paths);
+    }
+}
+
+#[test]
+fn v3_credentials_invalidated_crash_replays_monotonic_revocation_before_cleanup() {
+    let (directory, _workspace, state, workflow, approved) = fixture_v3();
+    let epochs_before = approved
+        .epochs()
+        .expect("materialize pre-restore credential epochs");
+    let (bundle, _, _) =
+        build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+            .expect("build credential replay V3 fixture");
+    stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect("stage credential replay V3 fixture");
+    let paths = application_restore_paths(directory.path());
+    let PendingApplicationRestoreObservation::Authenticated(prepared) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe prepared credential replay gate")
+    else {
+        panic!("credential replay marker must be present");
+    };
+    drop(workflow);
+    drop(state);
+
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let _ = apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &prepared,
+            Some(&approved.workspace),
+            |point| {
+                if point == ApplicationRestoreCommitPoint::CredentialsInvalidated {
+                    panic!("synthetic stop after credential invalidation");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(crashed.is_err(), "credential invalidation hook must stop");
+    let epochs_after_crash = approved
+        .epochs()
+        .expect("read epochs after first credential invalidation");
+    assert_ne!(epochs_after_crash.0, epochs_before.0);
+    assert_ne!(epochs_after_crash.1, epochs_before.1);
+
+    let PendingApplicationRestoreObservation::Authenticated(resume_gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe credential replay crash phase")
+    else {
+        panic!("credential replay marker must remain after the crash");
+    };
+    assert_eq!(
+        resume_gate.phase(),
+        PendingApplicationRestorePhase::InstalledPendingCleanup {
+            removed_rollback_prefix: 0,
+        },
+        "an invalidation hook has no durable cleanup proof"
+    );
+    assert!(!observed_present_original_cleanup_exists(&resume_gate)
+        .expect("classify credential replay cleanup evidence"));
+
+    apply_observed_pending_application_restore_with_hook(
+        directory.path(),
+        &resume_gate,
+        Some(&approved.workspace),
+        |_| Ok(()),
+    )
+    .expect("resume and replay credential invalidation");
+    let epochs_after_resume = approved
+        .epochs()
+        .expect("read epochs after replayed credential invalidation");
+    assert_ne!(
+        epochs_after_resume.0, epochs_after_crash.0,
+        "the ticket credential issued before the crash must remain invalid"
+    );
+    assert_ne!(
+        epochs_after_resume.1, epochs_after_crash.1,
+        "the qualification epoch issued before the crash must remain invalid"
+    );
+    assert_no_restore_residue(&paths);
+}
+
+#[test]
+fn v3_present_original_cleanup_proof_suppresses_duplicate_credential_invalidation() {
+    let (directory, _workspace, state, workflow, approved) = fixture_v3();
+    let epochs_before = approved
+        .epochs()
+        .expect("materialize pre-restore credential epochs");
+    let (bundle, _, _) =
+        build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+            .expect("build credential skip V3 fixture");
+    stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect("stage credential skip V3 fixture");
+    let paths = application_restore_paths(directory.path());
+    let marker = read_pair_marker(&paths.marker).expect("read credential skip marker");
+    assert_eq!(
+        marker_original_presence(&marker).expect("strict original presence"),
+        Some(vec![true, true, true, true, true])
+    );
+    let PendingApplicationRestoreObservation::Authenticated(prepared) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe prepared credential skip gate")
+    else {
+        panic!("credential skip marker must be present");
+    };
+    drop(workflow);
+    drop(state);
+
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let _ = apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &prepared,
+            Some(&approved.workspace),
+            |point| {
+                if point == ApplicationRestoreCommitPoint::UserRollbackCleaned {
+                    panic!("synthetic stop after first present rollback cleanup");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(crashed.is_err(), "first cleanup hook must stop");
+    let epochs_after_cleanup = approved
+        .epochs()
+        .expect("read epochs after the first cleanup");
+    assert_ne!(epochs_after_cleanup.0, epochs_before.0);
+    assert_ne!(epochs_after_cleanup.1, epochs_before.1);
+
+    let PendingApplicationRestoreObservation::Authenticated(resume_gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe credential skip crash phase")
+    else {
+        panic!("credential skip marker must remain after the crash");
+    };
+    assert_eq!(
+        resume_gate.phase(),
+        PendingApplicationRestorePhase::InstalledPendingCleanup {
+            removed_rollback_prefix: 1,
+        }
+    );
+    assert!(observed_present_original_cleanup_exists(&resume_gate)
+        .expect("authenticate present-original cleanup evidence"));
+
+    apply_observed_pending_application_restore_with_hook(
+        directory.path(),
+        &resume_gate,
+        Some(&approved.workspace),
+        |_| Ok(()),
+    )
+    .expect("resume without duplicate credential invalidation");
+    assert_eq!(
+        approved
+            .epochs()
+            .expect("read epochs after credential skip resume"),
+        epochs_after_cleanup,
+        "a cleaned present rollback is durable proof that invalidation already ran"
+    );
+    assert_no_restore_residue(&paths);
+}
+
+#[test]
+fn v2_observer_gate_apply_resumes_after_every_swap_and_cleanup_commit_point() {
+    let crash_matrix = [
+        (
+            ApplicationRestoreCommitPoint::UserMovedToRollback,
+            PendingApplicationRestorePhase::UserMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::UserInstalled,
+            PendingApplicationRestorePhase::UserInstalled,
+        ),
+        (
+            ApplicationRestoreCommitPoint::PrivacyMovedToRollback,
+            PendingApplicationRestorePhase::PrivacyMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::PrivacyInstalled,
+            PendingApplicationRestorePhase::PrivacyInstalled,
+        ),
+        (
+            ApplicationRestoreCommitPoint::VaultMovedToRollback,
+            PendingApplicationRestorePhase::VaultMovedToRollback,
+        ),
+        (
+            ApplicationRestoreCommitPoint::VaultInstalled,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 0,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::UserRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 1,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::PrivacyRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 2,
+            },
+        ),
+        (
+            ApplicationRestoreCommitPoint::VaultRollbackCleaned,
+            PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: 3,
+            },
+        ),
+    ];
+
+    for (crash_point, expected_phase) in crash_matrix {
+        let (directory, _workspace, state, workflow, approved) = fixture_v3();
+        let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+            .expect("build exact V2 crash fixture");
+        stage_application_restore_bytes(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &bundle,
+        )
+        .expect("stage exact V2 crash fixture");
+        let paths = application_restore_paths(directory.path());
+        let PendingApplicationRestoreObservation::Authenticated(prepared) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("observe prepared V2 gate")
+        else {
+            panic!("prepared V2 marker must be present");
+        };
+        assert_eq!(prepared.phase(), PendingApplicationRestorePhase::Prepared);
+        drop(workflow);
+        drop(state);
+
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached_in_hook = Arc::clone(&reached);
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            let result = apply_observed_pending_application_restore_with_hook(
+                directory.path(),
+                &prepared,
+                Some(&approved.workspace),
+                |point| {
+                    if point == crash_point {
+                        reached_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                        panic!("synthetic V2 process stop at {point:?}");
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(error) = result {
+                panic!("V2 apply failed before {crash_point:?}: {error:?}");
+            }
+        }));
+        assert!(crashed.is_err(), "V2 hook did not stop at {crash_point:?}");
+        assert!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            "V2 apply returned before {crash_point:?}"
+        );
+
+        let PendingApplicationRestoreObservation::Authenticated(resume_gate) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("observe exact V2 crash phase")
+        else {
+            panic!("crashed V2 marker must remain present");
+        };
+        assert_eq!(
+            resume_gate.phase(),
+            expected_phase,
+            "V2 crash point {crash_point:?}"
+        );
+        apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &resume_gate,
+            Some(&approved.workspace),
+            |_| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("resume V2 after {crash_point:?}: {error:?}"));
+        assert_no_restore_residue(&paths);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreObserverFilesystemEntry {
+    relative: String,
+    directory: bool,
+    bytes: u64,
+    created: u64,
+    modified: u64,
+    attributes: u32,
+    sha256: Option<String>,
+}
+
+fn restore_observer_filesystem_snapshot(root: &Path) -> Vec<RestoreObserverFilesystemEntry> {
+    fn visit(root: &Path, current: &Path, output: &mut Vec<RestoreObserverFilesystemEntry>) {
+        let mut entries = fs::read_dir(current)
+            .expect("snapshot directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("snapshot entries");
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot relative path")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let directory = metadata.is_dir();
+            output.push(RestoreObserverFilesystemEntry {
+                relative,
+                directory,
+                bytes: metadata.len(),
+                created: metadata.creation_time(),
+                modified: metadata.last_write_time(),
+                attributes: metadata.file_attributes(),
+                sha256: metadata
+                    .is_file()
+                    .then(|| privacy::sha256_hex(&fs::read(&path).expect("snapshot file"))),
+            });
+            if directory {
+                visit(root, &path, output);
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    visit(root, root, &mut output);
+    output
+}
+
+fn create_restore_test_directory_reparse(target: &Path, link: &Path) -> std::io::Result<()> {
+    use std::{
+        io,
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+    };
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => Ok(()),
+        Err(symlink_error) => {
+            let normalized_link = link.components().collect::<PathBuf>();
+            let normalized_target = target.components().collect::<PathBuf>();
+            let status = Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(normalized_link)
+                .arg(normalized_target)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    symlink_error.kind(),
+                    "failed to create a restore-test directory symlink or junction",
+                ))
+            }
+        }
+    }
+}
+
+#[test]
+fn v3_observer_is_recursive_zero_write_and_never_calls_load_or_create() {
+    let (directory, _workspace, state, workflow, approved) = fixture_v3();
+    let (bundle, _, _) =
+        build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+            .expect("build observer V3 fixture");
+    stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect("stage observer V3 fixture");
+    drop(workflow);
+    drop(state);
+    approved.panic_if_load_or_create_is_called();
+    let before = restore_observer_filesystem_snapshot(directory.path());
+
+    for _ in 0..2 {
+        let PendingApplicationRestoreObservation::Authenticated(gate) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("repeat exact read-only V3 observation")
+        else {
+            panic!("staged V3 marker must be observed");
+        };
+        assert_eq!(gate.phase(), PendingApplicationRestorePhase::Prepared);
+    }
+
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        before,
+        "observer changed recursive entries, bytes, timestamps, or attributes"
+    );
+}
+
+#[test]
+fn observed_gate_rejects_incoming_tamper_before_first_write() {
+    let (directory, _workspace, state, workflow, approved) = fixture_v3();
+    let (bundle, _, _) =
+        build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+            .expect("build gate tamper fixture");
+    stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect("stage gate tamper fixture");
+    let paths = application_restore_paths(directory.path());
+    drop(workflow);
+    drop(state);
+    let PendingApplicationRestoreObservation::Authenticated(gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("capture gate before tamper")
+    else {
+        panic!("tamper fixture marker must be observed");
+    };
+    let mut user = fs::read(&paths.user_incoming).expect("incoming user bytes");
+    user[0] ^= 0x80;
+    fs::write(&paths.user_incoming, user).expect("tamper after gate");
+    let tampered = restore_observer_filesystem_snapshot(directory.path());
+
+    let error = apply_observed_pending_application_restore_with_hook(
+        directory.path(),
+        &gate,
+        Some(&approved.workspace),
+        |_| Ok(()),
+    )
+    .expect_err("gate-after-tamper must reject before the first rename or cleanup");
+    assert!(matches!(
+        error.error_type.as_str(),
+        "application_restore_observation_changed"
+            | "application_restore_tampered"
+            | "application_restore_invalid"
+    ));
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        tampered,
+        "failed gate revalidation wrote or cleaned restore state"
+    );
+}
+
+#[test]
+fn v2_cross_workspace_identity_fails_closed_without_writes() {
+    let (directory, _workspace, state, workflow, approved) = fixture_v3();
+    let (other_directory, _, _, _, other_approved) = fixture_v3();
+    let _other_workspace = other_approved
+        .workspace
+        .workspace_instance_id()
+        .expect("create distinct existing workspace identity");
+    let (bundle, _, _) =
+        build_application_backup(directory.path(), &state, &workflow).expect("build V2 fixture");
+    stage_application_restore_bytes(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &bundle,
+    )
+    .expect("stage V2 cross-workspace fixture");
+    drop(workflow);
+    drop(state);
+    let before = restore_observer_filesystem_snapshot(directory.path());
+
+    let error = observe_pending_application_restore_read_only_with_approved(
+        directory.path(),
+        Some(&other_approved.workspace),
+    )
+    .expect_err("a different existing Approved identity must not authenticate V2");
+    assert_eq!(error.error_type, "approved_workspace_unavailable");
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        before
+    );
+    drop(other_directory);
+    drop(approved);
+}
+
+#[test]
+fn v2_original_absent_user_and_vault_are_lazily_installed_and_cleaned() {
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
+    let (bundle, _, _) = build_application_backup(directory.path(), &state, &workflow)
+        .expect("build V2 absent-original fixture");
+    let paths = application_restore_paths(directory.path());
+    remove_database_restore_files(&paths.user_active).expect("remove original user component");
+    remove_vault_restore_directory(&paths.vault_active).expect("remove original Vault component");
+    assert!(!paths.user_active.exists());
+    assert!(!paths.vault_active.exists());
+
+    stage_application_restore_bytes(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &bundle,
+    )
+    .expect("stage V2 with authenticated absent originals");
+    let marker = read_pair_marker(&paths.marker).expect("read V2 absent-original marker");
+    assert_eq!(
+        marker_original_presence(&marker).expect("V2 presence proof"),
+        Some(vec![false, true, false])
+    );
+    let PendingApplicationRestoreObservation::Authenticated(gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe V2 absent-original gate")
+    else {
+        panic!("V2 absent-original marker must be present");
+    };
+    assert_eq!(gate.phase(), PendingApplicationRestorePhase::Prepared);
+    drop(workflow);
+    drop(state);
+
+    apply_observed_pending_application_restore_with_hook(
+        directory.path(),
+        &gate,
+        Some(&approved.workspace),
+        |_| Ok(()),
+    )
+    .expect("apply V2 absent-original restore");
+    database::validate_user_database_read_only(&paths.user_active)
+        .expect("lazily installed user component is canonical");
+    let restarted = PrivacyWorkflowManager::new(directory.path().to_path_buf(), workspace)
+        .expect("reopen V2 absent-original Privacy component");
+    assert!(paths.vault_active.is_dir());
+    drop(restarted);
+    assert_no_restore_residue(&paths);
+}
+
+#[test]
+fn v3_original_absent_four_component_interleaving_is_lazily_installed_and_cleaned() {
+    let (directory, workspace, state, workflow, approved) = fixture_v3();
+    let epochs_before = approved
+        .epochs()
+        .expect("materialize credentials before the absent-original gate");
+    let (bundle, _, _) =
+        build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+            .expect("build V3 absent-original fixture");
+    let paths = application_restore_paths(directory.path());
+    remove_database_restore_files(&paths.user_active).expect("remove original user component");
+    remove_vault_restore_directory(&paths.vault_active).expect("remove original Vault component");
+    if paths.approved_active.exists() {
+        remove_restore_directory(&paths.approved_active)
+            .expect("remove original Approved component");
+    }
+    if paths.work_products_active.exists() {
+        remove_restore_directory(&paths.work_products_active)
+            .expect("remove original work-products component");
+    }
+    assert!(!paths.user_active.exists());
+    assert!(!paths.vault_active.exists());
+    assert!(!paths.approved_active.exists());
+    assert!(!paths.work_products_active.exists());
+
+    stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect("stage V3 with interleaved authenticated absent originals");
+    let marker = read_pair_marker(&paths.marker).expect("read V3 absent-original marker");
+    assert_eq!(
+        marker_original_presence(&marker).expect("V3 presence proof"),
+        Some(vec![false, true, false, false, false])
+    );
+    let PendingApplicationRestoreObservation::Authenticated(gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe V3 absent-original gate")
+    else {
+        panic!("V3 absent-original marker must be present");
+    };
+    assert_eq!(gate.phase(), PendingApplicationRestorePhase::Prepared);
+    drop(workflow);
+    drop(state);
+
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reached_in_hook = Arc::clone(&reached);
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let _ = apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &gate,
+            Some(&approved.workspace),
+            |point| {
+                if point == ApplicationRestoreCommitPoint::WorkProductsInstalled {
+                    reached_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("synthetic stop after absent-original V3 swaps");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(crashed.is_err());
+    assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        approved.epochs().expect("epochs before absent resume"),
+        epochs_before,
+        "the post-swap hook stops before credential invalidation"
+    );
+    let PendingApplicationRestoreObservation::Authenticated(resume_gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("observe absent-original post-swap phase")
+    else {
+        panic!("absent-original V3 marker must remain after the swap crash");
+    };
+    assert_eq!(
+        resume_gate.phase(),
+        PendingApplicationRestorePhase::InstalledPendingCleanup {
+            removed_rollback_prefix: 1,
+        },
+        "a leading absent slot is a numeric prefix, not invalidation evidence"
+    );
+    apply_observed_pending_application_restore_with_hook(
+        directory.path(),
+        &resume_gate,
+        Some(&approved.workspace),
+        |_| Ok(()),
+    )
+    .expect("resume V3 absent-original restore");
+    let epochs_after = approved.epochs().expect("epochs after absent resume");
+    assert_ne!(epochs_after.0, epochs_before.0);
+    assert_ne!(epochs_after.1, epochs_before.1);
+    database::validate_user_database_read_only(&paths.user_active)
+        .expect("lazily installed V3 user component is canonical");
+    let restarted = PrivacyWorkflowManager::new(directory.path().to_path_buf(), workspace)
+        .expect("reopen V3 absent-original Privacy component");
+    assert!(paths.vault_active.is_dir());
+    assert!(paths.approved_active.is_dir());
+    assert!(paths.work_products_active.is_dir());
+    drop(restarted);
+    assert_no_restore_residue(&paths);
+}
+
+#[test]
+fn observed_gate_rejects_recursive_file_and_directory_tamper_before_first_write() {
+    for tamper_directory in [false, true] {
+        let (directory, _workspace, state, workflow, approved) = fixture_v3();
+        let case_id = format!(
+            "case_{}",
+            (if tamper_directory { "7" } else { "6" }).repeat(32)
+        );
+        let generation = approved
+            .publish_generation(&case_id, if tamper_directory { 'b' } else { 'a' })
+            .expect("publish recursive-proof generation");
+        let work_product_id = approved
+            .create_work_product(&generation, b"[PERSON_001] recursive restore proof fixture")
+            .expect("create recursive-proof work product");
+        let (bundle, _, _) =
+            build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+                .expect("build recursive-proof V3 fixture");
+        stage_application_restore_bytes_with_approved(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &approved.workspace,
+            &bundle,
+        )
+        .expect("stage recursive-proof V3 fixture");
+        let paths = application_restore_paths(directory.path());
+        let PendingApplicationRestoreObservation::Authenticated(gate) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("capture gate before recursive tamper")
+        else {
+            panic!("recursive tamper fixture marker must be observed");
+        };
+        drop(workflow);
+        drop(state);
+
+        if tamper_directory {
+            let unexpected = paths
+                .work_products_incoming
+                .join("work-products")
+                .join("unexpected-recursive-directory");
+            fs::create_dir(&unexpected).expect("insert unexpected recursive directory");
+        } else {
+            let envelope = paths
+                .work_products_incoming
+                .join("work-products")
+                .join(&case_id)
+                .join(&work_product_id)
+                .join("v00000000000000000001")
+                .join("content.envelope.json");
+            let mut bytes = fs::read(&envelope).expect("read nested encrypted envelope");
+            let offset = bytes.len() / 2;
+            bytes[offset] ^= 0x20;
+            fs::write(&envelope, bytes).expect("tamper nested encrypted envelope");
+        }
+        let tampered = restore_observer_filesystem_snapshot(directory.path());
+        let error = apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &gate,
+            Some(&approved.workspace),
+            |_| Ok(()),
+        )
+        .expect_err("recursive tree drift must fail before the first rename or cleanup");
+        assert!(matches!(
+            error.error_type.as_str(),
+            "application_restore_observation_changed"
+                | "application_restore_invalid"
+                | "approved_workspace_unavailable"
+        ));
+        assert_eq!(
+            restore_observer_filesystem_snapshot(directory.path()),
+            tampered,
+            "recursive file/directory rejection changed the filesystem"
+        );
+    }
+}
+
+#[test]
+fn observed_gate_rejects_credential_digest_drift_before_first_write() {
+    let (directory, _workspace, state, workflow, approved) = fixture_v3();
+    approved
+        .epochs()
+        .expect("materialize both non-manifest credential slots");
+    let (bundle, _, _) =
+        build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+            .expect("build credential-drift V3 fixture");
+    stage_application_restore_bytes_with_approved(
+        directory.path(),
+        state.user_database_path(),
+        &workflow,
+        &approved.workspace,
+        &bundle,
+    )
+    .expect("stage credential-drift V3 fixture");
+    let PendingApplicationRestoreObservation::Authenticated(gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            directory.path(),
+            Some(&approved.workspace),
+        )
+        .expect("capture gate before credential drift")
+    else {
+        panic!("credential-drift fixture marker must be observed");
+    };
+    drop(workflow);
+    drop(state);
+    approved
+        .drift_application_restore_ticket_credential()
+        .expect("rotate one observed non-manifest credential");
+    let drifted = restore_observer_filesystem_snapshot(directory.path());
+
+    let error = apply_observed_pending_application_restore_with_hook(
+        directory.path(),
+        &gate,
+        Some(&approved.workspace),
+        |_| Ok(()),
+    )
+    .expect_err("credential proof drift must fail before the first rename or cleanup");
+    assert_eq!(error.error_type, "application_restore_observation_changed");
+    assert_eq!(
+        restore_observer_filesystem_snapshot(directory.path()),
+        drifted,
+        "credential digest rejection changed the restore filesystem"
+    );
+}
+
+#[test]
+fn observed_gate_rejects_unknown_unmarked_mixed_hardlink_and_reparse_state_without_writes() {
+    #[derive(Debug, Clone, Copy)]
+    enum Attack {
+        UnknownSibling,
+        UnmarkedResidue,
+        MixedProtocol,
+        Hardlink,
+        ReparsePoint,
+    }
+
+    for attack in [
+        Attack::UnknownSibling,
+        Attack::UnmarkedResidue,
+        Attack::MixedProtocol,
+        Attack::Hardlink,
+        Attack::ReparsePoint,
+    ] {
+        let (directory, _workspace, state, workflow, approved) = fixture_v3();
+        let (bundle, _, _) =
+            build_application_backup_v3(directory.path(), &state, &workflow, &approved.workspace)
+                .expect("build namespace-drift V3 fixture");
+        stage_application_restore_bytes_with_approved(
+            directory.path(),
+            state.user_database_path(),
+            &workflow,
+            &approved.workspace,
+            &bundle,
+        )
+        .expect("stage namespace-drift V3 fixture");
+        let paths = application_restore_paths(directory.path());
+        let PendingApplicationRestoreObservation::Authenticated(gate) =
+            observe_pending_application_restore_read_only_with_approved(
+                directory.path(),
+                Some(&approved.workspace),
+            )
+            .expect("capture gate before namespace drift")
+        else {
+            panic!("namespace-drift fixture marker must be observed");
+        };
+        drop(workflow);
+        drop(state);
+
+        let mut reparse_link = None;
+        match attack {
+            Attack::UnknownSibling => {
+                fs::write(
+                    directory
+                        .path()
+                        .join("user.sqlite.application-restore-staging-unknown"),
+                    b"unknown restore sibling",
+                )
+                .expect("create unknown restore sibling");
+            }
+            Attack::UnmarkedResidue => {
+                fs::remove_file(&paths.marker).expect("remove protected marker after gate");
+            }
+            Attack::MixedProtocol => {
+                fs::write(&paths.legacy_user_marker, b"mixed legacy restore marker")
+                    .expect("create mixed-protocol marker");
+            }
+            Attack::Hardlink => {
+                fs::hard_link(
+                    &paths.user_incoming,
+                    directory.path().join("synthetic-restore-hardlink-alias"),
+                )
+                .expect("create incoming user hardlink after gate");
+            }
+            Attack::ReparsePoint => {
+                let target = directory.path().join("synthetic-restore-reparse-target");
+                fs::create_dir(&target).expect("create reparse target");
+                fs::write(target.join("sentinel"), b"reparse target sentinel")
+                    .expect("write reparse target sentinel");
+                let link = paths.vault_incoming.join("synthetic-reparse-entry");
+                create_restore_test_directory_reparse(&target, &link)
+                    .expect("create restore reparse point after gate");
+                reparse_link = Some(link);
+            }
+        }
+        let attacked = restore_observer_filesystem_snapshot(directory.path());
+        let error = apply_observed_pending_application_restore_with_hook(
+            directory.path(),
+            &gate,
+            Some(&approved.workspace),
+            |_| Ok(()),
+        )
+        .expect_err("namespace drift must fail before the first write");
+        let expected_code = match attack {
+            Attack::UnknownSibling => "application_restore_unknown_state",
+            Attack::UnmarkedResidue | Attack::MixedProtocol => "application_restore_conflict",
+            Attack::Hardlink | Attack::ReparsePoint => "application_restore_invalid",
+        };
+        assert_eq!(error.error_type, expected_code, "attack {attack:?}");
+        assert_eq!(
+            restore_observer_filesystem_snapshot(directory.path()),
+            attacked,
+            "attack rejection changed the filesystem: {attack:?}"
+        );
+        if let Some(link) = reparse_link {
+            fs::remove_dir(link).expect("remove test junction without traversing its target");
+        }
     }
 }

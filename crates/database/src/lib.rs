@@ -13,18 +13,25 @@ use rusqlite::{functions::FunctionFlags, params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 mod migration_source;
+mod v031_upgrade;
 
 pub use migration_source::{
     validate_open_user_database_migration_source_read_only,
-    validate_user_database_migration_source_read_only,
+    validate_user_database_migration_source_read_only, validate_v031_user_sqlite_image_read_only,
     with_validated_user_database_migration_source_read_only, UserMigrationSourceFileProof,
     UserMigrationSourceProof, UserMigrationTableProof, V031UserSchemaProvenance,
     ValidatedUserMigrationSourceSession, ValidatedUserSourceSchema,
-    V031_USER_CANONICAL_EMPTY_FIXTURE_SHA256, V031_USER_CANONICAL_SCHEMA_MARKER,
-    V031_USER_GENERATION_CARGO_LOCK_SHA256, V031_USER_GENERATION_DATABASE_SOURCE_SHA256,
-    V031_USER_GENERATOR_SHA256, V031_USER_INTERNAL_SCHEMA_MANIFEST_SHA256,
-    V031_USER_INTERNAL_SCHEMA_OBJECT_COUNT, V031_USER_SCHEMA_MANIFEST_SHA256,
-    V031_USER_SCHEMA_OBJECT_COUNT, V031_USER_SCHEMA_PROVENANCE, V031_USER_SCHEMA_VERSION,
+    MAX_V031_USER_SQLITE_IMAGE_BYTES, V031_USER_CANONICAL_EMPTY_FIXTURE_SHA256,
+    V031_USER_CANONICAL_SCHEMA_MARKER, V031_USER_GENERATION_CARGO_LOCK_SHA256,
+    V031_USER_GENERATION_DATABASE_SOURCE_SHA256, V031_USER_GENERATOR_SHA256,
+    V031_USER_INTERNAL_SCHEMA_MANIFEST_SHA256, V031_USER_INTERNAL_SCHEMA_OBJECT_COUNT,
+    V031_USER_SCHEMA_MANIFEST_SHA256, V031_USER_SCHEMA_OBJECT_COUNT, V031_USER_SCHEMA_PROVENANCE,
+    V031_USER_SCHEMA_VERSION,
+};
+pub use v031_upgrade::{
+    migrate_exact_v031_user_to_v11_with_upgrade_audit, verify_exact_v031_user_v11_upgrade_audit,
+    V031UserPreAuditManifest, V031UserUpgradeAuditEvidence, V031UserUpgradeResult,
+    V031_TO_V040_USER_AUDIT_OPERATION, V031_TO_V040_USER_MIGRATION_ID,
 };
 
 pub const LEGAL_CORE_DB_FILE_NAME: &str = "legal_core.sqlite";
@@ -9550,6 +9557,18 @@ fn install_case_assistant_closed_audit_triggers(
 }
 
 fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), DatabaseInitError> {
+    run_user_migrations_with_hooks(connection, |_| Ok(()), |_| Ok(()))
+}
+
+/// Runs the canonical migration while allowing the v0.3.1 upgrade boundary to
+/// prove the exact source before the first write and append its audit record as
+/// the final write. Ordinary callers use [`run_user_migrations`], whose two
+/// no-op hooks preserve the established migration behavior.
+fn run_user_migrations_with_hooks<T>(
+    connection: &mut rusqlite::Connection,
+    before_first_write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(), DatabaseInitError>,
+    before_commit: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, DatabaseInitError>,
+) -> Result<T, DatabaseInitError> {
     let existing_version = existing_user_schema_version(connection)?;
     let schema_version_value = USER_SCHEMA_VERSION.to_string();
     let expected_canonical_marker = USER_CANONICAL_SCHEMA_MARKER_VALUE;
@@ -9586,6 +9605,7 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
     };
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    before_first_write(&transaction)?;
     let staged_tables = if needs_canonical_rebuild {
         // v9 contains a deliberate message/run cycle. Deferring foreign keys
         // keeps the staged copy deterministic while the final transaction is
@@ -11467,9 +11487,10 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
         (USER_CANONICAL_SCHEMA_MARKER_KEY, expected_canonical_marker),
     )?;
 
+    let result = before_commit(&transaction)?;
     transaction.commit()?;
 
-    Ok(())
+    Ok(result)
 }
 
 fn existing_user_schema_version(

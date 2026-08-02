@@ -8,15 +8,21 @@
 use crate::{
     egress::{DataClassification, PrivacyEgressAuditRecord},
     receipt::DestinationKind,
-    sha256_hex, unprotect_local, LOCAL_PROTECTION_SCHEME,
+    sha256_hex, unprotect_local,
+    v5_manifest::{
+        compute_privacy_v5_manifests_read_only, PrivacyV5ManifestError, PrivacyV5ManifestProof,
+    },
+    LOCAL_PROTECTION_SCHEME,
 };
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{
+    params_from_iter, types::Value, Connection, OpenFlags, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -40,6 +46,10 @@ const SQLITE_CANONICAL_BUSINESS_ROW_MANIFEST_V1_DOMAIN: &[u8] =
 const PRIVACY_V1_MAX_ACTIVE_RECEIPT_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const PRIVACY_V1_SOURCE_FILE_IDENTITY_DOMAIN: &[u8] =
     b"lawyer-assistance-privacy-migration-file-identity-v1\0";
+const PRIVACY_V1_MEMORY_IMAGE_IDENTITY_DOMAIN: &[u8] =
+    b"lawyer-assistance-privacy-migration-memory-image-identity-v1\0";
+pub const MAX_PRIVACY_V1_SQLITE_IMAGE_BYTES: usize =
+    crate::lifecycle::MAX_PRE_MIGRATION_BACKUP_DATABASE_BYTES;
 const PRIVACY_V1_INTERNAL_AUTO_INDEX_ALLOWLIST: &[(&str, &str)] = &[
     (
         "sqlite_autoindex_privacy_egress_audit_1",
@@ -70,7 +80,6 @@ pub const PRIVACY_V1_SCHEMA_PROVENANCE_JSON: &str =
 /// `PrivacyStore::initialize` implementation. Tests execute this text instead
 /// of copying a binary SQLite fixture, then compare every normalized object to
 /// [`PRIVACY_V1_SCHEMA_MANIFEST_JSONL`].
-#[cfg(all(test, windows))]
 pub const PRIVACY_V1_SCHEMA_MANIFEST_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS privacy_schema_metadata (
     key TEXT PRIMARY KEY,
@@ -260,6 +269,51 @@ impl std::fmt::Display for PrivacyV1SourceValidationError {
 
 impl std::error::Error for PrivacyV1SourceValidationError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyV5SourceValidationError {
+    Database,
+    UnsafeFilesystem,
+    Manifest(PrivacyV5ManifestError),
+    SourceDrift,
+}
+
+impl PrivacyV5SourceValidationError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Database => "privacy_v5_source_database_error",
+            Self::UnsafeFilesystem => "privacy_v5_source_unsafe_filesystem",
+            Self::Manifest(_) => "privacy_v5_source_manifest_invalid",
+            Self::SourceDrift => "privacy_v5_source_drift",
+        }
+    }
+}
+
+impl std::fmt::Display for PrivacyV5SourceValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for PrivacyV5SourceValidationError {}
+
+impl From<PrivacyV5ManifestError> for PrivacyV5SourceValidationError {
+    fn from(error: PrivacyV5ManifestError) -> Self {
+        Self::Manifest(error)
+    }
+}
+
+fn map_v5_source_guard_error(
+    error: PrivacyV1SourceValidationError,
+) -> PrivacyV5SourceValidationError {
+    match error {
+        PrivacyV1SourceValidationError::UnsafeFilesystem => {
+            PrivacyV5SourceValidationError::UnsafeFilesystem
+        }
+        PrivacyV1SourceValidationError::SourceDrift => PrivacyV5SourceValidationError::SourceDrift,
+        _ => PrivacyV5SourceValidationError::Database,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivacyV1SourceFileProof {
     pub identity_sha256: String,
@@ -320,17 +374,23 @@ pub struct PrivacyV1BusinessTableManifest {
 /// callers may use it as a source for SQLite's backup API but cannot write.
 pub struct ValidatedPrivacyV1ReadOnlySession<'connection> {
     connection: &'connection Connection,
-    logical_manifest: &'connection PrivacyV1LogicalManifest,
-    business_manifest: &'connection PrivacyV1BusinessManifest,
+    proof: &'connection ValidatedPrivacyV1Source,
 }
 
 impl<'connection> ValidatedPrivacyV1ReadOnlySession<'connection> {
+    /// Returns the complete, path-free proof captured for this still-pinned
+    /// source snapshot. The outer validator repeats every proof after the
+    /// callback before it can return success.
+    pub const fn proof(&self) -> &'connection ValidatedPrivacyV1Source {
+        self.proof
+    }
+
     pub const fn logical_manifest(&self) -> &'connection PrivacyV1LogicalManifest {
-        self.logical_manifest
+        &self.proof.logical_manifest
     }
 
     pub const fn business_manifest(&self) -> &'connection PrivacyV1BusinessManifest {
-        self.business_manifest
+        &self.proof.business_manifest
     }
 
     /// Copies the exact pinned source snapshot into a caller-owned destination
@@ -347,6 +407,78 @@ impl<'connection> ValidatedPrivacyV1ReadOnlySession<'connection> {
     }
 }
 
+/// Narrow Backup-API-only view of one exact Privacy-v5 snapshot.  The source
+/// transaction remains pinned for the callback and is re-proven, together
+/// with every database sidecar and ancestor binding, before success returns.
+pub struct ValidatedPrivacyV5ReadOnlySession<'connection> {
+    connection: &'connection Connection,
+    proof: &'connection PrivacyV5ManifestProof,
+}
+
+impl ValidatedPrivacyV5ReadOnlySession<'_> {
+    pub const fn proof(&self) -> &PrivacyV5ManifestProof {
+        self.proof
+    }
+
+    pub fn backup_to(&self, destination: &mut Connection) -> rusqlite::Result<()> {
+        let backup = rusqlite::backup::Backup::new(self.connection, destination)?;
+        backup.run_to_completion(64, Duration::from_millis(1), None)
+    }
+}
+
+/// Runs a Backup API operation while both the exact schema-5 semantic proof
+/// and all source file identities are stable.  This is migration-only; normal
+/// Privacy startup continues to reject schema 5.
+pub fn with_validated_privacy_v5_migration_source_read_only<T>(
+    path: impl AsRef<Path>,
+    callback: impl FnOnce(&ValidatedPrivacyV5ReadOnlySession<'_>) -> T,
+) -> Result<(PrivacyV5ManifestProof, T), PrivacyV5SourceValidationError> {
+    let path = path.as_ref();
+    let mut source_guard = SourcePathGuard::capture(path).map_err(map_v5_source_guard_error)?;
+    let before = source_guard.initial_snapshot();
+    let connection = open_privacy_v1_source_read_only(path).map_err(map_v5_source_guard_error)?;
+    source_guard
+        .verify_sqlite_binding(&connection)
+        .map_err(map_v5_source_guard_error)?;
+    let proof_before = compute_privacy_v5_manifests_read_only(&connection)?;
+
+    let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
+        .map_err(|_| PrivacyV5SourceValidationError::Database)?;
+    // The first read pins the snapshot before the Backup API is exposed.
+    let _: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+        .map_err(|_| PrivacyV5SourceValidationError::Database)?;
+    let data_version_before = transaction
+        .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+        .map_err(|_| PrivacyV5SourceValidationError::Database)?;
+    let callback_result = callback(&ValidatedPrivacyV5ReadOnlySession {
+        connection: &transaction,
+        proof: &proof_before,
+    });
+    let data_version_after = transaction
+        .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+        .map_err(|_| PrivacyV5SourceValidationError::Database)?;
+    let query_only = transaction
+        .pragma_query_value(None, "query_only", |row| row.get::<_, i64>(0))
+        .map_err(|_| PrivacyV5SourceValidationError::Database)?;
+    if transaction.is_autocommit() || query_only != 1 || data_version_before != data_version_after {
+        return Err(PrivacyV5SourceValidationError::SourceDrift);
+    }
+    transaction
+        .commit()
+        .map_err(|_| PrivacyV5SourceValidationError::Database)?;
+
+    let proof_after = compute_privacy_v5_manifests_read_only(&connection)?;
+    drop(connection);
+    let after = source_guard
+        .recapture()
+        .map_err(map_v5_source_guard_error)?;
+    if proof_before != proof_after || before != after {
+        return Err(PrivacyV5SourceValidationError::SourceDrift);
+    }
+    Ok((proof_before, callback_result))
+}
+
 /// Opens an existing Privacy database with SQLite read-only flags and validates
 /// the exact v1 migration-source contract. It never calls current initialization
 /// or any writable migration/repair path.
@@ -354,6 +486,128 @@ pub fn validate_privacy_v1_migration_source_read_only(
     path: impl AsRef<Path>,
 ) -> Result<ValidatedPrivacyV1Source, PrivacyV1SourceValidationError> {
     with_validated_privacy_v1_migration_source_read_only(path, |_| ()).map(|(proof, ())| proof)
+}
+
+/// Reconstructs the complete exact-Privacy-v1 proof from one canonical SQLite
+/// database image without creating a file or touching the original source.
+///
+/// SQLite copies the bytes into an owned in-memory buffer and attaches that
+/// buffer with `SQLITE_DESERIALIZE_READONLY`. The connection is additionally
+/// held in `query_only` mode, and only the frozen Privacy-v1 schema and data
+/// boundaries are accepted.
+pub fn validate_privacy_v1_sqlite_image_read_only(
+    sqlite_image: &[u8],
+) -> Result<ValidatedPrivacyV1Source, PrivacyV1SourceValidationError> {
+    validate_privacy_v1_sqlite_image_input(sqlite_image)?;
+    let image_length = u64::try_from(sqlite_image.len())
+        .map_err(|_| PrivacyV1SourceValidationError::DataBoundary)?;
+    let image_sha256 = sha256_hex(sqlite_image);
+
+    let mut connection =
+        Connection::open_in_memory().map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    connection
+        .deserialize_read_exact(
+            rusqlite::MAIN_DB,
+            Cursor::new(sqlite_image),
+            sqlite_image.len(),
+            true,
+        )
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    connection
+        .pragma_update(None, "query_only", "ON")
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    connection
+        .pragma_update(None, "trusted_schema", "OFF")
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    validate_privacy_v1_deserialized_image_geometry(&connection, image_length)?;
+
+    let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    let initial_validation = validate_privacy_v1_transaction(&transaction)?;
+    let query_only = transaction
+        .pragma_query_value(None, "query_only", |row| row.get::<_, i64>(0))
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    if query_only != 1 {
+        return Err(PrivacyV1SourceValidationError::SourceDrift);
+    }
+    let final_validation = validate_privacy_v1_transaction(&transaction)?;
+    if initial_validation != final_validation {
+        return Err(PrivacyV1SourceValidationError::SourceDrift);
+    }
+    transaction
+        .commit()
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+
+    Ok(ValidatedPrivacyV1Source {
+        schema_version: PRIVACY_V1_SCHEMA_VERSION,
+        schema_object_count: PRIVACY_V1_SCHEMA_OBJECT_COUNT,
+        protected_review_payload_count: initial_validation.protected_review_payload_count,
+        normalized_sqlite_master_sha256: PRIVACY_V1_SCHEMA_PROVENANCE
+            .normalized_sqlite_master_sha256,
+        database_file: privacy_v1_memory_image_file_proof(image_length, image_sha256),
+        wal: None,
+        shm: None,
+        journal: None,
+        logical_manifest: initial_validation.logical_manifest,
+        business_manifest: initial_validation.business_manifest,
+        data_version: initial_validation.data_version,
+    })
+}
+
+fn validate_privacy_v1_sqlite_image_input(
+    sqlite_image: &[u8],
+) -> Result<(), PrivacyV1SourceValidationError> {
+    if sqlite_image.len() < 100
+        || sqlite_image.len() > MAX_PRIVACY_V1_SQLITE_IMAGE_BYTES
+        || !sqlite_image.starts_with(b"SQLite format 3\0")
+    {
+        return Err(PrivacyV1SourceValidationError::DataBoundary);
+    }
+    Ok(())
+}
+
+fn validate_privacy_v1_deserialized_image_geometry(
+    connection: &Connection,
+    image_length: u64,
+) -> Result<(), PrivacyV1SourceValidationError> {
+    let page_size = connection
+        .pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    let page_count = connection
+        .pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    let expected_length = u64::try_from(page_size)
+        .ok()
+        .and_then(|size| {
+            u64::try_from(page_count)
+                .ok()
+                .and_then(|count| size.checked_mul(count))
+        })
+        .filter(|length| *length > 0)
+        .ok_or(PrivacyV1SourceValidationError::DataBoundary)?;
+    if expected_length != image_length {
+        return Err(PrivacyV1SourceValidationError::DataBoundary);
+    }
+    Ok(())
+}
+
+fn privacy_v1_memory_image_file_proof(
+    image_length: u64,
+    image_sha256: String,
+) -> PrivacyV1SourceFileProof {
+    let mut identity = Sha256::new();
+    Digest::update(&mut identity, PRIVACY_V1_MEMORY_IMAGE_IDENTITY_DOMAIN);
+    Digest::update(&mut identity, image_length.to_be_bytes());
+    Digest::update(&mut identity, image_sha256.as_bytes());
+    PrivacyV1SourceFileProof {
+        identity_sha256: format!("{:x}", identity.finalize()),
+        length: image_length,
+        modified_unix_nanos: None,
+        sha256: image_sha256,
+    }
 }
 
 /// Validates the source, invokes `callback` against that same pinned read-only
@@ -387,6 +641,20 @@ where
     let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
         .map_err(|_| PrivacyV1SourceValidationError::Database)?;
     let initial_validation = validate_privacy_v1_transaction(&transaction)?;
+    let source_proof = ValidatedPrivacyV1Source {
+        schema_version: PRIVACY_V1_SCHEMA_VERSION,
+        schema_object_count: PRIVACY_V1_SCHEMA_OBJECT_COUNT,
+        protected_review_payload_count: initial_validation.protected_review_payload_count,
+        normalized_sqlite_master_sha256: PRIVACY_V1_SCHEMA_PROVENANCE
+            .normalized_sqlite_master_sha256,
+        database_file: privacy_v1_source_file_proof(&before.database),
+        wal: before.wal.as_ref().map(privacy_v1_source_file_proof),
+        shm: before.shm.as_ref().map(privacy_v1_source_file_proof),
+        journal: before.journal.as_ref().map(privacy_v1_source_file_proof),
+        logical_manifest: initial_validation.logical_manifest.clone(),
+        business_manifest: initial_validation.business_manifest.clone(),
+        data_version: initial_validation.data_version,
+    };
     let transaction_guard = format!("privacy_migration_guard_{}", uuid::Uuid::new_v4().simple());
     transaction
         .execute_batch(&format!(
@@ -397,8 +665,7 @@ where
 
     let callback_result = callback(&ValidatedPrivacyV1ReadOnlySession {
         connection: &transaction,
-        logical_manifest: &initial_validation.logical_manifest,
-        business_manifest: &initial_validation.business_manifest,
+        proof: &source_proof,
     });
     transaction
         .execute_batch(&format!(
@@ -442,23 +709,7 @@ where
         return Err(PrivacyV1SourceValidationError::SourceDrift);
     }
 
-    Ok((
-        ValidatedPrivacyV1Source {
-            schema_version: PRIVACY_V1_SCHEMA_VERSION,
-            schema_object_count: PRIVACY_V1_SCHEMA_OBJECT_COUNT,
-            protected_review_payload_count: initial_validation.protected_review_payload_count,
-            normalized_sqlite_master_sha256: PRIVACY_V1_SCHEMA_PROVENANCE
-                .normalized_sqlite_master_sha256,
-            database_file: privacy_v1_source_file_proof(&before.database),
-            wal: before.wal.as_ref().map(privacy_v1_source_file_proof),
-            shm: before.shm.as_ref().map(privacy_v1_source_file_proof),
-            journal: before.journal.as_ref().map(privacy_v1_source_file_proof),
-            logical_manifest: initial_validation.logical_manifest,
-            business_manifest: initial_validation.business_manifest,
-            data_version: initial_validation.data_version,
-        },
-        callback_result,
-    ))
+    Ok((source_proof, callback_result))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -947,6 +1198,125 @@ struct PrivacyV1TransactionValidation {
     data_version: i64,
 }
 
+/// Reconstructed v0.3.1 business identity from the legacy columns retained by
+/// the deterministic schema-1 to schema-5 rebuild.  This proof is intentionally
+/// crate-private: it is only one input to the stricter partial-v5 recovery
+/// classifier and cannot authorize an ordinary schema migration by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrivacyV1EvolvedProjectionProof {
+    pub(crate) business_manifest_sha256: String,
+    pub(crate) total_row_count: u64,
+    pub(crate) protected_review_payload_count: u64,
+}
+
+/// Reconstructs the exact schema-1 business view from a pinned evolved store
+/// without modifying the source connection.  The schema-5 rebuild moves the
+/// legacy `privacy_materials.project_id` value to `legacy_case_id`; every other
+/// schema-1 column is retained verbatim.  Rows are copied only into an isolated
+/// in-memory canonical-v1 fixture, where the existing v1 boundary, DPAPI, FK,
+/// and canonical-manifest validators are reused.
+pub(crate) fn reconstruct_privacy_v1_projection_from_evolved_store_read_only(
+    source: &Connection,
+) -> Result<PrivacyV1EvolvedProjectionProof, PrivacyV1SourceValidationError> {
+    let fixture =
+        Connection::open_in_memory().map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    fixture
+        .execute_batch(PRIVACY_V1_SCHEMA_MANIFEST_DDL)
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+
+    for table_name in [
+        "privacy_schema_metadata",
+        "privacy_materials",
+        "privacy_redactions",
+        "privacy_receipts",
+        "privacy_egress_audit",
+    ] {
+        copy_evolved_rows_into_v1_fixture(source, &fixture, table_name)?;
+    }
+
+    let validation = validate_privacy_v1_transaction(&fixture)?;
+    Ok(PrivacyV1EvolvedProjectionProof {
+        business_manifest_sha256: validation.business_manifest.sha256,
+        total_row_count: validation.logical_manifest.total_row_count,
+        protected_review_payload_count: validation.protected_review_payload_count,
+    })
+}
+
+fn copy_evolved_rows_into_v1_fixture(
+    source: &Connection,
+    fixture: &Connection,
+    table_name: &str,
+) -> Result<(), PrivacyV1SourceValidationError> {
+    let columns = logical_table_columns(fixture, table_name)?;
+    let quoted_table = quote_projection_identifier(table_name)?;
+    let quoted_columns = columns
+        .iter()
+        .map(|column| quote_projection_identifier(&column.name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let select_columns = columns
+        .iter()
+        .map(|column| {
+            let quoted = quote_projection_identifier(&column.name)?;
+            match (table_name, column.name.as_str()) {
+                ("privacy_materials", "project_id") => {
+                    Ok("\"legacy_case_id\" AS \"project_id\"".to_owned())
+                }
+                ("privacy_schema_metadata", "value") => Ok(
+                    "CASE WHEN \"key\"='schema_version' THEN '1' ELSE \"value\" END AS \"value\""
+                        .to_owned(),
+                ),
+                _ => Ok(quoted),
+            }
+        })
+        .collect::<Result<Vec<_>, PrivacyV1SourceValidationError>>()?;
+    let select_sql = format!(
+        "SELECT {} FROM {} ORDER BY rowid",
+        select_columns.join(","),
+        quoted_table
+    );
+    let insert_sql = format!(
+        "INSERT INTO {}({}) VALUES({})",
+        quoted_table,
+        quoted_columns.join(","),
+        std::iter::repeat_n("?", columns.len())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut source_statement = source
+        .prepare(&select_sql)
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    let mut source_rows = source_statement
+        .query([])
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    let mut insert = fixture
+        .prepare(&insert_sql)
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    while let Some(row) = source_rows
+        .next()
+        .map_err(|_| PrivacyV1SourceValidationError::Database)?
+    {
+        let values = (0..columns.len())
+            .map(|index| row.get::<_, Value>(index))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PrivacyV1SourceValidationError::DataBoundary)?;
+        insert
+            .execute(params_from_iter(values.iter()))
+            .map_err(|_| PrivacyV1SourceValidationError::DataBoundary)?;
+    }
+    Ok(())
+}
+
+fn quote_projection_identifier(value: &str) -> Result<String, PrivacyV1SourceValidationError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(PrivacyV1SourceValidationError::SchemaMismatch);
+    }
+    Ok(format!("\"{value}\""))
+}
+
 fn validate_privacy_v1_transaction(
     connection: &Connection,
 ) -> Result<PrivacyV1TransactionValidation, PrivacyV1SourceValidationError> {
@@ -1034,9 +1404,90 @@ impl CanonicalSink for Vec<u8> {
 fn privacy_v1_manifests(
     connection: &Connection,
 ) -> Result<(PrivacyV1LogicalManifest, PrivacyV1BusinessManifest), PrivacyV1SourceValidationError> {
-    let definitions = privacy_v1_logical_table_definitions()?;
+    let definitions = privacy_v1_logical_table_definitions()?
+        .into_iter()
+        .map(|definition| (definition.name, definition.create_table_sql))
+        .collect();
+    canonical_sqlite_manifests(connection, definitions, &["privacy_schema_metadata"])
+}
+
+/// Shared ADR-0002 SQLite logical/business manifest encoder. Callers must
+/// first establish an exact schema allowlist and pass its normalized table
+/// definitions in raw UTF-8 name order. This is the only encoder used by both
+/// the frozen Privacy v1 source proof and current Privacy schema-6 proofs.
+pub(crate) fn canonical_sqlite_manifests(
+    connection: &Connection,
+    definitions: Vec<(String, String)>,
+    business_excluded_tables: &[&str],
+) -> Result<(PrivacyV1LogicalManifest, PrivacyV1BusinessManifest), PrivacyV1SourceValidationError> {
+    canonical_sqlite_manifests_inner(connection, definitions, business_excluded_tables, None)
+}
+
+/// Computes the same canonical manifests while removing exactly one validated
+/// application-upgrade lineage row from the logical view. The whole lineage
+/// table remains excluded from the business manifest under the frozen v6
+/// rules, so historical business evidence is unaffected.
+pub(crate) fn canonical_sqlite_manifests_excluding_application_upgrade_lineage(
+    connection: &Connection,
+    definitions: Vec<(String, String)>,
+    business_excluded_tables: &[&str],
+    excluded_lineage_id: &str,
+) -> Result<(PrivacyV1LogicalManifest, PrivacyV1BusinessManifest), PrivacyV1SourceValidationError> {
+    canonical_sqlite_manifests_inner(
+        connection,
+        definitions,
+        business_excluded_tables,
+        Some(CanonicalTextRowExclusion {
+            table_name: "application_upgrade_lineage",
+            column_name: "lineage_id",
+            value: excluded_lineage_id,
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalTextRowExclusion<'a> {
+    table_name: &'a str,
+    column_name: &'a str,
+    value: &'a str,
+}
+
+fn canonical_sqlite_manifests_inner(
+    connection: &Connection,
+    definitions: Vec<(String, String)>,
+    business_excluded_tables: &[&str],
+    row_exclusion: Option<CanonicalTextRowExclusion<'_>>,
+) -> Result<(PrivacyV1LogicalManifest, PrivacyV1BusinessManifest), PrivacyV1SourceValidationError> {
+    if definitions.is_empty()
+        || definitions
+            .windows(2)
+            .any(|pair| pair[0].0.as_bytes() >= pair[1].0.as_bytes())
+        || definitions
+            .iter()
+            .any(|(name, sql)| name.is_empty() || sql != &normalize_sql(sql))
+    {
+        return Err(PrivacyV1SourceValidationError::SchemaMismatch);
+    }
+    let business_excluded = business_excluded_tables
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if business_excluded.len() != business_excluded_tables.len()
+        || business_excluded.iter().any(|excluded| {
+            !definitions
+                .iter()
+                .any(|(table_name, _)| table_name == excluded)
+        })
+    {
+        return Err(PrivacyV1SourceValidationError::SchemaMismatch);
+    }
+
     let mut canonical_tables = Vec::with_capacity(definitions.len());
-    for definition in definitions {
+    for (name, create_table_sql) in definitions {
+        let definition = LogicalTableDefinition {
+            name,
+            create_table_sql,
+        };
         let columns = logical_table_columns(connection, &definition.name)?;
         let mut primary_key_columns = columns
             .iter()
@@ -1049,7 +1500,19 @@ fn privacy_v1_manifests(
             .into_iter()
             .map(|(_, index)| index)
             .collect::<Vec<_>>();
-        let mut rows = logical_table_rows(connection, &definition.name, &columns)?;
+        let exclusion =
+            row_exclusion.filter(|exclusion| exclusion.table_name == definition.name.as_str());
+        if let Some(exclusion) = exclusion {
+            if columns
+                .iter()
+                .filter(|column| column.name == exclusion.column_name)
+                .count()
+                != 1
+            {
+                return Err(PrivacyV1SourceValidationError::SchemaMismatch);
+            }
+        }
+        let mut rows = logical_table_rows(connection, &definition.name, &columns, exclusion)?;
         rows.sort_by(|left, right| {
             left.sort_key
                 .cmp(&right.sort_key)
@@ -1061,6 +1524,13 @@ fn privacy_v1_manifests(
             primary_key_columns,
             rows,
         });
+    }
+    if row_exclusion.is_some_and(|exclusion| {
+        !canonical_tables
+            .iter()
+            .any(|table| table.definition.name == exclusion.table_name)
+    }) {
+        return Err(PrivacyV1SourceValidationError::SchemaMismatch);
     }
 
     let logical_tables = canonical_tables.iter().collect::<Vec<_>>();
@@ -1089,9 +1559,9 @@ fn privacy_v1_manifests(
 
     let business_tables = canonical_tables
         .iter()
-        .filter(|table| table.definition.name != "privacy_schema_metadata")
+        .filter(|table| !business_excluded.contains(table.definition.name.as_str()))
         .collect::<Vec<_>>();
-    if business_tables.len() != 4 {
+    if business_tables.len() + business_excluded.len() != canonical_tables.len() {
         return Err(PrivacyV1SourceValidationError::SchemaMismatch);
     }
     let business_sha256 = canonical_manifest_sha256(
@@ -1302,25 +1772,71 @@ fn logical_table_rows(
     connection: &Connection,
     table_name: &str,
     columns: &[LogicalColumnMetadata],
+    exclusion: Option<CanonicalTextRowExclusion<'_>>,
 ) -> Result<Vec<CanonicalRow>, PrivacyV1SourceValidationError> {
     let quoted_columns = columns
         .iter()
         .map(|column| quote_identifier(&column.name))
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(
-        "SELECT {quoted_columns} FROM {}",
-        quote_identifier(table_name)
-    );
+    let (sql, expected_row_count) = if let Some(exclusion) = exclusion {
+        if exclusion.table_name != table_name {
+            return Err(PrivacyV1SourceValidationError::SchemaMismatch);
+        }
+        let total_rows = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", quote_identifier(table_name)),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+        let matching_rows = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {} WHERE {}=?1",
+                    quote_identifier(table_name),
+                    quote_identifier(exclusion.column_name)
+                ),
+                [exclusion.value],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+        if matching_rows != 1 || total_rows < 1 {
+            return Err(PrivacyV1SourceValidationError::DataBoundary);
+        }
+        (
+            format!(
+                "SELECT {quoted_columns} FROM {} WHERE {}<>?1",
+                quote_identifier(table_name),
+                quote_identifier(exclusion.column_name)
+            ),
+            usize::try_from(total_rows - 1)
+                .map_err(|_| PrivacyV1SourceValidationError::DataBoundary)?,
+        )
+    } else {
+        (
+            format!(
+                "SELECT {quoted_columns} FROM {}",
+                quote_identifier(table_name)
+            ),
+            usize::MAX,
+        )
+    };
     let mut statement = connection
         .prepare(&sql)
         .map_err(|_| PrivacyV1SourceValidationError::Database)?;
     if statement.column_count() != columns.len() {
         return Err(PrivacyV1SourceValidationError::SchemaMismatch);
     }
-    let mut query = statement
-        .query([])
-        .map_err(|_| PrivacyV1SourceValidationError::Database)?;
+    let mut query = if let Some(exclusion) = exclusion {
+        statement
+            .query([exclusion.value])
+            .map_err(|_| PrivacyV1SourceValidationError::Database)?
+    } else {
+        statement
+            .query([])
+            .map_err(|_| PrivacyV1SourceValidationError::Database)?
+    };
     let mut rows = Vec::new();
     while let Some(row) = query
         .next()
@@ -1361,6 +1877,9 @@ fn logical_table_rows(
             value.zeroize();
         }
         rows.push(CanonicalRow { sort_key, encoded });
+    }
+    if exclusion.is_some() && rows.len() != expected_row_count {
+        return Err(PrivacyV1SourceValidationError::SourceDrift);
     }
     Ok(rows)
 }
@@ -1436,11 +1955,11 @@ fn quote_identifier(identifier: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SchemaObject {
-    object_type: String,
-    name: String,
-    table_name: String,
-    sql: String,
+pub(crate) struct SchemaObject {
+    pub(crate) object_type: String,
+    pub(crate) name: String,
+    pub(crate) table_name: String,
+    pub(crate) sql: String,
 }
 
 fn expected_schema_objects() -> Result<Vec<SchemaObject>, PrivacyV1SourceValidationError> {
@@ -1515,7 +2034,7 @@ fn canonical_schema_manifest_sha256(
     Ok(sha256_hex(&encoded))
 }
 
-fn schema_objects(
+pub(crate) fn schema_objects(
     connection: &Connection,
 ) -> Result<Vec<SchemaObject>, PrivacyV1SourceValidationError> {
     let mut statement = connection
@@ -1543,7 +2062,7 @@ fn schema_objects(
     Ok(objects)
 }
 
-fn internal_schema_objects(
+pub(crate) fn internal_schema_objects(
     connection: &Connection,
 ) -> Result<Vec<SchemaObject>, PrivacyV1SourceValidationError> {
     let mut statement = connection
@@ -1592,7 +2111,9 @@ fn validate_schema_version(connection: &Connection) -> Result<(), PrivacyV1Sourc
     Ok(())
 }
 
-fn validate_quick_check(connection: &Connection) -> Result<(), PrivacyV1SourceValidationError> {
+pub(crate) fn validate_quick_check(
+    connection: &Connection,
+) -> Result<(), PrivacyV1SourceValidationError> {
     let mut statement = connection
         .prepare("PRAGMA quick_check")
         .map_err(|_| PrivacyV1SourceValidationError::IntegrityCheckFailed)?;
@@ -1615,7 +2136,9 @@ fn validate_quick_check(connection: &Connection) -> Result<(), PrivacyV1SourceVa
     Ok(())
 }
 
-fn validate_foreign_keys(connection: &Connection) -> Result<(), PrivacyV1SourceValidationError> {
+pub(crate) fn validate_foreign_keys(
+    connection: &Connection,
+) -> Result<(), PrivacyV1SourceValidationError> {
     let mut statement = connection
         .prepare("PRAGMA foreign_key_check")
         .map_err(|_| PrivacyV1SourceValidationError::ForeignKeyViolation)?;
@@ -2204,6 +2727,29 @@ mod tests {
         fixture_with_ddl(PRIVACY_V1_SCHEMA_MANIFEST_DDL)
     }
 
+    fn exact_v1_memory_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("in-memory v1 fixture opens");
+        connection
+            .execute_batch(PRIVACY_V1_SCHEMA_MANIFEST_DDL)
+            .expect("exact v1 schema initializes");
+        connection
+            .execute(
+                "INSERT INTO privacy_schema_metadata(key,value,updated_at)
+                 VALUES('schema_version','1','2026-07-19 15:41:29')",
+                [],
+            )
+            .expect("v1 schema version inserts");
+        connection
+    }
+
+    fn serialized_exact_v1_image() -> Vec<u8> {
+        let connection = exact_v1_memory_connection();
+        connection
+            .serialize(rusqlite::MAIN_DB)
+            .expect("exact v1 fixture serializes")
+            .to_vec()
+    }
+
     fn insert_material(connection: &Connection, material_id: &str) {
         connection
             .execute(
@@ -2395,6 +2941,81 @@ mod tests {
                 ],
             )
             .expect("egress audit row");
+    }
+
+    #[test]
+    fn privacy_v1_sqlite_image_validator_reconstructs_complete_read_only_proof() {
+        let image = serialized_exact_v1_image();
+        let image_before = image.clone();
+
+        let proof = validate_privacy_v1_sqlite_image_read_only(&image)
+            .expect("exact Privacy v1 image validates");
+
+        assert_eq!(proof.schema_version, PRIVACY_V1_SCHEMA_VERSION);
+        assert_eq!(proof.schema_object_count, PRIVACY_V1_SCHEMA_OBJECT_COUNT);
+        assert_eq!(proof.protected_review_payload_count, 0);
+        assert_eq!(proof.database_file.length, image.len() as u64);
+        assert_eq!(proof.database_file.sha256, sha256_hex(&image));
+        assert_eq!(proof.database_file.identity_sha256.len(), 64);
+        assert_eq!(proof.database_file.modified_unix_nanos, None);
+        assert_eq!((proof.wal, proof.shm, proof.journal), (None, None, None));
+        assert_eq!(
+            proof.normalized_sqlite_master_sha256,
+            PRIVACY_V1_SCHEMA_PROVENANCE.normalized_sqlite_master_sha256
+        );
+        assert!(!proof.logical_manifest.tables.is_empty());
+        assert_eq!(
+            image, image_before,
+            "validation must not mutate image bytes"
+        );
+    }
+
+    #[test]
+    fn privacy_v1_sqlite_image_validator_rejects_schema_tamper_and_current_schema() {
+        let tampered_connection = exact_v1_memory_connection();
+        tampered_connection
+            .execute_batch("DROP TRIGGER trg_privacy_egress_audit_no_update")
+            .expect("v1 trigger drops");
+        let tampered = tampered_connection
+            .serialize(rusqlite::MAIN_DB)
+            .expect("tampered v1 fixture serializes")
+            .to_vec();
+        assert_eq!(
+            validate_privacy_v1_sqlite_image_read_only(&tampered),
+            Err(PrivacyV1SourceValidationError::SchemaMismatch)
+        );
+
+        let current_connection =
+            Connection::open_in_memory().expect("current Privacy fixture opens");
+        PrivacyStore::initialize(&current_connection).expect("current Privacy schema initializes");
+        let current = current_connection
+            .serialize(rusqlite::MAIN_DB)
+            .expect("current Privacy fixture serializes")
+            .to_vec();
+        assert!(validate_privacy_v1_sqlite_image_read_only(&current).is_err());
+    }
+
+    #[test]
+    fn privacy_v1_sqlite_image_validator_rejects_corruption_and_non_page_bytes() {
+        let valid = serialized_exact_v1_image();
+
+        let mut corrupted_header = valid.clone();
+        corrupted_header[0] ^= 0xff;
+        assert_eq!(
+            validate_privacy_v1_sqlite_image_read_only(&corrupted_header),
+            Err(PrivacyV1SourceValidationError::DataBoundary)
+        );
+
+        let mut trailing_byte = valid;
+        trailing_byte.push(0);
+        assert_eq!(
+            validate_privacy_v1_sqlite_image_read_only(&trailing_byte),
+            Err(PrivacyV1SourceValidationError::DataBoundary)
+        );
+        assert_eq!(
+            validate_privacy_v1_sqlite_image_read_only(&[]),
+            Err(PrivacyV1SourceValidationError::DataBoundary)
+        );
     }
 
     #[test]
@@ -2783,7 +3404,8 @@ mod tests {
             .expect("sort vector schema and rows");
 
         let pk_columns = logical_table_columns(&connection, "with_pk").expect("PK metadata");
-        let mut pk_rows = logical_table_rows(&connection, "with_pk", &pk_columns).expect("PK rows");
+        let mut pk_rows =
+            logical_table_rows(&connection, "with_pk", &pk_columns, None).expect("PK rows");
         pk_rows.sort_by(|left, right| {
             left.sort_key
                 .cmp(&right.sort_key)
@@ -2805,8 +3427,8 @@ mod tests {
 
         let no_pk_columns =
             logical_table_columns(&connection, "without_pk").expect("fallback metadata");
-        let mut no_pk_rows =
-            logical_table_rows(&connection, "without_pk", &no_pk_columns).expect("fallback rows");
+        let mut no_pk_rows = logical_table_rows(&connection, "without_pk", &no_pk_columns, None)
+            .expect("fallback rows");
         no_pk_rows.sort_by(|left, right| {
             left.sort_key
                 .cmp(&right.sort_key)

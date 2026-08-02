@@ -159,6 +159,93 @@ pub fn export_encrypted_vault_backup(
     result
 }
 
+/// Reconstructs a canonical main-database-only staged archive without opening,
+/// checkpointing, or starting a transaction on its fixed Vault database. SQL
+/// semantics and all object/key authentication share one private read-only
+/// snapshot; archive files are still pinned and read from the fixed Vault root.
+/// Live WAL-backed originals use `validate_encrypted_vault_lineage_read_only`
+/// because a main-only archive hash cannot represent uncheckpointed WAL state.
+pub fn export_encrypted_vault_backup_read_only(
+    store: &VaultStore,
+) -> Result<(Vec<u8>, VaultBackupSummaryV1), VaultBackupError> {
+    reject_read_only_export_database_sidecars(store.encrypted_backup_root())?;
+    store.with_encrypted_backup_read_only_snapshot(|database| {
+        store.validate_application_restore_database_with_connection(database)?;
+        store.verify_all_committed_objects_with_database(database)?;
+        export_with_snapshot(store, database)
+    })
+}
+
+fn reject_read_only_export_database_sidecars(root: &Path) -> Result<(), VaultBackupError> {
+    for name in [
+        "vault-state.sqlite-journal",
+        "vault-state.sqlite-wal",
+        "vault-state.sqlite-shm",
+    ] {
+        match fs::symlink_metadata(root.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(VaultBackupError::UnsafeFilesystem),
+            Err(_) => return Err(VaultBackupError::IoFailed),
+        }
+    }
+    Ok(())
+}
+
+/// Validates an existing active Vault lineage without manufacturing a backup
+/// summary for a WAL-backed source. The same private snapshot binds database
+/// identity, integrity, object/key authentication, and the expected file tree.
+pub fn validate_encrypted_vault_lineage_read_only(
+    store: &VaultStore,
+) -> Result<(), VaultBackupError> {
+    store.with_encrypted_backup_read_only_snapshot(|database| {
+        store.validate_application_restore_database_with_connection(database)?;
+        store.verify_all_committed_objects_with_database(database)?;
+        expected_backup_paths(store, database)?;
+        Ok(())
+    })
+}
+
+/// Strictly re-reads an encrypted Vault archive without materializing a
+/// restore tree.  This is used by migration checkpoints that must prove the
+/// bytes returned by `export_encrypted_vault_backup` are canonical and bind
+/// every encrypted file before those bytes enter the outer application backup.
+pub fn verify_encrypted_vault_backup_archive(
+    archive: &[u8],
+    expected_workspace_instance_id: &WorkspaceInstanceId,
+) -> Result<VaultBackupSummaryV1, VaultBackupError> {
+    if archive.is_empty() || archive.len() > MAX_ENCRYPTED_VAULT_BACKUP_BYTES {
+        return Err(VaultBackupError::TooLarge);
+    }
+    let envelope: EncryptedVaultBackupEnvelopeV1 =
+        strict_json_v1_from_slice(archive).map_err(|_| VaultBackupError::Tampered)?;
+    if canonical_json_v1(&envelope).map_err(|_| VaultBackupError::Tampered)? != archive {
+        return Err(VaultBackupError::Tampered);
+    }
+    validate_archive_envelope(&envelope, expected_workspace_instance_id)?;
+    for entry in &envelope.files {
+        let decoded = ZeroizingBytes(
+            BASE64_STANDARD
+                .decode(entry.content_base64.as_bytes())
+                .map_err(|_| VaultBackupError::Tampered)?,
+        );
+        if decoded.0.len() as u64 != entry.bytes
+            || decoded.0.is_empty()
+            || sha256_hex(decoded.as_slice()) != entry.sha256.as_str()
+        {
+            return Err(VaultBackupError::Tampered);
+        }
+    }
+    Ok(VaultBackupSummaryV1 {
+        schema_version: ENCRYPTED_VAULT_BACKUP_SCHEMA_VERSION.to_owned(),
+        workspace_instance_id: expected_workspace_instance_id.clone(),
+        file_count: envelope.file_count,
+        encrypted_file_bytes: envelope.encrypted_file_bytes,
+        manifest_sha256: envelope.manifest_sha256,
+        archive_sha256: Sha256Hex::parse(sha256_hex(archive))
+            .map_err(|_| VaultBackupError::Tampered)?,
+    })
+}
+
 fn export_with_snapshot(
     store: &VaultStore,
     database: &Connection,
@@ -324,19 +411,11 @@ fn stage_archive_entries(
     {
         return Err(VaultBackupError::UnsafeFilesystem);
     }
-    store.verify_all_committed_objects()?;
-    let database = store.begin_encrypted_backup_snapshot()?;
-    let expected = expected_backup_paths(&store, &database)?;
-    let actual = envelope
-        .files
-        .iter()
-        .map(|entry| entry.relative_path.clone())
-        .collect::<BTreeSet<_>>();
-    let rollback = database
-        .execute_batch("ROLLBACK")
-        .map_err(|_| VaultBackupError::Store(VaultStoreError::DatabaseFailed));
-    rollback?;
-    if expected != actual {
+    let (reconstructed, summary) = export_encrypted_vault_backup_read_only(&store)?;
+    if summary.archive_sha256 != archive_sha256
+        || summary.manifest_sha256 != envelope.manifest_sha256
+        || sha256_hex(&reconstructed) != archive_sha256.as_str()
+    {
         return Err(VaultBackupError::Tampered);
     }
     Ok(VaultBackupSummaryV1 {
@@ -745,6 +824,54 @@ mod tests {
     use super::*;
     use crate::vault_store::VaultPrivateMetadataInputV1;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecursiveTreeEntry {
+        relative_path: String,
+        directory: bool,
+        metadata_bytes: u64,
+        modified_at: u64,
+        attributes: u32,
+        file_bytes: Vec<u8>,
+    }
+
+    fn recursive_tree_snapshot(root: &Path) -> Vec<RecursiveTreeEntry> {
+        fn visit(root: &Path, current: &Path, output: &mut Vec<RecursiveTreeEntry>) {
+            let mut entries = fs::read_dir(current)
+                .expect("snapshot Vault directory")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("snapshot Vault entries");
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).expect("snapshot Vault metadata");
+                let directory = metadata.is_dir();
+                output.push(RecursiveTreeEntry {
+                    relative_path: path
+                        .strip_prefix(root)
+                        .expect("relative Vault snapshot path")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    directory,
+                    metadata_bytes: metadata.len(),
+                    modified_at: std::os::windows::fs::MetadataExt::last_write_time(&metadata),
+                    attributes: std::os::windows::fs::MetadataExt::file_attributes(&metadata),
+                    file_bytes: if directory {
+                        Vec::new()
+                    } else {
+                        fs::read(&path).expect("snapshot Vault file bytes")
+                    },
+                });
+                if directory {
+                    visit(root, &path, output);
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        visit(root, root, &mut output);
+        output
+    }
+
     fn workspace() -> WorkspaceInstanceId {
         WorkspaceInstanceId::parse("ws_0123456789abcdef0123456789abcdef").expect("workspace")
     }
@@ -788,6 +915,9 @@ mod tests {
         .expect("quarantine residue");
         let (archive, summary) =
             export_encrypted_vault_backup(&store).expect("export encrypted vault");
+        let verified = verify_encrypted_vault_backup_archive(&archive, &workspace())
+            .expect("in-memory archive verifier accepts exact export");
+        assert_eq!(verified, summary);
         for needle in [
             b"SYNTHETIC_VAULT_PRIVATE_CANARY_001".as_slice(),
             b"synthetic-confidential.pdf".as_slice(),
@@ -824,6 +954,135 @@ mod tests {
     }
 
     #[test]
+    fn read_only_export_reconstructs_main_only_staged_vault_without_tree_drift() {
+        let directory = tempfile::tempdir().expect("temp");
+        let source = directory.path().join("source-vault");
+        let destination = directory.path().join("main-only-staged-vault");
+        let (store, _, _) = create_synthetic_vault(&source);
+        let (archive, expected) =
+            export_encrypted_vault_backup(&store).expect("export source Vault");
+        stage_encrypted_vault_backup(&archive, &workspace(), &destination)
+            .expect("stage main-only Vault");
+        for name in [
+            "vault-state.sqlite-journal",
+            "vault-state.sqlite-wal",
+            "vault-state.sqlite-shm",
+        ] {
+            assert!(!destination.join(name).exists(), "unexpected {name}");
+        }
+        let (staged, _) = VaultStore::open_for_application_startup(&destination, workspace())
+            .expect("open staged Vault read-only");
+        let before = recursive_tree_snapshot(&destination);
+        let (reconstructed, summary) = export_encrypted_vault_backup_read_only(&staged)
+            .expect("reconstruct main-only staged Vault");
+        assert_eq!(reconstructed, archive);
+        assert_eq!(summary, expected);
+        assert_eq!(
+            recursive_tree_snapshot(&destination),
+            before,
+            "read-only export changed recursive entries, bytes, metadata, or mtimes"
+        );
+    }
+
+    #[test]
+    fn read_only_lineage_accepts_live_wal_original_without_tree_drift() {
+        let directory = tempfile::tempdir().expect("temp");
+        let source = directory.path().join("live-wal-original");
+        let (_store, _, _) = create_synthetic_vault(&source);
+        let database = source.join(DATABASE_FILE);
+        let live = Connection::open(&database).expect("open live WAL source");
+        live.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             BEGIN IMMEDIATE;
+             UPDATE object_journal
+             SET committed_at_unix=committed_at_unix+1
+             WHERE state='committed';
+             COMMIT;",
+        )
+        .expect("leave a committed generation in the live WAL");
+        assert!(source.join("vault-state.sqlite-wal").is_file());
+        assert!(source.join("vault-state.sqlite-shm").is_file());
+        let (original, _) = VaultStore::open_for_application_startup(&source, workspace())
+            .expect("open live WAL original read-only");
+        let before = recursive_tree_snapshot(&source);
+        validate_encrypted_vault_lineage_read_only(&original)
+            .expect("validate live WAL original lineage");
+        assert_eq!(
+            recursive_tree_snapshot(&source),
+            before,
+            "lineage validation changed recursive entries, bytes, metadata, or mtimes"
+        );
+        drop(live);
+    }
+
+    #[test]
+    fn read_only_staged_replacement_rejects_sidecars_and_tamper_without_tree_drift() {
+        let directory = tempfile::tempdir().expect("temp");
+        let source = directory.path().join("source-vault");
+        let (store, case, object) = create_synthetic_vault(&source);
+        let (archive, _) = export_encrypted_vault_backup(&store).expect("export source Vault");
+
+        for (index, sidecar) in [
+            "vault-state.sqlite-journal",
+            "vault-state.sqlite-wal",
+            "vault-state.sqlite-shm",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = directory
+                .path()
+                .join(format!("sidecar-staged-vault-{index}"));
+            stage_encrypted_vault_backup(&archive, &workspace(), &destination)
+                .expect("stage sidecar rejection fixture");
+            let (staged, _) = VaultStore::open_for_application_startup(&destination, workspace())
+                .expect("open staged sidecar fixture read-only");
+            fs::write(
+                destination.join(sidecar),
+                b"SYNTHETIC_UNBOUND_SQLITE_SIDECAR",
+            )
+            .expect("add unbound staged sidecar");
+            let before = recursive_tree_snapshot(&destination);
+            assert_eq!(
+                export_encrypted_vault_backup_read_only(&staged),
+                Err(VaultBackupError::UnsafeFilesystem),
+                "staged replacement accepted {sidecar}"
+            );
+            assert_eq!(
+                recursive_tree_snapshot(&destination),
+                before,
+                "sidecar rejection changed recursive entries, bytes, metadata, or mtimes"
+            );
+        }
+
+        let destination = directory.path().join("tampered-staged-vault");
+        stage_encrypted_vault_backup(&archive, &workspace(), &destination)
+            .expect("stage tamper rejection fixture");
+        let (staged, _) = VaultStore::open_for_application_startup(&destination, workspace())
+            .expect("open staged tamper fixture read-only");
+        let chunk = destination
+            .join("objects")
+            .join(case.as_str())
+            .join(object.as_str())
+            .join("v00000000000000000001")
+            .join("chunk-00000000.bin");
+        let mut bytes = fs::read(&chunk).expect("read staged ciphertext");
+        bytes[0] ^= 0x80;
+        fs::write(&chunk, bytes).expect("tamper staged ciphertext");
+        let before = recursive_tree_snapshot(&destination);
+        assert!(matches!(
+            export_encrypted_vault_backup_read_only(&staged),
+            Err(VaultBackupError::Store(_)) | Err(VaultBackupError::Tampered)
+        ));
+        assert_eq!(
+            recursive_tree_snapshot(&destination),
+            before,
+            "tamper rejection changed recursive entries, bytes, metadata, or mtimes"
+        );
+    }
+
+    #[test]
     fn tamper_and_traversal_fail_and_remove_staging_tree() {
         let directory = tempfile::tempdir().expect("temp");
         let source = directory.path().join("source-vault");
@@ -837,6 +1096,10 @@ mod tests {
         decoded[0] ^= 1;
         envelope.files[0].content_base64 = BASE64_STANDARD.encode(decoded);
         let tampered = canonical_json_v1(&envelope).expect("canonical tamper");
+        assert_eq!(
+            verify_encrypted_vault_backup_archive(&tampered, &workspace()),
+            Err(VaultBackupError::Tampered)
+        );
         let tamper_destination = directory.path().join("tamper-destination");
         assert_eq!(
             stage_encrypted_vault_backup(&tampered, &workspace(), &tamper_destination),
@@ -848,6 +1111,10 @@ mod tests {
             strict_json_v1_from_slice(&archive).expect("strict archive");
         traversal.files[0].relative_path = "../vault-state.sqlite".to_owned();
         let traversal = canonical_json_v1(&traversal).expect("canonical traversal");
+        assert_eq!(
+            verify_encrypted_vault_backup_archive(&traversal, &workspace()),
+            Err(VaultBackupError::UnsafeFilesystem)
+        );
         let traversal_destination = directory.path().join("traversal-destination");
         assert_eq!(
             stage_encrypted_vault_backup(&traversal, &workspace(), &traversal_destination),

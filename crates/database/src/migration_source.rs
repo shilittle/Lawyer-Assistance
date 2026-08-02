@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -21,6 +21,7 @@ const V031_USER_SCHEMA_MANIFEST: &str = include_str!("../schema/v031-user-sqlite
 pub const V031_USER_SCHEMA_MANIFEST_SHA256: &str =
     "947a2823d2bbfce22bf687dc0a302c62fbbed4d68066e4167de9e0c15b534cf9";
 pub const V031_USER_SCHEMA_OBJECT_COUNT: usize = 74;
+pub const MAX_V031_USER_SQLITE_IMAGE_BYTES: usize = 512 * 1024 * 1024;
 pub const V031_USER_INTERNAL_SCHEMA_OBJECT_COUNT: usize = 37;
 pub const V031_USER_INTERNAL_SCHEMA_MANIFEST_SHA256: &str =
     "d943817279c2b2a48573e33dad8c3e36671df21346f8895464c5d2758f98c28c";
@@ -217,6 +218,159 @@ pub fn validate_user_database_migration_source_read_only(
     let (proof, ()) =
         with_validated_user_database_migration_source_read_only(user_database_path, |_| ())?;
     Ok(proof.schema)
+}
+
+/// Reconstructs the complete exact-v0.3.1 source proof from one self-contained
+/// SQLite image without ever materializing that image on disk.
+///
+/// The image is copied into SQLite-owned memory with
+/// `SQLITE_DESERIALIZE_READONLY`; the resulting main database must also have
+/// `query_only=ON`. Only the frozen v0.3.1 schema is accepted. Appended bytes,
+/// sidecars, writable deserialization, current schemas, and every weakened or
+/// damaged source shape fail closed.
+pub fn validate_v031_user_sqlite_image_read_only(
+    sqlite_image: &[u8],
+) -> Result<UserMigrationSourceProof, DatabaseInitError> {
+    validate_sqlite_image_input(sqlite_image)?;
+    let image_sha256 = sha256_hex(sqlite_image);
+    let image_length = u64::try_from(sqlite_image.len()).map_err(|_| {
+        user_schema_migration_error("v0.3.1 user SQLite image length is invalid".to_owned())
+    })?;
+
+    let mut connection = rusqlite::Connection::open_in_memory()?;
+    connection.deserialize_read_exact(
+        rusqlite::MAIN_DB,
+        Cursor::new(sqlite_image),
+        sqlite_image.len(),
+        true,
+    )?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "trusted_schema", "OFF")?;
+    validate_deserialized_image_geometry(&connection, image_length)?;
+
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+    let logical_before = deserialized_v031_logical_proof(&transaction)?;
+    let query_only: i64 = transaction.query_row("PRAGMA query_only", [], |row| row.get(0))?;
+    if query_only != 1 {
+        return Err(user_schema_migration_error(
+            "deserialized v0.3.1 user source is not query-only".to_owned(),
+        )
+        .into());
+    }
+    let logical_after = deserialized_v031_logical_proof(&transaction)?;
+    if logical_before != logical_after {
+        return Err(user_schema_migration_error(
+            "deserialized v0.3.1 user source changed during validation".to_owned(),
+        )
+        .into());
+    }
+    transaction.commit()?;
+
+    Ok(UserMigrationSourceProof {
+        schema: ValidatedUserSourceSchema::V031V10,
+        database_file: memory_image_file_proof(sqlite_image.len(), image_sha256)?,
+        wal: None,
+        shm: None,
+        journal: None,
+        schema_manifest_sha256: logical_before.schema_manifest_sha256,
+        logical_database_manifest_sha256: logical_before.logical_database_manifest_sha256,
+        business_manifest_sha256: logical_before.business_manifest_sha256,
+        business_primary_key_manifest_sha256: logical_before.business_primary_key_manifest_sha256,
+        business_row_manifest_sha256: logical_before.business_row_manifest_sha256,
+        tables: logical_before.tables,
+        total_rows: logical_before.total_rows,
+        data_version: logical_before.data_version,
+    })
+}
+
+fn deserialized_v031_logical_proof(
+    connection: &rusqlite::Connection,
+) -> Result<MigrationSourceLogicalProof, DatabaseInitError> {
+    let data_version_before: i64 =
+        connection.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    let manifest = v031_user_manifest_proof_for_upgrade(connection)?;
+    let data_version_after: i64 =
+        connection.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    if data_version_before != data_version_after {
+        return Err(user_schema_migration_error(
+            "deserialized v0.3.1 user source changed while computing its logical proof".to_owned(),
+        )
+        .into());
+    }
+    Ok(MigrationSourceLogicalProof {
+        schema: ValidatedUserSourceSchema::V031V10,
+        schema_manifest_sha256: manifest.schema_manifest_sha256,
+        logical_database_manifest_sha256: manifest.logical_database_manifest_sha256,
+        business_manifest_sha256: manifest.business_manifest_sha256,
+        business_primary_key_manifest_sha256: manifest.business_primary_key_manifest_sha256,
+        business_row_manifest_sha256: manifest.business_row_manifest_sha256,
+        tables: manifest.tables,
+        total_rows: manifest.total_rows,
+        data_version: data_version_before,
+    })
+}
+
+fn validate_sqlite_image_input(sqlite_image: &[u8]) -> Result<(), DatabaseInitError> {
+    const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+    if sqlite_image.len() < 100
+        || sqlite_image.len() > MAX_V031_USER_SQLITE_IMAGE_BYTES
+        || !sqlite_image.starts_with(SQLITE_HEADER)
+    {
+        return Err(user_schema_migration_error(
+            "v0.3.1 user SQLite image has an invalid header or size".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_deserialized_image_geometry(
+    connection: &rusqlite::Connection,
+    image_length: u64,
+) -> Result<(), DatabaseInitError> {
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let expected_length = u64::try_from(page_size)
+        .ok()
+        .and_then(|size| {
+            u64::try_from(page_count)
+                .ok()
+                .and_then(|count| size.checked_mul(count))
+        })
+        .filter(|length| *length > 0)
+        .ok_or_else(|| {
+            user_schema_migration_error(
+                "deserialized v0.3.1 user SQLite image geometry is invalid".to_owned(),
+            )
+        })?;
+    if expected_length != image_length {
+        return Err(user_schema_migration_error(
+            "deserialized v0.3.1 user SQLite image has trailing or missing page bytes".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn memory_image_file_proof(
+    image_length: usize,
+    image_sha256: String,
+) -> Result<UserMigrationSourceFileProof, DatabaseInitError> {
+    let length = u64::try_from(image_length).map_err(|_| {
+        user_schema_migration_error("v0.3.1 user SQLite image length is invalid".to_owned())
+    })?;
+    let mut identity = Sha256::new();
+    identity.update(b"lawyer-assistance-user-migration-memory-image-identity-v1\0");
+    identity.update(length.to_be_bytes());
+    identity.update(image_sha256.as_bytes());
+    Ok(UserMigrationSourceFileProof {
+        identity_sha256: sha256_digest_hex(identity.finalize()),
+        length,
+        modified_unix_nanos: None,
+        sha256: image_sha256,
+    })
 }
 
 /// Runs an operation against the same pinned deferred read transaction used to
@@ -444,6 +598,20 @@ struct MigrationSourceLogicalProof {
     tables: Vec<UserMigrationTableProof>,
     total_rows: u64,
     data_version: i64,
+}
+
+/// Canonical logical evidence computed on an already pinned user connection.
+/// This stays crate-private because writable callers may only use it through
+/// the narrowly gated v0.3.1 upgrade API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CanonicalUserManifestProof {
+    pub(super) schema_manifest_sha256: String,
+    pub(super) logical_database_manifest_sha256: String,
+    pub(super) business_manifest_sha256: String,
+    pub(super) business_primary_key_manifest_sha256: String,
+    pub(super) business_row_manifest_sha256: String,
+    pub(super) tables: Vec<UserMigrationTableProof>,
+    pub(super) total_rows: u64,
 }
 
 struct CanonicalManifestHashes {
@@ -1093,7 +1261,7 @@ fn migration_source_logical_proof(
     let schema = validate_open_user_database_migration_source_read_only(connection)?;
     let schema_objects = user_schema_objects(connection)?;
     let schema_manifest_sha256 = canonical_schema_manifest_sha256(&schema_objects)?;
-    let tables = canonical_logical_tables(connection, &schema_objects)?;
+    let tables = canonical_logical_tables(connection, &schema_objects, None)?;
     let manifests = canonical_logical_manifest_hashes(&tables)?;
     let data_version_after: i64 =
         connection.query_row("PRAGMA data_version", [], |row| row.get(0))?;
@@ -1114,6 +1282,41 @@ fn migration_source_logical_proof(
         tables: manifests.tables,
         total_rows: manifests.total_rows,
         data_version: data_version_before,
+    })
+}
+
+pub(super) fn v031_user_manifest_proof_for_upgrade(
+    connection: &rusqlite::Connection,
+) -> Result<CanonicalUserManifestProof, DatabaseInitError> {
+    validate_v031_canonical_user_database(connection)?;
+    canonical_user_manifest_proof(connection, None)
+}
+
+pub(super) fn current_user_manifest_proof_for_upgrade(
+    connection: &rusqlite::Connection,
+    excluded_upgrade_audit_lineage: Option<&str>,
+) -> Result<CanonicalUserManifestProof, DatabaseInitError> {
+    validate_open_user_database(connection)?;
+    canonical_user_manifest_proof(connection, excluded_upgrade_audit_lineage)
+}
+
+fn canonical_user_manifest_proof(
+    connection: &rusqlite::Connection,
+    excluded_upgrade_audit_lineage: Option<&str>,
+) -> Result<CanonicalUserManifestProof, DatabaseInitError> {
+    let schema_objects = user_schema_objects(connection)?;
+    let schema_manifest_sha256 = canonical_schema_manifest_sha256(&schema_objects)?;
+    let tables =
+        canonical_logical_tables(connection, &schema_objects, excluded_upgrade_audit_lineage)?;
+    let manifests = canonical_logical_manifest_hashes(&tables)?;
+    Ok(CanonicalUserManifestProof {
+        schema_manifest_sha256,
+        logical_database_manifest_sha256: manifests.logical_database_manifest_sha256,
+        business_manifest_sha256: manifests.business_manifest_sha256,
+        business_primary_key_manifest_sha256: manifests.business_primary_key_manifest_sha256,
+        business_row_manifest_sha256: manifests.business_row_manifest_sha256,
+        tables: manifests.tables,
+        total_rows: manifests.total_rows,
     })
 }
 
@@ -1145,6 +1348,7 @@ fn canonical_schema_manifest_sha256(
 fn canonical_logical_tables(
     connection: &rusqlite::Connection,
     schema_objects: &[UserSchemaObject],
+    excluded_upgrade_audit_lineage: Option<&str>,
 ) -> Result<Vec<CanonicalLogicalTable>, DatabaseInitError> {
     let mut table_definitions = schema_objects
         .iter()
@@ -1174,7 +1378,12 @@ fn canonical_logical_tables(
     table_definitions
         .into_iter()
         .map(|(table_name, create_table_sql)| {
-            canonical_logical_table(connection, table_name, create_table_sql)
+            canonical_logical_table(
+                connection,
+                table_name,
+                create_table_sql,
+                excluded_upgrade_audit_lineage,
+            )
         })
         .collect()
 }
@@ -1187,6 +1396,7 @@ fn canonical_logical_table(
     connection: &rusqlite::Connection,
     table_name: String,
     create_table_sql: String,
+    excluded_upgrade_audit_lineage: Option<&str>,
 ) -> Result<CanonicalLogicalTable, DatabaseInitError> {
     if create_table_sql.is_empty() {
         return Err(user_schema_migration_error(format!(
@@ -1288,11 +1498,32 @@ fn canonical_logical_table(
         .map(|column| quote_sql_identifier(&column.name))
         .collect::<Vec<_>>()
         .join(",");
-    let mut row_statement = connection.prepare(&format!(
-        "SELECT {select_columns} FROM {}",
-        quote_sql_identifier(&table_name)
-    ))?;
-    let mut query = row_statement.query([])?;
+    let exclude_upgrade_audit =
+        table_name == "operation_audit" && excluded_upgrade_audit_lineage.is_some();
+    let row_sql = if exclude_upgrade_audit {
+        format!(
+            "SELECT {select_columns} FROM {} \
+             WHERE NOT ( \
+                 origin = 'desktop' \
+                 AND operation = 'v031_to_v040_upgrade' \
+                 AND idempotency_key_hash IS ?1 \
+             )",
+            quote_sql_identifier(&table_name)
+        )
+    } else {
+        format!(
+            "SELECT {select_columns} FROM {}",
+            quote_sql_identifier(&table_name)
+        )
+    };
+    let mut row_statement = connection.prepare(&row_sql)?;
+    let mut query = if let Some(lineage_id) =
+        excluded_upgrade_audit_lineage.filter(|_| exclude_upgrade_audit)
+    {
+        row_statement.query([lineage_id])?
+    } else {
+        row_statement.query([])?
+    };
     let mut canonical_rows = Vec::new();
     while let Some(row) = query.next()? {
         let mut encoded_columns = Vec::with_capacity(columns.len());
@@ -1996,12 +2227,69 @@ fn v031_user_schema_objects() -> Result<Vec<UserSchemaObject>, DatabaseInitError
 }
 
 #[cfg(test)]
+pub(super) fn create_exact_v031_user_database_for_upgrade_test(
+    connection: &rusqlite::Connection,
+) -> Result<(), DatabaseInitError> {
+    let objects = v031_user_schema_objects()?;
+    for object_type in ["table", "index", "trigger", "view"] {
+        for (_, _, _, sql) in objects
+            .iter()
+            .filter(|(found_type, _, _, _)| found_type == object_type)
+        {
+            connection.execute_batch(sql)?;
+        }
+    }
+    connection.execute(
+        "INSERT INTO user_database_metadata(key,value,updated_at)
+         VALUES('schema_version',?1,'2026-07-19 15:41:29')",
+        [V031_USER_SCHEMA_VERSION.to_string()],
+    )?;
+    connection.execute(
+        "INSERT INTO user_database_metadata(key,value,updated_at)
+         VALUES(?1,?2,'2026-07-19 15:41:29')",
+        (
+            USER_CANONICAL_SCHEMA_MARKER_KEY,
+            V031_USER_CANONICAL_SCHEMA_MARKER,
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn v031_user_source_proof_for_upgrade_test(
+    connection: &rusqlite::Connection,
+) -> Result<UserMigrationSourceProof, DatabaseInitError> {
+    let proof = v031_user_manifest_proof_for_upgrade(connection)?;
+    Ok(UserMigrationSourceProof {
+        schema: ValidatedUserSourceSchema::V031V10,
+        database_file: UserMigrationSourceFileProof {
+            identity_sha256: sha256_hex(b"test-v031-source-identity"),
+            length: 1,
+            modified_unix_nanos: None,
+            sha256: sha256_hex(b"test-v031-source-file"),
+        },
+        wal: None,
+        shm: None,
+        journal: None,
+        schema_manifest_sha256: proof.schema_manifest_sha256,
+        logical_database_manifest_sha256: proof.logical_database_manifest_sha256,
+        business_manifest_sha256: proof.business_manifest_sha256,
+        business_primary_key_manifest_sha256: proof.business_primary_key_manifest_sha256,
+        business_row_manifest_sha256: proof.business_row_manifest_sha256,
+        tables: proof.tables,
+        total_rows: proof.total_rows,
+        data_version: connection.query_row("PRAGMA data_version", [], |row| row.get(0))?,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         ensure_user_database, is_lower_hex_sha256, open_user_database,
         open_user_database_read_only, validate_user_database_read_only,
     };
+    use rusqlite::Connection;
     use std::{fs, path::Path};
 
     fn create_v031_user_database_from_manifest(
@@ -2043,6 +2331,16 @@ mod tests {
 
     fn create_exact_v031_user_database(database_path: &Path) {
         create_v031_user_database_from_manifest(database_path, |_| {});
+    }
+
+    fn serialized_exact_v031_user_image() -> Vec<u8> {
+        let connection = Connection::open_in_memory().expect("in-memory fixture opens");
+        create_exact_v031_user_database_for_upgrade_test(&connection)
+            .expect("exact v0.3.1 fixture initializes");
+        connection
+            .serialize(rusqlite::MAIN_DB)
+            .expect("exact v0.3.1 fixture serializes")
+            .to_vec()
     }
 
     fn migration_source_proof(database_path: &Path) -> UserMigrationSourceProof {
@@ -2141,6 +2439,73 @@ mod tests {
         let changed = object.3.replace(before, after);
         assert_ne!(changed, object.3, "manifest mutation must change DDL");
         object.3 = changed;
+    }
+
+    #[test]
+    fn v031_sqlite_image_validator_reconstructs_complete_read_only_proof() {
+        let image = serialized_exact_v031_user_image();
+        let image_before = image.clone();
+
+        let proof = validate_v031_user_sqlite_image_read_only(&image)
+            .expect("exact serialized v0.3.1 image validates");
+
+        assert_eq!(proof.schema, ValidatedUserSourceSchema::V031V10);
+        assert_eq!(proof.database_file.length, image.len() as u64);
+        assert_eq!(proof.database_file.sha256, sha256_hex(&image));
+        assert!(is_lower_hex_sha256(&proof.database_file.identity_sha256));
+        assert_eq!(proof.database_file.modified_unix_nanos, None);
+        assert_eq!((proof.wal, proof.shm, proof.journal), (None, None, None));
+        assert_eq!(
+            proof.schema_manifest_sha256,
+            V031_USER_SCHEMA_MANIFEST_SHA256
+        );
+        assert!(!proof.tables.is_empty());
+        assert!(is_lower_hex_sha256(&proof.logical_database_manifest_sha256));
+        assert!(is_lower_hex_sha256(&proof.business_manifest_sha256));
+        assert_eq!(
+            image, image_before,
+            "validation must not mutate source bytes"
+        );
+    }
+
+    #[test]
+    fn v031_sqlite_image_validator_rejects_schema_tamper_and_current_schema() {
+        let tampered_connection =
+            Connection::open_in_memory().expect("tampered fixture connection opens");
+        create_exact_v031_user_database_for_upgrade_test(&tampered_connection)
+            .expect("exact fixture initializes");
+        tampered_connection
+            .execute_batch("DROP TRIGGER trg_agent_runs_message_scope_insert")
+            .expect("fixture trigger is removed");
+        let tampered = tampered_connection
+            .serialize(rusqlite::MAIN_DB)
+            .expect("tampered fixture serializes")
+            .to_vec();
+        assert!(validate_v031_user_sqlite_image_read_only(&tampered).is_err());
+
+        let mut current_connection =
+            Connection::open_in_memory().expect("current fixture connection opens");
+        crate::run_user_migrations(&mut current_connection).expect("current fixture initializes");
+        let current = current_connection
+            .serialize(rusqlite::MAIN_DB)
+            .expect("current fixture serializes")
+            .to_vec();
+        assert!(validate_v031_user_sqlite_image_read_only(&current).is_err());
+    }
+
+    #[test]
+    fn v031_sqlite_image_validator_rejects_corruption_and_non_page_bytes() {
+        let valid = serialized_exact_v031_user_image();
+
+        let mut corrupted_header = valid.clone();
+        corrupted_header[0] ^= 0xff;
+        assert!(validate_v031_user_sqlite_image_read_only(&corrupted_header).is_err());
+
+        let mut trailing_byte = valid;
+        trailing_byte.push(0);
+        assert!(validate_v031_user_sqlite_image_read_only(&trailing_byte).is_err());
+
+        assert!(validate_v031_user_sqlite_image_read_only(&[]).is_err());
     }
 
     #[test]
@@ -3068,6 +3433,7 @@ mod tests {
             &connection,
             "bag".to_owned(),
             "CREATE TABLE bag (left_value, right_value)".to_owned(),
+            None,
         )
         .expect("keyless table canonicalizes");
         assert!(table.primary_key_columns.is_empty());

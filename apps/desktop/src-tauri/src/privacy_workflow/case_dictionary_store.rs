@@ -245,36 +245,7 @@ impl Drop for FindingSecretV1 {
 }
 
 pub(super) fn initialize_schema(connection: &Connection) -> Result<(), PrivacyWorkflowError> {
-    connection
-        .execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS privacy_case_dictionary_heads (
-                case_id TEXT PRIMARY KEY,
-                revision INTEGER NOT NULL CHECK(revision > 0),
-                revision_hash TEXT NOT NULL CHECK(length(revision_hash) = 64),
-                state_object_id TEXT NOT NULL,
-                state_object_version INTEGER NOT NULL CHECK(state_object_version > 0),
-                state_content_sha256 TEXT NOT NULL CHECK(length(state_content_sha256) = 64),
-                state_envelope_sha256 TEXT NOT NULL CHECK(length(state_envelope_sha256) = 64),
-                state_content_bytes INTEGER NOT NULL CHECK(state_content_bytes > 0),
-                updated_at_unix INTEGER NOT NULL CHECK(updated_at_unix > 0)
-            );
-            CREATE TABLE IF NOT EXISTS privacy_finding_secret_evidence (
-                redaction_id TEXT PRIMARY KEY,
-                case_id TEXT NOT NULL,
-                evidence_hash TEXT NOT NULL CHECK(length(evidence_hash) = 64),
-                object_id TEXT NOT NULL,
-                object_version INTEGER NOT NULL CHECK(object_version > 0),
-                content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
-                envelope_sha256 TEXT NOT NULL CHECK(length(envelope_sha256) = 64),
-                content_bytes INTEGER NOT NULL CHECK(content_bytes > 0),
-                created_at_unix INTEGER NOT NULL CHECK(created_at_unix > 0)
-            );
-            CREATE INDEX IF NOT EXISTS idx_privacy_finding_secret_case
-                ON privacy_finding_secret_evidence(case_id,redaction_id);
-            ",
-        )
-        .map_err(|_| database_error())?;
+    privacy::initialize_case_dictionary_schema(connection).map_err(|_| database_error())?;
     Ok(())
 }
 

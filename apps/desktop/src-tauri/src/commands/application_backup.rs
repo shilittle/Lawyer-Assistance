@@ -2,7 +2,12 @@
 
 use super::privacy_workflow::IpcError;
 use crate::{
-    approved_mcp::ApprovedMcpWorkspace,
+    approved_mcp::{
+        observe_application_restore_workspace_identity_read_only,
+        validate_application_restore_components_read_only,
+        ApplicationRestoreApprovedComponentsProof, ApplicationRestoreWorkspaceIdentityProof,
+        ApprovedMcpWorkspace,
+    },
     privacy_manager,
     privacy_workflow::{ApplicationBackupPrivacyGuard, PrivacyWorkflowManager},
     state::AppState,
@@ -27,7 +32,7 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawHandle,
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::atomic::{compiler_fence, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -38,7 +43,8 @@ use windows_sys::Win32::{
     Foundation::HANDLE,
     Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     },
 };
 
@@ -153,13 +159,19 @@ pub struct StageApplicationRestoreRequest {
     pub confirmation: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PendingApplicationRestoreV2 {
     format_version: u16,
     backup_id: String,
     privacy_backup_id: String,
     workspace_instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_user_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_privacy_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_vault_present: Option<bool>,
     app_version: String,
     user_schema_version: i64,
     user_database_sha256: String,
@@ -169,13 +181,23 @@ struct PendingApplicationRestoreV2 {
     vault_archive_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PendingApplicationRestoreV3 {
     format_version: u16,
     backup_id: String,
     privacy_backup_id: String,
     workspace_instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_user_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_privacy_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_vault_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_approved_workspace_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_work_products_present: Option<bool>,
     app_version: String,
     user_schema_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,7 +213,7 @@ struct PendingApplicationRestoreV3 {
     work_products_manifest_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum PendingApplicationRestore {
     V2(PendingApplicationRestoreV2),
@@ -218,6 +240,185 @@ struct ApplicationRestorePaths {
     work_products_active: PathBuf,
     work_products_incoming: PathBuf,
     work_products_rollback: PathBuf,
+}
+
+const MAX_APPLICATION_RESTORE_TREE_ENTRIES: usize = 400_000;
+const MAX_APPLICATION_RESTORE_TREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingApplicationRestorePhase {
+    Prepared,
+    UserMovedToRollback,
+    UserInstalled,
+    PrivacyMovedToRollback,
+    PrivacyInstalled,
+    VaultMovedToRollback,
+    VaultInstalled,
+    ApprovedWorkspaceMovedToRollback,
+    ApprovedWorkspaceInstalled,
+    WorkProductsMovedToRollback,
+    InstalledPendingCleanup { removed_rollback_prefix: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreSlotProgress {
+    PreparedWithOriginal,
+    PreparedFromAbsent,
+    MovedToRollback,
+    InstalledWithRollback,
+    InstalledFromAbsent,
+    Cleaned,
+    /// Compatibility-only interpretation for durable V2/V3 pending markers
+    /// written before original-presence evidence was added.  A new marker
+    /// never produces this state.
+    LegacyInstalledWithoutRollback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreComponentKind {
+    User,
+    Privacy,
+    Vault,
+    ApprovedWorkspace,
+    WorkProducts,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RestoreFileProof {
+    identity_sha256: String,
+    bytes: u64,
+    created: u64,
+    modified: u64,
+    attributes: u32,
+    sha256: String,
+}
+
+impl std::fmt::Debug for RestoreFileProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestoreFileProof")
+            .field("identity_sha256", &self.identity_sha256)
+            .field("bytes", &self.bytes)
+            .field("created", &self.created)
+            .field("modified", &self.modified)
+            .field("attributes", &self.attributes)
+            .field("sha256", &self.sha256)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreTreeEntryKind {
+    Directory,
+    File,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RestoreTreeEntryProof {
+    relative_path_sha256: String,
+    kind: RestoreTreeEntryKind,
+    identity_sha256: String,
+    bytes: u64,
+    created: u64,
+    modified: u64,
+    attributes: u32,
+    content_sha256: Option<String>,
+}
+
+impl std::fmt::Debug for RestoreTreeEntryProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestoreTreeEntryProof")
+            .field("relative_path_sha256", &self.relative_path_sha256)
+            .field("kind", &self.kind)
+            .field("identity_sha256", &self.identity_sha256)
+            .field("bytes", &self.bytes)
+            .field("created", &self.created)
+            .field("modified", &self.modified)
+            .field("attributes", &self.attributes)
+            .field("content_sha256", &self.content_sha256)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreDirectoryProof {
+    root: RestoreTreeEntryProof,
+    entries: Vec<RestoreTreeEntryProof>,
+    total_file_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestorePathProof {
+    Absent,
+    File(RestoreFileProof),
+    Directory(RestoreDirectoryProof),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApplicationRestoreSlotsProof {
+    user_active: RestorePathProof,
+    user_incoming: RestorePathProof,
+    user_rollback: RestorePathProof,
+    privacy_active: RestorePathProof,
+    privacy_incoming: RestorePathProof,
+    privacy_rollback: RestorePathProof,
+    vault_active: RestorePathProof,
+    vault_incoming: RestorePathProof,
+    vault_rollback: RestorePathProof,
+    approved_active: RestorePathProof,
+    approved_incoming: RestorePathProof,
+    approved_rollback: RestorePathProof,
+    work_products_active: RestorePathProof,
+    work_products_incoming: RestorePathProof,
+    work_products_rollback: RestorePathProof,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PendingApplicationRestoreGate {
+    marker: PendingApplicationRestore,
+    marker_file: RestoreFileProof,
+    workspace_instance_id: privacy::vnext::WorkspaceInstanceId,
+    phase: PendingApplicationRestorePhase,
+    slots: ApplicationRestoreSlotsProof,
+    workspace_identity: ApplicationRestoreWorkspaceIdentityProof,
+    approved_components: Option<ApplicationRestoreApprovedComponentsProof>,
+}
+
+impl std::fmt::Debug for PendingApplicationRestoreGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingApplicationRestoreGate")
+            .field("marker", &"[DPAPI_AUTHENTICATED]")
+            .field("marker_file", &self.marker_file)
+            .field("workspace_instance_id", &"[AUTHENTICATED_WORKSPACE]")
+            .field("phase", &self.phase)
+            .field("slots", &self.slots)
+            .field("workspace_identity", &self.workspace_identity)
+            .field("approved_components", &self.approved_components)
+            .finish()
+    }
+}
+
+impl PendingApplicationRestoreGate {
+    #[cfg(test)]
+    pub(crate) fn workspace_instance_id(&self) -> &privacy::vnext::WorkspaceInstanceId {
+        &self.workspace_instance_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn phase(&self) -> PendingApplicationRestorePhase {
+        self.phase
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+// The authenticated observation intentionally owns the complete fixed-slot
+// proof so callers cannot separate classification from its capability.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PendingApplicationRestoreObservation {
+    Absent,
+    Authenticated(PendingApplicationRestoreGate),
 }
 
 struct SensitiveBytes(Vec<u8>);
@@ -2690,6 +2891,16 @@ where
                 "The authenticated Vault component does not match the complete-backup manifest.",
             ));
         }
+        // These bits are part of the protected marker, not inferred from a
+        // later ambiguous `(active, incoming, rollback)` tuple.  In
+        // particular, `(present, absent, absent)` can then be distinguished
+        // as either a legitimately installed absent-original component or a
+        // cleaned present-original component.
+        let original_user_present = restore_path_is_present(&paths.user_active)?;
+        let original_privacy_present = restore_path_is_present(&paths.privacy_active)?;
+        let original_vault_present = restore_path_is_present(&paths.vault_active)?;
+        let original_approved_workspace_present = restore_path_is_present(&paths.approved_active)?;
+        let original_work_products_present = restore_path_is_present(&paths.work_products_active)?;
         let marker = match (
             opened.approved_workspace_bundle.as_deref(),
             opened.work_products_bundle.as_deref(),
@@ -2735,6 +2946,11 @@ where
                         .workspace_instance_id
                         .as_str()
                         .to_owned(),
+                    original_user_present: Some(original_user_present),
+                    original_privacy_present: Some(original_privacy_present),
+                    original_vault_present: Some(original_vault_present),
+                    original_approved_workspace_present: Some(original_approved_workspace_present),
+                    original_work_products_present: Some(original_work_products_present),
                     app_version: migration_recovery_created_at_unix
                         .map(|_| env!("CARGO_PKG_VERSION").to_owned())
                         .unwrap_or_else(|| opened.metadata.app_version.clone()),
@@ -2761,6 +2977,9 @@ where
                         .workspace_instance_id
                         .as_str()
                         .to_owned(),
+                    original_user_present: Some(original_user_present),
+                    original_privacy_present: Some(original_privacy_present),
+                    original_vault_present: Some(original_vault_present),
                     app_version: migration_recovery_created_at_unix
                         .map(|_| env!("CARGO_PKG_VERSION").to_owned())
                         .unwrap_or_else(|| opened.metadata.app_version.clone()),
@@ -2786,14 +3005,1289 @@ where
     Ok(opened.metadata.clone())
 }
 
-#[cfg(test)]
-pub(crate) fn apply_pending_application_restore(
+/// Enumerates and authenticates the complete full-application restore namespace
+/// before any current manager, schema initializer, credential creator, cleanup,
+/// or writer is allowed to run.  Absence is accepted only when every full-
+/// restore transaction slot is absent; unmarked residue is never repaired here.
+pub(crate) fn observe_pending_application_restore_read_only(
     app_local_data_dir: &Path,
-    workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
-) -> Result<(), IpcError> {
-    apply_pending_application_restore_internal(app_local_data_dir, workspace_instance_id, None)
+) -> Result<PendingApplicationRestoreObservation, IpcError> {
+    observe_pending_application_restore_read_only_with_approved(app_local_data_dir, None)
 }
 
+fn observe_pending_application_restore_read_only_with_approved(
+    app_local_data_dir: &Path,
+    approved_workspace: Option<&ApprovedMcpWorkspace>,
+) -> Result<PendingApplicationRestoreObservation, IpcError> {
+    match fs::symlink_metadata(app_local_data_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PendingApplicationRestoreObservation::Absent);
+        }
+        Err(_) => {
+            return Err(ipc_error(
+                "application_restore_io",
+                "The fixed application data directory could not be inspected.",
+            ));
+        }
+        Ok(_) => {}
+    }
+    validate_application_restore_observation_root(app_local_data_dir)?;
+    let paths = application_restore_paths(app_local_data_dir);
+    reject_unknown_application_restore_siblings(app_local_data_dir, &paths)?;
+
+    if !restore_path_is_present(&paths.marker)? {
+        ensure_full_restore_residue_absent(&paths)?;
+        return Ok(PendingApplicationRestoreObservation::Absent);
+    }
+    ensure_no_mixed_application_restore(&paths, app_local_data_dir)?;
+
+    let (marker, marker_file) = read_pair_marker_with_proof(&paths.marker)?;
+    let workspace_instance_id = marker_workspace_instance_id(&marker)?;
+    validate_pair_marker(&marker, &workspace_instance_id)?;
+    let workspace_identity = match approved_workspace {
+        Some(workspace) => workspace
+            .observe_application_restore_workspace_identity_read_only(&workspace_instance_id),
+        None => observe_application_restore_workspace_identity_read_only(
+            app_local_data_dir,
+            &workspace_instance_id,
+        ),
+    }
+    .map_err(approved_mcp_error)?;
+    if workspace_identity.workspace_instance_id() != &workspace_instance_id {
+        return Err(ipc_error(
+            "application_restore_environment_mismatch",
+            "The authenticated restore marker is not bound to this application workspace.",
+        ));
+    }
+    let slots_before = capture_application_restore_slots(&paths)?;
+    let phase = classify_pending_application_restore(&marker, &slots_before)?;
+    let approved_components = validate_observed_application_restore_components(
+        app_local_data_dir,
+        &paths,
+        &marker,
+        &workspace_instance_id,
+        &slots_before,
+        approved_workspace,
+    )?;
+    let slots_after = capture_application_restore_slots(&paths)?;
+    if slots_after != slots_before {
+        return Err(application_restore_observation_changed());
+    }
+    let (marker_after, marker_file_after) = read_pair_marker_with_proof(&paths.marker)?;
+    if marker_after != marker || marker_file_after != marker_file {
+        return Err(application_restore_observation_changed());
+    }
+
+    Ok(PendingApplicationRestoreObservation::Authenticated(
+        PendingApplicationRestoreGate {
+            marker,
+            marker_file,
+            workspace_instance_id,
+            phase,
+            slots: slots_before,
+            workspace_identity,
+            approved_components,
+        },
+    ))
+}
+
+fn marker_workspace_instance_id(
+    marker: &PendingApplicationRestore,
+) -> Result<privacy::vnext::WorkspaceInstanceId, IpcError> {
+    let value = match marker {
+        PendingApplicationRestore::V2(marker) => &marker.workspace_instance_id,
+        PendingApplicationRestore::V3(marker) => &marker.workspace_instance_id,
+    };
+    privacy::vnext::WorkspaceInstanceId::parse(value.clone()).map_err(|_| {
+        ipc_error(
+            "application_restore_environment_mismatch",
+            "The authenticated application restore workspace identifier is invalid.",
+        )
+    })
+}
+
+fn validate_application_restore_observation_root(path: &Path) -> Result<(), IpcError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        ipc_error(
+            "application_restore_io",
+            "The fixed application data directory could not be inspected.",
+        )
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !privacy_manager::is_normal_local_absolute(path)
+        || !privacy_manager::local_path_chain_is_ordinary(path)
+    {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "The application restore root is not an ordinary fixed local directory.",
+        ));
+    }
+    Ok(())
+}
+
+fn application_restore_observation_changed() -> IpcError {
+    ipc_error(
+        "application_restore_observation_changed",
+        "The authenticated application restore namespace changed during read-only observation.",
+    )
+}
+
+fn classify_pending_application_restore(
+    marker: &PendingApplicationRestore,
+    slots: &ApplicationRestoreSlotsProof,
+) -> Result<PendingApplicationRestorePhase, IpcError> {
+    let original_presence = marker_original_presence(marker)?;
+    let mut states = vec![
+        classify_restore_slot_progress(
+            &slots.user_active,
+            &slots.user_incoming,
+            &slots.user_rollback,
+            original_presence.as_ref().map(|values| values[0]),
+        )?,
+        classify_restore_slot_progress(
+            &slots.privacy_active,
+            &slots.privacy_incoming,
+            &slots.privacy_rollback,
+            original_presence.as_ref().map(|values| values[1]),
+        )?,
+        classify_restore_slot_progress(
+            &slots.vault_active,
+            &slots.vault_incoming,
+            &slots.vault_rollback,
+            original_presence.as_ref().map(|values| values[2]),
+        )?,
+    ];
+    let mut kinds = vec![
+        RestoreComponentKind::User,
+        RestoreComponentKind::Privacy,
+        RestoreComponentKind::Vault,
+    ];
+    match marker {
+        PendingApplicationRestore::V2(_) => {
+            if slots.approved_incoming.is_present()
+                || slots.approved_rollback.is_present()
+                || slots.work_products_incoming.is_present()
+                || slots.work_products_rollback.is_present()
+            {
+                return Err(application_restore_crash_state_error());
+            }
+        }
+        PendingApplicationRestore::V3(_) => {
+            states.push(classify_restore_slot_progress(
+                &slots.approved_active,
+                &slots.approved_incoming,
+                &slots.approved_rollback,
+                original_presence.as_ref().map(|values| values[3]),
+            )?);
+            states.push(classify_restore_slot_progress(
+                &slots.work_products_active,
+                &slots.work_products_incoming,
+                &slots.work_products_rollback,
+                original_presence.as_ref().map(|values| values[4]),
+            )?);
+            kinds.push(RestoreComponentKind::ApprovedWorkspace);
+            kinds.push(RestoreComponentKind::WorkProducts);
+        }
+    }
+    classify_restore_progress_sequence(&states, &kinds, original_presence.as_deref())
+}
+
+fn marker_original_presence(
+    marker: &PendingApplicationRestore,
+) -> Result<Option<Vec<bool>>, IpcError> {
+    let values = match marker {
+        PendingApplicationRestore::V2(marker) => vec![
+            marker.original_user_present,
+            marker.original_privacy_present,
+            marker.original_vault_present,
+        ],
+        PendingApplicationRestore::V3(marker) => vec![
+            marker.original_user_present,
+            marker.original_privacy_present,
+            marker.original_vault_present,
+            marker.original_approved_workspace_present,
+            marker.original_work_products_present,
+        ],
+    };
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    values
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .map(Some)
+        .ok_or_else(application_restore_crash_state_error)
+}
+
+impl RestorePathProof {
+    fn is_present(&self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
+fn classify_restore_slot_progress(
+    active: &RestorePathProof,
+    incoming: &RestorePathProof,
+    rollback: &RestorePathProof,
+    original_present: Option<bool>,
+) -> Result<RestoreSlotProgress, IpcError> {
+    let tuple = (
+        active.is_present(),
+        incoming.is_present(),
+        rollback.is_present(),
+    );
+    match original_present {
+        Some(true) => match tuple {
+            (true, true, false) => Ok(RestoreSlotProgress::PreparedWithOriginal),
+            (false, true, true) => Ok(RestoreSlotProgress::MovedToRollback),
+            (true, false, true) => Ok(RestoreSlotProgress::InstalledWithRollback),
+            (true, false, false) => Ok(RestoreSlotProgress::Cleaned),
+            _ => Err(application_restore_crash_state_error()),
+        },
+        Some(false) => match tuple {
+            (false, true, false) => Ok(RestoreSlotProgress::PreparedFromAbsent),
+            (true, false, false) => Ok(RestoreSlotProgress::InstalledFromAbsent),
+            _ => Err(application_restore_crash_state_error()),
+        },
+        None => match tuple {
+            (true, true, false) => Ok(RestoreSlotProgress::PreparedWithOriginal),
+            (false, true, false) => Ok(RestoreSlotProgress::PreparedFromAbsent),
+            (false, true, true) => Ok(RestoreSlotProgress::MovedToRollback),
+            (true, false, true) => Ok(RestoreSlotProgress::InstalledWithRollback),
+            (true, false, false) => Ok(RestoreSlotProgress::LegacyInstalledWithoutRollback),
+            _ => Err(application_restore_crash_state_error()),
+        },
+    }
+}
+
+fn restore_slot_is_prepared(state: RestoreSlotProgress) -> bool {
+    matches!(
+        state,
+        RestoreSlotProgress::PreparedWithOriginal | RestoreSlotProgress::PreparedFromAbsent
+    )
+}
+
+fn restore_slot_is_installed(state: RestoreSlotProgress) -> bool {
+    matches!(
+        state,
+        RestoreSlotProgress::InstalledWithRollback
+            | RestoreSlotProgress::InstalledFromAbsent
+            | RestoreSlotProgress::LegacyInstalledWithoutRollback
+    )
+}
+
+fn classify_restore_progress_sequence(
+    states: &[RestoreSlotProgress],
+    kinds: &[RestoreComponentKind],
+    original_presence: Option<&[bool]>,
+) -> Result<PendingApplicationRestorePhase, IpcError> {
+    if states.len() != kinds.len()
+        || original_presence.is_some_and(|values| states.len() != values.len())
+        || states.is_empty()
+    {
+        return Err(application_restore_crash_state_error());
+    }
+    if states.iter().all(|state| restore_slot_is_prepared(*state)) {
+        return Ok(PendingApplicationRestorePhase::Prepared);
+    }
+
+    for index in 0..states.len() {
+        if states[..index]
+            .iter()
+            .all(|state| restore_slot_is_installed(*state))
+            && states[index] == RestoreSlotProgress::MovedToRollback
+            && states[index + 1..]
+                .iter()
+                .all(|state| restore_slot_is_prepared(*state))
+        {
+            return moved_restore_phase(kinds[index]);
+        }
+        if index + 1 < states.len()
+            && states[..=index]
+                .iter()
+                .all(|state| restore_slot_is_installed(*state))
+            && states[index + 1..]
+                .iter()
+                .all(|state| restore_slot_is_prepared(*state))
+        {
+            return installed_restore_phase(kinds[index]);
+        }
+    }
+
+    if original_presence.is_none() {
+        if states.iter().all(|state| restore_slot_is_installed(*state)) {
+            let removed = states
+                .iter()
+                .position(|state| *state == RestoreSlotProgress::InstalledWithRollback)
+                .unwrap_or(states.len());
+            return Ok(PendingApplicationRestorePhase::InstalledPendingCleanup {
+                removed_rollback_prefix: u8::try_from(removed)
+                    .map_err(|_| application_restore_crash_state_error())?,
+            });
+        }
+        return Err(application_restore_crash_state_error());
+    }
+
+    let original_presence = original_presence.ok_or_else(application_restore_crash_state_error)?;
+    // New markers carry a disk-authenticated canonical cleanup position even when
+    // absent-original slots are interspersed: every present-original before
+    // the first surviving rollback must be cleaned, every one after it must
+    // still have its rollback, and absent-original slots remain installed.
+    let mut first_surviving_rollback = None;
+    let mut surviving_rollback_seen = false;
+    for (index, (state, original_present)) in
+        states.iter().zip(original_presence.iter()).enumerate()
+    {
+        if *original_present {
+            match state {
+                RestoreSlotProgress::Cleaned if !surviving_rollback_seen => {}
+                RestoreSlotProgress::InstalledWithRollback => {
+                    surviving_rollback_seen = true;
+                    first_surviving_rollback.get_or_insert(index);
+                }
+                _ => return Err(application_restore_crash_state_error()),
+            }
+        } else if *state != RestoreSlotProgress::InstalledFromAbsent {
+            return Err(application_restore_crash_state_error());
+        }
+    }
+    let removed = first_surviving_rollback.unwrap_or(states.len());
+    Ok(PendingApplicationRestorePhase::InstalledPendingCleanup {
+        removed_rollback_prefix: u8::try_from(removed)
+            .map_err(|_| application_restore_crash_state_error())?,
+    })
+}
+
+fn moved_restore_phase(
+    component: RestoreComponentKind,
+) -> Result<PendingApplicationRestorePhase, IpcError> {
+    Ok(match component {
+        RestoreComponentKind::User => PendingApplicationRestorePhase::UserMovedToRollback,
+        RestoreComponentKind::Privacy => PendingApplicationRestorePhase::PrivacyMovedToRollback,
+        RestoreComponentKind::Vault => PendingApplicationRestorePhase::VaultMovedToRollback,
+        RestoreComponentKind::ApprovedWorkspace => {
+            PendingApplicationRestorePhase::ApprovedWorkspaceMovedToRollback
+        }
+        RestoreComponentKind::WorkProducts => {
+            PendingApplicationRestorePhase::WorkProductsMovedToRollback
+        }
+    })
+}
+
+fn installed_restore_phase(
+    component: RestoreComponentKind,
+) -> Result<PendingApplicationRestorePhase, IpcError> {
+    match component {
+        RestoreComponentKind::User => Ok(PendingApplicationRestorePhase::UserInstalled),
+        RestoreComponentKind::Privacy => Ok(PendingApplicationRestorePhase::PrivacyInstalled),
+        RestoreComponentKind::Vault => Ok(PendingApplicationRestorePhase::VaultInstalled),
+        RestoreComponentKind::ApprovedWorkspace => {
+            Ok(PendingApplicationRestorePhase::ApprovedWorkspaceInstalled)
+        }
+        RestoreComponentKind::WorkProducts => Err(application_restore_crash_state_error()),
+    }
+}
+
+fn application_restore_crash_state_error() -> IpcError {
+    ipc_error(
+        "application_restore_conflict",
+        "The full application restore slots do not match one exact authenticated crash phase.",
+    )
+}
+
+fn ensure_full_restore_residue_absent(paths: &ApplicationRestorePaths) -> Result<(), IpcError> {
+    for path in [
+        &paths.user_incoming,
+        &paths.user_rollback,
+        &paths.privacy_incoming,
+        &paths.privacy_rollback,
+    ] {
+        ensure_restore_database_slot_absent(path)?;
+    }
+    for path in [
+        &paths.vault_incoming,
+        &paths.vault_rollback,
+        &paths.approved_incoming,
+        &paths.approved_rollback,
+        &paths.work_products_incoming,
+        &paths.work_products_rollback,
+    ] {
+        if restore_path_is_present(path)? {
+            return Err(ipc_error(
+                "application_restore_conflict",
+                "An unmarked full-application restore residue requires explicit recovery.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_restore_database_slot_absent(path: &Path) -> Result<(), IpcError> {
+    for candidate in [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-journal"),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ] {
+        if restore_path_is_present(&candidate)? {
+            return Err(ipc_error(
+                "application_restore_conflict",
+                "An unmarked database restore residue requires explicit recovery.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_mixed_application_restore(
+    paths: &ApplicationRestorePaths,
+    app_local_data_dir: &Path,
+) -> Result<(), IpcError> {
+    let privacy_directory = app_local_data_dir.join("privacy");
+    for path in [
+        paths.legacy_user_incoming.clone(),
+        paths.legacy_user_marker.clone(),
+        paths.legacy_user_rollback.clone(),
+        privacy_directory.join("privacy-workflow.sqlite.restore-incoming"),
+        privacy_directory.join("privacy-workflow.sqlite.restore-pending.dpapi"),
+        privacy_directory.join("privacy-workflow.sqlite.restore-rollback"),
+        app_local_data_dir.join("v031-migration-recovery-pending.dpapi"),
+    ] {
+        if restore_path_is_present(&path)? {
+            return Err(ipc_error(
+                "application_restore_conflict",
+                "A full restore cannot coexist with a legacy, standalone, or migration-recovery transaction.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_unknown_application_restore_siblings(
+    app_local_data_dir: &Path,
+    paths: &ApplicationRestorePaths,
+) -> Result<(), IpcError> {
+    let privacy_directory = app_local_data_dir.join("privacy");
+    let approved_parent = paths
+        .approved_active
+        .parent()
+        .ok_or_else(application_restore_crash_state_error)?;
+    reject_unknown_restore_names_in_directory(
+        app_local_data_dir,
+        &["application", "user.sqlite", VAULT_DIRECTORY_NAME],
+        &[
+            FULL_RESTORE_MARKER_NAME,
+            "v031-migration-recovery-pending.dpapi",
+            "user.sqlite.application-restore-incoming",
+            "user.sqlite.application-restore-incoming-journal",
+            "user.sqlite.application-restore-incoming-wal",
+            "user.sqlite.application-restore-incoming-shm",
+            "user.sqlite.application-restore-rollback",
+            "user.sqlite.application-restore-rollback-journal",
+            "user.sqlite.application-restore-rollback-wal",
+            "user.sqlite.application-restore-rollback-shm",
+            "user.sqlite.restore-incoming",
+            "user.sqlite.restore-pending.json",
+            "user.sqlite.restore-rollback",
+            "case-vault-v2.application-restore-incoming",
+            "case-vault-v2.application-restore-rollback",
+        ],
+    )?;
+    if restore_path_is_present(&privacy_directory)? {
+        reject_unknown_restore_names_in_directory(
+            &privacy_directory,
+            &["privacy-workflow.sqlite"],
+            &[
+                "privacy-workflow.sqlite.application-restore-incoming",
+                "privacy-workflow.sqlite.application-restore-incoming-journal",
+                "privacy-workflow.sqlite.application-restore-incoming-wal",
+                "privacy-workflow.sqlite.application-restore-incoming-shm",
+                "privacy-workflow.sqlite.application-restore-rollback",
+                "privacy-workflow.sqlite.application-restore-rollback-journal",
+                "privacy-workflow.sqlite.application-restore-rollback-wal",
+                "privacy-workflow.sqlite.application-restore-rollback-shm",
+                "privacy-workflow.sqlite.restore-incoming",
+                "privacy-workflow.sqlite.restore-pending.dpapi",
+                "privacy-workflow.sqlite.restore-rollback",
+            ],
+        )?;
+    }
+    if restore_path_is_present(approved_parent)? {
+        reject_unknown_restore_names_in_directory(
+            approved_parent,
+            &[APPROVED_DIRECTORY_NAME, WORK_PRODUCTS_DIRECTORY_NAME],
+            &[
+                "approved-generations.application-restore-incoming",
+                "approved-generations.application-restore-rollback",
+                "work-products.application-restore-incoming",
+                "work-products.application-restore-rollback",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_unknown_restore_names_in_directory(
+    directory: &Path,
+    target_stems: &[&str],
+    allowed_restore_names: &[&str],
+) -> Result<(), IpcError> {
+    validate_restore_directory_identity(directory)?;
+    for entry in fs::read_dir(directory).map_err(|_| {
+        ipc_error(
+            "application_restore_io",
+            "A full-restore sibling directory could not be enumerated.",
+        )
+    })? {
+        let entry = entry.map_err(|_| {
+            ipc_error(
+                "application_restore_io",
+                "A full-restore sibling entry could not be inspected.",
+            )
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let looks_related = target_stems.iter().any(|stem| name.starts_with(stem))
+            && (name.contains("restore")
+                || name.contains("pending")
+                || name.contains(".incoming")
+                || name.contains(".rollback")
+                || name.contains(".staging"));
+        if looks_related && !allowed_restore_names.contains(&name.as_str()) {
+            return Err(ipc_error(
+                "application_restore_unknown_state",
+                "An unknown full-application restore sibling was found.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn capture_application_restore_slots(
+    paths: &ApplicationRestorePaths,
+) -> Result<ApplicationRestoreSlotsProof, IpcError> {
+    for path in [
+        &paths.user_active,
+        &paths.user_incoming,
+        &paths.user_rollback,
+        &paths.privacy_active,
+        &paths.privacy_incoming,
+        &paths.privacy_rollback,
+    ] {
+        ensure_no_database_sidecars(path)?;
+    }
+    Ok(ApplicationRestoreSlotsProof {
+        user_active: capture_optional_restore_file(
+            &paths.user_active,
+            MAX_USER_DATABASE_BACKUP_BYTES,
+        )?,
+        user_incoming: capture_optional_restore_file(
+            &paths.user_incoming,
+            MAX_USER_DATABASE_BACKUP_BYTES,
+        )?,
+        user_rollback: capture_optional_restore_file(
+            &paths.user_rollback,
+            MAX_USER_DATABASE_BACKUP_BYTES,
+        )?,
+        privacy_active: capture_optional_restore_file(
+            &paths.privacy_active,
+            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES,
+        )?,
+        privacy_incoming: capture_optional_restore_file(
+            &paths.privacy_incoming,
+            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES,
+        )?,
+        privacy_rollback: capture_optional_restore_file(
+            &paths.privacy_rollback,
+            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES,
+        )?,
+        vault_active: capture_optional_restore_directory(&paths.vault_active)?,
+        vault_incoming: capture_optional_restore_directory(&paths.vault_incoming)?,
+        vault_rollback: capture_optional_restore_directory(&paths.vault_rollback)?,
+        approved_active: capture_optional_restore_directory(&paths.approved_active)?,
+        approved_incoming: capture_optional_restore_directory(&paths.approved_incoming)?,
+        approved_rollback: capture_optional_restore_directory(&paths.approved_rollback)?,
+        work_products_active: capture_optional_restore_directory(&paths.work_products_active)?,
+        work_products_incoming: capture_optional_restore_directory(&paths.work_products_incoming)?,
+        work_products_rollback: capture_optional_restore_directory(&paths.work_products_rollback)?,
+    })
+}
+
+fn capture_optional_restore_file(
+    path: &Path,
+    maximum: usize,
+) -> Result<RestorePathProof, IpcError> {
+    if !restore_path_is_present(path)? {
+        return Ok(RestorePathProof::Absent);
+    }
+    let (_, proof) = read_restore_file_with_proof(path, maximum, false)?;
+    Ok(RestorePathProof::File(proof))
+}
+
+fn capture_optional_restore_directory(path: &Path) -> Result<RestorePathProof, IpcError> {
+    if !restore_path_is_present(path)? {
+        return Ok(RestorePathProof::Absent);
+    }
+    capture_restore_directory_proof(path).map(RestorePathProof::Directory)
+}
+
+fn read_pair_marker_with_proof(
+    path: &Path,
+) -> Result<(PendingApplicationRestore, RestoreFileProof), IpcError> {
+    let (protected, proof) =
+        read_restore_file_with_proof(path, FULL_RESTORE_MARKER_MAX_BYTES, false)?;
+    let plaintext = SensitiveBytes(unprotect_local(protected.as_slice()).map_err(|_| {
+        ipc_error(
+            "application_restore_invalid",
+            "The full application restore marker failed DPAPI authentication.",
+        )
+    })?);
+    let marker: PendingApplicationRestore =
+        privacy::vnext::strict_json_v1_from_slice(plaintext.as_slice()).map_err(|_| {
+            ipc_error(
+                "application_restore_invalid",
+                "The full application restore marker has an invalid strict encoding.",
+            )
+        })?;
+    if privacy::vnext::canonical_json_v1(&marker).map_err(|_| {
+        ipc_error(
+            "application_restore_invalid",
+            "The full application restore marker could not be canonically encoded.",
+        )
+    })? != plaintext.as_slice()
+    {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "The full application restore marker is not canonical JSON.",
+        ));
+    }
+    Ok((marker, proof))
+}
+
+fn read_restore_file_with_proof(
+    path: &Path,
+    maximum: usize,
+    allow_empty: bool,
+) -> Result<(SensitiveBytes, RestoreFileProof), IpcError> {
+    if !privacy_manager::is_normal_local_absolute(path)
+        || !privacy_manager::local_path_chain_is_ordinary(path)
+    {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "A restore proof file is not on an ordinary fixed local path.",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| {
+            ipc_error(
+                "application_restore_io",
+                "A restore proof file could not be opened.",
+            )
+        })?;
+    if !ordinary_single_link_handle(&file) {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "A restore proof file is not an ordinary single-link file.",
+        ));
+    }
+    let before = file.metadata().map_err(|_| {
+        ipc_error(
+            "application_restore_io",
+            "A restore proof file's metadata could not be read.",
+        )
+    })?;
+    if (!allow_empty && before.len() == 0) || before.len() > maximum as u64 {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "A restore proof file has an invalid length for its fixed bound.",
+        ));
+    }
+    let identity_sha256 = opened_file_identity_sha256(&file)?;
+    let capacity = usize::try_from(before.len()).map_err(|_| {
+        ipc_error(
+            "application_restore_invalid",
+            "A restore proof file length is unsupported.",
+        )
+    })?;
+    let mut bytes = SensitiveBytes(Vec::with_capacity(capacity));
+    (&mut file)
+        .take((maximum as u64).saturating_add(1))
+        .read_to_end(&mut bytes.0)
+        .map_err(|_| {
+            ipc_error(
+                "application_restore_io",
+                "A restore proof file could not be read.",
+            )
+        })?;
+    let after = file.metadata().map_err(|_| {
+        ipc_error(
+            "application_restore_io",
+            "A restore proof file's final metadata could not be read.",
+        )
+    })?;
+    if bytes.0.len() != capacity
+        || !same_restore_metadata(&before, &after)
+        || opened_file_identity_sha256(&file)? != identity_sha256
+        || !ordinary_single_link_handle(&file)
+    {
+        return Err(application_restore_observation_changed());
+    }
+    let proof = RestoreFileProof {
+        identity_sha256,
+        bytes: before.len(),
+        created: before.creation_time(),
+        modified: before.last_write_time(),
+        attributes: before.file_attributes(),
+        sha256: sha256_hex(bytes.as_slice()),
+    };
+    Ok((bytes, proof))
+}
+
+fn opened_file_identity_sha256(file: &File) -> Result<String, IpcError> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if handle.is_null()
+        || unsafe { GetFileInformationByHandle(handle, &mut information) } == 0
+        || information.nNumberOfLinks != 1
+    {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "A restore proof file identity could not be authenticated.",
+        ));
+    }
+    let mut value = Vec::with_capacity(20);
+    value.extend_from_slice(b"restore-file-identity-v1\0");
+    value.extend_from_slice(&information.dwVolumeSerialNumber.to_be_bytes());
+    value.extend_from_slice(&information.nFileIndexHigh.to_be_bytes());
+    value.extend_from_slice(&information.nFileIndexLow.to_be_bytes());
+    Ok(sha256_hex(&value))
+}
+
+fn same_restore_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.is_file() == right.is_file()
+        && left.is_dir() == right.is_dir()
+        && left.len() == right.len()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_attributes() == right.file_attributes()
+}
+
+fn capture_restore_directory_proof(root: &Path) -> Result<RestoreDirectoryProof, IpcError> {
+    validate_restore_directory_identity(root)?;
+    let root_metadata = fs::symlink_metadata(root).map_err(|_| {
+        ipc_error(
+            "application_restore_io",
+            "A restore proof directory could not be inspected.",
+        )
+    })?;
+    let root_proof = restore_directory_entry_proof(root, Path::new(""), &root_metadata)?;
+    let mut entries = Vec::new();
+    let mut total_file_bytes = 0_u64;
+    capture_restore_directory_entries(root, root, &mut entries, &mut total_file_bytes)?;
+    entries.sort_by(|left, right| {
+        left.relative_path_sha256
+            .cmp(&right.relative_path_sha256)
+            .then_with(|| (left.kind as u8).cmp(&(right.kind as u8)))
+    });
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].relative_path_sha256 == pair[1].relative_path_sha256)
+    {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "A restore directory contains an ambiguous recursive entry identity.",
+        ));
+    }
+    let root_after =
+        fs::symlink_metadata(root).map_err(|_| application_restore_observation_changed())?;
+    if !same_restore_metadata(&root_metadata, &root_after)
+        || restore_directory_entry_proof(root, Path::new(""), &root_after)? != root_proof
+    {
+        return Err(application_restore_observation_changed());
+    }
+    Ok(RestoreDirectoryProof {
+        root: root_proof,
+        entries,
+        total_file_bytes,
+    })
+}
+
+fn capture_restore_directory_entries(
+    root: &Path,
+    current: &Path,
+    entries: &mut Vec<RestoreTreeEntryProof>,
+    total_file_bytes: &mut u64,
+) -> Result<(), IpcError> {
+    validate_restore_directory_identity(current)?;
+    for entry in fs::read_dir(current).map_err(|_| {
+        ipc_error(
+            "application_restore_io",
+            "A restore proof directory could not be enumerated.",
+        )
+    })? {
+        if entries.len() >= MAX_APPLICATION_RESTORE_TREE_ENTRIES {
+            return Err(ipc_error(
+                "application_restore_invalid",
+                "A restore proof directory exceeds its fixed entry bound.",
+            ));
+        }
+        let entry = entry.map_err(|_| {
+            ipc_error(
+                "application_restore_io",
+                "A recursive restore proof entry could not be inspected.",
+            )
+        })?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| application_restore_crash_state_error())?;
+        let metadata = fs::symlink_metadata(&path).map_err(|_| {
+            ipc_error(
+                "application_restore_io",
+                "A recursive restore proof entry's metadata could not be read.",
+            )
+        })?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ipc_error(
+                "application_restore_invalid",
+                "A restore directory contains a reparse point.",
+            ));
+        }
+        if metadata.is_dir() {
+            entries.push(restore_directory_entry_proof(&path, relative, &metadata)?);
+            capture_restore_directory_entries(root, &path, entries, total_file_bytes)?;
+        } else if metadata.is_file() {
+            let remaining = MAX_APPLICATION_RESTORE_TREE_BYTES
+                .checked_sub(*total_file_bytes)
+                .ok_or_else(application_restore_crash_state_error)?;
+            let maximum = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(MAX_APPLICATION_BACKUP_BYTES);
+            let (_, file) = read_restore_file_with_proof(&path, maximum, true)?;
+            *total_file_bytes = total_file_bytes
+                .checked_add(file.bytes)
+                .filter(|value| *value <= MAX_APPLICATION_RESTORE_TREE_BYTES)
+                .ok_or_else(|| {
+                    ipc_error(
+                        "application_restore_invalid",
+                        "A restore proof directory exceeds its fixed byte bound.",
+                    )
+                })?;
+            entries.push(RestoreTreeEntryProof {
+                relative_path_sha256: restore_relative_path_sha256(
+                    relative,
+                    RestoreTreeEntryKind::File,
+                )?,
+                kind: RestoreTreeEntryKind::File,
+                identity_sha256: file.identity_sha256,
+                bytes: file.bytes,
+                created: file.created,
+                modified: file.modified,
+                attributes: file.attributes,
+                content_sha256: Some(file.sha256),
+            });
+        } else {
+            return Err(ipc_error(
+                "application_restore_invalid",
+                "A restore proof directory contains an unsupported entry type.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_directory_entry_proof(
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+) -> Result<RestoreTreeEntryProof, IpcError> {
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "A restore proof directory entry is not an ordinary directory.",
+        ));
+    }
+    Ok(RestoreTreeEntryProof {
+        relative_path_sha256: restore_relative_path_sha256(
+            relative,
+            RestoreTreeEntryKind::Directory,
+        )?,
+        kind: RestoreTreeEntryKind::Directory,
+        identity_sha256: opened_directory_identity_sha256(path)?,
+        bytes: 0,
+        created: metadata.creation_time(),
+        modified: metadata.last_write_time(),
+        attributes: metadata.file_attributes(),
+        content_sha256: None,
+    })
+}
+
+fn opened_directory_identity_sha256(path: &Path) -> Result<String, IpcError> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|_| {
+            ipc_error(
+                "application_restore_invalid",
+                "A restore proof directory identity could not be opened.",
+            )
+        })?;
+    let handle = directory.as_raw_handle() as HANDLE;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if handle.is_null() || unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+        return Err(ipc_error(
+            "application_restore_invalid",
+            "A restore proof directory identity could not be authenticated.",
+        ));
+    }
+    let mut value = Vec::new();
+    value.extend_from_slice(b"restore-directory-identity-v1\0");
+    value.extend_from_slice(&information.dwVolumeSerialNumber.to_be_bytes());
+    value.extend_from_slice(&information.nFileIndexHigh.to_be_bytes());
+    value.extend_from_slice(&information.nFileIndexLow.to_be_bytes());
+    Ok(sha256_hex(&value))
+}
+
+fn restore_relative_path_sha256(
+    relative: &Path,
+    kind: RestoreTreeEntryKind,
+) -> Result<String, IpcError> {
+    let components = relative.components().collect::<Vec<_>>();
+    let mut value = Vec::new();
+    value.extend_from_slice(b"lawyer-assistance-restore-tree-entry-v1\0");
+    value.push(match kind {
+        RestoreTreeEntryKind::Directory => 0,
+        RestoreTreeEntryKind::File => 1,
+    });
+    value.extend_from_slice(
+        &u32::try_from(components.len())
+            .map_err(|_| application_restore_crash_state_error())?
+            .to_be_bytes(),
+    );
+    for component in components {
+        let Component::Normal(component) = component else {
+            return Err(application_restore_crash_state_error());
+        };
+        let component = component.to_str().ok_or_else(|| {
+            ipc_error(
+                "application_restore_invalid",
+                "A restore tree contains a non-Unicode relative path.",
+            )
+        })?;
+        value.extend_from_slice(
+            &u32::try_from(component.len())
+                .map_err(|_| application_restore_crash_state_error())?
+                .to_be_bytes(),
+        );
+        value.extend_from_slice(component.as_bytes());
+    }
+    Ok(sha256_hex(&value))
+}
+
+fn validate_observed_application_restore_components(
+    app_local_data_dir: &Path,
+    paths: &ApplicationRestorePaths,
+    marker: &PendingApplicationRestore,
+    workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
+    slots: &ApplicationRestoreSlotsProof,
+    approved_workspace: Option<&ApprovedMcpWorkspace>,
+) -> Result<Option<ApplicationRestoreApprovedComponentsProof>, IpcError> {
+    let original_presence = marker_original_presence(marker)?;
+    let user_state = classify_restore_slot_progress(
+        &slots.user_active,
+        &slots.user_incoming,
+        &slots.user_rollback,
+        original_presence.as_ref().map(|values| values[0]),
+    )?;
+    let privacy_state = classify_restore_slot_progress(
+        &slots.privacy_active,
+        &slots.privacy_incoming,
+        &slots.privacy_rollback,
+        original_presence.as_ref().map(|values| values[1]),
+    )?;
+    let vault_state = classify_restore_slot_progress(
+        &slots.vault_active,
+        &slots.vault_incoming,
+        &slots.vault_rollback,
+        original_presence.as_ref().map(|values| values[2]),
+    )?;
+    let (user_sha256, privacy_sha256, privacy_epoch, privacy_schema, vault_manifest, vault_archive) =
+        match marker {
+            PendingApplicationRestore::V2(marker) => (
+                marker.user_database_sha256.as_str(),
+                marker.privacy_database_sha256.as_str(),
+                marker.privacy_key_epoch,
+                PRIVACY_STORE_SCHEMA_VERSION,
+                marker.vault_manifest_sha256.as_str(),
+                marker.vault_archive_sha256.as_str(),
+            ),
+            PendingApplicationRestore::V3(marker) => (
+                marker.user_database_sha256.as_str(),
+                marker.privacy_database_sha256.as_str(),
+                marker.privacy_key_epoch,
+                marker
+                    .privacy_store_schema_version
+                    .unwrap_or(PRIVACY_STORE_SCHEMA_VERSION),
+                marker.vault_manifest_sha256.as_str(),
+                marker.vault_archive_sha256.as_str(),
+            ),
+        };
+    let user_replacement =
+        restore_replacement_path(user_state, &paths.user_active, &paths.user_incoming);
+    validate_user_component(user_replacement, user_sha256)?;
+    ensure_no_database_sidecars(user_replacement)?;
+    let privacy_replacement = restore_replacement_path(
+        privacy_state,
+        &paths.privacy_active,
+        &paths.privacy_incoming,
+    );
+    validate_privacy_component(
+        privacy_replacement,
+        workspace_instance_id,
+        privacy_epoch,
+        privacy_schema,
+        privacy_sha256,
+    )?;
+    ensure_no_database_sidecars(privacy_replacement)?;
+    validate_vault_component(
+        restore_replacement_path(vault_state, &paths.vault_active, &paths.vault_incoming),
+        workspace_instance_id,
+        vault_manifest,
+        vault_archive,
+    )?;
+
+    if let Some(original) =
+        restore_original_path(user_state, &paths.user_active, &paths.user_rollback)
+    {
+        database::validate_user_database_migration_source_read_only(original).map_err(|_| {
+            ipc_error(
+                "application_restore_lineage_unverifiable",
+                "The original user database restore lineage is not an exact supported profile.",
+            )
+        })?;
+    }
+    if let Some(original) = restore_original_path(
+        privacy_state,
+        &paths.privacy_active,
+        &paths.privacy_rollback,
+    ) {
+        validate_original_privacy_restore_component(original, workspace_instance_id)?;
+    }
+    if let Some(original) =
+        restore_original_path(vault_state, &paths.vault_active, &paths.vault_rollback)
+    {
+        validate_original_vault_restore_component(original, workspace_instance_id)?;
+    }
+
+    match marker {
+        PendingApplicationRestore::V2(_) => {
+            ensure_observed_legacy_three_component_lineage_safe(paths, user_state, privacy_state)?;
+            Ok(None)
+        }
+        PendingApplicationRestore::V3(marker) => {
+            let approved_state = classify_restore_slot_progress(
+                &slots.approved_active,
+                &slots.approved_incoming,
+                &slots.approved_rollback,
+                original_presence.as_ref().map(|values| values[3]),
+            )?;
+            let work_products_state = classify_restore_slot_progress(
+                &slots.work_products_active,
+                &slots.work_products_incoming,
+                &slots.work_products_rollback,
+                original_presence.as_ref().map(|values| values[4]),
+            )?;
+            let approved_root = restore_replacement_path(
+                approved_state,
+                &paths.approved_active,
+                &paths.approved_incoming,
+            );
+            let work_products_root = restore_replacement_path(
+                work_products_state,
+                &paths.work_products_active,
+                &paths.work_products_incoming,
+            );
+            let proof = match approved_workspace {
+                Some(workspace) => workspace.validate_application_restore_components_read_only(
+                    approved_root,
+                    work_products_root,
+                    workspace_instance_id,
+                    &marker.approved_workspace_manifest_sha256,
+                    &marker.work_products_manifest_sha256,
+                ),
+                None => validate_application_restore_components_read_only(
+                    app_local_data_dir,
+                    approved_root,
+                    work_products_root,
+                    workspace_instance_id,
+                    &marker.approved_workspace_manifest_sha256,
+                    &marker.work_products_manifest_sha256,
+                ),
+            }
+            .map_err(approved_mcp_error)?;
+            if proof.workspace_instance_id() != workspace_instance_id {
+                return Err(ipc_error(
+                    "application_restore_environment_mismatch",
+                    "The restored Approved/work-products pair has a different workspace lineage.",
+                ));
+            }
+            Ok(Some(proof))
+        }
+    }
+}
+
+fn restore_replacement_path<'a>(
+    state: RestoreSlotProgress,
+    active: &'a Path,
+    incoming: &'a Path,
+) -> &'a Path {
+    match state {
+        RestoreSlotProgress::PreparedWithOriginal
+        | RestoreSlotProgress::PreparedFromAbsent
+        | RestoreSlotProgress::MovedToRollback => incoming,
+        RestoreSlotProgress::InstalledWithRollback
+        | RestoreSlotProgress::InstalledFromAbsent
+        | RestoreSlotProgress::Cleaned
+        | RestoreSlotProgress::LegacyInstalledWithoutRollback => active,
+    }
+}
+
+fn restore_original_path<'a>(
+    state: RestoreSlotProgress,
+    active: &'a Path,
+    rollback: &'a Path,
+) -> Option<&'a Path> {
+    match state {
+        RestoreSlotProgress::PreparedWithOriginal => Some(active),
+        RestoreSlotProgress::PreparedFromAbsent
+        | RestoreSlotProgress::InstalledFromAbsent
+        | RestoreSlotProgress::Cleaned
+        | RestoreSlotProgress::LegacyInstalledWithoutRollback => None,
+        RestoreSlotProgress::MovedToRollback | RestoreSlotProgress::InstalledWithRollback => {
+            Some(rollback)
+        }
+    }
+}
+
+fn validate_original_privacy_restore_component(
+    path: &Path,
+    expected_workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
+) -> Result<(), IpcError> {
+    validate_restore_file_identity(path)?;
+    ensure_no_database_sidecars(path)?;
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| {
+        ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The original Privacy restore component could not be opened read-only.",
+        )
+    })?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN DEFERRED;")
+        .map_err(|_| {
+            ipc_error(
+                "application_restore_lineage_unverifiable",
+                "The original Privacy restore snapshot could not be fixed read-only.",
+            )
+        })?;
+    let result = (|| {
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|_| application_restore_crash_state_error())?;
+        let foreign_keys = match connection.query_row("PRAGMA foreign_key_check", [], |_| Ok(1_i64))
+        {
+            Ok(_) => 1_i64,
+            Err(rusqlite::Error::QueryReturnedNoRows) => 0_i64,
+            Err(_) => return Err(application_restore_crash_state_error()),
+        };
+        let workspace: String = connection
+            .query_row(
+                "SELECT workspace_instance_id FROM privacy_lifecycle_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| application_restore_crash_state_error())?;
+        let lifecycle = PrivacyLifecycle::open(&connection, expected_workspace_instance_id.clone())
+            .map_err(|_| application_restore_crash_state_error())?;
+        let key_epoch = lifecycle
+            .current_key_epoch(&connection)
+            .map_err(|_| application_restore_crash_state_error())?;
+        if integrity != "ok"
+            || foreign_keys != 0
+            || workspace != expected_workspace_instance_id.as_str()
+            || key_epoch == 0
+        {
+            return Err(application_restore_crash_state_error());
+        }
+        Ok(())
+    })();
+    connection
+        .execute_batch("ROLLBACK")
+        .map_err(|_| application_restore_crash_state_error())?;
+    result
+}
+
+fn ensure_observed_legacy_three_component_lineage_safe(
+    paths: &ApplicationRestorePaths,
+    user_state: RestoreSlotProgress,
+    privacy_state: RestoreSlotProgress,
+) -> Result<(), IpcError> {
+    const UNIFIED_USER_STATE_TABLES: &[&str] = &["case_assistant_pending_outputs"];
+    const UNIFIED_PRIVACY_STATE_TABLES: &[&str] = &[
+        "privacy_materials",
+        "privacy_redactions",
+        "privacy_vault_material_refs",
+        "case_material_selections",
+        "case_material_migration_ledger",
+        "case_material_migration_events",
+        "case_material_legacy_references",
+        "project_privacy_case_bindings",
+        "project_privacy_case_binding_audit",
+        "project_deletion_journal",
+        "case_material_assignment_audit",
+    ];
+    let user_has_state =
+        match restore_original_path(user_state, &paths.user_active, &paths.user_rollback) {
+            Some(path) => restore_database_has_rows(path, UNIFIED_USER_STATE_TABLES, false)?,
+            None => false,
+        };
+    let privacy_has_state = match restore_original_path(
+        privacy_state,
+        &paths.privacy_active,
+        &paths.privacy_rollback,
+    ) {
+        Some(path) => restore_database_has_rows(path, UNIFIED_PRIVACY_STATE_TABLES, false)?,
+        None => false,
+    };
+    let approved_state = restore_workspace_component_has_state(
+        &paths.approved_active,
+        APPROVED_DATABASE_FILE_NAME,
+        "publication_journal",
+    )?;
+    let work_product_state = restore_workspace_component_has_state(
+        &paths.work_products_active,
+        WORK_PRODUCTS_DATABASE_FILE_NAME,
+        "work_product_versions",
+    )?;
+    if user_has_state || privacy_has_state || approved_state || work_product_state {
+        return Err(ipc_error(
+            "application_restore_requires_five_components",
+            "A legacy three-component restore cannot replace a five-component lineage.",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn apply_pending_application_restore_with_approved(
     app_local_data_dir: &Path,
     workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
@@ -2806,14 +4300,28 @@ pub(crate) fn apply_pending_application_restore_with_approved(
     )
 }
 
+#[cfg(test)]
 fn apply_pending_application_restore_internal(
     app_local_data_dir: &Path,
     workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
     approved_workspace: Option<&ApprovedMcpWorkspace>,
 ) -> Result<(), IpcError> {
-    apply_pending_application_restore_with_hook(
+    let observation = observe_pending_application_restore_read_only_with_approved(
         app_local_data_dir,
-        workspace_instance_id,
+        approved_workspace,
+    )?;
+    let PendingApplicationRestoreObservation::Authenticated(gate) = observation else {
+        return Ok(());
+    };
+    if gate.workspace_instance_id() != workspace_instance_id {
+        return Err(ipc_error(
+            "application_restore_environment_mismatch",
+            "The observed full restore is bound to a different workspace.",
+        ));
+    }
+    apply_observed_pending_application_restore_with_hook(
+        app_local_data_dir,
+        &gate,
         approved_workspace,
         |_| Ok(()),
     )
@@ -2821,14 +4329,38 @@ fn apply_pending_application_restore_internal(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplicationRestoreCommitPoint {
+    UserMovedToRollback,
     UserInstalled,
+    PrivacyMovedToRollback,
     PrivacyInstalled,
+    VaultMovedToRollback,
     VaultInstalled,
+    ApprovedWorkspaceMovedToRollback,
     ApprovedWorkspaceInstalled,
+    WorkProductsMovedToRollback,
     WorkProductsInstalled,
     CredentialsInvalidated,
+    UserRollbackCleaned,
+    PrivacyRollbackCleaned,
+    VaultRollbackCleaned,
+    ApprovedWorkspaceRollbackCleaned,
+    WorkProductsRollbackCleaned,
 }
 
+pub(crate) fn apply_observed_pending_application_restore(
+    app_local_data_dir: &Path,
+    gate: &PendingApplicationRestoreGate,
+) -> Result<(), IpcError> {
+    let approved_workspace = ApprovedMcpWorkspace::new(app_local_data_dir.to_path_buf());
+    apply_observed_pending_application_restore_with_hook(
+        app_local_data_dir,
+        gate,
+        Some(&approved_workspace),
+        |_| Ok(()),
+    )
+}
+
+#[cfg(test)]
 fn apply_pending_application_restore_with_hook<Hook>(
     app_local_data_dir: &Path,
     workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
@@ -2838,222 +4370,597 @@ fn apply_pending_application_restore_with_hook<Hook>(
 where
     Hook: FnMut(ApplicationRestoreCommitPoint) -> Result<(), IpcError>,
 {
-    let paths = application_restore_paths(app_local_data_dir);
-    if !restore_path_is_present(&paths.marker)? {
-        cleanup_unmarked_pair_incoming(&paths)?;
+    let PendingApplicationRestoreObservation::Authenticated(gate) =
+        observe_pending_application_restore_read_only_with_approved(
+            app_local_data_dir,
+            approved_workspace,
+        )?
+    else {
         return Ok(());
-    }
-    ensure_no_legacy_user_restore(&paths)?;
-    let marker = read_pair_marker(&paths.marker)?;
-    validate_pair_marker(&marker, workspace_instance_id)?;
-    if matches!(marker, PendingApplicationRestore::V2(_)) {
-        ensure_legacy_three_component_restore_is_lineage_safe(&paths)?;
-    }
-    let (
-        user_database_sha256,
-        privacy_database_sha256,
-        privacy_key_epoch,
-        privacy_store_schema_version,
-        vault_manifest_sha256,
-        vault_archive_sha256,
-    ) = match &marker {
-        PendingApplicationRestore::V2(marker) => (
-            marker.user_database_sha256.as_str(),
-            marker.privacy_database_sha256.as_str(),
-            marker.privacy_key_epoch,
-            PRIVACY_STORE_SCHEMA_VERSION,
-            marker.vault_manifest_sha256.as_str(),
-            marker.vault_archive_sha256.as_str(),
-        ),
-        PendingApplicationRestore::V3(marker) => (
-            marker.user_database_sha256.as_str(),
-            marker.privacy_database_sha256.as_str(),
-            marker.privacy_key_epoch,
-            marker
-                .privacy_store_schema_version
-                .unwrap_or(PRIVACY_STORE_SCHEMA_VERSION),
-            marker.vault_manifest_sha256.as_str(),
-            marker.vault_archive_sha256.as_str(),
-        ),
     };
-    privacy_database_backup_maximum(privacy_store_schema_version)?;
-    let result = (|| {
-        if let PendingApplicationRestore::V3(marker) = &marker {
-            let approved_candidate = pending_directory_candidate(
-                &paths.approved_active,
-                &paths.approved_incoming,
-                &paths.approved_rollback,
-            )?;
-            let work_products_candidate = pending_directory_candidate(
-                &paths.work_products_active,
-                &paths.work_products_incoming,
-                &paths.work_products_rollback,
-            )?;
-            approved_workspace
-                .ok_or_else(|| {
-                    ipc_error(
-                        "application_restore_environment_mismatch",
-                        "The approved workspace restore manager is unavailable.",
-                    )
-                })?
-                .validate_staged_application_backup_manifests(
-                    approved_candidate,
-                    &marker.approved_workspace_manifest_sha256,
-                    work_products_candidate,
-                    &marker.work_products_manifest_sha256,
-                )
-                .map_err(approved_mcp_error)?;
+    if gate.workspace_instance_id() != workspace_instance_id {
+        return Err(ipc_error(
+            "application_restore_environment_mismatch",
+            "The observed full restore is bound to a different workspace.",
+        ));
+    }
+    apply_observed_pending_application_restore_with_hook(
+        app_local_data_dir,
+        &gate,
+        approved_workspace,
+        &mut hook,
+    )
+}
+
+fn apply_observed_pending_application_restore_with_hook<Hook>(
+    app_local_data_dir: &Path,
+    expected_gate: &PendingApplicationRestoreGate,
+    approved_workspace: Option<&ApprovedMcpWorkspace>,
+    mut hook: Hook,
+) -> Result<(), IpcError>
+where
+    Hook: FnMut(ApplicationRestoreCommitPoint) -> Result<(), IpcError>,
+{
+    let owned_workspace;
+    let approved_workspace = match approved_workspace {
+        Some(workspace) => workspace,
+        None => {
+            owned_workspace = ApprovedMcpWorkspace::new(app_local_data_dir.to_path_buf());
+            &owned_workspace
         }
-        advance_component(
-            &paths.user_active,
-            &paths.user_incoming,
-            &paths.user_rollback,
-            user_database_sha256,
-            MAX_USER_DATABASE_BACKUP_BYTES,
-            |path| validate_user_component(path, user_database_sha256),
-        )?;
-        hook(ApplicationRestoreCommitPoint::UserInstalled)?;
-        advance_component(
-            &paths.privacy_active,
-            &paths.privacy_incoming,
-            &paths.privacy_rollback,
-            privacy_database_sha256,
-            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES,
-            |path| {
-                validate_privacy_component(
-                    path,
-                    workspace_instance_id,
-                    privacy_key_epoch,
-                    privacy_store_schema_version,
-                    privacy_database_sha256,
-                )
-            },
-        )?;
-        hook(ApplicationRestoreCommitPoint::PrivacyInstalled)?;
-        advance_vault_component(
-            &paths.vault_active,
-            &paths.vault_incoming,
-            &paths.vault_rollback,
-            workspace_instance_id,
-            vault_manifest_sha256,
-            vault_archive_sha256,
-        )?;
-        hook(ApplicationRestoreCommitPoint::VaultInstalled)?;
-        if let PendingApplicationRestore::V3(marker) = &marker {
-            advance_restore_directory(
-                &paths.approved_active,
-                &paths.approved_incoming,
-                &paths.approved_rollback,
-            )?;
-            hook(ApplicationRestoreCommitPoint::ApprovedWorkspaceInstalled)?;
-            advance_restore_directory(
-                &paths.work_products_active,
-                &paths.work_products_incoming,
-                &paths.work_products_rollback,
-            )?;
-            hook(ApplicationRestoreCommitPoint::WorkProductsInstalled)?;
-            let approved_workspace = approved_workspace.ok_or_else(|| {
-                ipc_error(
-                    "application_restore_environment_mismatch",
-                    "The approved workspace restore manager is unavailable.",
-                )
-            })?;
-            approved_workspace
-                .validate_staged_application_backup_manifests(
-                    &paths.approved_active,
-                    &marker.approved_workspace_manifest_sha256,
-                    &paths.work_products_active,
-                    &marker.work_products_manifest_sha256,
-                )
-                .map_err(approved_mcp_error)?;
-            approved_workspace
-                .invalidate_after_application_restore()
-                .map_err(approved_mcp_error)?;
-            hook(ApplicationRestoreCommitPoint::CredentialsInvalidated)?;
-            if !is_hash(&marker.approved_workspace_bundle_sha256)
-                || !is_hash(&marker.work_products_bundle_sha256)
-            {
-                return Err(ipc_error(
-                    "application_restore_tampered",
-                    "The approved workspace restore binding is invalid.",
-                ));
-            }
-        }
-        validate_user_component(&paths.user_active, user_database_sha256)?;
-        validate_privacy_component(
-            &paths.privacy_active,
-            workspace_instance_id,
-            privacy_key_epoch,
-            privacy_store_schema_version,
-            privacy_database_sha256,
-        )?;
-        validate_vault_component(
-            &paths.vault_active,
-            workspace_instance_id,
-            vault_manifest_sha256,
-            vault_archive_sha256,
-        )
-    })();
-    if let Err(error) = result {
-        let mut cleanup_error = None;
-        record_cleanup_error(
-            &mut cleanup_error,
-            rollback_restore_directory(
-                &paths.work_products_active,
-                &paths.work_products_incoming,
-                &paths.work_products_rollback,
-            ),
-        );
-        record_cleanup_error(
-            &mut cleanup_error,
-            rollback_restore_directory(
-                &paths.approved_active,
-                &paths.approved_incoming,
-                &paths.approved_rollback,
-            ),
-        );
-        record_cleanup_error(
-            &mut cleanup_error,
-            rollback_component(
+    };
+    let mut gate = reobserve_exact_application_restore_gate(
+        app_local_data_dir,
+        expected_gate,
+        approved_workspace,
+    )?;
+    let paths = application_restore_paths(app_local_data_dir);
+    let v3 = matches!(gate.marker, PendingApplicationRestore::V3(_));
+    let initial_cleanup = matches!(
+        gate.phase,
+        PendingApplicationRestorePhase::InstalledPendingCleanup { .. }
+    );
+    let original_absent = observed_original_absence(&gate)?;
+
+    if !initial_cleanup {
+        let swap_result = (|| {
+            install_observed_restore_component(
+                app_local_data_dir,
+                &mut gate,
                 &paths.user_active,
                 &paths.user_incoming,
                 &paths.user_rollback,
-            ),
-        );
-        record_cleanup_error(
-            &mut cleanup_error,
-            rollback_vault_component(
-                &paths.vault_active,
-                &paths.vault_incoming,
-                &paths.vault_rollback,
-            ),
-        );
-        record_cleanup_error(
-            &mut cleanup_error,
-            rollback_component(
+                false,
+                approved_workspace,
+                ApplicationRestoreCommitPoint::UserMovedToRollback,
+                ApplicationRestoreCommitPoint::UserInstalled,
+                &mut hook,
+            )?;
+            install_observed_restore_component(
+                app_local_data_dir,
+                &mut gate,
                 &paths.privacy_active,
                 &paths.privacy_incoming,
                 &paths.privacy_rollback,
-            ),
-        );
-        if let Some(cleanup_error) = cleanup_error {
-            return Err(cleanup_error);
+                false,
+                approved_workspace,
+                ApplicationRestoreCommitPoint::PrivacyMovedToRollback,
+                ApplicationRestoreCommitPoint::PrivacyInstalled,
+                &mut hook,
+            )?;
+            install_observed_restore_component(
+                app_local_data_dir,
+                &mut gate,
+                &paths.vault_active,
+                &paths.vault_incoming,
+                &paths.vault_rollback,
+                true,
+                approved_workspace,
+                ApplicationRestoreCommitPoint::VaultMovedToRollback,
+                ApplicationRestoreCommitPoint::VaultInstalled,
+                &mut hook,
+            )?;
+            if v3 {
+                install_observed_restore_component(
+                    app_local_data_dir,
+                    &mut gate,
+                    &paths.approved_active,
+                    &paths.approved_incoming,
+                    &paths.approved_rollback,
+                    true,
+                    approved_workspace,
+                    ApplicationRestoreCommitPoint::ApprovedWorkspaceMovedToRollback,
+                    ApplicationRestoreCommitPoint::ApprovedWorkspaceInstalled,
+                    &mut hook,
+                )?;
+                install_observed_restore_component(
+                    app_local_data_dir,
+                    &mut gate,
+                    &paths.work_products_active,
+                    &paths.work_products_incoming,
+                    &paths.work_products_rollback,
+                    true,
+                    approved_workspace,
+                    ApplicationRestoreCommitPoint::WorkProductsMovedToRollback,
+                    ApplicationRestoreCommitPoint::WorkProductsInstalled,
+                    &mut hook,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = swap_result {
+            rollback_observed_application_restore(&paths, &original_absent, v3)?;
+            remove_if_exists(&paths.marker)?;
+            return Err(error);
         }
-        remove_if_exists(&paths.marker)?;
-        return Err(error);
     }
-    remove_database_restore_files(&paths.user_rollback)?;
-    remove_database_restore_files(&paths.privacy_rollback)?;
-    remove_vault_restore_directory(&paths.vault_rollback)?;
-    remove_restore_directory(&paths.approved_rollback)?;
-    remove_restore_directory(&paths.work_products_rollback)?;
-    remove_database_restore_files(&paths.user_incoming)?;
-    remove_database_restore_files(&paths.privacy_incoming)?;
-    remove_vault_restore_directory(&paths.vault_incoming)?;
-    remove_restore_directory(&paths.approved_incoming)?;
-    remove_restore_directory(&paths.work_products_incoming)?;
-    remove_if_exists(&paths.marker)?;
+
+    gate = observe_authenticated_application_restore_gate(app_local_data_dir, approved_workspace)?;
+    if v3 && !observed_present_original_cleanup_exists(&gate)? {
+        reobserve_exact_application_restore_gate(app_local_data_dir, &gate, approved_workspace)?;
+        approved_workspace
+            .invalidate_after_application_restore()
+            .map_err(approved_mcp_error)?;
+        gate =
+            observe_authenticated_application_restore_gate(app_local_data_dir, approved_workspace)?;
+        hook(ApplicationRestoreCommitPoint::CredentialsInvalidated)?;
+    }
+
+    cleanup_observed_restore_file(
+        app_local_data_dir,
+        &mut gate,
+        &paths.user_rollback,
+        approved_workspace,
+        ApplicationRestoreCommitPoint::UserRollbackCleaned,
+        &mut hook,
+    )?;
+    cleanup_observed_restore_file(
+        app_local_data_dir,
+        &mut gate,
+        &paths.privacy_rollback,
+        approved_workspace,
+        ApplicationRestoreCommitPoint::PrivacyRollbackCleaned,
+        &mut hook,
+    )?;
+    cleanup_observed_restore_directory(
+        app_local_data_dir,
+        &mut gate,
+        &paths.vault_rollback,
+        true,
+        approved_workspace,
+        ApplicationRestoreCommitPoint::VaultRollbackCleaned,
+        &mut hook,
+    )?;
+    if v3 {
+        cleanup_observed_restore_directory(
+            app_local_data_dir,
+            &mut gate,
+            &paths.approved_rollback,
+            false,
+            approved_workspace,
+            ApplicationRestoreCommitPoint::ApprovedWorkspaceRollbackCleaned,
+            &mut hook,
+        )?;
+        cleanup_observed_restore_directory(
+            app_local_data_dir,
+            &mut gate,
+            &paths.work_products_rollback,
+            false,
+            approved_workspace,
+            ApplicationRestoreCommitPoint::WorkProductsRollbackCleaned,
+            &mut hook,
+        )?;
+    }
+    reobserve_exact_application_restore_gate(app_local_data_dir, &gate, approved_workspace)?;
+    remove_if_exists(&paths.marker)
+}
+
+fn observed_present_original_cleanup_exists(
+    gate: &PendingApplicationRestoreGate,
+) -> Result<bool, IpcError> {
+    let Some(original_presence) = marker_original_presence(&gate.marker)? else {
+        // Pre-presence V3 markers cannot distinguish a cleaned present original
+        // from an installed absent original. Replaying the monotonic revocation
+        // is safer than treating an unauthenticated numeric prefix as proof.
+        return Ok(false);
+    };
+    let mut states = vec![
+        classify_restore_slot_progress(
+            &gate.slots.user_active,
+            &gate.slots.user_incoming,
+            &gate.slots.user_rollback,
+            Some(original_presence[0]),
+        )?,
+        classify_restore_slot_progress(
+            &gate.slots.privacy_active,
+            &gate.slots.privacy_incoming,
+            &gate.slots.privacy_rollback,
+            Some(original_presence[1]),
+        )?,
+        classify_restore_slot_progress(
+            &gate.slots.vault_active,
+            &gate.slots.vault_incoming,
+            &gate.slots.vault_rollback,
+            Some(original_presence[2]),
+        )?,
+    ];
+    if matches!(gate.marker, PendingApplicationRestore::V3(_)) {
+        states.push(classify_restore_slot_progress(
+            &gate.slots.approved_active,
+            &gate.slots.approved_incoming,
+            &gate.slots.approved_rollback,
+            Some(original_presence[3]),
+        )?);
+        states.push(classify_restore_slot_progress(
+            &gate.slots.work_products_active,
+            &gate.slots.work_products_incoming,
+            &gate.slots.work_products_rollback,
+            Some(original_presence[4]),
+        )?);
+    }
+    Ok(original_presence
+        .iter()
+        .zip(states)
+        .any(|(present, state)| *present && state == RestoreSlotProgress::Cleaned))
+}
+
+fn observe_authenticated_application_restore_gate(
+    app_local_data_dir: &Path,
+    approved_workspace: &ApprovedMcpWorkspace,
+) -> Result<PendingApplicationRestoreGate, IpcError> {
+    match observe_pending_application_restore_read_only_with_approved(
+        app_local_data_dir,
+        Some(approved_workspace),
+    )? {
+        PendingApplicationRestoreObservation::Authenticated(gate) => Ok(gate),
+        PendingApplicationRestoreObservation::Absent => {
+            Err(application_restore_observation_changed())
+        }
+    }
+}
+
+fn reobserve_exact_application_restore_gate(
+    app_local_data_dir: &Path,
+    expected_gate: &PendingApplicationRestoreGate,
+    approved_workspace: &ApprovedMcpWorkspace,
+) -> Result<PendingApplicationRestoreGate, IpcError> {
+    let observed =
+        observe_authenticated_application_restore_gate(app_local_data_dir, approved_workspace)?;
+    if &observed != expected_gate {
+        return Err(application_restore_observation_changed());
+    }
+    Ok(observed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_observed_restore_component<Hook>(
+    app_local_data_dir: &Path,
+    gate: &mut PendingApplicationRestoreGate,
+    active: &Path,
+    incoming: &Path,
+    rollback: &Path,
+    directory: bool,
+    approved_workspace: &ApprovedMcpWorkspace,
+    moved_point: ApplicationRestoreCommitPoint,
+    installed_point: ApplicationRestoreCommitPoint,
+    hook: &mut Hook,
+) -> Result<(), IpcError>
+where
+    Hook: FnMut(ApplicationRestoreCommitPoint) -> Result<(), IpcError>,
+{
+    let state = restore_component_state_from_gate(gate, active)?;
+    if state == RestoreSlotProgress::PreparedWithOriginal {
+        perform_observed_restore_rename(
+            app_local_data_dir,
+            gate,
+            active,
+            rollback,
+            directory,
+            approved_workspace,
+        )?;
+        hook(moved_point)?;
+    }
+    let state = restore_component_state_from_gate(gate, active)?;
+    if matches!(
+        state,
+        RestoreSlotProgress::PreparedFromAbsent | RestoreSlotProgress::MovedToRollback
+    ) {
+        perform_observed_restore_rename(
+            app_local_data_dir,
+            gate,
+            incoming,
+            active,
+            directory,
+            approved_workspace,
+        )?;
+        hook(installed_point)?;
+    }
     Ok(())
+}
+
+fn perform_observed_restore_rename(
+    app_local_data_dir: &Path,
+    gate: &mut PendingApplicationRestoreGate,
+    from: &Path,
+    to: &Path,
+    directory: bool,
+    approved_workspace: &ApprovedMcpWorkspace,
+) -> Result<(), IpcError> {
+    reobserve_exact_application_restore_gate(app_local_data_dir, gate, approved_workspace)?;
+    if restore_path_is_present(to)? || !restore_path_is_present(from)? {
+        return Err(application_restore_crash_state_error());
+    }
+    if directory {
+        validate_restore_directory_identity(from)?;
+    } else {
+        validate_restore_file_identity(from)?;
+        ensure_no_database_sidecars(from)?;
+    }
+    fs::rename(from, to).map_err(|_| {
+        ipc_error(
+            "application_restore_io",
+            "An authenticated full-restore component could not enter its next fixed slot.",
+        )
+    })?;
+    *gate = observe_authenticated_application_restore_gate(app_local_data_dir, approved_workspace)?;
+    Ok(())
+}
+
+fn restore_component_state_from_gate(
+    gate: &PendingApplicationRestoreGate,
+    active: &Path,
+) -> Result<RestoreSlotProgress, IpcError> {
+    let paths = application_restore_paths_from_active(active)?;
+    let original_presence = marker_original_presence(&gate.marker)?;
+    let (active, incoming, rollback, index) = match paths {
+        RestoreGateSlotRefs::User => (
+            &gate.slots.user_active,
+            &gate.slots.user_incoming,
+            &gate.slots.user_rollback,
+            0,
+        ),
+        RestoreGateSlotRefs::Privacy => (
+            &gate.slots.privacy_active,
+            &gate.slots.privacy_incoming,
+            &gate.slots.privacy_rollback,
+            1,
+        ),
+        RestoreGateSlotRefs::Vault => (
+            &gate.slots.vault_active,
+            &gate.slots.vault_incoming,
+            &gate.slots.vault_rollback,
+            2,
+        ),
+        RestoreGateSlotRefs::Approved => (
+            &gate.slots.approved_active,
+            &gate.slots.approved_incoming,
+            &gate.slots.approved_rollback,
+            3,
+        ),
+        RestoreGateSlotRefs::WorkProducts => (
+            &gate.slots.work_products_active,
+            &gate.slots.work_products_incoming,
+            &gate.slots.work_products_rollback,
+            4,
+        ),
+    };
+    classify_restore_slot_progress(
+        active,
+        incoming,
+        rollback,
+        original_presence.as_ref().map(|values| values[index]),
+    )
+}
+
+enum RestoreGateSlotRefs {
+    User,
+    Privacy,
+    Vault,
+    Approved,
+    WorkProducts,
+}
+
+fn application_restore_paths_from_active(active: &Path) -> Result<RestoreGateSlotRefs, IpcError> {
+    let name = active
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    match name {
+        "user.sqlite" => Ok(RestoreGateSlotRefs::User),
+        "privacy-workflow.sqlite" => Ok(RestoreGateSlotRefs::Privacy),
+        VAULT_DIRECTORY_NAME => Ok(RestoreGateSlotRefs::Vault),
+        APPROVED_DIRECTORY_NAME => Ok(RestoreGateSlotRefs::Approved),
+        WORK_PRODUCTS_DIRECTORY_NAME => Ok(RestoreGateSlotRefs::WorkProducts),
+        _ => Err(application_restore_crash_state_error()),
+    }
+}
+
+fn observed_original_absence(gate: &PendingApplicationRestoreGate) -> Result<[bool; 5], IpcError> {
+    if let Some(original_presence) = marker_original_presence(&gate.marker)? {
+        let mut absent = [false; 5];
+        for (index, present) in original_presence.into_iter().enumerate() {
+            absent[index] = !present;
+        }
+        return Ok(absent);
+    }
+    let mut states = vec![
+        classify_restore_slot_progress(
+            &gate.slots.user_active,
+            &gate.slots.user_incoming,
+            &gate.slots.user_rollback,
+            None,
+        )?,
+        classify_restore_slot_progress(
+            &gate.slots.privacy_active,
+            &gate.slots.privacy_incoming,
+            &gate.slots.privacy_rollback,
+            None,
+        )?,
+        classify_restore_slot_progress(
+            &gate.slots.vault_active,
+            &gate.slots.vault_incoming,
+            &gate.slots.vault_rollback,
+            None,
+        )?,
+    ];
+    if matches!(gate.marker, PendingApplicationRestore::V3(_)) {
+        states.push(classify_restore_slot_progress(
+            &gate.slots.approved_active,
+            &gate.slots.approved_incoming,
+            &gate.slots.approved_rollback,
+            None,
+        )?);
+        states.push(classify_restore_slot_progress(
+            &gate.slots.work_products_active,
+            &gate.slots.work_products_incoming,
+            &gate.slots.work_products_rollback,
+            None,
+        )?);
+    }
+    let mut absent = [false; 5];
+    for (index, state) in states.into_iter().enumerate() {
+        absent[index] = matches!(
+            state,
+            RestoreSlotProgress::PreparedFromAbsent
+                | RestoreSlotProgress::LegacyInstalledWithoutRollback
+        );
+    }
+    Ok(absent)
+}
+
+fn rollback_observed_application_restore(
+    paths: &ApplicationRestorePaths,
+    original_absent: &[bool; 5],
+    v3: bool,
+) -> Result<(), IpcError> {
+    if v3 {
+        rollback_observed_restore_directory(
+            &paths.work_products_active,
+            &paths.work_products_incoming,
+            &paths.work_products_rollback,
+            original_absent[4],
+            false,
+        )?;
+        rollback_observed_restore_directory(
+            &paths.approved_active,
+            &paths.approved_incoming,
+            &paths.approved_rollback,
+            original_absent[3],
+            false,
+        )?;
+    }
+    rollback_observed_restore_directory(
+        &paths.vault_active,
+        &paths.vault_incoming,
+        &paths.vault_rollback,
+        original_absent[2],
+        true,
+    )?;
+    rollback_observed_restore_file(
+        &paths.privacy_active,
+        &paths.privacy_incoming,
+        &paths.privacy_rollback,
+        original_absent[1],
+    )?;
+    rollback_observed_restore_file(
+        &paths.user_active,
+        &paths.user_incoming,
+        &paths.user_rollback,
+        original_absent[0],
+    )
+}
+
+fn rollback_observed_restore_file(
+    active: &Path,
+    incoming: &Path,
+    rollback: &Path,
+    original_absent: bool,
+) -> Result<(), IpcError> {
+    if restore_path_is_present(rollback)? {
+        remove_database_restore_files(active)?;
+        fs::rename(rollback, active).map_err(|_| {
+            ipc_error(
+                "application_restore_rollback_failed",
+                "An original database component could not be restored.",
+            )
+        })?;
+    } else if original_absent && !restore_path_is_present(incoming)? {
+        remove_database_restore_files(active)?;
+    }
+    remove_database_restore_files(incoming)
+}
+
+fn rollback_observed_restore_directory(
+    active: &Path,
+    incoming: &Path,
+    rollback: &Path,
+    original_absent: bool,
+    vault: bool,
+) -> Result<(), IpcError> {
+    let remove = |path: &Path| {
+        if vault {
+            remove_vault_restore_directory(path)
+        } else {
+            remove_restore_directory(path)
+        }
+    };
+    if restore_path_is_present(rollback)? {
+        remove(active)?;
+        fs::rename(rollback, active).map_err(|_| {
+            ipc_error(
+                "application_restore_rollback_failed",
+                "An original directory component could not be restored.",
+            )
+        })?;
+    } else if original_absent && !restore_path_is_present(incoming)? {
+        remove(active)?;
+    }
+    remove(incoming)
+}
+
+fn cleanup_observed_restore_file<Hook>(
+    app_local_data_dir: &Path,
+    gate: &mut PendingApplicationRestoreGate,
+    rollback: &Path,
+    approved_workspace: &ApprovedMcpWorkspace,
+    point: ApplicationRestoreCommitPoint,
+    hook: &mut Hook,
+) -> Result<(), IpcError>
+where
+    Hook: FnMut(ApplicationRestoreCommitPoint) -> Result<(), IpcError>,
+{
+    if !restore_path_is_present(rollback)? {
+        return Ok(());
+    }
+    reobserve_exact_application_restore_gate(app_local_data_dir, gate, approved_workspace)?;
+    remove_database_restore_files(rollback)?;
+    *gate = observe_authenticated_application_restore_gate(app_local_data_dir, approved_workspace)?;
+    hook(point)
+}
+
+fn cleanup_observed_restore_directory<Hook>(
+    app_local_data_dir: &Path,
+    gate: &mut PendingApplicationRestoreGate,
+    rollback: &Path,
+    vault: bool,
+    approved_workspace: &ApprovedMcpWorkspace,
+    point: ApplicationRestoreCommitPoint,
+    hook: &mut Hook,
+) -> Result<(), IpcError>
+where
+    Hook: FnMut(ApplicationRestoreCommitPoint) -> Result<(), IpcError>,
+{
+    if !restore_path_is_present(rollback)? {
+        return Ok(());
+    }
+    reobserve_exact_application_restore_gate(app_local_data_dir, gate, approved_workspace)?;
+    if vault {
+        remove_vault_restore_directory(rollback)?;
+    } else {
+        remove_restore_directory(rollback)?;
+    }
+    *gate = observe_authenticated_application_restore_gate(app_local_data_dir, approved_workspace)?;
+    hook(point)
 }
 
 fn snapshot_user_database(
@@ -3496,11 +5403,12 @@ fn sibling_restore_path(active: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn vault_component_summary(
+fn exact_vault_replacement_summary(
     path: &Path,
     workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
 ) -> Result<privacy::VaultBackupSummaryV1, IpcError> {
     validate_restore_directory_identity(path)?;
+    ensure_no_vault_database_sidecars(path)?;
     let (store, _schema_upgrade_required) =
         VaultStore::open_for_application_startup(path, workspace_instance_id.clone())
             .map_err(vault_store_error)?;
@@ -3514,12 +5422,51 @@ fn vault_component_summary(
             "The staged Vault did not retain its private ACL, no-index, and encryption controls.",
         ));
     }
-    store
-        .verify_all_committed_objects()
-        .map_err(vault_store_error)?;
     let (_archive, summary) =
-        privacy::export_encrypted_vault_backup(&store).map_err(vault_backup_error)?;
+        privacy::export_encrypted_vault_backup_read_only(&store).map_err(vault_backup_error)?;
     Ok(summary)
+}
+
+fn validate_original_vault_restore_component(
+    path: &Path,
+    workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
+) -> Result<(), IpcError> {
+    validate_restore_directory_identity(path)?;
+    let (store, _schema_upgrade_required) =
+        VaultStore::open_for_application_startup(path, workspace_instance_id.clone())
+            .map_err(vault_store_error)?;
+    let isolation = store.isolation_status().map_err(vault_store_error)?;
+    if !isolation.private_acl_enforced
+        || !isolation.content_indexing_disabled
+        || !isolation.encrypted_at_rest
+    {
+        return Err(ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The original Vault lineage did not retain its private ACL, no-index, and encryption controls.",
+        ));
+    }
+    privacy::validate_encrypted_vault_lineage_read_only(&store).map_err(|_| {
+        ipc_error(
+            "application_restore_lineage_unverifiable",
+            "The original Vault restore lineage is not an exact supported profile.",
+        )
+    })
+}
+
+fn ensure_no_vault_database_sidecars(path: &Path) -> Result<(), IpcError> {
+    for name in [
+        "vault-state.sqlite-journal",
+        "vault-state.sqlite-wal",
+        "vault-state.sqlite-shm",
+    ] {
+        if restore_path_is_present(&path.join(name))? {
+            return Err(ipc_error(
+                "application_restore_conflict",
+                "A staged Vault replacement has an unexpected journal or WAL sidecar.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_vault_component(
@@ -3528,7 +5475,7 @@ fn validate_vault_component(
     expected_manifest_sha256: &str,
     expected_archive_sha256: &str,
 ) -> Result<(), IpcError> {
-    let summary = vault_component_summary(path, workspace_instance_id)?;
+    let summary = exact_vault_replacement_summary(path, workspace_instance_id)?;
     if summary.manifest_sha256.as_str() != expected_manifest_sha256
         || summary.archive_sha256.as_str() != expected_archive_sha256
     {
@@ -3540,281 +5487,6 @@ fn validate_vault_component(
     Ok(())
 }
 
-fn advance_vault_component(
-    active: &Path,
-    incoming: &Path,
-    rollback: &Path,
-    workspace_instance_id: &privacy::vnext::WorkspaceInstanceId,
-    expected_manifest_sha256: &str,
-    expected_archive_sha256: &str,
-) -> Result<(), IpcError> {
-    if restore_path_is_present(active)? {
-        let summary = vault_component_summary(active, workspace_instance_id)?;
-        if summary.manifest_sha256.as_str() == expected_manifest_sha256
-            && summary.archive_sha256.as_str() == expected_archive_sha256
-        {
-            if restore_path_is_present(incoming)? {
-                validate_vault_component(
-                    incoming,
-                    workspace_instance_id,
-                    expected_manifest_sha256,
-                    expected_archive_sha256,
-                )?;
-            }
-            return Ok(());
-        }
-    }
-    if !restore_path_is_present(incoming)? {
-        return Err(ipc_error(
-            "application_restore_incomplete",
-            "The authenticated incoming Vault restore component is missing.",
-        ));
-    }
-    validate_vault_component(
-        incoming,
-        workspace_instance_id,
-        expected_manifest_sha256,
-        expected_archive_sha256,
-    )?;
-    if !restore_path_is_present(rollback)? {
-        if !restore_path_is_present(active)? {
-            return Err(ipc_error(
-                "application_restore_incomplete",
-                "The active and rollback Vault components are both missing.",
-            ));
-        }
-        validate_restore_directory_identity(active)?;
-        fs::rename(active, rollback).map_err(|_| {
-            ipc_error(
-                "application_restore_io",
-                "The active Vault could not enter its fixed rollback slot.",
-            )
-        })?;
-        validate_restore_directory_identity(rollback)?;
-    } else {
-        validate_restore_directory_identity(rollback)?;
-    }
-    fs::rename(incoming, active).map_err(|_| {
-        ipc_error(
-            "application_restore_io",
-            "The authenticated Vault could not be atomically installed.",
-        )
-    })?;
-    validate_vault_component(
-        active,
-        workspace_instance_id,
-        expected_manifest_sha256,
-        expected_archive_sha256,
-    )
-}
-
-fn rollback_vault_component(
-    active: &Path,
-    incoming: &Path,
-    rollback: &Path,
-) -> Result<(), IpcError> {
-    if restore_path_is_present(rollback)? {
-        validate_restore_directory_identity(rollback)?;
-        if restore_path_is_present(active)? {
-            remove_vault_restore_directory(active)?;
-        }
-        fs::rename(rollback, active).map_err(|_| {
-            ipc_error(
-                "application_restore_rollback_failed",
-                "The original Vault could not be restored from its fixed rollback slot.",
-            )
-        })?;
-        validate_restore_directory_identity(active)?;
-    }
-    remove_vault_restore_directory(incoming)
-}
-
-fn pending_directory_candidate<'a>(
-    active: &'a Path,
-    incoming: &'a Path,
-    rollback: &'a Path,
-) -> Result<&'a Path, IpcError> {
-    let active_present = restore_path_is_present(active)?;
-    let incoming_present = restore_path_is_present(incoming)?;
-    let rollback_present = restore_path_is_present(rollback)?;
-    if active_present && incoming_present && rollback_present {
-        return Err(ipc_error(
-            "application_restore_conflict",
-            "An application restore directory occupies active, incoming, and rollback slots simultaneously.",
-        ));
-    }
-    let candidate = if incoming_present {
-        incoming
-    } else if active_present {
-        active
-    } else {
-        return Err(ipc_error(
-            "application_restore_incomplete",
-            "An authenticated application restore directory is missing.",
-        ));
-    };
-    validate_restore_directory_identity(candidate)?;
-    if rollback_present {
-        validate_restore_directory_identity(rollback)?;
-    }
-    Ok(candidate)
-}
-
-fn advance_restore_directory(
-    active: &Path,
-    incoming: &Path,
-    rollback: &Path,
-) -> Result<(), IpcError> {
-    let active_present = restore_path_is_present(active)?;
-    let incoming_present = restore_path_is_present(incoming)?;
-    let rollback_present = restore_path_is_present(rollback)?;
-    if rollback_present {
-        validate_restore_directory_identity(rollback)?;
-        return match (active_present, incoming_present) {
-            (true, false) => validate_restore_directory_identity(active),
-            (false, true) => {
-                validate_restore_directory_identity(incoming)?;
-                fs::rename(incoming, active).map_err(|_| {
-                    ipc_error(
-                        "application_restore_io",
-                        "The authenticated restore directory could not be installed after a crash.",
-                    )
-                })?;
-                validate_restore_directory_identity(active)
-            }
-            _ => Err(ipc_error(
-                "application_restore_conflict",
-                "The restore directory transaction has an ambiguous crash-recovery state.",
-            )),
-        };
-    }
-    if !incoming_present {
-        if !active_present {
-            return Err(ipc_error(
-                "application_restore_incomplete",
-                "The active and incoming restore directories are both missing.",
-            ));
-        }
-        return validate_restore_directory_identity(active);
-    }
-    if !active_present {
-        return Err(ipc_error(
-            "application_restore_incomplete",
-            "The active and rollback restore directories are both missing.",
-        ));
-    }
-    validate_restore_directory_identity(active)?;
-    validate_restore_directory_identity(incoming)?;
-    fs::rename(active, rollback).map_err(|_| {
-        ipc_error(
-            "application_restore_io",
-            "The active restore directory could not enter its fixed rollback slot.",
-        )
-    })?;
-    validate_restore_directory_identity(rollback)?;
-    fs::rename(incoming, active).map_err(|_| {
-        ipc_error(
-            "application_restore_io",
-            "The authenticated restore directory could not be atomically installed.",
-        )
-    })?;
-    validate_restore_directory_identity(active)
-}
-
-fn rollback_restore_directory(
-    active: &Path,
-    incoming: &Path,
-    rollback: &Path,
-) -> Result<(), IpcError> {
-    if restore_path_is_present(rollback)? {
-        validate_restore_directory_identity(rollback)?;
-        if restore_path_is_present(active)? {
-            remove_restore_directory(active)?;
-        }
-        fs::rename(rollback, active).map_err(|_| {
-            ipc_error(
-                "application_restore_rollback_failed",
-                "The original application restore directory could not be restored.",
-            )
-        })?;
-        validate_restore_directory_identity(active)?;
-    }
-    remove_restore_directory(incoming)
-}
-
-fn advance_component<Validate>(
-    active: &Path,
-    incoming: &Path,
-    rollback: &Path,
-    expected_sha256: &str,
-    maximum_bytes: usize,
-    validate: Validate,
-) -> Result<(), IpcError>
-where
-    Validate: Fn(&Path) -> Result<(), IpcError>,
-{
-    if restore_path_is_present(active)? && file_sha256(active, maximum_bytes)? == expected_sha256 {
-        validate(active)?;
-        if restore_path_is_present(incoming)? {
-            validate(incoming)?;
-            ensure_no_database_sidecars(incoming)?;
-        }
-        return Ok(());
-    }
-    if !restore_path_is_present(incoming)? {
-        return Err(ipc_error(
-            "application_restore_incomplete",
-            "The authenticated incoming restore component is missing.",
-        ));
-    }
-    validate(incoming)?;
-    ensure_no_database_sidecars(incoming)?;
-    if !restore_path_is_present(rollback)? {
-        if !restore_path_is_present(active)? {
-            return Err(ipc_error(
-                "application_restore_incomplete",
-                "The active and rollback database components are both missing.",
-            ));
-        }
-        validate_restore_file_identity(active)?;
-        ensure_no_database_sidecars(active)?;
-        fs::rename(active, rollback).map_err(|_| {
-            ipc_error(
-                "application_restore_io",
-                "The active database could not enter the fixed rollback slot.",
-            )
-        })?;
-        validate_restore_file_identity(rollback)?;
-    } else {
-        validate_restore_file_identity(rollback)?;
-        ensure_no_database_sidecars(rollback)?;
-    }
-    fs::rename(incoming, active).map_err(|_| {
-        ipc_error(
-            "application_restore_io",
-            "The authenticated restore component could not be atomically installed.",
-        )
-    })?;
-    validate(active)
-}
-
-fn rollback_component(active: &Path, incoming: &Path, rollback: &Path) -> Result<(), IpcError> {
-    if restore_path_is_present(rollback)? {
-        validate_restore_file_identity(rollback)?;
-        ensure_no_database_sidecars(rollback)?;
-        if restore_path_is_present(active)? {
-            remove_database_restore_files(active)?;
-        }
-        fs::rename(rollback, active).map_err(|_| {
-            ipc_error(
-                "application_restore_rollback_failed",
-                "The original database could not be restored from the fixed rollback slot.",
-            )
-        })?;
-        validate_restore_file_identity(active)?;
-    }
-    remove_database_restore_files(incoming)
-}
 fn ensure_pair_restore_slot_empty(paths: &ApplicationRestorePaths) -> Result<(), IpcError> {
     for path in [
         &paths.marker,
@@ -3836,22 +5508,6 @@ fn ensure_pair_restore_slot_empty(paths: &ApplicationRestorePaths) -> Result<(),
             return Err(ipc_error(
                 "application_restore_conflict",
                 "A fixed application restore transaction slot is already occupied.",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_no_legacy_user_restore(paths: &ApplicationRestorePaths) -> Result<(), IpcError> {
-    for path in [
-        &paths.legacy_user_incoming,
-        &paths.legacy_user_marker,
-        &paths.legacy_user_rollback,
-    ] {
-        if restore_path_is_present(path)? {
-            return Err(ipc_error(
-                "application_restore_conflict",
-                "A legacy user-database restore transaction is still present.",
             ));
         }
     }
@@ -3897,6 +5553,7 @@ fn cleanup_pair_incoming(paths: &ApplicationRestorePaths) -> Result<(), IpcError
     cleanup_error.map_or(Ok(()), Err)
 }
 
+#[cfg(test)]
 fn cleanup_unmarked_pair_incoming(paths: &ApplicationRestorePaths) -> Result<(), IpcError> {
     if restore_path_is_present(&paths.user_rollback)?
         || restore_path_is_present(&paths.privacy_rollback)?
@@ -4077,6 +5734,7 @@ fn write_pair_marker(path: &Path, marker: &PendingApplicationRestore) -> Result<
     write_new_file(path, &protected)
 }
 
+#[cfg(test)]
 fn read_pair_marker(path: &Path) -> Result<PendingApplicationRestore, IpcError> {
     let protected = read_local_file(path, FULL_RESTORE_MARKER_MAX_BYTES)?;
     let plaintext = SensitiveBytes(unprotect_local(&protected).map_err(|_| {

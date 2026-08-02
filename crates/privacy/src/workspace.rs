@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -692,6 +692,21 @@ impl ApprovedWorkspaceService {
     ) -> Result<Self, WorkspaceError> {
         let root = ValidatedWorkspaceRoot::open(root.as_ref())?;
         initialize_database(&root)?;
+        Ok(Self { root, verifier })
+    }
+
+    /// Opens an already initialized workspace without creating or repairing any
+    /// directory, lock file, schema object, journal mode, or database row.
+    ///
+    /// This narrow entry point exists for pre-manager startup arbitration.  All
+    /// database handles subsequently opened through this service are query-only
+    /// SQLite handles, so a caller cannot accidentally turn observation into a
+    /// schema migration merely by invoking an ordinary read method.
+    pub fn open_read_only(
+        root: impl AsRef<Path>,
+        verifier: ManifestVerificationKey,
+    ) -> Result<Self, WorkspaceError> {
+        let root = ValidatedWorkspaceRoot::open_read_only(root.as_ref())?;
         Ok(Self { root, verifier })
     }
     pub fn acquire_operation_guard(
@@ -1733,6 +1748,7 @@ struct ValidatedWorkspaceRoot {
     quarantine: PathBuf,
     database: PathBuf,
     operation_lock: PathBuf,
+    read_only: bool,
 }
 
 impl ValidatedWorkspaceRoot {
@@ -1744,7 +1760,7 @@ impl ValidatedWorkspaceRoot {
         platform::validate_fixed_local_root(root)?;
         platform::mark_not_content_indexed(root)?;
         let canonical = fs::canonicalize(root).map_err(|_| WorkspaceError::InvalidRoot)?;
-        let layout = Self::from_canonical(canonical);
+        let layout = Self::from_canonical(canonical, false);
         for directory in [&layout.cases, &layout.staging, &layout.quarantine] {
             fs::create_dir_all(directory).map_err(|_| WorkspaceError::IoFailed)?;
             platform::mark_not_content_indexed(directory)?;
@@ -1759,7 +1775,7 @@ impl ValidatedWorkspaceRoot {
         }
         platform::validate_fixed_local_root(root)?;
         let canonical = fs::canonicalize(root).map_err(|_| WorkspaceError::InvalidRoot)?;
-        let layout = Self::from_canonical(canonical);
+        let layout = Self::from_canonical(canonical, false);
         if !layout.cases.is_dir() || !layout.staging.is_dir() || !layout.quarantine.is_dir() {
             return Err(WorkspaceError::InvalidRoot);
         }
@@ -1767,7 +1783,21 @@ impl ValidatedWorkspaceRoot {
         Ok(layout)
     }
 
-    fn from_canonical(root: PathBuf) -> Self {
+    fn open_read_only(root: &Path) -> Result<Self, WorkspaceError> {
+        if !root.is_absolute() || !root.is_dir() {
+            return Err(WorkspaceError::InvalidRoot);
+        }
+        platform::validate_fixed_local_root(root)?;
+        let canonical = fs::canonicalize(root).map_err(|_| WorkspaceError::InvalidRoot)?;
+        let layout = Self::from_canonical(canonical, true);
+        if !layout.cases.is_dir() || !layout.staging.is_dir() || !layout.quarantine.is_dir() {
+            return Err(WorkspaceError::InvalidRoot);
+        }
+        validate_operation_lock_file(&layout)?;
+        Ok(layout)
+    }
+
+    fn from_canonical(root: PathBuf, read_only: bool) -> Self {
         Self {
             cases: root.join("cases"),
             staging: root.join(".staging"),
@@ -1775,6 +1805,7 @@ impl ValidatedWorkspaceRoot {
             database: root.join("workspace-state.sqlite"),
             operation_lock: root.join(OPERATION_LOCK_FILE_NAME),
             root,
+            read_only,
         }
     }
 }
@@ -1796,6 +1827,10 @@ fn ensure_operation_lock_file(root: &ValidatedWorkspaceRoot) -> Result<(), Works
             Err(_) => return Err(WorkspaceError::IoFailed),
         }
     }
+    validate_operation_lock_file(root)
+}
+
+fn validate_operation_lock_file(root: &ValidatedWorkspaceRoot) -> Result<(), WorkspaceError> {
     platform::reject_reparse_components(&root.root, &root.operation_lock)?;
     let metadata =
         fs::symlink_metadata(&root.operation_lock).map_err(|_| WorkspaceError::UnsafeFilesystem)?;
@@ -1812,12 +1847,9 @@ fn acquire_workspace_operation_guard(
     use std::os::windows::fs::OpenOptionsExt;
 
     for attempt in 0..OPERATION_LOCK_ATTEMPTS {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(&root.operation_lock)
-        {
+        let mut options = OpenOptions::new();
+        options.read(true).write(!root.read_only).share_mode(0);
+        match options.open(&root.operation_lock) {
             Ok(file) => {
                 return Ok(ApprovedWorkspaceOperationGuard {
                     _file: file,
@@ -1926,10 +1958,67 @@ fn open_database(root: &ValidatedWorkspaceRoot) -> Result<Connection, WorkspaceE
     if !root.database.exists() && !root.root.is_dir() {
         return Err(WorkspaceError::InvalidRoot);
     }
-    let db = Connection::open(&root.database).map_err(|_| WorkspaceError::DatabaseFailed)?;
+    let db = if root.read_only {
+        open_existing_sqlite_read_only(&root.database)?
+    } else {
+        Connection::open(&root.database).map_err(|_| WorkspaceError::DatabaseFailed)?
+    };
     db.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| WorkspaceError::DatabaseFailed)?;
     Ok(db)
+}
+
+/// Opens an existing SQLite database without creating sidecars for a cold
+/// WAL-mode main file.  A non-empty WAL is deliberately opened in ordinary
+/// read-only URI mode so committed frames remain visible; callers that need a
+/// physical no-write guarantee must additionally pin the database/WAL/SHM
+/// files against writes for the lifetime of the connection.
+pub fn open_existing_sqlite_read_only(path: &Path) -> Result<Connection, WorkspaceError> {
+    let canonical = fs::canonicalize(path).map_err(|_| WorkspaceError::DatabaseFailed)?;
+    let mut wal_name = path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal_path = PathBuf::from(wal_name);
+    let cold = match fs::symlink_metadata(&wal_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(WorkspaceError::UnsafeFilesystem);
+            }
+            metadata.len() == 0
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => return Err(WorkspaceError::DatabaseFailed),
+    };
+    let raw = canonical
+        .to_str()
+        .ok_or(WorkspaceError::InvalidRoot)?
+        .strip_prefix(r"\\?\")
+        .unwrap_or_else(|| canonical.to_str().expect("Unicode path checked"))
+        .replace('\\', "/");
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'.' | b'-' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    #[cfg(windows)]
+    let prefix = "file:///";
+    #[cfg(not(windows))]
+    let prefix = "file:";
+    let immutable = if cold { "&immutable=1" } else { "" };
+    let uri = format!("{prefix}{encoded}?mode=ro{immutable}");
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| WorkspaceError::DatabaseFailed)?;
+    connection
+        .pragma_update(None, "query_only", "ON")
+        .map_err(|_| WorkspaceError::DatabaseFailed)?;
+    Ok(connection)
 }
 
 fn build_egress_guard(

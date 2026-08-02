@@ -7,6 +7,7 @@
 pub mod application_backup;
 pub mod approved_case_projection;
 pub mod case_dictionary;
+pub mod current_manifest;
 pub mod deterministic;
 pub mod egress;
 pub mod evaluation;
@@ -15,6 +16,7 @@ pub mod lifecycle;
 pub mod local_ner;
 pub mod mcp_ticket;
 mod migration_source;
+pub mod original_rollback_v2;
 pub mod project_case_binding;
 pub mod protected_blob;
 pub mod qualification;
@@ -24,6 +26,10 @@ pub mod residual_scan;
 pub mod review_session;
 pub mod risk_engine;
 pub mod store;
+pub mod upgrade_lineage;
+pub mod upgrade_receipt_v1;
+pub mod v5_manifest;
+pub mod v6_application_schema;
 pub mod vault_backup;
 pub mod vault_crypto;
 pub mod vault_store;
@@ -48,6 +54,12 @@ pub use approved_case_projection::{
     APPROVED_CASE_PAYLOAD_SCHEMA_VERSION, APPROVED_CASE_PROJECTION_MIGRATION_ID,
     INTERACTIVE_CASE_WORK_PURPOSE, MAX_APPROVED_CASE_PAYLOAD_BYTES,
 };
+pub use current_manifest::{
+    compute_privacy_v6_manifests_read_only, compute_privacy_v6_pre_audit_manifests_read_only,
+    PrivacyV6BusinessManifest, PrivacyV6BusinessTableManifest, PrivacyV6LogicalManifest,
+    PrivacyV6LogicalTableManifest, PrivacyV6ManifestError, PrivacyV6ManifestProof,
+    PRIVACY_V6_APPLICATION_TABLES,
+};
 pub use egress::{
     scan_residual, ApprovedOutboundPayload, DataClassification, EgressCandidate, EgressError,
     EgressPolicyEngine, PrivacyEgressAuditRecord, ResidualScanResult,
@@ -69,11 +81,14 @@ pub use mcp_ticket::{
     SignedMcpAccessTicketV1, MCP_ACCESS_TICKET_PROFILE, MCP_ACCESS_TICKET_VERSION,
 };
 pub use migration_source::{
-    validate_privacy_v1_migration_source_read_only,
-    with_validated_privacy_v1_migration_source_read_only, PrivacyV1BusinessManifest,
+    validate_privacy_v1_migration_source_read_only, validate_privacy_v1_sqlite_image_read_only,
+    with_validated_privacy_v1_migration_source_read_only,
+    with_validated_privacy_v5_migration_source_read_only, PrivacyV1BusinessManifest,
     PrivacyV1BusinessTableManifest, PrivacyV1LogicalManifest, PrivacyV1LogicalTableManifest,
     PrivacyV1SchemaProvenance, PrivacyV1SourceFileProof, PrivacyV1SourceValidationError,
-    ValidatedPrivacyV1ReadOnlySession, ValidatedPrivacyV1Source, PRIVACY_V1_SCHEMA_PROVENANCE,
+    PrivacyV5SourceValidationError, ValidatedPrivacyV1ReadOnlySession, ValidatedPrivacyV1Source,
+    ValidatedPrivacyV5ReadOnlySession, MAX_PRIVACY_V1_SQLITE_IMAGE_BYTES,
+    PRIVACY_V1_SCHEMA_MANIFEST_DDL, PRIVACY_V1_SCHEMA_OBJECT_COUNT, PRIVACY_V1_SCHEMA_PROVENANCE,
     PRIVACY_V1_SCHEMA_VERSION,
 };
 pub use project_case_binding::{
@@ -106,15 +121,42 @@ pub use store::{
     RegisterPrivacyMaterial, RiskReviewRevisionSummary, SaveReviewDraft, SaveRiskReviewRevision,
     MAX_ACTIVE_RECEIPT_TTL_SECONDS, PRIVACY_STORE_SCHEMA_VERSION,
 };
+pub use upgrade_lineage::{
+    append_application_upgrade_lineage, load_application_upgrade_lineage,
+    ApplicationUpgradeLineageAppendOutcome, ApplicationUpgradeLineageRecord,
+    APPLICATION_UPGRADE_LINEAGE_TABLE_NAME, APPLICATION_UPGRADE_RESULT_OK,
+    MAX_APPLICATION_UPGRADE_CREATED_AT_UNIX, PRIVACY_V6_BUSINESS_MANIFEST_EXCLUDED_TABLES,
+    V031_TO_V040_MIGRATION_ID,
+};
+pub use v5_manifest::{
+    classify_privacy_v5_partial_in_transaction, classify_privacy_v5_partial_read_only,
+    compute_privacy_v5_manifests_read_only, validate_privacy_v5_sqlite_image_read_only,
+    verify_initial_privacy_v5_before_receipt4_read_only, PrivacyV5BusinessManifest,
+    PrivacyV5BusinessTableManifest, PrivacyV5InitialFullExpectation, PrivacyV5InitialFullProof,
+    PrivacyV5LogicalManifest, PrivacyV5LogicalTableManifest, PrivacyV5ManifestError,
+    PrivacyV5ManifestProof, PrivacyV5PartialProof, PrivacyV5PartialStage,
+    PRIVACY_V5_APPLICATION_TABLES, PRIVACY_V5_INTERNAL_SCHEMA_MANIFEST_SHA256,
+    PRIVACY_V5_SCHEMA_MANIFEST_SHA256, PRIVACY_V5_SCHEMA_OBJECT_COUNT,
+};
+pub use v6_application_schema::{
+    initialize_case_dictionary_schema, initialize_case_material_assignment_schema,
+    initialize_privacy_v6_application_extensions, initialize_privacy_vault_link_schema,
+    initialize_project_deletion_schema, ASSIGNMENT_AUDIT_NO_DELETE_TRIGGER_SQL,
+    ASSIGNMENT_AUDIT_NO_REPLACE_TRIGGER_SQL, ASSIGNMENT_AUDIT_NO_UPDATE_TRIGGER_SQL,
+    ASSIGNMENT_AUDIT_SCOPE_MATCH_TRIGGER_SQL, CASE_MATERIAL_ASSIGNMENT_SCHEMA_KEY,
+    CASE_MATERIAL_ASSIGNMENT_SCHEMA_VERSION,
+};
 pub use vault_backup::{
-    export_encrypted_vault_backup, stage_encrypted_vault_backup, VaultBackupError,
-    VaultBackupSummaryV1, ENCRYPTED_VAULT_BACKUP_SCHEMA_VERSION, MAX_ENCRYPTED_VAULT_BACKUP_BYTES,
+    export_encrypted_vault_backup, export_encrypted_vault_backup_read_only,
+    stage_encrypted_vault_backup, validate_encrypted_vault_lineage_read_only,
+    verify_encrypted_vault_backup_archive, VaultBackupError, VaultBackupSummaryV1,
+    ENCRYPTED_VAULT_BACKUP_SCHEMA_VERSION, MAX_ENCRYPTED_VAULT_BACKUP_BYTES,
     MAX_ENCRYPTED_VAULT_BACKUP_CONTENT_BYTES, MAX_ENCRYPTED_VAULT_BACKUP_FILES,
 };
 pub use vault_store::{
     fixed_local_file_identity, validate_fixed_local_directory, validate_fixed_local_regular_file,
-    VaultCleanupReportV1, VaultReadOnlyInventoryV1, VaultRetentionBindingV1,
-    VAULT_LIFECYCLE_SCHEMA_VERSION, VAULT_LOGICAL_ERASURE_DISCLOSURE,
+    VaultCleanupReportV1, VaultDatabaseReadOnlyManifestV1, VaultReadOnlyInventoryV1,
+    VaultRetentionBindingV1, VAULT_LIFECYCLE_SCHEMA_VERSION, VAULT_LOGICAL_ERASURE_DISCLOSURE,
 };
 
 use serde::{Deserialize, Serialize};
