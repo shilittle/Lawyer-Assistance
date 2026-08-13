@@ -375,8 +375,25 @@ jobs:
       - name: Lint Rust
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test Rust
-        run: cargo test --locked --workspace --all-targets --all-features
+      - name: Test Rust except the real OS restart parent
+        run: cargo test --locked --workspace --all-targets --all-features -- --skip commands::v031_user_upgrade::tests::real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env
+
+      - name: Test the real OS restart parent without sibling credential contention
+        shell: powershell
+        run: |
+          $testName = 'commands::v031_user_upgrade::tests::real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env'
+          $inventory = @(& cargo test --locked -p lawyer-assistance-desktop --lib --all-features $testName -- --exact --list --format terse)
+          if ($LASTEXITCODE -ne 0) {
+            throw 'V031 restart test inventory failed.'
+          }
+          $matches = @($inventory | Where-Object { [string]$_ -ceq "${testName}: test" })
+          if ($matches.Count -ne 1) {
+            throw "Expected exactly one V031 restart parent test, found $($matches.Count)."
+          }
+          & cargo test --locked -p lawyer-assistance-desktop --lib --all-features $testName -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw 'V031 restart parent test failed in isolation.'
+          }
 
       - name: Test the actual approved-workspace MCP binary over stdio and HTTP
         shell: powershell

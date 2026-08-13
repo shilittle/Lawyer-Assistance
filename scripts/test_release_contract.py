@@ -334,5 +334,76 @@ class McpCiReleaseContractPathTests(unittest.TestCase):
         self.assertIn("--expected-commit '${{ github.sha }}'", workflow)
 
 
+class MainCiV031RestartIsolationTests(unittest.TestCase):
+    TEST_NAME = (
+        "commands::v031_user_upgrade::tests::"
+        "real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env"
+    )
+
+    @classmethod
+    def workflow(cls) -> str:
+        return (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+    @classmethod
+    def workflow_step(cls, name: str) -> str:
+        lines = cls.workflow().splitlines()
+        marker = f"      - name: {name}"
+        try:
+            start = lines.index(marker)
+        except ValueError as error:
+            raise AssertionError(f"missing workflow step: {name}") from error
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            if lines[index].startswith("      - name:"):
+                end = index
+                break
+        return "\n".join(lines[start:end])
+
+    def test_broad_and_isolated_rust_gates_are_exact_and_ordered(self) -> None:
+        broad_name = "Test Rust except the real OS restart parent"
+        isolated_name = (
+            "Test the real OS restart parent without sibling credential contention"
+        )
+        broad = self.workflow_step(broad_name)
+        isolated = self.workflow_step(isolated_name)
+        broad_command = (
+            "cargo test --locked --workspace --all-targets --all-features -- --skip "
+            + self.TEST_NAME
+        )
+        inventory_command = (
+            "& cargo test --locked -p lawyer-assistance-desktop --lib --all-features "
+            "$testName -- --exact --list --format terse"
+        )
+        isolated_command = (
+            "& cargo test --locked -p lawyer-assistance-desktop --lib --all-features "
+            "$testName -- --exact --nocapture --test-threads=1"
+        )
+
+        workflow = self.workflow()
+        self.assertLess(workflow.index(broad), workflow.index(isolated))
+        self.assertEqual(workflow.count(broad_command), 1)
+        self.assertIn(f"run: {broad_command}", broad)
+        self.assertEqual(
+            isolated.count(f"$testName = '{self.TEST_NAME}'"),
+            1,
+        )
+        self.assertEqual(isolated.count(inventory_command), 1)
+        self.assertEqual(isolated.count(isolated_command), 1)
+        self.assertIn(
+            '$inventory | Where-Object { [string]$_ -ceq "${testName}: test" }',
+            isolated,
+        )
+        self.assertIn("$matches.Count -ne 1", isolated)
+        self.assertEqual(isolated.count("$LASTEXITCODE -ne 0"), 2)
+
+        combined = f"{broad}\n{isolated}".lower()
+        self.assertNotIn("continue-on-error", combined)
+        self.assertNotIn("retry", combined)
+        self.assertEqual(broad.count("--test-threads=1"), 0)
+        self.assertEqual(isolated.count("--test-threads=1"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
