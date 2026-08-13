@@ -1056,7 +1056,7 @@ fn http_metadata_reader_enforces_budget_before_allocation() {
 
 async fn slow_body_request(
     address: SocketAddr,
-    sent: tokio::sync::oneshot::Sender<()>,
+    permit_acquired: tokio::sync::oneshot::Sender<()>,
 ) -> RawHttpResponse {
     tokio::task::spawn_blocking(move || {
         let mut stream = TcpStream::connect(address).expect("slow connection");
@@ -1064,11 +1064,24 @@ async fn slow_body_request(
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("slow read timeout");
         let headers = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nAuthorization: Bearer {TEST_TOKEN}\r\nOrigin: https://client.example\r\nMCP-Protocol-Version: {STABLE_VERSION}\r\nContent-Length: 100\r\n\r\n{{"
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nAuthorization: Bearer {TEST_TOKEN}\r\nOrigin: https://client.example\r\nMCP-Protocol-Version: {STABLE_VERSION}\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n"
         );
         stream.write_all(headers.as_bytes()).expect("slow headers");
         stream.flush().expect("slow flush");
-        sent.send(()).expect("report flushed slow request");
+
+        // Hyper emits this informational response only when the service polls
+        // the request body. At that point the boundary middleware has already
+        // acquired the sole concurrency permit, so this is a server-side
+        // synchronization point rather than a client socket-flush heuristic.
+        const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let mut response = vec![0; CONTINUE.len()];
+        stream
+            .read_exact(&mut response)
+            .expect("read server-side 100-continue acknowledgement");
+        assert_eq!(response, CONTINUE);
+        permit_acquired
+            .send(())
+            .expect("report acquired slow-request permit");
         read_http_response(stream)
     })
     .await
@@ -1210,37 +1223,25 @@ async fn stdio_and_http_are_protocol_consistent_and_secure() {
     );
     assert_text_fallback_matches_structured(&invalid_call["result"]);
 
-    // Wait until the partial request is on the wire, then use complete,
-    // side-effect-free requests to observe the occupied permit. A complete
-    // probe can win the permit before the slow handler is polled, so retry it
-    // under a strict deadline; observing 429 proves the slow request acquired
-    // the permit before we wait for its 408 response.
-    let (slow_sent, slow_flushed) = tokio::sync::oneshot::channel();
-    let slow = tokio::spawn(slow_body_request(address, slow_sent));
-    slow_flushed.await.expect("slow request flushed");
-    let concurrency_deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
-    loop {
-        let concurrent = tokio::time::timeout_at(
-            concurrency_deadline,
-            post_json(
-                address,
-                json!({"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}),
-                Some(TEST_TOKEN),
-                Some("https://client.example"),
-                Some(STABLE_VERSION),
-            ),
-        )
+    // `100 Continue` is emitted only after Hyper polls the request body. The
+    // middleware therefore already owns the only permit when this signal is
+    // observed, making the following concurrency assertion deterministic.
+    let (permit_acquired, slow_ready) = tokio::sync::oneshot::channel();
+    let slow = tokio::spawn(slow_body_request(address, permit_acquired));
+    tokio::time::timeout(Duration::from_secs(5), slow_ready)
         .await
-        .expect("observe concurrency rejection before slow request timeout");
-        if concurrent.status == 429 {
-            break;
-        }
-        assert_eq!(
-            concurrent.status, 200,
-            "probe may complete before the slow request acquires the permit"
-        );
-        tokio::task::yield_now().await;
-    }
+        .expect("observe server-side slow-request admission")
+        .expect("slow request admission signal");
+    let concurrent = post_json(
+        address,
+        json!({"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}),
+        Some(TEST_TOKEN),
+        Some("https://client.example"),
+        Some(STABLE_VERSION),
+    )
+    .await;
+    assert_eq!(concurrent.status, 429);
+    assert_eq!(concurrent.header("Retry-After"), Some("1"));
     assert_eq!(slow.await.expect("slow join").status, 408);
 
     http_task.abort();
