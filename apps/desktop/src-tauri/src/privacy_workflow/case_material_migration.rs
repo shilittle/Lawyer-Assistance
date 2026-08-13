@@ -66,6 +66,53 @@ const CASE_MATERIAL_SOURCE_SCHEMA_CONTRACT: &str = concat!(
     "size_bytes,extraction_status,extracted_text,segments_json,error_code,created_at)"
 );
 
+/// Shape-only parser for the exact protected review wire emitted by peeled
+/// v0.3.1. `IgnoredAny` avoids making a second in-memory copy of case content
+/// while `deny_unknown_fields` prevents a generic empty current display name
+/// from being misclassified as legacy-compatible.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExactV031StoredReviewShape {
+    schema_version: serde::de::IgnoredAny,
+    material_id: serde::de::IgnoredAny,
+    redaction_id: serde::de::IgnoredAny,
+    source_sha256: serde::de::IgnoredAny,
+    extraction_sha256: serde::de::IgnoredAny,
+    suggested_redacted_content_sha256: serde::de::IgnoredAny,
+    processing_version: serde::de::IgnoredAny,
+    media_type: serde::de::IgnoredAny,
+    page_count: serde::de::IgnoredAny,
+    backend_trace: serde::de::IgnoredAny,
+    summary: serde::de::IgnoredAny,
+    forbidden_canaries: serde::de::IgnoredAny,
+    pages: serde::de::IgnoredAny,
+}
+
+/// The only application transition permitted for a v0.3.1 review whose
+/// original display name was never persisted: assignment adds the audited
+/// Privacy CaseId, but it must not manufacture a source display name or any
+/// newer optional payload field.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExactV031AssignedReviewShape {
+    schema_version: serde::de::IgnoredAny,
+    material_id: serde::de::IgnoredAny,
+    redaction_id: serde::de::IgnoredAny,
+    source_sha256: serde::de::IgnoredAny,
+    extraction_sha256: serde::de::IgnoredAny,
+    suggested_redacted_content_sha256: serde::de::IgnoredAny,
+    processing_version: serde::de::IgnoredAny,
+    media_type: serde::de::IgnoredAny,
+    page_count: serde::de::IgnoredAny,
+    backend_trace: serde::de::IgnoredAny,
+    summary: serde::de::IgnoredAny,
+    forbidden_canaries: serde::de::IgnoredAny,
+    pages: serde::de::IgnoredAny,
+    case_id: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CaseMaterialMigrationReport {
     pub privacy_materials_migrated: u64,
@@ -472,6 +519,17 @@ struct LedgerEntry {
     target_redaction_id: Option<String>,
     assigned_generation_number: Option<i64>,
     result_state: String,
+    error_code: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveLedgerEvidence {
+    source_fingerprint: String,
+    target_material_id: Option<String>,
+    target_redaction_id: Option<String>,
+    assigned_generation_number: Option<i64>,
+    result_state: String,
+    error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3840,6 +3898,9 @@ fn validate_privacy_material(
     let mut case_values = BTreeSet::new();
     let mut display_values = BTreeSet::new();
     let mut vault_tuples = BTreeSet::new();
+    let mut exact_v031_missing_display_count = 0_usize;
+    let mut exact_v031_assigned_missing_display_count = 0_usize;
+    let mut invalid_current_display_count = 0_usize;
 
     if source
         .source_sha256
@@ -3859,6 +3920,8 @@ fn validate_privacy_material(
         let loaded = PrivacyStore::load_review_draft(connection, &redaction_source.redaction_id);
         let payload = match loaded {
             Ok(loaded) => {
+                let exact_v031_payload =
+                    is_exact_v031_stored_review_payload(&loaded.review_payload_plaintext);
                 let decoded =
                     serde_json::from_slice::<StoredReviewPayload>(&loaded.review_payload_plaintext);
                 match decoded {
@@ -3877,7 +3940,25 @@ fn validate_privacy_material(
                             if let Some(case_id) = payload.case_id.as_deref() {
                                 case_values.insert(case_id.to_owned());
                             }
-                            display_values.insert(payload.source_display_name.clone());
+                            let exact_v031_assigned_payload =
+                                payload.case_id.as_deref().is_some_and(|case_id| {
+                                    is_exact_v031_assigned_review_payload(
+                                        &loaded.review_payload_plaintext,
+                                        case_id,
+                                    )
+                                });
+                            if exact_v031_payload && payload.source_display_name.is_empty() {
+                                exact_v031_missing_display_count += 1;
+                            } else if exact_v031_assigned_payload
+                                && payload.source_display_name.is_empty()
+                            {
+                                exact_v031_assigned_missing_display_count += 1;
+                            } else {
+                                if payload.source_display_name.is_empty() {
+                                    invalid_current_display_count += 1;
+                                }
+                                display_values.insert(payload.source_display_name.clone());
+                            }
                             vault_tuples.insert((
                                 payload.case_id.clone(),
                                 payload.vault_object_id.clone(),
@@ -3988,6 +4069,29 @@ fn validate_privacy_material(
             .as_ref()
             .map(|binding| PrivacyCaseId::from(binding.case_id.clone()))
     };
+    let authenticated_assigned_v031_missing_display = if exact_v031_assigned_missing_display_count
+        == source.redactions.len()
+        && !source.redactions.is_empty()
+        && exact_v031_missing_display_count == 0
+        && invalid_current_display_count == 0
+    {
+        match privacy_case_id.as_ref() {
+            Some(case_id) => authenticates_assigned_exact_v031_missing_display_source(
+                connection, &source, case_id,
+            )?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    if invalid_current_display_count > 0
+        || (exact_v031_assigned_missing_display_count > 0
+            && !authenticated_assigned_v031_missing_display)
+        || (exact_v031_missing_display_count > 0
+            && exact_v031_missing_display_count != source.redactions.len())
+    {
+        validation_error = Some("privacy_display_name_invalid");
+    }
 
     if let (Some(legacy), Some(case_id)) =
         (source.legacy_case_id.as_deref(), privacy_case_id.as_ref())
@@ -4030,6 +4134,12 @@ fn validate_privacy_material(
         (Ok(Some(existing)), _, _) => Some(existing),
         (Ok(None), payload @ Some(_), _) => payload,
         (Ok(None), None, true) => None,
+        (Ok(None), None, false)
+            if exact_v031_missing_display_count == source.redactions.len()
+                || authenticated_assigned_v031_missing_display =>
+        {
+            None
+        }
         (Ok(None), None, false) => {
             validation_error = Some("privacy_display_name_invalid");
             None
@@ -4062,6 +4172,337 @@ fn validate_privacy_material(
         redactions,
         validation_error,
     })
+}
+
+pub(super) fn is_exact_v031_stored_review_payload(plaintext: &[u8]) -> bool {
+    serde_json::from_slice::<ExactV031StoredReviewShape>(plaintext).is_ok()
+}
+
+pub(super) fn is_exact_v031_assigned_review_payload(
+    plaintext: &[u8],
+    expected_case_id: &str,
+) -> bool {
+    serde_json::from_slice::<ExactV031AssignedReviewShape>(plaintext)
+        .is_ok_and(|shape| shape.case_id == expected_case_id)
+}
+
+pub(super) fn authenticates_exact_v031_unassigned_missing_display_material(
+    connection: &Connection,
+    material_id: &privacy::vnext::MaterialId,
+) -> Result<bool, PrivacyWorkflowError> {
+    let Some(source) = load_privacy_sources_for_one(connection, material_id.as_str())?
+        .into_iter()
+        .next()
+    else {
+        return Ok(false);
+    };
+    if source.project_id.is_some()
+        || source.legacy_case_id.is_some()
+        || source.attachment_id.is_some()
+        || source.source_kind != "local_review"
+        || source.migration_status != "unassigned"
+        || source.deleted_at.is_some()
+        || !display_tuple_is_absent(&source)
+        || source.vault_binding.is_some()
+        || source.redactions.is_empty()
+        || connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM case_material_assignment_audit WHERE material_id=?1
+                 )",
+                [material_id.as_str()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|_| privacy_migration_store_error())?
+            .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    for redaction in &source.redactions {
+        let loaded = PrivacyStore::load_review_draft(connection, &redaction.redaction_id)
+            .map_err(PrivacyWorkflowError::store)?;
+        let stored =
+            serde_json::from_slice::<StoredReviewPayload>(&loaded.review_payload_plaintext)
+                .map_err(|_| migration_target_mismatch())?;
+        if !is_exact_v031_stored_review_payload(&loaded.review_payload_plaintext)
+            || stored.case_id.is_some()
+            || !stored.source_display_name.is_empty()
+            || stored.vault_object_id.is_some()
+            || stored.vault_object_version.is_some()
+            || stored.vault_isolation.is_some()
+            || validate_loaded_review(&loaded, &stored).is_err()
+        {
+            return Ok(false);
+        }
+    }
+    authenticates_v031_origin_ledgers(connection, &source, true)
+}
+
+pub(super) fn authenticates_assigned_exact_v031_missing_display_material(
+    connection: &Connection,
+    material_id: &str,
+    project_id: &ProjectId,
+) -> Result<bool, PrivacyWorkflowError> {
+    let mut sources = load_privacy_sources_for_one(connection, material_id)?;
+    if sources.len() != 1 {
+        return Ok(false);
+    }
+    let source = sources.pop().expect("one source was checked");
+    if source.project_id.as_deref() != Some(project_id.as_str()) {
+        return Ok(false);
+    }
+    let Some(case_id) = assigned_exact_v031_case_id(connection, &source, project_id)? else {
+        return Ok(false);
+    };
+    authenticates_assigned_exact_v031_missing_display_source(connection, &source, &case_id)
+}
+
+fn authenticates_assigned_exact_v031_missing_display_source(
+    connection: &Connection,
+    source: &PrivacyMaterialSource,
+    expected_case_id: &PrivacyCaseId,
+) -> Result<bool, PrivacyWorkflowError> {
+    let Some(project_value) = source.project_id.as_deref() else {
+        return Ok(false);
+    };
+    let project_id = match ProjectId::parse(project_value.to_owned()) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let Some(audit_case_id) = assigned_exact_v031_case_id(connection, source, &project_id)? else {
+        return Ok(false);
+    };
+    if &audit_case_id != expected_case_id || source.redactions.is_empty() {
+        return Ok(false);
+    }
+    for redaction in &source.redactions {
+        let loaded = PrivacyStore::load_review_draft(connection, &redaction.redaction_id)
+            .map_err(PrivacyWorkflowError::store)?;
+        let stored =
+            serde_json::from_slice::<StoredReviewPayload>(&loaded.review_payload_plaintext)
+                .map_err(|_| migration_target_mismatch())?;
+        if !is_exact_v031_assigned_review_payload(
+            &loaded.review_payload_plaintext,
+            expected_case_id.as_str(),
+        ) || stored.case_id.as_deref() != Some(expected_case_id.as_str())
+            || !stored.source_display_name.is_empty()
+            || stored.vault_object_id.is_some()
+            || stored.vault_object_version.is_some()
+            || stored.vault_isolation.is_some()
+            || validate_loaded_review(&loaded, &stored).is_err()
+        {
+            return Ok(false);
+        }
+    }
+    authenticates_v031_origin_ledgers(connection, source, false)
+}
+
+fn assigned_exact_v031_case_id(
+    connection: &Connection,
+    source: &PrivacyMaterialSource,
+    project_id: &ProjectId,
+) -> Result<Option<PrivacyCaseId>, PrivacyWorkflowError> {
+    if source.project_id.as_deref() != Some(project_id.as_str())
+        || source.legacy_case_id.is_some()
+        || source.attachment_id.is_some()
+        || source.source_kind != "local_review"
+        || source.migration_status != "ready"
+        || source.deleted_at.is_some()
+        || !display_tuple_is_absent(source)
+        || source.vault_binding.is_some()
+    {
+        return Ok(None);
+    }
+    super::case_materials::validate_assignment_schema(connection)?;
+    let audit = connection
+        .query_row(
+            "SELECT assignment_id,privacy_case_id,assignment_mode,binding_action,
+                    assigned_material_row_version,previous_migration_status,
+                    previous_state,result
+             FROM case_material_assignment_audit
+             WHERE material_id=?1 AND project_id=?2",
+            params![source.material_id, project_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| privacy_migration_store_error())?;
+    let Some((
+        assignment_id,
+        case_value,
+        mode,
+        binding_action,
+        assigned_version,
+        previous,
+        previous_state,
+        result,
+    )) = audit
+    else {
+        return Ok(None);
+    };
+    let expected_assignment_id = format!(
+        "asn_{}",
+        sha256_hex(
+            format!(
+                "case-material-assignment-v1\0{}\0{}",
+                source.material_id,
+                project_id.as_str()
+            )
+            .as_bytes()
+        )
+    );
+    if assignment_id != expected_assignment_id
+        || mode != "initialize_null_case"
+        || !matches!(binding_action.as_str(), "created" | "reused")
+        || assigned_version < 0
+        || source.row_version < assigned_version
+        || previous != "unassigned"
+        || previous_state != source.state
+        || result != "assigned"
+    {
+        return Ok(None);
+    }
+    let case_id = match PrivacyCaseId::parse(case_value) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if ProjectPrivacyCaseBindingStore::validate_pair(connection, project_id, &case_id).is_err()
+        || ProjectPrivacyCaseBindingStore::reverse_resolve(connection, &case_id)
+            .map_err(PrivacyWorkflowError::project_case_binding)?
+            .as_ref()
+            != Some(project_id)
+    {
+        return Ok(None);
+    }
+    Ok(Some(case_id))
+}
+
+fn display_tuple_is_absent(source: &PrivacyMaterialSource) -> bool {
+    source.protected_display_name.is_none()
+        && source.display_name_sha256.is_none()
+        && source.display_name_protection_scheme.is_none()
+}
+
+fn authenticates_v031_origin_ledgers(
+    connection: &Connection,
+    source: &PrivacyMaterialSource,
+    require_unchanged_origin: bool,
+) -> Result<bool, PrivacyWorkflowError> {
+    let Some((base, effective)) = load_ledger_evidence(
+        connection,
+        CASE_MATERIAL_MIGRATION_ID,
+        SOURCE_STORE_PRIVACY,
+        "privacy_materials",
+        &source.material_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    if !ledger_evidence_has_valid_fingerprint(&base)
+        || !ledger_evidence_has_valid_fingerprint(&effective)
+        || base.target_material_id.as_deref() != Some(source.material_id.as_str())
+        || base.target_redaction_id.is_some()
+        || base.assigned_generation_number.is_some()
+        || base.result_state != "migrated"
+        || base.error_code.as_deref() != Some("privacy_case_unassigned")
+        || effective.target_material_id.as_deref() != Some(source.material_id.as_str())
+        || effective.target_redaction_id.is_some()
+        || effective.assigned_generation_number.is_some()
+        || effective.result_state != "migrated"
+        || !matches!(
+            effective.error_code.as_deref(),
+            None | Some("privacy_case_unassigned")
+        )
+        || (require_unchanged_origin
+            && (effective.source_fingerprint != base.source_fingerprint
+                || effective.error_code != base.error_code))
+    {
+        return Ok(false);
+    }
+    let current_material_fingerprint = privacy_material_fingerprint(source);
+    if !require_unchanged_origin
+        && !((effective.source_fingerprint == base.source_fingerprint
+            && effective.error_code.as_deref() == Some("privacy_case_unassigned"))
+            || (effective.source_fingerprint == current_material_fingerprint
+                && effective.error_code.is_none()))
+    {
+        return Ok(false);
+    }
+
+    let ledger_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM case_material_migration_ledger
+             WHERE migration_id=?1 AND source_store=?2
+               AND source_table='privacy_redactions' AND target_material_id=?3",
+            params![
+                CASE_MATERIAL_MIGRATION_ID,
+                SOURCE_STORE_PRIVACY,
+                source.material_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| privacy_migration_store_error())?;
+    if usize::try_from(ledger_count).ok() != Some(source.redactions.len()) {
+        return Ok(false);
+    }
+    for redaction in &source.redactions {
+        let Some((base, effective)) = load_ledger_evidence(
+            connection,
+            CASE_MATERIAL_MIGRATION_ID,
+            SOURCE_STORE_PRIVACY,
+            "privacy_redactions",
+            &redaction.redaction_id,
+        )?
+        else {
+            return Ok(false);
+        };
+        let verified_risk_revision =
+            match validate_risk_revision_chain(connection, &redaction.redaction_id) {
+                Ok(value) => Some(value),
+                Err(_) => return Ok(false),
+            };
+        let current_redaction_fingerprint = privacy_redaction_fingerprint(&ValidatedRedaction {
+            source: redaction.clone(),
+            verified_risk_revision,
+            generation_status: "ready",
+            error_code: None,
+        });
+        if !ledger_evidence_has_valid_fingerprint(&base)
+            || !ledger_evidence_has_valid_fingerprint(&effective)
+            || base.target_material_id.as_deref() != Some(source.material_id.as_str())
+            || base.target_redaction_id.as_deref() != Some(redaction.redaction_id.as_str())
+            || base.assigned_generation_number != Some(redaction.generation_number)
+            || base.result_state != "migrated"
+            || base.error_code.is_some()
+            || effective.target_material_id.as_deref() != Some(source.material_id.as_str())
+            || effective.target_redaction_id.as_deref() != Some(redaction.redaction_id.as_str())
+            || effective.assigned_generation_number != Some(redaction.generation_number)
+            || effective.result_state != "migrated"
+            || effective.error_code.is_some()
+            || (require_unchanged_origin && effective.source_fingerprint != base.source_fingerprint)
+            || (!require_unchanged_origin
+                && effective.source_fingerprint != base.source_fingerprint
+                && effective.source_fingerprint != current_redaction_fingerprint)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn ledger_evidence_has_valid_fingerprint(evidence: &EffectiveLedgerEvidence) -> bool {
+    valid_hash(&evidence.source_fingerprint)
 }
 
 fn decode_existing_display_name(
@@ -4948,6 +5389,58 @@ fn effective_ledger_state(
     ))))
 }
 
+fn load_ledger_evidence(
+    connection: &Connection,
+    migration_id: &str,
+    source_store: &str,
+    source_table: &str,
+    source_key: &str,
+) -> Result<Option<(EffectiveLedgerEvidence, EffectiveLedgerEvidence)>, PrivacyWorkflowError> {
+    let Some(base) = load_ledger(
+        connection,
+        migration_id,
+        source_store,
+        source_table,
+        source_key,
+    )?
+    else {
+        return Ok(None);
+    };
+    let base_evidence = EffectiveLedgerEvidence {
+        source_fingerprint: base.source_fingerprint,
+        target_material_id: Some(base.target_material_id),
+        target_redaction_id: base.target_redaction_id,
+        assigned_generation_number: base.assigned_generation_number,
+        result_state: base.result_state,
+        error_code: base.error_code,
+    };
+    let event = connection
+        .query_row(
+            "SELECT source_fingerprint,target_material_id,target_redaction_id,
+                    assigned_generation_number,result_state,error_code
+             FROM case_material_migration_events
+             WHERE migration_id=?1 AND source_store=?2 AND source_table=?3
+               AND source_key=?4 AND source_fingerprint IS NOT NULL
+               AND result_state IS NOT NULL
+             ORDER BY rowid DESC LIMIT 1",
+            params![migration_id, source_store, source_table, source_key],
+            |row| {
+                Ok(EffectiveLedgerEvidence {
+                    source_fingerprint: row.get(0)?,
+                    target_material_id: row.get(1)?,
+                    target_redaction_id: row.get(2)?,
+                    assigned_generation_number: row.get(3)?,
+                    result_state: row.get(4)?,
+                    error_code: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|_| privacy_migration_store_error())?;
+    let effective = event.unwrap_or_else(|| base_evidence.clone());
+    Ok(Some((base_evidence, effective)))
+}
+
 fn effective_ledger_entry(
     connection: &Connection,
     migration_id: &str,
@@ -4992,7 +5485,7 @@ fn load_ledger(
     connection
         .query_row(
             "SELECT source_fingerprint,target_material_id,target_redaction_id,
-                    assigned_generation_number,result_state
+                    assigned_generation_number,result_state,error_code
              FROM case_material_migration_ledger
              WHERE migration_id=?1 AND source_store=?2 AND source_table=?3 AND source_key=?4",
             params![migration_id, source_store, source_table, source_key],
@@ -5003,6 +5496,7 @@ fn load_ledger(
                     target_redaction_id: row.get(2)?,
                     assigned_generation_number: row.get(3)?,
                     result_state: row.get(4)?,
+                    error_code: row.get(5)?,
                 })
             },
         )
@@ -6872,6 +7366,8 @@ mod tests {
 
     const PROJECT_A: &str = "case-migration-project-a";
     const PROJECT_B: &str = "case-migration-project-b";
+    const V031_UNASSIGNED_MATERIAL_ID: &str = "mat_31313131313131313131313131313131";
+    const V031_UNASSIGNED_REDACTION_ID: &str = "red_31313131313131313131313131313131";
 
     struct NoopPublicationInvalidator;
 
@@ -6921,6 +7417,13 @@ mod tests {
 
     impl V031Fixture {
         fn new(projects: &[&str]) -> Self {
+            Self::new_with_privacy_seed(projects, |_| {})
+        }
+
+        fn new_with_privacy_seed(
+            projects: &[&str],
+            seed_privacy: impl FnOnce(&Connection),
+        ) -> Self {
             let directory = tempfile::tempdir().expect("v0.3.1 migration fixture directory");
             let user_database_path = database::user_database_path(directory.path());
             create_exact_v031_user_database(&user_database_path, projects);
@@ -6951,6 +7454,7 @@ mod tests {
                     [],
                 )
                 .expect("privacy v1 marker");
+            seed_privacy(&privacy);
             drop(privacy);
             let original_privacy_source =
                 privacy::validate_privacy_v1_migration_source_read_only(&privacy_database)
@@ -6975,6 +7479,95 @@ mod tests {
             }
         }
 
+        #[cfg(windows)]
+        fn with_exact_unassigned_review(projects: &[&str]) -> Self {
+            Self::with_unassigned_review_payload(projects, false)
+        }
+
+        #[cfg(windows)]
+        fn with_nonlegacy_empty_display_review(projects: &[&str]) -> Self {
+            Self::with_unassigned_review_payload(projects, true)
+        }
+
+        #[cfg(windows)]
+        fn with_unassigned_review_payload(
+            projects: &[&str],
+            include_current_empty_display: bool,
+        ) -> Self {
+            Self::new_with_privacy_seed(projects, |privacy| {
+                let source_sha256 = sha256_hex(b"exact v0.3.1 unassigned review source");
+                let extraction_sha256 = sha256_hex(b"exact v0.3.1 extraction");
+                let redacted_sha256 = sha256_hex(b"exact v0.3.1 redacted content");
+                let mut payload = json!({
+                    "schemaVersion": 1,
+                    "materialId": V031_UNASSIGNED_MATERIAL_ID,
+                    "redactionId": V031_UNASSIGNED_REDACTION_ID,
+                    "sourceSha256": source_sha256,
+                    "extractionSha256": extraction_sha256,
+                    "suggestedRedactedContentSha256": redacted_sha256,
+                    "processingVersion": "v0.3.1-exact-test",
+                    "mediaType": "text/plain",
+                    "pageCount": 0,
+                    "backendTrace": [],
+                    "summary": {
+                        "total": 0,
+                        "counts": {},
+                        "changed": false,
+                        "manualReviewRequired": false,
+                        "redactionVersion": "v0.3.1-exact-test"
+                    },
+                    "forbiddenCanaries": [],
+                    "pages": []
+                });
+                if include_current_empty_display {
+                    payload["sourceDisplayName"] = serde_json::Value::String(String::new());
+                }
+                let payload = serde_json::to_vec(&payload).expect("review payload serializes");
+                assert_eq!(
+                    is_exact_v031_stored_review_payload(&payload),
+                    !include_current_empty_display
+                );
+                let protected = protect_local(&payload).expect("exact v0.3.1 review protects");
+                privacy
+                    .execute(
+                        "INSERT INTO privacy_materials(
+                            material_id,project_id,attachment_id,source_sha256,
+                            source_name_sha256,media_type,page_count,state,created_at,updated_at
+                         ) VALUES(?1,NULL,NULL,?2,?3,'text/plain',0,'review_required',?4,?4)",
+                        params![
+                            V031_UNASSIGNED_MATERIAL_ID,
+                            source_sha256,
+                            sha256_hex(b"exact-v031-local-material.txt"),
+                            "2026-07-19 15:41:30"
+                        ],
+                    )
+                    .expect("exact v0.3.1 material inserts");
+                privacy
+                    .execute(
+                        "INSERT INTO privacy_redactions(
+                            redaction_id,material_id,extraction_sha256,
+                            redacted_content_sha256,approved_payload_sha256,policy_id,
+                            policy_version,detector_version,unresolved_high_risk_count,
+                            review_state,protected_review_blob,protection_scheme,
+                            reviewed_by_sha256,created_at,reviewed_at
+                         ) VALUES(
+                            ?1,?2,?3,?4,NULL,'v031-policy',1,'v031-detector',0,
+                            'review_required',?5,?6,NULL,?7,NULL
+                         )",
+                        params![
+                            V031_UNASSIGNED_REDACTION_ID,
+                            V031_UNASSIGNED_MATERIAL_ID,
+                            extraction_sha256,
+                            redacted_sha256,
+                            protected,
+                            LOCAL_PROTECTION_SCHEME,
+                            "2026-07-19 15:41:31"
+                        ],
+                    )
+                    .expect("exact v0.3.1 redaction inserts");
+            })
+        }
+
         fn upgrade_to_v5(&self) -> PrivacyV5ManifestProof {
             self.manager
                 .upgrade_v031_privacy_store_to_v5_after_original_rollback(&self.gate)
@@ -6987,6 +7580,996 @@ mod tests {
                 self.manager.shared.workspace_instance_id.clone(),
             )
         }
+    }
+
+    #[test]
+    fn exact_v031_review_shape_is_narrow_and_does_not_accept_current_empty_display_name() {
+        let exact = json!({
+            "schemaVersion": 1,
+            "materialId": "mat_exact",
+            "redactionId": "red_exact",
+            "sourceSha256": "1".repeat(64),
+            "extractionSha256": "2".repeat(64),
+            "suggestedRedactedContentSha256": "3".repeat(64),
+            "processingVersion": "v0.3.1",
+            "mediaType": "text/plain",
+            "pageCount": 0,
+            "backendTrace": [],
+            "summary": {},
+            "forbiddenCanaries": [],
+            "pages": []
+        });
+        let bytes = serde_json::to_vec(&exact).expect("exact shape serializes");
+        assert!(is_exact_v031_stored_review_payload(&bytes));
+
+        let mut current = exact.clone();
+        current["sourceDisplayName"] = serde_json::Value::String(String::new());
+        assert!(!is_exact_v031_stored_review_payload(
+            &serde_json::to_vec(&current).expect("current shape serializes")
+        ));
+
+        let mut missing = exact;
+        missing
+            .as_object_mut()
+            .expect("shape is an object")
+            .remove("pages");
+        assert!(!is_exact_v031_stored_review_payload(
+            &serde_json::to_vec(&missing).expect("incomplete shape serializes")
+        ));
+        assert!(!is_exact_v031_stored_review_payload(b"not-json"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_v031_unassigned_review_migrates_readably_without_fabricating_identity() {
+        let fixture = V031Fixture::with_exact_unassigned_review(&[PROJECT_A]);
+        let user_before = fs::read(&fixture.user_database_path).expect("v0.3.1 user before");
+        fixture.upgrade_to_v5();
+        let source = fixture
+            .manager
+            .v031_case_material_migration_source_fingerprint(&fixture.gate)
+            .expect("exact v0.3.1 source fingerprint");
+        let first = fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("exact v0.3.1 review migrates");
+        assert!(first.source_unchanged_verified);
+        assert_eq!(first.bindings_created_or_verified, 1);
+        assert_eq!(first.privacy_materials_migrated, 1);
+        assert_eq!(first.redaction_generations_migrated, 1);
+        assert_eq!(first.blocked, 0);
+        assert_eq!(
+            fs::read(&fixture.user_database_path).expect("v0.3.1 user after"),
+            user_before
+        );
+        let connection = fixture
+            .manager
+            .open_raw_connection()
+            .expect("Privacy v5 reader");
+        let project = ProjectId::parse(PROJECT_A).expect("project identifier");
+        let case_id = ProjectPrivacyCaseBindingStore::resolve(&connection, &project)
+            .expect("resolve project binding")
+            .expect("independent project receives a binding");
+        assert!(case_id.as_str().starts_with("case_"));
+        assert_eq!(case_id.as_str().len(), 37);
+        assert!(case_id.as_str()[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_eq!(
+            ProjectPrivacyCaseBindingStore::reverse_resolve(&connection, &case_id)
+                .expect("reverse-resolve project binding")
+                .as_ref(),
+            Some(&project)
+        );
+        ProjectPrivacyCaseBindingStore::validate_pair(&connection, &project, &case_id)
+            .expect("binding and audit are valid");
+
+        let source_name_sha256 = sha256_hex(b"exact-v031-local-material.txt");
+        let material = connection
+            .query_row(
+                "SELECT project_id,legacy_case_id,attachment_id,source_name_sha256,
+                        protected_display_name,display_name_sha256,
+                        display_name_protection_scheme,migration_status,state,source_kind
+                 FROM privacy_materials WHERE material_id=?1",
+                [V031_UNASSIGNED_MATERIAL_ID],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .expect("migrated material");
+        assert_eq!(material.0, None);
+        assert_eq!(material.1, None);
+        assert_eq!(material.2, None);
+        assert_eq!(material.3, source_name_sha256);
+        assert_eq!(material.4, None);
+        assert_eq!(material.5, None);
+        assert_eq!(material.6, None);
+        assert_eq!(material.7, "unassigned");
+        assert_eq!(material.8, "review_required");
+        assert_eq!(material.9, "local_review");
+        let redaction = connection
+            .query_row(
+                "SELECT generation_status,review_state
+                 FROM privacy_redactions WHERE redaction_id=?1",
+                [V031_UNASSIGNED_REDACTION_ID],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("migrated redaction");
+        assert_eq!(
+            redaction,
+            ("ready".to_owned(), "review_required".to_owned())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT result_state,error_code
+                     FROM case_material_migration_ledger
+                     WHERE migration_id=?1 AND source_store=?2
+                       AND source_table='privacy_materials' AND source_key=?3",
+                    params![
+                        CASE_MATERIAL_MIGRATION_ID,
+                        SOURCE_STORE_PRIVACY,
+                        V031_UNASSIGNED_MATERIAL_ID
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .expect("material ledger"),
+            (
+                "migrated".to_owned(),
+                Some("privacy_case_unassigned".to_owned())
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT result_state,error_code
+                     FROM case_material_migration_ledger
+                     WHERE migration_id=?1 AND source_store=?2
+                       AND source_table='privacy_redactions' AND source_key=?3",
+                    params![
+                        CASE_MATERIAL_MIGRATION_ID,
+                        SOURCE_STORE_PRIVACY,
+                        V031_UNASSIGNED_REDACTION_ID
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .expect("redaction ledger"),
+            ("migrated".to_owned(), None)
+        );
+        drop(connection);
+
+        let first_terminal = fixture
+            .manager
+            .v031_binding_material_terminal_proof(&fixture.gate, &source)
+            .expect("first exact v0.3.1 terminal proof");
+        assert_eq!(first_terminal.binding_ledger_rows(), 1);
+        assert_eq!(first_terminal.material_ledger_rows(), 3);
+        assert_eq!(first_terminal.blocked_rows(), 0);
+        assert_eq!(first_terminal.bindings_verified(), 1);
+        let second = fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("exact v0.3.1 review retry is idempotent");
+        assert!(second.source_unchanged_verified);
+        assert_eq!(second.bindings_created_or_verified, 0);
+        assert_eq!(second.privacy_materials_migrated, 0);
+        assert_eq!(second.redaction_generations_migrated, 0);
+        assert!(second.idempotent_noops >= 3);
+        assert_eq!(
+            fixture
+                .manager
+                .v031_binding_material_terminal_proof(&fixture.gate, &source)
+                .expect("second exact v0.3.1 terminal proof"),
+            first_terminal
+        );
+        complete_approved_projection_migration(&fixture.manager);
+
+        let review = fixture
+            .manager
+            .load_review(V031_UNASSIGNED_REDACTION_ID)
+            .expect("exact v0.3.1 review remains readable");
+        assert_eq!(review.case_id, None);
+        assert_eq!(review.source_display_name, "Local material");
+        assert_eq!(
+            review.source_sha256,
+            sha256_hex(b"exact v0.3.1 unassigned review source")
+        );
+        assert_eq!(
+            review.extraction_sha256,
+            sha256_hex(b"exact v0.3.1 extraction")
+        );
+        assert_eq!(
+            review.suggested_redacted_content_sha256,
+            sha256_hex(b"exact v0.3.1 redacted content")
+        );
+        assert!(review.pages.is_empty());
+        let user_migration_source = fixture.gate.original_user_source_proof().clone();
+        let mut user = database::open_existing_user_database(&fixture.user_database_path)
+            .expect("open exact User-v10 post-upgrade target");
+        database::migrate_exact_v031_user_to_v11_with_upgrade_audit(
+            &mut user,
+            &user_migration_source,
+            &database::V031UserUpgradeAuditEvidence {
+                lineage_id: "1".repeat(64),
+                source_profile_proof_sha256: "2".repeat(64),
+                source_privacy_logical_manifest_sha256: "3".repeat(64),
+                source_privacy_business_manifest_sha256: "4".repeat(64),
+                original_rollback_identity_sha256: "5".repeat(64),
+                target_privacy_pre_audit_logical_manifest_sha256: "6".repeat(64),
+                target_privacy_pre_audit_business_manifest_sha256: "7".repeat(64),
+                previous_receipt_sha256: "8".repeat(64),
+                source_privacy_table_count: 5,
+                source_privacy_total_rows: 2,
+                target_privacy_table_count: privacy::PRIVACY_V6_APPLICATION_TABLES.len() as u64,
+                target_privacy_total_rows: 1,
+                original_rollback_slot_count: 5,
+            },
+        )
+        .expect("migrate exact User-v10 to canonical User-v11");
+        drop(user);
+
+        let unassigned = fixture
+            .manager
+            .list_unassigned_case_materials(
+                crate::privacy_workflow::ListUnassignedCaseMaterialsRequest {
+                    project_id: PROJECT_A.to_owned(),
+                },
+            )
+            .expect("exact v0.3.1 review appears as unassigned");
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0].material_id, V031_UNASSIGNED_MATERIAL_ID);
+        assert_eq!(unassigned[0].display_name, "未归属本地材料");
+        assert!(unassigned[0].assignable);
+        let assignment = fixture
+            .manager
+            .assign_unassigned_case_material(
+                crate::privacy_workflow::AssignUnassignedCaseMaterialRequest {
+                    project_id: PROJECT_A.to_owned(),
+                    material_id: V031_UNASSIGNED_MATERIAL_ID.to_owned(),
+                    expected_row_version: unassigned[0].row_version,
+                    actor: "v0.3.1 upgrade test".to_owned(),
+                },
+            )
+            .expect("user can explicitly assign the historical material");
+        assert_eq!(assignment.assignment_mode, "initialize_null_case");
+        assert_eq!(assignment.binding_action, "reused");
+        let catalog = fixture
+            .manager
+            .list_case_materials(crate::privacy_workflow::ListCaseMaterialsRequest {
+                project_id: PROJECT_A.to_owned(),
+            })
+            .expect("assigned exact v0.3.1 review appears in the case catalog");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].material_id, V031_UNASSIGNED_MATERIAL_ID);
+        assert_eq!(
+            catalog[0].display_name,
+            crate::privacy_workflow::case_materials::UNKNOWN_LEGACY_LOCAL_MATERIAL_DISPLAY_NAME
+        );
+        assert_eq!(catalog[0].migration_status, "ready");
+        let assigned_review = fixture
+            .manager
+            .load_review(V031_UNASSIGNED_REDACTION_ID)
+            .expect("assigned exact v0.3.1 review remains readable");
+        assert_eq!(assigned_review.case_id.as_deref(), Some(case_id.as_str()));
+        assert_eq!(assigned_review.source_display_name, "Local material");
+        assert_eq!(assigned_review.source_sha256, review.source_sha256);
+        assert_eq!(assigned_review.extraction_sha256, review.extraction_sha256);
+        assert_eq!(
+            assigned_review.suggested_redacted_content_sha256,
+            review.suggested_redacted_content_sha256
+        );
+
+        let connection = fixture
+            .manager
+            .open_connection()
+            .expect("assigned exact v0.3.1 reader");
+        let (display_blob, display_hash, display_scheme, source_name_hash) = connection
+            .query_row(
+                "SELECT protected_display_name,display_name_sha256,
+                        display_name_protection_scheme,source_name_sha256
+                 FROM privacy_materials WHERE material_id=?1",
+                [V031_UNASSIGNED_MATERIAL_ID],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("assigned display tuple");
+        assert_eq!(
+            (display_blob, display_hash, display_scheme),
+            (None, None, None)
+        );
+        assert_eq!(source_name_hash, source_name_sha256);
+        let loaded = PrivacyStore::load_review_draft(&connection, V031_UNASSIGNED_REDACTION_ID)
+            .expect("assigned review payload");
+        assert!(is_exact_v031_assigned_review_payload(
+            &loaded.review_payload_plaintext,
+            case_id.as_str()
+        ));
+        let raw = serde_json::from_slice::<serde_json::Value>(&loaded.review_payload_plaintext)
+            .expect("assigned review JSON");
+        assert!(raw.get("sourceDisplayName").is_none());
+        drop(connection);
+
+        assert!(fixture
+            .manager
+            .case_material_migration_required()
+            .expect("assignment changes the canonical source fingerprint"));
+        let rerun = fixture
+            .manager
+            .run_case_material_migration_after_backup()
+            .expect("audited v0.3.1 assignment remains migration-compatible");
+        assert_eq!(rerun.blocked, 0);
+        assert_eq!(rerun.privacy_materials_migrated, 1);
+        assert_eq!(rerun.redaction_generations_migrated, 1);
+        assert!(!fixture
+            .manager
+            .case_material_migration_required()
+            .expect("post-assignment migration reaches a terminal state"));
+        let no_op = fixture
+            .manager
+            .run_case_material_migration_after_backup()
+            .expect("post-assignment migration replay is idempotent");
+        assert_eq!(no_op.blocked, 0);
+        assert_eq!(no_op.privacy_materials_migrated, 0);
+        assert_eq!(no_op.redaction_generations_migrated, 0);
+
+        let catalog = fixture
+            .manager
+            .list_case_materials(crate::privacy_workflow::ListCaseMaterialsRequest {
+                project_id: PROJECT_A.to_owned(),
+            })
+            .expect("assigned material remains listable after migration reentry");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog[0].display_name,
+            crate::privacy_workflow::case_materials::UNKNOWN_LEGACY_LOCAL_MATERIAL_DISPLAY_NAME
+        );
+        let connection = fixture
+            .manager
+            .open_connection()
+            .expect("post-rerun exact v0.3.1 reader");
+        let tuple = connection
+            .query_row(
+                "SELECT protected_display_name,display_name_sha256,
+                        display_name_protection_scheme,source_name_sha256
+                 FROM privacy_materials WHERE material_id=?1",
+                [V031_UNASSIGNED_MATERIAL_ID],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("post-rerun display tuple");
+        assert_eq!(tuple, (None, None, None, source_name_sha256));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn assigned_exact_v031_missing_display_compatibility_rejects_unaudited_ready_material() {
+        let (fixture, _) = assigned_exact_v031_fixture();
+        let connection = fixture
+            .manager
+            .open_connection()
+            .expect("assigned exact v0.3.1 tamper connection");
+        mutate_append_only_row(
+            &connection,
+            "trg_case_material_assignment_audit_no_delete",
+            "DELETE FROM case_material_assignment_audit WHERE material_id=?1",
+            V031_UNASSIGNED_MATERIAL_ID,
+        );
+        drop(connection);
+        assert_assigned_exact_v031_listing_rejected(&fixture);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn assigned_exact_v031_missing_display_compatibility_rejects_material_event_tampering() {
+        for tamper in [
+            LatestLedgerTamper::Blocked,
+            LatestLedgerTamper::WrongTarget,
+            LatestLedgerTamper::WrongError,
+        ] {
+            let (fixture, _) = assigned_exact_v031_fixture();
+            let connection = fixture
+                .manager
+                .open_connection()
+                .expect("assigned exact v0.3.1 material-event connection");
+            append_invalid_latest_ledger_event(
+                &connection,
+                "privacy_materials",
+                V031_UNASSIGNED_MATERIAL_ID,
+                tamper,
+            );
+            drop(connection);
+            assert_assigned_exact_v031_listing_rejected(&fixture);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn assigned_exact_v031_missing_display_compatibility_rejects_redaction_ledger_tampering() {
+        for tamper in [
+            RedactionLedgerTamper::MissingBase,
+            RedactionLedgerTamper::LatestBlocked,
+            RedactionLedgerTamper::LatestWrongTarget,
+            RedactionLedgerTamper::LatestWrongGeneration,
+            RedactionLedgerTamper::ExtraLedger,
+        ] {
+            let (fixture, _) = assigned_exact_v031_fixture();
+            let connection = fixture
+                .manager
+                .open_connection()
+                .expect("assigned exact v0.3.1 redaction-ledger connection");
+            match tamper {
+                RedactionLedgerTamper::MissingBase => {
+                    delete_redaction_ledger_evidence(&connection, V031_UNASSIGNED_REDACTION_ID)
+                }
+                RedactionLedgerTamper::LatestBlocked => append_invalid_latest_ledger_event(
+                    &connection,
+                    "privacy_redactions",
+                    V031_UNASSIGNED_REDACTION_ID,
+                    LatestLedgerTamper::Blocked,
+                ),
+                RedactionLedgerTamper::LatestWrongTarget => append_invalid_latest_ledger_event(
+                    &connection,
+                    "privacy_redactions",
+                    V031_UNASSIGNED_REDACTION_ID,
+                    LatestLedgerTamper::WrongTarget,
+                ),
+                RedactionLedgerTamper::LatestWrongGeneration => append_invalid_latest_ledger_event(
+                    &connection,
+                    "privacy_redactions",
+                    V031_UNASSIGNED_REDACTION_ID,
+                    LatestLedgerTamper::WrongGeneration,
+                ),
+                RedactionLedgerTamper::ExtraLedger => {
+                    connection
+                        .execute(
+                            "INSERT INTO case_material_migration_ledger(
+                                migration_id,source_store,source_table,source_key,
+                                source_fingerprint,target_material_id,target_redaction_id,
+                                assigned_generation_number,result_state,error_code,
+                                started_at,completed_at
+                             ) VALUES(?1,?2,'privacy_redactions',?3,?4,?5,?3,2,
+                                      'migrated',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                            params![
+                                CASE_MATERIAL_MIGRATION_ID,
+                                SOURCE_STORE_PRIVACY,
+                                "red_32323232323232323232323232323232",
+                                sha256_hex(b"extra redaction ledger evidence"),
+                                V031_UNASSIGNED_MATERIAL_ID,
+                            ],
+                        )
+                        .expect("extra redaction ledger row inserts");
+                }
+            }
+            drop(connection);
+            assert_assigned_exact_v031_listing_rejected(&fixture);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn assigned_exact_v031_missing_display_compatibility_rejects_assignment_audit_tampering() {
+        for tamper in [
+            AssignmentAuditTamper::BrokenChain,
+            AssignmentAuditTamper::WrongProject,
+            AssignmentAuditTamper::WrongCase,
+            AssignmentAuditTamper::WrongMode,
+            AssignmentAuditTamper::WrongBindingAction,
+            AssignmentAuditTamper::WrongRowVersion,
+        ] {
+            let (fixture, _) = assigned_exact_v031_fixture();
+            let connection = fixture
+                .manager
+                .open_connection()
+                .expect("assigned exact v0.3.1 audit connection");
+            let update = match tamper {
+                AssignmentAuditTamper::BrokenChain => {
+                    "UPDATE case_material_assignment_audit
+                     SET previous_event_hash='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                     WHERE material_id=?1"
+                }
+                AssignmentAuditTamper::WrongProject => {
+                    "UPDATE case_material_assignment_audit
+                     SET project_id='case-assignment-project-b' WHERE material_id=?1"
+                }
+                AssignmentAuditTamper::WrongCase => {
+                    "UPDATE case_material_assignment_audit
+                     SET privacy_case_id='case_99999999999999999999999999999999'
+                     WHERE material_id=?1"
+                }
+                AssignmentAuditTamper::WrongMode => {
+                    "UPDATE case_material_assignment_audit
+                     SET assignment_mode='preserve_historical_case' WHERE material_id=?1"
+                }
+                AssignmentAuditTamper::WrongBindingAction => {
+                    "UPDATE case_material_assignment_audit
+                     SET binding_action='created' WHERE material_id=?1"
+                }
+                AssignmentAuditTamper::WrongRowVersion => {
+                    "UPDATE case_material_assignment_audit
+                     SET expected_material_row_version=expected_material_row_version+1,
+                         assigned_material_row_version=assigned_material_row_version+1
+                     WHERE material_id=?1"
+                }
+            };
+            mutate_append_only_row(
+                &connection,
+                "trg_case_material_assignment_audit_no_update",
+                update,
+                V031_UNASSIGNED_MATERIAL_ID,
+            );
+            drop(connection);
+            assert_assigned_exact_v031_listing_rejected(&fixture);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn assigned_exact_v031_missing_display_compatibility_rejects_broken_binding() {
+        let (fixture, _) = assigned_exact_v031_fixture();
+        let connection = fixture
+            .manager
+            .open_connection()
+            .expect("assigned exact v0.3.1 binding connection");
+        mutate_append_only_row(
+            &connection,
+            "trg_project_privacy_case_binding_no_delete",
+            "DELETE FROM project_privacy_case_bindings WHERE project_id=?1",
+            PROJECT_A,
+        );
+        drop(connection);
+        assert_assigned_exact_v031_listing_rejected(&fixture);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn assigned_exact_v031_missing_display_compatibility_rejects_noncanonical_payloads() {
+        for tamper in [
+            AssignedPayloadTamper::WrongCase,
+            AssignedPayloadTamper::SourceDisplayName,
+            AssignedPayloadTamper::VaultField,
+        ] {
+            let (fixture, _) = assigned_exact_v031_fixture();
+            let connection = fixture
+                .manager
+                .open_connection()
+                .expect("assigned exact v0.3.1 payload connection");
+            let loaded = PrivacyStore::load_review_draft(&connection, V031_UNASSIGNED_REDACTION_ID)
+                .expect("assigned exact v0.3.1 payload loads");
+            let mut payload =
+                serde_json::from_slice::<serde_json::Value>(&loaded.review_payload_plaintext)
+                    .expect("assigned exact v0.3.1 payload parses");
+            match tamper {
+                AssignedPayloadTamper::WrongCase => {
+                    payload["caseId"] = serde_json::Value::String(
+                        "case_99999999999999999999999999999999".to_owned(),
+                    );
+                }
+                AssignedPayloadTamper::SourceDisplayName => {
+                    payload["sourceDisplayName"] = serde_json::Value::String(String::new());
+                }
+                AssignedPayloadTamper::VaultField => {
+                    payload["vaultObjectId"] =
+                        serde_json::Value::String("obj_not_historical".to_owned());
+                }
+            }
+            let protected =
+                protect_local(&serde_json::to_vec(&payload).expect("tampered payload serializes"))
+                    .expect("tampered payload protects");
+            connection
+                .execute(
+                    "UPDATE privacy_redactions
+                     SET protected_review_blob=?2,row_version=row_version+1
+                     WHERE redaction_id=?1",
+                    params![V031_UNASSIGNED_REDACTION_ID, protected],
+                )
+                .expect("tampered review payload writes through canonical row-version trigger");
+            drop(connection);
+            assert_assigned_exact_v031_listing_rejected(&fixture);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn assigned_exact_v031_missing_display_compatibility_rejects_partial_display_tuple() {
+        let (fixture, _) = assigned_exact_v031_fixture();
+        let connection = fixture
+            .manager
+            .open_connection()
+            .expect("assigned exact v0.3.1 display connection");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .expect("test explicitly bypasses the all-or-none display tuple CHECK");
+        connection
+            .execute(
+                "UPDATE privacy_materials
+                 SET protected_display_name=x'01',row_version=row_version+1
+                 WHERE material_id=?1",
+                [V031_UNASSIGNED_MATERIAL_ID],
+            )
+            .expect("partial display tuple writes through canonical row-version trigger");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .expect("test restores SQLite CHECK enforcement");
+        drop(connection);
+        assert_assigned_exact_v031_listing_rejected(&fixture);
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum LatestLedgerTamper {
+        Blocked,
+        WrongTarget,
+        WrongError,
+        WrongGeneration,
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum RedactionLedgerTamper {
+        MissingBase,
+        LatestBlocked,
+        LatestWrongTarget,
+        LatestWrongGeneration,
+        ExtraLedger,
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum AssignmentAuditTamper {
+        BrokenChain,
+        WrongProject,
+        WrongCase,
+        WrongMode,
+        WrongBindingAction,
+        WrongRowVersion,
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum AssignedPayloadTamper {
+        WrongCase,
+        SourceDisplayName,
+        VaultField,
+    }
+
+    #[cfg(windows)]
+    fn assigned_exact_v031_fixture() -> (V031Fixture, PrivacyCaseId) {
+        let fixture = V031Fixture::with_exact_unassigned_review(&[PROJECT_A]);
+        fixture.upgrade_to_v5();
+        let source = fixture
+            .manager
+            .v031_case_material_migration_source_fingerprint(&fixture.gate)
+            .expect("exact v0.3.1 assignment fixture source fingerprint");
+        let report = fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("exact v0.3.1 assignment fixture migrates");
+        assert_eq!(report.blocked, 0);
+        complete_approved_projection_migration(&fixture.manager);
+
+        let user_migration_source = fixture.gate.original_user_source_proof().clone();
+        let mut user = database::open_existing_user_database(&fixture.user_database_path)
+            .expect("open exact assignment fixture User-v10");
+        database::migrate_exact_v031_user_to_v11_with_upgrade_audit(
+            &mut user,
+            &user_migration_source,
+            &database::V031UserUpgradeAuditEvidence {
+                lineage_id: "1".repeat(64),
+                source_profile_proof_sha256: "2".repeat(64),
+                source_privacy_logical_manifest_sha256: "3".repeat(64),
+                source_privacy_business_manifest_sha256: "4".repeat(64),
+                original_rollback_identity_sha256: "5".repeat(64),
+                target_privacy_pre_audit_logical_manifest_sha256: "6".repeat(64),
+                target_privacy_pre_audit_business_manifest_sha256: "7".repeat(64),
+                previous_receipt_sha256: "8".repeat(64),
+                source_privacy_table_count: 5,
+                source_privacy_total_rows: 2,
+                target_privacy_table_count: privacy::PRIVACY_V6_APPLICATION_TABLES.len() as u64,
+                target_privacy_total_rows: 1,
+                original_rollback_slot_count: 5,
+            },
+        )
+        .expect("migrate exact assignment fixture User-v10 to User-v11");
+        drop(user);
+
+        let unassigned = fixture
+            .manager
+            .list_unassigned_case_materials(
+                crate::privacy_workflow::ListUnassignedCaseMaterialsRequest {
+                    project_id: PROJECT_A.to_owned(),
+                },
+            )
+            .expect("exact v0.3.1 assignment fixture is unassigned");
+        assert_eq!(unassigned.len(), 1);
+        fixture
+            .manager
+            .assign_unassigned_case_material(
+                crate::privacy_workflow::AssignUnassignedCaseMaterialRequest {
+                    project_id: PROJECT_A.to_owned(),
+                    material_id: V031_UNASSIGNED_MATERIAL_ID.to_owned(),
+                    expected_row_version: unassigned[0].row_version,
+                    actor: "v0.3.1 assignment compatibility negative test".to_owned(),
+                },
+            )
+            .expect("exact v0.3.1 assignment fixture assigns");
+        let project = ProjectId::parse(PROJECT_A).expect("assignment fixture project id");
+        let connection = fixture
+            .manager
+            .open_connection()
+            .expect("assigned fixture binding reader");
+        let case_id = ProjectPrivacyCaseBindingStore::resolve(&connection, &project)
+            .expect("assigned fixture binding resolves")
+            .expect("assigned fixture binding exists");
+        assert!(authenticates_assigned_exact_v031_missing_display_material(
+            &connection,
+            V031_UNASSIGNED_MATERIAL_ID,
+            &project,
+        )
+        .expect("clean assignment compatibility authenticates"));
+        drop(connection);
+        (fixture, case_id)
+    }
+
+    #[cfg(windows)]
+    fn assert_assigned_exact_v031_listing_rejected(fixture: &V031Fixture) {
+        let error = fixture
+            .manager
+            .list_case_materials(crate::privacy_workflow::ListCaseMaterialsRequest {
+                project_id: PROJECT_A.to_owned(),
+            })
+            .expect_err("tampered v0.3.1 assignment compatibility must fail closed");
+        assert!(
+            matches!(
+                error.code(),
+                "case_material_display_name_invalid"
+                    | "case_material_assignment_store_failed"
+                    | "project_privacy_case_store_failed"
+                    | "case_material_store_failed"
+                    | "privacy_store_database_error"
+                    | "privacy_store_schema_unsupported"
+                    | "privacy_store_unavailable"
+            ),
+            "unexpected fail-closed error code: {}",
+            error.code()
+        );
+    }
+
+    #[cfg(windows)]
+    fn append_invalid_latest_ledger_event(
+        connection: &Connection,
+        source_table: &str,
+        source_key: &str,
+        tamper: LatestLedgerTamper,
+    ) {
+        let (_, evidence) = load_ledger_evidence(
+            connection,
+            CASE_MATERIAL_MIGRATION_ID,
+            SOURCE_STORE_PRIVACY,
+            source_table,
+            source_key,
+        )
+        .expect("effective migration ledger evidence loads")
+        .expect("base migration ledger evidence exists");
+        let mut target_material_id = evidence.target_material_id;
+        let mut target_redaction_id = evidence.target_redaction_id;
+        let mut generation = evidence.assigned_generation_number;
+        let mut result_state = evidence.result_state;
+        let mut error_code = evidence.error_code;
+        match tamper {
+            LatestLedgerTamper::Blocked => {
+                result_state = "blocked".to_owned();
+                error_code = Some("tampered_latest_block".to_owned());
+            }
+            LatestLedgerTamper::WrongTarget => {
+                if source_table == "privacy_redactions" {
+                    target_redaction_id = Some("red_32323232323232323232323232323232".to_owned());
+                } else {
+                    target_material_id = Some("mat_32323232323232323232323232323232".to_owned());
+                }
+            }
+            LatestLedgerTamper::WrongError => {
+                error_code = Some("tampered_latest_error".to_owned());
+            }
+            LatestLedgerTamper::WrongGeneration => generation = Some(2),
+        }
+        connection
+            .execute(
+                "INSERT INTO case_material_migration_events(
+                    migration_event_id,migration_id,source_store,source_table,source_key,
+                    event_type,source_fingerprint,target_material_id,target_redaction_id,
+                    assigned_generation_number,result_state,error_code,occurred_at
+                 ) VALUES(?1,?2,?3,?4,?5,'tamper_probe',?6,?7,?8,?9,?10,?11,
+                          CURRENT_TIMESTAMP)",
+                params![
+                    format!("migev_{}", Uuid::new_v4().simple()),
+                    CASE_MATERIAL_MIGRATION_ID,
+                    SOURCE_STORE_PRIVACY,
+                    source_table,
+                    source_key,
+                    evidence.source_fingerprint,
+                    target_material_id,
+                    target_redaction_id,
+                    generation,
+                    result_state,
+                    error_code,
+                ],
+            )
+            .expect("invalid latest migration event appends");
+    }
+
+    #[cfg(windows)]
+    fn mutate_append_only_row(
+        connection: &Connection,
+        trigger_name: &str,
+        mutation: &str,
+        parameter: &str,
+    ) {
+        connection
+            .execute_batch(&format!("DROP TRIGGER {trigger_name}"))
+            .expect("test explicitly removes append-only trigger");
+        let changed = connection
+            .execute(mutation, [parameter])
+            .expect("test-only append-only evidence mutation succeeds");
+        assert_eq!(changed, 1, "test-only evidence mutation changes one row");
+        connection
+            .execute_batch(canonical_tamper_trigger_sql(trigger_name))
+            .expect("test restores the canonical append-only trigger");
+    }
+
+    #[cfg(windows)]
+    fn delete_redaction_ledger_evidence(connection: &Connection, redaction_id: &str) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER trg_case_material_migration_events_no_delete;
+                 DROP TRIGGER trg_case_material_migration_ledger_no_delete;",
+            )
+            .expect("test explicitly removes migration evidence delete triggers");
+        connection
+            .execute(
+                "DELETE FROM case_material_migration_events
+                 WHERE migration_id=?1 AND source_store=?2
+                   AND source_table='privacy_redactions' AND source_key=?3",
+                params![
+                    CASE_MATERIAL_MIGRATION_ID,
+                    SOURCE_STORE_PRIVACY,
+                    redaction_id,
+                ],
+            )
+            .expect("test-only redaction migration events delete");
+        connection
+            .execute(
+                "DELETE FROM case_material_migration_ledger
+                 WHERE migration_id=?1 AND source_store=?2
+                   AND source_table='privacy_redactions' AND source_key=?3",
+                params![
+                    CASE_MATERIAL_MIGRATION_ID,
+                    SOURCE_STORE_PRIVACY,
+                    redaction_id,
+                ],
+            )
+            .expect("test-only redaction migration ledger deletes");
+        connection
+            .execute_batch(canonical_tamper_trigger_sql(
+                "trg_case_material_migration_events_no_delete",
+            ))
+            .expect("canonical migration event delete trigger restores");
+        connection
+            .execute_batch(canonical_tamper_trigger_sql(
+                "trg_case_material_migration_ledger_no_delete",
+            ))
+            .expect("canonical migration ledger delete trigger restores");
+    }
+
+    #[cfg(windows)]
+    fn canonical_tamper_trigger_sql(trigger_name: &str) -> &'static str {
+        match trigger_name {
+            "trg_case_material_assignment_audit_no_update" => {
+                privacy::ASSIGNMENT_AUDIT_NO_UPDATE_TRIGGER_SQL
+            }
+            "trg_case_material_assignment_audit_no_delete" => {
+                privacy::ASSIGNMENT_AUDIT_NO_DELETE_TRIGGER_SQL
+            }
+            "trg_project_privacy_case_binding_no_delete" => {
+                "CREATE TRIGGER IF NOT EXISTS trg_project_privacy_case_binding_no_delete
+                 BEFORE DELETE ON project_privacy_case_bindings
+                 BEGIN
+                     SELECT RAISE(ABORT, 'project/privacy case binding is immutable');
+                 END;"
+            }
+            "trg_case_material_migration_ledger_no_delete" => {
+                "CREATE TRIGGER IF NOT EXISTS trg_case_material_migration_ledger_no_delete
+                 BEFORE DELETE ON case_material_migration_ledger
+                 BEGIN
+                     SELECT RAISE(ABORT, 'case material migration ledger is append only');
+                 END;"
+            }
+            "trg_case_material_migration_events_no_delete" => {
+                "CREATE TRIGGER IF NOT EXISTS trg_case_material_migration_events_no_delete
+                 BEFORE DELETE ON case_material_migration_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'case material migration events are append only');
+                 END;"
+            }
+            _ => panic!("unsupported test-only append-only trigger: {trigger_name}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nonlegacy_empty_display_review_is_blocked_instead_of_using_v031_compatibility() {
+        let fixture = V031Fixture::with_nonlegacy_empty_display_review(&[PROJECT_A]);
+        fixture.upgrade_to_v5();
+        let source = fixture
+            .manager
+            .v031_case_material_migration_source_fingerprint(&fixture.gate)
+            .expect("nonlegacy source fingerprint");
+        let report = fixture
+            .manager
+            .run_v031_case_material_migration_after_backup_for_source(&fixture.gate, &source)
+            .expect("invalid display is ledgered fail-closed");
+        assert_eq!(report.blocked, 2);
+        complete_approved_projection_migration(&fixture.manager);
+        let connection = fixture
+            .manager
+            .open_connection()
+            .expect("Privacy v5 reader");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT migration_status,state,project_id,legacy_case_id
+                     FROM privacy_materials WHERE material_id=?1",
+                    [V031_UNASSIGNED_MATERIAL_ID],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .expect("blocked material"),
+            ("blocked".to_owned(), "blocked".to_owned(), None, None)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT error_code FROM case_material_migration_ledger
+                     WHERE migration_id=?1 AND source_store=?2
+                       AND source_table='privacy_materials' AND source_key=?3",
+                    params![
+                        CASE_MATERIAL_MIGRATION_ID,
+                        SOURCE_STORE_PRIVACY,
+                        V031_UNASSIGNED_MATERIAL_ID
+                    ],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("blocked material ledger"),
+            Some("privacy_display_name_invalid".to_owned())
+        );
     }
 
     #[test]

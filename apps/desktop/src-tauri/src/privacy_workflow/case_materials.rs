@@ -18,6 +18,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+pub(super) const UNKNOWN_LEGACY_LOCAL_MATERIAL_DISPLAY_NAME: &str =
+    "Legacy local material (name unavailable)";
+
 #[cfg(test)]
 #[path = "case_materials_tests.rs"]
 mod tests;
@@ -324,7 +327,9 @@ pub(super) fn initialize_assignment_schema(
         .map_err(|_| case_material_assignment_store_error())
 }
 
-fn validate_assignment_schema(connection: &Connection) -> Result<(), PrivacyWorkflowError> {
+pub(super) fn validate_assignment_schema(
+    connection: &Connection,
+) -> Result<(), PrivacyWorkflowError> {
     let schema_version = connection
         .query_row(
             "SELECT value FROM privacy_schema_metadata WHERE key=?1",
@@ -715,6 +720,16 @@ impl PrivacyWorkflowManager {
                 .get::<_, Option<String>>(15)
                 .map_err(|_| case_material_store_error())?;
 
+            let authenticated_legacy_missing_display = protected_display_name.is_none()
+                && display_name_sha256.is_none()
+                && display_name_scheme.is_none()
+                && migration_status == "ready"
+                && super::case_material_migration::authenticates_assigned_exact_v031_missing_display_material(
+                    &connection,
+                    &material_id,
+                    &project_id,
+                )?;
+
             if source_kind == "vault" && migration_status == "ready" && deleted_at.is_none() {
                 let privacy_case_id = PrivacyCaseId::parse(vault_case_id.ok_or_else(|| {
                     PrivacyWorkflowError::new(
@@ -735,6 +750,7 @@ impl PrivacyWorkflowManager {
                 display_name_sha256,
                 display_name_scheme,
                 &migration_status,
+                authenticated_legacy_missing_display,
             )?;
             materials.push(CaseMaterialSummary {
                 project_id: project_id.as_str().to_owned(),
@@ -829,6 +845,7 @@ impl PrivacyWorkflowManager {
                     row.get::<_, Option<String>>(3)
                         .map_err(|_| case_material_store_error())?,
                     &migration_status,
+                    false,
                 )?,
                 media_type: row
                     .get::<_, Option<String>>(4)
@@ -947,13 +964,22 @@ impl PrivacyWorkflowManager {
         }
         let mut reviews = Vec::with_capacity(redaction_ids.len());
         let mut saw_null_review_case = false;
+        let mut all_reviews_missing_display_name = true;
+        let mut all_reviews_exact_v031 = true;
         for redaction_id in redaction_ids {
             let loaded = PrivacyStore::load_review_draft(&transaction, &redaction_id)
                 .map_err(PrivacyWorkflowError::store)?;
+            let exact_v031 = super::case_material_migration::is_exact_v031_stored_review_payload(
+                &loaded.review_payload_plaintext,
+            );
             let stored: StoredReviewPayload =
                 serde_json::from_slice(&loaded.review_payload_plaintext)
                     .map_err(|_| case_material_assignment_identity_error())?;
             validate_loaded_review(&loaded, &stored)?;
+            all_reviews_exact_v031 &= exact_v031;
+            if !stored.source_display_name.is_empty() {
+                all_reviews_missing_display_name = false;
+            }
             match stored.case_id.as_deref() {
                 Some(value) => {
                     candidates.insert(parse_assignment_case_id(value)?);
@@ -976,12 +1002,23 @@ impl PrivacyWorkflowManager {
             } else if material.source_kind == "vault" {
                 return Err(case_material_assignment_identity_error());
             }
-            reviews.push((loaded, stored));
+            reviews.push((loaded, stored, exact_v031));
         }
         if candidates.len() > 1 || (!candidates.is_empty() && saw_null_review_case) {
             return Err(case_material_assignment_ambiguous_error());
         }
         if material.source_kind == "vault" && material.vault_case_id.is_none() {
+            return Err(case_material_assignment_identity_error());
+        }
+        let assign_exact_v031_missing_display =
+            material.source_kind == "local_review" && all_reviews_missing_display_name;
+        if assign_exact_v031_missing_display
+            && (!all_reviews_exact_v031
+                || !super::case_material_migration::authenticates_exact_v031_unassigned_missing_display_material(
+                    &transaction,
+                    &material_id,
+                )?)
+        {
             return Err(case_material_assignment_identity_error());
         }
 
@@ -1028,7 +1065,7 @@ impl PrivacyWorkflowManager {
                     || assignment_has_risk_history(&transaction, &material_id)?
                     || reviews
                         .iter()
-                        .any(|(loaded, _)| loaded.review_state != "review_required")
+                        .any(|(loaded, _, _)| loaded.review_state != "review_required")
                 {
                     return Err(case_material_assignment_identity_error());
                 }
@@ -1047,10 +1084,33 @@ impl PrivacyWorkflowManager {
                     &context,
                 )
                 .map_err(PrivacyWorkflowError::project_case_binding)?;
-                for (loaded, mut stored) in reviews {
+                for (loaded, mut stored, exact_v031) in reviews {
                     stored.case_id = Some(resolved.as_str().to_owned());
-                    let plaintext = serde_json::to_vec(&stored)
+                    let plaintext = if assign_exact_v031_missing_display && exact_v031 {
+                        let mut payload = serde_json::from_slice::<serde_json::Value>(
+                            &loaded.review_payload_plaintext,
+                        )
                         .map_err(|_| case_material_assignment_identity_error())?;
+                        let fields = payload
+                            .as_object_mut()
+                            .ok_or_else(case_material_assignment_identity_error)?;
+                        fields.insert(
+                            "caseId".to_owned(),
+                            serde_json::Value::String(resolved.as_str().to_owned()),
+                        );
+                        let plaintext = serde_json::to_vec(&payload)
+                            .map_err(|_| case_material_assignment_identity_error())?;
+                        if !super::case_material_migration::is_exact_v031_assigned_review_payload(
+                            &plaintext,
+                            resolved.as_str(),
+                        ) {
+                            return Err(case_material_assignment_identity_error());
+                        }
+                        plaintext
+                    } else {
+                        serde_json::to_vec(&stored)
+                            .map_err(|_| case_material_assignment_identity_error())?
+                    };
                     PrivacyStore::update_review_draft_exact(
                         &transaction,
                         &loaded.redaction_id,
@@ -2129,6 +2189,7 @@ fn decode_display_name(
     expected_sha256: Option<String>,
     scheme: Option<String>,
     migration_status: &str,
+    authenticated_legacy_missing_display: bool,
 ) -> Result<String, PrivacyWorkflowError> {
     match (protected, expected_sha256, scheme) {
         (Some(protected), Some(expected_sha256), Some(scheme))
@@ -2152,6 +2213,11 @@ fn decode_display_name(
                     "案件材料展示名编码无效。",
                 )
             })
+        }
+        (None, None, None)
+            if migration_status == "ready" && authenticated_legacy_missing_display =>
+        {
+            Ok(UNKNOWN_LEGACY_LOCAL_MATERIAL_DISPLAY_NAME.to_owned())
         }
         (None, None, None)
             if matches!(
