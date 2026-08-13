@@ -196,6 +196,70 @@ if ($wrapperErrors.Count -gt 0 -or $wrapperPreflightCommands.Count -ne 1) {
   throw "Release wrapper must delegate Run to signed build without a second preflight or recursion"
 }
 
+$approvedMcpHarnessPath = Join-Path $ProjectRoot "scripts\test-standalone-approved-mcp.ps1"
+$approvedMcpHarnessSource = Get-Content -LiteralPath $approvedMcpHarnessPath -Raw -Encoding UTF8
+$approvedMcpHarnessTokens = $null
+$approvedMcpHarnessErrors = $null
+$approvedMcpHarnessAst = [Management.Automation.Language.Parser]::ParseFile(
+  $approvedMcpHarnessPath,
+  [ref]$approvedMcpHarnessTokens,
+  [ref]$approvedMcpHarnessErrors
+)
+if ($approvedMcpHarnessErrors.Count -gt 0) {
+  throw "Approved MCP E2E harness AST could not be inspected: $($approvedMcpHarnessErrors -join '; ')"
+}
+$qualificationTestName = "approved_mcp::standalone_binary_tests::explicit_binary_qualification_canary_is_fail_closed"
+$fullSessionTestName = "approved_mcp::standalone_binary_tests::app_approval_to_real_stdio_and_http_binary_is_fail_closed"
+foreach ($requiredHarnessFragment in @(
+  "`$qualificationTestName = '$qualificationTestName'",
+  "`$fullSessionTestName = '$fullSessionTestName'",
+  '$testName = if ($usingExplicitBinary) { $qualificationTestName } else { $fullSessionTestName }',
+  'Assert-McpBinaryUnchanged -Candidate $binaryPath -ExpectedSha256 $binarySha256',
+  'release-external-stdio-http-qualification-canary',
+  'MCP_STANDALONE_APPROVED_E2E_TEST='
+)) {
+  if (-not $approvedMcpHarnessSource.Contains($requiredHarnessFragment)) {
+    throw "Approved MCP explicit-binary E2E contract is missing: $requiredHarnessFragment"
+  }
+}
+$testNameAssignments = @($approvedMcpHarnessAst.FindAll({
+  param($node)
+  $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+    $node.Left.Extent.Text -ceq '$testName'
+}, $true))
+$testLoops = @($approvedMcpHarnessAst.FindAll({
+  param($node)
+  $node -is [Management.Automation.Language.ForEachStatementAst] -and
+    $node.Variable.VariablePath.UserPath -ceq 'testName'
+}, $true))
+if ($testNameAssignments.Count -ne 1 -or $testLoops.Count -ne 0) {
+  throw "Approved MCP E2E harness must select exactly one namespace-compatible test"
+}
+$selectionText = $testNameAssignments[0].Extent.Text
+if ($selectionText.IndexOf('$qualificationTestName', [StringComparison]::Ordinal) -lt 0 -or
+    $selectionText.IndexOf('$fullSessionTestName', [StringComparison]::Ordinal) -lt 0) {
+  throw "Approved MCP E2E selection must isolate release qualification from the feature-bound full session"
+}
+$harnessCargoSteps = @($approvedMcpHarnessAst.FindAll({
+  param($node)
+  $node -is [Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -ceq 'Invoke-CargoStep' -and
+    $node.Extent.Text.Contains('MCP_E2E_TEST_FAILED')
+}, $true))
+$harnessHashChecks = @($approvedMcpHarnessAst.FindAll({
+  param($node)
+  $node -is [Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -ceq 'Assert-McpBinaryUnchanged'
+}, $true))
+if ($harnessCargoSteps.Count -ne 1 -or $harnessHashChecks.Count -ne 2) {
+  throw "The selected approved MCP exact test must run once between before/after binary identity checks"
+}
+$cargoOffset = $harnessCargoSteps[0].Extent.StartOffset
+$hashOffsets = @($harnessHashChecks | ForEach-Object { $_.Extent.StartOffset } | Sort-Object)
+if ($hashOffsets[0] -ge $cargoOffset -or $hashOffsets[1] -le $cargoOffset) {
+  throw "The selected approved MCP exact test must remain between its two binary identity checks"
+}
+
 $parseFailures = @()
 foreach ($script in @(
   "release_filenames.ps1",

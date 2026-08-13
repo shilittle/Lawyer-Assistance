@@ -3,9 +3,9 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
-import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -290,75 +290,39 @@ class ReleaseContractTests(unittest.TestCase):
 
 class McpCiReleaseContractPathTests(unittest.TestCase):
     @staticmethod
-    def workflow_paths(event: str) -> list[str]:
-        workflow = (
-            REPOSITORY_ROOT / ".github/workflows/mcp-ci.yml"
-        ).read_text(encoding="utf-8")
-        event_header = f"  {event}:"
+    def workflow_event_block(event: str) -> list[str]:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/mcp-ci.yml").read_text(
+            encoding="utf-8"
+        )
         lines = workflow.splitlines()
         try:
-            event_start = lines.index(event_header)
-            paths_start = lines.index("    paths:", event_start + 1)
+            event_start = lines.index(f"  {event}:")
         except ValueError as error:
-            raise AssertionError(f"missing {event} paths filter") from error
-
-        paths: list[str] = []
-        for line in lines[paths_start + 1 :]:
-            if line.startswith('      - "') and line.endswith('"'):
-                paths.append(line[len('      - "') : -1])
-                continue
-            if line.strip():
+            raise AssertionError(f"missing {event} event") from error
+        block: list[str] = []
+        for line in lines[event_start + 1 :]:
+            if line.startswith("  ") and not line.startswith("    "):
                 break
-        if not paths:
-            raise AssertionError(f"empty {event} paths filter")
-        return paths
+            block.append(line)
+        return block
 
-    @staticmethod
-    def is_covered(required: str, pattern: str) -> bool:
-        if pattern == required:
-            return True
-        if pattern.endswith("/**"):
-            prefix = pattern[:-3].rstrip("/")
-            return required.startswith(prefix + "/")
-        return False
-
-    def test_push_and_pull_request_cover_every_release_contract_input(self) -> None:
-        contract = load_contract(CONTRACT_PATH)
-        required = {
-            ".github/workflows/mcp-ci.yml",
-            "Cargo.lock",
-            "scripts/check_release_contract.py",
-            "scripts/release/release_contract.py",
-            "scripts/verify_release_assets.py",
-            "scripts/test_verify_release_assets.py",
-            "scripts/verify_updater_signature.py",
-            "scripts/test_verify_updater_signature.py",
-            CONTRACT_PATH.relative_to(REPOSITORY_ROOT).as_posix(),
-            Path(__file__).resolve().relative_to(REPOSITORY_ROOT).as_posix(),
-            contract["mcpVersionProbe"]["sourcePath"],
-            contract["releaseNotes"]["path"],
-            contract["compatibilityContract"]["path"],
-            contract["minerU"]["formalFilenameFixturePath"],
-        }
-        required.update(source["path"] for source in contract["versionSources"])
-        required.update(document["path"] for document in contract["currentDocs"])
-
-        workspace = tomllib.loads(
-            (REPOSITORY_ROOT / "Cargo.toml").read_text(encoding="utf-8")
-        )
-        required.update(
-            f"{member.rstrip('/')}/Cargo.toml"
-            for member in workspace["workspace"]["members"]
-        )
-
+    def test_push_and_pull_request_are_unconditionally_eligible(self) -> None:
         for event in ("push", "pull_request"):
-            patterns = self.workflow_paths(event)
-            uncovered = sorted(
-                path
-                for path in required
-                if not any(self.is_covered(path, pattern) for pattern in patterns)
+            block = self.workflow_event_block(event)
+            self.assertFalse(
+                any(
+                    re.match(r"^(?:paths|paths-ignore)\s*:", line.strip())
+                    for line in block
+                ),
+                f"{event} must run for every commit so exact-HEAD closure always exists",
             )
-            self.assertEqual(uncovered, [], f"{event} does not cover contract inputs")
+
+    def test_inline_and_block_path_filters_are_both_detected(self) -> None:
+        for line in ('paths:', 'paths: ["docs/**"]', 'paths-ignore: ["README.md"]'):
+            self.assertIsNotNone(
+                re.match(r"^(?:paths|paths-ignore)\s*:", line.strip()),
+                line,
+            )
 
         workflow = (REPOSITORY_ROOT / ".github/workflows/mcp-ci.yml").read_text(
             encoding="utf-8"

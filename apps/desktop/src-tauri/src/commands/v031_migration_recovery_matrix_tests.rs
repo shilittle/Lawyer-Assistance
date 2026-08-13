@@ -538,9 +538,12 @@ fn write_residue(root: &Path, relative: &str, bytes: &[u8]) {
     std::fs::write(path, bytes).expect("write deterministic residue");
 }
 
+type RecoveryResidueEntry<'a> = (&'a str, &'a [u8]);
+type RecoveryResidueCase<'a> = (&'a str, &'a [RecoveryResidueEntry<'a>]);
+
 #[test]
 fn r3_formal_absent_ignores_malformed_residue_without_parsing_or_writes() {
-    let cases: [(&str, &[(&str, &[u8])]); 5] = [
+    let cases: [RecoveryResidueCase<'_>; 5] = [
         (
             "incoming only",
             &[(V031_MIGRATION_RECOVERY_MARKER_INCOMING, b"not-dpapi")],

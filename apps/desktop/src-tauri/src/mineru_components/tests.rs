@@ -891,8 +891,8 @@ fn real_signed_sharded_release_imports_installs_and_remeasures() {
         .expect("LA_REAL_MINERU_COMPONENT_OFFLINE_SET_DIRECTORY is required");
     let catalog_path = release.join("mineru-component-catalog.json");
     let signature_path = release.join("mineru-component-catalog.json.minisig");
-    let descriptor_path = offline_set
-        .join("lawyer-assistance-mineru-0.4.0-windows-x86_64.laocrpkg.laocrparts");
+    let descriptor_path =
+        offline_set.join("lawyer-assistance-mineru-0.4.0-windows-x86_64.laocrpkg.laocrparts");
     for path in [&catalog_path, &signature_path, &descriptor_path] {
         assert!(path.is_file(), "required release artifact is missing");
     }
@@ -903,10 +903,7 @@ fn real_signed_sharded_release_imports_installs_and_remeasures() {
         .expect("production catalog signature and epoch verify");
     assert!(imported.catalog_trusted);
     assert_eq!(imported.available_packages.len(), 1);
-    assert_eq!(
-        imported.available_packages[0].component_version,
-        "0.4.0"
-    );
+    assert_eq!(imported.available_packages[0].component_version, "0.4.0");
     assert_eq!(
         imported.available_packages[0].package_sha256,
         expected_package_sha256
