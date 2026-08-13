@@ -844,10 +844,10 @@ fn validate_migration_source_path_components(path: &Path) -> Result<(), Database
     }
     #[cfg(not(windows))]
     {
-        return Err(DatabaseInitError::Io(std::io::Error::new(
+        Err(DatabaseInitError::Io(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "user migration source fixed-local identity proof is unavailable on this platform",
-        )));
+        )))
     }
     #[cfg(windows)]
     {
