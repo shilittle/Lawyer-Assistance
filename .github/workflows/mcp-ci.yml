@@ -178,13 +178,13 @@ jobs:
       - name: Build release server
         run: cargo build --release --locked -p legal-mcp --bin lawyer-assistance-mcp
 
-      - name: Verify current release contract and exact MCP version output
+      - name: Verify formal release contract and exact MCP version output
         shell: pwsh
         run: |
           $suffix = if ('${{ runner.os }}' -eq 'Windows') { '.exe' } else { '' }
           $binary = "target/${{ matrix.target }}/release/lawyer-assistance-mcp$suffix"
           python -m unittest scripts.test_release_contract scripts.test_verify_updater_signature
-          python scripts/check_release_contract.py --root . --contract scripts/release/release-contract-v0.4.0.json --mode current --mcp-binary $binary
+          python scripts/check_release_contract.py --root . --contract scripts/release/release-contract-v0.4.0.json --mode formal --mcp-binary $binary
 
       - name: Fetch complete release notice dependency closure
         run: cargo fetch --locked --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-gnu --target aarch64-apple-darwin
@@ -201,11 +201,7 @@ jobs:
           python -m unittest scripts.test_package_mcp_release
           $suffix = if ('${{ runner.os }}' -eq 'Windows') { '.exe' } else { '' }
           $binary = "target/${{ matrix.target }}/release/lawyer-assistance-mcp$suffix"
-          # R4 keeps source versions prerelease until R5. This explicit CI-only
-          # mode still validates every version source and the built binary;
-          # the packaging CLI itself defaults to formal for operator use.
-          $mode = 'current'
-          $json = python scripts/package_mcp_release.py --target '${{ matrix.target }}' --binary $binary --output-dir dist/mcp --version-gate-mode $mode --expected-commit '${{ github.sha }}'
+          $json = python scripts/package_mcp_release.py --target '${{ matrix.target }}' --binary $binary --output-dir dist/mcp --version-gate-mode formal --expected-commit '${{ github.sha }}'
           if ($LASTEXITCODE -ne 0) { throw 'MCP release packaging failed' }
           $result = $json | ConvertFrom-Json
           "archive=$($result.archive)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8

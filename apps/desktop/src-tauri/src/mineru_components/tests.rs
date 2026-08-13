@@ -892,7 +892,7 @@ fn real_signed_sharded_release_imports_installs_and_remeasures() {
     let catalog_path = release.join("mineru-component-catalog.json");
     let signature_path = release.join("mineru-component-catalog.json.minisig");
     let descriptor_path = offline_set
-        .join("lawyer-assistance-mineru-0.4.0-beta.2-windows-x86_64.laocrpkg.laocrparts");
+        .join("lawyer-assistance-mineru-0.4.0-windows-x86_64.laocrpkg.laocrparts");
     for path in [&catalog_path, &signature_path, &descriptor_path] {
         assert!(path.is_file(), "required release artifact is missing");
     }
@@ -905,7 +905,7 @@ fn real_signed_sharded_release_imports_installs_and_remeasures() {
     assert_eq!(imported.available_packages.len(), 1);
     assert_eq!(
         imported.available_packages[0].component_version,
-        "0.4.0-beta.2"
+        "0.4.0"
     );
     assert_eq!(
         imported.available_packages[0].package_sha256,
@@ -933,7 +933,7 @@ fn real_signed_sharded_release_imports_installs_and_remeasures() {
         .install_offline_package(&descriptor_path)
         .expect("all catalog-pinned parts assemble and install atomically");
     let binding = mutation.binding.expect("installed component is activated");
-    assert_eq!(binding.component_version.to_string(), "0.4.0-beta.2");
+    assert_eq!(binding.component_version.to_string(), "0.4.0");
     assert_eq!(binding.manifest_sha256, expected_manifest_sha256);
     assert!(binding.worker_path.is_file());
     assert!(binding.model_root.join("pipeline").is_dir());
@@ -952,7 +952,7 @@ fn real_signed_sharded_release_imports_installs_and_remeasures() {
     )
     .expect("component manager restart remeasures installed bytes");
     let status = restarted.status().expect("component status loads");
-    assert_eq!(status.active_version.as_deref(), Some("0.4.0-beta.2"));
+    assert_eq!(status.active_version.as_deref(), Some("0.4.0"));
     assert!(status.active_integrity_valid);
     assert!(status.qualification_recheck_required);
     assert!(!status.remote_ocr_allowed);

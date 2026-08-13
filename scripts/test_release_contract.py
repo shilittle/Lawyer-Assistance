@@ -33,7 +33,7 @@ class ReleaseContractTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.contract = load_contract(CONTRACT_PATH)
-        self.write_repository("0.4.0-beta.2")
+        self.write_repository("0.4.0")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -143,23 +143,21 @@ class ReleaseContractTests(unittest.TestCase):
 
     def test_current_repository_and_formal_repository_pass(self) -> None:
         result = self.validate()
-        self.assertEqual((result.mode, result.version), ("current", "0.4.0-beta.2"))
-        self.write_repository("0.4.0")
+        self.assertEqual((result.mode, result.version), ("current", "0.4.0"))
         result = self.validate("formal")
         self.assertEqual((result.mode, result.version), ("formal", "0.4.0"))
 
     def test_formal_rejects_prerelease_build_and_wrong_core(self) -> None:
-        self.assert_code("FORMAL_VERSION", lambda: self.validate("formal"))
-        for version in ("0.4.0+build.1", "0.4.0-rc.1+build.1", "0.4.1"):
+        for version in ("0.4.0-rc.1", "0.4.0+build.1", "0.4.0-rc.1+build.1", "0.4.1"):
             self.write_repository(version)
             self.assert_code("FORMAL_VERSION", lambda: self.validate("formal"))
 
     def test_all_six_version_sources_are_exact(self) -> None:
         for source in VERSION_SOURCES[1:]:
-            self.write_repository("0.4.0-beta.2")
+            self.write_repository("0.4.0")
             path = self.root / source["path"]
             path.write_text(
-                path.read_text("utf-8").replace("0.4.0-beta.2", "0.4.0-beta.3"),
+                path.read_text("utf-8").replace("0.4.0", "0.4.1"),
                 encoding="utf-8",
             )
             self.assert_code("VERSION_DRIFT", self.validate)
@@ -171,7 +169,7 @@ class ReleaseContractTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assert_code("WORKSPACE_SET", self.validate)
-        self.write_repository("0.4.0-beta.2")
+        self.write_repository("0.4.0")
         lock = self.root / "Cargo.lock"
         lock.write_text(
             lock.read_text("utf-8").replace('name = "privacy"', 'name = "other"'),
@@ -184,16 +182,16 @@ class ReleaseContractTests(unittest.TestCase):
         text = lock.read_text("utf-8")
         lock.write_text(
             text.replace(
-                'name = "privacy"\nversion = "0.4.0-beta.2"',
-                'name = "privacy"\nversion = "0.4.0-beta.3"',
+                'name = "privacy"\nversion = "0.4.0"',
+                'name = "privacy"\nversion = "0.4.1"',
             ),
             encoding="utf-8",
         )
         self.assert_code("CARGO_LOCK_VERSION", self.validate)
-        self.write_repository("0.4.0-beta.2")
+        self.write_repository("0.4.0")
         lock.write_text(
             lock.read_text("utf-8")
-            + '\n[[package]]\nname = "privacy"\nversion = "0.4.0-beta.2"\n',
+            + '\n[[package]]\nname = "privacy"\nversion = "0.4.0"\n',
             encoding="utf-8",
         )
         self.assert_code("CARGO_LOCK", self.validate)
@@ -202,7 +200,7 @@ class ReleaseContractTests(unittest.TestCase):
         binary = self.root / "lawyer-assistance-mcp.exe"
         binary.write_bytes(b"fixture")
         success = subprocess.CompletedProcess(
-            [str(binary), "--version"], 0, b"lawyer-assistance-mcp 0.4.0-beta.2\n", b""
+            [str(binary), "--version"], 0, b"lawyer-assistance-mcp 0.4.0\n", b""
         )
         with patch("scripts.release.release_contract.subprocess.run", return_value=success):
             self.validate(binary=binary)
@@ -210,13 +208,13 @@ class ReleaseContractTests(unittest.TestCase):
             (subprocess.CompletedProcess([], 1, b"", b""), "MCP_BINARY"),
             (
                 subprocess.CompletedProcess(
-                    [], 0, b"lawyer-assistance-mcp 0.4.0-beta.2\nextra\n", b""
+                    [], 0, b"lawyer-assistance-mcp 0.4.0\nextra\n", b""
                 ),
                 "MCP_STDOUT",
             ),
             (
                 subprocess.CompletedProcess(
-                    [], 0, b"lawyer-assistance-mcp 0.4.0-beta.2\n", b"warning\n"
+                    [], 0, b"lawyer-assistance-mcp 0.4.0\n", b"warning\n"
                 ),
                 "MCP_STDERR",
             ),
@@ -232,12 +230,12 @@ class ReleaseContractTests(unittest.TestCase):
         notes = self.root / "RELEASE_NOTES.md"
         notes.write_text(
             notes.read_text("utf-8").replace(
-                "# Lawyer Assistance 0.4.0-beta.2", "# Lawyer Assistance 0.4.0-beta.3"
+                "# Lawyer Assistance 0.4.0", "# Lawyer Assistance 0.4.1"
             ),
             encoding="utf-8",
         )
         self.assert_code("RELEASE_NOTES_TITLE", self.validate)
-        self.write_repository("0.4.0-beta.2")
+        self.write_repository("0.4.0")
         notes.write_text(
             notes.read_text("utf-8").replace("| Public service schema | `1` |", ""),
             encoding="utf-8",
@@ -247,7 +245,7 @@ class ReleaseContractTests(unittest.TestCase):
     def test_current_docs_and_formal_mineru_fixture_fail_closed(self) -> None:
         self.write("docs/release-status.en.md", "The current target version is `9.9.9`\n")
         self.assert_code("CURRENT_DOCS", self.validate)
-        self.write_repository("0.4.0-beta.2")
+        self.write_repository("0.4.0")
         self.write(
             "scripts/release/fixtures/mineru-formal-filename-v0.4.0.txt",
             "lawyer-assistance-mineru-0.4.0-windows-x86_64.laocrpkg\n",

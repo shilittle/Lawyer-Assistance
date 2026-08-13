@@ -52,7 +52,7 @@ const qualification: ApprovedMcpQualificationStatus = {
   streamableHttpCanaryPassed: true,
   exactAppPolicyBinding: true,
   exactServerKeyBinding: true,
-  appVersion: "0.4.0-beta.2",
+  appVersion: "0.4.0",
   policyId: "approved-mcp-local-egress-v1",
   policyVersion: 2,
   serverKeyId: "mcpkey_opaque",

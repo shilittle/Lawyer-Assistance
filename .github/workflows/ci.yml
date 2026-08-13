@@ -40,10 +40,10 @@ jobs:
           python -m unittest scripts.test_check_utf8_text
           python scripts/check_utf8_text.py
 
-      - name: Verify current release contract and release asset verifier
+      - name: Verify formal release contract and release asset verifier
         run: |
           python -m unittest scripts.test_release_contract scripts.test_verify_release_assets scripts.test_verify_updater_signature -v
-          python scripts/check_release_contract.py --root . --contract scripts/release/release-contract-v0.4.0.json --mode current
+          python scripts/check_release_contract.py --root . --contract scripts/release/release-contract-v0.4.0.json --mode formal
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable

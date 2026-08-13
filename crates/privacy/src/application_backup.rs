@@ -1703,7 +1703,7 @@ mod tests {
             backup_id: "appbkp_11111111111111111111111111111111",
             privacy_backup_id: "bkp_22222222222222222222222222222222",
             workspace_instance_id: workspace,
-            app_version: "0.4.0-beta.2",
+            app_version: "0.4.0",
             user_schema_version: 9,
             created_at_unix: 10_000,
             expires_at_unix: 20_000,
@@ -1730,7 +1730,7 @@ mod tests {
             backup_id: "appbkp_33333333333333333333333333333333",
             privacy_backup_id: "bkp_44444444444444444444444444444444",
             workspace_instance_id: workspace,
-            app_version: "0.4.0-beta.2",
+            app_version: "0.4.0",
             user_schema_version: 9,
             created_at_unix: 10_000,
             expires_at_unix: 20_000,
@@ -1771,7 +1771,7 @@ mod tests {
         }
         let context = ApplicationBackupOpenContext {
             expected_workspace_instance_id: &workspace,
-            expected_app_version: "0.4.0-beta.2",
+            expected_app_version: "0.4.0",
             expected_user_schema_version: 9,
             now_unix: 10_001,
         };
@@ -1830,7 +1830,7 @@ mod tests {
         .expect("seal");
         let context = ApplicationBackupOpenContext {
             expected_workspace_instance_id: &workspace,
-            expected_app_version: "0.4.0-beta.2",
+            expected_app_version: "0.4.0",
             expected_user_schema_version: 9,
             now_unix: 10_001,
         };
@@ -1895,7 +1895,7 @@ mod tests {
             &bundle,
             &ApplicationBackupOpenContext {
                 expected_workspace_instance_id: &workspace,
-                expected_app_version: "0.4.0-beta.2",
+                expected_app_version: "0.4.0",
                 expected_user_schema_version: 9,
                 now_unix: 10_001,
             },
@@ -1995,7 +1995,7 @@ mod tests {
         .expect("seal v3");
         let context = ApplicationBackupOpenContext {
             expected_workspace_instance_id: &workspace,
-            expected_app_version: "0.4.0-beta.2",
+            expected_app_version: "0.4.0",
             expected_user_schema_version: 9,
             now_unix: 10_001,
         };
@@ -2049,7 +2049,7 @@ mod tests {
             &bundle,
             &ApplicationBackupOpenContext {
                 expected_workspace_instance_id: &workspace,
-                expected_app_version: "0.4.0-beta.2",
+                expected_app_version: "0.4.0",
                 expected_user_schema_version: 9,
                 now_unix: 10_001,
             },
