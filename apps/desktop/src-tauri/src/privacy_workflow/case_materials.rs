@@ -253,7 +253,7 @@ pub(super) struct CaseRedactionScope {
 
 #[derive(Debug)]
 pub(super) struct CaseRedactionAuthorization {
-    project_id: ProjectId,
+    pub(super) project_id: ProjectId,
     redaction_id: String,
 }
 

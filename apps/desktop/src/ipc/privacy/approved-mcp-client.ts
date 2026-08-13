@@ -13,7 +13,7 @@ export interface ApprovedPrivacyReviewSelection {
   materialId: string;
   mcpPublishApproved: boolean;
   mcpPublishApprovalExpiresAtUnix: number | null;
-  caseId: string;
+  projectId: string;
   approvedPayloadSha256: string;
 }
 
@@ -42,12 +42,12 @@ export interface ApprovedMcpToolGrant {
 
 export interface PublishApprovedGenerationRequest {
   redactionId: string;
-  caseId: string;
+  projectId: string;
   expectedApprovedPayloadSha256: string;
 }
 
 export interface PublishedApprovedGeneration {
-  caseId: string;
+  projectId: string;
   materialId: string;
   documentVersion: number;
   publicationId: string;
@@ -56,7 +56,7 @@ export interface PublishedApprovedGeneration {
 }
 
 export interface ApprovedGenerationHistory {
-  caseId: string;
+  projectId: string;
   materialId: string;
   documentVersion: number;
   publicationId: string;
@@ -142,22 +142,22 @@ export function approveReviewForApprovedWorkspace(
 }
 
 export function listApprovedGenerations(
-  caseId?: string,
+  projectId?: string,
 ): Promise<ApprovedGenerationHistory[]> {
   return invoke<ApprovedGenerationHistory[]>("list_approved_generations", {
-    request: { caseId: caseId || null },
+    request: { projectId: projectId || null },
   });
 }
 
 export function revokeApprovedGeneration(
   generation: Pick<
     ApprovedGenerationHistory,
-    "caseId" | "materialId" | "documentVersion" | "publicationId"
+    "projectId" | "materialId" | "documentVersion" | "publicationId"
   >,
 ): Promise<void> {
   return invoke<void>("revoke_approved_generation", {
     request: {
-      caseId: generation.caseId,
+      projectId: generation.projectId,
       materialId: generation.materialId,
       documentVersion: generation.documentVersion,
       publicationId: generation.publicationId,

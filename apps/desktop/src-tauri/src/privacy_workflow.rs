@@ -325,7 +325,7 @@ pub struct PrivacyReviewView {
 pub struct ApprovedPrivacyReviewSelection {
     pub redaction_id: String,
     pub material_id: String,
-    pub case_id: String,
+    pub project_id: String,
     pub approved_payload_sha256: String,
     pub mcp_publish_approved: bool,
     pub mcp_publish_approval_expires_at_unix: Option<u64>,
@@ -2249,7 +2249,7 @@ impl PrivacyWorkflowManager {
 
         let mut selections = Vec::with_capacity(indexed.len());
         for (redaction_id, approved_payload_sha256) in indexed {
-            let (_authorization, project_guard) =
+            let (authorization, project_guard) =
                 self.begin_live_case_redaction_authorization(&redaction_id, true)?;
             let loaded = PrivacyStore::load_review_draft(&connection, &redaction_id)
                 .map_err(PrivacyWorkflowError::store)?;
@@ -2322,7 +2322,7 @@ impl PrivacyWorkflowManager {
             selections.push(ApprovedPrivacyReviewSelection {
                 redaction_id,
                 material_id: loaded.material_id,
-                case_id,
+                project_id: authorization.project_id.as_str().to_owned(),
                 approved_payload_sha256,
                 mcp_publish_approved: mcp_publish_approval_expires_at_unix.is_some(),
                 mcp_publish_approval_expires_at_unix,
@@ -7258,6 +7258,13 @@ mod tests {
             .as_ref()
             .expect("current risk revision")
             .revision;
+        let publish_project_id = manager
+            .list_approved_review_selections()
+            .expect("resolve application project identity")
+            .into_iter()
+            .find(|selection| selection.redaction_id == review.redaction_id)
+            .expect("approved review project selection")
+            .project_id;
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -7268,9 +7275,10 @@ mod tests {
         let publish_thread = thread::spawn(move || {
             publish_manager
                 .with_approved_generation_source_publish(
+                    &publish_project_id,
                     &publish_redaction_id,
                     &publish_hash,
-                    |source| {
+                    |_project_id, _privacy_case_id, source| {
                         entered_tx.send(()).expect("announce publish commit");
                         release_rx.recv().expect("release publish commit");
                         Ok::<String, &'static str>(source.approved_payload_sha256)
