@@ -12,6 +12,41 @@ if ($filenames.SignedArtifact -ceq $filenames.GitHubAsset) {
   throw "The signed and GitHub filenames must remain distinct"
 }
 
+$ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
+$formalFilenames = Get-LawyerAssistanceFormalReleaseFilenames -ProjectRoot $ProjectRoot
+if ($formalFilenames.Version -cne "0.4.0" -or
+    $formalFilenames.SignedArtifact -cne "Lawyer Assistance_0.4.0_x64-setup.exe" -or
+    $formalFilenames.GitHubAsset -cne "Lawyer.Assistance_0.4.0_x64-setup.exe" -or
+    $formalFilenames.AppAssets.Count -ne 12 -or
+    $formalFilenames.LocalAppAssets.Count -ne 6 -or
+    $formalFilenames.AppAssets[0] -cne $formalFilenames.GitHubAsset -or
+    $formalFilenames.AppAssets[11] -cne "lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz.sha256") {
+  throw "The frozen formal App asset filename mapping changed unexpectedly"
+}
+$expectedFormalAssets = @(
+  "Lawyer.Assistance_0.4.0_x64-setup.exe",
+  "Lawyer.Assistance_0.4.0_x64-setup.exe.sha256",
+  "Lawyer.Assistance_0.4.0_x64-setup.exe.sig",
+  "latest.json",
+  "Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip",
+  "Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip.sha256",
+  "lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip",
+  "lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip.sha256",
+  "lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz",
+  "lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256",
+  "lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz",
+  "lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz.sha256"
+)
+for ($index = 0; $index -lt $expectedFormalAssets.Count; $index++) {
+  if ($formalFilenames.AppAssets[$index] -cne $expectedFormalAssets[$index]) {
+    throw "The frozen formal App asset order changed at index $index"
+  }
+}
+if ([IO.Path]::GetFullPath($formalFilenames.StagingDirectory) -cne
+    [IO.Path]::GetFullPath((Join-Path $ProjectRoot "dist\release-v0.4.0\app"))) {
+  throw "The fixed local App release staging directory changed unexpectedly"
+}
+
 foreach ($validVersion in @("0.0.0", "1.2.3-alpha.1", "1.2.3+build.01", "1.2.3-rc.1+build.7")) {
   Get-LawyerAssistanceReleaseFilenames -Version $validVersion | Out-Null
 }
@@ -38,7 +73,6 @@ foreach ($invalidVersion in @(
   }
 }
 
-$ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
 foreach ($releaseScript in @(
   "build_portable_release.ps1",
   "build_unsigned_installer_release.ps1",
@@ -79,6 +113,87 @@ foreach ($installerScript in @("build_unsigned_installer_release.ps1", "build_si
   if (-not $source.Contains('externalBin = @("binaries/lawyer-assistance-mcp")')) {
     throw "$installerScript does not configure the fixed Tauri externalBin sibling"
   }
+}
+
+$signedBuildSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot "build_signed_release.ps1") -Raw -Encoding UTF8
+foreach ($requiredSignedBuildFragment in @(
+  "Invoke-LawyerAssistanceFormalVersionGate -Root `$ProjectRoot",
+  "Invoke-LawyerAssistanceReleasePreflightCore",
+  "New-LawyerAssistanceProductionReleaseAdapters",
+  '$CodeSigningThumbprint = $directPreflight.CodeSigningThumbprint',
+  "Resolve-LawyerAssistanceSignedBuildFailure",
+  'exit $failure.ExitCode',
+  "-McpBinaryPath `$expectedMcpExecutable",
+  "Assert-LawyerAssistanceTimestampedAuthenticode",
+  "Test-LawyerAssistanceRfc3161Authenticode",
+  "tsp = `$true",
+  "StagingDirectory",
+  "Install-LawyerAssistanceCreateNewIndependentFile",
+  "FileMode]::CreateNew",
+  "latest.json and detached updater signature differ",
+  "exact independent copy of the signed Tauri installer bytes",
+  "must retain the Tauri local-space installer filename",
+  "must contain exactly six files"
+)) {
+  if (-not $signedBuildSource.Contains($requiredSignedBuildFragment)) {
+    throw "Signed release assembly contract is missing: $requiredSignedBuildFragment"
+  }
+}
+$signedBuildTokens = $null
+$signedBuildErrors = $null
+$signedBuildAst = [Management.Automation.Language.Parser]::ParseFile(
+  (Join-Path $PSScriptRoot "build_signed_release.ps1"),
+  [ref]$signedBuildTokens,
+  [ref]$signedBuildErrors
+)
+if ($signedBuildErrors.Count -gt 0) {
+  throw "Signed build AST could not be inspected: $($signedBuildErrors -join '; ')"
+}
+$signedBuildParameterNames = @($signedBuildAst.ParamBlock.Parameters | ForEach-Object {
+  $_.Name.VariablePath.UserPath
+})
+foreach ($forbiddenParameter in @("Adapters", "Bypass", "SkipPreflight")) {
+  if ($signedBuildParameterNames -contains $forbiddenParameter) {
+    throw "Signed build exposed a forbidden bypass seam: $forbiddenParameter"
+  }
+}
+$thumbprintParameter = @($signedBuildAst.ParamBlock.Parameters | Where-Object {
+  $_.Name.VariablePath.UserPath -ceq "CodeSigningThumbprint"
+})
+if ($thumbprintParameter.Count -ne 1 -or
+    $thumbprintParameter[0].Extent.Text -match 'ValidatePattern') {
+  throw "Signed build must delegate thumbprint normalization to the full production preflight"
+}
+$preflightCommands = @($signedBuildAst.FindAll({
+  param($node)
+  $node -is [Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -ceq "Invoke-LawyerAssistanceReleasePreflightCore"
+}, $true))
+if ($preflightCommands.Count -ne 1 -or
+    -not $preflightCommands[0].Extent.Text.Contains("New-LawyerAssistanceProductionReleaseAdapters") -or
+    -not $signedBuildSource.Contains('$CodeSigningThumbprint = $directPreflight.CodeSigningThumbprint')) {
+  throw "Signed build does not perform exactly one full production preflight before using its normalized thumbprint"
+}
+$wrapperSource = Get-Content -LiteralPath (Join-Path $ProjectRoot "scripts\release\release_preflight.ps1") -Raw -Encoding UTF8
+if ($wrapperSource -notmatch '(?s)if \(\$Mode -ceq "Preflight"\).*Invoke-LawyerAssistanceReleasePreflightCore' -or
+    $wrapperSource -notmatch '(?s)\$signedBuildScript.*build_signed_release\.ps1.*& \$powerShell' -or
+    $wrapperSource -notmatch 'Resolve-LawyerAssistanceSignedBuildExitCode') {
+  throw "Release wrapper does not preserve the nonrecursive preflight/build exit-code contract"
+}
+$wrapperTokens = $null
+$wrapperErrors = $null
+$wrapperAst = [Management.Automation.Language.Parser]::ParseFile(
+  (Join-Path $ProjectRoot "scripts\release\release_preflight.ps1"),
+  [ref]$wrapperTokens,
+  [ref]$wrapperErrors
+)
+$wrapperPreflightCommands = @($wrapperAst.FindAll({
+  param($node)
+  $node -is [Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -ceq "Invoke-LawyerAssistanceReleasePreflightCore"
+}, $true))
+if ($wrapperErrors.Count -gt 0 -or $wrapperPreflightCommands.Count -ne 1) {
+  throw "Release wrapper must delegate Run to signed build without a second preflight or recursion"
 }
 
 $parseFailures = @()

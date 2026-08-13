@@ -179,6 +179,50 @@ def _run_checked(command: list[str], root: Path) -> str:
     return completed.stdout.strip()
 
 
+def run_release_contract_gate(
+    root: Path,
+    mode: str,
+    binary: Path | None = None,
+) -> None:
+    if mode not in {"current", "formal"}:
+        raise PackageError("release contract mode is invalid")
+    checker = root / "scripts" / "check_release_contract.py"
+    contract = root / "scripts" / "release" / "release-contract-v0.4.0.json"
+    command = [
+        os.sys.executable,
+        str(checker),
+        "--root",
+        str(root),
+        "--contract",
+        str(contract),
+        "--mode",
+        mode,
+    ]
+    if binary is not None:
+        command.extend(("--mcp-binary", str(binary)))
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        raise PackageError("release contract gate could not run") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        suffix = f": {detail}" if detail else ""
+        raise PackageError(f"release contract {mode} gate failed{suffix}")
+    expected_stdout = f"release contract {mode} OK: {workspace_version(root)}"
+    if completed.stderr or completed.stdout.strip() != expected_stdout:
+        raise PackageError("release contract gate returned unexpected output")
+
+
 def inspect_repository_provenance(
     root: Path,
     binary: Path,
@@ -697,14 +741,26 @@ def main() -> int:
         action="store_true",
         help="allow dirty or stale inputs only for local preflight; the package is marked releaseReady=false",
     )
+    parser.add_argument(
+        "--version-gate-mode",
+        choices=("current", "formal"),
+        default="formal",
+        help="use current only for pre-stable CI; direct release packaging defaults to formal",
+    )
     arguments = parser.parse_args()
     result: PackageResult | None = None
     try:
+        run_release_contract_gate(ROOT, arguments.version_gate_mode)
         provenance = inspect_repository_provenance(
             ROOT,
             arguments.binary,
             allow_nonrelease_inputs=arguments.allow_nonrelease_inputs,
             expected_commit=arguments.expected_commit,
+        )
+        run_release_contract_gate(
+            ROOT,
+            arguments.version_gate_mode,
+            arguments.binary,
         )
         result = build_package(
             ROOT,

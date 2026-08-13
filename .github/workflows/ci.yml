@@ -40,6 +40,11 @@ jobs:
           python -m unittest scripts.test_check_utf8_text
           python scripts/check_utf8_text.py
 
+      - name: Verify current release contract and release asset verifier
+        run: |
+          python -m unittest scripts.test_release_contract scripts.test_verify_release_assets scripts.test_verify_updater_signature -v
+          python scripts/check_release_contract.py --root . --contract scripts/release/release-contract-v0.4.0.json --mode current
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -355,11 +360,17 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --check
 
-      - name: Test release file operations, filename mapping, and PowerShell syntax
+      - name: Test release file operations, preflight, publication, and PowerShell syntax
         shell: powershell
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_file_ops.ps1
           powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_filename_mapping.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/test_release_preflight.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/test_release_publication.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/test_collect_exact_mcp_ci_assets.ps1
+
+      - name: Reject whitespace errors in the exact checked-out tree
+        run: git diff --check
 
       - name: Lint Rust
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

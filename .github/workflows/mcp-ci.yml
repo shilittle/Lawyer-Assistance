@@ -19,8 +19,22 @@ on:
       - "scripts/test_generate_third_party_notices.py"
       - "scripts/package_mcp_release.py"
       - "scripts/test_package_mcp_release.py"
+      - "scripts/check_release_contract.py"
+      - "scripts/test_release_contract.py"
+      - "scripts/verify_release_assets.py"
+      - "scripts/test_verify_release_assets.py"
+      - "scripts/verify_updater_signature.py"
+      - "scripts/test_verify_updater_signature.py"
+      - "scripts/release/**"
       - "apps/desktop/package.json"
+      - "apps/desktop/src-tauri/Cargo.toml"
+      - "apps/desktop/src-tauri/tauri.conf.json"
       - "apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt"
+      - "crates/diagrams/Cargo.toml"
+      - "crates/material-processing/Cargo.toml"
+      - "crates/privacy/Cargo.toml"
+      - "crates/providers/Cargo.toml"
+      - "vendor/minisign-verify/Cargo.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "pnpm-lock.yaml"
@@ -28,7 +42,15 @@ on:
       - "pnpm-workspace.yaml"
       - "LICENSE"
       - "README.md"
+      - "README.en.md"
       - "RELEASE_NOTES.md"
+      - "docs/README.md"
+      - "docs/README.en.md"
+      - "docs/release-status.md"
+      - "docs/release-status.en.md"
+      - "docs/getting-started.md"
+      - "docs/getting-started.en.md"
+      - "docs/privacy-vnext/OPERATIONS.md"
       - ".github/workflows/mcp-ci.yml"
   pull_request:
     paths:
@@ -47,8 +69,22 @@ on:
       - "scripts/test_generate_third_party_notices.py"
       - "scripts/package_mcp_release.py"
       - "scripts/test_package_mcp_release.py"
+      - "scripts/check_release_contract.py"
+      - "scripts/test_release_contract.py"
+      - "scripts/verify_release_assets.py"
+      - "scripts/test_verify_release_assets.py"
+      - "scripts/verify_updater_signature.py"
+      - "scripts/test_verify_updater_signature.py"
+      - "scripts/release/**"
       - "apps/desktop/package.json"
+      - "apps/desktop/src-tauri/Cargo.toml"
+      - "apps/desktop/src-tauri/tauri.conf.json"
       - "apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt"
+      - "crates/diagrams/Cargo.toml"
+      - "crates/material-processing/Cargo.toml"
+      - "crates/privacy/Cargo.toml"
+      - "crates/providers/Cargo.toml"
+      - "vendor/minisign-verify/Cargo.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "pnpm-lock.yaml"
@@ -56,7 +92,15 @@ on:
       - "pnpm-workspace.yaml"
       - "LICENSE"
       - "README.md"
+      - "README.en.md"
       - "RELEASE_NOTES.md"
+      - "docs/README.md"
+      - "docs/README.en.md"
+      - "docs/release-status.md"
+      - "docs/release-status.en.md"
+      - "docs/getting-started.md"
+      - "docs/getting-started.en.md"
+      - "docs/privacy-vnext/OPERATIONS.md"
       - ".github/workflows/mcp-ci.yml"
 
 permissions:
@@ -134,6 +178,14 @@ jobs:
       - name: Build release server
         run: cargo build --release --locked -p legal-mcp --bin lawyer-assistance-mcp
 
+      - name: Verify current release contract and exact MCP version output
+        shell: pwsh
+        run: |
+          $suffix = if ('${{ runner.os }}' -eq 'Windows') { '.exe' } else { '' }
+          $binary = "target/${{ matrix.target }}/release/lawyer-assistance-mcp$suffix"
+          python -m unittest scripts.test_release_contract scripts.test_verify_updater_signature
+          python scripts/check_release_contract.py --root . --contract scripts/release/release-contract-v0.4.0.json --mode current --mcp-binary $binary
+
       - name: Fetch complete release notice dependency closure
         run: cargo fetch --locked --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-gnu --target aarch64-apple-darwin
 
@@ -143,17 +195,28 @@ jobs:
           python scripts/generate_third_party_notices.py --check
 
       - name: Test and assemble verified MCP release archive
+        id: package
         shell: pwsh
         run: |
           python -m unittest scripts.test_package_mcp_release
           $suffix = if ('${{ runner.os }}' -eq 'Windows') { '.exe' } else { '' }
           $binary = "target/${{ matrix.target }}/release/lawyer-assistance-mcp$suffix"
-          python scripts/package_mcp_release.py --target '${{ matrix.target }}' --binary $binary --output-dir dist/mcp
+          # R4 keeps source versions prerelease until R5. This explicit CI-only
+          # mode still validates every version source and the built binary;
+          # the packaging CLI itself defaults to formal for operator use.
+          $mode = 'current'
+          $json = python scripts/package_mcp_release.py --target '${{ matrix.target }}' --binary $binary --output-dir dist/mcp --version-gate-mode $mode --expected-commit '${{ github.sha }}'
+          if ($LASTEXITCODE -ne 0) { throw 'MCP release packaging failed' }
+          $result = $json | ConvertFrom-Json
+          "archive=$($result.archive)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "checksum=$($result.checksum)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Upload verified MCP release archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lawyer-assistance-mcp-${{ matrix.target }}
-          path: dist/mcp/*
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
           if-no-files-found: error
           retention-days: 14

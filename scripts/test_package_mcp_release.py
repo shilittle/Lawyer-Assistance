@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path, PurePosixPath
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from scripts.package_mcp_release import (
     PackageError,
+    PackageResult,
     RepositoryProvenance,
     _read_archive,
     _scan_support_content,
     build_package,
     collect_payloads,
     inspect_repository_provenance,
+    main,
+    run_release_contract_gate,
     sha256_bytes,
     verify_embedded_manifest,
     workspace_version,
@@ -333,6 +338,77 @@ Fixture limits.
                 )
             self.assertFalse(preflight.source_clean)
             self.assertFalse(preflight.release_ready)
+
+    def test_contract_gate_invokes_formal_checker_with_exact_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, binary = self.fixture(directory)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\n[workspace.package]\nversion = "0.4.0"\n',
+                encoding="utf-8",
+            )
+            completed = subprocess.CompletedProcess(
+                [], 0, "release contract formal OK: 0.4.0\n", ""
+            )
+            with patch(
+                "scripts.package_mcp_release.subprocess.run",
+                return_value=completed,
+            ) as checker:
+                run_release_contract_gate(root, "formal", binary)
+            command = checker.call_args.args[0]
+            self.assertEqual(command[0], sys.executable)
+            self.assertEqual(
+                command[-4:],
+                ["--mode", "formal", "--mcp-binary", str(binary)],
+            )
+            self.assertEqual(checker.call_args.kwargs["cwd"], root)
+
+    def test_contract_gate_rejects_formal_beta_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, _binary = self.fixture(directory)
+            failed = subprocess.CompletedProcess(
+                [],
+                1,
+                "",
+                "RELEASE_CONTRACT_FORMAL_VERSION: formal releases require exact 0.4.0\n",
+            )
+            with patch(
+                "scripts.package_mcp_release.subprocess.run",
+                return_value=failed,
+            ), self.assertRaisesRegex(PackageError, "FORMAL_VERSION"):
+                run_release_contract_gate(root, "formal")
+
+    def test_cli_defaults_to_formal_and_gates_repository_then_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, binary = self.fixture(directory)
+            output = root / "out"
+            archive = output / "archive.tar.gz"
+            checksum = output / "archive.tar.gz.sha256"
+            result = PackageResult(archive, checksum, "c" * 64, "package", 9)
+            provenance = self.provenance(root, binary)
+            arguments = [
+                "package_mcp_release.py",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--binary",
+                str(binary),
+                "--output-dir",
+                str(output),
+            ]
+            with patch("scripts.package_mcp_release.ROOT", root), patch(
+                "scripts.package_mcp_release.os.sys.argv", arguments
+            ), patch(
+                "scripts.package_mcp_release.run_release_contract_gate"
+            ) as gate, patch(
+                "scripts.package_mcp_release.inspect_repository_provenance",
+                side_effect=(provenance, provenance),
+            ), patch(
+                "scripts.package_mcp_release.build_package", return_value=result
+            ):
+                self.assertEqual(main(), 0)
+            self.assertEqual(
+                gate.call_args_list,
+                [call(root, "formal"), call(root, "formal", binary)],
+            )
 
 
 if __name__ == "__main__":

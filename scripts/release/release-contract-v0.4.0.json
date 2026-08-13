@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "repository": {
+    "owner": "shilittle",
+    "name": "Lawyer-Assistance",
+    "httpsUrl": "https://github.com/shilittle/Lawyer-Assistance.git"
+  },
+  "release": {
+    "formalVersion": "0.4.0",
+    "appTag": "v0.4.0",
+    "minerUTag": "mineru-components-v0.4.0"
+  },
+  "versions": {
+    "currentSource": {
+      "path": "package.json",
+      "kind": "json",
+      "key": "version"
+    },
+    "formal": "0.4.0"
+  },
+  "workspacePackages": [
+    "assistant",
+    "citations",
+    "database",
+    "diagrams",
+    "domain",
+    "file-ingest",
+    "lawyer-assistance-desktop",
+    "legal-mcp",
+    "legal-services",
+    "material-processing",
+    "privacy",
+    "providers",
+    "retrieval"
+  ],
+  "versionSources": [
+    {
+      "path": "package.json",
+      "kind": "json",
+      "key": "version"
+    },
+    {
+      "path": "apps/desktop/package.json",
+      "kind": "json",
+      "key": "version"
+    },
+    {
+      "path": "apps/desktop/src-tauri/tauri.conf.json",
+      "kind": "json",
+      "key": "version"
+    },
+    {
+      "path": "Cargo.toml",
+      "kind": "toml",
+      "key": "workspace.package.version"
+    },
+    {
+      "path": "crates/assistant/Cargo.toml",
+      "kind": "toml",
+      "key": "package.version"
+    },
+    {
+      "path": "crates/legal-mcp/Cargo.toml",
+      "kind": "toml",
+      "key": "package.version"
+    }
+  ],
+  "mcpVersionProbe": {
+    "package": "legal-mcp",
+    "binary": "lawyer-assistance-mcp",
+    "expectedStdoutTemplate": "lawyer-assistance-mcp {version}",
+    "sourcePath": "crates/legal-mcp/src/config.rs",
+    "sourceMarkers": [
+      "name = \"lawyer-assistance-mcp\"",
+      "version,"
+    ]
+  },
+  "releaseNotes": {
+    "path": "RELEASE_NOTES.md",
+    "titleTemplate": "# Lawyer Assistance {version}"
+  },
+  "compatibilityContract": {
+    "path": "RELEASE_NOTES.md",
+    "heading": "## Compatibility contract",
+    "versionRowTemplate": "| Binary release | `{version}` |",
+    "requiredRows": [
+      "| MCP protocol metadata | `2025-11-25` |",
+      "| Public service schema | `1` |",
+      "| Legal archive schema | `4` |",
+      "| Legal runtime schema | `1` when present |",
+      "| User database schema | `11` |",
+      "| Approved session policy | v2;"
+    ]
+  },
+  "currentDocs": [
+    {
+      "path": "README.md",
+      "versionMarkerTemplate": "当前版本：`{version}`"
+    },
+    {
+      "path": "README.en.md",
+      "versionMarkerTemplate": "Current version: `{version}`"
+    },
+    {
+      "path": "docs/README.md",
+      "versionMarkerTemplate": "当前版本为 `{version}`"
+    },
+    {
+      "path": "docs/README.en.md",
+      "versionMarkerTemplate": "The current version is `{version}`"
+    },
+    {
+      "path": "docs/release-status.md",
+      "versionMarkerTemplate": "当前目标版本为 `{version}`"
+    },
+    {
+      "path": "docs/release-status.en.md",
+      "versionMarkerTemplate": "The current target version is `{version}`"
+    },
+    {
+      "path": "docs/getting-started.md",
+      "versionMarkerTemplate": "`{version}` 面向 Windows x86_64"
+    },
+    {
+      "path": "docs/getting-started.en.md",
+      "versionMarkerTemplate": "`{version}` targets Windows x86_64"
+    },
+    {
+      "path": "docs/privacy-vnext/OPERATIONS.md",
+      "versionMarkerTemplate": "Applies to: Lawyer Assistance `{version}` on Windows x86_64"
+    }
+  ],
+  "minerU": {
+    "formalFilenameFixturePath": "scripts/release/fixtures/mineru-formal-filename-v0.4.0.txt",
+    "formalFilename": "lawyer-assistance-mineru-0.4.0-windows-x86_64.laocrpkg.laocrparts"
+  },
+  "appAssets": [
+    "Lawyer.Assistance_0.4.0_x64-setup.exe",
+    "Lawyer.Assistance_0.4.0_x64-setup.exe.sha256",
+    "Lawyer.Assistance_0.4.0_x64-setup.exe.sig",
+    "latest.json",
+    "Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip",
+    "Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip.sha256",
+    "lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip",
+    "lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip.sha256",
+    "lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz",
+    "lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256",
+    "lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz",
+    "lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz.sha256"
+  ],
+  "immutableTags": {
+    "v0.3.1": {
+      "tagObject": "9a92737f87ef3a5cc33953b874bbc97a8b5e79fc",
+      "peeledCommit": "0970f1c614b1bec1856869c68065162339849468"
+    }
+  }
+}
