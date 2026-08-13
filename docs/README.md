@@ -11,6 +11,7 @@ Lawyer Assistance 是面向 Windows x86_64 的本地法律辅助应用。它提�
 - [快速开始](getting-started.md)：安装、普通聊天与附件、材料与脱敏、案件助理、BYOK Provider、MCP、OCR 与备份。
 - [安全与隐私](security-and-privacy.md)：普通聊天、案件工作、自动化三种出站边界，以及本地数据、OCR、宿主集成和备份规则。
 - [当前发布状态](release-status.md)：`0.4.0-beta.2` 已实现能力、默认禁用项和正式发布门槛。
+- [从 v0.3.1 升级到 v0.4.0](upgrade-v0.3.1-to-v0.4.0.md)：exact profile 自动升级、完整五槽恢复、旧版重开与再次升级。
 - [English documentation](README.en.md)
 
 ## 功能参考

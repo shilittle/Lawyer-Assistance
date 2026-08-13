@@ -2103,6 +2103,10 @@ pub(super) trait VaultBroker: Send + Sync {
         &self,
     ) -> Result<(Vec<u8>, privacy::VaultBackupSummaryV1), privacy::VaultBackupError>;
 
+    fn export_encrypted_backup_read_only(
+        &self,
+    ) -> Result<(Vec<u8>, privacy::VaultBackupSummaryV1), privacy::VaultBackupError>;
+
     fn import_source(
         &self,
         request: ImportSourceRequest<'_>,
@@ -2304,6 +2308,18 @@ impl VaultBroker for LocalEncryptedVaultBroker {
             .lock()
             .map_err(|_| privacy::VaultBackupError::Store(VaultStoreError::DatabaseFailed))?;
         privacy::export_encrypted_vault_backup(store.as_ref().ok_or(
+            privacy::VaultBackupError::Store(VaultStoreError::ObjectNotAvailable),
+        )?)
+    }
+
+    fn export_encrypted_backup_read_only(
+        &self,
+    ) -> Result<(Vec<u8>, privacy::VaultBackupSummaryV1), privacy::VaultBackupError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| privacy::VaultBackupError::Store(VaultStoreError::DatabaseFailed))?;
+        privacy::export_encrypted_vault_backup_read_only(store.as_ref().ok_or(
             privacy::VaultBackupError::Store(VaultStoreError::ObjectNotAvailable),
         )?)
     }

@@ -31,7 +31,7 @@ use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_WRITE_THROUGH,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 
 pub const V031_MIGRATION_ID: &str = "v0.3.1-to-v0.4.0-user-schema-v1";
@@ -3010,6 +3010,48 @@ pub(crate) fn rename_new_no_replace_write_through(
                 incoming.as_ptr(),
                 destination.as_ptr(),
                 MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if succeeded == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        pinned_parent.verify_path_binding()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (incoming, destination, parent);
+        Err(R2InfrastructureError::AtomicNoReplaceUnavailable)
+    }
+}
+
+/// Replaces one already-authenticated sibling with its exact authenticated
+/// successor. R3 uses this only for the phase-bearing DPAPI marker after both
+/// files have been read back and compared as a direct state-machine successor.
+pub(crate) fn replace_existing_sibling_write_through(
+    incoming: &Path,
+    destination: &Path,
+) -> Result<(), R2InfrastructureError> {
+    let parent = incoming
+        .parent()
+        .filter(|parent| Some(*parent) == destination.parent())
+        .ok_or(R2InfrastructureError::AtomicInstallRequiresSiblings)?;
+    if incoming.file_name().is_none() || destination.file_name().is_none() {
+        return Err(R2InfrastructureError::AtomicInstallRequiresSiblings);
+    }
+    #[cfg(windows)]
+    {
+        let pinned_parent = PinnedPlainDirectory::open(parent)?;
+        pinned_parent.verify_path_binding()?;
+        let incoming = wide_path(incoming);
+        let destination = wide_path(destination);
+        // SAFETY: both sibling paths are NUL-terminated and remain alive for
+        // the call. The caller authenticated the exact old/new marker pair.
+        let succeeded = unsafe {
+            MoveFileExW(
+                incoming.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
             )
         };
         if succeeded == 0 {

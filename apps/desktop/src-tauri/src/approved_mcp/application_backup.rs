@@ -20,7 +20,10 @@ use privacy::{
         WorkspaceInstanceId,
     },
     work_products::{WorkProductPublisher, WorkProductService},
-    workspace::{ApprovedWorkspaceService, ManifestSigningKey, WorkspacePublisher},
+    workspace::{
+        ApprovedWorkspaceOperationGuard, ApprovedWorkspaceService, ManifestSigningKey,
+        WorkspacePublisher,
+    },
     MAX_APPROVED_WORKSPACE_BACKUP_BYTES, MAX_WORK_PRODUCTS_BACKUP_BYTES,
 };
 #[cfg(test)]
@@ -54,6 +57,59 @@ use windows_sys::Win32::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     },
 };
+
+/// Holds both the in-process Approved workspace gate and the cross-process
+/// Approved/Work-Products operation lock. Safety V3 retains it across both
+/// five-slot captures; final recovery staging reacquires the same boundary
+/// after descriptor revocation and retains it through process exit once the
+/// formal marker is installed.
+pub(crate) struct V031ApprovedRecoveryQuiescenceGuard<'a> {
+    owner: &'a ApprovedMcpWorkspace,
+    _manager_operation: std::sync::MutexGuard<'a, ()>,
+    _workspace_operation: ApprovedWorkspaceOperationGuard,
+}
+
+impl V031ApprovedRecoveryQuiescenceGuard<'_> {
+    fn belongs_to(&self, workspace: &ApprovedMcpWorkspace) -> bool {
+        std::sync::Arc::ptr_eq(&self.owner.inner, &workspace.inner)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V031RecoverySafetyApprovedArchiveProof {
+    pub(crate) approved_workspace_manifest_sha256: String,
+    pub(crate) work_products_manifest_sha256: String,
+}
+
+/// Allocation-only validation for the two archive components embedded in an
+/// authenticated R3 Safety V3 bundle. It requires no workspace manager or
+/// Credential Manager access and materializes no restore directory.
+pub(crate) fn verify_v031_recovery_safety_archive_pair_allocation_only(
+    approved_bundle: &[u8],
+    work_products_bundle: &[u8],
+    workspace_id: &WorkspaceInstanceId,
+) -> Result<V031RecoverySafetyApprovedArchiveProof, ApprovedMcpError> {
+    let approved_workspace_manifest_sha256 = verify_archive_bytes(
+        approved_bundle,
+        None,
+        APPROVED_STORE_KIND,
+        APPROVED_DATABASE_FILE,
+        workspace_id,
+        MAX_APPROVED_WORKSPACE_BACKUP_BYTES,
+    )?;
+    let work_products_manifest_sha256 = verify_archive_bytes(
+        work_products_bundle,
+        None,
+        WORK_PRODUCTS_STORE_KIND,
+        WORK_PRODUCTS_DATABASE_FILE,
+        workspace_id,
+        MAX_WORK_PRODUCTS_BACKUP_BYTES,
+    )?;
+    Ok(V031RecoverySafetyApprovedArchiveProof {
+        approved_workspace_manifest_sha256,
+        work_products_manifest_sha256,
+    })
+}
 
 const ARCHIVE_SCHEMA_VERSION: &str = "approved-mcp-application-backup-archive-v1";
 const ARCHIVE_MANIFEST_SCHEMA_VERSION: &str = "approved-mcp-application-backup-archive-manifest-v1";
@@ -696,6 +752,33 @@ struct V031PinnedSqlitePhysicalState {
 }
 
 impl ApprovedMcpWorkspace {
+    pub(crate) fn begin_v031_recovery_quiescence(
+        &self,
+    ) -> Result<V031ApprovedRecoveryQuiescenceGuard<'_>, ApprovedMcpError> {
+        let manager_operation = self.operation()?;
+        let mut manifest_key = self
+            .inner
+            .keys
+            .load_existing(KeyRole::ApprovedManifest)?
+            .ok_or_else(workspace_error)?;
+        let signer = ManifestSigningKey::from_bytes(manifest_key, KEY_VERSION);
+        zeroize(&mut manifest_key);
+        let signer = signer.map_err(|_| workspace_error())?;
+        let approved = ApprovedWorkspaceService::open_read_only(
+            &self.inner.approved_root,
+            signer.verification_key(),
+        )
+        .map_err(|_| workspace_error())?;
+        let workspace_operation = approved
+            .acquire_writer_exclusion_guard()
+            .map_err(|_| workspace_error())?;
+        Ok(V031ApprovedRecoveryQuiescenceGuard {
+            owner: self,
+            _manager_operation: manager_operation,
+            _workspace_operation: workspace_operation,
+        })
+    }
+
     /// Authenticates the finite, lazy lifecycle of the two ordinary current
     /// stores before any manager is initialized.
     ///
@@ -708,6 +791,16 @@ impl ApprovedMcpWorkspace {
         &self,
     ) -> Result<CurrentApprovedComponentsObservation, ApprovedMcpError> {
         let _manager_operation = self.operation()?;
+        self.observe_current_components_locked_read_only(None)
+    }
+
+    fn observe_current_components_locked_read_only(
+        &self,
+        recovery_guard: Option<&V031ApprovedRecoveryQuiescenceGuard<'_>>,
+    ) -> Result<CurrentApprovedComponentsObservation, ApprovedMcpError> {
+        if recovery_guard.is_some_and(|guard| !guard.belongs_to(self)) {
+            return Err(workspace_error());
+        }
         validate_directory_identity(&self.inner.app_local_data_directory)?;
 
         let (approved_present, work_products_present, ticket_present, qualification_present) =
@@ -783,12 +876,26 @@ impl ApprovedMcpWorkspace {
                 approved_signer.verification_key(),
             )
             .map_err(|_| workspace_error())?;
-            let operation = approved
-                .acquire_operation_guard()
-                .map_err(|_| workspace_error())?;
+            let owned_operation = if recovery_guard.is_none() {
+                Some(
+                    approved
+                        .acquire_operation_guard()
+                        .map_err(|_| workspace_error())?,
+                )
+            } else {
+                None
+            };
+            let operation = if let Some(guard) = recovery_guard {
+                approved
+                    .validate_read_operation_guard(&guard._workspace_operation)
+                    .map_err(|_| workspace_error())?;
+                &guard._workspace_operation
+            } else {
+                owned_operation.as_ref().ok_or_else(workspace_error)?
+            };
             approved_publication_rows = validate_current_approved_store_locked(
                 &approved,
-                &operation,
+                operation,
                 &self.inner.approved_root.join(APPROVED_DATABASE_FILE),
                 now_seconds()?,
             )?;
@@ -825,7 +932,7 @@ impl ApprovedMcpWorkspace {
                 active_work_product_rows = validate_current_work_products_locked(
                     &approved,
                     &work_products,
-                    &operation,
+                    operation,
                     &self
                         .inner
                         .work_product_root
@@ -847,7 +954,6 @@ impl ApprovedMcpWorkspace {
                 work_products_manifest_sha256 = Some(work_before.manifest_sha256);
                 drop(work_physical_guard);
             }
-            drop(operation);
             let approved_after = capture_current_store_archive(
                 &self.inner.app_local_data_directory,
                 &self.inner.approved_root,
@@ -974,6 +1080,139 @@ impl ApprovedMcpWorkspace {
         Ok(snapshot)
     }
 
+    /// Captures the already-authenticated current Approved/Work-Product pair
+    /// for the R3 safety bundle without lazy credential creation, writable
+    /// publisher initialization, or disk-backed SQLite snapshot temporaries.
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_v031_recovery_safety_read_only(
+        &self,
+    ) -> Result<ApprovedApplicationBackupSnapshot, ApprovedMcpError> {
+        let recovery_guard = self.begin_v031_recovery_quiescence()?;
+        self.snapshot_for_v031_recovery_safety_locked_read_only(&recovery_guard)
+    }
+
+    /// Builds the Approved/Work-Products part of Safety V3 while the caller
+    /// retains the same in-process and cross-process write barrier that covers
+    /// the enclosing five-slot snapshot. The guard is intentionally
+    /// owner-bound so another workspace cannot lend authority to this call.
+    pub(crate) fn snapshot_for_v031_recovery_safety_locked_read_only(
+        &self,
+        recovery_guard: &V031ApprovedRecoveryQuiescenceGuard<'_>,
+    ) -> Result<ApprovedApplicationBackupSnapshot, ApprovedMcpError> {
+        if !recovery_guard.belongs_to(self) {
+            return Err(workspace_error());
+        }
+        let before = self.observe_current_components_locked_read_only(Some(recovery_guard))?;
+        let CurrentApprovedComponentsObservation::Exact(before_proof) = &before else {
+            return Err(workspace_error());
+        };
+        if before_proof.lifecycle != CurrentApprovedComponentsLifecycle::ApprovedAndWorkProducts
+            || !before_proof.mcp_ticket_credential_present
+            || !before_proof.qualification_credential_present
+        {
+            return Err(workspace_error());
+        }
+
+        let root_basenames_before = direct_child_basenames(&self.inner.app_local_data_directory)?;
+        reject_application_backup_temporaries(&root_basenames_before)?;
+        let credential_digests_before = current_credential_digests(self.inner.keys.as_ref())?;
+        let component_directories_before = observe_current_component_directories(self)?;
+        enforce_v031_recovery_safety_component_boundary(
+            component_directories_before,
+            &credential_digests_before,
+            component_directories_before,
+            &credential_digests_before,
+        )?;
+        let mut approved_key = self
+            .inner
+            .keys
+            .load_existing(KeyRole::ApprovedManifest)?
+            .ok_or_else(workspace_error)?;
+        let workspace_id = workspace_instance_id(&approved_key);
+        zeroize(&mut approved_key);
+        let workspace_id = workspace_id?;
+        let mut work_product_key = self
+            .inner
+            .keys
+            .load_existing(KeyRole::WorkProductManifest)?
+            .ok_or_else(workspace_error)?;
+        let work_product_key_valid =
+            ManifestSigningKey::from_bytes(work_product_key, KEY_VERSION).is_ok();
+        zeroize(&mut work_product_key);
+        if !work_product_key_valid || &workspace_id != before_proof.workspace_instance_id() {
+            return Err(workspace_error());
+        }
+
+        let approved_database = snapshot_database_for_v031_migration(
+            &self.inner.app_local_data_directory,
+            &self.inner.approved_root.join(APPROVED_DATABASE_FILE),
+            APPROVED_STORE_KIND,
+        )?;
+        let work_products_database = snapshot_database_for_v031_migration(
+            &self.inner.app_local_data_directory,
+            &self
+                .inner
+                .work_product_root
+                .join(WORK_PRODUCTS_DATABASE_FILE),
+            WORK_PRODUCTS_STORE_KIND,
+        )?;
+        let (approved_workspace_bundle, approved_workspace_manifest_sha256) = build_archive(
+            &self.inner.approved_root,
+            APPROVED_STORE_KIND,
+            APPROVED_DATABASE_FILE,
+            approved_database.bytes,
+            approved_database.active_paths,
+            &workspace_id,
+            MAX_APPROVED_WORKSPACE_BACKUP_BYTES,
+        )?;
+        let (work_products_bundle, work_products_manifest_sha256) = build_archive(
+            &self.inner.work_product_root,
+            WORK_PRODUCTS_STORE_KIND,
+            WORK_PRODUCTS_DATABASE_FILE,
+            work_products_database.bytes,
+            work_products_database.active_paths,
+            &workspace_id,
+            MAX_WORK_PRODUCTS_BACKUP_BYTES,
+        )?;
+        let credential_digests_after = current_credential_digests(self.inner.keys.as_ref())?;
+        let component_directories_after = observe_current_component_directories(self)?;
+        if before_proof.approved_manifest_sha256()
+            != Some(approved_workspace_manifest_sha256.as_str())
+            || before_proof.work_products_manifest_sha256()
+                != Some(work_products_manifest_sha256.as_str())
+        {
+            return Err(workspace_error());
+        }
+        enforce_v031_recovery_safety_component_boundary(
+            component_directories_before,
+            &credential_digests_before,
+            component_directories_after,
+            &credential_digests_after,
+        )?;
+        let root_basenames_after = direct_child_basenames(&self.inner.app_local_data_directory)?;
+        reject_application_backup_temporaries(&root_basenames_after)?;
+        if root_basenames_after != root_basenames_before {
+            return Err(workspace_error());
+        }
+        if self.observe_current_components_locked_read_only(Some(recovery_guard))? != before {
+            return Err(workspace_error());
+        }
+        let final_credential_digests = current_credential_digests(self.inner.keys.as_ref())?;
+        let final_component_directories = observe_current_component_directories(self)?;
+        enforce_v031_recovery_safety_component_boundary(
+            component_directories_before,
+            &credential_digests_before,
+            final_component_directories,
+            &final_credential_digests,
+        )?;
+        Ok(ApprovedApplicationBackupSnapshot {
+            approved_workspace_bundle,
+            approved_workspace_manifest_sha256,
+            work_products_bundle,
+            work_products_manifest_sha256,
+        })
+    }
+
     pub(crate) fn snapshot_for_application_backup(
         &self,
     ) -> Result<ApprovedApplicationBackupSnapshot, ApprovedMcpError> {
@@ -1047,7 +1286,7 @@ impl ApprovedMcpWorkspace {
         let workspace_id = self.existing_workspace_instance_id_locked()?;
         verify_archive_bytes(
             approved_bundle,
-            expected_approved_manifest_sha256,
+            Some(expected_approved_manifest_sha256),
             APPROVED_STORE_KIND,
             APPROVED_DATABASE_FILE,
             &workspace_id,
@@ -1055,12 +1294,13 @@ impl ApprovedMcpWorkspace {
         )?;
         verify_archive_bytes(
             work_products_bundle,
-            expected_work_products_manifest_sha256,
+            Some(expected_work_products_manifest_sha256),
             WORK_PRODUCTS_STORE_KIND,
             WORK_PRODUCTS_DATABASE_FILE,
             &workspace_id,
             MAX_WORK_PRODUCTS_BACKUP_BYTES,
-        )
+        )?;
+        Ok(())
     }
 
     pub(crate) fn stage_application_backup_components(
@@ -1388,6 +1628,28 @@ fn current_credential_digests(
     Ok(output)
 }
 
+fn enforce_v031_recovery_safety_component_boundary(
+    directories_before: (bool, bool, bool, bool),
+    credential_digests_before: &[Option<String>; 4],
+    directories_after: (bool, bool, bool, bool),
+    credential_digests_after: &[Option<String>; 4],
+) -> Result<(), ApprovedMcpError> {
+    let (approved_present_before, work_products_present_before, _, _) = directories_before;
+    let (approved_present_after, work_products_present_after, _, _) = directories_after;
+    if !approved_present_before
+        || !work_products_present_before
+        || !approved_present_after
+        || !work_products_present_after
+        || credential_digests_before.iter().any(Option::is_none)
+        || credential_digests_after.iter().any(Option::is_none)
+        || directories_after != directories_before
+        || credential_digests_after != credential_digests_before
+    {
+        return Err(workspace_error());
+    }
+    Ok(())
+}
+
 fn capture_current_store_archive(
     app_local_data_directory: &Path,
     root: &Path,
@@ -1475,13 +1737,16 @@ fn validate_current_work_products_locked(
 #[allow(clippy::too_many_arguments)]
 fn verify_archive_bytes(
     bytes: &[u8],
-    expected_manifest_sha256: &str,
+    expected_manifest_sha256: Option<&str>,
     expected_store_kind: &str,
     database_name: &str,
     workspace_id: &WorkspaceInstanceId,
     maximum_bytes: usize,
-) -> Result<(), ApprovedMcpError> {
-    if bytes.is_empty() || bytes.len() > maximum_bytes || !is_hash(expected_manifest_sha256) {
+) -> Result<String, ApprovedMcpError> {
+    if bytes.is_empty()
+        || bytes.len() > maximum_bytes
+        || expected_manifest_sha256.is_some_and(|value| !is_hash(value))
+    {
         return Err(workspace_error());
     }
     let envelope: StoreArchiveEnvelopeV1 =
@@ -1502,7 +1767,7 @@ fn verify_archive_bytes(
     let actual_manifest_sha256 =
         sha256_hex(&canonical_json_v1(&envelope.manifest).map_err(|_| workspace_error())?);
     if envelope.manifest_sha256 != actual_manifest_sha256
-        || actual_manifest_sha256 != expected_manifest_sha256
+        || expected_manifest_sha256.is_some_and(|expected| actual_manifest_sha256 != expected)
     {
         return Err(workspace_error());
     }
@@ -1589,7 +1854,7 @@ fn verify_archive_bytes(
     if archived_paths != active_paths {
         return Err(workspace_error());
     }
-    Ok(())
+    Ok(actual_manifest_sha256)
 }
 
 fn revoke_standalone_sessions_with<Inspect, Revoke>(
@@ -2952,6 +3217,36 @@ mod tests {
         assert_eq!(capture_test_tree(root), before);
     }
 
+    fn populate_v031_recovery_safety_fixture(
+        harness: &ApplicationBackupTestHarness,
+    ) -> WorkspaceInstanceId {
+        let case_id = format!("case_{}", "c".repeat(32));
+        let generation = harness
+            .publish_generation(&case_id, 'c')
+            .expect("approved generation publishes");
+        harness
+            .create_work_product(
+                &generation,
+                b"[PERSON_001] authenticated R3 safety work product",
+            )
+            .expect("work product publishes");
+        harness
+            .epochs()
+            .expect("ticket and qualification credentials create before safety capture");
+        let CurrentApprovedComponentsObservation::Exact(proof) = harness
+            .workspace
+            .observe_current_components_read_only()
+            .expect("completed current components authenticate")
+        else {
+            panic!("completed current components must be present");
+        };
+        assert_eq!(
+            proof.lifecycle(),
+            CurrentApprovedComponentsLifecycle::ApprovedAndWorkProducts
+        );
+        proof.workspace_instance_id().clone()
+    }
+
     #[test]
     fn current_approved_components_observer_authenticates_lazy_lifecycle_without_writes() {
         let root = tempfile::tempdir().expect("current components fixture");
@@ -3054,6 +3349,148 @@ mod tests {
             .observe_current_components_read_only()
             .is_err());
         assert_eq!(capture_test_tree(root.path()), before);
+    }
+
+    #[test]
+    fn v031_recovery_safety_component_boundary_accepts_optional_absence_and_rejects_drift() {
+        let credentials = [
+            Some("a".repeat(64)),
+            Some("b".repeat(64)),
+            Some("c".repeat(64)),
+            Some("d".repeat(64)),
+        ];
+        let optional_directories_absent = (true, true, false, false);
+        enforce_v031_recovery_safety_component_boundary(
+            optional_directories_absent,
+            &credentials,
+            optional_directories_absent,
+            &credentials,
+        )
+        .expect("the two auxiliary directories are optional when their state is stable");
+
+        for drifted_directories in [(true, true, true, false), (true, true, false, true)] {
+            assert!(enforce_v031_recovery_safety_component_boundary(
+                optional_directories_absent,
+                &credentials,
+                drifted_directories,
+                &credentials,
+            )
+            .is_err());
+        }
+        for missing_critical_directory in [(false, true, false, false), (true, false, false, false)]
+        {
+            assert!(enforce_v031_recovery_safety_component_boundary(
+                missing_critical_directory,
+                &credentials,
+                missing_critical_directory,
+                &credentials,
+            )
+            .is_err());
+        }
+
+        let mut missing_credential = credentials.clone();
+        missing_credential[3] = None;
+        assert!(enforce_v031_recovery_safety_component_boundary(
+            optional_directories_absent,
+            &missing_credential,
+            optional_directories_absent,
+            &missing_credential,
+        )
+        .is_err());
+        let mut drifted_credential = credentials.clone();
+        drifted_credential[2] = Some("e".repeat(64));
+        assert!(enforce_v031_recovery_safety_component_boundary(
+            optional_directories_absent,
+            &credentials,
+            optional_directories_absent,
+            &drifted_credential,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v031_recovery_safety_snapshot_allows_absent_auxiliary_directories_without_mutation() {
+        let root = tempfile::tempdir().expect("R3 safety fixture");
+        let harness = ApplicationBackupTestHarness::new(root.path().to_path_buf());
+        let workspace_instance_id = populate_v031_recovery_safety_fixture(&harness);
+        let directories_before = observe_current_component_directories(&harness.workspace)
+            .expect("component directories inspect before safety capture");
+        assert_eq!(directories_before, (true, true, false, false));
+        let credentials_before = current_credential_digests(harness.keys.as_ref())
+            .expect("four credentials inspect before safety capture");
+        assert!(credentials_before.iter().all(Option::is_some));
+        let tree_before = capture_test_tree(root.path());
+        harness.panic_if_load_or_create_is_called();
+
+        let snapshot = harness
+            .workspace
+            .snapshot_for_v031_recovery_safety_read_only()
+            .expect("read-only safety capture accepts absent auxiliary directories");
+
+        assert_eq!(capture_test_tree(root.path()), tree_before);
+        assert_eq!(
+            current_credential_digests(harness.keys.as_ref())
+                .expect("four credentials inspect after safety capture"),
+            credentials_before
+        );
+        assert_eq!(
+            observe_current_component_directories(&harness.workspace)
+                .expect("component directories inspect after safety capture"),
+            directories_before
+        );
+        let archive_proof = verify_v031_recovery_safety_archive_pair_allocation_only(
+            &snapshot.approved_workspace_bundle,
+            &snapshot.work_products_bundle,
+            &workspace_instance_id,
+        )
+        .expect("both Safety V3 archive components authenticate");
+        assert_eq!(
+            archive_proof.approved_workspace_manifest_sha256,
+            snapshot.approved_workspace_manifest_sha256
+        );
+        assert_eq!(
+            archive_proof.work_products_manifest_sha256,
+            snapshot.work_products_manifest_sha256
+        );
+    }
+
+    #[test]
+    fn v031_recovery_safety_snapshot_fails_closed_when_critical_directory_is_missing() {
+        let root = tempfile::tempdir().expect("R3 missing critical directory fixture");
+        let moved = tempfile::tempdir().expect("R3 held work-products fixture");
+        let harness = ApplicationBackupTestHarness::new(root.path().to_path_buf());
+        populate_v031_recovery_safety_fixture(&harness);
+        fs::rename(
+            &harness.workspace.inner.work_product_root,
+            moved.path().join("work-products"),
+        )
+        .expect("work-products root moves outside the application tree");
+        assert_eq!(
+            observe_current_component_directories(&harness.workspace)
+                .expect("missing critical directory state inspects"),
+            (true, false, false, false)
+        );
+        let credentials_before = current_credential_digests(harness.keys.as_ref())
+            .expect("credentials inspect before rejected safety capture");
+        let tree_before = capture_test_tree(root.path());
+        harness.panic_if_load_or_create_is_called();
+
+        assert!(harness
+            .workspace
+            .snapshot_for_v031_recovery_safety_read_only()
+            .is_err());
+
+        assert_eq!(capture_test_tree(root.path()), tree_before);
+        assert_eq!(
+            current_credential_digests(harness.keys.as_ref())
+                .expect("credentials inspect after rejected safety capture"),
+            credentials_before
+        );
+        assert_eq!(
+            observe_current_component_directories(&harness.workspace)
+                .expect("missing critical directory remains missing"),
+            (true, false, false, false)
+        );
     }
 
     #[cfg(windows)]

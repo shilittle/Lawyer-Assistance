@@ -5,6 +5,7 @@ use crate::{
     approved_mcp::{
         observe_application_restore_workspace_identity_read_only,
         validate_application_restore_components_read_only,
+        verify_v031_recovery_safety_archive_pair_allocation_only,
         ApplicationRestoreApprovedComponentsProof, ApplicationRestoreWorkspaceIdentityProof,
         ApprovedMcpWorkspace,
     },
@@ -27,7 +28,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     os::windows::{
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawHandle,
@@ -84,6 +85,55 @@ pub struct ApplicationBackupResponse {
     pub file_name: Option<String>,
     pub metadata: Option<ApplicationBackupMetadata>,
     pub restart_required: bool,
+}
+
+/// Frozen R3 audit proof for the current-v0.4 V3 safety backup.  It contains
+/// only authenticated identifiers, version/schema values, lengths, and
+/// digests; no case content, key, path, or PrivacyCaseId is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct V031RecoverySafetyBackupProof {
+    backup_id: String,
+    privacy_backup_id: String,
+    workspace_instance_id: String,
+    app_version: String,
+    user_schema_version: i64,
+    created_at_unix: u64,
+    expires_at_unix: u64,
+    bundle_sha256: String,
+    bundle_bytes: u64,
+    component_identity_sha256: String,
+    stage_slot_inventory_sha256: String,
+}
+
+/// Pins the exact user main file with no write/delete sharing after all
+/// ordinary user-database operations have drained. Retaining this value keeps
+/// new writers out until the R3 restart tears the process down.
+pub(crate) struct V031RecoveryUserDatabaseWriteBarrier {
+    _validated_snapshot: Connection,
+    _source_file: File,
+}
+
+impl V031RecoverySafetyBackupProof {
+    pub(crate) fn bundle_sha256(&self) -> &str {
+        &self.bundle_sha256
+    }
+
+    pub(crate) const fn bundle_bytes(&self) -> u64 {
+        self.bundle_bytes
+    }
+
+    pub(crate) fn workspace_instance_id(&self) -> &str {
+        &self.workspace_instance_id
+    }
+
+    pub(crate) fn component_identity_sha256(&self) -> &str {
+        &self.component_identity_sha256
+    }
+
+    pub(crate) fn stage_slot_inventory_sha256(&self) -> &str {
+        &self.stage_slot_inventory_sha256
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +333,8 @@ enum RestoreComponentKind {
     WorkProducts,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RestoreFileProof {
     identity_sha256: String,
     bytes: u64,
@@ -307,13 +358,15 @@ impl std::fmt::Debug for RestoreFileProof {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum RestoreTreeEntryKind {
     Directory,
     File,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RestoreTreeEntryProof {
     relative_path_sha256: String,
     kind: RestoreTreeEntryKind,
@@ -341,7 +394,8 @@ impl std::fmt::Debug for RestoreTreeEntryProof {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RestoreDirectoryProof {
     root: RestoreTreeEntryProof,
     entries: Vec<RestoreTreeEntryProof>,
@@ -372,6 +426,171 @@ struct ApplicationRestoreSlotsProof {
     work_products_active: RestorePathProof,
     work_products_incoming: RestorePathProof,
     work_products_rollback: RestorePathProof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum V031RecoveryComponent {
+    UserDatabase,
+    PrivacyDatabase,
+    VaultStore,
+    ApprovedWorkspace,
+    WorkProducts,
+}
+
+impl V031RecoveryComponent {
+    const fn is_directory(self) -> bool {
+        matches!(
+            self,
+            Self::VaultStore | Self::ApprovedWorkspace | Self::WorkProducts
+        )
+    }
+}
+
+/// Location-independent physical proof used to bind a component before and
+/// after its no-replacement rename. Directory entry paths are represented only
+/// by hashes inside the underlying proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct V031RecoverySlotFingerprint {
+    component: V031RecoveryComponent,
+    directory: bool,
+    proof_sha256: String,
+    total_bytes: u64,
+    entry_count: u64,
+}
+
+/// Stable across a same-volume rename, including an NTFS tunneled destination
+/// basename.  The full restore observer still authenticates timestamps and
+/// attributes while each snapshot is captured; the R3 cross-rename binding
+/// deliberately retains only identity, structure, size, and content fields
+/// that Windows guarantees remain meaningful for the moved object.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V031RecoveryStableFileProof<'a> {
+    identity_sha256: &'a str,
+    bytes: u64,
+    sha256: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V031RecoveryStableTreeEntryProof<'a> {
+    relative_path_sha256: &'a str,
+    kind: RestoreTreeEntryKind,
+    identity_sha256: &'a str,
+    bytes: u64,
+    content_sha256: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V031RecoveryStableDirectoryProof<'a> {
+    root: V031RecoveryStableTreeEntryProof<'a>,
+    entries: Vec<V031RecoveryStableTreeEntryProof<'a>>,
+    total_file_bytes: u64,
+}
+
+fn stable_recovery_tree_entry(
+    entry: &RestoreTreeEntryProof,
+) -> V031RecoveryStableTreeEntryProof<'_> {
+    V031RecoveryStableTreeEntryProof {
+        relative_path_sha256: &entry.relative_path_sha256,
+        kind: entry.kind,
+        identity_sha256: &entry.identity_sha256,
+        bytes: entry.bytes,
+        content_sha256: entry.content_sha256.as_deref(),
+    }
+}
+
+impl V031RecoverySlotFingerprint {
+    pub(crate) fn is_well_formed_for(&self, component: V031RecoveryComponent) -> bool {
+        let expected_directory = component.is_directory();
+        self.component == component
+            && self.directory == expected_directory
+            && self.proof_sha256.len() == 64
+            && self
+                .proof_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && self.entry_count > 0
+            && (expected_directory || self.total_bytes > 0 && self.entry_count == 1)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct V031RecoverySwapPaths {
+    user_active: PathBuf,
+    user_incoming: PathBuf,
+    user_staging: PathBuf,
+    user_rollback: PathBuf,
+    privacy_active: PathBuf,
+    privacy_incoming: PathBuf,
+    privacy_staging: PathBuf,
+    privacy_rollback: PathBuf,
+    vault_active: PathBuf,
+    vault_incoming: PathBuf,
+    vault_rollback: PathBuf,
+    vault_cleanup: PathBuf,
+    approved_active: PathBuf,
+    approved_incoming: PathBuf,
+    approved_rollback: PathBuf,
+    approved_cleanup: PathBuf,
+    work_products_active: PathBuf,
+    work_products_incoming: PathBuf,
+    work_products_rollback: PathBuf,
+    work_products_cleanup: PathBuf,
+}
+
+impl V031RecoverySwapPaths {
+    pub(crate) fn active(&self, component: V031RecoveryComponent) -> &Path {
+        match component {
+            V031RecoveryComponent::UserDatabase => &self.user_active,
+            V031RecoveryComponent::PrivacyDatabase => &self.privacy_active,
+            V031RecoveryComponent::VaultStore => &self.vault_active,
+            V031RecoveryComponent::ApprovedWorkspace => &self.approved_active,
+            V031RecoveryComponent::WorkProducts => &self.work_products_active,
+        }
+    }
+
+    pub(crate) fn incoming(&self, component: V031RecoveryComponent) -> Option<&Path> {
+        match component {
+            V031RecoveryComponent::UserDatabase => Some(&self.user_incoming),
+            V031RecoveryComponent::PrivacyDatabase => Some(&self.privacy_incoming),
+            V031RecoveryComponent::VaultStore => Some(&self.vault_incoming),
+            V031RecoveryComponent::ApprovedWorkspace => Some(&self.approved_incoming),
+            V031RecoveryComponent::WorkProducts => Some(&self.work_products_incoming),
+        }
+    }
+
+    pub(crate) fn staging(&self, component: V031RecoveryComponent) -> Option<&Path> {
+        match component {
+            V031RecoveryComponent::UserDatabase => Some(&self.user_staging),
+            V031RecoveryComponent::PrivacyDatabase => Some(&self.privacy_staging),
+            V031RecoveryComponent::VaultStore
+            | V031RecoveryComponent::ApprovedWorkspace
+            | V031RecoveryComponent::WorkProducts => None,
+        }
+    }
+
+    pub(crate) fn rollback(&self, component: V031RecoveryComponent) -> &Path {
+        match component {
+            V031RecoveryComponent::UserDatabase => &self.user_rollback,
+            V031RecoveryComponent::PrivacyDatabase => &self.privacy_rollback,
+            V031RecoveryComponent::VaultStore => &self.vault_rollback,
+            V031RecoveryComponent::ApprovedWorkspace => &self.approved_rollback,
+            V031RecoveryComponent::WorkProducts => &self.work_products_rollback,
+        }
+    }
+
+    pub(crate) fn cleanup(&self, component: V031RecoveryComponent) -> Option<&Path> {
+        match component {
+            V031RecoveryComponent::VaultStore => Some(&self.vault_cleanup),
+            V031RecoveryComponent::ApprovedWorkspace => Some(&self.approved_cleanup),
+            V031RecoveryComponent::WorkProducts => Some(&self.work_products_cleanup),
+            V031RecoveryComponent::UserDatabase | V031RecoveryComponent::PrivacyDatabase => None,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -599,14 +818,260 @@ fn build_application_backup_v3(
     workflow: &PrivacyWorkflowManager,
     approved_workspace: &ApprovedMcpWorkspace,
 ) -> Result<(Vec<u8>, ApplicationBackupMetadata, String), IpcError> {
-    let (bytes, metadata, privacy_backup_id, _) = build_application_backup_internal(
+    let (bytes, metadata, privacy_backup_id, _, _) = build_application_backup_internal(
         app_local_data_dir,
         state,
         workflow,
         Some(approved_workspace),
+        false,
+        || {},
         || {},
     )?;
     Ok((bytes, metadata, privacy_backup_id))
+}
+
+type BuiltApplicationBackup = (
+    Vec<u8>,
+    ApplicationBackupMetadata,
+    String,
+    Option<BuiltMigrationComponentIdentity>,
+    Option<[V031RecoverySlotFingerprint; 5]>,
+);
+
+type BuiltV031RecoverySafetyApplicationBackup = (
+    Vec<u8>,
+    ApplicationBackupMetadata,
+    String,
+    BuiltMigrationComponentIdentity,
+    [V031RecoverySlotFingerprint; 5],
+);
+
+fn build_v031_recovery_safety_application_backup_v3(
+    app_local_data_dir: &Path,
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+) -> Result<BuiltV031RecoverySafetyApplicationBackup, IpcError> {
+    let (bytes, metadata, privacy_backup_id, identity, slots) = build_application_backup_internal(
+        app_local_data_dir,
+        state,
+        workflow,
+        Some(approved_workspace),
+        true,
+        || {},
+        || {},
+    )?;
+    Ok((
+        bytes,
+        metadata,
+        privacy_backup_id,
+        identity.ok_or_else(five_component_backup_error)?,
+        slots.ok_or_else(five_component_backup_error)?,
+    ))
+}
+
+/// Builds the frozen R3 current-v0.4 safety backup at one caller-owned,
+/// create-new audit destination and authenticates it again from disk.
+pub(crate) fn build_and_install_v031_recovery_safety_backup(
+    app_local_data_dir: &Path,
+    state: &AppState,
+    workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+    destination: &Path,
+) -> Result<
+    (
+        V031RecoverySafetyBackupProof,
+        [V031RecoverySlotFingerprint; 5],
+    ),
+    IpcError,
+> {
+    let (bytes, metadata, _privacy_backup_id, identity, current_slots) =
+        build_v031_recovery_safety_application_backup_v3(
+            app_local_data_dir,
+            state,
+            workflow,
+            approved_workspace,
+        )?;
+    let incoming = append_restore_path_suffix(destination, ".incoming");
+    let inner_staging = append_restore_path_suffix(destination, ".incoming.staging");
+    install_and_verify_v031_recovery_safety_backup(
+        &inner_staging,
+        &incoming,
+        destination,
+        &bytes,
+        workflow,
+    )?;
+    let proof = V031RecoverySafetyBackupProof {
+        backup_id: metadata.backup_id.clone(),
+        privacy_backup_id: metadata.privacy_backup_id.clone(),
+        workspace_instance_id: metadata.workspace_instance_id.as_str().to_owned(),
+        app_version: metadata.app_version.clone(),
+        user_schema_version: metadata.user_schema_version,
+        created_at_unix: metadata.created_at_unix,
+        expires_at_unix: metadata.expires_at_unix,
+        bundle_sha256: metadata.bundle_sha256.clone(),
+        bundle_bytes: u64::try_from(bytes.len()).map_err(|_| five_component_backup_error())?,
+        component_identity_sha256: migration_component_fingerprint(&identity.current),
+        stage_slot_inventory_sha256: sha256_hex(
+            &privacy::vnext::canonical_json_v1(&current_slots)
+                .map_err(|_| five_component_backup_error())?,
+        ),
+    };
+    verify_v031_recovery_safety_backup_read_only(destination, &proof)?;
+    Ok((proof, current_slots))
+}
+
+fn install_and_verify_v031_recovery_safety_backup(
+    inner_staging: &Path,
+    incoming: &Path,
+    destination: &Path,
+    bytes: &[u8],
+    workflow: &PrivacyWorkflowManager,
+) -> Result<(), IpcError> {
+    validate_new_local_file(destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(five_component_backup_error)?;
+    if inner_staging.parent() != Some(parent)
+        || incoming.parent() != Some(parent)
+        || path_is_present(inner_staging)?
+        || path_is_present(incoming)?
+    {
+        return Err(five_component_backup_error());
+    }
+
+    write_new_file(inner_staging, bytes)?;
+    verify_installed_backup_bytes(inner_staging, bytes, workflow)?;
+    atomic_install_new_migration_file(inner_staging, incoming)?;
+    sync_v031_recovery_safety_parent(parent)?;
+    if path_is_present(inner_staging)? {
+        return Err(five_component_backup_error());
+    }
+    verify_installed_backup_bytes(incoming, bytes, workflow)?;
+    atomic_install_new_migration_file(incoming, destination)?;
+    sync_v031_recovery_safety_parent(parent)?;
+    if path_is_present(inner_staging)? || path_is_present(incoming)? {
+        return Err(five_component_backup_error());
+    }
+    verify_installed_backup_bytes(destination, bytes, workflow)
+}
+
+fn sync_v031_recovery_safety_parent(parent: &Path) -> Result<(), IpcError> {
+    crate::v031_upgrade_r2::DirectorySync::sync_directory(
+        &crate::v031_upgrade_r2::PlatformDirectorySync,
+        parent,
+    )
+    .map_err(|_| five_component_backup_error())
+}
+
+/// Manager-free readback used by recovery-only startup before any current
+/// schema manager can be constructed.
+pub(crate) fn verify_v031_recovery_safety_backup_read_only(
+    path: &Path,
+    expected: &V031RecoverySafetyBackupProof,
+) -> Result<(), IpcError> {
+    let bytes = read_local_file(path, MAX_APPLICATION_BACKUP_BYTES)?;
+    if u64::try_from(bytes.len()).ok() != Some(expected.bundle_bytes)
+        || sha256_hex(&bytes) != expected.bundle_sha256
+        || !is_hash(&expected.component_identity_sha256)
+        || !is_hash(&expected.stage_slot_inventory_sha256)
+    {
+        return Err(five_component_backup_error());
+    }
+    let opened = open_application_backup_for_migration_recovery(
+        &bytes,
+        &MigrationApplicationBackupOpenContext {
+            expected_workspace_instance_id: &privacy::vnext::WorkspaceInstanceId::parse(
+                expected.workspace_instance_id.clone(),
+            )
+            .map_err(|_| five_component_backup_error())?,
+            expected_user_schema_version: expected.user_schema_version,
+            expected_backup_id: &expected.backup_id,
+            expected_privacy_backup_id: &expected.privacy_backup_id,
+            expected_app_version: &expected.app_version,
+            expected_created_at_unix: expected.created_at_unix,
+            expected_expires_at_unix: expected.expires_at_unix,
+            expected_bundle_sha256: &expected.bundle_sha256,
+        },
+    )
+    .map_err(application_backup_error)?;
+    let reconstructed_identity = reconstruct_v031_recovery_safety_component_identity(
+        &opened.metadata,
+        &opened.user_database,
+        &opened.encrypted_privacy_bundle,
+        &opened.encrypted_vault_bundle,
+        opened
+            .approved_workspace_bundle
+            .as_deref()
+            .ok_or_else(five_component_backup_error)?,
+        opened
+            .work_products_bundle
+            .as_deref()
+            .ok_or_else(five_component_backup_error)?,
+    )?;
+    let metadata = validate_opened_five_component_backup(&bytes, opened)?;
+    if metadata.backup_id != expected.backup_id
+        || metadata.privacy_backup_id != expected.privacy_backup_id
+        || metadata.workspace_instance_id.as_str() != expected.workspace_instance_id
+        || metadata.app_version != expected.app_version
+        || metadata.user_schema_version != expected.user_schema_version
+        || metadata.created_at_unix != expected.created_at_unix
+        || metadata.expires_at_unix != expected.expires_at_unix
+        || metadata.bundle_sha256 != expected.bundle_sha256
+        || migration_component_fingerprint(&reconstructed_identity)
+            != expected.component_identity_sha256
+    {
+        return Err(five_component_backup_error());
+    }
+    Ok(())
+}
+
+fn reconstruct_v031_recovery_safety_component_identity(
+    metadata: &ApplicationBackupMetadata,
+    user_database: &[u8],
+    encrypted_privacy_bundle: &[u8],
+    encrypted_vault_bundle: &[u8],
+    approved_workspace_bundle: &[u8],
+    work_products_bundle: &[u8],
+) -> Result<CurrentMigrationComponentIdentity, IpcError> {
+    let privacy = privacy::verify_v031_recovery_safety_portable_backup_allocation_only(
+        encrypted_privacy_bundle,
+        &metadata.privacy_backup_id,
+        &metadata.workspace_instance_id,
+        metadata.created_at_unix,
+        metadata.expires_at_unix,
+    )
+    .map_err(|_| five_component_backup_error())?;
+    let vault = privacy::verify_v031_recovery_safety_encrypted_vault_backup_allocation_only(
+        encrypted_vault_bundle,
+        &metadata.workspace_instance_id,
+    )
+    .map_err(vault_backup_error)?;
+    let approved = verify_v031_recovery_safety_archive_pair_allocation_only(
+        approved_workspace_bundle,
+        work_products_bundle,
+        &metadata.workspace_instance_id,
+    )
+    .map_err(approved_mcp_error)?;
+    if metadata.user_database_sha256 != sha256_hex(user_database)
+        || metadata.vault_manifest_sha256 != vault.vault_manifest_sha256
+        || metadata.approved_workspace_manifest_sha256.as_deref()
+            != Some(approved.approved_workspace_manifest_sha256.as_str())
+        || metadata.work_products_manifest_sha256.as_deref()
+            != Some(approved.work_products_manifest_sha256.as_str())
+    {
+        return Err(five_component_backup_error());
+    }
+    Ok(CurrentMigrationComponentIdentity {
+        user_database_sha256: sha256_hex(user_database),
+        privacy_store_schema_version: privacy.privacy_store_schema_version,
+        privacy_store_manifest_sha256: privacy.privacy_store_manifest_sha256,
+        vault_store_schema_version: vault.vault_store_schema_version,
+        vault_content_manifest_sha256: vault.vault_content_manifest_sha256,
+        vault_manifest_sha256: vault.vault_manifest_sha256,
+        approved_workspace_manifest_sha256: approved.approved_workspace_manifest_sha256,
+        work_products_manifest_sha256: approved.work_products_manifest_sha256,
+    })
 }
 
 pub(crate) fn ensure_pre_migration_application_backup(
@@ -707,12 +1172,14 @@ where
         }
     }
 
-    let (bytes, expected_metadata, privacy_backup_id, built_identity) =
+    let (bytes, expected_metadata, privacy_backup_id, built_identity, _) =
         build_application_backup_internal(
             app_local_data_dir,
             state,
             workflow,
             Some(approved_workspace),
+            false,
+            || {},
             || {},
         )?;
     let built_identity = built_identity.ok_or_else(five_component_backup_error)?;
@@ -2275,36 +2742,66 @@ fn build_application_backup_with_lock_hook<Hook>(
 where
     Hook: FnOnce(),
 {
-    let (bytes, metadata, privacy_backup_id, _) =
-        build_application_backup_internal(app_local_data_dir, state, workflow, None, lock_hook)?;
+    let (bytes, metadata, privacy_backup_id, _, _) = build_application_backup_internal(
+        app_local_data_dir,
+        state,
+        workflow,
+        None,
+        false,
+        lock_hook,
+        || {},
+    )?;
     Ok((bytes, metadata, privacy_backup_id))
 }
 
-fn build_application_backup_internal<Hook>(
+fn build_application_backup_internal<Hook, RecoverySlotsVerifiedHook>(
     app_local_data_dir: &Path,
     state: &AppState,
     workflow: &PrivacyWorkflowManager,
     approved_workspace: Option<&ApprovedMcpWorkspace>,
+    v031_recovery_read_only_boundary: bool,
     lock_hook: Hook,
-) -> Result<
-    (
-        Vec<u8>,
-        ApplicationBackupMetadata,
-        String,
-        Option<BuiltMigrationComponentIdentity>,
-    ),
-    IpcError,
->
+    recovery_slots_verified_hook: RecoverySlotsVerifiedHook,
+) -> Result<BuiltApplicationBackup, IpcError>
 where
     Hook: FnOnce(),
+    RecoverySlotsVerifiedHook: FnOnce(),
 {
     let guard = workflow.begin_application_backup_pair();
-    let (user_connection, mut user_file) =
-        open_coherent_user_snapshot(app_local_data_dir, state.user_database_path())?;
+    let (user_connection, mut user_file) = if v031_recovery_read_only_boundary {
+        open_v031_recovery_coherent_user_snapshot(app_local_data_dir, state.user_database_path())?
+    } else {
+        open_coherent_user_snapshot(app_local_data_dir, state.user_database_path())?
+    };
+    let approved_recovery_barrier = if v031_recovery_read_only_boundary {
+        let workspace = approved_workspace.ok_or_else(five_component_backup_error)?;
+        Some(
+            workspace
+                .begin_v031_recovery_quiescence()
+                .map_err(approved_mcp_error)?,
+        )
+    } else {
+        None
+    };
+    let recovery_slots_before = if v031_recovery_read_only_boundary {
+        Some(capture_v031_recovery_active_fingerprints(
+            &v031_recovery_swap_paths(app_local_data_dir),
+        )?)
+    } else {
+        None
+    };
     lock_hook();
 
     let approved_snapshot = match approved_workspace {
-        Some(workspace) => match workspace.snapshot_for_application_backup() {
+        Some(workspace) => match if v031_recovery_read_only_boundary {
+            workspace.snapshot_for_v031_recovery_safety_locked_read_only(
+                approved_recovery_barrier
+                    .as_ref()
+                    .ok_or_else(five_component_backup_error)?,
+            )
+        } else {
+            workspace.snapshot_for_application_backup()
+        } {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 return Err(abort_application_backup_pair(
@@ -2320,61 +2817,90 @@ where
     };
 
     let privacy_store_identity = match approved_workspace {
-        Some(_) => Some(privacy_store_identity(app_local_data_dir, workflow)?),
-        None => None,
-    };
-    let privacy_backup = match workflow.create_privacy_backup_locked(&guard) {
-        Ok(backup) => backup,
-        Err(error) => {
-            return Err(abort_application_backup_pair(
-                &user_connection,
-                workflow,
-                &guard,
-                None,
-                workflow_error(error),
-            ));
+        Some(_) if !v031_recovery_read_only_boundary => {
+            Some(privacy_store_identity(app_local_data_dir, workflow)?)
         }
+        None => None,
+        Some(_) => None,
     };
-    let privacy_bundle =
-        match workflow.export_privacy_backup_bundle_locked(&guard, &privacy_backup.backup_id) {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                return Err(abort_application_backup_pair(
-                    &user_connection,
-                    workflow,
-                    &guard,
-                    Some(&privacy_backup.backup_id),
-                    workflow_error(error),
-                ));
+    let (privacy_backup, privacy_bundle, privacy_backup_registered) =
+        if v031_recovery_read_only_boundary {
+            match workflow.export_v031_recovery_safety_privacy_backup_locked(&guard) {
+                Ok((backup, bundle)) => (backup, bundle, false),
+                Err(error) => {
+                    return Err(abort_application_backup_pair(
+                        &user_connection,
+                        workflow,
+                        &guard,
+                        None,
+                        workflow_error(error),
+                    ));
+                }
             }
+        } else {
+            let backup = match workflow.create_privacy_backup_locked(&guard) {
+                Ok(backup) => backup,
+                Err(error) => {
+                    return Err(abort_application_backup_pair(
+                        &user_connection,
+                        workflow,
+                        &guard,
+                        None,
+                        workflow_error(error),
+                    ));
+                }
+            };
+            let bundle =
+                match workflow.export_privacy_backup_bundle_locked(&guard, &backup.backup_id) {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        return Err(abort_application_backup_pair(
+                            &user_connection,
+                            workflow,
+                            &guard,
+                            Some(&backup.backup_id),
+                            workflow_error(error),
+                        ));
+                    }
+                };
+            (backup, bundle, true)
         };
-    let (vault_bundle, vault_summary) = match workflow.export_encrypted_vault_backup_locked(&guard)
-    {
+    let revocable_privacy_backup_id =
+        privacy_backup_registered.then_some(privacy_backup.backup_id.as_str());
+    let vault_export = if v031_recovery_read_only_boundary {
+        workflow.export_encrypted_vault_backup_read_only_locked(&guard)
+    } else {
+        workflow.export_encrypted_vault_backup_locked(&guard)
+    };
+    let (vault_bundle, vault_summary) = match vault_export {
         Ok(bundle) => bundle,
         Err(error) => {
             return Err(abort_application_backup_pair(
                 &user_connection,
                 workflow,
                 &guard,
-                Some(&privacy_backup.backup_id),
+                revocable_privacy_backup_id,
                 vault_backup_error(error),
             ));
         }
     };
     let vault_content_identity = match approved_workspace {
-        Some(_) => match vault_content_identity(app_local_data_dir, workflow) {
-            Ok(identity) => Some(identity),
-            Err(error) => {
-                return Err(abort_application_backup_pair(
-                    &user_connection,
-                    workflow,
-                    &guard,
-                    Some(&privacy_backup.backup_id),
-                    error,
-                ));
+        Some(_) if !v031_recovery_read_only_boundary => {
+            match vault_content_identity(app_local_data_dir, workflow) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    return Err(abort_application_backup_pair(
+                        &user_connection,
+                        workflow,
+                        &guard,
+                        revocable_privacy_backup_id,
+                        error,
+                    ));
+                }
             }
-        },
+        }
         None => None,
+        Some(_) => None,
     };
     let user_database = match snapshot_user_database(
         app_local_data_dir,
@@ -2387,7 +2913,7 @@ where
                 &user_connection,
                 workflow,
                 &guard,
-                Some(&privacy_backup.backup_id),
+                revocable_privacy_backup_id,
                 error,
             ));
         }
@@ -2399,21 +2925,60 @@ where
             &user_connection,
             workflow,
             &guard,
-            Some(&privacy_backup.backup_id),
+            revocable_privacy_backup_id,
             ipc_error(
                 "application_backup_environment_mismatch",
                 "The fixed user database changed identity during the coherent backup window.",
             ),
         ));
     }
+    let recovery_slot_fingerprints = if v031_recovery_read_only_boundary {
+        match capture_v031_recovery_active_fingerprints(&v031_recovery_swap_paths(
+            app_local_data_dir,
+        )) {
+            Ok(slots)
+                if recovery_slots_before
+                    .as_ref()
+                    .is_none_or(|before| before == &slots) =>
+            {
+                Some(slots)
+            }
+            Ok(_) => {
+                return Err(abort_application_backup_pair(
+                    &user_connection,
+                    workflow,
+                    &guard,
+                    revocable_privacy_backup_id,
+                    five_component_backup_error(),
+                ));
+            }
+            Err(error) => {
+                return Err(abort_application_backup_pair(
+                    &user_connection,
+                    workflow,
+                    &guard,
+                    revocable_privacy_backup_id,
+                    error,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    if v031_recovery_read_only_boundary {
+        recovery_slots_verified_hook();
+    }
     if let Err(rollback_error) = rollback_user_snapshot(&user_connection) {
-        if let Err(revoke_error) =
-            workflow.revoke_privacy_backup_locked(&guard, &privacy_backup.backup_id)
-        {
-            return Err(workflow_error(revoke_error));
+        if privacy_backup_registered {
+            if let Err(revoke_error) =
+                workflow.revoke_privacy_backup_locked(&guard, &privacy_backup.backup_id)
+            {
+                return Err(workflow_error(revoke_error));
+            }
         }
         return Err(rollback_error);
     }
+    drop(approved_recovery_barrier);
     drop(user_connection);
     drop(user_file);
     drop(guard);
@@ -2455,40 +3020,62 @@ where
     .map_err(application_backup_error);
     match result {
         Ok((bytes, metadata)) => {
-            let migration_identity = match (
-                approved_snapshot.as_ref(),
-                privacy_store_identity,
-                vault_content_identity,
-            ) {
-                (
-                    Some(snapshot),
-                    Some((privacy_store_schema_version, privacy_store_manifest_sha256)),
-                    Some((vault_store_schema_version, vault_content_manifest_sha256)),
-                ) => Some(BuiltMigrationComponentIdentity {
-                    current: CurrentMigrationComponentIdentity {
-                        user_database_sha256: metadata.user_database_sha256.clone(),
-                        privacy_store_schema_version,
-                        privacy_store_manifest_sha256,
-                        vault_store_schema_version,
-                        vault_content_manifest_sha256,
-                        vault_manifest_sha256: vault_summary.manifest_sha256.as_str().to_owned(),
-                        approved_workspace_manifest_sha256: snapshot
-                            .approved_workspace_manifest_sha256
-                            .clone(),
-                        work_products_manifest_sha256: snapshot
-                            .work_products_manifest_sha256
-                            .clone(),
-                    },
-                    privacy_database_sha256: privacy_backup.database_sha256.clone(),
-                }),
-                (None, None, None) => None,
-                _ => {
-                    if let Err(revoke_error) =
-                        workflow.revoke_privacy_backup(&privacy_backup.backup_id)
-                    {
-                        return Err(workflow_error(revoke_error));
-                    }
+            let migration_identity = if v031_recovery_read_only_boundary {
+                let Some(snapshot) = approved_snapshot.as_ref() else {
                     return Err(five_component_backup_error());
+                };
+                Some(BuiltMigrationComponentIdentity {
+                    current: reconstruct_v031_recovery_safety_component_identity(
+                        &metadata,
+                        user_database.as_slice(),
+                        &privacy_bundle,
+                        &vault_bundle,
+                        &snapshot.approved_workspace_bundle,
+                        &snapshot.work_products_bundle,
+                    )?,
+                    privacy_database_sha256: privacy_backup.database_sha256.clone(),
+                })
+            } else {
+                match (
+                    approved_snapshot.as_ref(),
+                    privacy_store_identity,
+                    vault_content_identity,
+                ) {
+                    (
+                        Some(snapshot),
+                        Some((privacy_store_schema_version, privacy_store_manifest_sha256)),
+                        Some((vault_store_schema_version, vault_content_manifest_sha256)),
+                    ) => Some(BuiltMigrationComponentIdentity {
+                        current: CurrentMigrationComponentIdentity {
+                            user_database_sha256: metadata.user_database_sha256.clone(),
+                            privacy_store_schema_version,
+                            privacy_store_manifest_sha256,
+                            vault_store_schema_version,
+                            vault_content_manifest_sha256,
+                            vault_manifest_sha256: vault_summary
+                                .manifest_sha256
+                                .as_str()
+                                .to_owned(),
+                            approved_workspace_manifest_sha256: snapshot
+                                .approved_workspace_manifest_sha256
+                                .clone(),
+                            work_products_manifest_sha256: snapshot
+                                .work_products_manifest_sha256
+                                .clone(),
+                        },
+                        privacy_database_sha256: privacy_backup.database_sha256.clone(),
+                    }),
+                    (None, None, None) => None,
+                    _ => {
+                        if privacy_backup_registered {
+                            if let Err(revoke_error) =
+                                workflow.revoke_privacy_backup(&privacy_backup.backup_id)
+                            {
+                                return Err(workflow_error(revoke_error));
+                            }
+                        }
+                        return Err(five_component_backup_error());
+                    }
                 }
             };
             Ok((
@@ -2496,11 +3083,15 @@ where
                 metadata,
                 privacy_backup.backup_id,
                 migration_identity,
+                recovery_slot_fingerprints,
             ))
         }
         Err(error) => {
-            if let Err(revoke_error) = workflow.revoke_privacy_backup(&privacy_backup.backup_id) {
-                return Err(workflow_error(revoke_error));
+            if privacy_backup_registered {
+                if let Err(revoke_error) = workflow.revoke_privacy_backup(&privacy_backup.backup_id)
+                {
+                    return Err(workflow_error(revoke_error));
+                }
             }
             Err(error)
         }
@@ -2595,6 +3186,105 @@ fn open_coherent_user_snapshot(
     }
     Ok((connection, source_file))
 }
+
+fn open_v031_recovery_coherent_user_snapshot(
+    app_local_data_dir: &Path,
+    source_path: &Path,
+) -> Result<(Connection, File), IpcError> {
+    if source_path != database::user_database_path(app_local_data_dir)
+        || !privacy_manager::is_normal_local_absolute(source_path)
+        || !privacy_manager::local_path_chain_is_ordinary(source_path)
+    {
+        return Err(ipc_error(
+            "application_backup_environment_mismatch",
+            "The R3 safety source is not the fixed ordinary user database.",
+        ));
+    }
+    ensure_no_database_sidecars(source_path)?;
+    let mut source_file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(source_path)
+        .map_err(|_| {
+            ipc_error(
+                "application_backup_busy",
+                "The R3 safety source could not be pinned against writes and replacement.",
+            )
+        })?;
+    if !ordinary_single_link_handle(&source_file) {
+        return Err(ipc_error(
+            "application_backup_environment_mismatch",
+            "The pinned R3 safety user database is not an ordinary single-link file.",
+        ));
+    }
+    let source_image = snapshot_user_database(app_local_data_dir, source_path, &mut source_file)?;
+    if source_image.0.len() < 100 || source_image.0[18] != 1 || source_image.0[19] != 1 {
+        return Err(ipc_error(
+            "application_backup_environment_mismatch",
+            "The R3 safety user database is not a main-file-only rollback-journal image.",
+        ));
+    }
+    let mut connection = Connection::open_in_memory().map_err(|_| {
+        ipc_error(
+            "application_backup_invalid",
+            "The R3 safety user snapshot could not be opened in memory.",
+        )
+    })?;
+    connection
+        .deserialize_read_exact(
+            rusqlite::MAIN_DB,
+            Cursor::new(source_image.as_slice()),
+            source_image.0.len(),
+            true,
+        )
+        .map_err(|_| {
+            ipc_error(
+                "application_backup_invalid",
+                "The pinned R3 safety user image could not be attached read-only.",
+            )
+        })?;
+    connection
+        .execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA foreign_keys=ON;
+             PRAGMA trusted_schema=OFF;
+             BEGIN DEFERRED;",
+        )
+        .map_err(|_| {
+            ipc_error(
+                "application_backup_invalid",
+                "The R3 safety user image could not enter its read-only snapshot.",
+            )
+        })?;
+    database::validate_open_user_database(&connection).map_err(|_| {
+        ipc_error(
+            "application_backup_invalid",
+            "The R3 safety user image failed canonical schema and integrity validation.",
+        )
+    })?;
+    ensure_no_database_sidecars(source_path)?;
+    if !ordinary_single_link_handle(&source_file) {
+        return Err(ipc_error(
+            "application_backup_environment_mismatch",
+            "The pinned R3 safety user database changed identity during validation.",
+        ));
+    }
+    Ok((connection, source_file))
+}
+
+pub(crate) fn acquire_v031_recovery_user_database_write_barrier(
+    app_local_data_dir: &Path,
+    source_path: &Path,
+) -> Result<V031RecoveryUserDatabaseWriteBarrier, IpcError> {
+    let (validated_snapshot, source_file) =
+        open_v031_recovery_coherent_user_snapshot(app_local_data_dir, source_path)?;
+    Ok(V031RecoveryUserDatabaseWriteBarrier {
+        _validated_snapshot: validated_snapshot,
+        _source_file: source_file,
+    })
+}
+
 fn rollback_user_snapshot(connection: &Connection) -> Result<(), IpcError> {
     connection.execute_batch("ROLLBACK").map_err(|_| {
         ipc_error(
@@ -3475,11 +4165,19 @@ fn reject_unknown_application_restore_siblings(
         .ok_or_else(application_restore_crash_state_error)?;
     reject_unknown_restore_names_in_directory(
         app_local_data_dir,
-        &["application", "user.sqlite", VAULT_DIRECTORY_NAME],
+        &[
+            "application",
+            "user.sqlite",
+            VAULT_DIRECTORY_NAME,
+            "v031-migration-recovery-pending.dpapi",
+        ],
         &[
             FULL_RESTORE_MARKER_NAME,
             "v031-migration-recovery-pending.dpapi",
+            "v031-migration-recovery-pending.dpapi.incoming",
+            "v031-migration-recovery-pending.dpapi.incoming.staging",
             "user.sqlite.application-restore-incoming",
+            "user.sqlite.application-restore-incoming.staging",
             "user.sqlite.application-restore-incoming-journal",
             "user.sqlite.application-restore-incoming-wal",
             "user.sqlite.application-restore-incoming-shm",
@@ -3492,6 +4190,7 @@ fn reject_unknown_application_restore_siblings(
             "user.sqlite.restore-rollback",
             "case-vault-v2.application-restore-incoming",
             "case-vault-v2.application-restore-rollback",
+            "case-vault-v2.application-restore-cleanup",
         ],
     )?;
     if restore_path_is_present(&privacy_directory)? {
@@ -3500,6 +4199,7 @@ fn reject_unknown_application_restore_siblings(
             &["privacy-workflow.sqlite"],
             &[
                 "privacy-workflow.sqlite.application-restore-incoming",
+                "privacy-workflow.sqlite.application-restore-incoming.staging",
                 "privacy-workflow.sqlite.application-restore-incoming-journal",
                 "privacy-workflow.sqlite.application-restore-incoming-wal",
                 "privacy-workflow.sqlite.application-restore-incoming-shm",
@@ -3520,8 +4220,10 @@ fn reject_unknown_application_restore_siblings(
             &[
                 "approved-generations.application-restore-incoming",
                 "approved-generations.application-restore-rollback",
+                "approved-generations.application-restore-cleanup",
                 "work-products.application-restore-incoming",
                 "work-products.application-restore-rollback",
+                "work-products.application-restore-cleanup",
             ],
         )?;
     }
@@ -5112,6 +5814,14 @@ fn install_and_verify_backup(
 ) -> Result<(), IpcError> {
     validate_new_local_file(destination)?;
     write_new_file(destination, bytes)?;
+    verify_installed_backup_bytes(destination, bytes, workflow)
+}
+
+fn verify_installed_backup_bytes(
+    destination: &Path,
+    bytes: &[u8],
+    workflow: &PrivacyWorkflowManager,
+) -> Result<(), IpcError> {
     let installed = read_local_file(destination, MAX_APPLICATION_BACKUP_BYTES)?;
     if installed.len() != bytes.len() || sha256_hex(&installed) != sha256_hex(bytes) {
         return Err(ipc_error(
@@ -5174,6 +5884,294 @@ fn application_restore_paths(app_local_data_dir: &Path) -> ApplicationRestorePat
         work_products_rollback: sibling_restore_path(&work_products_active, "rollback"),
         work_products_active,
     }
+}
+
+pub(crate) fn v031_recovery_swap_paths(app_local_data_dir: &Path) -> V031RecoverySwapPaths {
+    let paths = application_restore_paths(app_local_data_dir);
+    let user_staging = append_restore_path_suffix(&paths.user_incoming, ".staging");
+    let privacy_staging = append_restore_path_suffix(&paths.privacy_incoming, ".staging");
+    V031RecoverySwapPaths {
+        user_active: paths.user_active,
+        user_incoming: paths.user_incoming,
+        user_staging,
+        user_rollback: paths.user_rollback,
+        privacy_active: paths.privacy_active,
+        privacy_incoming: paths.privacy_incoming,
+        privacy_staging,
+        privacy_rollback: paths.privacy_rollback,
+        vault_active: paths.vault_active,
+        vault_incoming: paths.vault_incoming,
+        vault_rollback: paths.vault_rollback,
+        vault_cleanup: app_local_data_dir.join(format!(
+            "{VAULT_DIRECTORY_NAME}.application-restore-cleanup"
+        )),
+        approved_active: paths.approved_active,
+        approved_incoming: paths.approved_incoming,
+        approved_rollback: paths.approved_rollback,
+        approved_cleanup: sibling_restore_path(
+            &app_local_data_dir.join(APPROVED_DIRECTORY_RELATIVE),
+            "cleanup",
+        ),
+        work_products_active: paths.work_products_active,
+        work_products_incoming: paths.work_products_incoming,
+        work_products_rollback: paths.work_products_rollback,
+        work_products_cleanup: sibling_restore_path(
+            &app_local_data_dir.join(WORK_PRODUCTS_DIRECTORY_RELATIVE),
+            "cleanup",
+        ),
+    }
+}
+
+pub(crate) fn reject_unknown_v031_recovery_restore_siblings(
+    app_local_data_dir: &Path,
+) -> Result<(), IpcError> {
+    let paths = application_restore_paths(app_local_data_dir);
+    reject_unknown_application_restore_siblings(app_local_data_dir, &paths)
+}
+
+pub(crate) fn v031_recovery_path_is_present(path: &Path) -> Result<bool, IpcError> {
+    restore_path_is_present(path)
+}
+
+pub(crate) fn capture_v031_recovery_slot_fingerprint(
+    path: &Path,
+    component: V031RecoveryComponent,
+) -> Result<Option<V031RecoverySlotFingerprint>, IpcError> {
+    if !component.is_directory() {
+        ensure_no_database_sidecars(path)?;
+    }
+    if !restore_path_is_present(path)? {
+        return Ok(None);
+    }
+    if component.is_directory() {
+        let proof = capture_restore_directory_proof(path)?;
+        let stable = V031RecoveryStableDirectoryProof {
+            root: stable_recovery_tree_entry(&proof.root),
+            entries: proof
+                .entries
+                .iter()
+                .map(stable_recovery_tree_entry)
+                .collect(),
+            total_file_bytes: proof.total_file_bytes,
+        };
+        let canonical = privacy::vnext::canonical_json_v1(&stable)
+            .map_err(|_| application_restore_crash_state_error())?;
+        return Ok(Some(V031RecoverySlotFingerprint {
+            component,
+            directory: true,
+            proof_sha256: sha256_hex(&canonical),
+            total_bytes: proof.total_file_bytes,
+            entry_count: u64::try_from(proof.entries.len().saturating_add(1))
+                .map_err(|_| application_restore_crash_state_error())?,
+        }));
+    }
+    let (_, proof) = read_restore_file_with_proof(
+        path,
+        if component == V031RecoveryComponent::UserDatabase {
+            MAX_USER_DATABASE_BACKUP_BYTES
+        } else {
+            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES
+        },
+        false,
+    )?;
+    let stable = V031RecoveryStableFileProof {
+        identity_sha256: &proof.identity_sha256,
+        bytes: proof.bytes,
+        sha256: &proof.sha256,
+    };
+    let canonical = privacy::vnext::canonical_json_v1(&stable)
+        .map_err(|_| application_restore_crash_state_error())?;
+    Ok(Some(V031RecoverySlotFingerprint {
+        component,
+        directory: false,
+        proof_sha256: sha256_hex(&canonical),
+        total_bytes: proof.bytes,
+        entry_count: 1,
+    }))
+}
+
+pub(crate) fn capture_v031_recovery_active_fingerprints(
+    paths: &V031RecoverySwapPaths,
+) -> Result<[V031RecoverySlotFingerprint; 5], IpcError> {
+    let capture = |component| {
+        capture_v031_recovery_slot_fingerprint(paths.active(component), component)?.ok_or_else(
+            || {
+                ipc_error(
+                    "v031_recovery_current_component_missing",
+                    "The current v0.4 five-component safety profile is incomplete.",
+                )
+            },
+        )
+    };
+    Ok([
+        capture(V031RecoveryComponent::UserDatabase)?,
+        capture(V031RecoveryComponent::PrivacyDatabase)?,
+        capture(V031RecoveryComponent::VaultStore)?,
+        capture(V031RecoveryComponent::ApprovedWorkspace)?,
+        capture(V031RecoveryComponent::WorkProducts)?,
+    ])
+}
+
+pub(crate) fn write_v031_recovery_database_incoming(
+    path: &Path,
+    component: V031RecoveryComponent,
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> Result<V031RecoverySlotFingerprint, IpcError> {
+    if !matches!(
+        component,
+        V031RecoveryComponent::UserDatabase | V031RecoveryComponent::PrivacyDatabase
+    ) || sha256_hex(bytes) != expected_sha256
+    {
+        return Err(application_restore_crash_state_error());
+    }
+    ensure_restore_database_slot_absent(path)?;
+    let staging = append_restore_path_suffix(path, ".staging");
+    if restore_path_is_present(&staging)? {
+        remove_v031_recovery_component(&staging, component)?;
+    }
+    ensure_restore_database_slot_absent(&staging)?;
+    write_new_file(&staging, bytes)?;
+    crate::v031_upgrade_r2::DirectorySync::sync_directory(
+        &crate::v031_upgrade_r2::PlatformDirectorySync,
+        path.parent()
+            .ok_or_else(application_restore_crash_state_error)?,
+    )
+    .map_err(|_| application_restore_crash_state_error())?;
+    let installed = read_local_file(
+        &staging,
+        if component == V031RecoveryComponent::UserDatabase {
+            MAX_USER_DATABASE_BACKUP_BYTES
+        } else {
+            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES
+        },
+    )?;
+    if installed != bytes {
+        return Err(application_restore_crash_state_error());
+    }
+    let expected = capture_v031_recovery_slot_fingerprint(&staging, component)?
+        .ok_or_else(application_restore_crash_state_error)?;
+    rename_v031_recovery_component_no_replace(&staging, path, component, &expected)?;
+    let installed = read_local_file(
+        path,
+        if component == V031RecoveryComponent::UserDatabase {
+            MAX_USER_DATABASE_BACKUP_BYTES
+        } else {
+            privacy::lifecycle::MAX_BACKUP_DATABASE_BYTES
+        },
+    )?;
+    if installed != bytes || restore_path_is_present(&staging)? {
+        return Err(application_restore_crash_state_error());
+    }
+    capture_v031_recovery_slot_fingerprint(path, component)?
+        .filter(|fingerprint| fingerprint == &expected)
+        .ok_or_else(application_restore_crash_state_error)
+}
+
+pub(crate) fn rename_v031_recovery_component_no_replace(
+    from: &Path,
+    to: &Path,
+    component: V031RecoveryComponent,
+    expected: &V031RecoverySlotFingerprint,
+) -> Result<(), IpcError> {
+    if capture_v031_recovery_slot_fingerprint(from, component)?.as_ref() != Some(expected)
+        || capture_v031_recovery_slot_fingerprint(to, component)?.is_some()
+    {
+        return Err(application_restore_crash_state_error());
+    }
+    crate::v031_upgrade_r2::rename_new_no_replace_write_through(from, to)
+        .map_err(|_| application_restore_crash_state_error())?;
+    crate::v031_upgrade_r2::DirectorySync::sync_directory(
+        &crate::v031_upgrade_r2::PlatformDirectorySync,
+        from.parent()
+            .ok_or_else(application_restore_crash_state_error)?,
+    )
+    .map_err(|_| application_restore_crash_state_error())?;
+    if capture_v031_recovery_slot_fingerprint(to, component)?.as_ref() != Some(expected)
+        || restore_path_is_present(from)?
+    {
+        return Err(application_restore_crash_state_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_v031_recovery_component(
+    path: &Path,
+    component: V031RecoveryComponent,
+) -> Result<(), IpcError> {
+    if !restore_path_is_present(path)? {
+        return Ok(());
+    }
+    if component.is_directory() {
+        if component == V031RecoveryComponent::VaultStore {
+            remove_vault_restore_directory(path)?;
+        } else {
+            remove_restore_directory(path)?;
+        }
+    } else {
+        ensure_no_database_sidecars(path)?;
+        remove_database_restore_files(path)?;
+    }
+    crate::v031_upgrade_r2::DirectorySync::sync_directory(
+        &crate::v031_upgrade_r2::PlatformDirectorySync,
+        path.parent()
+            .ok_or_else(application_restore_crash_state_error)?,
+    )
+    .map_err(|_| application_restore_crash_state_error())
+}
+
+pub(crate) fn remove_v031_recovery_auxiliary_directory(
+    app_local_data_dir: &Path,
+    name: &str,
+) -> Result<(), IpcError> {
+    if !matches!(name, "ticket-sessions" | "qualification") {
+        return Err(application_restore_crash_state_error());
+    }
+    let approved_parent = app_local_data_dir.join("privacy/approved-mcp");
+    let path = approved_parent.join(name);
+    if path.parent() != Some(approved_parent.as_path()) {
+        return Err(application_restore_crash_state_error());
+    }
+    if !restore_path_is_present(&path)? {
+        return Ok(());
+    }
+    validate_restore_directory_identity(&path)?;
+    validate_vault_cleanup_tree(&path, &path)?;
+    fs::remove_dir_all(&path).map_err(|_| application_restore_crash_state_error())?;
+    if restore_path_is_present(&path)? {
+        return Err(application_restore_crash_state_error());
+    }
+    crate::v031_upgrade_r2::DirectorySync::sync_directory(
+        &crate::v031_upgrade_r2::PlatformDirectorySync,
+        &approved_parent,
+    )
+    .map_err(|_| application_restore_crash_state_error())?;
+    Ok(())
+}
+
+pub(crate) fn remove_v031_recovery_approved_parent_if_empty(
+    app_local_data_dir: &Path,
+) -> Result<(), IpcError> {
+    let path = app_local_data_dir.join("privacy/approved-mcp");
+    if !restore_path_is_present(&path)? {
+        return Ok(());
+    }
+    validate_restore_directory_identity(&path)?;
+    if fs::read_dir(&path)
+        .map_err(|_| application_restore_crash_state_error())?
+        .next()
+        .is_some()
+    {
+        return Err(application_restore_crash_state_error());
+    }
+    fs::remove_dir(&path).map_err(|_| application_restore_crash_state_error())?;
+    crate::v031_upgrade_r2::DirectorySync::sync_directory(
+        &crate::v031_upgrade_r2::PlatformDirectorySync,
+        path.parent()
+            .ok_or_else(application_restore_crash_state_error)?,
+    )
+    .map_err(|_| application_restore_crash_state_error())?;
+    Ok(())
 }
 
 pub(crate) fn ensure_standalone_restore_is_lineage_safe(
@@ -5400,6 +6398,12 @@ fn restore_database_has_rows(
 fn sibling_restore_path(active: &Path, suffix: &str) -> PathBuf {
     let mut value = active.as_os_str().to_os_string();
     value.push(format!(".application-restore-{suffix}"));
+    PathBuf::from(value)
+}
+
+fn append_restore_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
     PathBuf::from(value)
 }
 
@@ -6130,6 +7134,7 @@ fn remove_vault_restore_directory(path: &Path) -> Result<(), IpcError> {
                 VAULT_DIRECTORY_NAME
                     | "case-vault-v2.application-restore-incoming"
                     | "case-vault-v2.application-restore-rollback"
+                    | "case-vault-v2.application-restore-cleanup"
             )
         });
     if !allowed_name || !metadata.is_dir() {
@@ -6175,9 +7180,11 @@ fn remove_restore_directory(path: &Path) -> Result<(), IpcError> {
                 APPROVED_DIRECTORY_NAME
                     | "approved-generations.application-restore-incoming"
                     | "approved-generations.application-restore-rollback"
+                    | "approved-generations.application-restore-cleanup"
                     | WORK_PRODUCTS_DIRECTORY_NAME
                     | "work-products.application-restore-incoming"
                     | "work-products.application-restore-rollback"
+                    | "work-products.application-restore-cleanup"
             )
         });
     if !allowed_name || !metadata.is_dir() {

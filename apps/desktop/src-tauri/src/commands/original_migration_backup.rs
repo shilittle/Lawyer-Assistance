@@ -106,6 +106,97 @@ pub(crate) struct OriginalRollbackVerifiedGate {
     original_privacy_protected_review_payload_count: u64,
 }
 
+/// R3-only capability that owns the two authenticated source SQLite images.
+/// The byte buffers are zeroized on drop and Debug intentionally exposes only
+/// fixed audit anchors.
+pub(crate) struct AuthenticatedOriginalV2Images {
+    lineage_id: String,
+    envelope_binding_id: String,
+    source_profile_proof_sha256: String,
+    identity_protected_sha256: String,
+    identity_protected_bytes: u64,
+    bundle_sha256: String,
+    bundle_bytes: u64,
+    step8_predecessor_protected_sha256: String,
+    upgrade_complete_sidecar_protected_sha256: String,
+    receipt_nine_protected_sha256: String,
+    receipt_nine_evidence_sha256: String,
+    final_component_manifest_sha256: String,
+    user_database: Zeroizing<Vec<u8>>,
+    privacy_database: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for AuthenticatedOriginalV2Images {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedOriginalV2Images")
+            .field("lineage_id", &self.lineage_id)
+            .field("identity_protected_sha256", &self.identity_protected_sha256)
+            .field("bundle_sha256", &self.bundle_sha256)
+            .field("user_bytes", &self.user_database.len())
+            .field("privacy_bytes", &self.privacy_database.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedOriginalV2Images {
+    pub(crate) fn lineage_id(&self) -> &str {
+        &self.lineage_id
+    }
+
+    pub(crate) fn envelope_binding_id(&self) -> &str {
+        &self.envelope_binding_id
+    }
+
+    pub(crate) fn source_profile_proof_sha256(&self) -> &str {
+        &self.source_profile_proof_sha256
+    }
+
+    pub(crate) fn identity_protected_sha256(&self) -> &str {
+        &self.identity_protected_sha256
+    }
+
+    pub(crate) const fn identity_protected_bytes(&self) -> u64 {
+        self.identity_protected_bytes
+    }
+
+    pub(crate) fn bundle_sha256(&self) -> &str {
+        &self.bundle_sha256
+    }
+
+    pub(crate) const fn bundle_bytes(&self) -> u64 {
+        self.bundle_bytes
+    }
+
+    pub(crate) fn step8_predecessor_protected_sha256(&self) -> &str {
+        &self.step8_predecessor_protected_sha256
+    }
+
+    pub(crate) fn upgrade_complete_sidecar_protected_sha256(&self) -> &str {
+        &self.upgrade_complete_sidecar_protected_sha256
+    }
+
+    pub(crate) fn receipt_nine_protected_sha256(&self) -> &str {
+        &self.receipt_nine_protected_sha256
+    }
+
+    pub(crate) fn receipt_nine_evidence_sha256(&self) -> &str {
+        &self.receipt_nine_evidence_sha256
+    }
+
+    pub(crate) fn final_component_manifest_sha256(&self) -> &str {
+        &self.final_component_manifest_sha256
+    }
+
+    pub(crate) fn user_database(&self) -> &[u8] {
+        self.user_database.as_slice()
+    }
+
+    pub(crate) fn privacy_database(&self) -> &[u8] {
+        self.privacy_database.as_slice()
+    }
+}
+
 impl fmt::Debug for OriginalRollbackVerifiedGate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1548,6 +1639,103 @@ pub(crate) fn verify_one_v031_terminal_history_lineage_read_only(
         &terminal_evidence_sha256,
     )
     .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)
+}
+
+/// Opens the immutable Original-V2 images without consulting any active
+/// component. This remains valid for every authenticated partial R3 swap phase;
+/// authority comes from the complete terminal chain plus V2 DPAPI/AEAD proof.
+pub(crate) fn open_authenticated_original_v2_images_for_recovery(
+    app_local_data_dir: &Path,
+    lineage_id: &str,
+) -> Result<AuthenticatedOriginalV2Images, OriginalMigrationBackupError> {
+    validate_absolute_path(app_local_data_dir)?;
+    v031_upgrade_r2::validate_lineage_id(lineage_id)
+        .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let namespace = v031_upgrade_r2::inspect_receipt_zero_namespace(app_local_data_dir, |_| {
+        PrivacyReceiptAuthenticationBridge::discovering()
+    })
+    .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let expected_inventory = namespace
+        .authenticated_lineages()
+        .iter()
+        .find(|inventory| inventory.lineage_id == lineage_id)
+        .ok_or(OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let verified =
+        verify_one_v031_terminal_history_lineage_read_only(app_local_data_dir, expected_inventory)?;
+
+    let bridge = PrivacyReceiptAuthenticationBridge::discovering();
+    let inventory = load_authenticated_v031_lineage(app_local_data_dir, lineage_id, &bridge)
+        .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    if &inventory != expected_inventory {
+        return Err(OriginalMigrationBackupError::ExistingLineageConflict);
+    }
+    let context = bridge
+        .context()
+        .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let terminal = authenticate_v031_terminal_history_for_bootstrap_offline(
+        app_local_data_dir,
+        &inventory,
+        &context,
+    )
+    .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let lineage_directory =
+        v031_upgrade_r2::canonical_lineage_directory(app_local_data_dir, lineage_id)
+            .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let protected_identity = v031_upgrade_r2::read_bounded_file(
+        &lineage_directory.join(v031_upgrade_r2::V2_IDENTITY_FINAL),
+        MAX_V031_ORIGINAL_ROLLBACK_IDENTITY_BYTES,
+    )
+    .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let bundle = v031_upgrade_r2::read_bounded_file(
+        &lineage_directory.join(v031_upgrade_r2::V2_BUNDLE_FINAL),
+        MAX_V031_ORIGINAL_ROLLBACK_BUNDLE_BYTES,
+    )
+    .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let identity = open_v031_original_rollback_identity_v2(&protected_identity)
+        .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    let mut opened = open_v031_original_rollback_v2_for_identity(&bundle, &identity)
+        .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?;
+    validate_v031_user_sqlite_image_read_only(&opened.user_database)
+        .map_err(|_| OriginalMigrationBackupError::UserSource)?;
+    validate_privacy_v1_sqlite_image_read_only(&opened.privacy_store)
+        .map_err(|_| OriginalMigrationBackupError::PrivacySource)?;
+    if verified.lineage_id() != lineage_id
+        || identity.lineage_id != lineage_id
+        || identity.envelope_binding_id != context.envelope_binding_id
+        || identity.source_profile_proof_sha256 != context.source_profile_proof_sha256
+        || sha256_hex(&protected_identity) != verified.identity_protected_sha256()
+        || sha256_hex(&bundle) != verified.bundle_sha256()
+        || u64::try_from(bundle.len()).ok() != Some(verified.bundle_bytes())
+        || sha256_hex(&opened.user_database) != verified.user_database_snapshot_sha256()
+        || sha256_hex(&opened.privacy_store) != verified.privacy_store_snapshot_sha256()
+    {
+        return Err(OriginalMigrationBackupError::ExistingLineageConflict);
+    }
+    let receipt_nine = inventory
+        .final_receipts
+        .get(usize::from(
+            V031UpgradeReceiptStage::UpgradeComplete.ordinal(),
+        ))
+        .ok_or(OriginalMigrationBackupError::ExistingLineageConflict)?;
+    Ok(AuthenticatedOriginalV2Images {
+        lineage_id: context.lineage_id,
+        envelope_binding_id: context.envelope_binding_id,
+        source_profile_proof_sha256: context.source_profile_proof_sha256,
+        identity_protected_sha256: verified.identity_protected_sha256().to_owned(),
+        identity_protected_bytes: u64::try_from(protected_identity.len())
+            .map_err(|_| OriginalMigrationBackupError::ExistingLineageConflict)?,
+        bundle_sha256: verified.bundle_sha256().to_owned(),
+        bundle_bytes: verified.bundle_bytes(),
+        step8_predecessor_protected_sha256: terminal.predecessor().protected_sha256().to_owned(),
+        upgrade_complete_sidecar_protected_sha256: terminal
+            .upgrade_complete_protected_sha256()
+            .to_owned(),
+        receipt_nine_protected_sha256: receipt_nine.protected_file_sha256.clone(),
+        receipt_nine_evidence_sha256: receipt_nine.metadata.evidence_sha256.clone(),
+        final_component_manifest_sha256: terminal.final_component_manifest_sha256().to_owned(),
+        user_database: Zeroizing::new(std::mem::take(&mut opened.user_database)),
+        privacy_database: Zeroizing::new(std::mem::take(&mut opened.privacy_store)),
+    })
 }
 
 fn is_terminal_historical_lineage(inventory: &AuthenticatedLineageInventory) -> bool {

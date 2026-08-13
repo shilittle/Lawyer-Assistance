@@ -707,12 +707,35 @@ impl PrivacyWorkflowManager {
         workspace_instance_id: WorkspaceInstanceId,
         invalidator: Arc<dyn ApprovedPublicationInvalidator>,
     ) -> Result<Self, PrivacyWorkflowError> {
-        Self::new_internal(
+        let manager = Self::new_internal(
             app_local_data_directory,
             workspace_instance_id,
             Some(invalidator),
             true,
-        )
+        )?;
+        #[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+        if crate::r3_current_binary_harness::is_initialized() {
+            let key = crate::approved_mcp::load_r3_current_receipt_signer_key_read_only().map_err(
+                |_| {
+                    PrivacyWorkflowError::new(
+                        "receipt_key_unavailable",
+                        "The R3 current-binary receipt key is unavailable.",
+                    )
+                },
+            )?;
+            let signer = ReceiptSigner::new(key).map_err(|error| {
+                PrivacyWorkflowError::new(
+                    error.code(),
+                    "The R3 current-binary receipt key is invalid.",
+                )
+            })?;
+            *manager
+                .shared
+                .receipt_signer_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(signer);
+        }
+        Ok(manager)
     }
 
     fn new_internal(
@@ -986,6 +1009,13 @@ impl PrivacyWorkflowManager {
         _guard: &ApplicationBackupPrivacyGuard<'_>,
     ) -> Result<(Vec<u8>, privacy::VaultBackupSummaryV1), privacy::VaultBackupError> {
         self.shared.vault_broker.export_encrypted_backup()
+    }
+
+    pub(crate) fn export_encrypted_vault_backup_read_only_locked(
+        &self,
+        _guard: &ApplicationBackupPrivacyGuard<'_>,
+    ) -> Result<(Vec<u8>, privacy::VaultBackupSummaryV1), privacy::VaultBackupError> {
+        self.shared.vault_broker.export_encrypted_backup_read_only()
     }
 
     fn privacy_lifecycle(

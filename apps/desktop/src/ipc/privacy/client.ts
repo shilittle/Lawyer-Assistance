@@ -46,6 +46,7 @@ import type {
   SetRetentionPolicyRequest,
   StageApplicationRestoreRequest,
   StagePrivacyRestoreRequest,
+  StageV031MigrationRecoveryRequest,
   TrustInstallationStatus,
   VerifiedBackupView,
 } from "./types";
@@ -228,6 +229,12 @@ export function stageApplicationRestore(
   return invoke<ApplicationBackupResponse>("stage_application_restore", {
     request,
   });
+}
+
+export function stageV031MigrationRecovery(
+  request: StageV031MigrationRecoveryRequest,
+): Promise<void> {
+  return invoke<void>("stage_v031_migration_recovery", { request });
 }
 
 export function getProviderQualificationStatus(

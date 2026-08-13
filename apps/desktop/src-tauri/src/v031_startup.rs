@@ -33,6 +33,10 @@ use crate::{
             verify_v031_case_migration_backups_historical_profile_read_only,
         },
         v031_migration_checkpoint::load_v031_historical_target_components_from_checkpoint_read_only,
+        v031_migration_recovery::{
+            observe_v031_migration_recovery_read_only, V031MigrationRecoveryGate,
+            V031MigrationRecoveryObservation,
+        },
         v031_privacy_migration::{
             ensure_v031_binding_materials_verified, ensure_v031_privacy_v5_verified,
             ensure_v031_privacy_v6_verified, load_v031_binding_materials_verified_gate_read_only,
@@ -66,25 +70,12 @@ use std::{fmt, fs, path::Path, sync::Arc};
 
 const RECEIPT_EIGHT_FINAL_COUNT: u8 =
     privacy::upgrade_receipt_v1::V031UpgradeReceiptStage::UpgradeComplete.ordinal();
-const V031_MIGRATION_RECOVERY_PENDING: &str = "v031-migration-recovery-pending.dpapi";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthenticatedPresence {
     Absent,
     Authenticated,
     UnknownOrInvalid,
-}
-
-/// R2 knows only the frozen basename. Until R3 supplies the DPAPI codec and
-/// opaque apply gate, any presence is intentionally unauthenticated and stops
-/// startup. No bytes are opened and no residue is cleaned here.
-pub(crate) fn observe_r2_explicit_recovery_read_only(
-    app_local_data_dir: &Path,
-) -> AuthenticatedPresence {
-    match fs::symlink_metadata(app_local_data_dir.join(V031_MIGRATION_RECOVERY_PENDING)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthenticatedPresence::Absent,
-        Ok(_) | Err(_) => AuthenticatedPresence::UnknownOrInvalid,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -831,10 +822,11 @@ impl std::error::Error for V031StartupTransitionError {}
 /// write also retains the exact opaque capability returned by its observer.
 pub(crate) struct ProductionStartupObservation {
     summary: StartupObservation,
+    explicit_recovery: Option<V031MigrationRecoveryGate>,
     full_application_restore: Option<PendingApplicationRestoreGate>,
     legacy_user_database_restore: Option<PendingDatabaseRestoreGate>,
     standalone_privacy_restore: Option<PendingPrivacyRestoreGate>,
-    process_start_upgrade: V031ProcessStartUpgradeObservation,
+    process_start_upgrade: Option<V031ProcessStartUpgradeObservation>,
     genuine_fresh: Option<GenuineFreshProfileGate>,
     exact_v031_source: Option<ExactV031SourceProfileGate>,
     exact_current: Option<ExactCurrentProfileGate>,
@@ -846,6 +838,7 @@ impl fmt::Debug for ProductionStartupObservation {
         formatter
             .debug_struct("ProductionStartupObservation")
             .field("summary", &self.summary)
+            .field("explicit_recovery", &self.explicit_recovery.is_some())
             .field(
                 "full_application_restore",
                 &self.full_application_restore.is_some(),
@@ -875,6 +868,10 @@ impl ProductionStartupObservation {
         self.summary
     }
 
+    pub(crate) fn take_explicit_recovery_gate(&mut self) -> Option<V031MigrationRecoveryGate> {
+        self.explicit_recovery.take()
+    }
+
     pub(crate) fn full_application_restore_gate(&self) -> Option<&PendingApplicationRestoreGate> {
         self.full_application_restore.as_ref()
     }
@@ -887,8 +884,14 @@ impl ProductionStartupObservation {
         self.standalone_privacy_restore.as_ref()
     }
 
+    pub(crate) fn process_start_upgrade_gate(&self) -> Option<&V031ProcessStartUpgradeObservation> {
+        self.process_start_upgrade.as_ref()
+    }
+
+    #[cfg(test)]
     pub(crate) fn process_start_upgrade(&self) -> &V031ProcessStartUpgradeObservation {
-        &self.process_start_upgrade
+        self.process_start_upgrade_gate()
+            .expect("ordinary startup test fixture retains a process-start upgrade observation")
     }
 
     pub(crate) fn genuine_fresh_gate(&self) -> Option<&GenuineFreshProfileGate> {
@@ -907,6 +910,7 @@ impl ProductionStartupObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProductionStartupObservationError {
     Root,
+    ExplicitRecovery,
     FullApplicationRestore,
     LegacyUserDatabaseRestore,
     StandalonePrivacyRestore,
@@ -921,6 +925,7 @@ impl fmt::Display for ProductionStartupObservationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Root => "the fixed application root could not be observed",
+            Self::ExplicitRecovery => "the explicit v0.3.1 recovery namespace is invalid",
             Self::FullApplicationRestore => {
                 "the pending full-application restore namespace is invalid"
             }
@@ -982,12 +987,55 @@ fn observe_production_startup_with_credentials_read_only<
         Ok(_) => return Err(ProductionStartupObservationError::Root),
     };
 
-    // The process observer is part of the same immutable pass even when a
-    // restore has precedence.  This rejects an invalid or mixed historical
-    // lineage before any restore swap is authorized.
+    // R3 recovery owns the shared restore slots and authenticates every
+    // conflicting marker itself.  Observe it before the ordinary upgrade and
+    // restore observers because a legal recovery crash phase may have moved
+    // one or more current slots away from their ordinary locations.
+    let explicit_recovery = if root_absent {
+        None
+    } else {
+        match observe_v031_migration_recovery_read_only(app_local_data_dir)
+            .map_err(|_| ProductionStartupObservationError::ExplicitRecovery)?
+        {
+            V031MigrationRecoveryObservation::Absent => None,
+            V031MigrationRecoveryObservation::Authenticated(gate) => Some(*gate),
+        }
+    };
+    if explicit_recovery.is_some() {
+        return Ok(ProductionStartupObservation {
+            summary: StartupObservation {
+                restores: RestoreObservation {
+                    explicit_recovery: AuthenticatedPresence::Authenticated,
+                    full_application: AuthenticatedPresence::Absent,
+                    legacy_user_database: AuthenticatedPresence::Absent,
+                    standalone_privacy: AuthenticatedPresence::Absent,
+                },
+                // Explicit recovery is classified before the ordinary upgrade
+                // summary, so no synthetic receipt capability is retained.
+                upgrade: UpgradeObservation {
+                    terminal_lineage_count: 0,
+                    active: None,
+                },
+                profile: InstalledProfile::PartialOrUnknown,
+                unknown_marker_or_sibling: false,
+            },
+            explicit_recovery,
+            full_application_restore: None,
+            legacy_user_database_restore: None,
+            standalone_privacy_restore: None,
+            process_start_upgrade: None,
+            genuine_fresh: None,
+            exact_v031_source: None,
+            exact_current: None,
+            authenticated_upgrade: None,
+        });
+    }
+
+    // The process observer is part of the same immutable ordinary pass even
+    // when a current restore has precedence. This rejects an invalid or mixed
+    // historical lineage before any ordinary restore swap is authorized.
     let process_start_upgrade = observe_v031_upgrade_at_process_start_read_only(app_local_data_dir)
         .map_err(|_| ProductionStartupObservationError::UpgradeHistory)?;
-    let explicit_recovery = observe_r2_explicit_recovery_read_only(app_local_data_dir);
 
     let (full_application, full_application_restore) = if root_absent {
         (AuthenticatedPresence::Absent, None)
@@ -1026,7 +1074,7 @@ fn observe_production_startup_with_credentials_read_only<
         }
     };
     let restores = RestoreObservation {
-        explicit_recovery,
+        explicit_recovery: AuthenticatedPresence::Absent,
         full_application,
         legacy_user_database,
         standalone_privacy,
@@ -1036,14 +1084,9 @@ fn observe_production_startup_with_credentials_read_only<
     // Recovery routes are selected before an installed profile.  Their exact
     // gates above are retained, while ordinary profile observers are skipped
     // because a legal crash phase can temporarily move an active slot away.
-    if [
-        explicit_recovery,
-        full_application,
-        legacy_user_database,
-        standalone_privacy,
-    ]
-    .into_iter()
-    .any(|presence| presence != AuthenticatedPresence::Absent)
+    if [full_application, legacy_user_database, standalone_privacy]
+        .into_iter()
+        .any(|presence| presence != AuthenticatedPresence::Absent)
     {
         return Ok(ProductionStartupObservation {
             summary: StartupObservation {
@@ -1052,10 +1095,11 @@ fn observe_production_startup_with_credentials_read_only<
                 profile: InstalledProfile::PartialOrUnknown,
                 unknown_marker_or_sibling: false,
             },
+            explicit_recovery: None,
             full_application_restore,
             legacy_user_database_restore,
             standalone_privacy_restore,
-            process_start_upgrade,
+            process_start_upgrade: Some(process_start_upgrade),
             genuine_fresh: None,
             exact_v031_source: None,
             exact_current: None,
@@ -1192,10 +1236,11 @@ fn observe_production_startup_with_credentials_read_only<
             profile,
             unknown_marker_or_sibling: false,
         },
+        explicit_recovery: None,
         full_application_restore,
         legacy_user_database_restore,
         standalone_privacy_restore,
-        process_start_upgrade,
+        process_start_upgrade: Some(process_start_upgrade),
         genuine_fresh,
         exact_v031_source,
         exact_current,
@@ -1392,8 +1437,7 @@ pub(crate) fn load_completed_v031_for_ordinary_startup(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn load_completed_v031_with_existing_managers_for_test(
+fn load_completed_v031_with_existing_managers(
     app_local_data_dir: &Path,
     process_start: &V031ProcessStartUpgradeObservation,
     exact_current: &ExactCurrentProfileGate,
@@ -1416,6 +1460,50 @@ pub(crate) fn load_completed_v031_with_existing_managers_for_test(
         privacy_workflow,
         approved_workspace,
         &selected_lineage_id,
+    )
+}
+
+/// Re-authenticates the unique completed lineage for an explicit R3 staging
+/// request made by the already initialized current v0.4 application.
+pub(crate) fn authenticate_completed_v031_for_recovery_stage(
+    app_local_data_dir: &Path,
+    privacy_workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+) -> Result<V031UpgradeCompleteGate, V031StartupTransitionError> {
+    let process_start = observe_v031_upgrade_at_process_start_read_only(app_local_data_dir)
+        .map_err(|_| V031StartupTransitionError::Observation)?;
+    let ExactCurrentProfileObservation::Exact(exact_current) =
+        observe_exact_current_profile_with_approved_workspace_read_only(
+            app_local_data_dir,
+            approved_workspace,
+        )
+        .map_err(|_| V031StartupTransitionError::Observation)?
+    else {
+        return Err(V031StartupTransitionError::Observation);
+    };
+    load_completed_v031_with_existing_managers(
+        app_local_data_dir,
+        &process_start,
+        &exact_current,
+        privacy_workflow,
+        approved_workspace,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn load_completed_v031_with_existing_managers_for_test(
+    app_local_data_dir: &Path,
+    process_start: &V031ProcessStartUpgradeObservation,
+    exact_current: &ExactCurrentProfileGate,
+    privacy_workflow: &PrivacyWorkflowManager,
+    approved_workspace: &ApprovedMcpWorkspace,
+) -> Result<V031UpgradeCompleteGate, V031StartupTransitionError> {
+    load_completed_v031_with_existing_managers(
+        app_local_data_dir,
+        process_start,
+        exact_current,
+        privacy_workflow,
+        approved_workspace,
     )
 }
 
@@ -2717,21 +2805,47 @@ mod tests {
     }
 
     #[test]
-    fn r2_explicit_recovery_is_absent_only_and_never_path_authenticated() {
-        let directory = tempfile::tempdir().expect("recovery observer root");
-        assert_eq!(
-            observe_r2_explicit_recovery_read_only(directory.path()),
-            AuthenticatedPresence::Absent
+    fn production_observer_authenticates_r3_before_every_ordinary_observer() {
+        let source = include_str!("v031_startup.rs");
+        let observer = source
+            .split("fn observe_production_startup_with_credentials_read_only")
+            .nth(1)
+            .and_then(|value| value.split("fn upgrade_summary").next())
+            .expect("production startup observer source");
+        let r3 = observer
+            .find("observe_v031_migration_recovery_read_only")
+            .expect("authenticated R3 observer");
+        let exclusive_return = observer
+            .find("if explicit_recovery.is_some()")
+            .expect("exclusive recovery return");
+        let upgrade = observer
+            .find("observe_v031_upgrade_at_process_start_read_only")
+            .expect("ordinary upgrade observer");
+        let full_restore = observer
+            .find("observe_pending_application_restore_read_only")
+            .expect("ordinary full restore observer");
+        let legacy_restore = observer
+            .find("observe_pending_database_restore_read_only")
+            .expect("ordinary legacy restore observer");
+        let privacy_restore = observer
+            .find("observe_pending_privacy_restore_read_only")
+            .expect("ordinary Privacy restore observer");
+        assert!(
+            r3 < exclusive_return
+                && exclusive_return < upgrade
+                && upgrade < full_restore
+                && full_restore < legacy_restore
+                && legacy_restore < privacy_restore
         );
-        std::fs::write(
-            directory.path().join(V031_MIGRATION_RECOVERY_PENDING),
-            b"untrusted-r3-marker",
-        )
-        .expect("untrusted marker creates");
-        assert_eq!(
-            observe_r2_explicit_recovery_read_only(directory.path()),
-            AuthenticatedPresence::UnknownOrInvalid
-        );
+        let recovery_only = &observer[exclusive_return..upgrade];
+        for retained_absence in [
+            "full_application_restore: None",
+            "legacy_user_database_restore: None",
+            "standalone_privacy_restore: None",
+            "process_start_upgrade: None",
+        ] {
+            assert!(recovery_only.contains(retained_absence));
+        }
     }
 
     #[test]

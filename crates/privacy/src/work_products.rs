@@ -727,7 +727,7 @@ impl WorkProductService {
         now_unix: u64,
     ) -> Result<Vec<WorkProductSummaryV1>, WorkProductError> {
         approved
-            .validate_operation_guard(operation)
+            .validate_read_operation_guard(operation)
             .map_err(map_approved_error)?;
         let db = open_database(&self.root)?;
         let mut statement = db
@@ -803,7 +803,7 @@ impl WorkProductService {
         now_unix: u64,
     ) -> Result<VerifiedWorkProductV1, WorkProductError> {
         approved
-            .validate_operation_guard(operation)
+            .validate_read_operation_guard(operation)
             .map_err(map_approved_error)?;
         let version_sql = sql_i64(version)?;
         let db = open_database(&self.root)?;

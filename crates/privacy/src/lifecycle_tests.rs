@@ -1189,6 +1189,39 @@ mod lifecycle_tests {
             )
             .expect("complete lifecycle state");
         set_privacy_store_schema_version(&connection, 4);
+        let allocation_only_id = "bkp_55555555555555555555555555555555";
+        let registry_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM privacy_backup_registry", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy registry before allocation-only export");
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED;")
+            .expect("legacy read-only source transaction");
+        let (allocation_only, allocation_only_portable) = lifecycle
+            .export_pre_migration_v031_recovery_safety_portable_backup(
+                &connection,
+                &BackupExportRequestV1 {
+                    backup_id: allocation_only_id,
+                    created_at_unix: NOW + 2,
+                    expires_at_unix: Some(NOW + 100),
+                },
+                &PreMigrationBackupExportContextV1 {
+                    expected_privacy_store_schema_version: 4,
+                },
+            )
+            .expect("allocation-only v4 recovery safety backup");
+        assert_eq!(allocation_only.privacy_store_schema_version, 4);
+        assert!(!allocation_only_portable.is_empty());
+        let registry_during: i64 = connection
+            .query_row("SELECT COUNT(*) FROM privacy_backup_registry", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy registry during allocation-only export");
+        assert_eq!(registry_during, registry_before);
+        connection
+            .execute_batch("ROLLBACK; PRAGMA query_only=OFF;")
+            .expect("close legacy read-only source transaction");
         let directory = tempfile::tempdir().expect("backup directory");
         let store =
             EncryptedPrivacyBackupStore::initialize(directory.path()).expect("backup store");
@@ -1362,6 +1395,103 @@ mod lifecycle_tests {
                 },
             ),
             Err(LifecycleError::EnvironmentMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v031_recovery_safety_portable_export_is_allocation_only_and_restore_compatible() {
+        let (mut connection, lifecycle) = setup_review();
+        lifecycle
+            .save_mapping_revision(
+                &mut connection,
+                MAP_ID,
+                "redaction-1",
+                1,
+                &mapping(),
+                NOW + 1,
+            )
+            .expect("complete lifecycle state");
+        let registry_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM privacy_backup_registry", [], |row| {
+                row.get(0)
+            })
+            .expect("registry count before allocation-only export");
+        let request = BackupExportRequestV1 {
+            backup_id: BACKUP_ID,
+            created_at_unix: NOW + 2,
+            expires_at_unix: Some(NOW + 100),
+        };
+        assert_eq!(
+            lifecycle.export_v031_recovery_safety_portable_backup(&connection, &request),
+            Err(LifecycleError::InvalidInput),
+            "a writable/autocommit caller has no allocation-only export authority"
+        );
+        connection
+            .execute_batch("PRAGMA query_only=ON;")
+            .expect("query-only source mode");
+        assert_eq!(
+            lifecycle.export_v031_recovery_safety_portable_backup(&connection, &request),
+            Err(LifecycleError::InvalidInput),
+            "query_only without a caller-held transaction is insufficient"
+        );
+        connection
+            .execute_batch("BEGIN DEFERRED;")
+            .expect("read-only source transaction");
+        let (verified, portable) = lifecycle
+            .export_v031_recovery_safety_portable_backup(&connection, &request)
+            .expect("allocation-only authenticated portable backup");
+        assert_eq!(verified.backup_id, BACKUP_ID);
+        assert_eq!(
+            verified.privacy_store_schema_version,
+            PRIVACY_STORE_SCHEMA_VERSION
+        );
+        assert!(!portable.is_empty());
+        let registry_during: i64 = connection
+            .query_row("SELECT COUNT(*) FROM privacy_backup_registry", [], |row| {
+                row.get(0)
+            })
+            .expect("registry count during allocation-only export");
+        assert_eq!(registry_during, registry_before);
+        connection
+            .execute_batch("ROLLBACK;")
+            .expect("close source transaction");
+        let registry_after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM privacy_backup_registry", [], |row| {
+                row.get(0)
+            })
+            .expect("registry count after allocation-only export");
+        assert_eq!(registry_after, registry_before);
+
+        let restore_directory = tempfile::tempdir().expect("restore backup directory");
+        let restore_store = EncryptedPrivacyBackupStore::initialize(restore_directory.path())
+            .expect("restore backup store");
+        let context = BackupVerificationContextV1 {
+            expected_workspace_instance_id: lifecycle.workspace_instance_id(),
+            expected_key_epoch: verified.key_epoch,
+            now_unix: NOW + 3,
+        };
+        let imported = restore_store
+            .import_portable_bundle_for_coordinated_pre_migration_restore(&portable, &context)
+            .expect("coordinated restore imports allocation-only bundle");
+        assert_eq!(imported, verified);
+        let mut restored = Connection::open_in_memory().expect("restored database");
+        assert_eq!(
+            restore_store
+                .restore_detached_for_coordinated_pre_migration_restore(
+                    &mut restored,
+                    BACKUP_ID,
+                    PRIVACY_STORE_SCHEMA_VERSION,
+                    &context,
+                )
+                .expect("restore allocation-only bundle"),
+            verified
+        );
+        assert_eq!(
+            lifecycle
+                .current_key_epoch(&restored)
+                .expect("restored lifecycle key epoch"),
+            verified.key_epoch
         );
     }
 

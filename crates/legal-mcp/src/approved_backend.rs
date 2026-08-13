@@ -301,15 +301,7 @@ impl ApprovedWorkspaceBackend {
         scope: ApprovedCallScope,
     ) -> CallToolResult {
         let now_unix = now_seconds();
-        let qualified = if now_unix == 0 {
-            false
-        } else {
-            self.inner
-                .qualification
-                .current_qualification(now_unix)
-                .is_ok_and(|snapshot| snapshot.approved_workspace_qualified_at(now_unix))
-        };
-        if !qualified {
+        if !self.qualification_is_current(now_unix) {
             return approved_unavailable();
         }
         let binding = match bind_business_request(tool_name, &business_arguments) {
@@ -334,22 +326,43 @@ impl ApprovedWorkspaceBackend {
             Ok(operation) => operation,
             Err(error) => return approved_error(workspace_error_code(error)),
         };
+        // Ticket consumption deliberately precedes the cross-process workspace lock. A
+        // standalone descriptor can be revoked while this call is queued for that lock, so the
+        // descriptor-backed qualification must be reloaded only after the guard is held and
+        // before any target read or work-product write becomes reachable.
+        let guarded_now_unix = now_seconds();
+        if !self.qualification_is_current(guarded_now_unix) {
+            return approved_unavailable();
+        }
         if let Err(code) =
-            self.preflight_access_target_locked(&operation, &verification.target, now_unix)
+            self.preflight_access_target_locked(&operation, &verification.target, guarded_now_unix)
         {
             return approved_error(code);
         }
-        let response =
-            match self.dispatch_locked(&operation, tool_name, &business_arguments, now_unix, scope)
-            {
-                Ok(data) => approved_success(tool_name, data),
-                Err(code) => approved_error(code),
-            };
+        let response = match self.dispatch_locked(
+            &operation,
+            tool_name,
+            &business_arguments,
+            guarded_now_unix,
+            scope,
+        ) {
+            Ok(data) => approved_success(tool_name, data),
+            Err(code) => approved_error(code),
+        };
         // Keep the cross-process boundary alive until the complete MCP response has been
         // constructed. A concurrent revoke can therefore only linearize before this call
         // starts reading or after the response no longer depends on workspace state.
         drop(operation);
         response
+    }
+
+    fn qualification_is_current(&self, now_unix: u64) -> bool {
+        now_unix != 0
+            && self
+                .inner
+                .qualification
+                .current_qualification(now_unix)
+                .is_ok_and(|snapshot| snapshot.approved_workspace_qualified_at(now_unix))
     }
 
     /// Revalidates the exact immutable target before issuing or consuming a ticket. Publication
@@ -1717,8 +1730,11 @@ mod tests {
         workspace::{ManifestSigningKey, WorkspacePublisher},
     };
     use rmcp::{transport::async_rw::AsyncRwTransport, RoleServer, ServiceExt};
+    use rusqlite::Connection;
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Read, Write};
+    use std::sync::Mutex;
+    use std::time::Duration;
     use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
     use tokio_util::sync::CancellationToken;
 
@@ -1726,6 +1742,7 @@ mod tests {
         _root: tempfile::TempDir,
         backend: ApprovedWorkspaceBackend,
         approved_control: ApprovedWorkspaceService,
+        qualification: SyntheticQualificationProvider,
         tickets: McpAccessTicketStore,
         adapter: ServiceAdapter,
         case_id: CaseId,
@@ -1734,7 +1751,20 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct SyntheticQualificationProvider(ApprovedMcpQualificationSnapshotV1);
+    struct SyntheticQualificationProvider(Arc<Mutex<ApprovedMcpQualificationSnapshotV1>>);
+
+    impl SyntheticQualificationProvider {
+        fn new(snapshot: ApprovedMcpQualificationSnapshotV1) -> Self {
+            Self(Arc::new(Mutex::new(snapshot)))
+        }
+
+        fn revoke(&self) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .revoked = true;
+        }
+    }
 
     impl ApprovedWorkspaceQualificationProvider for SyntheticQualificationProvider {
         fn current_qualification(
@@ -1742,7 +1772,11 @@ mod tests {
             _now_unix: u64,
         ) -> Result<ApprovedMcpQualificationSnapshotV1, ApprovedWorkspaceQualificationError>
         {
-            Ok(self.0.clone())
+            Ok(self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
         }
     }
 
@@ -1887,8 +1921,9 @@ mod tests {
             format!("srv_{}", "a".repeat(32)),
         )
         .expect("ticket store");
+        let qualification = SyntheticQualificationProvider::new(qualification(now));
         let backend = ApprovedWorkspaceBackend::initialize(
-            Arc::new(SyntheticQualificationProvider(qualification(now))),
+            Arc::new(qualification.clone()),
             approved,
             work_product_publisher,
             work_products,
@@ -1918,6 +1953,7 @@ mod tests {
             _root: root,
             backend,
             approved_control,
+            qualification,
             tickets,
             adapter,
             case_id,
@@ -2233,6 +2269,97 @@ mod tests {
         );
         let serialized = serde_json::to_string(&replay).expect("replay JSON");
         assert!(!serialized.contains(&ticket));
+    }
+
+    #[test]
+    fn queued_consumed_ticket_rechecks_qualification_after_workspace_guard() {
+        let fixture = fixture(McpTransportBindingV1::Stdio);
+        let business = object(json!({
+            "schema_version":1,
+            "case_id":fixture.case_id.as_str(),
+            "task_type":"case_analysis",
+            "status":"draft",
+            "source_approved_refs":[{
+                "material_id":fixture.material_id.as_str(),
+                "publication_id":fixture.publication_id.as_str()
+            }],
+            "content_media_type":"text/markdown",
+            "content":"[PERSON_001] must never be written after descriptor revoke",
+            "idempotency_key":format!("idem_{}", "Q".repeat(32))
+        }));
+        let now = now_seconds();
+        let request = fixture
+            .backend
+            .ticket_request("case_write_work_product", &business, now, now + 60)
+            .expect("write ticket request");
+        let ticket = fixture.tickets.issue(request).expect("write ticket");
+        let held_operation = fixture
+            .approved_control
+            .acquire_operation_guard()
+            .expect("hold cross-process workspace operation guard");
+        let backend = fixture.backend.clone();
+        let call = std::thread::spawn(move || {
+            serde_json::to_value(backend.call_for_standalone(
+                "case_write_work_product",
+                &ticket,
+                business,
+                false,
+            ))
+            .expect("queued call response")
+        });
+
+        let ticket_database = fixture
+            ._root
+            .path()
+            .join("tickets")
+            .join("mcp-access-tickets.sqlite");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let database = Connection::open_with_flags(
+                &ticket_database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("inspect ticket database read-only");
+            let consumed: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM mcp_access_tickets WHERE state='consumed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("consumed ticket count");
+            if consumed == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the prepared call did not consume its ticket before queuing"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        fixture.qualification.revoke();
+        drop(held_operation);
+        let response = call.join().expect("queued call joins");
+        assert_eq!(response["isError"], true, "{response:#}");
+        assert_eq!(
+            response["structuredContent"]["reason_code"], "PROFILE_NOT_QUALIFIED",
+            "{response:#}"
+        );
+        let work_product_database = Connection::open_with_flags(
+            fixture
+                ._root
+                .path()
+                .join("work-products")
+                .join("work-products.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("inspect work products read-only");
+        let written: i64 = work_product_database
+            .query_row("SELECT COUNT(*) FROM work_product_versions", [], |row| {
+                row.get(0)
+            })
+            .expect("work product count");
+        assert_eq!(written, 0, "revoked queued call must not write");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

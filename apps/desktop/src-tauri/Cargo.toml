@@ -7,6 +7,8 @@ version.workspace = true
 [features]
 default = []
 standalone-mcp-e2e = ["legal-mcp/standalone-mcp-e2e"]
+# Manual R3 acceptance seam. Formal/release builds never enable this feature.
+r3-real-current-binary-harness = []
 
 [lib]
 name = "lawyer_assistance_desktop"

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     os::windows::{
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawHandle,
@@ -30,7 +30,7 @@ use windows_sys::Win32::{
     Foundation::HANDLE,
     Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     },
 };
 
@@ -916,6 +916,112 @@ impl PrivacyWorkflowManager {
         Ok(VerifiedBackupView::from(verified))
     }
 
+    /// Builds the Privacy member of the v0.3.1 recovery Safety V3 backup without granting any
+    /// pre-marker persistence authority. The fixed main database is pinned against replacement,
+    /// opened read-only/query-only inside a read transaction, and copied/encrypted entirely in
+    /// memory. Neither `backup_store()` nor `open_raw_connection()` is reachable from this path.
+    pub(crate) fn export_v031_recovery_safety_privacy_backup_locked(
+        &self,
+        _guard: &ApplicationBackupPrivacyGuard<'_>,
+    ) -> Result<(VerifiedBackupView, Vec<u8>), PrivacyWorkflowError> {
+        let database_path = &self.shared.database_path;
+        let privacy_directory = database_path.parent().ok_or_else(|| {
+            v031_recovery_safety_privacy_error(
+                "The fixed Privacy database directory could not be resolved.",
+            )
+        })?;
+        validate_ordinary_database_file(database_path)?;
+        ensure_v031_recovery_safety_database_has_no_sidecars(database_path)?;
+        let directory_entries_before = v031_recovery_safety_directory_entries(privacy_directory)?;
+        let (mut pinned_file, pinned_identity_before) =
+            open_v031_recovery_safety_privacy_file(database_path)?;
+        validate_v031_recovery_safety_sqlite_header(&mut pinned_file)?;
+
+        let source_image = read_v031_recovery_safety_privacy_image(&mut pinned_file)?;
+        let mut connection = Connection::open_in_memory().map_err(|_| {
+            v031_recovery_safety_privacy_error(
+                "The allocation-only Privacy snapshot connection could not be opened.",
+            )
+        })?;
+        connection
+            .deserialize_read_exact(
+                rusqlite::MAIN_DB,
+                Cursor::new(source_image.as_slice()),
+                source_image.len(),
+                true,
+            )
+            .map_err(|_| {
+                v031_recovery_safety_privacy_error(
+                    "The pinned Privacy database image could not be attached read-only.",
+                )
+            })?;
+        connection
+            .execute_batch(
+                "PRAGMA query_only=ON;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA trusted_schema=OFF;
+                 BEGIN DEFERRED;",
+            )
+            .map_err(|_| {
+                v031_recovery_safety_privacy_error(
+                    "The fixed Privacy database could not enter its read-only backup transaction.",
+                )
+            })?;
+
+        let export_result = (|| {
+            let lifecycle = self.privacy_lifecycle(&connection)?;
+            let created_at_unix = self.current_unix()?;
+            let backup_id = format!("bkp_{}", Uuid::new_v4().simple());
+            let request = BackupExportRequestV1 {
+                backup_id: &backup_id,
+                created_at_unix,
+                expires_at_unix: None,
+            };
+            let exported = if let Some(schema_version) =
+                self.pre_migration_backup_schema_version(&connection)?
+            {
+                lifecycle.export_pre_migration_v031_recovery_safety_portable_backup(
+                    &connection,
+                    &request,
+                    &PreMigrationBackupExportContextV1 {
+                        expected_privacy_store_schema_version: schema_version,
+                    },
+                )
+            } else {
+                lifecycle.export_v031_recovery_safety_portable_backup(&connection, &request)
+            }
+            .map_err(PrivacyWorkflowError::lifecycle)?;
+            Ok((VerifiedBackupView::from(exported.0), exported.1))
+        })();
+
+        let rollback_result = connection.execute_batch("ROLLBACK;").map_err(|_| {
+            v031_recovery_safety_privacy_error(
+                "The fixed Privacy read-only backup transaction could not be closed.",
+            )
+        });
+        drop(connection);
+        drop(source_image);
+        rollback_result?;
+
+        let pinned_identity_after = v031_recovery_safety_file_identity(&pinned_file)?;
+        let (path_file, path_identity_after) =
+            open_v031_recovery_safety_privacy_file(database_path)?;
+        drop(path_file);
+        validate_ordinary_database_file(database_path)?;
+        ensure_v031_recovery_safety_database_has_no_sidecars(database_path)?;
+        let directory_entries_after = v031_recovery_safety_directory_entries(privacy_directory)?;
+        if pinned_identity_before != pinned_identity_after
+            || pinned_identity_before != path_identity_after
+            || directory_entries_before != directory_entries_after
+        {
+            return Err(v031_recovery_safety_privacy_error(
+                "The fixed Privacy component changed during the allocation-only backup window.",
+            ));
+        }
+        drop(pinned_file);
+        export_result
+    }
+
     pub fn verify_privacy_backup(
         &self,
         backup_id: &str,
@@ -1798,6 +1904,192 @@ fn remove_restore_database_files(path: &Path) -> Result<(), PrivacyWorkflowError
     cleanup_error.map_or(Ok(()), Err)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V031RecoverySafetyPrivacyFileIdentity {
+    volume_serial_number: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    last_write_high: u32,
+    last_write_low: u32,
+}
+
+struct V031RecoverySafetyPrivacyImage(Vec<u8>);
+
+impl V031RecoverySafetyPrivacyImage {
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl Drop for V031RecoverySafetyPrivacyImage {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+}
+
+fn v031_recovery_safety_privacy_error(message: &'static str) -> PrivacyWorkflowError {
+    PrivacyWorkflowError::new("v031_recovery_safety_privacy_invalid", message)
+}
+
+fn open_v031_recovery_safety_privacy_file(
+    path: &Path,
+) -> Result<(File, V031RecoverySafetyPrivacyFileIdentity), PrivacyWorkflowError> {
+    if !crate::privacy_manager::is_normal_local_absolute(path)
+        || !crate::privacy_manager::local_path_chain_is_ordinary(path)
+    {
+        return Err(v031_recovery_safety_privacy_error(
+            "The fixed Privacy database is not an ordinary local path.",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        // Excluding write and delete sharing pins this exact source against an independently
+        // opened writer or namespace replacement for the full allocation-only export.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| {
+            v031_recovery_safety_privacy_error(
+                "The fixed Privacy database could not be pinned read-only.",
+            )
+        })?;
+    if !ordinary_single_link_handle(&file) {
+        return Err(v031_recovery_safety_privacy_error(
+            "The fixed Privacy database is not an ordinary single-link local file.",
+        ));
+    }
+    let identity = v031_recovery_safety_file_identity(&file)?;
+    Ok((file, identity))
+}
+
+fn v031_recovery_safety_file_identity(
+    file: &File,
+) -> Result<V031RecoverySafetyPrivacyFileIdentity, PrivacyWorkflowError> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if handle.is_null()
+        || unsafe { GetFileInformationByHandle(handle, &mut information) } == 0
+        || information.nNumberOfLinks != 1
+    {
+        return Err(v031_recovery_safety_privacy_error(
+            "The pinned Privacy database identity could not be authenticated.",
+        ));
+    }
+    Ok(V031RecoverySafetyPrivacyFileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index_high: information.nFileIndexHigh,
+        file_index_low: information.nFileIndexLow,
+        file_size_high: information.nFileSizeHigh,
+        file_size_low: information.nFileSizeLow,
+        last_write_high: information.ftLastWriteTime.dwHighDateTime,
+        last_write_low: information.ftLastWriteTime.dwLowDateTime,
+    })
+}
+
+fn validate_v031_recovery_safety_sqlite_header(
+    file: &mut File,
+) -> Result<(), PrivacyWorkflowError> {
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header).map_err(|_| {
+        v031_recovery_safety_privacy_error(
+            "The pinned Privacy database header could not be read exactly.",
+        )
+    })?;
+    // Bytes 18 and 19 are SQLite's file write/read versions. WAL mode uses 2; accepting only
+    // rollback-journal format 1 prevents a read-only open from depending on an unbound WAL/SHM.
+    if !header.starts_with(b"SQLite format 3\0") || header[18] != 1 || header[19] != 1 {
+        return Err(v031_recovery_safety_privacy_error(
+            "The fixed Privacy database is not a self-contained rollback-journal SQLite image.",
+        ));
+    }
+    Ok(())
+}
+
+fn read_v031_recovery_safety_privacy_image(
+    file: &mut File,
+) -> Result<V031RecoverySafetyPrivacyImage, PrivacyWorkflowError> {
+    file.seek(SeekFrom::Start(0)).map_err(|_| {
+        v031_recovery_safety_privacy_error(
+            "The pinned Privacy database could not be rewound for its exact read.",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PRIVACY_DATABASE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            v031_recovery_safety_privacy_error(
+                "The pinned Privacy database could not be read exactly.",
+            )
+        })?;
+    let image = V031RecoverySafetyPrivacyImage(bytes);
+    if image.len() < 100
+        || u64::try_from(image.len())
+            .ok()
+            .is_none_or(|length| length > MAX_PRIVACY_DATABASE_BYTES)
+        || !image.as_slice().starts_with(b"SQLite format 3\0")
+    {
+        return Err(v031_recovery_safety_privacy_error(
+            "The pinned Privacy database image has an invalid size or format.",
+        ));
+    }
+    Ok(image)
+}
+
+fn ensure_v031_recovery_safety_database_has_no_sidecars(
+    path: &Path,
+) -> Result<(), PrivacyWorkflowError> {
+    for candidate in [
+        sqlite_sidecar_path(path, "-journal"),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ] {
+        match fs::symlink_metadata(candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(v031_recovery_safety_privacy_error(
+                    "The fixed Privacy database has an unbound journal, WAL, or SHM sidecar.",
+                ));
+            }
+            Err(_) => {
+                return Err(v031_recovery_safety_privacy_error(
+                    "A fixed Privacy database sidecar path could not be inspected.",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn v031_recovery_safety_directory_entries(
+    directory: &Path,
+) -> Result<Vec<std::ffi::OsString>, PrivacyWorkflowError> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|_| {
+            v031_recovery_safety_privacy_error(
+                "The fixed Privacy directory could not be inspected.",
+            )
+        })?
+        .map(|entry| {
+            entry.map(|value| value.file_name()).map_err(|_| {
+                v031_recovery_safety_privacy_error(
+                    "A fixed Privacy directory entry could not be inspected.",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    Ok(entries)
+}
+
 fn ensure_no_database_sidecars(path: &Path) -> Result<(), PrivacyWorkflowError> {
     for candidate in [
         sqlite_sidecar_path(path, "-journal"),
@@ -2633,6 +2925,71 @@ mod tests {
         pending
             .revoke_privacy_backup(&backup.backup_id)
             .expect("revoke legacy backup through the backup-only path");
+    }
+
+    #[test]
+    fn v031_recovery_safety_privacy_export_creates_no_backup_root_or_registry_row() {
+        let directory = tempfile::tempdir().expect("app directory");
+        let manager = PrivacyWorkflowManager::new(
+            directory.path().to_path_buf(),
+            test_workspace_instance_id(),
+        )
+        .expect("manager");
+        let privacy_directory = directory.path().join(super::super::PRIVACY_DIRECTORY_NAME);
+        let backup_root = privacy_directory.join(BACKUP_ROOT_NAME);
+        assert!(!backup_root.exists());
+        let connection = manager
+            .open_raw_connection()
+            .expect("registry inspection connection");
+        let registry_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM privacy_backup_registry", [], |row| {
+                row.get(0)
+            })
+            .expect("registry count before allocation-only export");
+        drop(connection);
+
+        let wal = sqlite_sidecar_path(&manager.shared.database_path, "-wal");
+        fs::write(&wal, b"synthetic unbound WAL").expect("write synthetic WAL sidecar");
+        let guard = manager.begin_application_backup_pair();
+        assert_eq!(
+            manager
+                .export_v031_recovery_safety_privacy_backup_locked(&guard)
+                .expect_err("an unbound WAL must fail closed")
+                .code(),
+            "v031_recovery_safety_privacy_invalid"
+        );
+        drop(guard);
+        assert!(!backup_root.exists());
+        fs::remove_file(&wal).expect("remove synthetic WAL sidecar");
+
+        let guard = manager.begin_application_backup_pair();
+        let (verified, portable) = manager
+            .export_v031_recovery_safety_privacy_backup_locked(&guard)
+            .expect("allocation-only Privacy export");
+        drop(guard);
+        assert!(!portable.is_empty());
+        assert!(verified.backup_id.starts_with("bkp_"));
+        assert!(!backup_root.exists());
+
+        let connection = manager
+            .open_raw_connection()
+            .expect("post-export registry inspection connection");
+        let registry_after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM privacy_backup_registry", [], |row| {
+                row.get(0)
+            })
+            .expect("registry count after allocation-only export");
+        let exported_registered: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM privacy_backup_registry WHERE backup_id=?1
+                 )",
+                [&verified.backup_id],
+                |row| row.get(0),
+            )
+            .expect("allocation-only backup registry absence");
+        assert_eq!(registry_after, registry_before);
+        assert!(!exported_registered);
     }
 
     #[test]

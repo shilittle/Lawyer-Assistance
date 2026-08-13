@@ -13,6 +13,9 @@ use tempfile::TempDir;
 const USER_CANARY_KEY: &str = "privacy_vnext_paired_backup_canary";
 const BACKED_UP_USER_CANARY: &str = "SYNTHETIC_USER_DB_BEFORE_BACKUP_4F9C";
 const MUTATED_USER_CANARY: &str = "SYNTHETIC_USER_DB_AFTER_BACKUP_A71D";
+const R3_SAFETY_WRITER_LOCK_ENV: &str = "LAWYER_ASSISTANCE_R3_SAFETY_WRITER_LOCK";
+const R3_SAFETY_WRITER_READY_ENV: &str = "LAWYER_ASSISTANCE_R3_SAFETY_WRITER_READY";
+const R3_SAFETY_WRITER_COMMIT_ENV: &str = "LAWYER_ASSISTANCE_R3_SAFETY_WRITER_COMMIT";
 fn policy(days: u64) -> SetRetentionPolicyRequest {
     SetRetentionPolicyRequest {
         review_retention_seconds: days * 86_400,
@@ -58,6 +61,187 @@ fn fixture_v3() -> (
     let workflow = PrivacyWorkflowManager::new(directory.path().to_path_buf(), workspace.clone())
         .expect("privacy workflow");
     (directory, workspace, state, workflow, approved)
+}
+
+#[test]
+fn r3_safety_readback_recomputes_and_enforces_component_identity() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let (bytes, metadata, _, identity, _) = build_application_backup_internal(
+        directory.path(),
+        &state,
+        &workflow,
+        Some(&approved.workspace),
+        false,
+        || {},
+        || {},
+    )
+    .expect("build authenticated five-component V3 fixture");
+    let identity = identity.expect("five-component identity");
+    let path = directory.path().join("r3-safety-reproof.lavbackup");
+    write_new_file(&path, &bytes).expect("write fixed Safety fixture");
+    let mut proof = V031RecoverySafetyBackupProof {
+        backup_id: metadata.backup_id.clone(),
+        privacy_backup_id: metadata.privacy_backup_id.clone(),
+        workspace_instance_id: metadata.workspace_instance_id.as_str().to_owned(),
+        app_version: metadata.app_version.clone(),
+        user_schema_version: metadata.user_schema_version,
+        created_at_unix: metadata.created_at_unix,
+        expires_at_unix: metadata.expires_at_unix,
+        bundle_sha256: metadata.bundle_sha256.clone(),
+        bundle_bytes: bytes.len() as u64,
+        component_identity_sha256: migration_component_fingerprint(&identity.current),
+        stage_slot_inventory_sha256: "11".repeat(32),
+    };
+    verify_v031_recovery_safety_backup_read_only(&path, &proof)
+        .expect("bundle-derived component identity matches build identity");
+
+    proof.component_identity_sha256 = "22".repeat(32);
+    assert_eq!(
+        verify_v031_recovery_safety_backup_read_only(&path, &proof)
+            .expect_err("a valid-shaped but mismatched component identity must fail")
+            .error_type,
+        "migration_backup_component_mismatch"
+    );
+}
+
+/// Exact child-process endpoint for the production Approved operation lock.
+/// A normal test run has no environment binding and returns without touching
+/// the filesystem.
+#[test]
+fn r3_safety_writer_child_process() {
+    let Some(lock_path) = std::env::var_os(R3_SAFETY_WRITER_LOCK_ENV) else {
+        return;
+    };
+    let ready_path = std::env::var_os(R3_SAFETY_WRITER_READY_ENV)
+        .map(std::path::PathBuf::from)
+        .expect("R3 safety writer ready path");
+    let commit_path = std::env::var_os(R3_SAFETY_WRITER_COMMIT_ENV)
+        .map(std::path::PathBuf::from)
+        .expect("R3 safety writer commit path");
+    std::fs::write(&ready_path, b"attempting-production-operation-lock")
+        .expect("announce cross-process writer attempt");
+
+    use std::os::windows::fs::OpenOptionsExt;
+    let started = std::time::Instant::now();
+    let _operation = loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&lock_path)
+        {
+            Ok(file) => break file,
+            Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("cross-process writer could not acquire production lock: {error}"),
+        }
+    };
+    std::fs::write(&commit_path, b"writer-committed-after-safety-reproof")
+        .expect("commit cross-process writer sentinel");
+}
+
+#[test]
+fn r3_safety_holds_cross_process_approved_writer_until_slots_after_reproof() {
+    let (directory, _, state, workflow, approved) = fixture_v3();
+    let case_id = format!("case_{}", "e".repeat(32));
+    let generation = approved
+        .publish_generation(&case_id, 'e')
+        .expect("approved Safety generation");
+    approved
+        .create_work_product(&generation, b"[PERSON_001] Safety barrier work product")
+        .expect("Safety work product");
+    approved
+        .epochs()
+        .expect("all four Safety credentials are present");
+
+    let coordination = tempfile::tempdir().expect("R3 Safety writer coordination directory");
+    let ready_path = coordination.path().join("writer-ready");
+    let commit_path = directory
+        .path()
+        .join("privacy/approved-mcp/approved-generations")
+        .join("r3-safety-cross-process-writer-sentinel");
+    let operation_lock = directory
+        .path()
+        .join("privacy/approved-mcp/approved-generations")
+        .join(".approved-workspace-operation.lock");
+    assert!(operation_lock.is_file());
+
+    let mut child = None;
+    let ready_for_attempt = ready_path.clone();
+    let commit_for_attempt = commit_path.clone();
+    let commit_at_reproof = commit_path.clone();
+    let slots_after_reproved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slots_after_reproved_in_hook = Arc::clone(&slots_after_reproved);
+    let build = build_application_backup_internal(
+        directory.path(),
+        &state,
+        &workflow,
+        Some(&approved.workspace),
+        true,
+        || {
+            child = Some(
+                std::process::Command::new(
+                    std::env::current_exe().expect("current desktop test executable"),
+                )
+                .arg("--exact")
+                .arg("commands::application_backup::tests::r3_safety_writer_child_process")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(R3_SAFETY_WRITER_LOCK_ENV, &operation_lock)
+                .env(R3_SAFETY_WRITER_READY_ENV, &ready_for_attempt)
+                .env(R3_SAFETY_WRITER_COMMIT_ENV, &commit_for_attempt)
+                .spawn()
+                .expect("spawn cross-process Approved writer"),
+            );
+            for _ in 0..300 {
+                if ready_for_attempt.is_file() {
+                    break;
+                }
+                assert!(
+                    child
+                        .as_mut()
+                        .expect("writer child")
+                        .try_wait()
+                        .expect("poll writer child")
+                        .is_none(),
+                    "writer child exited before attempting the production lock"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                ready_for_attempt.is_file(),
+                "writer attempt was not observed"
+            );
+            thread::sleep(Duration::from_millis(150));
+            assert!(
+                !commit_for_attempt.exists(),
+                "cross-process writer committed while the Safety barrier was held"
+            );
+        },
+        || {
+            assert!(
+                !commit_at_reproof.exists(),
+                "cross-process writer committed before slots-after reproof"
+            );
+            slots_after_reproved_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+
+    let status = child
+        .as_mut()
+        .expect("writer child was spawned")
+        .wait()
+        .expect("wait for cross-process Approved writer");
+    assert!(status.success());
+    assert!(
+        slots_after_reproved.load(std::sync::atomic::Ordering::SeqCst),
+        "production Safety path never reached slots-after reproof"
+    );
+    assert!(commit_path.is_file(), "writer did not resume after release");
+    let (_, _, _, identity, slots) = build.expect("production R3 Safety build succeeds");
+    assert!(identity.is_some());
+    assert!(slots.is_some());
 }
 
 #[test]
@@ -734,11 +918,13 @@ fn pre_migration_backup_cleans_authenticated_precommit_staging_and_revokes_its_r
     let source_fingerprint = workflow
         .case_material_migration_source_fingerprint()
         .expect("semantic migration source fingerprint");
-    let (bytes, metadata, _, built) = build_application_backup_internal(
+    let (bytes, metadata, _, built, _) = build_application_backup_internal(
         directory.path(),
         &state,
         &workflow,
         Some(&approved.workspace),
+        false,
+        || {},
         || {},
     )
     .expect("build interrupted pair");

@@ -727,6 +727,7 @@ pub(crate) struct AuthenticatedV031Step8PredecessorEvidence {
 pub(crate) struct AuthenticatedV031TerminalHistoryEvidence {
     predecessor: AuthenticatedV031Step8PredecessorEvidence,
     upgrade_complete_protected_sha256: String,
+    final_component_manifest_sha256: String,
 }
 
 impl AuthenticatedV031TerminalHistoryEvidence {
@@ -736,6 +737,10 @@ impl AuthenticatedV031TerminalHistoryEvidence {
 
     pub(crate) fn upgrade_complete_protected_sha256(&self) -> &str {
         &self.upgrade_complete_protected_sha256
+    }
+
+    pub(crate) fn final_component_manifest_sha256(&self) -> &str {
+        &self.final_component_manifest_sha256
     }
 }
 
@@ -1744,6 +1749,9 @@ pub(crate) fn authenticate_v031_terminal_history_for_bootstrap_offline(
     Ok(AuthenticatedV031TerminalHistoryEvidence {
         predecessor,
         upgrade_complete_protected_sha256: upgrade_complete.protected_sha256,
+        final_component_manifest_sha256: upgrade_complete
+            .evidence
+            .post_maintenance_final_component_manifest_sha256,
     })
 }
 

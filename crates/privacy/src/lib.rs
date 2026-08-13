@@ -65,14 +65,15 @@ pub use egress::{
     EgressPolicyEngine, PrivacyEgressAuditRecord, ResidualScanResult,
 };
 pub use lifecycle::{
-    ApprovedOutputAccessContextV1, ApprovedOutputSummaryV1, BackupExportRequestV1,
-    BackupVerificationContextV1, CleanupReportV1, EncryptedPrivacyBackupStore, LifecycleError,
-    LoadedApprovedOutputV1, MappingAccessContextV1, MappingKeySummaryV1, MappingRevisionStatusV1,
-    MappingRevisionSummaryV1, PreMigrationBackupExportContextV1,
-    PreMigrationBackupVerificationContextV1, PrivacyLifecycle, RetentionBindingSummaryV1,
-    RetentionPolicyV1, SaveApprovedOutputV1, SensitiveMappingEntryV1, SensitiveMappingPayloadV1,
-    VerifiedBackupV1, BACKUP_CRYPTO_SUITE, ENCRYPTED_BACKUP_SCHEMA_VERSION,
-    LOGICAL_ERASURE_DISCLOSURE, PORTABLE_BACKUP_SCHEMA_VERSION, PRIVACY_LIFECYCLE_SCHEMA_VERSION,
+    verify_v031_recovery_safety_portable_backup_allocation_only, ApprovedOutputAccessContextV1,
+    ApprovedOutputSummaryV1, BackupExportRequestV1, BackupVerificationContextV1, CleanupReportV1,
+    EncryptedPrivacyBackupStore, LifecycleError, LoadedApprovedOutputV1, MappingAccessContextV1,
+    MappingKeySummaryV1, MappingRevisionStatusV1, MappingRevisionSummaryV1,
+    PreMigrationBackupExportContextV1, PreMigrationBackupVerificationContextV1, PrivacyLifecycle,
+    RetentionBindingSummaryV1, RetentionPolicyV1, SaveApprovedOutputV1, SensitiveMappingEntryV1,
+    SensitiveMappingPayloadV1, V031RecoverySafetyPrivacyComponentProof, VerifiedBackupV1,
+    BACKUP_CRYPTO_SUITE, ENCRYPTED_BACKUP_SCHEMA_VERSION, LOGICAL_ERASURE_DISCLOSURE,
+    PORTABLE_BACKUP_SCHEMA_VERSION, PRIVACY_LIFECYCLE_SCHEMA_VERSION,
     SENSITIVE_MAPPING_SCHEMA_VERSION,
 };
 pub use mcp_ticket::{
@@ -149,7 +150,9 @@ pub use v6_application_schema::{
 pub use vault_backup::{
     export_encrypted_vault_backup, export_encrypted_vault_backup_read_only,
     stage_encrypted_vault_backup, validate_encrypted_vault_lineage_read_only,
-    verify_encrypted_vault_backup_archive, VaultBackupError, VaultBackupSummaryV1,
+    verify_encrypted_vault_backup_archive,
+    verify_v031_recovery_safety_encrypted_vault_backup_allocation_only,
+    V031RecoverySafetyVaultComponentProof, VaultBackupError, VaultBackupSummaryV1,
     ENCRYPTED_VAULT_BACKUP_SCHEMA_VERSION, MAX_ENCRYPTED_VAULT_BACKUP_BYTES,
     MAX_ENCRYPTED_VAULT_BACKUP_CONTENT_BYTES, MAX_ENCRYPTED_VAULT_BACKUP_FILES,
 };

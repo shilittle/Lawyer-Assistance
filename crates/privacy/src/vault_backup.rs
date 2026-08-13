@@ -18,14 +18,15 @@ use crate::{
     },
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use rusqlite::Connection;
+use rusqlite::{types::ValueRef, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{compiler_fence, Ordering},
 };
@@ -91,6 +92,15 @@ pub struct VaultBackupSummaryV1 {
     pub encrypted_file_bytes: u64,
     pub manifest_sha256: Sha256Hex,
     pub archive_sha256: Sha256Hex,
+}
+
+/// Semantic Vault identity reconstructed exclusively from one authenticated
+/// encrypted archive, without materializing a restore tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V031RecoverySafetyVaultComponentProof {
+    pub vault_store_schema_version: u32,
+    pub vault_content_manifest_sha256: String,
+    pub vault_manifest_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +254,164 @@ pub fn verify_encrypted_vault_backup_archive(
         archive_sha256: Sha256Hex::parse(sha256_hex(archive))
             .map_err(|_| VaultBackupError::Tampered)?,
     })
+}
+
+/// Allocation-only R3 reproof. The canonical archive and every payload are
+/// authenticated first; the embedded SQLite main image is then deserialized
+/// in memory to derive the same schema/content identity used while building
+/// the Safety bundle.
+pub fn verify_v031_recovery_safety_encrypted_vault_backup_allocation_only(
+    archive: &[u8],
+    expected_workspace_instance_id: &WorkspaceInstanceId,
+) -> Result<V031RecoverySafetyVaultComponentProof, VaultBackupError> {
+    let summary = verify_encrypted_vault_backup_archive(archive, expected_workspace_instance_id)?;
+    let envelope: EncryptedVaultBackupEnvelopeV1 =
+        strict_json_v1_from_slice(archive).map_err(|_| VaultBackupError::Tampered)?;
+    let mut database_bytes = None;
+    let mut non_database_files = Vec::new();
+    for entry in &envelope.files {
+        let decoded = ZeroizingBytes(
+            BASE64_STANDARD
+                .decode(entry.content_base64.as_bytes())
+                .map_err(|_| VaultBackupError::Tampered)?,
+        );
+        if entry.relative_path == DATABASE_FILE {
+            if database_bytes.replace(decoded).is_some() {
+                return Err(VaultBackupError::Tampered);
+            }
+        } else {
+            non_database_files.push((
+                entry.relative_path.clone(),
+                entry.sha256.as_str().to_owned(),
+            ));
+        }
+    }
+    let mut database_bytes = database_bytes.ok_or(VaultBackupError::Tampered)?;
+    if database_bytes.0.len() < 100 || !database_bytes.0.starts_with(b"SQLite format 3\0") {
+        return Err(VaultBackupError::Tampered);
+    }
+    // The exported main file is already bound by the canonical archive hash and
+    // follows a successful TRUNCATE checkpoint, but SQLite persists the source
+    // WAL read/write version bytes in the main header. A detached allocation-only
+    // image has no sidecars, so normalize only those two mode bytes in the
+    // zeroizing in-memory copy before deserialization.
+    match (database_bytes.0[18], database_bytes.0[19]) {
+        (1, 1) => {}
+        (2, 2) => {
+            database_bytes.0[18] = 1;
+            database_bytes.0[19] = 1;
+        }
+        _ => return Err(VaultBackupError::Tampered),
+    }
+    let mut connection = Connection::open_in_memory()
+        .map_err(|_| VaultBackupError::Store(VaultStoreError::DatabaseFailed))?;
+    connection
+        .deserialize_read_exact(
+            rusqlite::MAIN_DB,
+            Cursor::new(database_bytes.as_slice()),
+            database_bytes.0.len(),
+            true,
+        )
+        .map_err(|_| VaultBackupError::Tampered)?;
+    connection
+        .execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA foreign_keys=ON;
+             PRAGMA trusted_schema=OFF;",
+        )
+        .map_err(|_| VaultBackupError::Tampered)?;
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|_| VaultBackupError::Tampered)?;
+    let foreign_key_error = connection
+        .prepare("PRAGMA foreign_key_check")
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(|_| VaultBackupError::Tampered)?;
+    let (vault_store_schema_version, workspace): (u32, String) = connection
+        .query_row(
+            "SELECT schema_version,workspace_instance_id FROM vault_meta WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| VaultBackupError::Tampered)?;
+    if integrity != "ok"
+        || foreign_key_error
+        || !matches!(
+            vault_store_schema_version,
+            1 | crate::vault_store::VAULT_STORE_SCHEMA_VERSION
+        )
+        || workspace != expected_workspace_instance_id.as_str()
+    {
+        return Err(VaultBackupError::Tampered);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"vault-content-manifest-v1\0");
+    for table in ["object_journal", "nonce_reservations"] {
+        digest.update(table.as_bytes());
+        digest
+            .update(v031_recovery_safety_vault_table_rows_manifest(&connection, table)?.as_bytes());
+    }
+    for (relative, hash) in non_database_files {
+        digest.update((relative.len() as u64).to_be_bytes());
+        digest.update(relative.as_bytes());
+        digest.update(hash.as_bytes());
+    }
+    Ok(V031RecoverySafetyVaultComponentProof {
+        vault_store_schema_version,
+        vault_content_manifest_sha256: format!("{:x}", digest.finalize()),
+        vault_manifest_sha256: summary.manifest_sha256.as_str().to_owned(),
+    })
+}
+
+fn v031_recovery_safety_vault_table_rows_manifest(
+    connection: &Connection,
+    table: &str,
+) -> Result<String, VaultBackupError> {
+    let quoted = table.replace('"', "\"\"");
+    let mut statement = connection
+        .prepare(&format!("SELECT * FROM \"{quoted}\""))
+        .map_err(|_| VaultBackupError::Tampered)?;
+    let column_count = statement.column_count();
+    let mut rows = statement
+        .query([])
+        .map_err(|_| VaultBackupError::Tampered)?;
+    let mut row_hashes = Vec::new();
+    while let Some(row) = rows.next().map_err(|_| VaultBackupError::Tampered)? {
+        let mut digest = Sha256::new();
+        digest.update(b"sqlite-row-v1\0");
+        for index in 0..column_count {
+            match row.get_ref(index).map_err(|_| VaultBackupError::Tampered)? {
+                ValueRef::Null => digest.update([0]),
+                ValueRef::Integer(value) => {
+                    digest.update([1]);
+                    digest.update(value.to_be_bytes());
+                }
+                ValueRef::Real(value) => {
+                    digest.update([2]);
+                    digest.update(value.to_bits().to_be_bytes());
+                }
+                ValueRef::Text(value) => {
+                    digest.update([3]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value);
+                }
+                ValueRef::Blob(value) => {
+                    digest.update([4]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value);
+                }
+            }
+        }
+        row_hashes.push(digest.finalize().to_vec());
+    }
+    row_hashes.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"sqlite-table-rows-v1\0");
+    digest.update((row_hashes.len() as u64).to_be_bytes());
+    for hash in row_hashes {
+        digest.update(hash);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn export_with_snapshot(

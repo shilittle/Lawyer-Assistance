@@ -6,6 +6,9 @@
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 compile_error!("Lawyer Assistance currently supports only Windows x86_64.");
 
+#[cfg(all(feature = "r3-real-current-binary-harness", not(debug_assertions)))]
+compile_error!("the R3 real-current-binary harness is forbidden in release builds");
+
 use domain::health::HealthCheckResponse;
 use std::{
     path::PathBuf,
@@ -23,6 +26,8 @@ mod mineru_components;
 mod privacy_manager;
 mod privacy_qualification;
 mod privacy_workflow;
+#[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+mod r3_current_binary_harness;
 mod single_instance;
 mod state;
 mod v031_startup;
@@ -30,7 +35,7 @@ mod v031_upgrade_r2;
 mod v031_upgrade_receipts;
 mod v031_upgrade_source;
 
-const MCP_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MCP_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitDrainDecision {
@@ -537,20 +542,23 @@ fn initialize_ordinary_application(
     // construction point: all startup gates, migrations, writable managers,
     // and managed state are complete before WebView2 can create app-data or
     // execute renderer JavaScript.
-    let _main_window =
-        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
-            .title("Lawyer Assistance")
-            .inner_size(1440.0, 900.0)
-            .min_inner_size(640.0, 420.0)
-            .maximized(true)
-            .visible(false)
-            .resizable(true)
-            .build()
-            .map_err(|error| {
-                std::io::Error::other(format!(
-                    "failed to create the gated main application window: {error}"
-                ))
-            })?;
+    let main_window_builder =
+        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()));
+    #[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+    let main_window_builder = r3_current_binary_harness::configure_main_window(main_window_builder);
+    #[cfg(any(not(feature = "r3-real-current-binary-harness"), test))]
+    let main_window_builder = main_window_builder
+        .title("Lawyer Assistance")
+        .inner_size(1440.0, 900.0)
+        .min_inner_size(640.0, 420.0)
+        .maximized(true)
+        .visible(false)
+        .resizable(true);
+    let _main_window = main_window_builder.build().map_err(|error| {
+        std::io::Error::other(format!(
+            "failed to create the gated main application window: {error}"
+        ))
+    })?;
     if mcp_manager.auto_start_enabled() {
         tauri::async_runtime::spawn(async move {
             let _ = mcp_manager.auto_start_if_enabled().await;
@@ -575,6 +583,39 @@ struct ProductionStartupActions<'a> {
     managed_exit_drain: &'a Arc<ExitDrainCoordinator>,
 }
 
+/// The recovery-only process boundary shared by production startup and its
+/// child-process acceptance test.  The authenticated downgrade itself remains
+/// an opaque capability owned by the concrete action.  This function only
+/// accepts its exact terminal target and then freezes the irreversible order:
+/// release the migration guard, mark the exit coordinator finalizing, and
+/// request one successful process exit.
+trait ExplicitRecoveryExitBoundary {
+    type Error;
+
+    fn apply_authenticated_recovery(&mut self) -> Result<String, Self::Error>;
+    fn release_recovery_migration_guard(&mut self) -> Result<(), Self::Error>;
+    fn mark_recovery_exit_finalizing(&mut self);
+    fn exit_recovery_process(&mut self, exit_code: i32);
+}
+
+fn apply_authenticated_recovery_and_exit<Action>(action: &mut Action) -> Result<(), Action::Error>
+where
+    Action: ExplicitRecoveryExitBoundary,
+    Action::Error: From<std::io::Error>,
+{
+    let target_app_version = action.apply_authenticated_recovery()?;
+    if target_app_version != "0.3.1" {
+        return Err(std::io::Error::other(
+            "the authenticated recovery returned an unexpected target application version",
+        )
+        .into());
+    }
+    action.release_recovery_migration_guard()?;
+    action.mark_recovery_exit_finalizing();
+    action.exit_recovery_process(0);
+    Ok(())
+}
+
 impl ProductionStartupActions<'_> {
     fn observed(
         &self,
@@ -591,6 +632,50 @@ impl ProductionStartupActions<'_> {
         })?;
         drop(guard);
         Ok(())
+    }
+}
+
+impl ExplicitRecoveryExitBoundary for ProductionStartupActions<'_> {
+    type Error = Box<dyn std::error::Error>;
+
+    fn apply_authenticated_recovery(&mut self) -> Result<String, Self::Error> {
+        let recovery_gate = self
+            .observed
+            .as_mut()
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "explicit recovery was requested before read-only startup observation",
+                )
+            })?
+            .take_explicit_recovery_gate()
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "the explicit recovery route has no authenticated apply capability",
+                )
+            })?;
+        let applied = commands::v031_migration_recovery::apply_observed_v031_migration_recovery(
+            &self.app_local_data_dir,
+            recovery_gate,
+        )
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "failed to apply the authenticated v0.3.1 recovery: {}",
+                error.message
+            ))
+        })?;
+        Ok(applied.target_app_version().to_owned())
+    }
+
+    fn release_recovery_migration_guard(&mut self) -> Result<(), Self::Error> {
+        self.release_migration_guard()
+    }
+
+    fn mark_recovery_exit_finalizing(&mut self) {
+        self.managed_exit_drain.mark_finalizing();
+    }
+
+    fn exit_recovery_process(&mut self, exit_code: i32) {
+        self.app.handle().exit(exit_code);
     }
 }
 
@@ -612,10 +697,7 @@ impl v031_startup::StartupActions for ProductionStartupActions<'_> {
     }
 
     fn apply_explicit_recovery_and_exit(&mut self) -> Result<(), Self::Error> {
-        Err(std::io::Error::other(
-            "the R3 authenticated recovery apply-and-exit capability is not installed",
-        )
-        .into())
+        apply_authenticated_recovery_and_exit(self)
     }
 
     fn apply_current_restore(
@@ -710,7 +792,9 @@ impl v031_startup::StartupActions for ProductionStartupActions<'_> {
         }
         v031_startup::advance_v031_upgrade_through_receipt_eight(
             &self.app_local_data_dir,
-            observed.process_start_upgrade(),
+            observed.process_start_upgrade_gate().ok_or_else(|| {
+                std::io::Error::other("the upgrade route has no process-start upgrade capability")
+            })?,
             observed.exact_v031_source_gate(),
         )?;
         Ok(())
@@ -723,7 +807,9 @@ impl v031_startup::StartupActions for ProductionStartupActions<'_> {
         })?;
         self.step_eight_ready = Some(v031_startup::run_step_eight_and_install_receipt_nine(
             &self.app_local_data_dir,
-            observed.process_start_upgrade(),
+            observed.process_start_upgrade_gate().ok_or_else(|| {
+                std::io::Error::other("Step 8 has no process-start upgrade capability")
+            })?,
             exact_current,
         )?);
         Ok(())
@@ -762,7 +848,15 @@ impl v031_startup::StartupActions for ProductionStartupActions<'_> {
                 let expected = observed.exact_current_gate().cloned().ok_or_else(|| {
                     std::io::Error::other("the current route has no exact five-slot capability")
                 })?;
-                (expected, observed.process_start_upgrade().clone())
+                let process_start_upgrade = observed
+                    .process_start_upgrade_gate()
+                    .cloned()
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "the current route has no process-start upgrade capability",
+                        )
+                    })?;
+                (expected, process_start_upgrade)
             };
             if v031_startup::observe_exact_current_profile_read_only(&self.app_local_data_dir)?
                 != v031_startup::ExactCurrentProfileObservation::Exact(expected.clone())
@@ -804,6 +898,9 @@ impl v031_startup::StartupActions for ProductionStartupActions<'_> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
+    #[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+    r3_current_binary_harness::initialize(&context.config().identifier)
+        .expect("failed to authenticate the R3 current-binary harness environment");
     let migration_identifier = context.config().identifier.clone();
     let startup_guard = single_instance::acquire_startup_guard(&context.config().identifier)
         .expect("failed to acquire the single-instance startup guard");
@@ -833,6 +930,8 @@ pub fn run() {
             }
             let migration_guard = single_instance::acquire_migration_guard(&migration_identifier)?;
             let app_local_data_dir = app.path().app_local_data_dir()?;
+            #[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+            r3_current_binary_harness::validate_resolved_app_root(app, &app_local_data_dir)?;
             let mut startup = ProductionStartupActions {
                 app,
                 app_local_data_dir,
@@ -1000,6 +1099,7 @@ pub fn run() {
             commands::application_backup::export_application_backup,
             commands::application_backup::verify_application_backup,
             commands::application_backup::stage_application_restore,
+            commands::v031_migration_recovery::stage_v031_migration_recovery,
             commands::release::get_version_info,
             commands::release::export_diagnostic_report,
             commands::updater::check_for_application_update,
@@ -1128,6 +1228,23 @@ mod tests {
                 "unscoped legacy review command remains renderer-callable: {unscoped}"
             );
         }
+    }
+
+    #[test]
+    fn renderer_registers_the_exact_r3_recovery_staging_command() {
+        let source = include_str!("lib.rs");
+        let registrations = source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .and_then(|value| value.split("])").next())
+            .expect("Tauri invoke registration list");
+        assert_eq!(
+            registrations
+                .matches("commands::v031_migration_recovery::stage_v031_migration_recovery,")
+                .count(),
+            1,
+            "the recovery staging command has one renderer boundary"
+        );
     }
 
     #[test]
@@ -1473,3 +1590,7 @@ mod tests {
         assert_eq!(coordinator.request(0), ExitDrainDecision::AllowExit);
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "r3_startup_exit_tests.rs"]
+mod r3_startup_exit_tests;

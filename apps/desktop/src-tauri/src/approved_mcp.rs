@@ -5,8 +5,8 @@ mod qualification_canary;
 #[cfg(test)]
 pub(crate) use application_backup::ApplicationBackupTestHarness;
 pub(crate) use application_backup::{
-    CurrentApprovedComponentsLifecycle, CurrentApprovedComponentsObservation,
-    CurrentApprovedComponentsProof,
+    verify_v031_recovery_safety_archive_pair_allocation_only, CurrentApprovedComponentsLifecycle,
+    CurrentApprovedComponentsObservation, CurrentApprovedComponentsProof,
 };
 #[cfg(test)]
 mod qualification_tests;
@@ -50,7 +50,7 @@ use providers::{
     ProviderStoreLock,
 };
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::{Map, Value};
 use std::{
@@ -79,6 +79,10 @@ const WORK_PRODUCT_ROOT_NAME: &str = "work-products";
 const TICKET_ROOT_NAME: &str = "ticket-sessions";
 const V031_TARGET_COMPONENTS_EVIDENCE_SCHEMA: &str =
     "lawyer-assistance-v031-approved-mcp-target-components-v1";
+const V031_RECOVERY_CREDENTIAL_ARCHIVE_SCHEMA: &str =
+    "lawyer-assistance-v031-recovery-credential-archive-v1";
+const V031_RECOVERY_CREDENTIAL_ARCHIVE_FORMAT_VERSION: u64 = 1;
+const MAX_V031_RECOVERY_CREDENTIAL_ARCHIVE_PLAINTEXT_BYTES: usize = 8 * 1024;
 pub(crate) const V031_APPROVED_WORKSPACE_SCHEMA_SHA256: &str =
     "cbd44ec67a2a0bc709fa26e71137103ed76082a7f6c87ee54d1fb2657a90127b";
 pub(crate) const V031_WORK_PRODUCTS_SCHEMA_SHA256: &str =
@@ -475,7 +479,7 @@ impl V031ApprovedTargetWriterFailureInjector for V031ApprovedTargetWriterFailure
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyRole {
     ApprovedManifest,
     WorkProductManifest,
@@ -501,6 +505,13 @@ const V031_TARGET_CREDENTIAL_ROLES: [KeyRole; 4] = [
     KeyRole::QualificationRevocationEpoch,
 ];
 
+const V031_RECOVERY_CREDENTIAL_DELETE_ROLES: [KeyRole; 4] = [
+    KeyRole::QualificationRevocationEpoch,
+    KeyRole::McpTicket,
+    KeyRole::WorkProductManifest,
+    KeyRole::ApprovedManifest,
+];
+
 trait ApprovedMcpKeyProvider: Send + Sync {
     /// Reads an existing key without creating, rotating, or otherwise mutating the provider.
     ///
@@ -512,6 +523,467 @@ trait ApprovedMcpKeyProvider: Send + Sync {
 
     fn load_or_create(&self, role: KeyRole) -> Result<[u8; 32], ApprovedMcpError>;
     fn rotate(&self, role: KeyRole) -> Result<[u8; 32], ApprovedMcpError>;
+
+    /// Installs one already-authenticated key without generating or rotating it.
+    ///
+    /// This is intentionally unavailable unless a provider can hold its store
+    /// lock across conflict detection, write, and byte-exact readback.
+    fn write_exact(&self, _role: KeyRole, _expected: &[u8; 32]) -> Result<(), ApprovedMcpError> {
+        Err(key_store_error())
+    }
+
+    /// Deletes one already-authenticated key and proves the exact entry absent.
+    ///
+    /// Providers must treat an already-absent entry as an idempotent success,
+    /// but must not delete a present value that differs from `expected`.
+    fn delete_exact(&self, _role: KeyRole, _expected: &[u8; 32]) -> Result<(), ApprovedMcpError> {
+        Err(key_store_error())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static V031_RECOVERY_TEST_KEY_PROVIDER: std::cell::RefCell<Option<Arc<dyn ApprovedMcpKeyProvider>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_v031_recovery_key_provider<T>(
+    operation: impl FnOnce(&dyn ApprovedMcpKeyProvider) -> Result<T, ApprovedMcpError>,
+) -> Result<T, ApprovedMcpError> {
+    #[cfg(test)]
+    {
+        let test_provider = V031_RECOVERY_TEST_KEY_PROVIDER.with(|slot| slot.borrow().clone());
+        if let Some(provider) = test_provider {
+            return operation(provider.as_ref());
+        }
+    }
+
+    let production = WindowsApprovedMcpKeyProvider::new();
+    operation(&production)
+}
+
+/// The four post-invalidation approved-MCP credentials retained by an R3
+/// safety archive. Values stay private to this module, are always stored in
+/// the frozen creation order, and are cleared when the owner is dropped.
+pub(crate) struct V031ApprovedMcpCredentialSnapshot {
+    values: [[u8; 32]; 4],
+}
+
+impl V031ApprovedMcpCredentialSnapshot {
+    fn zeroed() -> Self {
+        Self {
+            values: [[0_u8; 32]; 4],
+        }
+    }
+
+    fn value(&self, role: KeyRole) -> &[u8; 32] {
+        &self.values[v031_recovery_credential_role_index(role)]
+    }
+
+    fn validate(&self) -> Result<(), ApprovedMcpError> {
+        if self
+            .values
+            .iter()
+            .any(|value| value.iter().all(|byte| *byte == 0))
+        {
+            return Err(key_store_error());
+        }
+        let distinct = self
+            .values
+            .iter()
+            .map(|value| sha256_hex(value))
+            .collect::<BTreeSet<_>>();
+        if distinct.len() != V031_TARGET_CREDENTIAL_ROLES.len() {
+            return Err(key_store_error());
+        }
+        Ok(())
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+
+    fn binding_sha256(&self) -> Result<String, ApprovedMcpError> {
+        let evidence = V031RecoveryCredentialSnapshotEvidence {
+            schema: V031_RECOVERY_CREDENTIAL_ARCHIVE_SCHEMA,
+            credential_sha256: self.values.each_ref().map(|value| sha256_hex(value)),
+        };
+        canonical_sha256(&evidence).map_err(|_| key_store_error())
+    }
+
+    /// Produces the only plaintext representation accepted by the R3 DPAPI
+    /// credential archive. The returned buffer owns and zeroizes its bytes.
+    pub(crate) fn to_canonical_archive_plaintext(
+        &self,
+    ) -> Result<V031ApprovedMcpCredentialArchivePlaintext, ApprovedMcpError> {
+        self.validate()?;
+        let wire = V031RecoveryCredentialArchiveWire {
+            schema: V031_RECOVERY_CREDENTIAL_ARCHIVE_SCHEMA.to_owned(),
+            format_version: V031_RECOVERY_CREDENTIAL_ARCHIVE_FORMAT_VERSION,
+            credentials: std::array::from_fn(|index| V031RecoveryCredentialArchiveEntry {
+                role: V031_TARGET_CREDENTIAL_ROLES[index].provider_id().to_owned(),
+                value: self.values[index],
+            }),
+        };
+        let bytes = canonical_json_v1(&wire).map_err(|_| key_store_error())?;
+        if bytes.len() > MAX_V031_RECOVERY_CREDENTIAL_ARCHIVE_PLAINTEXT_BYTES {
+            return Err(key_store_error());
+        }
+        Ok(V031ApprovedMcpCredentialArchivePlaintext(bytes))
+    }
+
+    /// Reconstructs an opaque snapshot only from byte-for-byte canonical R3
+    /// archive plaintext with exactly the four frozen roles in order.
+    pub(crate) fn from_canonical_archive_plaintext(
+        plaintext: &[u8],
+    ) -> Result<Self, ApprovedMcpError> {
+        if plaintext.is_empty()
+            || plaintext.len() > MAX_V031_RECOVERY_CREDENTIAL_ARCHIVE_PLAINTEXT_BYTES
+        {
+            return Err(key_store_error());
+        }
+        let wire: V031RecoveryCredentialArchiveWire =
+            serde_json::from_slice(plaintext).map_err(|_| key_store_error())?;
+        let mut canonical = canonical_json_v1(&wire).map_err(|_| key_store_error())?;
+        let canonical_matches = canonical.as_slice() == plaintext;
+        zeroize(&mut canonical);
+        if !canonical_matches
+            || wire.schema != V031_RECOVERY_CREDENTIAL_ARCHIVE_SCHEMA
+            || wire.format_version != V031_RECOVERY_CREDENTIAL_ARCHIVE_FORMAT_VERSION
+        {
+            return Err(key_store_error());
+        }
+
+        let mut snapshot = Self::zeroed();
+        for (index, entry) in wire.credentials.iter().enumerate() {
+            if entry.role != V031_TARGET_CREDENTIAL_ROLES[index].provider_id() {
+                return Err(key_store_error());
+            }
+            snapshot.values[index].copy_from_slice(&entry.value);
+        }
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn clear(&mut self) {
+        for value in &mut self.values {
+            zeroize(value);
+        }
+    }
+
+    #[cfg(test)]
+    fn clear_for_test(&mut self) {
+        self.clear();
+    }
+
+    #[cfg(test)]
+    fn is_cleared_for_test(&self) -> bool {
+        self.values
+            .iter()
+            .all(|value| value.iter().all(|byte| *byte == 0))
+    }
+}
+
+impl fmt::Debug for V031ApprovedMcpCredentialSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("V031ApprovedMcpCredentialSnapshot")
+            .field("credential_count", &self.values.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for V031ApprovedMcpCredentialSnapshot {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Zeroizing canonical JSON bytes ready to be protected by DPAPI CurrentUser.
+pub(crate) struct V031ApprovedMcpCredentialArchivePlaintext(Vec<u8>);
+
+impl V031ApprovedMcpCredentialArchivePlaintext {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn clear(&mut self) {
+        zeroize(&mut self.0);
+    }
+
+    #[cfg(test)]
+    fn clear_for_test(&mut self) {
+        self.clear();
+    }
+
+    #[cfg(test)]
+    fn is_cleared_for_test(&self) -> bool {
+        self.0.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl fmt::Debug for V031ApprovedMcpCredentialArchivePlaintext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("V031ApprovedMcpCredentialArchivePlaintext")
+            .field("bytes", &self.0.len())
+            .field("plaintext", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for V031ApprovedMcpCredentialArchivePlaintext {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V031RecoveryCredentialSnapshotEvidence {
+    schema: &'static str,
+    credential_sha256: [String; 4],
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct V031RecoveryCredentialArchiveWire {
+    schema: String,
+    format_version: u64,
+    credentials: [V031RecoveryCredentialArchiveEntry; 4],
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct V031RecoveryCredentialArchiveEntry {
+    role: String,
+    value: [u8; 32],
+}
+
+impl Drop for V031RecoveryCredentialArchiveEntry {
+    fn drop(&mut self) {
+        zeroize(&mut self.value);
+    }
+}
+
+/// Read-only proof that Credential Manager is in exactly one legal deletion
+/// prefix relative to an authenticated snapshot.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct V031ApprovedMcpCredentialDeletePrefixGate {
+    prefix_len: u8,
+    snapshot_binding_sha256: String,
+}
+
+impl V031ApprovedMcpCredentialDeletePrefixGate {
+    pub(crate) const fn prefix_len(&self) -> usize {
+        self.prefix_len as usize
+    }
+}
+
+impl fmt::Debug for V031ApprovedMcpCredentialDeletePrefixGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("V031ApprovedMcpCredentialDeletePrefixGate")
+            .field("prefix_len", &self.prefix_len)
+            .field("snapshot_binding_sha256", &self.snapshot_binding_sha256)
+            .finish()
+    }
+}
+
+/// Captures and immediately re-reads the four production entries without
+/// constructing any approved-MCP manager or creating credentials.
+pub(crate) fn capture_v031_recovery_approved_mcp_credentials_read_only(
+) -> Result<V031ApprovedMcpCredentialSnapshot, ApprovedMcpError> {
+    with_v031_recovery_key_provider(capture_v031_recovery_approved_mcp_credentials_with)
+}
+
+/// Re-observes all four production entries twice and compares them byte for
+/// byte with the opaque safety snapshot.
+pub(crate) fn authenticate_v031_recovery_approved_mcp_credentials_read_only(
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<(), ApprovedMcpError> {
+    with_v031_recovery_key_provider(|provider| {
+        authenticate_v031_recovery_approved_mcp_credentials_with(provider, expected)
+    })
+}
+
+/// Observes the exact ADR deletion prefix without creating, deleting, or
+/// repairing any Credential Manager entry.
+pub(crate) fn observe_v031_recovery_approved_mcp_credential_delete_prefix_read_only(
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<V031ApprovedMcpCredentialDeletePrefixGate, ApprovedMcpError> {
+    with_v031_recovery_key_provider(|provider| {
+        observe_v031_recovery_approved_mcp_credential_delete_prefix_with(provider, expected)
+    })
+}
+
+/// Advances exactly one frozen deletion step. A stale, skipped, conflicted,
+/// or already-complete gate is rejected before mutation.
+pub(crate) fn advance_v031_recovery_approved_mcp_credential_delete_prefix(
+    expected: &V031ApprovedMcpCredentialSnapshot,
+    current: &V031ApprovedMcpCredentialDeletePrefixGate,
+) -> Result<V031ApprovedMcpCredentialDeletePrefixGate, ApprovedMcpError> {
+    with_v031_recovery_key_provider(|provider| {
+        advance_v031_recovery_approved_mcp_credential_delete_prefix_with(
+            provider, expected, current,
+        )
+    })
+}
+
+/// Restores only absent entries whose remaining peers still exactly match the
+/// snapshot, then re-reads all four values twice. No new random key is made.
+pub(crate) fn restore_v031_recovery_approved_mcp_credentials_exact(
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<(), ApprovedMcpError> {
+    with_v031_recovery_key_provider(|provider| {
+        restore_v031_recovery_approved_mcp_credentials_exact_with(provider, expected)
+    })
+}
+
+fn v031_recovery_credential_role_index(role: KeyRole) -> usize {
+    match role {
+        KeyRole::ApprovedManifest => 0,
+        KeyRole::WorkProductManifest => 1,
+        KeyRole::McpTicket => 2,
+        KeyRole::QualificationRevocationEpoch => 3,
+    }
+}
+
+fn read_v031_recovery_approved_mcp_credentials_once(
+    provider: &dyn ApprovedMcpKeyProvider,
+) -> Result<V031ApprovedMcpCredentialSnapshot, ApprovedMcpError> {
+    let mut snapshot = V031ApprovedMcpCredentialSnapshot::zeroed();
+    for role in V031_TARGET_CREDENTIAL_ROLES {
+        snapshot.values[v031_recovery_credential_role_index(role)] =
+            provider.load_existing(role)?.ok_or_else(key_store_error)?;
+    }
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn capture_v031_recovery_approved_mcp_credentials_with(
+    provider: &dyn ApprovedMcpKeyProvider,
+) -> Result<V031ApprovedMcpCredentialSnapshot, ApprovedMcpError> {
+    let first = read_v031_recovery_approved_mcp_credentials_once(provider)?;
+    let second = read_v031_recovery_approved_mcp_credentials_once(provider)?;
+    if !first.matches(&second) {
+        return Err(key_store_error());
+    }
+    Ok(first)
+}
+
+fn authenticate_v031_recovery_approved_mcp_credentials_with(
+    provider: &dyn ApprovedMcpKeyProvider,
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<(), ApprovedMcpError> {
+    expected.validate()?;
+    let first = read_v031_recovery_approved_mcp_credentials_once(provider)?;
+    let second = read_v031_recovery_approved_mcp_credentials_once(provider)?;
+    if !expected.matches(&first) || !first.matches(&second) {
+        return Err(key_store_error());
+    }
+    Ok(())
+}
+
+fn observe_v031_recovery_approved_mcp_credential_delete_prefix_once(
+    provider: &dyn ApprovedMcpKeyProvider,
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<V031ApprovedMcpCredentialDeletePrefixGate, ApprovedMcpError> {
+    expected.validate()?;
+    let mut prefix_len = 0_u8;
+    let mut saw_present = false;
+    for role in V031_RECOVERY_CREDENTIAL_DELETE_ROLES {
+        match provider.load_existing(role)? {
+            None if !saw_present => prefix_len += 1,
+            None => return Err(key_store_error()),
+            Some(mut actual) => {
+                saw_present = true;
+                let matches = &actual == expected.value(role);
+                zeroize(&mut actual);
+                if !matches {
+                    return Err(key_store_error());
+                }
+            }
+        }
+    }
+    Ok(V031ApprovedMcpCredentialDeletePrefixGate {
+        prefix_len,
+        snapshot_binding_sha256: expected.binding_sha256()?,
+    })
+}
+
+fn observe_v031_recovery_approved_mcp_credential_delete_prefix_with(
+    provider: &dyn ApprovedMcpKeyProvider,
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<V031ApprovedMcpCredentialDeletePrefixGate, ApprovedMcpError> {
+    let first =
+        observe_v031_recovery_approved_mcp_credential_delete_prefix_once(provider, expected)?;
+    let second =
+        observe_v031_recovery_approved_mcp_credential_delete_prefix_once(provider, expected)?;
+    if first != second {
+        return Err(key_store_error());
+    }
+    Ok(first)
+}
+
+fn advance_v031_recovery_approved_mcp_credential_delete_prefix_with(
+    provider: &dyn ApprovedMcpKeyProvider,
+    expected: &V031ApprovedMcpCredentialSnapshot,
+    current: &V031ApprovedMcpCredentialDeletePrefixGate,
+) -> Result<V031ApprovedMcpCredentialDeletePrefixGate, ApprovedMcpError> {
+    let observed =
+        observe_v031_recovery_approved_mcp_credential_delete_prefix_with(provider, expected)?;
+    if &observed != current || current.prefix_len() >= V031_RECOVERY_CREDENTIAL_DELETE_ROLES.len() {
+        return Err(key_store_error());
+    }
+    let role = V031_RECOVERY_CREDENTIAL_DELETE_ROLES[current.prefix_len()];
+    provider.delete_exact(role, expected.value(role))?;
+    let advanced =
+        observe_v031_recovery_approved_mcp_credential_delete_prefix_with(provider, expected)?;
+    if advanced.prefix_len() != current.prefix_len() + 1 {
+        return Err(key_store_error());
+    }
+    Ok(advanced)
+}
+
+fn observe_v031_recovery_restore_compatible_once(
+    provider: &dyn ApprovedMcpKeyProvider,
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<[bool; 4], ApprovedMcpError> {
+    expected.validate()?;
+    let mut missing = [false; 4];
+    for role in V031_TARGET_CREDENTIAL_ROLES {
+        let index = v031_recovery_credential_role_index(role);
+        match provider.load_existing(role)? {
+            None => missing[index] = true,
+            Some(mut actual) => {
+                let matches = &actual == expected.value(role);
+                zeroize(&mut actual);
+                if !matches {
+                    return Err(key_store_error());
+                }
+            }
+        }
+    }
+    Ok(missing)
+}
+
+fn restore_v031_recovery_approved_mcp_credentials_exact_with(
+    provider: &dyn ApprovedMcpKeyProvider,
+    expected: &V031ApprovedMcpCredentialSnapshot,
+) -> Result<(), ApprovedMcpError> {
+    let first = observe_v031_recovery_restore_compatible_once(provider, expected)?;
+    let second = observe_v031_recovery_restore_compatible_once(provider, expected)?;
+    if first != second {
+        return Err(key_store_error());
+    }
+    for role in V031_TARGET_CREDENTIAL_ROLES {
+        if first[v031_recovery_credential_role_index(role)] {
+            provider.write_exact(role, expected.value(role))?;
+        }
+    }
+    authenticate_v031_recovery_approved_mcp_credentials_with(provider, expected)
 }
 
 #[cfg(test)]
@@ -1000,6 +1472,140 @@ impl ApprovedMcpKeyProvider for WindowsApprovedMcpKeyProvider {
         let credential_key = ProviderCredentialKey::new(role.provider_id(), "user-boundary-v1");
         self.write_random_locked(&credential_key)
     }
+
+    fn write_exact(&self, role: KeyRole, expected: &[u8; 32]) -> Result<(), ApprovedMcpError> {
+        if expected.iter().all(|byte| *byte == 0) {
+            return Err(key_store_error());
+        }
+        let _store_lock = ProviderStoreLock::acquire().map_err(|_| key_store_error())?;
+        let credential_key = ProviderCredentialKey::new(role.provider_id(), "user-boundary-v1");
+        if let Some(secret) = self
+            .store
+            .read_api_key(&credential_key)
+            .map_err(|_| key_store_error())?
+        {
+            let mut existing = decode_key(secret.expose_secret())?;
+            let matches = &existing == expected;
+            zeroize(&mut existing);
+            return if matches {
+                Ok(())
+            } else {
+                Err(key_store_error())
+            };
+        }
+
+        let encoded = format!("{KEY_FORMAT_PREFIX}{}", URL_SAFE_NO_PAD.encode(expected));
+        self.store
+            .write_api_key(&credential_key, ApiSecret::new(encoded))
+            .map_err(|_| key_store_error())?;
+        let mut readback = self
+            .store
+            .read_api_key(&credential_key)
+            .map_err(|_| key_store_error())?
+            .ok_or_else(key_store_error)
+            .and_then(|secret| decode_key(secret.expose_secret()))?;
+        let matches = &readback == expected;
+        zeroize(&mut readback);
+        if !matches {
+            return Err(key_store_error());
+        }
+        Ok(())
+    }
+
+    fn delete_exact(&self, role: KeyRole, expected: &[u8; 32]) -> Result<(), ApprovedMcpError> {
+        if expected.iter().all(|byte| *byte == 0) {
+            return Err(key_store_error());
+        }
+        let _store_lock = ProviderStoreLock::acquire().map_err(|_| key_store_error())?;
+        let credential_key = ProviderCredentialKey::new(role.provider_id(), "user-boundary-v1");
+        let Some(secret) = self
+            .store
+            .read_api_key(&credential_key)
+            .map_err(|_| key_store_error())?
+        else {
+            return Ok(());
+        };
+        let mut existing = decode_key(secret.expose_secret())?;
+        let matches = &existing == expected;
+        zeroize(&mut existing);
+        if !matches {
+            return Err(key_store_error());
+        }
+        self.store
+            .delete_api_key(&credential_key)
+            .map_err(|_| key_store_error())?;
+        if self
+            .store
+            .read_api_key(&credential_key)
+            .map_err(|_| key_store_error())?
+            .is_some()
+        {
+            return Err(key_store_error());
+        }
+        Ok(())
+    }
+}
+
+/// Feature-only provider used by the R3 current desktop executable. Every
+/// mutating trait operation fails closed; the real process can only reopen the
+/// UUID-scoped keys already installed by the parent acceptance harness.
+#[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+#[derive(Debug)]
+struct R3CurrentReadOnlyApprovedMcpKeyProvider {
+    store: WindowsCredentialStore,
+}
+
+#[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+impl R3CurrentReadOnlyApprovedMcpKeyProvider {
+    fn new(service_prefix: &str) -> Self {
+        let suffix = service_prefix
+            .strip_prefix(V031_CROSS_PROCESS_CREDENTIAL_PREFIX)
+            .expect("authenticated R3 current credential prefix");
+        let parsed = Uuid::parse_str(suffix).expect("authenticated R3 current credential UUID");
+        assert_eq!(parsed.hyphenated().to_string(), suffix);
+        Self {
+            store: WindowsCredentialStore::with_service_prefix(service_prefix),
+        }
+    }
+}
+
+#[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+impl ApprovedMcpKeyProvider for R3CurrentReadOnlyApprovedMcpKeyProvider {
+    fn load_existing(&self, role: KeyRole) -> Result<Option<[u8; 32]>, ApprovedMcpError> {
+        let _store_lock = ProviderStoreLock::acquire().map_err(|_| key_store_error())?;
+        self.store
+            .read_api_key(&ProviderCredentialKey::new(
+                role.provider_id(),
+                "user-boundary-v1",
+            ))
+            .map_err(|_| key_store_error())?
+            .map(|secret| decode_key(secret.expose_secret()))
+            .transpose()
+    }
+
+    fn load_or_create(&self, role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+        self.load_existing(role)?.ok_or_else(key_store_error)
+    }
+
+    fn rotate(&self, _role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+        Err(key_store_error())
+    }
+}
+
+#[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+pub(crate) fn load_r3_current_receipt_signer_key_read_only() -> Result<[u8; 32], ApprovedMcpError> {
+    let store = WindowsCredentialStore::with_service_prefix(
+        crate::r3_current_binary_harness::credential_prefix(),
+    );
+    let _store_lock = ProviderStoreLock::acquire().map_err(|_| key_store_error())?;
+    store
+        .read_api_key(&ProviderCredentialKey::new(
+            V031_CROSS_PROCESS_RECEIPT_SIGNER_PROVIDER,
+            V031_CROSS_PROCESS_RECEIPT_SIGNER_ACCOUNT,
+        ))
+        .map_err(|_| key_store_error())?
+        .ok_or_else(key_store_error)
+        .and_then(|secret| decode_key(secret.expose_secret()))
 }
 
 fn decode_key(value: &str) -> Result<[u8; 32], ApprovedMcpError> {
@@ -1301,12 +1907,12 @@ impl V031TargetWriterTestHarness {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "r3-real-current-binary-harness"))]
 const V031_CROSS_PROCESS_CREDENTIAL_PREFIX: &str = "LawyerAssistanceV031RestartTest-";
-#[cfg(test)]
+#[cfg(any(test, feature = "r3-real-current-binary-harness"))]
 const V031_CROSS_PROCESS_RECEIPT_SIGNER_PROVIDER: &str =
     "v031-process-restart-privacy-receipt-signer";
-#[cfg(test)]
+#[cfg(any(test, feature = "r3-real-current-binary-harness"))]
 const V031_CROSS_PROCESS_RECEIPT_SIGNER_ACCOUNT: &str = "test-boundary-v1";
 
 /// Test-only credential boundary for a real Windows child-process restart.
@@ -1323,6 +1929,57 @@ pub(crate) struct V031CrossProcessCredentialHarness {
     provider: Arc<WindowsApprovedMcpKeyProvider>,
     service_prefix: String,
     cleanup_on_drop: bool,
+}
+
+/// A same-thread test seam for driving the production R3 credential state
+/// machine against one UUID-scoped Windows Credential Manager namespace.
+/// The `Rc` marker deliberately prevents moving the override across threads.
+#[cfg(test)]
+pub(crate) struct V031RecoveryCredentialOverrideGuard {
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+/// Sendable factory for installing the UUID-scoped R3 credential provider on
+/// the exact blocking worker that executes one production staging boundary.
+/// The installed guard remains thread-local and deliberately cannot leave that
+/// worker.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct V031RecoveryCredentialOverrideFactory {
+    provider: Arc<dyn ApprovedMcpKeyProvider>,
+}
+
+#[cfg(test)]
+impl V031RecoveryCredentialOverrideFactory {
+    pub(crate) fn install_on_current_thread(
+        &self,
+    ) -> Result<V031RecoveryCredentialOverrideGuard, ApprovedMcpError> {
+        let installed = V031_RECOVERY_TEST_KEY_PROVIDER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                false
+            } else {
+                *slot = Some(Arc::clone(&self.provider));
+                true
+            }
+        });
+        if !installed {
+            return Err(key_store_error());
+        }
+        Ok(V031RecoveryCredentialOverrideGuard {
+            _same_thread: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for V031RecoveryCredentialOverrideGuard {
+    fn drop(&mut self) {
+        V031_RECOVERY_TEST_KEY_PROVIDER.with(|slot| {
+            let removed = slot.borrow_mut().take();
+            debug_assert!(removed.is_some());
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1378,6 +2035,20 @@ impl V031CrossProcessCredentialHarness {
 
     pub(crate) fn credential_probe(&self) -> V031ApprovedMcpCredentialProbe {
         V031ApprovedMcpCredentialProbe::from_provider(self.provider.clone())
+    }
+
+    pub(crate) fn recovery_credential_override_factory_for_test(
+        &self,
+    ) -> V031RecoveryCredentialOverrideFactory {
+        let provider: Arc<dyn ApprovedMcpKeyProvider> = self.provider.clone();
+        V031RecoveryCredentialOverrideFactory { provider }
+    }
+
+    pub(crate) fn install_recovery_credential_override_for_test(
+        &self,
+    ) -> Result<V031RecoveryCredentialOverrideGuard, ApprovedMcpError> {
+        self.recovery_credential_override_factory_for_test()
+            .install_on_current_thread()
     }
 
     pub(crate) fn load_or_create_privacy_receipt_signer_key(
@@ -2378,7 +3049,41 @@ impl fmt::Debug for ApprovedMcpWorkspace {
 
 impl ApprovedMcpWorkspace {
     pub(crate) fn new(app_local_data_directory: PathBuf) -> Self {
+        #[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+        if let Some(credential_prefix) =
+            crate::r3_current_binary_harness::credential_prefix_if_initialized()
+        {
+            return Self::new_with_r3_current_read_only_credentials(
+                app_local_data_directory,
+                credential_prefix,
+            );
+        }
         Self::new_with_binary(app_local_data_directory, installed_mcp_binary_path())
+    }
+
+    #[cfg(all(feature = "r3-real-current-binary-harness", not(test)))]
+    fn new_with_r3_current_read_only_credentials(
+        app_local_data_directory: PathBuf,
+        credential_prefix: &str,
+    ) -> Self {
+        let keys: Arc<dyn ApprovedMcpKeyProvider> = Arc::new(
+            R3CurrentReadOnlyApprovedMcpKeyProvider::new(credential_prefix),
+        );
+        let qualification_control =
+            Arc::new(qualification::DesktopApprovedMcpQualificationProvider::new(
+                app_local_data_directory
+                    .join("privacy")
+                    .join("approved-mcp")
+                    .join("qualification"),
+                Arc::clone(&keys),
+                installed_mcp_binary_path(),
+            ));
+        Self::from_parts(
+            app_local_data_directory,
+            qualification_control.clone(),
+            keys,
+            Some(qualification_control),
+        )
     }
 
     fn new_with_binary(app_local_data_directory: PathBuf, binary_path: PathBuf) -> Self {
@@ -3953,6 +4658,337 @@ fn validate_v031_credential_digest_prefix(
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod v031_recovery_credential_boundary_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct RecoveryCredentialTestProvider {
+        keys: Mutex<[Option<[u8; 32]>; 4]>,
+        load_calls: AtomicUsize,
+        write_order: Mutex<Vec<KeyRole>>,
+        delete_order: Mutex<Vec<KeyRole>>,
+    }
+
+    impl RecoveryCredentialTestProvider {
+        fn full() -> Self {
+            Self {
+                keys: Mutex::new(std::array::from_fn(|index| Some([(index + 1) as u8; 32]))),
+                load_calls: AtomicUsize::new(0),
+                write_order: Mutex::new(Vec::new()),
+                delete_order: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn set(&self, role: KeyRole, value: Option<[u8; 32]>) {
+            let mut keys = self.keys.lock().expect("recovery credential test keys");
+            if let Some(mut old) =
+                keys[v031_recovery_credential_role_index(role)].replace(value.unwrap_or([0_u8; 32]))
+            {
+                zeroize(&mut old);
+            }
+            if value.is_none() {
+                keys[v031_recovery_credential_role_index(role)] = None;
+            }
+        }
+
+        fn is_absent(&self, role: KeyRole) -> bool {
+            self.keys.lock().expect("recovery credential test keys")
+                [v031_recovery_credential_role_index(role)]
+            .is_none()
+        }
+    }
+
+    impl Drop for RecoveryCredentialTestProvider {
+        fn drop(&mut self) {
+            if let Ok(keys) = self.keys.get_mut() {
+                for key in keys.iter_mut().flatten() {
+                    zeroize(key);
+                }
+            }
+        }
+    }
+
+    impl ApprovedMcpKeyProvider for RecoveryCredentialTestProvider {
+        fn load_existing(&self, role: KeyRole) -> Result<Option<[u8; 32]>, ApprovedMcpError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            self.keys
+                .lock()
+                .map(|keys| keys[v031_recovery_credential_role_index(role)])
+                .map_err(|_| key_store_error())
+        }
+
+        fn load_or_create(&self, _role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+            panic!("R3 recovery boundary must not generate a credential")
+        }
+
+        fn rotate(&self, _role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+            panic!("R3 recovery boundary must not rotate a credential")
+        }
+
+        fn write_exact(&self, role: KeyRole, expected: &[u8; 32]) -> Result<(), ApprovedMcpError> {
+            if expected.iter().all(|byte| *byte == 0) {
+                return Err(key_store_error());
+            }
+            let mut keys = self.keys.lock().map_err(|_| key_store_error())?;
+            let slot = &mut keys[v031_recovery_credential_role_index(role)];
+            match slot {
+                Some(existing) if existing != expected => return Err(key_store_error()),
+                Some(_) => return Ok(()),
+                None => *slot = Some(*expected),
+            }
+            self.write_order
+                .lock()
+                .map_err(|_| key_store_error())?
+                .push(role);
+            if slot.as_ref() != Some(expected) {
+                return Err(key_store_error());
+            }
+            Ok(())
+        }
+
+        fn delete_exact(&self, role: KeyRole, expected: &[u8; 32]) -> Result<(), ApprovedMcpError> {
+            let mut keys = self.keys.lock().map_err(|_| key_store_error())?;
+            let slot = &mut keys[v031_recovery_credential_role_index(role)];
+            let Some(mut existing) = slot.take() else {
+                return Ok(());
+            };
+            if &existing != expected {
+                *slot = Some(existing);
+                return Err(key_store_error());
+            }
+            zeroize(&mut existing);
+            self.delete_order
+                .lock()
+                .map_err(|_| key_store_error())?
+                .push(role);
+            if slot.is_some() {
+                return Err(key_store_error());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_snapshot_is_repeatable_canonical_opaque_and_zeroizing() {
+        let provider = RecoveryCredentialTestProvider::full();
+        let mut snapshot =
+            capture_v031_recovery_approved_mcp_credentials_with(&provider).expect("capture");
+        assert_eq!(provider.load_calls.load(Ordering::SeqCst), 8);
+        authenticate_v031_recovery_approved_mcp_credentials_with(&provider, &snapshot)
+            .expect("repeatable readback");
+        assert_eq!(provider.load_calls.load(Ordering::SeqCst), 16);
+        let mut plaintext = snapshot
+            .to_canonical_archive_plaintext()
+            .expect("canonical plaintext");
+        let decoded = V031ApprovedMcpCredentialSnapshot::from_canonical_archive_plaintext(
+            plaintext.as_bytes(),
+        )
+        .expect("canonical plaintext decodes");
+        assert!(snapshot.matches(&decoded));
+        let wire: Value = serde_json::from_slice(plaintext.as_bytes()).expect("archive JSON");
+        assert_eq!(
+            wire["credentials"]
+                .as_array()
+                .expect("credential array")
+                .iter()
+                .map(|entry| entry["role"].as_str().expect("role"))
+                .collect::<Vec<_>>(),
+            V031_TARGET_CREDENTIAL_ROLES
+                .iter()
+                .map(|role| role.provider_id())
+                .collect::<Vec<_>>()
+        );
+        assert!(format!("{snapshot:?}").contains("<redacted>"));
+        assert!(format!("{plaintext:?}").contains("<redacted>"));
+
+        let mut noncanonical = Vec::with_capacity(plaintext.as_bytes().len() + 1);
+        noncanonical.push(b' ');
+        noncanonical.extend_from_slice(plaintext.as_bytes());
+        assert!(
+            V031ApprovedMcpCredentialSnapshot::from_canonical_archive_plaintext(&noncanonical)
+                .is_err()
+        );
+        zeroize(&mut noncanonical);
+
+        snapshot.clear_for_test();
+        plaintext.clear_for_test();
+        assert!(snapshot.is_cleared_for_test());
+        assert!(plaintext.is_cleared_for_test());
+    }
+
+    #[test]
+    fn recovery_delete_advances_only_the_frozen_exact_prefix() {
+        let provider = RecoveryCredentialTestProvider::full();
+        let snapshot =
+            capture_v031_recovery_approved_mcp_credentials_with(&provider).expect("capture");
+        let mut gate =
+            observe_v031_recovery_approved_mcp_credential_delete_prefix_with(&provider, &snapshot)
+                .expect("initial prefix");
+        let stale = gate.clone();
+        assert_eq!(gate.prefix_len(), 0);
+        for expected_prefix in 1..=V031_RECOVERY_CREDENTIAL_DELETE_ROLES.len() {
+            gate = advance_v031_recovery_approved_mcp_credential_delete_prefix_with(
+                &provider, &snapshot, &gate,
+            )
+            .expect("advance one exact prefix");
+            assert_eq!(gate.prefix_len(), expected_prefix);
+            assert_eq!(
+                observe_v031_recovery_approved_mcp_credential_delete_prefix_with(
+                    &provider, &snapshot
+                )
+                .expect("idempotent prefix read"),
+                gate
+            );
+        }
+        assert_eq!(
+            *provider.delete_order.lock().expect("delete order"),
+            V031_RECOVERY_CREDENTIAL_DELETE_ROLES
+        );
+        assert!(
+            advance_v031_recovery_approved_mcp_credential_delete_prefix_with(
+                &provider, &snapshot, &stale
+            )
+            .is_err()
+        );
+        assert_eq!(provider.delete_order.lock().expect("delete order").len(), 4);
+    }
+
+    #[test]
+    fn recovery_delete_rejects_holes_and_conflicts_before_mutation() {
+        let partial = RecoveryCredentialTestProvider::full();
+        let snapshot =
+            capture_v031_recovery_approved_mcp_credentials_with(&partial).expect("capture");
+        partial.set(KeyRole::QualificationRevocationEpoch, None);
+        partial.set(KeyRole::McpTicket, None);
+        assert_eq!(
+            observe_v031_recovery_approved_mcp_credential_delete_prefix_with(&partial, &snapshot)
+                .expect("legal partial delete")
+                .prefix_len(),
+            2
+        );
+
+        let hole = RecoveryCredentialTestProvider::full();
+        let hole_snapshot =
+            capture_v031_recovery_approved_mcp_credentials_with(&hole).expect("capture hole");
+        hole.set(KeyRole::McpTicket, None);
+        assert!(
+            observe_v031_recovery_approved_mcp_credential_delete_prefix_with(&hole, &hole_snapshot)
+                .is_err()
+        );
+        assert!(hole
+            .delete_order
+            .lock()
+            .expect("hole delete order")
+            .is_empty());
+
+        let conflict = RecoveryCredentialTestProvider::full();
+        let conflict_snapshot = capture_v031_recovery_approved_mcp_credentials_with(&conflict)
+            .expect("capture conflict");
+        conflict.set(KeyRole::WorkProductManifest, Some([9_u8; 32]));
+        let forged_current = V031ApprovedMcpCredentialDeletePrefixGate {
+            prefix_len: 0,
+            snapshot_binding_sha256: conflict_snapshot
+                .binding_sha256()
+                .expect("snapshot binding"),
+        };
+        assert!(
+            advance_v031_recovery_approved_mcp_credential_delete_prefix_with(
+                &conflict,
+                &conflict_snapshot,
+                &forged_current
+            )
+            .is_err()
+        );
+        assert!(conflict
+            .delete_order
+            .lock()
+            .expect("conflict delete order")
+            .is_empty());
+    }
+
+    #[test]
+    fn recovery_restore_is_exact_idempotent_and_uses_creation_order() {
+        let provider = RecoveryCredentialTestProvider::full();
+        let snapshot =
+            capture_v031_recovery_approved_mcp_credentials_with(&provider).expect("capture");
+        let mut gate =
+            observe_v031_recovery_approved_mcp_credential_delete_prefix_with(&provider, &snapshot)
+                .expect("initial prefix");
+        while gate.prefix_len() < V031_RECOVERY_CREDENTIAL_DELETE_ROLES.len() {
+            gate = advance_v031_recovery_approved_mcp_credential_delete_prefix_with(
+                &provider, &snapshot, &gate,
+            )
+            .expect("delete all");
+        }
+        restore_v031_recovery_approved_mcp_credentials_exact_with(&provider, &snapshot)
+            .expect("restore all");
+        assert_eq!(
+            *provider.write_order.lock().expect("write order"),
+            V031_TARGET_CREDENTIAL_ROLES
+        );
+        restore_v031_recovery_approved_mcp_credentials_exact_with(&provider, &snapshot)
+            .expect("idempotent restore");
+        assert_eq!(provider.write_order.lock().expect("write order").len(), 4);
+
+        let partial = RecoveryCredentialTestProvider::full();
+        let partial_snapshot =
+            capture_v031_recovery_approved_mcp_credentials_with(&partial).expect("partial capture");
+        partial.set(KeyRole::ApprovedManifest, None);
+        partial.set(KeyRole::McpTicket, None);
+        restore_v031_recovery_approved_mcp_credentials_exact_with(&partial, &partial_snapshot)
+            .expect("arbitrary crash prefix restores");
+        assert_eq!(
+            *partial.write_order.lock().expect("partial write order"),
+            [KeyRole::ApprovedManifest, KeyRole::McpTicket]
+        );
+
+        let conflict = RecoveryCredentialTestProvider::full();
+        let conflict_snapshot = capture_v031_recovery_approved_mcp_credentials_with(&conflict)
+            .expect("conflict capture");
+        conflict.set(KeyRole::ApprovedManifest, None);
+        conflict.set(KeyRole::WorkProductManifest, Some([9_u8; 32]));
+        assert!(restore_v031_recovery_approved_mcp_credentials_exact_with(
+            &conflict,
+            &conflict_snapshot
+        )
+        .is_err());
+        assert!(conflict
+            .write_order
+            .lock()
+            .expect("conflict write order")
+            .is_empty());
+        assert!(conflict.is_absent(KeyRole::ApprovedManifest));
+    }
+
+    #[test]
+    fn recovery_mutation_methods_fail_closed_by_default() {
+        struct ReadOnlyDefaults;
+
+        impl ApprovedMcpKeyProvider for ReadOnlyDefaults {
+            fn load_existing(&self, _role: KeyRole) -> Result<Option<[u8; 32]>, ApprovedMcpError> {
+                Ok(Some([1_u8; 32]))
+            }
+
+            fn load_or_create(&self, _role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+                Err(key_store_error())
+            }
+
+            fn rotate(&self, _role: KeyRole) -> Result<[u8; 32], ApprovedMcpError> {
+                Err(key_store_error())
+            }
+        }
+
+        let provider = ReadOnlyDefaults;
+        assert!(provider
+            .write_exact(KeyRole::ApprovedManifest, &[1_u8; 32])
+            .is_err());
+        assert!(provider
+            .delete_exact(KeyRole::ApprovedManifest, &[1_u8; 32])
+            .is_err());
+    }
 }
 
 #[cfg(test)]

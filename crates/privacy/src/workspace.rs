@@ -715,7 +715,28 @@ impl ApprovedWorkspaceService {
         acquire_workspace_operation_guard(&self.root)
     }
 
+    /// Excludes every writer while permitting additional read-only handles to
+    /// inspect the operation-lock file itself. R3 Safety V3 uses this narrower
+    /// boundary so its exact recursive directory fingerprint can include the
+    /// fixed lock file while the writer barrier remains continuously held.
+    pub fn acquire_writer_exclusion_guard(
+        &self,
+    ) -> Result<ApprovedWorkspaceOperationGuard, WorkspaceError> {
+        acquire_workspace_writer_exclusion_guard(&self.root)
+    }
+
     pub fn validate_operation_guard(
+        &self,
+        operation: &ApprovedWorkspaceOperationGuard,
+    ) -> Result<(), WorkspaceError> {
+        if operation.workspace_root == self.root.root && operation.allows_mutation {
+            Ok(())
+        } else {
+            Err(WorkspaceError::InvalidRoot)
+        }
+    }
+
+    pub fn validate_read_operation_guard(
         &self,
         operation: &ApprovedWorkspaceOperationGuard,
     ) -> Result<(), WorkspaceError> {
@@ -797,7 +818,7 @@ impl ApprovedWorkspaceService {
         operation: &ApprovedWorkspaceOperationGuard,
         now_unix: u64,
     ) -> Result<Vec<ApprovedCaseSummaryV1>, WorkspaceError> {
-        self.validate_operation_guard(operation)?;
+        self.validate_read_operation_guard(operation)?;
         let db = open_database(&self.root)?;
         let mut statement = db
             .prepare(
@@ -938,7 +959,7 @@ impl ApprovedWorkspaceService {
         expected_destination_scope: Option<&str>,
         expected_purpose: Option<&str>,
     ) -> Result<VerifiedApprovedMaterial, WorkspaceError> {
-        self.validate_operation_guard(operation)?;
+        self.validate_read_operation_guard(operation)?;
         let db = open_database(&self.root)?;
         let document_version = db
             .query_row(
@@ -982,7 +1003,7 @@ impl ApprovedWorkspaceService {
         case_id: &CaseId,
         now_unix: u64,
     ) -> Result<Vec<ApprovedMaterialSummaryV1>, WorkspaceError> {
-        self.validate_operation_guard(operation)?;
+        self.validate_read_operation_guard(operation)?;
         let db = open_database(&self.root)?;
         let mut statement = db
             .prepare(
@@ -1061,7 +1082,7 @@ impl ApprovedWorkspaceService {
         expected_destination_scope: Option<&str>,
         expected_purpose: Option<&str>,
     ) -> Result<VerifiedApprovedMaterial, WorkspaceError> {
-        self.validate_operation_guard(operation)?;
+        self.validate_read_operation_guard(operation)?;
         let document_version_sql = sql_i64(document_version)?;
         self.ensure_publication_active(case_id, material_id, document_version_sql, publication_id)?;
         let directory = self
@@ -1127,7 +1148,7 @@ impl ApprovedWorkspaceService {
         content: &[u8],
         now_unix: u64,
     ) -> Result<(), WorkspaceError> {
-        self.validate_operation_guard(operation)?;
+        self.validate_read_operation_guard(operation)?;
         if references.is_empty() || content.is_empty() {
             return Err(WorkspaceError::InvalidInput);
         }
@@ -1180,7 +1201,7 @@ impl ApprovedWorkspaceService {
         guard: &ApprovedEgressGuardV1,
         now_unix: u64,
     ) -> Result<(), WorkspaceError> {
-        self.validate_operation_guard(operation)?;
+        self.validate_read_operation_guard(operation)?;
         let latest_case = self.latest_revision_bundle_locked(operation, case_id, None, now_unix)?;
         if latest_case.egress_guard.claims.workspace_instance_id != guard.workspace_instance_id
             || latest_case.egress_guard.claims.dictionary_revision_hash
@@ -1212,7 +1233,7 @@ impl ApprovedWorkspaceService {
         material_id: Option<&MaterialId>,
         now_unix: u64,
     ) -> Result<VerifiedBundle, WorkspaceError> {
-        self.validate_operation_guard(operation)?;
+        self.validate_read_operation_guard(operation)?;
         let db = open_database(&self.root)?;
         let row = match material_id {
             Some(material_id) => db
@@ -1813,6 +1834,7 @@ impl ValidatedWorkspaceRoot {
 pub struct ApprovedWorkspaceOperationGuard {
     _file: File,
     workspace_root: PathBuf,
+    allows_mutation: bool,
 }
 
 fn ensure_operation_lock_file(root: &ValidatedWorkspaceRoot) -> Result<(), WorkspaceError> {
@@ -1854,6 +1876,36 @@ fn acquire_workspace_operation_guard(
                 return Ok(ApprovedWorkspaceOperationGuard {
                     _file: file,
                     workspace_root: root.root.clone(),
+                    allows_mutation: true,
+                })
+            }
+            Err(_) if attempt + 1 < OPERATION_LOCK_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    OPERATION_LOCK_RETRY_MILLIS,
+                ));
+            }
+            Err(_) => return Err(WorkspaceError::DatabaseFailed),
+        }
+    }
+    Err(WorkspaceError::DatabaseFailed)
+}
+
+#[cfg(windows)]
+fn acquire_workspace_writer_exclusion_guard(
+    root: &ValidatedWorkspaceRoot,
+) -> Result<ApprovedWorkspaceOperationGuard, WorkspaceError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    for attempt in 0..OPERATION_LOCK_ATTEMPTS {
+        let mut options = OpenOptions::new();
+        options.read(true).share_mode(FILE_SHARE_READ);
+        match options.open(&root.operation_lock) {
+            Ok(file) => {
+                return Ok(ApprovedWorkspaceOperationGuard {
+                    _file: file,
+                    workspace_root: root.root.clone(),
+                    allows_mutation: false,
                 })
             }
             Err(_) if attempt + 1 < OPERATION_LOCK_ATTEMPTS => {
@@ -1869,6 +1921,13 @@ fn acquire_workspace_operation_guard(
 
 #[cfg(not(windows))]
 fn acquire_workspace_operation_guard(
+    _root: &ValidatedWorkspaceRoot,
+) -> Result<ApprovedWorkspaceOperationGuard, WorkspaceError> {
+    Err(WorkspaceError::PlatformUnavailable)
+}
+
+#[cfg(not(windows))]
+fn acquire_workspace_writer_exclusion_guard(
     _root: &ValidatedWorkspaceRoot,
 ) -> Result<ApprovedWorkspaceOperationGuard, WorkspaceError> {
     Err(WorkspaceError::PlatformUnavailable)

@@ -21,6 +21,7 @@ mod research_output;
 pub mod updater;
 pub(crate) mod v031_checkpoint_receipts;
 pub(crate) mod v031_migration_checkpoint;
+pub(crate) mod v031_migration_recovery;
 pub(crate) mod v031_privacy_migration;
 pub(crate) mod v031_target_components;
 pub(crate) mod v031_upgrade_complete;

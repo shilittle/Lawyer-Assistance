@@ -15,6 +15,7 @@ import {
   getLocalOcrStatus,
   getPrivacyConfig,
   savePrivacyConfig,
+  stageV031MigrationRecovery,
 } from "./client";
 import type { PrivacyConfig } from "./types";
 
@@ -173,5 +174,16 @@ describe("privacy IPC client", () => {
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("case/raw.pdf");
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("workerPath");
     expect(JSON.stringify(invoke.mock.calls)).not.toContain("modelDirectory");
+  });
+
+  it("stages v0.3.1 migration recovery with only the exact confirmation", async () => {
+    const confirmation = "恢复到 v0.3.1 并退出当前应用";
+
+    await stageV031MigrationRecovery({ confirmation });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("stage_v031_migration_recovery", {
+      request: { confirmation },
+    });
   });
 });
