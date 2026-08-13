@@ -77,7 +77,7 @@ A Skill or Agent rule may load after a host sends the first message or attachmen
 
 PDF, DOCX, UTF-8 TXT, and Markdown receive local format, size, structure, and content checks. Reliable text layers can be parsed locally. Visual pages may enter local MinerU only after current qualification is complete.
 
-Production OCR qualification requires an exact component, worker, configuration, model, and runtime inventory; Windows Firewall outbound isolation; process-tree containment; a fixed synthetic canary; restart validation; and expiry, revocation, and drift invalidation. These controls belong under **Settings → Local processing environment and OCR components**. The current technical prerelease has not achieved production qualification and provides no SSH, cloud OCR, remote model download, or silent fallback.
+Production OCR qualification requires an exact component, worker, configuration, model, and runtime inventory; Windows Firewall outbound isolation; process-tree containment; a fixed synthetic canary; restart validation; and expiry, revocation, and drift invalidation. These controls belong under **Settings → Local processing environment and OCR components**. The `0.4.0` source candidate implements this validation chain, but production qualification cannot be claimed until final MinerU assets, signatures, GPU/driver, and clean-machine evidence exist. There is no SSH, cloud OCR, remote model download, or silent fallback.
 
 ## Diagram security
 
@@ -93,10 +93,10 @@ The application aims to log only stable error codes, versions, and content-free 
 
 - The legal database and model output support research and review; they are not legal advice.
 - A professional must verify citations, versions, effectiveness, case facts, and final documents.
-- The unsigned technical prerelease has no trusted Windows publisher identity.
+- Only the exact installer from an official Release that passes Authenticode, RFC3161, and server readback has a verified Windows publisher identity; a source candidate or unsigned artifact does not.
 - The source repository is public, but public source or downloadable assets do not prove Authenticode signing, updater readiness, OCR qualification, or clean-machine release acceptance.
-- There is currently no automatic-update release chain.
-- The full archival database is not included in the technical prerelease package.
-- Production OCR is not qualified; scanned and visual PDFs must remain blocked.
+- Updater code and verification are implemented, but automatic update is unavailable until the installer-bound signature, `latest.json`, Release promotion, and final endpoint revalidation complete.
+- The full archival database is not included in the desktop App Release.
+- Final production-OCR qualification still requires real assets and machine evidence; scanned or visual PDFs must remain blocked whenever current qualification is invalid.
 
 See [Current Release Status](release-status.en.md) for current limitations and release gates.

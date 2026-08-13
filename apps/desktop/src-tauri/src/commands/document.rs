@@ -1212,6 +1212,38 @@ pub fn recover_pending_document_exports(
     Ok(())
 }
 
+pub(crate) fn pending_document_export_marker_count_read_only(
+    app_local_data_dir: &Path,
+) -> Result<u64, IpcError> {
+    if !app_local_data_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0_u64;
+    for entry in
+        fs::read_dir(app_local_data_dir).map_err(|error| IpcError::new("io", error.to_string()))?
+    {
+        let entry = entry.map_err(|error| IpcError::new("io", error.to_string()))?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with(EXPORT_MARKER_PREFIX) || !file_name.ends_with(".json") {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| IpcError::new("io", error.to_string()))?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(IpcError::new(
+                "document_recovery",
+                "document export marker must be an ordinary file",
+            ));
+        }
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| IpcError::new("document_recovery", "marker count overflow"))?;
+    }
+    Ok(count)
+}
+
 fn validate_export_marker(marker: &ExportMarker, marker_path: &Path) -> Result<(), IpcError> {
     if marker.format_version != 1
         || Uuid::parse_str(&marker.record_id).is_err()

@@ -17,8 +17,10 @@ use windows_sys::Win32::{
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const STARTUP_GUARD_TIMEOUT_MS: u32 = 120_000;
+const MIGRATION_GUARD_TIMEOUT_MS: u32 = 120_000;
 
 pub(crate) type PendingRevealFlag = Arc<AtomicBool>;
+pub(crate) type UiReadyFlag = Arc<AtomicBool>;
 
 /// Owns one session-local mutex used by the startup or lifetime fail-closed guard.
 #[must_use]
@@ -40,10 +42,26 @@ pub(crate) fn new_pending_reveal_flag() -> PendingRevealFlag {
     Arc::new(AtomicBool::new(false))
 }
 
+pub(crate) fn new_ui_ready_flag() -> UiReadyFlag {
+    Arc::new(AtomicBool::new(false))
+}
+
 pub(crate) fn acquire_startup_guard(identifier: &str) -> io::Result<NamedMutexGuard> {
     acquire_named_startup_guard(
         &format!("Local\\{identifier}-single-instance-startup"),
         STARTUP_GUARD_TIMEOUT_MS,
+    )
+}
+
+/// Serializes every migration and restore transition independently of the
+/// single-instance startup/lifetime guards. Keeping this namespace distinct is
+/// intentional: the startup guard is released once Tauri has finished
+/// building, whereas this guard is held only for the classified state
+/// transition and must be released before the normal event loop starts.
+pub(crate) fn acquire_migration_guard(identifier: &str) -> io::Result<NamedMutexGuard> {
+    acquire_named_startup_guard(
+        &format!("Local\\{identifier}-migration-and-restore"),
+        MIGRATION_GUARD_TIMEOUT_MS,
     )
 }
 
@@ -122,31 +140,41 @@ fn create_owned_named_mutex(name: &str) -> io::Result<(HANDLE, bool)> {
     Ok((handle, unsafe { GetLastError() } == ERROR_ALREADY_EXISTS))
 }
 
-pub(crate) fn plugin<R: Runtime>(pending_reveal: PendingRevealFlag) -> TauriPlugin<R> {
+pub(crate) fn plugin<R: Runtime>(
+    pending_reveal: PendingRevealFlag,
+    ui_ready: UiReadyFlag,
+) -> TauriPlugin<R> {
     // The secondary process's argv and cwd are intentionally matched with `_`:
     // they are immediately discarded and are never logged, emitted, or persisted.
     tauri_plugin_single_instance::init(move |app, _, _| {
-        request_main_window_reveal(app, &pending_reveal);
+        request_main_window_reveal(app, &pending_reveal, &ui_ready);
     })
 }
 
-fn request_main_window_reveal<R: Runtime>(app: &AppHandle<R>, pending: &AtomicBool) {
-    request_reveal(pending, || reveal_main_window(app));
+fn request_main_window_reveal<R: Runtime>(
+    app: &AppHandle<R>,
+    pending: &AtomicBool,
+    ui_ready: &AtomicBool,
+) {
+    request_reveal(pending, ui_ready, || reveal_main_window(app));
 }
 
-fn request_reveal(pending: &AtomicBool, reveal: impl FnOnce() -> bool) {
+fn request_reveal(pending: &AtomicBool, ui_ready: &AtomicBool, reveal: impl FnOnce() -> bool) {
     // Store first, then try the window. This order closes the race with app setup:
     // either this call reveals the window or setup observes and flushes the flag.
     pending.store(true, Ordering::Release);
-    if reveal() {
+    if ui_ready.load(Ordering::Acquire) && reveal() {
         pending.store(false, Ordering::Release);
     }
 }
 
-pub(crate) fn flush_pending_main_window_reveal<R: Runtime>(
+pub(crate) fn mark_ui_ready_and_reveal_main_window<R: Runtime>(
     app: &AppHandle<R>,
     pending: &AtomicBool,
+    ui_ready: &AtomicBool,
 ) {
+    ui_ready.store(true, Ordering::Release);
+    pending.store(true, Ordering::Release);
     flush_pending_reveal(pending, || reveal_main_window(app));
 }
 
@@ -184,6 +212,17 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         let first = acquire_named_startup_guard(&name, 1_000).expect("first guard");
+        run_startup_guard_child(&name, "blocked");
+
+        drop(first);
+        run_startup_guard_child(&name, "available");
+    }
+
+    #[test]
+    fn migration_guard_blocks_across_processes_and_recovers_after_release() {
+        let identifier = format!("lawyer-assistance-test-migration-{}", uuid::Uuid::new_v4());
+        let name = format!("Local\\{identifier}-migration-and-restore");
+        let first = acquire_migration_guard(&identifier).expect("first migration guard");
         run_startup_guard_child(&name, "blocked");
 
         drop(first);
@@ -265,11 +304,17 @@ mod tests {
     #[test]
     fn early_reveal_request_is_flushed_after_reveal_target_exists() {
         let pending = new_pending_reveal_flag();
+        let ui_ready = new_ui_ready_flag();
         let reveal_attempts = AtomicBool::new(false);
 
-        request_reveal(&pending, || false);
+        request_reveal(&pending, &ui_ready, || {
+            reveal_attempts.store(true, Ordering::Release);
+            true
+        });
         assert!(pending.load(Ordering::Acquire));
+        assert!(!reveal_attempts.load(Ordering::Acquire));
 
+        ui_ready.store(true, Ordering::Release);
         flush_pending_reveal(&pending, || {
             reveal_attempts.store(true, Ordering::Release);
             true

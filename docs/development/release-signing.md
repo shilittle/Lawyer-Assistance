@@ -16,6 +16,9 @@ release secret store，不得提交到仓库、Release 资产、日志或构建�
 
 在干净、已提交的 release commit 上设置凭据引用：
 
+Authenticode 证书必须安装在运行发布命令的账号的 `Cert:\CurrentUser\My`；该流程不从
+`LocalMachine\My` 选择证书。证书指纹中的显示空格会在完整预检后统一移除。
+
 ```powershell
 $env:LAWYER_ASSISTANCE_CODE_SIGNING_THUMBPRINT = "<CODE_SIGNING_CERT_THUMBPRINT>"
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "<UPDATER_KEY_PASSWORD>"
@@ -68,3 +71,48 @@ Use `scripts/release/release_preflight.ps1` with `Preflight`, then `Run`. Releas
 credentials must stay in an external secret store and must never be committed,
 uploaded, logged, or embedded in manifests. `Cleanup` removes only fixed build
 outputs and transient signing configuration.
+
+The stable workflow is intentionally fail closed. Preflight accepts only exact
+`0.4.0` on a clean, freshly fetched `main` where `HEAD == origin/main`, both
+required GitHub Actions workflows succeeded for that exact push commit, the
+immutable `v0.3.1` provenance is unchanged, and signing credentials, final legal
+resources, notices, and the RFC3161 endpoint are valid. The two new release tags
+must either both be absent before the build or both be annotated, immutable, and
+peel to exact `HEAD`.
+
+Install the Authenticode certificate in `Cert:\CurrentUser\My` for the account
+that runs the release. The workflow intentionally does not select certificates
+from `LocalMachine\My`; display whitespace in the thumbprint is normalized only
+by the complete production preflight used by both `Preflight` and `Run`.
+
+After the signed build, collect the exact three-platform MCP artifacts from the
+successful exact-HEAD workflow and assemble the frozen 12-item App allowlist:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File scripts\release\collect_exact_mcp_ci_assets.ps1 `
+  -ExpectedCommit <EXACT_40_CHARACTER_HEAD>
+```
+
+Only after both annotated tags already exist remotely at exact `HEAD`, create or
+resume a draft with literal allowlisted files. An equal remote asset is retained;
+a differing or unknown asset fails without replacement:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File scripts\release\publish_draft_release.ps1 `
+  -Kind App `
+  -AssetDirectory dist\release-v0.4.0\app-release-assets `
+  -NotesFile RELEASE_NOTES.md
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File scripts\release\verify_remote_release.ps1 `
+  -Kind App `
+  -LocalAssetDirectory dist\release-v0.4.0\app-release-assets
+```
+
+Run the same draft publication and remote-readback commands with `-Kind MinerU`
+and the final approved MinerU asset directory. These scripts never publish or
+promote a Release. Keep both Releases in draft until server readback, Windows
+10/11 clean-machine acceptance, final GPU qualification, and every external gate
+in the frozen release plan are complete.

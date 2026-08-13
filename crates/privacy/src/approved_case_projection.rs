@@ -570,14 +570,16 @@ impl PrivacyStore {
     /// Computes the v5 projection migration source fingerprint without
     /// decrypting the legacy full review blob. Projection, migration-ledger,
     /// generation-status and row-version fields are deliberately excluded so
-    /// crash recovery remains idempotent.
+    /// crash recovery remains idempotent. The v5-optional Vault reference
+    /// table is normalized by content, so its absence and the canonical empty
+    /// v6 table have the same fingerprint while every stored reference remains
+    /// source-bound. Callers must still enforce the exact v5/v6 schema gate.
     pub fn approved_projection_migration_source_fingerprint(
         connection: &Connection,
     ) -> Result<String, PrivacyStoreError> {
         let mut digest = Sha256::new();
         digest.update(b"LawyerAssistance/approved-case-projection-source/v1\0");
         append_table_presence(&mut digest, connection, "project_privacy_case_bindings")?;
-        append_table_presence(&mut digest, connection, "privacy_vault_material_refs")?;
 
         let mut statement = connection
             .prepare(
@@ -804,8 +806,6 @@ impl PrivacyStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| PrivacyStoreError::Database)?;
-        let (material_id, generation_number) =
-            load_projection_migration_block_target(&transaction, redaction_id)?;
         if let Some(existing) = load_projection_migration_ledger(&transaction, redaction_id)? {
             if existing
                 != (
@@ -813,6 +813,7 @@ impl PrivacyStore {
                     "blocked".to_owned(),
                     Some(error_code.to_owned()),
                 )
+                || !projection_migration_block_target_is_terminal(&transaction, redaction_id)?
             {
                 return Err(PrivacyStoreError::Conflict);
             }
@@ -821,6 +822,8 @@ impl PrivacyStore {
                 .map_err(|_| PrivacyStoreError::Database)?;
             return Ok(());
         }
+        let (material_id, generation_number) =
+            load_projection_migration_block_target(&transaction, redaction_id)?;
         transaction
             .execute(
                 "UPDATE case_material_selections
@@ -905,6 +908,39 @@ fn load_projection_migration_block_target(
                 u64::try_from(generation_number).map_err(|_| PrivacyStoreError::Database)?,
             ))
         })
+}
+
+fn projection_migration_block_target_is_terminal(
+    connection: &Connection,
+    redaction_id: &str,
+) -> Result<bool, PrivacyStoreError> {
+    connection
+        .query_row(
+            "SELECT
+                generation.generation_status='blocked'
+                AND generation.review_state='approved'
+                AND generation.revocation_state='active'
+                AND generation.revoked_at IS NULL
+                AND generation.approved_payload_schema_version IS NULL
+                AND generation.protected_approved_payload_blob IS NULL
+                AND generation.approved_payload_protection_scheme IS NULL
+                AND generation.approved_risk_revision_hash IS NULL
+                AND ledger.target_material_id=generation.material_id
+                AND ledger.target_redaction_id=generation.redaction_id
+                AND ledger.assigned_generation_number=generation.generation_number
+             FROM case_material_migration_ledger AS ledger
+             JOIN privacy_redactions AS generation
+               ON generation.redaction_id=ledger.source_key
+             WHERE ledger.migration_id=?1
+               AND ledger.source_store='privacy-workflow.sqlite'
+               AND ledger.source_table='privacy_redactions'
+               AND ledger.source_key=?2",
+            params![APPROVED_CASE_PROJECTION_MIGRATION_ID, redaction_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|_| PrivacyStoreError::Database)
+        .map(|matches| matches == Some(true))
 }
 
 #[derive(Debug)]
@@ -1444,6 +1480,12 @@ fn append_vault_source(
     digest: &mut Sha256,
     connection: &Connection,
 ) -> Result<(), PrivacyStoreError> {
+    // Canonical v5 permits this table to be absent, while v6 requires the
+    // canonical table even when it has no rows. Bind the content domain in
+    // both cases instead of treating authorized empty-table installation as a
+    // source mutation. A present table must still expose the exact columns
+    // below, and every real row is included in the digest.
+    append_len_prefixed(digest, b"privacy_vault_material_refs/canonical-rows/v1");
     if !table_exists(connection, "privacy_vault_material_refs")? {
         return Ok(());
     }
@@ -1711,6 +1753,66 @@ mod tests {
         assert_eq!(
             decode_canonical_payload(whitespace.as_bytes()),
             Err(PrivacyStoreError::Conflict)
+        );
+    }
+
+    #[test]
+    fn projection_source_normalizes_only_absent_and_canonical_empty_vault_refs() {
+        let mut connection = Connection::open_in_memory().expect("database");
+        PrivacyStore::initialize(&connection).expect("privacy schema");
+        ProjectPrivacyCaseBindingStore::initialize(&mut connection).expect("binding schema");
+
+        let absent = PrivacyStore::approved_projection_migration_source_fingerprint(&connection)
+            .expect("absent optional v5 Vault table fingerprint");
+        crate::initialize_privacy_vault_link_schema(&connection)
+            .expect("canonical empty v6 Vault table");
+        let canonical_empty =
+            PrivacyStore::approved_projection_migration_source_fingerprint(&connection)
+                .expect("canonical empty Vault table fingerprint");
+        assert_eq!(absent, canonical_empty);
+
+        PrivacyStore::register_material(
+            &connection,
+            &crate::RegisterPrivacyMaterial {
+                material_id: "material-vault-fingerprint",
+                project_id: None,
+                attachment_id: None,
+                source_sha256: &sha256_hex(b"vault fingerprint source"),
+                source_name_sha256: &sha256_hex(b"vault fingerprint source name"),
+                media_type: "application/pdf",
+                page_count: Some(1),
+            },
+        )
+        .expect("source material");
+        connection
+            .execute(
+                "INSERT INTO privacy_vault_material_refs(
+                    material_id,case_id,object_id,object_version,source_sha256,
+                    envelope_sha256,content_bytes,retention_expires_at_unix,
+                    retention_policy_revision,bound_at_unix,import_state
+                 ) VALUES(?1,?2,?3,1,?4,?5,1,2,1,1,'review_ready')",
+                params![
+                    "material-vault-fingerprint",
+                    "case_vault_fingerprint",
+                    "object-vault-fingerprint",
+                    sha256_hex(b"vault fingerprint source"),
+                    sha256_hex(b"vault fingerprint envelope"),
+                ],
+            )
+            .expect("valid Vault reference");
+        let one_row = PrivacyStore::approved_projection_migration_source_fingerprint(&connection)
+            .expect("one-row Vault fingerprint");
+        assert_ne!(canonical_empty, one_row);
+
+        connection
+            .execute_batch(
+                "DROP TABLE privacy_vault_material_refs;
+                 CREATE TABLE privacy_vault_material_refs(material_id TEXT PRIMARY KEY);",
+            )
+            .expect("drifted Vault schema");
+        assert_eq!(
+            PrivacyStore::approved_projection_migration_source_fingerprint(&connection),
+            Err(PrivacyStoreError::Database)
         );
     }
 

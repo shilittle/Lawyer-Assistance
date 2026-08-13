@@ -238,6 +238,16 @@ impl ProjectPrivacyCaseBindingStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_failed)?;
+        Self::initialize_in_transaction(&transaction)?;
+        transaction.commit().map_err(store_failed)
+    }
+
+    /// Installs and verifies the binding schema inside a caller-owned write
+    /// transaction. Coordinated migrations use this only after reauthenticating
+    /// their exact pre-binding state under the same `BEGIN IMMEDIATE` lock.
+    pub fn initialize_in_transaction(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), ProjectPrivacyCaseBindingError> {
         transaction
             .execute_batch(
                 "
@@ -371,10 +381,10 @@ impl ProjectPrivacyCaseBindingStore {
                 ",
             )
             .map_err(store_failed)?;
-        validate_schema_objects(&transaction)?;
-        validate_schema_contract(&transaction)?;
-        validate_all_bindings(&transaction)?;
-        transaction.commit().map_err(store_failed)
+        validate_schema_objects(transaction)?;
+        validate_schema_contract(transaction)?;
+        validate_all_bindings(transaction)?;
+        Ok(())
     }
 
     pub fn resolve(

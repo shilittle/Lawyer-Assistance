@@ -45,7 +45,7 @@ pub struct FileOperationResponse {
     pub restart_required: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PendingRestoreMarker {
     format_version: u8,
@@ -53,8 +53,66 @@ struct PendingRestoreMarker {
 }
 
 const PENDING_RESTORE_FORMAT_VERSION: u8 = 1;
+const MAX_PENDING_RESTORE_MARKER_BYTES: u64 = 4 * 1024;
 #[cfg(test)]
 const MAX_DATABASE_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingDatabaseRestorePhase {
+    /// Marker, active v11, and authenticated incoming v11 are present. No
+    /// rollback has been created yet.
+    Prepared,
+    /// The previous active database reached the rollback slot, while the
+    /// authenticated incoming database has not reached the active slot.
+    ActiveMovedToRollback,
+    /// The marker-bound replacement is active. The previous database may
+    /// still occupy the rollback slot until cleanup commits.
+    InstalledPendingCleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRestoreFileProof {
+    identity_sha256: String,
+    length: u64,
+    modified_unix_nanos: Option<u128>,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRestoreDatabaseProof {
+    file: PendingRestoreFileProof,
+    schema_manifest_sha256: String,
+    logical_database_manifest_sha256: String,
+    business_manifest_sha256: String,
+    case_assistant_pending_output_rows: u64,
+}
+
+/// Path-free, non-forgeable capability returned only after the complete
+/// legacy-user restore namespace has been authenticated read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingDatabaseRestoreGate {
+    phase: PendingDatabaseRestorePhase,
+    marker: PendingRestoreMarker,
+    marker_file: PendingRestoreFileProof,
+    incoming: Option<PendingRestoreDatabaseProof>,
+    active: Option<PendingRestoreDatabaseProof>,
+    rollback: Option<PendingRestoreDatabaseProof>,
+}
+
+impl PendingDatabaseRestoreGate {
+    #[cfg(test)]
+    pub(crate) const fn phase(&self) -> PendingDatabaseRestorePhase {
+        self.phase
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Keep the observed restore proof inline as one non-forgeable capability.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PendingDatabaseRestoreObservation {
+    Absent,
+    Authenticated(PendingDatabaseRestoreGate),
+}
 
 #[tauri::command]
 pub fn get_version_info(state: State<'_, AppState>) -> Result<VersionInfo, IpcError> {
@@ -301,69 +359,367 @@ fn stage_database_restore(source: &Path, destination: &Path) -> Result<(), IpcEr
     Ok(())
 }
 
-/// Applies a fully validated restore before any application database
-/// connection is created. The marker/backup protocol is restart-safe across
-/// every individual filesystem step.
-pub fn apply_pending_database_restore(app_local_data_dir: &Path) -> Result<(), IpcError> {
+/// Authenticates the complete legacy-user restore namespace without creating,
+/// repairing, deleting, renaming, or opening a writable SQLite connection.
+///
+/// An absent marker is accepted only when both mutation slots and every
+/// restore-namespaced sibling are also absent. A present marker must be the
+/// exact canonical JSON produced by the staging protocol and must describe one
+/// of the three frozen crash states below. Every database image is exact v11,
+/// sidecar-free, ordinary, single-link, stable, and lineage-safe before a gate
+/// can escape this module.
+pub(crate) fn observe_pending_database_restore_read_only(
+    app_local_data_dir: &Path,
+) -> Result<PendingDatabaseRestoreObservation, IpcError> {
     let destination = database::user_database_path(app_local_data_dir);
     let paths = restore_paths(&destination)?;
+    reject_unknown_restore_namespace_entries(&destination, &paths)?;
 
-    if !paths.marker.exists() {
-        if paths.incoming.exists() {
-            fs::remove_file(&paths.incoming).map_err(io_error)?;
+    let marker_present = restore_slot_present(&paths.marker)?;
+    let incoming_present = restore_slot_present(&paths.incoming)?;
+    let active_present = restore_slot_present(&destination)?;
+    let rollback_present = restore_slot_present(&paths.rollback)?;
+
+    if !marker_present {
+        if incoming_present || rollback_present {
+            return Err(restore_pending_error(
+                "an unmarked legacy-user restore mutation slot is present",
+            ));
         }
-        recover_or_remove_stale_rollback(&destination, &paths.rollback)?;
-        return Ok(());
+        return Ok(PendingDatabaseRestoreObservation::Absent);
     }
 
-    let marker: PendingRestoreMarker =
-        serde_json::from_slice(&fs::read(&paths.marker).map_err(io_error)?)
-            .map_err(|_| IpcError::new("restore_pending", "pending restore marker is invalid"))?;
-    if marker.format_version != PENDING_RESTORE_FORMAT_VERSION || marker.incoming_sha256.len() != 64
-    {
-        return Err(IpcError::new(
-            "restore_pending",
-            "pending restore marker version or digest is invalid",
+    let (marker, marker_file) = read_canonical_pending_restore_marker(&paths.marker)?;
+    let phase = match (incoming_present, active_present, rollback_present) {
+        (true, true, false) => PendingDatabaseRestorePhase::Prepared,
+        (true, false, true) => PendingDatabaseRestorePhase::ActiveMovedToRollback,
+        (false, true, _) => PendingDatabaseRestorePhase::InstalledPendingCleanup,
+        _ => {
+            return Err(restore_pending_error(
+                "the legacy-user restore slots do not match a complete crash state",
+            ))
+        }
+    };
+
+    let incoming = incoming_present
+        .then(|| observe_current_restore_database(&paths.incoming, "incoming"))
+        .transpose()?;
+    let active = active_present
+        .then(|| observe_current_restore_database(&destination, "active"))
+        .transpose()?;
+    let rollback = rollback_present
+        .then(|| observe_current_restore_database(&paths.rollback, "rollback"))
+        .transpose()?;
+
+    let installed = match phase {
+        PendingDatabaseRestorePhase::Prepared
+        | PendingDatabaseRestorePhase::ActiveMovedToRollback => incoming.as_ref(),
+        PendingDatabaseRestorePhase::InstalledPendingCleanup => active.as_ref(),
+    }
+    .ok_or_else(|| restore_pending_error("the marker-bound restore image is absent"))?;
+    if installed.file.sha256 != marker.incoming_sha256 {
+        return Err(restore_pending_error(
+            "the marker-bound restore image digest does not match canonical evidence",
         ));
     }
+
+    if legacy_restore_database_proofs_have_unified_lineage(&incoming, &active, &rollback) {
+        return Err(IpcError::new(
+            "application_restore_requires_five_components",
+            "A legacy user-database restore cannot replace or install case-assistant pending-output lineage. Restore an authenticated five-component backup instead.",
+        ));
+    }
+
+    // This probe is deliberately part of observation. It cannot create a
+    // manager or mutate storage, and it prevents a single-database restore
+    // from severing already-unified Privacy/Vault/application lineage.
     super::application_backup::ensure_standalone_restore_is_lineage_safe(app_local_data_dir)
         .map_err(|error| IpcError::new(error.error_type, error.message))?;
 
-    if paths.incoming.exists() {
-        if file_sha256(&paths.incoming)? != marker.incoming_sha256 {
-            return Err(IpcError::new(
-                "restore_pending",
-                "pending restore copy digest does not match its marker",
-            ));
+    Ok(PendingDatabaseRestoreObservation::Authenticated(
+        PendingDatabaseRestoreGate {
+            phase,
+            marker,
+            marker_file,
+            incoming,
+            active,
+            rollback,
+        },
+    ))
+}
+
+fn legacy_restore_database_proofs_have_unified_lineage(
+    incoming: &Option<PendingRestoreDatabaseProof>,
+    active: &Option<PendingRestoreDatabaseProof>,
+    rollback: &Option<PendingRestoreDatabaseProof>,
+) -> bool {
+    [incoming, active, rollback]
+        .into_iter()
+        .flatten()
+        .any(|proof| proof.case_assistant_pending_output_rows != 0)
+}
+
+/// Applies only the exact path-free capability returned by the read-only
+/// observer. The whole namespace is re-observed and compared byte-for-byte at
+/// the proof layer immediately before the first filesystem mutation.
+pub(crate) fn apply_observed_pending_database_restore(
+    app_local_data_dir: &Path,
+    gate: &PendingDatabaseRestoreGate,
+) -> Result<(), IpcError> {
+    match observe_pending_database_restore_read_only(app_local_data_dir)? {
+        PendingDatabaseRestoreObservation::Authenticated(observed) if &observed == gate => {}
+        PendingDatabaseRestoreObservation::Absent
+        | PendingDatabaseRestoreObservation::Authenticated(_) => {
+            return Err(restore_pending_error(
+                "legacy-user restore evidence changed after process-start observation",
+            ))
         }
-        database::validate_user_database_read_only(&paths.incoming)?;
-        recover_or_remove_stale_rollback(&destination, &paths.rollback)?;
-        crate::atomic_file::install(
-            &paths.incoming,
-            &destination,
-            destination.exists().then_some(paths.rollback.as_path()),
-        )
-        .map_err(io_error)?;
-    } else if !destination.exists() || file_sha256(&destination)? != marker.incoming_sha256 {
-        rollback_pending_restore(&destination, &paths)?;
-        return Err(IpcError::new(
-            "restore_pending",
-            "interrupted restore did not leave the validated replacement in place",
+    }
+
+    let destination = database::user_database_path(app_local_data_dir);
+    let paths = restore_paths(&destination)?;
+    let expected_active = match gate.phase {
+        PendingDatabaseRestorePhase::Prepared => {
+            crate::atomic_file::install(
+                &paths.incoming,
+                &destination,
+                Some(paths.rollback.as_path()),
+            )
+            .map_err(io_error)?;
+            gate.incoming.as_ref()
+        }
+        PendingDatabaseRestorePhase::ActiveMovedToRollback => {
+            crate::atomic_file::install(&paths.incoming, &destination, None).map_err(io_error)?;
+            gate.incoming.as_ref()
+        }
+        PendingDatabaseRestorePhase::InstalledPendingCleanup => gate.active.as_ref(),
+    }
+    .ok_or_else(|| restore_pending_error("the authenticated replacement proof is absent"))?;
+
+    let active = observe_current_restore_database(&destination, "installed active")?;
+    if &active != expected_active || active.file.sha256 != gate.marker.incoming_sha256 {
+        return Err(restore_pending_error(
+            "the installed restore image does not match its authenticated gate",
         ));
     }
 
-    if let Err(error) = database::validate_user_database_read_only(&destination) {
-        rollback_pending_restore(&destination, &paths)?;
-        return Err(IpcError::new(
-            "restore_pending",
-            format!("restored database failed final validation: {error}"),
+    let expected_rollback = match gate.phase {
+        PendingDatabaseRestorePhase::Prepared => gate.active.as_ref(),
+        PendingDatabaseRestorePhase::ActiveMovedToRollback
+        | PendingDatabaseRestorePhase::InstalledPendingCleanup => gate.rollback.as_ref(),
+    };
+    if let Some(expected) = expected_rollback {
+        let rollback = observe_current_restore_database(&paths.rollback, "rollback cleanup")?;
+        if &rollback != expected {
+            return Err(restore_pending_error(
+                "the restore rollback slot changed before authenticated cleanup",
+            ));
+        }
+    }
+    let (marker, marker_file) = read_canonical_pending_restore_marker(&paths.marker)?;
+    if marker != gate.marker || marker_file != gate.marker_file {
+        return Err(restore_pending_error(
+            "the pending restore marker changed before authenticated cleanup",
         ));
     }
+
+    // Rollback is removed before the marker. A crash after this deletion is
+    // the final authenticated crash state and is resumed without another swap.
+    if gate.rollback.is_some() || gate.phase == PendingDatabaseRestorePhase::Prepared {
+        fs::remove_file(&paths.rollback).map_err(io_error)?;
+    }
     fs::remove_file(&paths.marker).map_err(io_error)?;
-    if paths.rollback.exists() {
-        let _ = fs::remove_file(&paths.rollback);
+    Ok(())
+}
+
+fn restore_pending_error(message: impl Into<String>) -> IpcError {
+    IpcError::new("restore_pending", message)
+}
+
+fn restore_slot_present(path: &Path) -> Result<bool, IpcError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(error)),
+    }
+}
+
+fn reject_unknown_restore_namespace_entries(
+    destination: &Path,
+    paths: &RestorePaths,
+) -> Result<(), IpcError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| IpcError::new("validation", "database path has no parent directory"))?;
+    let database_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| IpcError::new("validation", "database path has an invalid filename"))?;
+    let ordinary_prefix = format!("{database_name}.restore-");
+    let temporary_prefix = format!(".{database_name}.restore-");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let path = entry.path();
+        if path == paths.incoming || path == paths.marker || path == paths.rollback {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let normalized_name = name.to_ascii_lowercase();
+        if normalized_name.starts_with(&ordinary_prefix)
+            || normalized_name.starts_with(&temporary_prefix)
+        {
+            return Err(restore_pending_error(
+                "an unknown legacy-user restore sibling is present",
+            ));
+        }
     }
     Ok(())
+}
+
+fn read_canonical_pending_restore_marker(
+    marker_path: &Path,
+) -> Result<(PendingRestoreMarker, PendingRestoreFileProof), IpcError> {
+    let before = observe_fixed_restore_file(marker_path, "pending restore marker")?;
+    if before.length == 0 || before.length > MAX_PENDING_RESTORE_MARKER_BYTES {
+        return Err(restore_pending_error(
+            "the pending restore marker length is invalid",
+        ));
+    }
+    let mut file = File::open(marker_path).map_err(io_error)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_PENDING_RESTORE_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    drop(file);
+    let after = observe_fixed_restore_file(marker_path, "pending restore marker")?;
+    if before != after
+        || u64::try_from(bytes.len()).ok() != Some(before.length)
+        || sha256_bytes(&bytes) != before.sha256
+    {
+        return Err(restore_pending_error(
+            "the pending restore marker changed during read-only observation",
+        ));
+    }
+    let marker: PendingRestoreMarker = serde_json::from_slice(&bytes)
+        .map_err(|_| restore_pending_error("the pending restore marker is invalid"))?;
+    if marker.format_version != PENDING_RESTORE_FORMAT_VERSION
+        || !is_lowercase_sha256(&marker.incoming_sha256)
+    {
+        return Err(restore_pending_error(
+            "the pending restore marker version or digest is invalid",
+        ));
+    }
+    let canonical = serde_json::to_vec(&marker)
+        .map_err(|_| restore_pending_error("the pending restore marker cannot be canonicalized"))?;
+    if canonical != bytes {
+        return Err(restore_pending_error(
+            "the pending restore marker is not canonical and complete",
+        ));
+    }
+    Ok((marker, before))
+}
+
+fn observe_current_restore_database(
+    path: &Path,
+    role: &str,
+) -> Result<PendingRestoreDatabaseProof, IpcError> {
+    let (proof, ()) =
+        database::with_validated_user_database_migration_source_read_only(path, |_| ()).map_err(
+            |_| {
+                restore_pending_error(format!(
+                    "the {role} legacy-user restore database is not an exact stable source"
+                ))
+            },
+        )?;
+    if proof.schema != database::ValidatedUserSourceSchema::CurrentV11
+        || proof.wal.is_some()
+        || proof.shm.is_some()
+        || proof.journal.is_some()
+    {
+        return Err(restore_pending_error(format!(
+            "the {role} legacy-user restore database is not sidecar-free exact current schema"
+        )));
+    }
+    let case_assistant_pending_output_rows = proof
+        .tables
+        .iter()
+        .find(|table| table.table == "case_assistant_pending_outputs")
+        .map(|table| table.rows)
+        .ok_or_else(|| {
+            restore_pending_error(format!(
+                "the {role} legacy-user restore database lacks current lineage evidence"
+            ))
+        })?;
+    Ok(PendingRestoreDatabaseProof {
+        file: PendingRestoreFileProof {
+            identity_sha256: proof.database_file.identity_sha256,
+            length: proof.database_file.length,
+            modified_unix_nanos: proof.database_file.modified_unix_nanos,
+            sha256: proof.database_file.sha256,
+        },
+        schema_manifest_sha256: proof.schema_manifest_sha256,
+        logical_database_manifest_sha256: proof.logical_database_manifest_sha256,
+        business_manifest_sha256: proof.business_manifest_sha256,
+        case_assistant_pending_output_rows,
+    })
+}
+
+fn observe_fixed_restore_file(
+    path: &Path,
+    role: &str,
+) -> Result<PendingRestoreFileProof, IpcError> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(restore_pending_error(format!(
+            "the {role} is not an ordinary fixed file"
+        )));
+    }
+    let information = windows_file_information(path).map_err(io_error)?;
+    if information.nNumberOfLinks != 1
+        || information.dwFileAttributes
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    {
+        return Err(restore_pending_error(format!(
+            "the {role} is linked or reparse-backed"
+        )));
+    }
+    let mut identity = Sha256::new();
+    identity.update(b"lawyer-assistance-legacy-user-restore-file-identity-v1\0");
+    identity.update(information.dwVolumeSerialNumber.to_be_bytes());
+    identity.update(information.nFileIndexHigh.to_be_bytes());
+    identity.update(information.nFileIndexLow.to_be_bytes());
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Ok(PendingRestoreFileProof {
+        identity_sha256: format!("{:x}", identity.finalize()),
+        length: metadata.len(),
+        modified_unix_nanos,
+        sha256: file_sha256(path)?,
+    })
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
 }
 
 struct RestorePaths {
@@ -454,6 +810,13 @@ pub(crate) fn paths_refer_to_same_file(first: &Path, second: &Path) -> bool {
 }
 
 fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    let information = windows_file_information(path)?;
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+fn windows_file_information(path: &Path) -> std::io::Result<BY_HANDLE_FILE_INFORMATION> {
     let wide = path
         .as_os_str()
         .encode_wide()
@@ -481,44 +844,7 @@ fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
     if succeeded == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Ok((information.dwVolumeSerialNumber, file_index))
-}
-
-fn recover_or_remove_stale_rollback(destination: &Path, rollback: &Path) -> Result<(), IpcError> {
-    if !rollback.exists() {
-        return Ok(());
-    }
-    if destination.exists() && database::validate_user_database_read_only(destination).is_ok() {
-        fs::remove_file(rollback).map_err(io_error)?;
-    } else if !destination.exists() {
-        fs::rename(rollback, destination).map_err(io_error)?;
-    } else {
-        restore_previous_database(destination, rollback)?;
-    }
-    Ok(())
-}
-
-fn rollback_pending_restore(destination: &Path, paths: &RestorePaths) -> Result<(), IpcError> {
-    if paths.rollback.exists() {
-        restore_previous_database(destination, &paths.rollback)?;
-    }
-    let _ = fs::remove_file(&paths.incoming);
-    let _ = fs::remove_file(&paths.marker);
-    Ok(())
-}
-
-fn restore_previous_database(destination: &Path, rollback: &Path) -> Result<(), IpcError> {
-    if destination.exists() {
-        let failed = unique_sibling(destination, "restore-failed")?;
-        crate::atomic_file::install(rollback, destination, Some(&failed)).map_err(io_error)?;
-        let _ = fs::remove_file(failed);
-    } else {
-        fs::rename(rollback, destination).map_err(io_error)?;
-    }
-    database::validate_user_database_read_only(destination)?;
-    Ok(())
+    Ok(information)
 }
 fn io_error(error: std::io::Error) -> IpcError {
     IpcError::new("io", error.to_string())
@@ -545,6 +871,72 @@ pub fn sanitize_diagnostic_text(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Debug, PartialEq, Eq)]
+    struct RestoreTreeEntrySnapshot {
+        name: Vec<u16>,
+        is_file: bool,
+        is_directory: bool,
+        is_symlink: bool,
+        length: u64,
+        modified: Option<std::time::SystemTime>,
+        bytes: Option<Vec<u8>>,
+    }
+
+    fn restore_tree_snapshot(root: &Path) -> Vec<RestoreTreeEntrySnapshot> {
+        let mut entries = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                RestoreTreeEntrySnapshot {
+                    name: entry.file_name().encode_wide().collect(),
+                    is_file: metadata.is_file(),
+                    is_directory: metadata.is_dir(),
+                    is_symlink: metadata.file_type().is_symlink(),
+                    length: metadata.len(),
+                    modified: metadata.modified().ok(),
+                    bytes: metadata.is_file().then(|| fs::read(entry.path()).unwrap()),
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
+    }
+
+    fn observe_without_mutation(
+        app_root: &Path,
+    ) -> Result<PendingDatabaseRestoreObservation, IpcError> {
+        let before = restore_tree_snapshot(app_root);
+        let result = observe_pending_database_restore_read_only(app_root);
+        assert_eq!(restore_tree_snapshot(app_root), before);
+        result
+    }
+
+    fn stage_current_restore(
+        app_root: &Path,
+    ) -> (PathBuf, RestorePaths, PendingDatabaseRestoreGate) {
+        let active = database::ensure_user_database(app_root).unwrap();
+        let backup = app_root.join("legacy-user-backup.sqlite");
+        backup_database(&active, &backup, &[&active]).unwrap();
+        stage_database_restore(&backup, &active).unwrap();
+        let paths = restore_paths(&active).unwrap();
+        let PendingDatabaseRestoreObservation::Authenticated(gate) =
+            observe_without_mutation(app_root).unwrap()
+        else {
+            panic!("staged restore must authenticate");
+        };
+        (active, paths, gate)
+    }
+
+    fn observe_and_apply_pending_database_restore(app_root: &Path) -> Result<(), IpcError> {
+        match observe_pending_database_restore_read_only(app_root)? {
+            PendingDatabaseRestoreObservation::Absent => Ok(()),
+            PendingDatabaseRestoreObservation::Authenticated(gate) => {
+                apply_observed_pending_database_restore(app_root, &gate)
+            }
+        }
+    }
+
     #[test]
     fn plaintext_user_database_backup_is_disabled() {
         let error = require_protected_database_backup().unwrap_err();
@@ -808,7 +1200,8 @@ mod tests {
                 "online restore never swaps the active database"
             );
         }
-        apply_pending_database_restore(directory.path()).expect("startup applies restore");
+        observe_and_apply_pending_database_restore(directory.path())
+            .expect("startup applies restore");
         let connection = database::open_user_database(&active).expect("restored opens");
         assert_eq!(
             database::list_case_projects(&connection).unwrap()[0].title,
@@ -914,11 +1307,223 @@ mod tests {
         assert!(paths.marker.exists());
         assert!(paths.rollback.exists());
 
-        apply_pending_database_restore(directory.path()).unwrap();
+        observe_and_apply_pending_database_restore(directory.path()).unwrap();
 
         assert!(!paths.marker.exists());
         assert!(!paths.rollback.exists());
         database::validate_and_migrate_user_database(&active).unwrap();
+    }
+
+    #[test]
+    fn legacy_restore_observer_authenticates_every_frozen_crash_state_without_writes() {
+        for phase in [
+            PendingDatabaseRestorePhase::Prepared,
+            PendingDatabaseRestorePhase::ActiveMovedToRollback,
+            PendingDatabaseRestorePhase::InstalledPendingCleanup,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (active, paths, _) = stage_current_restore(directory.path());
+            match phase {
+                PendingDatabaseRestorePhase::Prepared => {}
+                PendingDatabaseRestorePhase::ActiveMovedToRollback => {
+                    fs::rename(&active, &paths.rollback).unwrap();
+                }
+                PendingDatabaseRestorePhase::InstalledPendingCleanup => {
+                    crate::atomic_file::install(&paths.incoming, &active, Some(&paths.rollback))
+                        .unwrap();
+                }
+            }
+
+            let PendingDatabaseRestoreObservation::Authenticated(gate) =
+                observe_without_mutation(directory.path()).unwrap()
+            else {
+                panic!("crash state must authenticate");
+            };
+            assert_eq!(gate.phase(), phase);
+            apply_observed_pending_database_restore(directory.path(), &gate).unwrap();
+            assert!(!paths.marker.exists());
+            assert!(!paths.incoming.exists());
+            assert!(!paths.rollback.exists());
+            database::validate_user_database_read_only(&active).unwrap();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (active, paths, _) = stage_current_restore(directory.path());
+        crate::atomic_file::install(&paths.incoming, &active, Some(&paths.rollback)).unwrap();
+        fs::remove_file(&paths.rollback).unwrap();
+        let PendingDatabaseRestoreObservation::Authenticated(gate) =
+            observe_without_mutation(directory.path()).unwrap()
+        else {
+            panic!("post-rollback-cleanup crash state must authenticate");
+        };
+        assert_eq!(
+            gate.phase(),
+            PendingDatabaseRestorePhase::InstalledPendingCleanup
+        );
+        apply_observed_pending_database_restore(directory.path(), &gate).unwrap();
+        assert!(!paths.marker.exists());
+        assert!(!paths.rollback.exists());
+        database::validate_user_database_read_only(&active).unwrap();
+    }
+
+    #[test]
+    fn legacy_restore_observer_rejects_noncanonical_and_tampered_markers_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, paths, _) = stage_current_restore(directory.path());
+        let mut bytes = fs::read(&paths.marker).unwrap();
+        bytes.push(b'\n');
+        fs::write(&paths.marker, bytes).unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("noncanonical marker must fail closed");
+        assert_eq!(error.error_type, "restore_pending");
+
+        let directory = tempfile::tempdir().unwrap();
+        let (_, paths, _) = stage_current_restore(directory.path());
+        let mut marker: PendingRestoreMarker =
+            serde_json::from_slice(&fs::read(&paths.marker).unwrap()).unwrap();
+        marker.incoming_sha256 = "A".repeat(64);
+        fs::write(&paths.marker, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("non-lowercase digest must fail closed");
+        assert_eq!(error.error_type, "restore_pending");
+    }
+
+    #[test]
+    fn legacy_restore_apply_reobserves_marker_and_incoming_proofs_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (active, paths, gate) = stage_current_restore(directory.path());
+        let alternate_root = tempfile::tempdir().unwrap();
+        let alternate = database::ensure_user_database(alternate_root.path()).unwrap();
+        {
+            let connection = database::open_user_database(&alternate).unwrap();
+            database::upsert_case_project(
+                &connection,
+                &database::CaseProjectRow {
+                    project_id: "gate-drift-project".to_owned(),
+                    title: "Gate drift".to_owned(),
+                    case_type: "civil".to_owned(),
+                    status: "active".to_owned(),
+                    opened_on: None,
+                    summary: String::new(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+            )
+            .unwrap();
+        }
+        fs::copy(&alternate, &paths.incoming).unwrap();
+        let mut marker: PendingRestoreMarker =
+            serde_json::from_slice(&fs::read(&paths.marker).unwrap()).unwrap();
+        marker.incoming_sha256 = file_sha256(&paths.incoming).unwrap();
+        fs::write(&paths.marker, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let before_apply = restore_tree_snapshot(directory.path());
+        let error = apply_observed_pending_database_restore(directory.path(), &gate)
+            .expect_err("a stale opaque gate must not authorize mutation");
+        assert_eq!(error.error_type, "restore_pending");
+        assert_eq!(restore_tree_snapshot(directory.path()), before_apply);
+        assert!(active.exists());
+        assert!(paths.incoming.exists());
+        assert!(!paths.rollback.exists());
+    }
+
+    #[test]
+    fn legacy_restore_observer_rejects_unmarked_and_mixed_residue_without_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, paths, _) = stage_current_restore(directory.path());
+        fs::remove_file(&paths.marker).unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("unmarked incoming residue must fail closed");
+        assert_eq!(error.error_type, "restore_pending");
+        assert!(paths.incoming.exists());
+
+        let directory = tempfile::tempdir().unwrap();
+        let (active, paths, _) = stage_current_restore(directory.path());
+        fs::copy(&active, &paths.rollback).unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("active + incoming + rollback is not an atomic crash state");
+        assert_eq!(error.error_type, "restore_pending");
+        assert!(paths.marker.exists());
+        assert!(paths.incoming.exists());
+        assert!(paths.rollback.exists());
+
+        let directory = tempfile::tempdir().unwrap();
+        let (active, paths, _) = stage_current_restore(directory.path());
+        fs::remove_file(&active).unwrap();
+        fs::remove_file(&paths.incoming).unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("marker-only partial state must fail closed");
+        assert_eq!(error.error_type, "restore_pending");
+        assert!(paths.marker.exists());
+    }
+
+    #[test]
+    fn legacy_restore_observer_rejects_unknown_restore_siblings_without_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, _, _) = stage_current_restore(directory.path());
+        let unknown = directory.path().join("user.sqlite.restore-surprise");
+        fs::write(&unknown, b"unknown").unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("unknown restore namespace sibling must fail closed");
+        assert_eq!(error.error_type, "restore_pending");
+        assert_eq!(fs::read(unknown).unwrap(), b"unknown");
+    }
+
+    #[test]
+    fn legacy_restore_observer_rejects_hardlinked_marker_and_incoming_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (_, paths, _) = stage_current_restore(directory.path());
+        let marker_alias = outside.path().join("marker-alias");
+        fs::hard_link(&paths.marker, &marker_alias).unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("a hardlinked marker must fail closed");
+        assert_eq!(error.error_type, "restore_pending");
+        assert_eq!(
+            fs::read(&marker_alias).unwrap(),
+            fs::read(&paths.marker).unwrap()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (_, paths, _) = stage_current_restore(directory.path());
+        let incoming_alias = outside.path().join("incoming-alias");
+        fs::hard_link(&paths.incoming, &incoming_alias).unwrap();
+        let error = observe_without_mutation(directory.path())
+            .expect_err("a hardlinked incoming database must fail closed");
+        assert_eq!(error.error_type, "restore_pending");
+        assert_eq!(
+            fs::read(&incoming_alias).unwrap(),
+            fs::read(&paths.incoming).unwrap()
+        );
+    }
+
+    #[test]
+    fn every_legacy_restore_database_slot_participates_in_unified_lineage_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, _, gate) = stage_current_restore(directory.path());
+        let clean = gate.active.clone().unwrap();
+        for slot in 0..3 {
+            let mut incoming = None;
+            let mut active = None;
+            let mut rollback = None;
+            let mut unified = clean.clone();
+            unified.case_assistant_pending_output_rows = 1;
+            match slot {
+                0 => incoming = Some(unified),
+                1 => active = Some(unified),
+                2 => rollback = Some(unified),
+                _ => unreachable!(),
+            }
+            assert!(legacy_restore_database_proofs_have_unified_lineage(
+                &incoming, &active, &rollback
+            ));
+        }
+        assert!(!legacy_restore_database_proofs_have_unified_lineage(
+            &None,
+            &Some(clean),
+            &None,
+        ));
     }
 
     #[test]
@@ -957,7 +1562,7 @@ mod tests {
             .unwrap();
         let paths = restore_paths(&active).unwrap();
 
-        let error = apply_pending_database_restore(directory.path())
+        let error = observe_without_mutation(directory.path())
             .expect_err("single-database restore must fail closed for unified lineage");
         assert_eq!(
             error.error_type,

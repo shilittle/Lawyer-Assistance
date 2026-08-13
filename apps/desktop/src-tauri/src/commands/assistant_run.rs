@@ -1894,6 +1894,31 @@ pub fn recover_interrupted_assistant_runs(
     Ok(recovered)
 }
 
+pub(crate) fn pending_assistant_run_recovery_counts_read_only(
+    user_database_path: &Path,
+) -> Result<(u64, u64), AssistantIpcError> {
+    let connection = database::open_user_database_read_only(user_database_path)?;
+    database::validate_open_user_database(&connection)?;
+    let pending_runs: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM agent_runs WHERE status IN ('queued','running')",
+        [],
+        |row| row.get(0),
+    )?;
+    let pending_tools: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM tool_calls WHERE status IN ('queued','running')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((
+        u64::try_from(pending_runs).map_err(|_| {
+            AssistantIpcError::new("assistant_recovery", "pending run count is invalid")
+        })?,
+        u64::try_from(pending_tools).map_err(|_| {
+            AssistantIpcError::new("assistant_recovery", "pending tool count is invalid")
+        })?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

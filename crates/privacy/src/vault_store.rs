@@ -460,6 +460,22 @@ pub struct VaultReadOnlyInventoryV1 {
     pub object_root_entry_count: u64,
 }
 
+/// WAL-aware semantic and durable-source proof for the current Vault database.
+/// The proof is computed from the same private read-only snapshot mechanism as
+/// startup inventory inspection, so no source WAL/SHM read mark is mutated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultDatabaseReadOnlyManifestV1 {
+    pub schema_version: u32,
+    pub schema_sha256: String,
+    pub database_sha256: String,
+    pub wal_sha256: Option<String>,
+    pub schema_object_count: u64,
+    pub metadata_rows: u64,
+    pub business_rows: u64,
+    pub journal_row_count: u64,
+    pub committed_object_count: u64,
+}
+
 impl VaultReadOnlyInventoryV1 {
     pub fn is_empty(self) -> bool {
         self.journal_row_count == 0
@@ -563,6 +579,91 @@ impl VaultStore {
         })
     }
 
+    /// Authenticates the exact current schema and semantic row counts from a
+    /// WAL-aware private snapshot while binding the durable main/WAL source
+    /// bytes. SQLite SHM is intentionally excluded because it contains only
+    /// volatile lock and read-mark state.
+    pub fn inspect_database_manifest_read_only(
+        &self,
+    ) -> Result<VaultDatabaseReadOnlyManifestV1, VaultStoreError> {
+        let source_before = capture_read_only_database_source_proof(&self.root)?;
+        let semantic = with_database_read_only_snapshot(&self.root, |db| {
+            validate_database_integrity(db)?;
+            let (vault_meta_rows, schema_version, workspace): (i64, i64, String) = db
+                .query_row(
+                    "SELECT COUNT(*),MIN(schema_version),MIN(workspace_instance_id) FROM vault_meta",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            let (lifecycle_meta_rows, lifecycle_schema_version): (i64, i64) = db
+                .query_row(
+                    "SELECT COUNT(*),MIN(schema_version) FROM vault_lifecycle_meta",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            if vault_meta_rows != 1
+                || schema_version != i64::from(VAULT_STORE_SCHEMA_VERSION)
+                || workspace != self.workspace_instance_id.as_str()
+                || lifecycle_meta_rows != 1
+                || lifecycle_schema_version != i64::from(VAULT_LIFECYCLE_SCHEMA_VERSION)
+            {
+                return Err(VaultStoreError::ContentCorrupt);
+            }
+
+            let schema = current_database_schema_objects(db)?;
+            let schema_sha256 = sha256_hex(
+                &canonical_json_v1(&schema).map_err(|_| VaultStoreError::ContentCorrupt)?,
+            );
+            let mut business_rows = 0_u64;
+            for table in [
+                "object_journal",
+                "nonce_reservations",
+                "vault_object_retention",
+                "vault_cleanup_journal",
+                "vault_cleanup_candidates",
+            ] {
+                let count: i64 = db
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|_| VaultStoreError::DatabaseFailed)?;
+                business_rows = business_rows
+                    .checked_add(u64::try_from(count).map_err(|_| VaultStoreError::ContentCorrupt)?)
+                    .ok_or(VaultStoreError::ContentCorrupt)?;
+            }
+            let (journal_rows, committed_objects): (i64, i64) = db
+                .query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(state='committed'),0) FROM object_journal",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            Ok((
+                schema_sha256,
+                u64::try_from(schema.len()).map_err(|_| VaultStoreError::ContentCorrupt)?,
+                business_rows,
+                u64::try_from(journal_rows).map_err(|_| VaultStoreError::ContentCorrupt)?,
+                u64::try_from(committed_objects).map_err(|_| VaultStoreError::ContentCorrupt)?,
+            ))
+        })?;
+        if capture_read_only_database_source_proof(&self.root)? != source_before {
+            return Err(VaultStoreError::DatabaseFailed);
+        }
+        Ok(VaultDatabaseReadOnlyManifestV1 {
+            schema_version: VAULT_STORE_SCHEMA_VERSION,
+            schema_sha256: semantic.0,
+            database_sha256: source_before.database_sha256,
+            wal_sha256: source_before.wal_sha256,
+            schema_object_count: semantic.1,
+            metadata_rows: 2,
+            business_rows: semantic.2,
+            journal_row_count: semantic.3,
+            committed_object_count: semantic.4,
+        })
+    }
+
     pub fn isolation_status(&self) -> Result<VaultIsolationStatusV1, VaultStoreError> {
         let private_acl_enforced = verify_vault_private_acl(&self.root.root)?;
         let content_indexing_disabled = platform::content_indexing_disabled(&self.root.root)?;
@@ -612,7 +713,14 @@ impl VaultStore {
     /// held only in zeroizing object buffers and is dropped before this method returns.
     pub fn verify_all_committed_objects(&self) -> Result<u64, VaultStoreError> {
         let db = open_database(&self.root)?;
-        validate_database_integrity(&db)?;
+        self.verify_all_committed_objects_with_database(&db)
+    }
+
+    pub(crate) fn verify_all_committed_objects_with_database(
+        &self,
+        db: &Connection,
+    ) -> Result<u64, VaultStoreError> {
+        self.validate_application_restore_database_with_connection(db)?;
         let mut statement = db
             .prepare(
                 "SELECT case_id,object_id,version FROM object_journal
@@ -634,7 +742,7 @@ impl VaultStore {
             let case = CaseId::parse(case).map_err(|_| VaultStoreError::ContentCorrupt)?;
             let object = ObjectId::parse(object).map_err(|_| VaultStoreError::ContentCorrupt)?;
             let version = u64::try_from(version).map_err(|_| VaultStoreError::ContentCorrupt)?;
-            let decrypted = self.read_object(&case, &object, version)?;
+            let decrypted = self.read_object_with_database(db, &case, &object, version)?;
             drop(decrypted);
             count = count
                 .checked_add(1)
@@ -643,6 +751,37 @@ impl VaultStore {
         drop(statement);
         verify_all_case_key_files(self)?;
         Ok(count)
+    }
+
+    pub(crate) fn validate_application_restore_database_with_connection(
+        &self,
+        db: &Connection,
+    ) -> Result<(), VaultStoreError> {
+        validate_database_integrity(db)?;
+        let (version, workspace): (u32, String) = db
+            .query_row(
+                "SELECT schema_version,workspace_instance_id
+                 FROM vault_meta WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        if !matches!(version, 1 | VAULT_STORE_SCHEMA_VERSION)
+            || workspace != self.workspace_instance_id.as_str()
+        {
+            return Err(VaultStoreError::ContentCorrupt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_encrypted_backup_read_only_snapshot<T, E>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<VaultStoreError>,
+    {
+        with_database_read_only_snapshot(&self.root, operation)
     }
 
     pub(crate) fn verify_case_key_for_backup(
@@ -929,6 +1068,16 @@ impl VaultStore {
             return Err(VaultStoreError::InvalidInput);
         }
         let db = open_database(&self.root)?;
+        self.read_object_with_database(&db, case_id, object_id, version)
+    }
+
+    fn read_object_with_database(
+        &self,
+        db: &Connection,
+        case_id: &CaseId,
+        object_id: &ObjectId,
+        version: u64,
+    ) -> Result<DecryptedVaultObjectV1, VaultStoreError> {
         let version_sql = sql_i64(version)?;
         let row: Option<(String, String, String, String, Option<String>)> = db
             .query_row(
@@ -1165,19 +1314,104 @@ impl VaultStore {
             return self.load_case_key(case_id);
         }
 
-        // A missing key is never interpreted as an invitation to rotate it silently. If any
-        // journal record exists for the case, replacement would make prior ciphertext
-        // permanently unreadable and could hide key-loss incidents.
+        // A missing key is never interpreted as an invitation to rotate it silently while any
+        // object can still require the old key. The sole safe exception is a quarantined object
+        // whose one cleanup candidate and owning cleanup journal are both immutable `purged`
+        // history: its ciphertext and key were deliberately destroyed by that completed cleanup.
+        // Any prepared/committed object, unfinished quarantined cleanup, duplicate/missing
+        // candidate evidence, or unknown state remains a fail-closed key-loss incident.
         let db = open_database(&self.root)?;
-        let object_count: i64 = db
+        let objects_requiring_existing_key: i64 = db
             .query_row(
-                "SELECT COUNT(*) FROM object_journal WHERE case_id=?1",
+                "SELECT COUNT(*)
+                 FROM object_journal AS object
+                 WHERE object.case_id=?1
+                   AND NOT(
+                     object.state='quarantined'
+                     AND (
+                       SELECT COUNT(*)
+                       FROM vault_cleanup_candidates AS candidate
+                       JOIN vault_cleanup_journal AS cleanup
+                         ON cleanup.cleanup_id=candidate.cleanup_id
+                       WHERE candidate.case_id=object.case_id
+                         AND candidate.object_id=object.object_id
+                         AND candidate.version=object.version
+                     )=1
+                     AND (
+                       SELECT COUNT(*)
+                       FROM vault_cleanup_candidates AS candidate
+                       JOIN vault_cleanup_journal AS cleanup
+                         ON cleanup.cleanup_id=candidate.cleanup_id
+                       WHERE candidate.case_id=object.case_id
+                         AND candidate.object_id=object.object_id
+                         AND candidate.version=object.version
+                         AND candidate.state='purged'
+                         AND cleanup.state='purged'
+                     )=1
+                   )",
                 params![case_id.as_str()],
                 |row| row.get(0),
             )
             .map_err(|_| VaultStoreError::DatabaseFailed)?;
-        if object_count != 0 {
+        if objects_requiring_existing_key != 0 {
             return Err(VaultStoreError::CaseKeyUnavailable);
+        }
+        let purged_objects = {
+            let mut statement = db
+                .prepare(
+                    "SELECT object.object_id,object.version,candidate.cleanup_id
+                     FROM object_journal AS object
+                     JOIN vault_cleanup_candidates AS candidate
+                       ON candidate.case_id=object.case_id
+                      AND candidate.object_id=object.object_id
+                      AND candidate.version=object.version
+                     JOIN vault_cleanup_journal AS cleanup
+                       ON cleanup.cleanup_id=candidate.cleanup_id
+                     WHERE object.case_id=?1
+                       AND object.state='quarantined'
+                       AND candidate.state='purged'
+                       AND cleanup.state='purged'
+                     ORDER BY object.object_id,object.version",
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            let rows = statement
+                .query_map([case_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|_| VaultStoreError::DatabaseFailed)?
+        };
+        if !purged_objects.is_empty() {
+            Self::verify_vault_cleanup_journal_connection(&db)?;
+        }
+        for (object_id, version, cleanup_id) in purged_objects {
+            let object_id =
+                ObjectId::parse(object_id).map_err(|_| VaultStoreError::ContentCorrupt)?;
+            let version = u64::try_from(version).map_err(|_| VaultStoreError::ContentCorrupt)?;
+            let active_path = self.object_directory(case_id, &object_id, version);
+            let quarantine_path =
+                vault_cleanup_quarantine_path(&self.root, &cleanup_id, &object_id, version)?;
+            let stale_rows: bool = db
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM nonce_reservations
+                       WHERE object_id=?1 AND version=?2
+                       UNION ALL
+                       SELECT 1 FROM vault_object_retention
+                       WHERE object_id=?1 AND version=?2
+                     )",
+                    params![object_id.as_str(), sql_i64(version)?],
+                    |row| row.get(0),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            if active_path.exists() || quarantine_path.exists() || stale_rows {
+                return Err(VaultStoreError::ContentCorrupt);
+            }
         }
 
         validate_new_controlled_path(&self.root, &final_path)?;
@@ -1684,17 +1918,53 @@ struct ReadOnlyDatabaseSourceProof {
     wal_sha256: Option<String>,
 }
 
-fn with_database_read_only_snapshot<T>(
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentVaultSchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql_sha256: String,
+}
+
+fn current_database_schema_objects(
+    db: &Connection,
+) -> Result<Vec<CurrentVaultSchemaObject>, VaultStoreError> {
+    let mut statement = db
+        .prepare(
+            "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_schema
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name,tbl_name",
+        )
+        .map_err(|_| VaultStoreError::DatabaseFailed)?;
+    let rows = statement
+        .query_map([], |row| {
+            let sql = row.get::<_, String>(3)?;
+            Ok(CurrentVaultSchemaObject {
+                object_type: row.get(0)?,
+                name: row.get(1)?,
+                table_name: row.get(2)?,
+                sql_sha256: sha256_hex(sql.as_bytes()),
+            })
+        })
+        .map_err(|_| VaultStoreError::DatabaseFailed)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| VaultStoreError::DatabaseFailed)
+}
+
+fn with_database_read_only_snapshot<T, E>(
     root: &ValidatedVaultRoot,
-    operation: impl FnOnce(&Connection) -> Result<T, VaultStoreError>,
-) -> Result<T, VaultStoreError> {
+    operation: impl FnOnce(&Connection) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<VaultStoreError>,
+{
     let _snapshot_gate = READ_ONLY_SNAPSHOT_GATE
         .lock()
         .map_err(|_| VaultStoreError::DatabaseFailed)?;
     let source_before = capture_read_only_database_source_proof(root)?;
     let temporary_parent = std::env::temp_dir();
     if !temporary_parent.is_absolute() {
-        return Err(VaultStoreError::UnsafeFilesystem);
+        return Err(E::from(VaultStoreError::UnsafeFilesystem));
     }
     let snapshot_storage = FixedLocalStorageRoot::initialize(
         &temporary_parent.join(READ_ONLY_SNAPSHOT_BASE_DIRECTORY),
@@ -1705,7 +1975,7 @@ fn with_database_read_only_snapshot<T>(
     let snapshot_database = temporary_root.join("vault-state.sqlite");
     let snapshot_wal = temporary_root.join("vault-state.sqlite-wal");
     let source_wal = sqlite_sidecar_path(&root.database, "-wal")?;
-    let copy_result = (|| {
+    let copy_result: Result<T, E> = (|| {
         fs::copy(&root.database, &snapshot_database).map_err(|_| VaultStoreError::IoFailed)?;
         if source_before.wal_sha256.is_some() {
             fs::copy(&source_wal, &snapshot_wal).map_err(|_| VaultStoreError::IoFailed)?;
@@ -1716,7 +1986,7 @@ fn with_database_read_only_snapshot<T>(
             platform::mark_not_content_indexed(&snapshot_wal)?;
         }
         if capture_read_only_database_source_proof(root)? != source_before {
-            return Err(VaultStoreError::DatabaseFailed);
+            return Err(E::from(VaultStoreError::DatabaseFailed));
         }
         let db = Connection::open_with_flags(&snapshot_database, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|_| VaultStoreError::DatabaseFailed)?;
@@ -1732,12 +2002,12 @@ fn with_database_read_only_snapshot<T>(
             .pragma_query_value(None, "query_only", |row| row.get(0))
             .map_err(|_| VaultStoreError::DatabaseFailed)?;
         if query_only != 1 {
-            return Err(VaultStoreError::DatabaseFailed);
+            return Err(E::from(VaultStoreError::DatabaseFailed));
         }
         let result = operation(&db);
         drop(db);
         if capture_read_only_database_source_proof(root)? != source_before {
-            return Err(VaultStoreError::DatabaseFailed);
+            return Err(E::from(VaultStoreError::DatabaseFailed));
         }
         result
     })();
@@ -1746,7 +2016,7 @@ fn with_database_read_only_snapshot<T>(
     match (copy_result, cleanup_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        (Ok(_), Err(error)) => Err(E::from(error)),
     }
 }
 

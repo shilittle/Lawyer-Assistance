@@ -7,6 +7,8 @@ version.workspace = true
 [features]
 default = []
 standalone-mcp-e2e = ["legal-mcp/standalone-mcp-e2e"]
+# Manual R3 acceptance seam. Formal/release builds never enable this feature.
+r3-real-current-binary-harness = []
 
 [lib]
 name = "lawyer_assistance_desktop"
@@ -56,3 +58,4 @@ lopdf = "0.26.0"
 
 [dev-dependencies]
 rcgen = "0.14.8"
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }

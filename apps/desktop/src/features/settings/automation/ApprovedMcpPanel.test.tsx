@@ -52,7 +52,7 @@ const qualification: ApprovedMcpQualificationStatus = {
   streamableHttpCanaryPassed: true,
   exactAppPolicyBinding: true,
   exactServerKeyBinding: true,
-  appVersion: "0.4.0-beta.2",
+  appVersion: "0.4.0",
   policyId: "approved-mcp-local-egress-v1",
   policyVersion: 2,
   serverKeyId: "mcpkey_opaque",
@@ -66,14 +66,14 @@ const qualification: ApprovedMcpQualificationStatus = {
 const reviewSelection: ApprovedPrivacyReviewSelection = {
   redactionId: "red_00000000000000000000000000000001",
   materialId: "mat_00000000000000000000000000000001",
-  caseId: "case_00000000000000000000000000000001",
+  projectId: "case-project-1",
   approvedPayloadSha256: "d".repeat(64),
   mcpPublishApproved: true,
   mcpPublishApprovalExpiresAtUnix: 1_700_003_600,
 };
 
 const generation: ApprovedGenerationHistory = {
-  caseId: "case_00000000000000000000000000000001",
+  projectId: "case-project-1",
   materialId: "mat_00000000000000000000000000000001",
   documentVersion: 2,
   publicationId: "pub_00000000000000000000000000000001",
@@ -119,24 +119,24 @@ describe("approved MCP request builders", () => {
   it("builds only an opaque publication request", () => {
     expect(buildApprovedGenerationPublication({
       redactionId: "red_00000000000000000000000000000001",
-      caseId: generation.caseId,
+      projectId: generation.projectId,
       approvedPayloadSha256: "d".repeat(64),
     })).toEqual({
       redactionId: "red_00000000000000000000000000000001",
-      caseId: generation.caseId,
+      projectId: generation.projectId,
       expectedApprovedPayloadSha256: "d".repeat(64),
     });
 
     expect(() => buildApprovedGenerationPublication({
       redactionId: "C:/cases/raw.pdf",
-      caseId: generation.caseId,
+      projectId: generation.projectId,
       approvedPayloadSha256: "d".repeat(64),
     })).toThrow("opaque ID");
     expect(() => buildApprovedGenerationPublication({
       redactionId: "red_00000000000000000000000000000001",
-      caseId: "../case",
+      projectId: "case-project 1",
       approvedPayloadSha256: "d".repeat(64),
-    })).toThrow("opaque ID");
+    })).toThrow("ProjectId");
   });
 
   it("creates only fixed stdio sessions with no host-supplied path or origin", () => {
@@ -312,7 +312,7 @@ describe("ApprovedMcpPanelView", () => {
         sessions={[session, httpSession]}
         selectedRedactionId={reviewSelection.redactionId}
         selectedGenerationKey={`${generation.publicationId}:${generation.documentVersion}`}
-        historyCaseId={generation.caseId}
+        historyProjectId={generation.projectId}
         qualificationDays="1"
         connectorId="workbuddy"
         transport="streamable_http"
@@ -331,7 +331,7 @@ describe("ApprovedMcpPanelView", () => {
         error=""
         onSelectedRedactionIdChange={vi.fn()}
         onSelectedGenerationKeyChange={vi.fn()}
-        onHistoryCaseIdChange={vi.fn()}
+        onHistoryProjectIdChange={vi.fn()}
         onQualificationDaysChange={vi.fn()}
         onConnectorIdChange={vi.fn()}
         onTransportChange={vi.fn()}
@@ -363,7 +363,7 @@ describe("ApprovedMcpPanelView", () => {
     expect(markup).toContain("stdio canary");
     expect(markup).toContain(reviewSelection.redactionId);
     expect(markup).toContain(reviewSelection.materialId);
-    expect(markup).toContain(reviewSelection.caseId);
+    expect(markup).toContain(reviewSelection.projectId);
     expect(markup).toContain(reviewSelection.approvedPayloadSha256);
     expect(markup).toContain(generation.publicationId);
     expect(markup).toContain("<select");
@@ -381,6 +381,7 @@ describe("ApprovedMcpPanelView", () => {
     expect(markup).toContain(httpSession.endpoint ?? "");
     expect(markup).toContain(buildStandaloneHttpServerCommand(httpSession));
     expect(markup).not.toContain(`mcp-http-${"e".repeat(64)}`);
+    expect(markup).not.toContain("case_00000000000000000000000000000001");
     for (const forbidden of [
       "SYNTHETIC_RAW_PARTY",
       "C:/cases/raw.pdf",

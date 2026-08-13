@@ -2,16 +2,16 @@
 
 ## 1. Before you begin
 
-`0.4.0-beta.2` targets Windows x86_64 and is currently an unsigned technical prerelease:
+`0.4.0` targets Windows x86_64. The repository currently represents a source-complete candidate for that stable version; it is not proof that a stable Release has been published:
 
-- The installer has no verified Windows publisher identity and may trigger SmartScreen or security-software warnings.
-- There is no active automatic-update release chain. Upgrade only with a complete new package supplied and verified by the project.
+- Use an installer only after the project has published the exact signed `v0.4.0` allowlist and reported successful service-side readback. A stable installer must have valid Authenticode and RFC 3161 evidence; stop on an unknown-publisher or invalid-signature warning.
+- There is no active stable automatic-update chain until the signed installer-bound updater `.sig` and `latest.json` have passed publication and latest-endpoint readback. Upgrade only with a complete package supplied and verified by the project.
 - Production scanned-document OCR is not qualified. Do not use it for scanned or visual PDFs unless every current qualification gate is shown as passed in the App.
-- The technical prerelease uses the `runtime-slim-v1` legal database and does not include the full archival database.
+- The desktop package uses the `runtime-slim-v1` legal database and does not include the full archival database.
 
 When downloading or receiving a package, verify its version, filename, SHA-256, and bundled manifest. Do not treat a CI fixture, debug executable, or historical OCR component as a product asset.
 
-The source repository is public, but public visibility or downloadability is not a substitute for Authenticode signing, updater metadata, OCR qualification, or clean-machine release acceptance.
+The source repository is public, but public visibility or downloadability is not a substitute for Authenticode signing, updater metadata, exact-main CI, server readback, OCR qualification, or clean-machine release acceptance. See [Current Release Status](release-status.en.md) before obtaining a package, and see [Upgrade from v0.3.1 to v0.4.0](upgrade-v0.3.1-to-v0.4.0.en.md) before opening an existing v0.3.1 workspace.
 
 ## 2. Product map
 
@@ -28,7 +28,7 @@ Case material, redacted text, and human review stay under **Cases → Materials 
 
 ## 3. First launch
 
-1. Start Lawyer Assistance and confirm that the displayed version is `0.4.0-beta.2`.
+1. After verifying a project-accepted package, start Lawyer Assistance and confirm that the displayed version is `0.4.0`.
 2. Open **Settings → Version, backup, and diagnostics** and confirm that the runtime legal database is loaded.
 3. Read the privacy notice and confirm that the application's retention and outbound-data boundaries fit the intended work.
 4. Under **Settings → Provider services and credentials**, create your own Provider configuration and save its API key. Windows Credential Manager stores the key; the frontend displays masked status only.
@@ -139,7 +139,7 @@ The default WorkBuddy, Codex, and OpenCode examples use `public_law_only`. Appro
 
 Reliable native text layers can be handled by local parsers. A scanned or visual PDF may enter local MinerU only when the App shows that the current worker, models, component integrity, Windows Firewall isolation, synthetic canary, and environment remeasurement have all passed.
 
-Manage this boundary under **Settings → Local processing environment and OCR components**. The current technical prerelease is not production-OCR-qualified. Historical components, GPU diagnostics, user consent, or remote OCR cannot replace qualification. Failure must block processing rather than silently upload or fall back to a remote service.
+Manage this boundary under **Settings → Local processing environment and OCR components**. This release candidate records no qualifying evidence for a final published and production-qualified MinerU v4 component; treat the component as unpublished and unqualified until official Release evidence exists. Historical components, GPU diagnostics, user consent, or remote OCR cannot replace qualification. Failure must block processing rather than silently upload or fall back to a remote service.
 
 ## 13. Backup and restore
 

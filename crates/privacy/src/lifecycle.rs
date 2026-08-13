@@ -16,14 +16,17 @@ use crate::{
     PrivacyStore, PrivacyStoreError, PrivacyStoreSchemaStatus, PRIVACY_STORE_SCHEMA_VERSION,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use rusqlite::{backup::Backup, params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{
+    backup::Backup, params, types::ValueRef, Connection, OpenFlags, OptionalExtension, Transaction,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{compiler_fence, Ordering},
     time::Duration,
@@ -386,6 +389,15 @@ pub struct VerifiedBackupV1 {
     pub envelope_sha256: String,
 }
 
+/// Allocation-only semantic identity reconstructed from an authenticated R3
+/// Privacy portable component. No backup registry or filesystem path is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V031RecoverySafetyPrivacyComponentProof {
+    pub privacy_store_schema_version: i64,
+    pub privacy_store_manifest_sha256: String,
+    pub database_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct BackupEnvelopeV1 {
@@ -515,6 +527,26 @@ impl PrivacyLifecycle {
         let transaction = connection
             .transaction()
             .map_err(|_| LifecycleError::Database)?;
+        let lifecycle =
+            Self::initialize_state_in_transaction(&transaction, workspace_instance_id, now_unix)?;
+        transaction.commit().map_err(|_| LifecycleError::Database)?;
+        Ok(lifecycle)
+    }
+
+    /// Initializes the lifecycle rows inside a caller-owned write transaction.
+    ///
+    /// The schema must already exist. Coordinated migrations use this narrow
+    /// entry point only after acquiring `BEGIN IMMEDIATE` and reauthenticating
+    /// the exact pre-lifecycle state in the same transaction, so no external
+    /// SQLite writer can change the classified state before the first insert.
+    pub fn initialize_state_in_transaction(
+        transaction: &Transaction<'_>,
+        workspace_instance_id: WorkspaceInstanceId,
+        now_unix: u64,
+    ) -> Result<Self, LifecycleError> {
+        if now_unix == 0 {
+            return Err(LifecycleError::InvalidInput);
+        }
         let existing: Option<(String, i64, i64)> = transaction
             .query_row(
                 "SELECT workspace_instance_id,schema_version,key_epoch
@@ -559,10 +591,9 @@ impl PrivacyLifecycle {
                     )
                     .map_err(|_| LifecycleError::Database)?;
                 let policy = RetentionPolicyV1::default_at(now_unix)?;
-                insert_retention_policy(&transaction, &policy)?;
+                insert_retention_policy(transaction, &policy)?;
             }
         }
-        transaction.commit().map_err(|_| LifecycleError::Database)?;
         Ok(Self {
             workspace_instance_id,
         })
@@ -1760,6 +1791,587 @@ impl PrivacyLifecycle {
             .iter()
             .any(|value| value == material_id))
     }
+}
+
+impl PrivacyLifecycle {
+    /// Builds the Privacy component used only by the authenticated v0.3.1 recovery safety
+    /// backup. The source must already be held in a caller-owned read-only transaction.
+    ///
+    /// Unlike `EncryptedPrivacyBackupStore::export_database`, this path is allocation-only: it
+    /// never initializes a backup root, creates a staging file, writes a detached envelope/state
+    /// pair, or inserts a `privacy_backup_registry` row. The returned portable bundle retains the
+    /// ordinary DPAPI-current-user and AEAD authentication boundaries and can be imported by the
+    /// coordinated application restore path after the formal recovery marker exists.
+    pub fn export_v031_recovery_safety_portable_backup(
+        &self,
+        connection: &Connection,
+        request: &BackupExportRequestV1<'_>,
+    ) -> Result<(VerifiedBackupV1, Vec<u8>), LifecycleError> {
+        export_v031_recovery_safety_portable_backup_with_schema_expectation(
+            connection,
+            self,
+            request,
+            BackupSchemaExpectation::Current,
+        )
+    }
+
+    /// Allocation-only counterpart for an exact authenticated Privacy v1-v5 source. This is
+    /// intentionally separate from the current-schema method so callers cannot gain legacy
+    /// acceptance through fallback.
+    pub fn export_pre_migration_v031_recovery_safety_portable_backup(
+        &self,
+        connection: &Connection,
+        request: &BackupExportRequestV1<'_>,
+        context: &PreMigrationBackupExportContextV1,
+    ) -> Result<(VerifiedBackupV1, Vec<u8>), LifecycleError> {
+        export_v031_recovery_safety_portable_backup_with_schema_expectation(
+            connection,
+            self,
+            request,
+            BackupSchemaExpectation::PreMigration(context.expected_privacy_store_schema_version),
+        )
+    }
+}
+
+fn export_v031_recovery_safety_portable_backup_with_schema_expectation(
+    connection: &Connection,
+    lifecycle: &PrivacyLifecycle,
+    request: &BackupExportRequestV1<'_>,
+    schema_expectation: BackupSchemaExpectation,
+) -> Result<(VerifiedBackupV1, Vec<u8>), LifecycleError> {
+    schema_expectation.expected_version()?;
+    valid_opaque_id(request.backup_id, "bkp_")?;
+    if request.created_at_unix == 0 || connection.is_autocommit() {
+        return Err(LifecycleError::InvalidInput);
+    }
+    let query_only: i64 = connection
+        .pragma_query_value(None, "query_only", |row| row.get(0))
+        .map_err(|_| LifecycleError::Database)?;
+    if query_only != 1 {
+        return Err(LifecycleError::InvalidInput);
+    }
+
+    ensure_workspace(connection, lifecycle.workspace_instance_id())?;
+    let privacy_store_schema_version =
+        schema_expectation.validate_actual(read_privacy_store_schema_version(connection)?)?;
+    let policy = load_retention_policy(connection)?;
+    let expires_at_unix = request.expires_at_unix.unwrap_or(
+        request
+            .created_at_unix
+            .checked_add(policy.backup_retention_seconds)
+            .ok_or(LifecycleError::InvalidInput)?,
+    );
+    if expires_at_unix <= request.created_at_unix
+        || expires_at_unix - request.created_at_unix > MAX_RETENTION_SECONDS
+    {
+        return Err(LifecycleError::InvalidInput);
+    }
+    let key_epoch = lifecycle.current_key_epoch(connection)?;
+    let database_bytes = snapshot_database_in_memory(
+        connection,
+        lifecycle.workspace_instance_id(),
+        key_epoch,
+        privacy_store_schema_version,
+    )?;
+    let (envelope_bytes, verified) = build_v031_recovery_safety_backup_envelope(
+        lifecycle.workspace_instance_id(),
+        request,
+        privacy_store_schema_version,
+        key_epoch,
+        expires_at_unix,
+        &database_bytes,
+    )?;
+    let portable = build_v031_recovery_safety_portable_bundle(&envelope_bytes, &verified)?;
+    authenticate_v031_recovery_safety_portable_bundle_in_memory(
+        &portable,
+        &verified,
+        privacy_store_schema_version,
+    )?;
+    Ok((verified, portable))
+}
+
+fn snapshot_database_in_memory(
+    source: &Connection,
+    workspace: &WorkspaceInstanceId,
+    key_epoch: u64,
+    expected_privacy_store_schema_version: i64,
+) -> Result<ZeroizingBytes, LifecycleError> {
+    let maximum_database_bytes =
+        max_backup_database_bytes_for_schema(expected_privacy_store_schema_version)
+            .ok_or(LifecycleError::InvalidInput)?;
+    let mut destination = Connection::open_in_memory().map_err(|_| LifecycleError::Database)?;
+    {
+        let backup = Backup::new(source, &mut destination).map_err(|_| LifecycleError::Database)?;
+        backup
+            .run_to_completion(64, Duration::from_millis(1), None)
+            .map_err(|_| LifecycleError::Database)?;
+    }
+    destination
+        .execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA foreign_keys=ON;
+             PRAGMA trusted_schema=OFF;",
+        )
+        .map_err(|_| LifecycleError::Database)?;
+    validate_sqlite_connection(
+        &destination,
+        workspace,
+        key_epoch,
+        expected_privacy_store_schema_version,
+    )?;
+    let serialized = destination
+        .serialize(rusqlite::MAIN_DB)
+        .map_err(|_| LifecycleError::Database)?;
+    if serialized.len() < 100 || serialized.len() > maximum_database_bytes {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    let bytes = ZeroizingBytes::new(serialized.to_vec());
+    drop(serialized);
+    verify_sqlite_snapshot_bytes_in_memory(
+        &bytes,
+        workspace,
+        key_epoch,
+        expected_privacy_store_schema_version,
+    )?;
+    Ok(bytes)
+}
+
+fn build_v031_recovery_safety_backup_envelope(
+    workspace: &WorkspaceInstanceId,
+    request: &BackupExportRequestV1<'_>,
+    privacy_store_schema_version: i64,
+    key_epoch: u64,
+    expires_at_unix: u64,
+    database_bytes: &[u8],
+) -> Result<(Vec<u8>, VerifiedBackupV1), LifecycleError> {
+    let maximum_database_bytes = max_backup_database_bytes_for_schema(privacy_store_schema_version)
+        .ok_or(LifecycleError::InvalidInput)?;
+    let maximum_envelope_bytes = max_backup_envelope_bytes_for_schema(privacy_store_schema_version)
+        .ok_or(LifecycleError::InvalidInput)?;
+    if database_bytes.len() < 100
+        || database_bytes.len() > maximum_database_bytes
+        || !database_bytes.starts_with(b"SQLite format 3\0")
+    {
+        return Err(LifecycleError::BackupInvalid);
+    }
+
+    let database_sha256 = sha256_hex(database_bytes);
+    let data_key = SecretKey32::generate().map_err(map_crypto_error)?;
+    let wrapped_data_key = wrap_case_key(&data_key).map_err(map_crypto_error)?;
+    let wrapped_data_key_sha256 = sha256_hex(&wrapped_data_key);
+    let database_length =
+        u64::try_from(database_bytes.len()).map_err(|_| LifecycleError::InvalidInput)?;
+    let aad = backup_aad(
+        request.backup_id,
+        workspace,
+        privacy_store_schema_version,
+        key_epoch,
+        request.created_at_unix,
+        expires_at_unix,
+        database_length,
+        &database_sha256,
+        &wrapped_data_key_sha256,
+    )?;
+    let sealed = seal(&data_key, database_bytes, &aad).map_err(map_crypto_error)?;
+    let envelope = BackupEnvelopeV1 {
+        schema_version: ENCRYPTED_BACKUP_SCHEMA_VERSION.to_owned(),
+        crypto_suite: BACKUP_CRYPTO_SUITE.to_owned(),
+        backup_id: request.backup_id.to_owned(),
+        workspace_instance_id: workspace.clone(),
+        privacy_store_schema_version,
+        lifecycle_schema_version: PRIVACY_LIFECYCLE_SCHEMA_VERSION,
+        key_epoch,
+        created_at_unix: request.created_at_unix,
+        expires_at_unix,
+        database_bytes: database_length,
+        database_sha256: database_sha256.clone(),
+        wrapped_data_key_base64: BASE64_STANDARD.encode(&wrapped_data_key),
+        wrapped_data_key_sha256,
+        nonce_base64: BASE64_STANDARD.encode(sealed.nonce()),
+        ciphertext_base64: BASE64_STANDARD.encode(sealed.ciphertext()),
+        ciphertext_sha256: sha256_hex(sealed.ciphertext()),
+        tag_base64: BASE64_STANDARD.encode(sealed.tag()),
+    };
+    let envelope_bytes = canonical_json_v1(&envelope).map_err(|_| LifecycleError::BackupInvalid)?;
+    if envelope_bytes.is_empty() || envelope_bytes.len() > maximum_envelope_bytes {
+        return Err(LifecycleError::InvalidInput);
+    }
+    let envelope_sha256 = sha256_hex(&envelope_bytes);
+    Ok((
+        envelope_bytes,
+        VerifiedBackupV1 {
+            backup_id: request.backup_id.to_owned(),
+            workspace_instance_id: workspace.clone(),
+            privacy_store_schema_version,
+            created_at_unix: request.created_at_unix,
+            expires_at_unix,
+            key_epoch,
+            database_sha256,
+            envelope_sha256,
+        },
+    ))
+}
+
+fn build_v031_recovery_safety_portable_bundle(
+    envelope: &[u8],
+    verified: &VerifiedBackupV1,
+) -> Result<Vec<u8>, LifecycleError> {
+    if sha256_hex(envelope) != verified.envelope_sha256 {
+        return Err(LifecycleError::BackupTampered);
+    }
+    let state = ProtectedBackupStateV1 {
+        schema_version: PROTECTED_BACKUP_STATE_VERSION.to_owned(),
+        backup_id: verified.backup_id.clone(),
+        workspace_instance_id: verified.workspace_instance_id.clone(),
+        envelope_sha256: verified.envelope_sha256.clone(),
+        created_at_unix: verified.created_at_unix,
+        expires_at_unix: verified.expires_at_unix,
+        key_epoch: verified.key_epoch,
+        state: "active".to_owned(),
+        revoked_at_unix: None,
+    };
+    state.validate()?;
+    let plaintext =
+        ZeroizingBytes::new(canonical_json_v1(&state).map_err(|_| LifecycleError::BackupInvalid)?);
+    let protected_state = protect_local(&plaintext).map_err(|_| LifecycleError::ProtectedBlob)?;
+    if protected_state.is_empty() || protected_state.len() > MAX_PROTECTED_BACKUP_STATE_BYTES {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    let bundle = PortableBackupBundleV1 {
+        schema_version: PORTABLE_BACKUP_SCHEMA_VERSION.to_owned(),
+        backup_id: verified.backup_id.clone(),
+        envelope_sha256: verified.envelope_sha256.clone(),
+        protected_state_sha256: sha256_hex(&protected_state),
+        envelope_base64: BASE64_STANDARD.encode(envelope),
+        protected_state_base64: BASE64_STANDARD.encode(protected_state),
+    };
+    let bytes = canonical_json_v1(&bundle).map_err(|_| LifecycleError::BackupInvalid)?;
+    let maximum_portable_bytes =
+        max_portable_backup_bytes_for_schema(verified.privacy_store_schema_version)
+            .ok_or(LifecycleError::BackupInvalid)?;
+    if bytes.is_empty() || bytes.len() > maximum_portable_bytes {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    Ok(bytes)
+}
+
+/// Reconstructs the R3 Privacy component identity exclusively from one
+/// authenticated portable bundle. This is intentionally allocation-only: it
+/// unwraps DPAPI state and decrypts the SQLite image in memory, and never
+/// creates a backup root, registry row, SQLite sidecar, or credential.
+pub fn verify_v031_recovery_safety_portable_backup_allocation_only(
+    portable: &[u8],
+    expected_backup_id: &str,
+    expected_workspace_instance_id: &WorkspaceInstanceId,
+    expected_created_at_unix: u64,
+    expected_expires_at_unix: u64,
+) -> Result<V031RecoverySafetyPrivacyComponentProof, LifecycleError> {
+    if portable.is_empty() || portable.len() > MAX_PORTABLE_BACKUP_BYTES {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    let bundle: PortableBackupBundleV1 =
+        strict_json_v1_from_slice(portable).map_err(|_| LifecycleError::BackupInvalid)?;
+    if canonical_json_v1(&bundle).map_err(|_| LifecycleError::BackupInvalid)? != portable
+        || bundle.schema_version != PORTABLE_BACKUP_SCHEMA_VERSION
+        || bundle.backup_id != expected_backup_id
+    {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    valid_hash(&bundle.envelope_sha256)?;
+    valid_hash(&bundle.protected_state_sha256)?;
+    let protected_state = ZeroizingBytes::new(decode_bounded_base64(
+        &bundle.protected_state_base64,
+        MAX_PROTECTED_BACKUP_STATE_BYTES,
+    )?);
+    if sha256_hex(&protected_state) != bundle.protected_state_sha256 {
+        return Err(LifecycleError::BackupTampered);
+    }
+    let plaintext = ZeroizingBytes::new(
+        unprotect_local(&protected_state).map_err(|_| LifecycleError::ProtectedBlob)?,
+    );
+    let state: ProtectedBackupStateV1 =
+        strict_json_v1_from_slice(&plaintext).map_err(|_| LifecycleError::BackupInvalid)?;
+    if canonical_json_v1(&state).map_err(|_| LifecycleError::BackupInvalid)? != *plaintext {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    state.validate()?;
+    if state.backup_id != expected_backup_id
+        || state.workspace_instance_id != *expected_workspace_instance_id
+        || state.envelope_sha256 != bundle.envelope_sha256
+        || state.created_at_unix != expected_created_at_unix
+        || state.expires_at_unix != expected_expires_at_unix
+        || state.state != "active"
+        || state.revoked_at_unix.is_some()
+    {
+        return Err(LifecycleError::EnvironmentMismatch);
+    }
+    let context = BackupVerificationContextV1 {
+        expected_workspace_instance_id,
+        expected_key_epoch: state.key_epoch,
+        now_unix: expected_created_at_unix,
+    };
+    let decoded = decode_portable_bundle(portable, &context)?;
+    let envelope: BackupEnvelopeV1 =
+        strict_json_v1_from_slice(&decoded.envelope).map_err(|_| LifecycleError::BackupInvalid)?;
+    if canonical_json_v1(&envelope).map_err(|_| LifecycleError::BackupInvalid)? != decoded.envelope
+        || envelope.backup_id != expected_backup_id
+        || envelope.workspace_instance_id != *expected_workspace_instance_id
+        || envelope.created_at_unix != expected_created_at_unix
+        || envelope.expires_at_unix != expected_expires_at_unix
+    {
+        return Err(LifecycleError::BackupTampered);
+    }
+    let expected = VerifiedBackupV1 {
+        backup_id: envelope.backup_id.clone(),
+        workspace_instance_id: envelope.workspace_instance_id.clone(),
+        privacy_store_schema_version: envelope.privacy_store_schema_version,
+        created_at_unix: envelope.created_at_unix,
+        expires_at_unix: envelope.expires_at_unix,
+        key_epoch: envelope.key_epoch,
+        database_sha256: envelope.database_sha256.clone(),
+        envelope_sha256: sha256_hex(&decoded.envelope),
+    };
+    authenticate_v031_recovery_safety_portable_bundle_in_memory(
+        portable,
+        &expected,
+        envelope.privacy_store_schema_version,
+    )
+}
+
+fn authenticate_v031_recovery_safety_portable_bundle_in_memory(
+    portable: &[u8],
+    expected: &VerifiedBackupV1,
+    expected_privacy_store_schema_version: i64,
+) -> Result<V031RecoverySafetyPrivacyComponentProof, LifecycleError> {
+    let context = BackupVerificationContextV1 {
+        expected_workspace_instance_id: &expected.workspace_instance_id,
+        expected_key_epoch: expected.key_epoch,
+        now_unix: expected.created_at_unix,
+    };
+    let decoded = decode_portable_bundle(portable, &context)?;
+    if decoded.backup_id != expected.backup_id
+        || sha256_hex(&decoded.envelope) != expected.envelope_sha256
+    {
+        return Err(LifecycleError::BackupTampered);
+    }
+    let envelope: BackupEnvelopeV1 =
+        strict_json_v1_from_slice(&decoded.envelope).map_err(|_| LifecycleError::BackupInvalid)?;
+    let maximum_envelope_bytes =
+        max_backup_envelope_bytes_for_schema(envelope.privacy_store_schema_version)
+            .ok_or(LifecycleError::BackupInvalid)?;
+    let maximum_database_bytes =
+        max_backup_database_bytes_for_schema(envelope.privacy_store_schema_version)
+            .ok_or(LifecycleError::BackupInvalid)?;
+    if decoded.envelope.len() > maximum_envelope_bytes {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    let registry = (
+        expected.envelope_sha256.clone(),
+        sql_i64(expected.created_at_unix)?,
+        sql_i64(expected.expires_at_unix)?,
+        sql_i64(expected.key_epoch)?,
+        "active".to_owned(),
+    );
+    let expectation = BackupVerificationExpectation {
+        expected_workspace_instance_id: &expected.workspace_instance_id,
+        expected_key_epoch: expected.key_epoch,
+        expected_privacy_store_schema_version,
+        now_unix: expected.created_at_unix,
+    };
+    validate_backup_envelope(&envelope, &expected.backup_id, &expectation, &registry)?;
+    let wrapped = decode_bounded_base64(&envelope.wrapped_data_key_base64, 64 * 1024)?;
+    if sha256_hex(&wrapped) != envelope.wrapped_data_key_sha256 {
+        return Err(LifecycleError::BackupTampered);
+    }
+    let key = unwrap_case_key(&wrapped).map_err(map_crypto_error)?;
+    let nonce = decode_bounded_base64(&envelope.nonce_base64, 64)?;
+    let ciphertext = decode_bounded_base64(&envelope.ciphertext_base64, maximum_database_bytes)?;
+    let tag = decode_bounded_base64(&envelope.tag_base64, 64)?;
+    if sha256_hex(&ciphertext) != envelope.ciphertext_sha256 {
+        return Err(LifecycleError::BackupTampered);
+    }
+    let sealed = AeadSealedV1::from_parts(&nonce, ciphertext, &tag)
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    let aad = backup_aad(
+        &expected.backup_id,
+        &expected.workspace_instance_id,
+        envelope.privacy_store_schema_version,
+        envelope.key_epoch,
+        envelope.created_at_unix,
+        envelope.expires_at_unix,
+        envelope.database_bytes,
+        &envelope.database_sha256,
+        &envelope.wrapped_data_key_sha256,
+    )?;
+    let database_bytes = ZeroizingBytes::new(open(&key, &sealed, &aad).map_err(map_crypto_error)?);
+    if u64::try_from(database_bytes.len()).ok() != Some(envelope.database_bytes)
+        || sha256_hex(&database_bytes) != envelope.database_sha256
+    {
+        return Err(LifecycleError::BackupTampered);
+    }
+    verify_sqlite_snapshot_bytes_in_memory(
+        &database_bytes,
+        &expected.workspace_instance_id,
+        expected.key_epoch,
+        expected_privacy_store_schema_version,
+    )?;
+    let actual = VerifiedBackupV1 {
+        backup_id: envelope.backup_id,
+        workspace_instance_id: envelope.workspace_instance_id,
+        privacy_store_schema_version: envelope.privacy_store_schema_version,
+        created_at_unix: envelope.created_at_unix,
+        expires_at_unix: envelope.expires_at_unix,
+        key_epoch: envelope.key_epoch,
+        database_sha256: envelope.database_sha256,
+        envelope_sha256: sha256_hex(&decoded.envelope),
+    };
+    if &actual != expected {
+        return Err(LifecycleError::BackupTampered);
+    }
+    let privacy_store_manifest_sha256 =
+        v031_recovery_safety_privacy_logical_manifest(&database_bytes)?;
+    Ok(V031RecoverySafetyPrivacyComponentProof {
+        privacy_store_schema_version: actual.privacy_store_schema_version,
+        privacy_store_manifest_sha256,
+        database_sha256: actual.database_sha256,
+    })
+}
+
+fn v031_recovery_safety_privacy_logical_manifest(
+    database_bytes: &[u8],
+) -> Result<String, LifecycleError> {
+    let mut connection = Connection::open_in_memory().map_err(|_| LifecycleError::Database)?;
+    connection
+        .deserialize_read_exact(
+            rusqlite::MAIN_DB,
+            Cursor::new(database_bytes),
+            database_bytes.len(),
+            true,
+        )
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT type,name,COALESCE(sql,'')
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type,name",
+        )
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| LifecycleError::BackupInvalid)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    drop(statement);
+    let mut digest = Sha256::new();
+    digest.update(b"sqlite-logical-manifest-v1\0");
+    for (object_type, name, sql) in objects {
+        for value in [&object_type, &name, &sql] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        if object_type == "table" && name != "privacy_backup_registry" {
+            digest.update(v031_recovery_safety_table_rows_manifest(&connection, &name)?.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn v031_recovery_safety_table_rows_manifest(
+    connection: &Connection,
+    table: &str,
+) -> Result<String, LifecycleError> {
+    let quoted = table.replace('"', "\"\"");
+    let mut statement = connection
+        .prepare(&format!("SELECT * FROM \"{quoted}\""))
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    let column_count = statement.column_count();
+    let mut rows = statement
+        .query([])
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    let mut row_hashes = Vec::new();
+    while let Some(row) = rows.next().map_err(|_| LifecycleError::BackupInvalid)? {
+        let mut digest = Sha256::new();
+        digest.update(b"sqlite-row-v1\0");
+        for index in 0..column_count {
+            match row
+                .get_ref(index)
+                .map_err(|_| LifecycleError::BackupInvalid)?
+            {
+                ValueRef::Null => digest.update([0]),
+                ValueRef::Integer(value) => {
+                    digest.update([1]);
+                    digest.update(value.to_be_bytes());
+                }
+                ValueRef::Real(value) => {
+                    digest.update([2]);
+                    digest.update(value.to_bits().to_be_bytes());
+                }
+                ValueRef::Text(value) => {
+                    digest.update([3]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value);
+                }
+                ValueRef::Blob(value) => {
+                    digest.update([4]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value);
+                }
+            }
+        }
+        row_hashes.push(digest.finalize().to_vec());
+    }
+    row_hashes.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"sqlite-table-rows-v1\0");
+    digest.update((row_hashes.len() as u64).to_be_bytes());
+    for hash in row_hashes {
+        digest.update(hash);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn verify_sqlite_snapshot_bytes_in_memory(
+    bytes: &[u8],
+    workspace: &WorkspaceInstanceId,
+    key_epoch: u64,
+    expected_privacy_store_schema_version: i64,
+) -> Result<(), LifecycleError> {
+    let maximum_database_bytes =
+        max_backup_database_bytes_for_schema(expected_privacy_store_schema_version)
+            .ok_or(LifecycleError::BackupInvalid)?;
+    if bytes.len() < 100
+        || bytes.len() > maximum_database_bytes
+        || !bytes.starts_with(b"SQLite format 3\0")
+    {
+        return Err(LifecycleError::BackupInvalid);
+    }
+    let mut connection = Connection::open_in_memory().map_err(|_| LifecycleError::Database)?;
+    connection
+        .deserialize_read_exact(rusqlite::MAIN_DB, Cursor::new(bytes), bytes.len(), true)
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    connection
+        .execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA foreign_keys=ON;
+             PRAGMA trusted_schema=OFF;",
+        )
+        .map_err(|_| LifecycleError::BackupInvalid)?;
+    validate_sqlite_connection(
+        &connection,
+        workspace,
+        key_epoch,
+        expected_privacy_store_schema_version,
+    )
 }
 
 pub struct EncryptedPrivacyBackupStore {

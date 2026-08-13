@@ -101,106 +101,7 @@ enum ProjectDeletionCheckpoint {
 }
 
 pub(super) fn initialize_schema(connection: &Connection) -> Result<(), PrivacyWorkflowError> {
-    connection
-        .execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS project_deletion_journal(
-                deletion_id TEXT PRIMARY KEY NOT NULL CHECK(
-                    length(deletion_id) BETWEEN 1 AND 128
-                ),
-                project_id TEXT UNIQUE NOT NULL CHECK(
-                    length(CAST(project_id AS BLOB)) BETWEEN 1 AND 256
-                    AND substr(project_id,1,5)='case-'
-                    AND project_id=trim(project_id)
-                ),
-                privacy_case_id TEXT CHECK(
-                    privacy_case_id IS NULL OR (
-                        length(privacy_case_id)=37
-                        AND substr(privacy_case_id,1,5)='case_'
-                        AND substr(privacy_case_id,6) NOT GLOB '*[^0-9a-f]*'
-                    )
-                ),
-                scope_json TEXT NOT NULL CHECK(
-                    length(scope_json) BETWEEN 2 AND 1048576
-                ),
-                scope_sha256 TEXT NOT NULL CHECK(length(scope_sha256)=64),
-                state TEXT NOT NULL CHECK(state IN(
-                    'prepared','privacy_revoked','user_deleted','completed'
-                )),
-                created_at_unix INTEGER NOT NULL CHECK(created_at_unix>0),
-                privacy_revoked_at_unix INTEGER,
-                user_deleted_at_unix INTEGER,
-                completed_at_unix INTEGER,
-                CHECK(
-                    (state='prepared'
-                     AND privacy_revoked_at_unix IS NULL
-                     AND user_deleted_at_unix IS NULL
-                     AND completed_at_unix IS NULL)
-                    OR
-                    (state='privacy_revoked'
-                     AND privacy_revoked_at_unix IS NOT NULL
-                     AND user_deleted_at_unix IS NULL
-                     AND completed_at_unix IS NULL)
-                    OR
-                    (state='user_deleted'
-                     AND privacy_revoked_at_unix IS NOT NULL
-                     AND user_deleted_at_unix IS NOT NULL
-                     AND completed_at_unix IS NULL)
-                    OR
-                    (state='completed'
-                     AND privacy_revoked_at_unix IS NOT NULL
-                     AND user_deleted_at_unix IS NOT NULL
-                     AND completed_at_unix IS NOT NULL)
-                )
-            );
-            CREATE INDEX IF NOT EXISTS idx_project_deletion_journal_state
-                ON project_deletion_journal(state,created_at_unix);
-            CREATE TRIGGER IF NOT EXISTS trg_project_deletion_journal_no_delete
-            BEFORE DELETE ON project_deletion_journal
-            BEGIN
-                SELECT RAISE(ABORT,'project deletion journal is append preserving');
-            END;
-            CREATE TRIGGER IF NOT EXISTS trg_project_deletion_journal_no_replace
-            BEFORE INSERT ON project_deletion_journal
-            WHEN EXISTS(
-                SELECT 1 FROM project_deletion_journal AS existing
-                WHERE existing.deletion_id=NEW.deletion_id
-                   OR existing.project_id=NEW.project_id
-            )
-            BEGIN
-                SELECT RAISE(ABORT,'project deletion journal is append preserving');
-            END;
-            CREATE TRIGGER IF NOT EXISTS trg_project_deletion_journal_one_way
-            BEFORE UPDATE ON project_deletion_journal
-            WHEN NEW.deletion_id IS NOT OLD.deletion_id
-              OR NEW.project_id IS NOT OLD.project_id
-              OR NEW.privacy_case_id IS NOT OLD.privacy_case_id
-              OR NEW.scope_json IS NOT OLD.scope_json
-              OR NEW.scope_sha256 IS NOT OLD.scope_sha256
-              OR NEW.created_at_unix IS NOT OLD.created_at_unix
-              OR NOT(
-                   (OLD.state='prepared'
-                    AND NEW.state='privacy_revoked'
-                    AND OLD.privacy_revoked_at_unix IS NULL
-                    AND NEW.privacy_revoked_at_unix IS NOT NULL
-                    AND NEW.user_deleted_at_unix IS NULL
-                    AND NEW.completed_at_unix IS NULL)
-                OR (OLD.state='privacy_revoked'
-                    AND NEW.state='user_deleted'
-                    AND NEW.privacy_revoked_at_unix=OLD.privacy_revoked_at_unix
-                    AND NEW.user_deleted_at_unix IS NOT NULL
-                    AND NEW.completed_at_unix IS NULL)
-                OR (OLD.state='user_deleted'
-                    AND NEW.state='completed'
-                    AND NEW.privacy_revoked_at_unix=OLD.privacy_revoked_at_unix
-                    AND NEW.user_deleted_at_unix=OLD.user_deleted_at_unix
-                    AND NEW.completed_at_unix IS NOT NULL)
-              )
-            BEGIN
-                SELECT RAISE(ABORT,'project deletion journal transition is invalid');
-            END;
-            ",
-        )
+    privacy::initialize_project_deletion_schema(connection)
         .map_err(|_| project_deletion_journal_error())?;
     validate_schema_contract(connection)
 }
@@ -480,9 +381,11 @@ impl PrivacyWorkflowManager {
     pub(super) fn recover_pending_project_deletions_unlocked(
         &self,
         privacy_connection: &mut Connection,
-    ) -> Result<(), PrivacyWorkflowError> {
+    ) -> Result<u64, PrivacyWorkflowError> {
         initialize_schema(privacy_connection)?;
         let project_ids = pending_project_ids(privacy_connection)?;
+        let recovered =
+            u64::try_from(project_ids.len()).map_err(|_| project_deletion_journal_error())?;
         for project_id in project_ids {
             let mut user_connection = database::open_user_database(&self.shared.user_database_path)
                 .map_err(|_| project_source_error())?;
@@ -492,7 +395,7 @@ impl PrivacyWorkflowManager {
                 &project_id,
             )?;
         }
-        Ok(())
+        Ok(recovered)
     }
 
     fn resume_pending_project_deletion_unlocked(

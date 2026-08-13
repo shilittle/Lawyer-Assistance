@@ -2104,6 +2104,40 @@ pub fn recover_pending_assistant_artifact_exports(
     Ok(recovered)
 }
 
+pub(crate) fn pending_assistant_artifact_export_marker_count_read_only(
+    app_local_data_dir: &Path,
+) -> Result<u64, AssistantIpcError> {
+    if !app_local_data_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0_u64;
+    for entry in fs::read_dir(app_local_data_dir)
+        .map_err(|error| AssistantIpcError::new("artifact_export_recovery", error.to_string()))?
+    {
+        let entry = entry.map_err(|error| {
+            AssistantIpcError::new("artifact_export_recovery", error.to_string())
+        })?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with(ARTIFACT_EXPORT_MARKER_PREFIX) || !file_name.ends_with(".json") {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            AssistantIpcError::new("artifact_export_recovery", error.to_string())
+        })?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(AssistantIpcError::new(
+                "artifact_export_recovery",
+                "artifact export marker must be an ordinary file",
+            ));
+        }
+        count = count.checked_add(1).ok_or_else(|| {
+            AssistantIpcError::new("artifact_export_recovery", "marker count overflow")
+        })?;
+    }
+    Ok(count)
+}
+
 fn validate_artifact_export_marker(
     marker: &ArtifactExportMarker,
     marker_path: &Path,

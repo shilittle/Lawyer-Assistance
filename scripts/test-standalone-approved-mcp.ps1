@@ -55,6 +55,25 @@ function Resolve-OrdinaryMcpBinary {
     return $resolved
 }
 
+function Assert-McpBinaryUnchanged {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Candidate,
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$ExpectedSha256
+    )
+
+    $resolved = Resolve-OrdinaryMcpBinary -Candidate $Candidate
+    if (-not $resolved.Equals($Candidate, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'MCP_E2E_BINARY_PATH_CHANGED'
+    }
+    $actualSha256 = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualSha256 -cne $ExpectedSha256) {
+        throw 'MCP_E2E_BINARY_CHANGED_DURING_TEST'
+    }
+}
+
 Push-Location $repositoryRoot
 try {
     $usingExplicitBinary = -not [string]::IsNullOrWhiteSpace($Binary)
@@ -120,18 +139,17 @@ try {
 
     $env:LAWYER_ASSISTANCE_MCP_E2E_BINARY = $binaryPath
     $env:LAWYER_ASSISTANCE_MCP_RELEASE_SHA256 = $binarySha256
-    $testName = if ($usingExplicitBinary) {
-        'approved_mcp::standalone_binary_tests::explicit_binary_qualification_canary_is_fail_closed'
-    }
-    else {
-        'approved_mcp::standalone_binary_tests::app_approval_to_real_stdio_and_http_binary_is_fail_closed'
-    }
+    $qualificationTestName = 'approved_mcp::standalone_binary_tests::explicit_binary_qualification_canary_is_fail_closed'
+    $fullSessionTestName = 'approved_mcp::standalone_binary_tests::app_approval_to_real_stdio_and_http_binary_is_fail_closed'
+    $testName = if ($usingExplicitBinary) { $qualificationTestName } else { $fullSessionTestName }
     $testScope = if ($usingExplicitBinary) {
-        'release-qualification-canary'
+        'release-external-stdio-http-qualification-canary'
     }
     else {
         'full-standalone-session'
     }
+
+    Assert-McpBinaryUnchanged -Candidate $binaryPath -ExpectedSha256 $binarySha256
     $testArguments = @(
         'test',
         '--locked',
@@ -145,7 +163,7 @@ try {
     )
     $listedTests = @(& cargo @testArguments -- --ignored --exact --list)
     if ($LASTEXITCODE -ne 0) {
-        throw "MCP_E2E_TEST_LIST_FAILED (exit=$LASTEXITCODE)"
+        throw "MCP_E2E_TEST_LIST_FAILED (test=$testName, exit=$LASTEXITCODE)"
     }
     $expectedListing = "$testName`: test"
     $listedTestCases = @(
@@ -154,7 +172,7 @@ try {
             Where-Object { $_.EndsWith(': test', [System.StringComparison]::Ordinal) }
     )
     if ($listedTestCases.Count -ne 1 -or $listedTestCases[0] -cne $expectedListing) {
-        throw "MCP_E2E_TEST_NOT_EXACT (expected one exact ignored test)"
+        throw "MCP_E2E_TEST_NOT_EXACT (test=$testName, expected one exact ignored test)"
     }
     $runTestArguments = $testArguments + @(
         '--',
@@ -163,15 +181,12 @@ try {
         '--nocapture',
         '--test-threads=1'
     )
-    Invoke-CargoStep -ResultCode 'MCP_E2E_TEST_FAILED' -Arguments $runTestArguments
-
-    $binarySha256After = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($binarySha256After -cne $binarySha256) {
-        throw 'MCP_E2E_BINARY_CHANGED_DURING_TEST'
-    }
+    Invoke-CargoStep -ResultCode "MCP_E2E_TEST_FAILED (test=$testName)" -Arguments $runTestArguments
+    Assert-McpBinaryUnchanged -Candidate $binaryPath -ExpectedSha256 $binarySha256
     $stopwatch.Stop()
     Write-Output 'MCP_STANDALONE_APPROVED_E2E=PASS'
     Write-Output "MCP_STANDALONE_APPROVED_E2E_SCOPE=$testScope"
+    Write-Output "MCP_STANDALONE_APPROVED_E2E_TEST=$testName"
     Write-Output "MCP_STANDALONE_APPROVED_E2E_SOURCE=$(if ($usingExplicitBinary) { 'explicit' } else { 'default-debug' })"
     Write-Output "MCP_STANDALONE_APPROVED_E2E_BINARY=$binaryPath"
     Write-Output "MCP_STANDALONE_APPROVED_E2E_VERSION=$expectedVersion"

@@ -160,6 +160,202 @@ mod vault_lifecycle_tests {
         assert_eq!(store.verify_vault_cleanup_journal().expect("journal"), 1);
     }
 
+    struct FailVaultCleanupAt(VaultCleanupFailurePoint);
+
+    impl VaultCleanupFailureInjector for FailVaultCleanupAt {
+        fn inject(&self, point: VaultCleanupFailurePoint) -> Result<(), VaultStoreError> {
+            if point == self.0 {
+                Err(VaultStoreError::IoFailed)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_purge_crash_preserves_durable_key_count_and_later_same_case_writes() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("vault");
+        let store = VaultStore::initialize(&root, workspace()).expect("store");
+        let case = case_id();
+        let object = store
+            .create_object(
+                &case,
+                VaultObjectKind::ReviewDraft,
+                metadata(250),
+                b"SYNTHETIC_DURABLE_KEY_COUNT",
+                250,
+            )
+            .expect("object");
+        store
+            .set_object_retention(&VaultRetentionBindingV1 {
+                case_id: case.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version,
+                expires_at_unix: 270,
+                legal_hold: false,
+                policy_revision: 1,
+                bound_at_unix: 260,
+            })
+            .expect("retention");
+        let cleanup = "cln_44444444444444444444444444444444";
+        assert_eq!(
+            store.run_or_resume_expired_object_cleanup_with_failure_injector(
+                cleanup,
+                280,
+                &FailVaultCleanupAt(
+                    VaultCleanupFailurePoint::AfterPhysicalPurgeBeforeJournalCommit,
+                ),
+            ),
+            Err(VaultStoreError::IoFailed)
+        );
+
+        let db = open_database(&store.root).expect("committed cleanup database");
+        let committed: (String, i64, String) = db
+            .query_row(
+                "SELECT state,key_records_destroyed,event_hash
+                 FROM vault_cleanup_journal WHERE cleanup_id=?1",
+                [cleanup],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("committed cleanup row");
+        assert_eq!(committed, ("committed".to_owned(), 1, String::new()));
+        assert!(!store.case_key_path(&case).exists());
+        assert!(!vault_cleanup_quarantine_path(
+            &store.root,
+            cleanup,
+            &object.object_id,
+            object.version,
+        )
+        .expect("quarantine path")
+        .exists());
+        drop(db);
+
+        assert_eq!(
+            store.create_object(
+                &case,
+                VaultObjectKind::ReviewDraft,
+                metadata(281),
+                b"MUST_NOT_REKEY_UNFINISHED_QUARANTINED_OBJECT",
+                281,
+            ),
+            Err(VaultStoreError::CaseKeyUnavailable),
+            "an unfinished committed cleanup still owns quarantined ciphertext and must not be re-keyed",
+        );
+
+        let reports = store.recover_object_cleanups(280).expect("recovery");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, "purged");
+        assert_eq!(reports[0].key_records_destroyed, 1);
+        assert_eq!(reports[0].event_hash.len(), 64);
+        let stable = store
+            .run_or_resume_expired_object_cleanup(cleanup, 280)
+            .expect("purged cleanup reloads");
+        assert_eq!(stable, reports[0]);
+
+        let replacement = store
+            .create_object(
+                &case,
+                VaultObjectKind::ReviewDraft,
+                metadata(290),
+                b"SYNTHETIC_REPLACEMENT_IN_SAME_CASE",
+                290,
+            )
+            .expect("same-case replacement creates a new key");
+        assert!(store.case_key_path(&case).is_file());
+        assert_eq!(
+            store
+                .read_object(&case, &replacement.object_id, replacement.version)
+                .expect("replacement decrypts")
+                .content,
+            b"SYNTHETIC_REPLACEMENT_IN_SAME_CASE"
+        );
+        assert_eq!(store.verify_vault_cleanup_journal().expect("journal"), 1);
+        assert_eq!(
+            store
+                .run_or_resume_expired_object_cleanup(cleanup, 280)
+                .expect("historical cleanup remains stable after same-case write"),
+            stable
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lineage_cleanup_run_or_resume_covers_missing_prepared_committed_and_purged() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("vault");
+        let store = VaultStore::initialize(&root, workspace()).expect("store");
+
+        let missing_id = "cln_11111111111111111111111111111111";
+        let missing = store
+            .run_or_resume_expired_object_cleanup(missing_id, 400)
+            .expect("missing cleanup runs exactly once");
+        assert_eq!(missing.state, "purged");
+        assert_eq!(missing.started_at_unix, 400);
+        assert_eq!(missing.completed_at_unix, 400);
+        assert_eq!(
+            store
+                .run_or_resume_expired_object_cleanup(missing_id, 400)
+                .expect("purged cleanup verifies as a stable no-op"),
+            missing
+        );
+        assert_eq!(
+            store.run_or_resume_expired_object_cleanup(missing_id, 401),
+            Err(VaultStoreError::ContentCorrupt),
+            "the same cleanup identity cannot be rebound to another cutoff"
+        );
+
+        let prepared_id = "cln_22222222222222222222222222222222";
+        store
+            .prepare_expired_object_cleanup(prepared_id, 500)
+            .expect("prepare crash window");
+        let prepared = store
+            .run_or_resume_expired_object_cleanup(prepared_id, 500)
+            .expect("prepared cleanup resumes");
+        assert_eq!(prepared.state, "purged");
+        assert_eq!(prepared.started_at_unix, 500);
+        assert_eq!(prepared.completed_at_unix, 500);
+
+        let committed_id = "cln_33333333333333333333333333333333";
+        store
+            .prepare_expired_object_cleanup(committed_id, 600)
+            .expect("prepare committed crash window");
+        let connection = open_database(&store.root).expect("open committed crash fixture");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE vault_cleanup_journal
+                     SET state='committed',completed_at_unix=600
+                     WHERE cleanup_id=?1 AND state='prepared'",
+                    [committed_id],
+                )
+                .expect("commit journal crash fixture"),
+            1
+        );
+        drop(connection);
+        let committed = store
+            .run_or_resume_expired_object_cleanup(committed_id, 600)
+            .expect("committed cleanup resumes final purge");
+        assert_eq!(committed.state, "purged");
+        assert_eq!(committed.started_at_unix, 600);
+        assert_eq!(committed.completed_at_unix, 600);
+        assert_eq!(
+            store
+                .run_or_resume_expired_object_cleanup(committed_id, 600)
+                .expect("resumed purged cleanup remains stable"),
+            committed
+        );
+
+        let status = store
+            .inspect_cleanup_status_read_only()
+            .expect("final cleanup status");
+        assert_eq!(status.prepared_count, 0);
+        assert_eq!(status.committed_count, 0);
+        assert_eq!(status.purged_count, 3);
+        assert_eq!(store.verify_vault_cleanup_journal().expect("journal"), 3);
+    }
+
     #[cfg(windows)]
     #[test]
     fn cleanup_rejects_envelope_tamper_and_hardlink_without_marking_removed() {

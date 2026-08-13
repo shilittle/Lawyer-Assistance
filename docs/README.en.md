@@ -2,7 +2,7 @@
 
 Lawyer Assistance is a local legal-assistance application for Windows x86_64. Its four top-level product areas are **Assistant**, **Cases**, **Legal Library**, and **Settings**. It provides ordinary Provider chat, offline public-law research, case-material organization and redaction, approved-only case work, controlled automation, legal diagrams, protected work products, and encrypted backup. Local processing is the default data boundary; every Provider or host integration requires the authorization chain for its exact execution mode.
 
-The current version is `0.4.0-beta.2`, an unsigned technical prerelease. It is not a formal release that has completed Authenticode signing, automatic-update, production OCR, and full archival-data delivery acceptance. Read the [current release status](release-status.en.md) before use.
+The current version is `0.4.0`. The repository is a source-complete stable-version candidate, not evidence that the stable Release has been published. Authenticode and updater credentials, exact-main CI, signed-asset service readback, Windows 10/11 clean-machine acceptance, and final MinerU/GPU qualification remain external release gates. Read the [current release status](release-status.en.md) before use.
 
 The source repository is public. That makes the source and any actually published files inspectable; it does not establish a trusted Windows publisher, a usable updater signature, OCR qualification, clean-machine acceptance, or a formal release.
 
@@ -19,7 +19,8 @@ The trust model keeps `interactive_chat`, `interactive_case_work`, and `approved
 
 - [Getting started](getting-started.en.md): installation, the four product areas, ordinary chat and explicit attachments, Materials & Redaction, approved-only Case Assistant, BYOK Providers, MCP, and backup.
 - [Security and privacy](security-and-privacy.en.md): the three non-interchangeable execution modes, local data, outbound authorization, OCR, host integrations, and backup boundaries.
-- [Current release status](release-status.en.md): implemented `0.4.0-beta.2` capabilities, disabled-by-default features, and formal-release gates.
+- [Current release status](release-status.en.md): implemented `0.4.0` capabilities, source-candidate status, disabled-by-default features, and stable-publication gates.
+- [Upgrade from v0.3.1 to v0.4.0](upgrade-v0.3.1-to-v0.4.0.en.md): exact-profile automatic upgrade, authenticated five-slot recovery, v0.3.1 reopen, and idempotent re-upgrade.
 - [中文文档](README.md)
 
 ## Functional reference
@@ -46,7 +47,7 @@ The repository includes functional integration examples for WorkBuddy, Codex, an
 
 ## Legal and data notice
 
-Application content supports research and lawyer review; it does not replace verification of current official texts, case facts, or professional judgment. Application packages use the verified `runtime-slim-v1` legal database. The full archival database is not included in the technical prerelease package. Data provenance and version identity are governed by the repository source manifest, distribution manifest, and in-App version information.
+Application content supports research and lawyer review; it does not replace verification of current official texts, case facts, or professional judgment. Application packages use the verified `runtime-slim-v1` legal database. The full archival database is not part of the desktop package. Data provenance and version identity are governed by the repository source manifest, distribution manifest, signed release assets, and in-App version information.
 
 - [Data-source manifest](../data/sources/source_manifest.md)
 - [Release notes](../RELEASE_NOTES.md)

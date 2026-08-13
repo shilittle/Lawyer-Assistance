@@ -38,11 +38,25 @@ type ApprovedMcpOperation =
   | "revoking-session";
 
 const REDACTION_ID = /^red_[a-f0-9]{32}$/u;
-const CASE_ID = /^case_[a-f0-9]{32}$/u;
+const PROJECT_ID_SHAPE = /^case-\S*$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const SERVER_ID = /^srv_[a-f0-9]{32}$/u;
 const HTTP_BEARER = /^mcp-http-[a-f0-9]{64}$/u;
 const HTTP_ENDPOINT = /^http:\/\/127\.0\.0\.1:(\d{4,5})\/mcp$/u;
+
+function isValidProjectId(projectId: string): boolean {
+  if (!PROJECT_ID_SHAPE.test(projectId)) return false;
+  return Array.from(projectId).every((character) => {
+    const codePoint = character.codePointAt(0);
+    return (
+      codePoint !== undefined &&
+      (codePoint > 0x1f || codePoint === 0x09) &&
+      codePoint !== 0x7f &&
+      codePoint !== 0x2028 &&
+      codePoint !== 0x2029
+    );
+  });
+}
 const APPROVED_TOOLS = [
   "system_status",
   "legal_search",
@@ -83,7 +97,7 @@ interface ApprovedMcpPanelViewProps {
   sessions: StandaloneApprovedMcpSessionMetadata[];
   selectedRedactionId: string;
   selectedGenerationKey: string;
-  historyCaseId: string;
+  historyProjectId: string;
   qualificationDays: string;
   connectorId: ApprovedMcpConnectorId;
   transport: ApprovedMcpTransport;
@@ -102,7 +116,7 @@ interface ApprovedMcpPanelViewProps {
   error: string;
   onSelectedRedactionIdChange: (value: string) => void;
   onSelectedGenerationKeyChange: (value: string) => void;
-  onHistoryCaseIdChange: (value: string) => void;
+  onHistoryProjectIdChange: (value: string) => void;
   onQualificationDaysChange: (value: string) => void;
   onConnectorIdChange: (value: ApprovedMcpConnectorId) => void;
   onTransportChange: (value: ApprovedMcpTransport) => void;
@@ -145,22 +159,22 @@ function boundedInteger(
 // eslint-disable-next-line react-refresh/only-export-components
 export function buildApprovedGenerationPublication(input: {
   redactionId: string;
-  caseId: string;
+  projectId: string;
   approvedPayloadSha256: string;
 }): PublishApprovedGenerationRequest {
   const redactionId = input.redactionId.trim();
-  const caseId = input.caseId.trim();
+  const projectId = input.projectId.trim();
   const expectedApprovedPayloadSha256 = input.approvedPayloadSha256.trim();
   if (!REDACTION_ID.test(redactionId)) {
     throw new Error("脱敏记录 ID 必须是 App 生成的 red_ opaque ID。");
   }
-  if (!CASE_ID.test(caseId)) {
-    throw new Error("案件 ID 必须是 case_ 加 32 位小写十六进制 opaque ID。");
+  if (!isValidProjectId(projectId) || new TextEncoder().encode(projectId).length > 256) {
+    throw new Error("项目 ID 必须是 App 提供的有效 case- ProjectId。");
   }
   if (!SHA256.test(expectedApprovedPayloadSha256)) {
     throw new Error("批准载荷 SHA-256 必须是 64 位小写十六进制值。");
   }
-  return { redactionId, caseId, expectedApprovedPayloadSha256 };
+  return { redactionId, projectId, expectedApprovedPayloadSha256 };
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -395,7 +409,7 @@ export function ApprovedMcpPanelView({
   sessions,
   selectedRedactionId,
   selectedGenerationKey,
-  historyCaseId,
+  historyProjectId,
   qualificationDays,
   connectorId,
   transport,
@@ -414,7 +428,7 @@ export function ApprovedMcpPanelView({
   error,
   onSelectedRedactionIdChange,
   onSelectedGenerationKeyChange,
-  onHistoryCaseIdChange,
+  onHistoryProjectIdChange,
   onQualificationDaysChange,
   onConnectorIdChange,
   onTransportChange,
@@ -448,9 +462,9 @@ export function ApprovedMcpPanelView({
   const selectedGeneration =
     generations.find((generation) => approvedGenerationKey(generation) === selectedGenerationKey)
       ?? null;
-  const caseOptions = Array.from(new Set([
-    ...reviewSelections.map((review) => review.caseId),
-    ...generations.map((generation) => generation.caseId),
+  const projectOptions = Array.from(new Set([
+    ...reviewSelections.map((review) => review.projectId),
+    ...generations.map((generation) => generation.projectId),
   ])).sort();
 
   return (
@@ -515,7 +529,7 @@ export function ApprovedMcpPanelView({
                 <option value="">请选择已批准且已绑定案件的审阅</option>
                 {reviewSelections.map((review) => (
                   <option key={review.redactionId} value={review.redactionId}>
-                    {review.caseId} / {review.materialId} / {review.redactionId}
+                    {review.projectId} / {review.materialId} / {review.redactionId}
                   </option>
                 ))}
               </select>
@@ -523,7 +537,7 @@ export function ApprovedMcpPanelView({
             {selectedReview ? (
               <dl className="approved-mcp-status">
                 <div><dt>redaction</dt><dd><code>{selectedReview.redactionId}</code></dd></div>
-                <div><dt>case</dt><dd><code>{selectedReview.caseId}</code></dd></div>
+                <div><dt>project</dt><dd><code>{selectedReview.projectId}</code></dd></div>
                 <div><dt>material</dt><dd><code>{selectedReview.materialId}</code></dd></div>
                 <div><dt>approved payload</dt><dd><code>{selectedReview.approvedPayloadSha256}</code></dd></div>
                 <div><dt>MCP 发布批准</dt><dd>{selectedReview.mcpPublishApproved ? "有效" : "未签发或已过期"}</dd></div>
@@ -583,12 +597,12 @@ export function ApprovedMcpPanelView({
             <span>案件筛选</span>
             <select
               disabled={locked}
-              value={historyCaseId}
-              onChange={(event) => onHistoryCaseIdChange(event.target.value)}
+              value={historyProjectId}
+              onChange={(event) => onHistoryProjectIdChange(event.target.value)}
             >
               <option value="">全部已批准案件</option>
-              {caseOptions.map((knownCaseId) => (
-                <option key={knownCaseId} value={knownCaseId}>{knownCaseId}</option>
+              {projectOptions.map((knownProjectId) => (
+                <option key={knownProjectId} value={knownProjectId}>{knownProjectId}</option>
               ))}
             </select>
           </label>
@@ -607,14 +621,14 @@ export function ApprovedMcpPanelView({
                 key={approvedGenerationKey(generation)}
                 value={approvedGenerationKey(generation)}
               >
-                {generation.caseId} / {generation.materialId} / {generation.publicationId} / v{generation.documentVersion}
+                {generation.projectId} / {generation.materialId} / {generation.publicationId} / v{generation.documentVersion}
               </option>
             ))}
           </select>
         </label>
         {selectedGeneration ? (
           <div className="approved-mcp-selected-generation">
-            <code>{selectedGeneration.caseId}</code>
+            <code>{selectedGeneration.projectId}</code>
             <code>{selectedGeneration.materialId}</code>
             <code>{selectedGeneration.publicationId}</code>
             <span>v{selectedGeneration.documentVersion} · {selectedGeneration.revokedAtUnix ? "已撤销" : "有效"}</span>
@@ -827,7 +841,7 @@ export function ApprovedMcpPanel({
   const [sessions, setSessions] = useState<StandaloneApprovedMcpSessionMetadata[]>([]);
   const [selectedRedactionId, setSelectedRedactionId] = useState("");
   const [selectedGenerationKey, setSelectedGenerationKey] = useState("");
-  const [historyCaseId, setHistoryCaseId] = useState("");
+  const [historyProjectId, setHistoryProjectId] = useState("");
   const [qualificationDays, setQualificationDays] = useState("1");
   const [connectorId, setConnectorId] = useState<ApprovedMcpConnectorId>("workbuddy");
   const [transport, setTransport] = useState<ApprovedMcpTransport>("stdio");
@@ -848,8 +862,8 @@ export function ApprovedMcpPanel({
   const loadState = useCallback(async (caseFilter: string) => {
     setOneTimeHttpProvisioning(null);
     const filter = caseFilter.trim();
-    if (filter && !CASE_ID.test(filter)) {
-      throw new Error("历史筛选只能使用后端返回的 case_ opaque ID。");
+    if (filter && (!isValidProjectId(filter) || new TextEncoder().encode(filter).length > 256)) {
+      throw new Error("历史筛选只能使用后端返回的 ProjectId。");
     }
     const [nextQualification, nextReviews, nextGenerations, nextSessions] = await Promise.all([
       getApprovedMcpQualificationStatus(),
@@ -929,7 +943,7 @@ export function ApprovedMcpPanel({
 
   const refresh = () => perform(
     "refreshing",
-    () => loadState(historyCaseId),
+    () => loadState(historyProjectId),
     "已重新验证资格证据，并读取批准审阅、generation 与会话状态。",
   );
 
@@ -988,12 +1002,12 @@ export function ApprovedMcpPanel({
       }
       const request = buildApprovedGenerationPublication({
         redactionId: selectedReview.redactionId,
-        caseId: selectedReview.caseId,
+        projectId: selectedReview.projectId,
         approvedPayloadSha256: selectedReview.approvedPayloadSha256,
       });
       const published = await publishApprovedGeneration(request);
-      setHistoryCaseId(request.caseId);
-      const nextGenerations = await listApprovedGenerations(request.caseId);
+      setHistoryProjectId(request.projectId);
+      const nextGenerations = await listApprovedGenerations(request.projectId);
       setGenerations(nextGenerations);
       setSelectedGenerationKey(
         nextGenerations.some((generation) => (
@@ -1009,7 +1023,7 @@ export function ApprovedMcpPanel({
   const revokeGeneration = (generation: ApprovedGenerationHistory) => {
     void perform("revoking-generation", async () => {
       await revokeApprovedGeneration(generation);
-      const nextGenerations = await listApprovedGenerations(historyCaseId.trim() || undefined);
+      const nextGenerations = await listApprovedGenerations(historyProjectId.trim() || undefined);
       setGenerations(nextGenerations);
       setSelectedGenerationKey(
         nextGenerations[0] ? approvedGenerationKey(nextGenerations[0]) : "",
@@ -1099,7 +1113,7 @@ export function ApprovedMcpPanel({
       sessions={sessions}
       selectedRedactionId={selectedRedactionId}
       selectedGenerationKey={selectedGenerationKey}
-      historyCaseId={historyCaseId}
+      historyProjectId={historyProjectId}
       qualificationDays={qualificationDays}
       connectorId={connectorId}
       transport={transport}
@@ -1118,7 +1132,7 @@ export function ApprovedMcpPanel({
       error={error}
       onSelectedRedactionIdChange={setSelectedRedactionId}
       onSelectedGenerationKeyChange={setSelectedGenerationKey}
-      onHistoryCaseIdChange={setHistoryCaseId}
+      onHistoryProjectIdChange={setHistoryProjectId}
       onQualificationDaysChange={setQualificationDays}
       onConnectorIdChange={(value) => {
         setOneTimeHttpProvisioning(null);

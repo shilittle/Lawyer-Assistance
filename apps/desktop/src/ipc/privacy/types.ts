@@ -505,6 +505,10 @@ export interface StageApplicationRestoreRequest {
   confirmation: string;
 }
 
+export interface StageV031MigrationRecoveryRequest {
+  confirmation: string;
+}
+
 export type ApprovedProviderTask =
   | "summary"
   | "legal_analysis"

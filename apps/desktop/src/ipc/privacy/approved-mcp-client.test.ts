@@ -23,15 +23,15 @@ describe("approved MCP IPC client", () => {
     invoke.mockResolvedValue({});
   });
 
-  it("publishes and revokes only by opaque IDs and immutable hashes", async () => {
+  it("publishes, lists and revokes through ProjectId without carrying PrivacyCaseId", async () => {
     await publishApprovedGeneration({
       redactionId: "red_00000000000000000000000000000001",
-      caseId: "case_00000000000000000000000000000001",
+      projectId: "case-project-1",
       expectedApprovedPayloadSha256: "a".repeat(64),
     });
-    await listApprovedGenerations("case_00000000000000000000000000000001");
+    await listApprovedGenerations("case-project-1");
     await revokeApprovedGeneration({
-      caseId: "case_00000000000000000000000000000001",
+      projectId: "case-project-1",
       materialId: "mat_00000000000000000000000000000001",
       documentVersion: 1,
       publicationId: "pub_00000000000000000000000000000001",
@@ -40,22 +40,25 @@ describe("approved MCP IPC client", () => {
     expect(invoke).toHaveBeenNthCalledWith(1, "publish_approved_generation", {
       request: {
         redactionId: "red_00000000000000000000000000000001",
-        caseId: "case_00000000000000000000000000000001",
+        projectId: "case-project-1",
         expectedApprovedPayloadSha256: "a".repeat(64),
       },
     });
     expect(invoke).toHaveBeenNthCalledWith(2, "list_approved_generations", {
-      request: { caseId: "case_00000000000000000000000000000001" },
+      request: { projectId: "case-project-1" },
     });
     expect(invoke).toHaveBeenNthCalledWith(3, "revoke_approved_generation", {
       request: {
-        caseId: "case_00000000000000000000000000000001",
+        projectId: "case-project-1",
         materialId: "mat_00000000000000000000000000000001",
         documentVersion: 1,
         publicationId: "pub_00000000000000000000000000000001",
       },
     });
     const wire = JSON.stringify(invoke.mock.calls);
+    expect(wire).not.toContain('"caseId"');
+    expect(wire).not.toContain("privacyCaseId");
+    expect(wire).not.toContain("case_00000000000000000000000000000001");
     for (const forbidden of [
       "path",
       "filename",

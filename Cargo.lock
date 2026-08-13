@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "assistant"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "quick-xml",
  "serde",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "citations"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "database",
  "domain",
@@ -1074,12 +1074,14 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "database"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "rusqlite",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1161,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "diagrams"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "jsonschema",
  "rustix",
@@ -1284,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1583,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "file-ingest"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "infer",
  "lopdf 0.44.0",
@@ -2666,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "lawyer-assistance-desktop"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "assistant",
  "base64 0.22.1",
@@ -2688,6 +2690,7 @@ dependencies = [
  "reqwest 0.12.28",
  "retrieval",
  "rusqlite",
+ "rustls",
  "semver 1.0.28",
  "serde",
  "serde_json",
@@ -2713,7 +2716,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "legal-mcp"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2748,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "legal-services"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "assistant",
  "citations",
@@ -2954,7 +2957,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "material-processing"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "image",
  "lopdf 0.44.0",
@@ -3792,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "privacy"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "regex",
@@ -3890,7 +3893,7 @@ dependencies = [
 
 [[package]]
 name = "providers"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "privacy",
  "reqwest 0.12.28",
@@ -4207,7 +4210,7 @@ dependencies = [
 
 [[package]]
 name = "retrieval"
-version = "0.4.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "database",
  "domain",

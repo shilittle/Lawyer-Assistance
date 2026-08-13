@@ -15,6 +15,7 @@ use privacy::mcp_ticket::McpTransportBindingV1;
 use providers::{ApiSecret, CredentialStore, ProviderCredentialKey, ProviderStoreLock};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     fmt,
     fs::{self, OpenOptions},
     io::Write,
@@ -70,6 +71,15 @@ impl McpServerConfig {
             request_timeout_ms: legal_mcp::config::DEFAULT_REQUEST_TIMEOUT_MS,
             max_concurrency: legal_mcp::config::DEFAULT_MAX_CONCURRENCY,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defaults_for_test(app_local_data_directory: &Path) -> Self {
+        let mcp_directory = app_local_data_directory.join(CONFIG_DIRECTORY_NAME);
+        Self::defaults(
+            mcp_directory.join(DEFAULT_MATERIALS_DIRECTORY_NAME),
+            mcp_directory.join(DEFAULT_EXPORTS_DIRECTORY_NAME),
+        )
     }
 }
 
@@ -714,6 +724,14 @@ impl McpManager {
         self.shared.lifecycle_notify.notify_waiters();
     }
 
+    /// R3 staging must close every in-process MCP admission path as soon as it
+    /// owns (or observes another owner of) application exit. This operation is
+    /// deliberately idempotent: the subsequent quiescence drain repeats it so
+    /// no error path can accidentally reopen admission.
+    pub(crate) fn close_v031_recovery_admission(&self) {
+        self.cancel_for_exit();
+    }
+
     /// Permanently close MCP admission for this process and wait without a UI
     /// timeout until startup, server requests, blocking writes, and any current
     /// configuration/credential operation have all reached a terminal state.
@@ -760,6 +778,7 @@ impl McpManager {
         http_port: Option<u16>,
         allowed_origins: Vec<String>,
     ) -> Result<ProvisionedStandaloneSessionV1, McpManagerError> {
+        let _operation = self.begin_control_operation("provision_standalone")?;
         let (config, workspace) = {
             let state = self.state();
             if !state.config_valid {
@@ -860,6 +879,31 @@ impl McpManager {
         tokio::time::timeout(timeout, self.shutdown_for_exit())
             .await
             .is_ok()
+    }
+
+    /// R3-only fail-closed barrier. It permanently closes embedded and control admission, waits
+    /// for every admitted control/server operation, then authenticates and revokes every still
+    /// active standalone descriptor. Ordinary application exit deliberately does not call this
+    /// method and therefore retains its existing standalone persistence semantics.
+    pub(crate) async fn shutdown_for_v031_recovery_with_timeout(&self, timeout: Duration) -> bool {
+        self.close_v031_recovery_admission();
+        let workspace = self.shared.approved_workspace.clone();
+        tokio::time::timeout(timeout, async {
+            self.shutdown_for_exit().await;
+            let Some(workspace) = workspace else {
+                return Ok(());
+            };
+            tokio::task::spawn_blocking(move || revoke_all_active_standalone_sessions(&workspace))
+                .await
+                .map_err(|_| {
+                    McpManagerError::new(
+                        "approved_mcp_quiesce_failed",
+                        "The standalone approved MCP revocation worker did not complete",
+                    )
+                })?
+        })
+        .await
+        .is_ok_and(|result| result.is_ok())
     }
 
     async fn prepare_server(
@@ -1107,6 +1151,61 @@ impl Drop for ControlOperationGuard {
             shared.lifecycle_notify.notify_waiters();
         }
     }
+}
+
+fn revoke_all_active_standalone_sessions(
+    workspace: &ApprovedMcpWorkspace,
+) -> Result<(), McpManagerError> {
+    revoke_active_standalone_sessions_with(
+        || {
+            workspace
+                .list_standalone_sessions()
+                .map_err(map_approved_mcp_error)
+        },
+        |server_instance_id| {
+            workspace
+                .revoke_standalone_session(server_instance_id)
+                .map_err(map_approved_mcp_error)
+        },
+    )
+}
+
+fn revoke_active_standalone_sessions_with<Inspect, Revoke>(
+    mut inspect: Inspect,
+    mut revoke: Revoke,
+) -> Result<(), McpManagerError>
+where
+    Inspect: FnMut() -> Result<Vec<StandaloneSessionMetadataV1>, McpManagerError>,
+    Revoke: FnMut(&str) -> Result<(), McpManagerError>,
+{
+    let active = inspect()?
+        .into_iter()
+        .filter(|session| session.active)
+        .map(|session| session.server_instance_id)
+        .collect::<BTreeSet<_>>();
+    let mut first_error = None;
+    for server_instance_id in active {
+        if let Err(error) = revoke(&server_instance_id) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    let remaining = inspect()?
+        .into_iter()
+        .filter(|session| session.active)
+        .map(|session| session.server_instance_id)
+        .collect::<BTreeSet<_>>();
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(first_error.unwrap_or_else(|| {
+        McpManagerError::new(
+            "approved_mcp_quiesce_failed",
+            "An active standalone approved MCP descriptor remains after revocation",
+        )
+    }))
 }
 
 fn record_server_exit(
@@ -1642,6 +1741,26 @@ fn civil_date_from_days(days: i64) -> (i64, i64, i64) {
 mod tests {
     use super::*;
 
+    fn standalone_metadata(server_instance_id: &str, active: bool) -> StandaloneSessionMetadataV1 {
+        StandaloneSessionMetadataV1 {
+            descriptor_id: format!("mcpd_{}", "d".repeat(32)),
+            connector_id: "codex".to_owned(),
+            workspace_instance_id: format!("ws_{}", "e".repeat(32)),
+            server_instance_id: server_instance_id.to_owned(),
+            session_id: format!("session_{}", "f".repeat(32)),
+            transport: McpTransportBindingV1::Stdio,
+            grant_groups: Vec::new(),
+            grants: Vec::new(),
+            endpoint: None,
+            qualification_evidence_id: format!("mcpq_{}", "1".repeat(32)),
+            qualification_evidence_sha256: "2".repeat(64),
+            issued_at_unix: 1,
+            expires_at_unix: 2,
+            active,
+            reason_code: if active { "ACTIVE" } else { "REVOKED" }.to_owned(),
+        }
+    }
+
     fn manager_fixture() -> (tempfile::TempDir, McpManager) {
         let directory = tempfile::tempdir().expect("temporary application directory");
         let legal = directory.path().join("legal.sqlite");
@@ -1941,6 +2060,152 @@ mod tests {
             .await
             .expect("exit drain completes after control operation")
             .expect("drain task joins");
+    }
+
+    #[test]
+    fn standalone_provisioning_uses_control_admission_and_rejects_exit() {
+        let (_directory, manager) = manager_fixture();
+        let operation = manager
+            .begin_control_operation("synthetic_blocker")
+            .expect("hold control admission");
+        assert_eq!(
+            manager
+                .provision_standalone_approved_session(
+                    "codex".to_owned(),
+                    McpTransportBindingV1::Stdio,
+                    Vec::new(),
+                    60,
+                    None,
+                    Vec::new(),
+                )
+                .expect_err("standalone provision waits behind control admission")
+                .code(),
+            "operation_in_progress"
+        );
+        drop(operation);
+        manager.cancel_for_exit();
+        assert_eq!(
+            manager
+                .provision_standalone_approved_session(
+                    "codex".to_owned(),
+                    McpTransportBindingV1::Stdio,
+                    Vec::new(),
+                    60,
+                    None,
+                    Vec::new(),
+                )
+                .expect_err("standalone provision is permanently closed during exit")
+                .code(),
+            "application_exiting"
+        );
+    }
+
+    #[test]
+    fn r3_explicit_admission_close_is_idempotent_and_never_reopens() {
+        let (_directory, manager) = manager_fixture();
+        manager.close_v031_recovery_admission();
+        manager.close_v031_recovery_admission();
+        assert!(manager.state().exiting);
+        assert_eq!(
+            manager
+                .begin_control_operation("new_work_after_r3_close")
+                .expect_err("R3 admission remains permanently closed")
+                .code(),
+            "application_exiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn r3_quiesce_timeout_is_fail_closed_and_keeps_admission_closed() {
+        let (_directory, manager) = manager_fixture();
+        let operation = manager
+            .begin_control_operation("synthetic_blocker")
+            .expect("hold control operation");
+        assert!(
+            !manager
+                .shutdown_for_v031_recovery_with_timeout(Duration::from_millis(20))
+                .await
+        );
+        assert!(manager.state().exiting);
+        assert_eq!(
+            manager
+                .begin_control_operation("new_work")
+                .expect_err("timed-out R3 drain keeps admission closed")
+                .code(),
+            "application_exiting"
+        );
+        drop(operation);
+        assert!(
+            manager
+                .shutdown_for_v031_recovery_with_timeout(Duration::from_secs(1))
+                .await
+        );
+    }
+
+    #[test]
+    fn r3_standalone_quiesce_revokes_only_active_descriptors_and_rechecks() {
+        let active = Arc::new(Mutex::new(BTreeSet::from([
+            format!("srv_{}", "a".repeat(32)),
+            format!("srv_{}", "b".repeat(32)),
+        ])));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let inspect_active = Arc::clone(&active);
+        let revoke_active = Arc::clone(&active);
+        let revoked_calls = Arc::clone(&revoked);
+        revoke_active_standalone_sessions_with(
+            move || {
+                let current = inspect_active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let mut sessions = current
+                    .iter()
+                    .map(|id| standalone_metadata(id, true))
+                    .collect::<Vec<_>>();
+                sessions.push(standalone_metadata(
+                    &format!("srv_{}", "c".repeat(32)),
+                    false,
+                ));
+                Ok(sessions)
+            },
+            move |server_instance_id| {
+                revoked_calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(server_instance_id.to_owned());
+                revoke_active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(server_instance_id);
+                Ok(())
+            },
+        )
+        .expect("all authenticated active descriptors revoke");
+        let mut revoked = revoked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        revoked.sort();
+        assert_eq!(
+            revoked,
+            vec![
+                format!("srv_{}", "a".repeat(32)),
+                format!("srv_{}", "b".repeat(32))
+            ]
+        );
+
+        let remaining_id = format!("srv_{}", "9".repeat(32));
+        let error = revoke_active_standalone_sessions_with(
+            || Ok(vec![standalone_metadata(&remaining_id, true)]),
+            |_| {
+                Err(McpManagerError::new(
+                    "synthetic_revoke_failed",
+                    "Synthetic standalone revoke failure",
+                ))
+            },
+        )
+        .expect_err("an authenticated active descriptor remaining is fail closed");
+        assert_eq!(error.code(), "synthetic_revoke_failed");
     }
 
     #[tokio::test]

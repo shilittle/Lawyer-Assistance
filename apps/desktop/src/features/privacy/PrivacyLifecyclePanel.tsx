@@ -16,6 +16,7 @@ import {
   setPrivacyRetentionPolicy,
   stageApplicationRestore,
   stagePrivacyRestore,
+  stageV031MigrationRecovery,
   verifyApplicationBackup,
   verifyPrivacyBackup,
 } from "../../ipc/privacy/client";
@@ -26,6 +27,7 @@ import type {
   MappingKeyView,
   MappingRevisionView,
   RevealMappingResponse,
+  StageV031MigrationRecoveryRequest,
   VerifiedBackupView,
 } from "../../ipc/privacy/types";
 import "./privacy-lifecycle.css";
@@ -37,6 +39,9 @@ export const DESTROY_MAPPING_KEY_CONFIRMATION = "销毁映射密钥";
 export const RUN_RETENTION_CONFIRMATION = "执行到期清理";
 export const RESTORE_BACKUP_CONFIRMATION = "恢复隐私备份";
 export const RESTORE_APPLICATION_BACKUP_CONFIRMATION = "恢复完整应用备份";
+export const V031_MIGRATION_RECOVERY_CONFIRMATION = "恢复到 v0.3.1 并退出当前应用";
+export const V031_MIGRATION_RECOVERY_STAGED_NOTICE =
+  "受保护的 v0.3.1 migration recovery 请求已安装；应用将受控重启。下一 recovery-only 进程完成恢复后会退出，且不会运行普通初始化。";
 
 const MAX_RETENTION_SECONDS = 10 * 365 * 24 * 60 * 60;
 
@@ -49,7 +54,8 @@ type LifecycleOperation =
   | "mapping"
   | "key"
   | "sweep"
-  | "backup";
+  | "backup"
+  | "migration-recovery";
 
 interface RetentionDraft {
   reviewRetentionSeconds: string;
@@ -137,6 +143,75 @@ export function ApplicationBackupOutcomeView({
       ) : null}
       {response.restartRequired ? <p className="privacy-restart-required"><strong>restart_required=true</strong>：五组件认证备份集仅已暂存；请正常重启应用完成用户数据库、加密隐私 bundle、加密案件 Vault、已批准工作区与加密 work products 的原子安装和启动时复核，任一组件失败将整体回滚。</p> : null}
     </div>
+  );
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export async function submitV031MigrationRecovery(
+  confirmation: string,
+  stage: (request: StageV031MigrationRecoveryRequest) => Promise<void>,
+): Promise<boolean> {
+  if (confirmation !== V031_MIGRATION_RECOVERY_CONFIRMATION) return false;
+  await stage({ confirmation });
+  return true;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function shouldReleaseLifecycleBusy(
+  succeeded: boolean,
+  holdBusyOnSuccess: boolean,
+): boolean {
+  return !succeeded || !holdBusyOnSuccess;
+}
+
+export function V031MigrationRecoveryControl({
+  busy,
+  confirmation,
+  onConfirmationChange,
+  onStage,
+}: {
+  busy: boolean;
+  confirmation: string;
+  onConfirmationChange: (value: string) => void;
+  onStage: () => void;
+}) {
+  const confirmed = confirmation === V031_MIGRATION_RECOVERY_CONFIRMATION;
+  return (
+    <section className="privacy-lifecycle-card">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">显式旧态恢复 · apply-and-exit</p>
+          <h3>恢复到 v0.3.1 原态五槽</h3>
+        </div>
+        <span>recovery-only</span>
+      </div>
+      <p className="privacy-help">
+        此操作会先建立 current v0.4 五组件安全备份，再安装受保护恢复请求并受控重启。
+        下一 recovery-only 进程会在任何普通 manager、后台任务或 UI 初始化前完成五槽恢复；
+        成功后退出当前应用且不运行普通初始化。原态 bundle 不能通过普通恢复入口打开。
+      </p>
+      <div className="privacy-sensitive-action">
+        <label>
+          <span>显式恢复前输入：<strong>{V031_MIGRATION_RECOVERY_CONFIRMATION}</strong></span>
+          <input
+            autoComplete="off"
+            disabled={busy}
+            value={confirmation}
+            onChange={(event) => onConfirmationChange(event.target.value)}
+          />
+        </label>
+        <button
+          className="danger"
+          disabled={busy || !confirmed}
+          type="button"
+          onClick={() => {
+            if (!busy && confirmed) onStage();
+          }}
+        >
+          安装受保护恢复请求并受控重启
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -243,6 +318,7 @@ export function PrivacyLifecyclePanel({
   const [restoreConfirmation, setRestoreConfirmation] = useState("");
   const [applicationBackupOutcome, setApplicationBackupOutcome] = useState<ApplicationBackupOutcome | null>(null);
   const [applicationRestoreConfirmation, setApplicationRestoreConfirmation] = useState("");
+  const [migrationRecoveryConfirmation, setMigrationRecoveryConfirmation] = useState("");
 
   const busy = disabled || operation !== "idle";
   const clearReveal = useCallback(() => {
@@ -307,19 +383,24 @@ export function PrivacyLifecyclePanel({
       action: () => Promise<void>,
       success: string,
       refresh = true,
+      holdBusyOnSuccess = false,
     ) => {
       if (disabled || operation !== "idle") return;
       setOperation(nextOperation);
       setError("");
       setNotice("");
+      let succeeded = false;
       try {
         await action();
         if (refresh) await loadStatus();
         setNotice(success);
+        succeeded = true;
       } catch (reason: unknown) {
         setError(displayError(reason));
       } finally {
-        setOperation("idle");
+        if (shouldReleaseLifecycleBusy(succeeded, holdBusyOnSuccess)) {
+          setOperation("idle");
+        }
       }
     },
     [disabled, loadStatus, operation],
@@ -502,6 +583,36 @@ export function PrivacyLifecyclePanel({
         </div>
         <ApplicationBackupOutcomeView outcome={applicationBackupOutcome} />
       </section>
+
+      <V031MigrationRecoveryControl
+        busy={busy}
+        confirmation={migrationRecoveryConfirmation}
+        onConfirmationChange={setMigrationRecoveryConfirmation}
+        onStage={() => {
+          if (
+            busy ||
+            migrationRecoveryConfirmation !== V031_MIGRATION_RECOVERY_CONFIRMATION
+          ) {
+            return;
+          }
+          void run(
+            "migration-recovery",
+            async () => {
+              try {
+                await submitV031MigrationRecovery(
+                  migrationRecoveryConfirmation,
+                  stageV031MigrationRecovery,
+                );
+              } finally {
+                setMigrationRecoveryConfirmation("");
+              }
+            },
+            V031_MIGRATION_RECOVERY_STAGED_NOTICE,
+            false,
+            true,
+          );
+        }}
+      />
 
       <section className="privacy-lifecycle-card">
         <div className="panel-heading"><div><p className="eyebrow">DPAPI 当前用户 + 认证加密</p><h3>隐私库独立备份与重启恢复</h3></div><span>.lavprivacy</span></div>

@@ -1,6 +1,10 @@
 use super::{qualification::DesktopApprovedMcpQualificationProvider, *};
 use crate::{
-    commands::approved_mcp::{publish_approved_generation_inner, PublishApprovedGenerationRequest},
+    commands::approved_mcp::{
+        list_approved_generations_inner, publish_approved_generation_inner,
+        revoke_approved_generation_inner, ListApprovedGenerationsRequest,
+        PublishApprovedGenerationRequest, RevokeApprovedGenerationRequest,
+    },
     privacy_manager::{LocalOcrStatus, LocalOcrStatusCode, PrivacyConfig},
     privacy_workflow::{
         test_workspace_instance_id, ApplyCaseRedactionRiskReviewActionRequest,
@@ -369,13 +373,19 @@ impl PublishCommandFixture {
                 confirmed: true,
             })
             .expect("issue dedicated approved workspace authorization");
-        let privacy_case_id = workflow
+        let selection = workflow
             .list_approved_review_selections()
             .expect("list exact approved selection")
             .into_iter()
             .find(|selection| selection.redaction_id == reviewed.redaction_id)
-            .expect("integration selection")
-            .case_id;
+            .expect("integration selection");
+        assert_eq!(selection.project_id, project_id);
+        let privacy_case_id = workflow
+            .with_existing_project_privacy_case(&project_id, |_project_id, privacy_case_id| {
+                Ok::<String, ()>(privacy_case_id.as_str().to_owned())
+            })
+            .expect("resolve persisted project binding")
+            .expect("read internal PrivacyCaseId in backend-only test");
         assert!(
             workspace
                 .list(Some(&privacy_case_id))
@@ -401,7 +411,7 @@ impl PublishCommandFixture {
     fn request(&self) -> PublishApprovedGenerationRequest {
         PublishApprovedGenerationRequest {
             redaction_id: self.redaction_id.clone(),
-            case_id: self.privacy_case_id.clone(),
+            project_id: self.project_id.clone(),
             expected_approved_payload_sha256: self.approved_payload_sha256.clone(),
         }
     }
@@ -553,25 +563,7 @@ fn assert_publish_rejected_without_workspace_write(fixture: &PublishCommandFixtu
     );
 }
 
-#[test]
-fn command_publish_commits_a_real_binding_authorized_generation() {
-    let fixture = PublishCommandFixture::new();
-    let published =
-        publish_approved_generation_inner(&fixture.workflow, &fixture.workspace, fixture.request())
-            .expect("publish through the command service boundary");
-    assert_eq!(published.case_id, fixture.privacy_case_id);
-    assert_eq!(published.material_id, fixture.material_id);
-    let history = fixture
-        .workspace
-        .list(Some(&fixture.privacy_case_id))
-        .expect("list committed publication");
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].publication_id, published.publication_id);
-}
-
-#[test]
-fn command_publish_rejects_binding_tamper_without_workspace_write() {
-    let fixture = PublishCommandFixture::new();
+fn tamper_project_privacy_case_binding(fixture: &PublishCommandFixture) {
     let privacy_database = fixture
         .directory
         .path()
@@ -600,9 +592,121 @@ fn command_publish_rejects_binding_tamper_without_workspace_write() {
     connection
         .execute_batch(&format!("{trigger_sql};"))
         .expect("restore canonical binding guard");
-    drop(connection);
+}
 
+#[test]
+fn command_publish_commits_a_real_binding_authorized_generation() {
+    let fixture = PublishCommandFixture::new();
+    let published =
+        publish_approved_generation_inner(&fixture.workflow, &fixture.workspace, fixture.request())
+            .expect("publish through the command service boundary");
+    assert_eq!(published.project_id, fixture.project_id);
+    assert_eq!(published.material_id, fixture.material_id);
+    let history = fixture
+        .workspace
+        .list(Some(&fixture.privacy_case_id))
+        .expect("list committed publication");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].publication_id, published.publication_id);
+}
+
+#[test]
+fn command_list_and_revoke_resolve_project_id_without_exposing_privacy_case_id() {
+    let fixture = PublishCommandFixture::new();
+    let published =
+        publish_approved_generation_inner(&fixture.workflow, &fixture.workspace, fixture.request())
+            .expect("publish through ProjectId boundary");
+    let history = list_approved_generations_inner(
+        &fixture.workflow,
+        &fixture.workspace,
+        ListApprovedGenerationsRequest {
+            project_id: Some(fixture.project_id.clone()),
+        },
+    )
+    .expect("list through ProjectId binding");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].project_id, fixture.project_id);
+    let wire = serde_json::to_string(&history).expect("serialize safe history");
+    assert!(!wire.contains("caseId"));
+    assert!(!wire.contains("privacyCaseId"));
+    assert!(!wire.contains(&fixture.privacy_case_id));
+
+    revoke_approved_generation_inner(
+        &fixture.workflow,
+        &fixture.workspace,
+        RevokeApprovedGenerationRequest {
+            project_id: fixture.project_id.clone(),
+            material_id: published.material_id,
+            document_version: published.document_version,
+            publication_id: published.publication_id,
+        },
+        || Ok(()),
+    )
+    .expect("revoke through ProjectId binding");
+    let internal_history = fixture
+        .workspace
+        .list(Some(&fixture.privacy_case_id))
+        .expect("read internal revoked generation");
+    assert!(internal_history[0].revoked_at_unix.is_some());
+}
+
+#[test]
+fn command_publish_rejects_mismatched_project_id_without_workspace_write() {
+    let fixture = PublishCommandFixture::new();
+    let before = approved_tree_hashes(&fixture.approved_root());
+    let mut request = fixture.request();
+    request.project_id = "case-another-project".to_owned();
+    let error = publish_approved_generation_inner(&fixture.workflow, &fixture.workspace, request)
+        .expect_err("redaction and caller ProjectId mismatch must fail closed");
+    assert_eq!(error.error_type, "project_privacy_case_conflict");
+    assert_eq!(approved_tree_hashes(&fixture.approved_root()), before);
+}
+
+#[test]
+fn command_publish_rejects_binding_tamper_without_workspace_write() {
+    let fixture = PublishCommandFixture::new();
+    tamper_project_privacy_case_binding(&fixture);
     assert_publish_rejected_without_workspace_write(&fixture);
+}
+
+#[test]
+fn command_list_and_revoke_reject_binding_tamper_without_workspace_write() {
+    let fixture = PublishCommandFixture::new();
+    let published =
+        publish_approved_generation_inner(&fixture.workflow, &fixture.workspace, fixture.request())
+            .expect("publish before binding tamper");
+    tamper_project_privacy_case_binding(&fixture);
+    let before = approved_tree_hashes(&fixture.approved_root());
+
+    let list_error = list_approved_generations_inner(
+        &fixture.workflow,
+        &fixture.workspace,
+        ListApprovedGenerationsRequest {
+            project_id: Some(fixture.project_id.clone()),
+        },
+    )
+    .expect_err("tampered binding must block ProjectId history resolution");
+    assert!(!list_error.error_type.is_empty());
+
+    let revoke_error = revoke_approved_generation_inner(
+        &fixture.workflow,
+        &fixture.workspace,
+        RevokeApprovedGenerationRequest {
+            project_id: fixture.project_id.clone(),
+            material_id: published.material_id,
+            document_version: published.document_version,
+            publication_id: published.publication_id,
+        },
+        || Ok(()),
+    )
+    .expect_err("tampered binding must block ProjectId revocation resolution");
+    assert!(!revoke_error.error_type.is_empty());
+    assert_eq!(approved_tree_hashes(&fixture.approved_root()), before);
+    let internal_history = fixture
+        .workspace
+        .list(Some(&fixture.privacy_case_id))
+        .expect("read unchanged internal history");
+    assert!(internal_history[0].revoked_at_unix.is_none());
 }
 
 #[test]

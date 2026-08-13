@@ -1,24 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Lawyer Assistance",
-  "version": "0.4.0-beta.2",
+  "version": "0.4.0",
   "identifier": "com.shilittle.lawyer-assistance",
   "build": {
     "beforeBuildCommand": "node scripts/build_tauri_frontend.mjs",
     "frontendDist": "../frontend-dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Lawyer Assistance",
-        "width": 1440,
-        "height": 900,
-        "minWidth": 640,
-        "minHeight": 420,
-        "maximized": true,
-        "resizable": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": {
         "default-src": "'self'",

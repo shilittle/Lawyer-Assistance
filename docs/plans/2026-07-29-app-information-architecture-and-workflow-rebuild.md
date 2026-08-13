@@ -780,3 +780,11 @@ approved workspace 或 MCP 后端安全契约，也不得提前执行 Phase 7 �
   * UI 截图；
   * 回滚方法。
 * 未完成端到端验收前，不得发布正式 v0.4。
+
+## 12. Phase 7 后的 v0.4.0 发布阶段
+
+Phase 7 合并后的真实 `v0.3.1 → v0.4.0` 升级、原态五槽回滚、`apply-and-exit`、稳定版本
+同步、签名资产、服务端回读和 GitHub Release 唯一顺序，统一由
+[`2026-08-01-v0.4.0-upgrade-release-and-publication.md`](2026-08-01-v0.4.0-upgrade-release-and-publication.md)
+冻结。本计划 Phase 3–7 的业务与安全契约继续有效；发布计划只能补齐升级和发布门禁，不能
+回退 ADR-0001、普通聊天/案件/MCP 边界或 Phase 7 产品验收。

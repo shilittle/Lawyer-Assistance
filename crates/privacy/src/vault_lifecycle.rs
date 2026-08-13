@@ -43,6 +43,33 @@ pub struct VaultCleanupPendingStatusV1 {
     pub purged_count: u64,
 }
 
+/// Durable writer boundaries used by the application upgrade coordinator to
+/// prove that an interrupted cleanup resumes through the same production
+/// implementation.  The public surface is intentionally minimal: production
+/// callers use [`NoopVaultCleanupFailureInjector`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultCleanupFailurePoint {
+    AfterPreparedTransactionCommit,
+    AfterCommittedTransactionCommit,
+    AfterPhysicalPurgeBeforeJournalCommit,
+}
+
+#[doc(hidden)]
+pub trait VaultCleanupFailureInjector: Send + Sync {
+    fn inject(&self, point: VaultCleanupFailurePoint) -> Result<(), VaultStoreError>;
+}
+
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopVaultCleanupFailureInjector;
+
+impl VaultCleanupFailureInjector for NoopVaultCleanupFailureInjector {
+    fn inject(&self, _point: VaultCleanupFailurePoint) -> Result<(), VaultStoreError> {
+        Ok(())
+    }
+}
+
 impl VaultCleanupPendingStatusV1 {
     pub fn has_unfinished_cleanup(self) -> bool {
         self.prepared_count != 0 || self.committed_count != 0
@@ -240,6 +267,19 @@ impl VaultStore {
         cleanup_id: &str,
         completed_at_unix: u64,
     ) -> Result<VaultCleanupReportV1, VaultStoreError> {
+        self.commit_expired_object_cleanup_with_failure_injector(
+            cleanup_id,
+            completed_at_unix,
+            &NoopVaultCleanupFailureInjector,
+        )
+    }
+
+    fn commit_expired_object_cleanup_with_failure_injector(
+        &self,
+        cleanup_id: &str,
+        completed_at_unix: u64,
+        failure_injector: &dyn VaultCleanupFailureInjector,
+    ) -> Result<VaultCleanupReportV1, VaultStoreError> {
         valid_vault_cleanup_id(cleanup_id)?;
         if completed_at_unix == 0 {
             return Err(VaultStoreError::InvalidInput);
@@ -279,6 +319,15 @@ impl VaultStore {
             let transaction = db
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            let key_destruction_cases =
+                cleanup_key_destruction_cases_before_commit(&transaction, cleanup_id, &candidates)?;
+            for case_id in &key_destruction_cases {
+                let key_path = self.case_key_path(case_id);
+                if !key_path.exists() {
+                    return Err(VaultStoreError::CaseKeyUnavailable);
+                }
+                validate_controlled_path(&self.root, &key_path, true)?;
+            }
             for candidate in &candidates {
                 validate_vault_cleanup_candidate_current(
                     &transaction,
@@ -334,9 +383,15 @@ impl VaultStore {
             let changed = transaction
                 .execute(
                     "UPDATE vault_cleanup_journal SET state='committed',removed_count=?2,
-                       completed_at_unix=?3
+                       completed_at_unix=?3,key_records_destroyed=?4
                      WHERE cleanup_id=?1 AND state='prepared'",
-                    params![cleanup_id, candidate_count, sql_i64(completed_at_unix)?],
+                    params![
+                        cleanup_id,
+                        candidate_count,
+                        sql_i64(completed_at_unix)?,
+                        i64::try_from(key_destruction_cases.len())
+                            .map_err(|_| VaultStoreError::InvalidInput)?
+                    ],
                 )
                 .map_err(|_| VaultStoreError::DatabaseFailed)?;
             if changed != 1 {
@@ -345,13 +400,14 @@ impl VaultStore {
             transaction
                 .commit()
                 .map_err(|_| VaultStoreError::DatabaseFailed)?;
+            failure_injector.inject(VaultCleanupFailurePoint::AfterCommittedTransactionCommit)?;
         } else if candidates
             .iter()
             .any(|candidate| candidate.state != "quarantined")
         {
             return Err(VaultStoreError::ContentCorrupt);
         }
-        self.finalize_committed_vault_cleanup(cleanup_id, completed_at_unix)
+        self.finalize_committed_vault_cleanup(cleanup_id, completed_at_unix, failure_injector)
     }
 
     pub fn run_expired_object_cleanup(
@@ -359,8 +415,134 @@ impl VaultStore {
         cleanup_id: &str,
         now_unix: u64,
     ) -> Result<VaultCleanupReportV1, VaultStoreError> {
+        self.run_expired_object_cleanup_with_failure_injector(
+            cleanup_id,
+            now_unix,
+            &NoopVaultCleanupFailureInjector,
+        )
+    }
+
+    fn run_expired_object_cleanup_with_failure_injector(
+        &self,
+        cleanup_id: &str,
+        now_unix: u64,
+        failure_injector: &dyn VaultCleanupFailureInjector,
+    ) -> Result<VaultCleanupReportV1, VaultStoreError> {
         self.prepare_expired_object_cleanup(cleanup_id, now_unix)?;
-        self.commit_expired_object_cleanup(cleanup_id, now_unix)
+        failure_injector.inject(VaultCleanupFailurePoint::AfterPreparedTransactionCommit)?;
+        self.commit_expired_object_cleanup_with_failure_injector(
+            cleanup_id,
+            now_unix,
+            failure_injector,
+        )
+    }
+
+    /// Runs the lineage-bound cleanup exactly once, or resumes/verifies the
+    /// same durable journal after a crash. A reused identifier with a different
+    /// cutoff is a conflict rather than a request to create another cleanup.
+    pub fn run_or_resume_expired_object_cleanup(
+        &self,
+        cleanup_id: &str,
+        now_unix: u64,
+    ) -> Result<VaultCleanupReportV1, VaultStoreError> {
+        self.run_or_resume_expired_object_cleanup_with_failure_injector(
+            cleanup_id,
+            now_unix,
+            &NoopVaultCleanupFailureInjector,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn run_or_resume_expired_object_cleanup_with_failure_injector(
+        &self,
+        cleanup_id: &str,
+        now_unix: u64,
+        failure_injector: &dyn VaultCleanupFailureInjector,
+    ) -> Result<VaultCleanupReportV1, VaultStoreError> {
+        valid_vault_cleanup_id(cleanup_id)?;
+        if now_unix == 0 {
+            return Err(VaultStoreError::InvalidInput);
+        }
+        let db = open_database(&self.root)?;
+        initialize_vault_lifecycle_schema(&db)?;
+        let existing = db
+            .query_row(
+                "SELECT state,started_at_unix,completed_at_unix,candidate_count,
+                        removed_count,key_records_destroyed,event_hash,erasure_disclosure
+                 FROM vault_cleanup_journal WHERE cleanup_id=?1",
+                [cleanup_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        drop(db);
+        let Some((
+            state,
+            started_at,
+            completed_at,
+            candidate_count,
+            removed_count,
+            key_records_destroyed,
+            event_hash,
+            erasure_disclosure,
+        )) = existing
+        else {
+            return self.run_expired_object_cleanup_with_failure_injector(
+                cleanup_id,
+                now_unix,
+                failure_injector,
+            );
+        };
+        if u64::try_from(started_at).ok() != Some(now_unix) {
+            return Err(VaultStoreError::ContentCorrupt);
+        }
+        match state.as_str() {
+            "prepared" | "committed" => self.commit_expired_object_cleanup_with_failure_injector(
+                cleanup_id,
+                now_unix,
+                failure_injector,
+            ),
+            "purged" => {
+                if completed_at.and_then(|value| u64::try_from(value).ok()) != Some(now_unix)
+                    || candidate_count < 0
+                    || removed_count < 0
+                    || key_records_destroyed < 0
+                    || removed_count != candidate_count
+                    || event_hash.len() != 64
+                    || erasure_disclosure != VAULT_LOGICAL_ERASURE_DISCLOSURE
+                {
+                    return Err(VaultStoreError::ContentCorrupt);
+                }
+                self.verify_vault_cleanup_journal()?;
+                Ok(VaultCleanupReportV1 {
+                    cleanup_id: cleanup_id.to_owned(),
+                    state,
+                    candidate_count: u64::try_from(candidate_count)
+                        .map_err(|_| VaultStoreError::ContentCorrupt)?,
+                    logically_removed_count: u64::try_from(removed_count)
+                        .map_err(|_| VaultStoreError::ContentCorrupt)?,
+                    key_records_destroyed: u64::try_from(key_records_destroyed)
+                        .map_err(|_| VaultStoreError::ContentCorrupt)?,
+                    quarantine_paths_pending: 0,
+                    started_at_unix: now_unix,
+                    completed_at_unix: now_unix,
+                    event_hash,
+                    erasure_disclosure: VAULT_LOGICAL_ERASURE_DISCLOSURE,
+                })
+            }
+            _ => Err(VaultStoreError::ContentCorrupt),
+        }
     }
 
     pub fn recover_object_cleanups(
@@ -492,6 +674,21 @@ impl VaultStore {
                         },
                     )
                     .map_err(|_| VaultStoreError::DatabaseFailed)?;
+                let cleanup_candidates = load_vault_cleanup_candidates(db, &row.0)?;
+                let distinct_candidate_cases =
+                    i64::try_from(cleanup_candidate_cases(&cleanup_candidates).len())
+                        .map_err(|_| VaultStoreError::ContentCorrupt)?;
+                let committed_expected_key_destructions = if row.1 == "committed" {
+                    Some(
+                        i64::try_from(
+                            cleanup_key_destruction_cases_after_commit(db, &cleanup_candidates)?
+                                .len(),
+                        )
+                        .map_err(|_| VaultStoreError::ContentCorrupt)?,
+                    )
+                } else {
+                    None
+                };
                 if row.2 <= 0
                     || row.4 < 0
                     || row.5 < 0
@@ -517,7 +714,7 @@ impl VaultStore {
                     "committed"
                         if row.3.is_some_and(|completed| completed >= row.2)
                             && row.5 == row.4
-                            && row.6 == 0
+                            && committed_expected_key_destructions == Some(row.6)
                             && row.7.is_empty()
                             && row.8.is_empty()
                             && candidate_counts.1 == 0
@@ -529,6 +726,7 @@ impl VaultStore {
                     "purged"
                         if row.3.is_some_and(|completed| completed >= row.2)
                             && row.5 == row.4
+                            && row.6 <= distinct_candidate_cases
                             && candidate_counts.1 == 0
                             && candidate_counts.2 == 0
                             && candidate_counts.3 == row.4 =>
@@ -578,10 +776,28 @@ impl VaultStore {
         let mut count = 0_u64;
         for row in rows {
             let row = row.map_err(|_| VaultStoreError::DatabaseFailed)?;
+            let (candidate_count, purged_candidates, distinct_cases): (i64, i64, i64) = db
+                .query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(state='purged'),0),
+                            COUNT(DISTINCT case_id)
+                     FROM vault_cleanup_candidates WHERE cleanup_id=?1",
+                    [&row.0],
+                    |candidate| Ok((candidate.get(0)?, candidate.get(1)?, candidate.get(2)?)),
+                )
+                .map_err(|_| VaultStoreError::DatabaseFailed)?;
             let expected = vault_cleanup_event_hash(
                 &row.0, row.1, row.2, row.3, row.4, row.5, &row.6, &row.8,
             )?;
-            if row.6 != previous || row.7 != expected || row.8 != VAULT_LOGICAL_ERASURE_DISCLOSURE {
+            if row.3 < 0
+                || row.4 != row.3
+                || row.5 < 0
+                || row.5 > distinct_cases
+                || candidate_count != row.3
+                || purged_candidates != row.3
+                || row.6 != previous
+                || row.7 != expected
+                || row.8 != VAULT_LOGICAL_ERASURE_DISCLOSURE
+            {
                 return Err(VaultStoreError::ContentCorrupt);
             }
             previous = row.7;
@@ -639,30 +855,29 @@ impl VaultStore {
         &self,
         cleanup_id: &str,
         completed_at_unix: u64,
+        failure_injector: &dyn VaultCleanupFailureInjector,
     ) -> Result<VaultCleanupReportV1, VaultStoreError> {
         let mut db = open_database(&self.root)?;
         let candidates = load_vault_cleanup_candidates(&db, cleanup_id)?;
-        let mut cases = BTreeSet::new();
-        for candidate in &candidates {
-            cases.insert(candidate.case_id.clone());
+        let expected_keys_destroyed: i64 = db
+            .query_row(
+                "SELECT key_records_destroyed FROM vault_cleanup_journal
+                 WHERE cleanup_id=?1 AND state='committed'",
+                [cleanup_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| VaultStoreError::DatabaseFailed)?
+            .ok_or(VaultStoreError::ObjectNotAvailable)?;
+        let key_destruction_cases = cleanup_key_destruction_cases_after_commit(&db, &candidates)?;
+        if i64::try_from(key_destruction_cases.len()).ok() != Some(expected_keys_destroyed) {
+            return Err(VaultStoreError::ContentCorrupt);
         }
-        let mut keys_destroyed = 0_u64;
-        for case_id in cases {
-            let committed: i64 = db
-                .query_row(
-                    "SELECT COUNT(*) FROM object_journal
-                     WHERE case_id=?1 AND state='committed'",
-                    [case_id.as_str()],
-                    |row| row.get(0),
-                )
-                .map_err(|_| VaultStoreError::DatabaseFailed)?;
-            if committed == 0 {
-                let key_path = self.case_key_path(&case_id);
-                if key_path.exists() {
-                    validate_controlled_path(&self.root, &key_path, true)?;
-                    fs::remove_file(&key_path).map_err(|_| VaultStoreError::IoFailed)?;
-                    keys_destroyed = keys_destroyed.saturating_add(1);
-                }
+        for case_id in key_destruction_cases {
+            let key_path = self.case_key_path(&case_id);
+            if key_path.exists() {
+                validate_controlled_path(&self.root, &key_path, true)?;
+                fs::remove_file(&key_path).map_err(|_| VaultStoreError::IoFailed)?;
             }
         }
         for candidate in &candidates {
@@ -677,6 +892,7 @@ impl VaultStore {
                 fs::remove_dir_all(&quarantine).map_err(|_| VaultStoreError::IoFailed)?;
             }
         }
+        failure_injector.inject(VaultCleanupFailurePoint::AfterPhysicalPurgeBeforeJournalCommit)?;
         let transaction = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| VaultStoreError::DatabaseFailed)?;
@@ -687,16 +903,24 @@ impl VaultStore {
                 [cleanup_id],
             )
             .map_err(|_| VaultStoreError::DatabaseFailed)?;
-        let (started_at, candidate_count, removed_count): (i64, i64, i64) = transaction
+        let (started_at, candidate_count, removed_count, durable_expected_keys_destroyed): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = transaction
             .query_row(
-                "SELECT started_at_unix,candidate_count,removed_count
+                "SELECT started_at_unix,candidate_count,removed_count,key_records_destroyed
                  FROM vault_cleanup_journal WHERE cleanup_id=?1 AND state='committed'",
                 [cleanup_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|_| VaultStoreError::DatabaseFailed)?
             .ok_or(VaultStoreError::ObjectNotAvailable)?;
+        if durable_expected_keys_destroyed != expected_keys_destroyed {
+            return Err(VaultStoreError::ContentCorrupt);
+        }
         let previous = transaction
             .query_row(
                 "SELECT event_hash FROM vault_cleanup_journal
@@ -713,7 +937,7 @@ impl VaultStore {
             sql_i64(completed_at_unix)?,
             candidate_count,
             removed_count,
-            i64::try_from(keys_destroyed).map_err(|_| VaultStoreError::InvalidInput)?,
+            expected_keys_destroyed,
             &previous,
             VAULT_LOGICAL_ERASURE_DISCLOSURE,
         )?;
@@ -725,7 +949,7 @@ impl VaultStore {
                 params![
                     cleanup_id,
                     sql_i64(completed_at_unix)?,
-                    sql_i64(keys_destroyed)?,
+                    expected_keys_destroyed,
                     previous,
                     event_hash
                 ],
@@ -741,7 +965,8 @@ impl VaultStore {
                 .map_err(|_| VaultStoreError::ContentCorrupt)?,
             logically_removed_count: u64::try_from(removed_count)
                 .map_err(|_| VaultStoreError::ContentCorrupt)?,
-            key_records_destroyed: keys_destroyed,
+            key_records_destroyed: u64::try_from(expected_keys_destroyed)
+                .map_err(|_| VaultStoreError::ContentCorrupt)?,
             quarantine_paths_pending: 0,
             started_at_unix: u64::try_from(started_at)
                 .map_err(|_| VaultStoreError::ContentCorrupt)?,
@@ -835,6 +1060,76 @@ fn initialize_vault_lifecycle_schema(db: &Connection) -> Result<(), VaultStoreEr
         return Err(VaultStoreError::DatabaseFailed);
     }
     Ok(())
+}
+
+fn cleanup_candidate_cases(candidates: &[VaultCleanupCandidateV1]) -> BTreeSet<CaseId> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.case_id.clone())
+        .collect()
+}
+
+/// Computes the cases whose final committed object is part of this cleanup.
+/// This runs under the same IMMEDIATE transaction that validates and commits
+/// the candidates, before any object is moved to quarantine.  A case key must
+/// exist at this boundary; only after the durable expected count is committed
+/// may recovery treat an absent key as evidence of an interrupted finalizer.
+fn cleanup_key_destruction_cases_before_commit(
+    db: &Connection,
+    cleanup_id: &str,
+    candidates: &[VaultCleanupCandidateV1],
+) -> Result<BTreeSet<CaseId>, VaultStoreError> {
+    let mut cases = BTreeSet::new();
+    for case_id in cleanup_candidate_cases(candidates) {
+        let remaining_after_cleanup: i64 = db
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM object_journal AS journal
+                 WHERE journal.case_id=?1 AND journal.state='committed'
+                   AND NOT EXISTS(
+                     SELECT 1 FROM vault_cleanup_candidates AS candidate
+                     WHERE candidate.cleanup_id=?2
+                       AND candidate.case_id=journal.case_id
+                       AND candidate.object_id=journal.object_id
+                       AND candidate.version=journal.version
+                       AND candidate.state='pending'
+                   )",
+                params![case_id.as_str(), cleanup_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        if remaining_after_cleanup == 0 {
+            cases.insert(case_id);
+        }
+    }
+    Ok(cases)
+}
+
+/// Recomputes the still-exclusive cleanup cases while the journal is in its
+/// unfinished committed state.  Ordinary business writes are barred at this
+/// startup boundary, so this must match the expected count durably bound by
+/// the commit transaction.  Purged history deliberately does not use this
+/// computation because later ordinary writes may create a new object/key in
+/// the same case.
+fn cleanup_key_destruction_cases_after_commit(
+    db: &Connection,
+    candidates: &[VaultCleanupCandidateV1],
+) -> Result<BTreeSet<CaseId>, VaultStoreError> {
+    let mut cases = BTreeSet::new();
+    for case_id in cleanup_candidate_cases(candidates) {
+        let committed: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM object_journal
+                 WHERE case_id=?1 AND state='committed'",
+                [case_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| VaultStoreError::DatabaseFailed)?;
+        if committed == 0 {
+            cases.insert(case_id);
+        }
+    }
+    Ok(cases)
 }
 
 fn validate_vault_cleanup_candidate_current(

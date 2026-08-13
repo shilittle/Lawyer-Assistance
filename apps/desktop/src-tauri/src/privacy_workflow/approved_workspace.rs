@@ -74,21 +74,50 @@ impl PrivacyWorkflowManager {
     /// publication reaches a terminal result.
     pub(crate) fn with_approved_generation_source_publish<T, E, F>(
         &self,
+        requested_project_id: &str,
         redaction_id: &str,
         expected_approved_payload_sha256: &str,
         publish: F,
     ) -> Result<Result<T, E>, PrivacyWorkflowError>
     where
-        F: FnOnce(ApprovedGenerationSource) -> Result<T, E>,
+        F: FnOnce(&ProjectId, &PrivacyCaseId, ApprovedGenerationSource) -> Result<T, E>,
     {
         let _gate = self.gate();
-        let (_authorization, project_guard) =
+        let requested_project_id = self.parse_project_id(requested_project_id.to_owned())?;
+        let (authorization, project_guard) =
             self.begin_live_case_redaction_authorization(redaction_id, true)?;
+        if authorization.project_id != requested_project_id {
+            return Err(PrivacyWorkflowError::project_case_binding(
+                ProjectPrivacyCaseBindingError::ProjectPrivacyCaseConflict,
+            ));
+        }
+        let (_, privacy_case_id) =
+            self.resolve_existing_project_binding_unlocked(requested_project_id.as_str())?;
         let source = self.load_approved_generation_source_unlocked(
             redaction_id,
             expected_approved_payload_sha256,
         )?;
-        match publish(source) {
+        let source_privacy_case_id =
+            PrivacyCaseId::parse(source.case_id.clone().ok_or_else(|| {
+                PrivacyWorkflowError::project_case_binding(
+                    ProjectPrivacyCaseBindingError::ProjectPrivacyCaseUnbound,
+                )
+            })?)
+            .map_err(PrivacyWorkflowError::project_case_binding)?;
+        let connection = self.open_connection()?;
+        ProjectPrivacyCaseBindingStore::validate_pair(
+            &connection,
+            &requested_project_id,
+            &source_privacy_case_id,
+        )
+        .map_err(PrivacyWorkflowError::project_case_binding)?;
+        if source_privacy_case_id != privacy_case_id {
+            return Err(PrivacyWorkflowError::project_case_binding(
+                ProjectPrivacyCaseBindingError::ProjectPrivacyCaseConflict,
+            ));
+        }
+        drop(connection);
+        match publish(&requested_project_id, &privacy_case_id, source) {
             Ok(value) => {
                 project_guard.commit()?;
                 Ok(Ok(value))
@@ -98,6 +127,65 @@ impl PrivacyWorkflowManager {
                 Ok(Err(error))
             }
         }
+    }
+
+    /// Resolves an application-facing ProjectId to its immutable internal
+    /// PrivacyCaseId while the workflow gate is held. The internal identity is
+    /// passed only to trusted backend code and is never returned over IPC.
+    pub(crate) fn with_existing_project_privacy_case<T, E, F>(
+        &self,
+        requested_project_id: &str,
+        operation: F,
+    ) -> Result<Result<T, E>, PrivacyWorkflowError>
+    where
+        F: FnOnce(&ProjectId, &PrivacyCaseId) -> Result<T, E>,
+    {
+        let _gate = self.gate();
+        let (project_id, privacy_case_id) =
+            self.resolve_existing_project_binding_unlocked(requested_project_id)?;
+        Ok(operation(&project_id, &privacy_case_id))
+    }
+
+    /// Maps an internal Approved-workspace identity back to the application
+    /// ProjectId and fails closed if the persisted one-to-one binding cannot be
+    /// authenticated.
+    pub(crate) fn project_id_for_privacy_case_id(
+        &self,
+        privacy_case_id: &str,
+    ) -> Result<ProjectId, PrivacyWorkflowError> {
+        let _gate = self.gate();
+        let privacy_case_id = PrivacyCaseId::parse(privacy_case_id.to_owned())
+            .map_err(PrivacyWorkflowError::project_case_binding)?;
+        let connection = self.open_connection()?;
+        let project_id =
+            ProjectPrivacyCaseBindingStore::reverse_resolve(&connection, &privacy_case_id)
+                .map_err(PrivacyWorkflowError::project_case_binding)?
+                .ok_or_else(|| {
+                    PrivacyWorkflowError::project_case_binding(
+                        ProjectPrivacyCaseBindingError::ProjectPrivacyCaseUnbound,
+                    )
+                })?;
+        ProjectPrivacyCaseBindingStore::validate_pair(&connection, &project_id, &privacy_case_id)
+            .map_err(PrivacyWorkflowError::project_case_binding)?;
+        Ok(project_id)
+    }
+
+    fn resolve_existing_project_binding_unlocked(
+        &self,
+        requested_project_id: &str,
+    ) -> Result<(ProjectId, PrivacyCaseId), PrivacyWorkflowError> {
+        let project_id = self.parse_project_id(requested_project_id.to_owned())?;
+        let connection = self.open_connection()?;
+        let privacy_case_id = ProjectPrivacyCaseBindingStore::resolve(&connection, &project_id)
+            .map_err(PrivacyWorkflowError::project_case_binding)?
+            .ok_or_else(|| {
+                PrivacyWorkflowError::project_case_binding(
+                    ProjectPrivacyCaseBindingError::ProjectPrivacyCaseUnbound,
+                )
+            })?;
+        ProjectPrivacyCaseBindingStore::validate_pair(&connection, &project_id, &privacy_case_id)
+            .map_err(PrivacyWorkflowError::project_case_binding)?;
+        Ok((project_id, privacy_case_id))
     }
 
     #[cfg(test)]

@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ApplicationBackupOutcomeView,
@@ -11,9 +11,14 @@ import {
   REVOKE_MAPPING_CONFIRMATION,
   ROTATE_MAPPING_KEY_CONFIRMATION,
   RUN_RETENTION_CONFIRMATION,
+  V031_MIGRATION_RECOVERY_CONFIRMATION,
+  V031_MIGRATION_RECOVERY_STAGED_NOTICE,
+  V031MigrationRecoveryControl,
   applicationBackupOutcomeMessage,
   parseRetentionSeconds,
   shouldClearRevealedMapping,
+  shouldReleaseLifecycleBusy,
+  submitV031MigrationRecovery,
 } from "./PrivacyLifecyclePanel";
 
 describe("PrivacyLifecyclePanel safety boundaries", () => {
@@ -49,6 +54,7 @@ describe("PrivacyLifecyclePanel safety boundaries", () => {
       RUN_RETENTION_CONFIRMATION,
       RESTORE_BACKUP_CONFIRMATION,
       RESTORE_APPLICATION_BACKUP_CONFIRMATION,
+      V031_MIGRATION_RECOVERY_CONFIRMATION,
     ]).toEqual([
       "撤销映射",
       "轮换映射密钥",
@@ -56,7 +62,64 @@ describe("PrivacyLifecyclePanel safety boundaries", () => {
       "执行到期清理",
       "恢复隐私备份",
       "恢复完整应用备份",
+      "恢复到 v0.3.1 并退出当前应用",
     ]);
+  });
+
+  it("does not stage migration recovery when the confirmation is not exact", async () => {
+    const stage = vi.fn(async () => undefined);
+
+    await expect(
+      submitV031MigrationRecovery("恢复到 v0.3.1", stage),
+    ).resolves.toBe(false);
+
+    expect(stage).not.toHaveBeenCalled();
+  });
+
+  it("stages only the exact confirmation and states the recovery-only sequence", async () => {
+    const stage = vi.fn(async () => undefined);
+
+    await expect(
+      submitV031MigrationRecovery(V031_MIGRATION_RECOVERY_CONFIRMATION, stage),
+    ).resolves.toBe(true);
+    expect(stage).toHaveBeenCalledWith({
+      confirmation: V031_MIGRATION_RECOVERY_CONFIRMATION,
+    });
+
+    const markup = renderToStaticMarkup(
+      <V031MigrationRecoveryControl
+        busy={false}
+        confirmation={V031_MIGRATION_RECOVERY_CONFIRMATION}
+        onConfirmationChange={() => undefined}
+        onStage={() => undefined}
+      />,
+    );
+    expect(markup).toContain("先建立 current v0.4 五组件安全备份");
+    expect(markup).toContain("安装受保护恢复请求并受控重启");
+    expect(markup).toContain("下一 recovery-only 进程");
+    expect(markup).toContain("退出当前应用且不运行普通初始化");
+    expect(V031_MIGRATION_RECOVERY_STAGED_NOTICE).toContain("受保护的 v0.3.1 migration recovery 请求已安装");
+    expect(V031_MIGRATION_RECOVERY_STAGED_NOTICE).toContain("不会运行普通初始化");
+  });
+
+  it("keeps the recovery confirmation and action disabled while busy", () => {
+    const markup = renderToStaticMarkup(
+      <V031MigrationRecoveryControl
+        busy
+        confirmation={V031_MIGRATION_RECOVERY_CONFIRMATION}
+        onConfirmationChange={() => undefined}
+        onStage={() => undefined}
+      />,
+    );
+
+    expect(markup.match(/disabled=""/gu)).toHaveLength(2);
+    expect(markup).toContain("安装受保护恢复请求并受控重启");
+  });
+
+  it("keeps the lifecycle busy only after a successful terminal recovery stage", () => {
+    expect(shouldReleaseLifecycleBusy(true, true)).toBe(false);
+    expect(shouldReleaseLifecycleBusy(false, true)).toBe(true);
+    expect(shouldReleaseLifecycleBusy(true, false)).toBe(true);
   });
 
   it("accepts only bounded integer retention seconds", () => {

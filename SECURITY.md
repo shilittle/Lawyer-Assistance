@@ -2,8 +2,8 @@
 
 ## 支持版本
 
-当前仅维护最新的 `0.4.x` 技术预发布。请先确认问题能够在最新 Release 或当前 `main`
-复现。
+当前维护 `0.4.x` 源码与发布候选线。请先确认问题能够在最新已发布 Release、正式发布候选或当前
+`main` 复现，并在报告中准确注明所用资产和 commit；不要把候选状态写成已发布 stable。
 
 ## 报告安全问题
 
@@ -20,16 +20,22 @@
 
 ## 发布边界
 
-`0.4.0-beta.2` 是未签名技术预发布。未知发布者提示本身不等于漏洞，但被重新命名、
-hash 不匹配或来源不明的安装包应视为不可信。生产 OCR 与自动更新当前未启用。
+仓库版本源当前为稳定 `0.4.0`，但只有 `v0.4.0` 同一 Release 完成正式签名资产回读、
+clean-machine、updater 和 MinerU qualification，并明确提升为 stable/latest 后，才能视为
+正式发布。未知或不匹配的发布者、缺失 RFC3161 时间戳、被重新命名、hash/签名不匹配或
+来源不明的安装包都应视为不可信；候选阶段不得宣称生产 OCR 或自动更新已经可用。
 
 ## English
 
-Only the latest `0.4.x` technical prerelease is maintained. Prefer GitHub's
+The current `0.4.x` source and release-candidate line is maintained. Prefer GitHub's
 private **Report a vulnerability** flow. Never include real case data, source
 documents, OCR text, databases, backups, credentials, private keys, session
 descriptors, identifying paths, or raw logs in a public report.
 
 Provide a minimal synthetic reproduction, affected version, expected and actual
-behavior, and impact. `0.4.0-beta.2` is an unsigned technical prerelease;
-production OCR and automatic updates are not enabled.
+behavior, and impact. Repository version sources are fixed at stable `0.4.0`,
+but only an official Release that has completed signing, exact-HEAD CI,
+server-readback, clean-machine, updater, and final MinerU gates is a stable
+release. Do not trust an unknown/mismatched publisher, a missing RFC3161
+timestamp, a renamed file, or a hash/signature mismatch. Production OCR and
+automatic updates must remain unavailable until their release evidence exists.

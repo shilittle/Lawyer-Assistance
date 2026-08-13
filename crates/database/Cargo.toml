@@ -5,9 +5,13 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 serde_json.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

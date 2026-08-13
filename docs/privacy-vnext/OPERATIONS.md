@@ -1,9 +1,9 @@
 # Privacy vNext operations guide
 
-Updated: 2026-08-01
-Applies to: Lawyer Assistance `0.4.0-beta.2` on Windows x86_64
+Updated: 2026-08-13
+Applies to: Lawyer Assistance `0.4.0` on Windows x86_64
 
-This guide describes the implemented production paths. It does not grant qualification by itself. The App's current backend status, signed evidence, current-machine remeasurement, revocation state, and exact purpose/session binding are authoritative. All acceptance fixtures must be synthetic. Never use a real client file to prove a release, and never send raw or pending material to a browser, search engine, remote OCR service, external MCP, Skill, memory, subagent, log, or test service.
+This guide describes the implemented production paths. The repository is a source-complete `0.4.0` candidate; this guide does not assert that the stable Release or any external qualification is complete. The App's current backend status, signed evidence, current-machine remeasurement, revocation state, and exact purpose/session binding are authoritative. All acceptance fixtures must be synthetic. Never use a real client file to prove a release, and never send raw or pending material to a browser, search engine, remote OCR service, external MCP, Skill, memory, subagent, log, or test service.
 
 ## 1. State and trust boundaries
 
@@ -23,8 +23,8 @@ The frontend exchanges opaque IDs and bounded enums. Rust restores protected con
 ### Prerequisites
 
 For final deployment, use only an App-managed v4 component imported from its
-explicitly approved and signed offline set. No final v4 set or final v4 hash is
-published yet: it must be rebuilt deterministically, reviewed, signed, installed
+explicitly approved and signed offline set. This release candidate records no
+qualifying evidence for a published final v4 set or hash: it must be rebuilt deterministically, reviewed, signed, installed
 under a short root, remeasured and GPU-probed before App qualification.
 Historical candidates are permanently excluded from publication and must not be
 substituted. Download only the complete catalog/signature/descriptor/parts set
@@ -57,8 +57,9 @@ Every final installed component path must be at most 259 UTF-16 code units.
 
 Package/catalog provenance binds the source commit, build-script SHA-256,
 worker-source-tree SHA-256, selected runtime distributions and exact model
-revisions. A final v4 package has not been published, so this guide intentionally
-records no final v4 artifact hash. A release still requires deterministic
+revisions. Because this release candidate records no qualifying evidence for a
+published final v4 package, this guide intentionally records no final v4 artifact
+hash. A release still requires deterministic
 rebuild, explicit provenance approval, signing, short-root installation,
 installed-tree remeasurement, GPU probe, and the complete App-owned Windows
 Firewall/Job Object/canary/restart qualification.
@@ -244,4 +245,7 @@ The stable signed-release workflow is documented in
 `scripts/release/release_preflight.ps1`. Signing and updater secrets are
 external release credentials and are never stored in the repository. Their
 absence does not block privacy feature development or explicitly unsigned
-technical artifacts.
+technical artifacts, but it does block stable publication. Exact-main CI,
+the signed 12-asset App/MCP allowlist, final signed MinerU assets, server-side
+readback, Windows 10/11 clean-machine acceptance, and target-GPU qualification
+must also have recorded evidence before the release state can be `COMPLETE`.

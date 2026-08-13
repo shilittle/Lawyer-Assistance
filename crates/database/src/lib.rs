@@ -12,6 +12,28 @@ use std::{
 use rusqlite::{functions::FunctionFlags, params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+mod migration_source;
+mod v031_upgrade;
+
+pub use migration_source::{
+    validate_open_user_database_migration_source_read_only,
+    validate_user_database_migration_source_read_only, validate_v031_user_sqlite_image_read_only,
+    with_validated_user_database_migration_source_read_only, UserMigrationSourceFileProof,
+    UserMigrationSourceProof, UserMigrationTableProof, V031UserSchemaProvenance,
+    ValidatedUserMigrationSourceSession, ValidatedUserSourceSchema,
+    MAX_V031_USER_SQLITE_IMAGE_BYTES, V031_USER_CANONICAL_EMPTY_FIXTURE_SHA256,
+    V031_USER_CANONICAL_SCHEMA_MARKER, V031_USER_GENERATION_CARGO_LOCK_SHA256,
+    V031_USER_GENERATION_DATABASE_SOURCE_SHA256, V031_USER_GENERATOR_SHA256,
+    V031_USER_INTERNAL_SCHEMA_MANIFEST_SHA256, V031_USER_INTERNAL_SCHEMA_OBJECT_COUNT,
+    V031_USER_SCHEMA_MANIFEST_SHA256, V031_USER_SCHEMA_OBJECT_COUNT, V031_USER_SCHEMA_PROVENANCE,
+    V031_USER_SCHEMA_VERSION,
+};
+pub use v031_upgrade::{
+    migrate_exact_v031_user_to_v11_with_upgrade_audit, verify_exact_v031_user_v11_upgrade_audit,
+    V031UserPreAuditManifest, V031UserUpgradeAuditEvidence, V031UserUpgradeResult,
+    V031_TO_V040_USER_AUDIT_OPERATION, V031_TO_V040_USER_MIGRATION_ID,
+};
+
 pub const LEGAL_CORE_DB_FILE_NAME: &str = "legal_core.sqlite";
 pub const USER_DB_FILE_NAME: &str = "user.sqlite";
 pub const USER_SCHEMA_VERSION: i64 = 11;
@@ -8711,19 +8733,46 @@ fn user_schema_objects(
     Ok(objects)
 }
 
+fn user_internal_schema_objects(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<UserSchemaObject>, DatabaseInitError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT type, name, tbl_name, COALESCE(sql, '')
+        FROM sqlite_master
+        WHERE type IN ('table', 'index', 'trigger', 'view')
+          AND name LIKE 'sqlite_%'
+        ORDER BY type, name
+        ",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            let sql = row.get::<_, String>(3)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                sql.split_whitespace().collect::<Vec<_>>().join(" "),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(objects)
+}
+
 fn validate_exact_canonical_user_schema(
     connection: &rusqlite::Connection,
 ) -> Result<(), DatabaseInitError> {
     // Generate the expected schema through the same canonical migration code
-    // in a separate empty database. Comparing every non-internal sqlite_master
-    // object proves PK/UNIQUE/CHECK/FK clauses, index definitions and complete
-    // trigger bodies; matching column names or object names alone is not
-    // sufficient for a restore trust boundary.
+    // in a separate empty database. Application objects and SQLite-owned
+    // autoindexes are compared separately so ANALYZE/sqlite_stat* or any other
+    // unexpected internal object cannot hide behind a blanket sqlite_% filter.
     let mut canonical = rusqlite::Connection::open_in_memory()?;
     configure_user_database_connection(&canonical)?;
     run_user_migrations(&mut canonical)?;
 
-    if user_schema_objects(connection)? != user_schema_objects(&canonical)? {
+    if user_schema_objects(connection)? != user_schema_objects(&canonical)?
+        || user_internal_schema_objects(connection)? != user_internal_schema_objects(&canonical)?
+    {
         return Err(user_schema_migration_error(
             "user database sqlite_master does not match the exact canonical schema".to_owned(),
         )
@@ -9508,6 +9557,18 @@ fn install_case_assistant_closed_audit_triggers(
 }
 
 fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), DatabaseInitError> {
+    run_user_migrations_with_hooks(connection, |_| Ok(()), |_| Ok(()))
+}
+
+/// Runs the canonical migration while allowing the v0.3.1 upgrade boundary to
+/// prove the exact source before the first write and append its audit record as
+/// the final write. Ordinary callers use [`run_user_migrations`], whose two
+/// no-op hooks preserve the established migration behavior.
+fn run_user_migrations_with_hooks<T>(
+    connection: &mut rusqlite::Connection,
+    before_first_write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(), DatabaseInitError>,
+    before_commit: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, DatabaseInitError>,
+) -> Result<T, DatabaseInitError> {
     let existing_version = existing_user_schema_version(connection)?;
     let schema_version_value = USER_SCHEMA_VERSION.to_string();
     let expected_canonical_marker = USER_CANONICAL_SCHEMA_MARKER_VALUE;
@@ -9544,6 +9605,7 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
     };
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    before_first_write(&transaction)?;
     let staged_tables = if needs_canonical_rebuild {
         // v9 contains a deliberate message/run cycle. Deferring foreign keys
         // keeps the staged copy deterministic while the final transaction is
@@ -11425,9 +11487,10 @@ fn run_user_migrations(connection: &mut rusqlite::Connection) -> Result<(), Data
         (USER_CANONICAL_SCHEMA_MARKER_KEY, expected_canonical_marker),
     )?;
 
+    let result = before_commit(&transaction)?;
     transaction.commit()?;
 
-    Ok(())
+    Ok(result)
 }
 
 fn existing_user_schema_version(
