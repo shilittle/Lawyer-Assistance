@@ -2,18 +2,20 @@
 
 ## 1. 使用前确认
 
-`0.4.0-beta.2` 面向 Windows x86_64，当前定位为未签名技术预发布：
+`0.4.0` 面向 Windows x86_64。仓库源码已使用稳定版本号，但正式 `v0.4.0` Release 仍须完成外部门禁；在 Release 明确提升为 stable/latest 之前，只能按正式发布候选处理：
 
-- 安装程序没有已验证的 Windows 发布者身份，可能触发 SmartScreen 或安全软件提示。
-- 当前没有可用的自动更新发布链；升级应使用项目提供并核验过的完整新包。
-- 生产扫描件 OCR 尚未取得资格。没有在 App 中看到全部当前资格门通过时，不要用它处理扫描或视觉 PDF。
-- 技术预发布包使用 `runtime-slim-v1` 法律库，不包含完整归档数据库。
+- 不把未通过 Authenticode、RFC3161 时间戳和服务端回读的候选安装程序视为正式资产；未知或不匹配的发布者应立即阻断。
+- 不把候选 `latest.json` 或 updater `.sig` 视为可用更新链；只有 stable/latest 端点最终验收通过后才能使用自动更新。
+- 生产扫描件 OCR 仍须 final MinerU v4 资产、签名、许可审批、隔离和目标 GPU 资格全部通过。没有在 App 中看到全部当前资格门通过时，不要用它处理扫描或视觉 PDF。
+- 桌面应用资产使用 `runtime-slim-v1` 法律库，不包含完整归档数据库。
 
-下载或接收安装包时，应同时核对版本、文件名、SHA-256 和随包 manifest。不要把 CI fixture、调试程序或历史 OCR 组件当作产品资产。
+下载或接收安装包时，应同时核对 stable/latest 状态、版本、精确文件名、SHA-256、签名、时间戳和 `latest.json`。不要把 draft/prerelease、CI fixture、调试程序、历史 candidate 或历史 OCR 组件当作正式产品资产。
+
+Windows 正式安装入口必须精确为 `Lawyer.Assistance_0.4.0_x64-setup.exe`，并同时取得 `Lawyer.Assistance_0.4.0_x64-setup.exe.sha256`、`Lawyer.Assistance_0.4.0_x64-setup.exe.sig` 和 `latest.json`；便携包必须精确为 `Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip` 及其同名 `.sha256`。配对 MCP 的三平台正式文件名和完整 12 项 allowlist 见[当前发布状态](release-status.md)。
 
 ## 2. 首次启动
 
-1. 启动 Lawyer Assistance，确认版本显示为 `0.4.0-beta.2`。
+1. 仅使用已经通过正式资产核验的安装或便携包启动 Lawyer Assistance，确认版本显示为 `0.4.0`。
 2. 打开应用健康或版本信息，确认运行时法律库已加载。
 3. 阅读隐私提示，确认应用的数据保留和外发边界符合当前工作要求。
 4. 如需使用模型 Provider，打开“设置 → Provider 与凭据”，创建自己的 Provider 配置并保存 API Key。密钥由 Windows Credential Manager 管理，前端只显示掩码状态。
@@ -102,7 +104,7 @@ WorkBuddy、Codex 和 OpenCode 的默认示例使用 `public_law_only`。应用�
 
 OCR 配置、组件导入/安装/回滚/卸载、信任、防火墙隔离和资格运行统一位于“设置 → 本地处理环境与 OCR 组件”。配置草稿、组件 mutation 和资格 mutation 相互隔离；任一写入进行时不得并行启动另一类写入。
 
-当前技术预发布没有取得生产 OCR 资格。不得用历史组件、GPU 诊断、用户同意或远程 OCR 代替资格门；失败时应用应阻断，而不是静默上传或远程回退。
+在 final MinerU v4 签名资产、许可审批、Windows 10/11 clean-machine 和目标 GPU qualification 留下完整证据前，不得宣称 `0.4.0` 已取得生产 OCR 资格。不得用历史组件、GPU 诊断、用户同意或远程 OCR 代替资格门；失败时应用应阻断，而不是静默上传或远程回退。
 
 ## 10. 备份与恢复
 

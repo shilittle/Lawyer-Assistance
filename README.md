@@ -4,12 +4,12 @@
 
 Lawyer Assistance 是一款面向 Windows x86_64 的本地优先法律辅助工作台。它把公开法律检索、案件材料整理、引用核验、文书与图示成果、隐私审批，以及受控的 MCP/模型调用整合在同一个桌面应用中。
 
-当前版本：`0.4.0-beta.2`
+当前版本：`0.4.0`
 
 > [!WARNING]
-> 当前版本是技术预发布版。现有 Windows 安装包未进行 Authenticode 签名，不具备受信任发布者身份；生产 OCR 与自动更新尚未启用。请仅从项目 Releases 下载文件，并在安装前核对 SHA-256 与随附 manifest。
+> 仓库中的 manifest、lockfile 和当前用户文档已使用稳定版本号 `0.4.0`；这只表示当前源码进入正式发布候选阶段。`v0.4.0` 只有在签名、精确资产回读、跨平台 CI、Windows 10/11 clean-machine、升级/回滚、updater 与最终 MinerU 资格门全部留下证据后，才能提升为 GitHub stable/latest。本文不宣称这些外部门禁已经完成，也不宣称正式 Release 已经发布。
 >
-> 源代码仓库当前公开。公开访问源码或下载文件不代表安装包已经签名，也不会自动启用 updater、取得 OCR 资格或完成正式发布验收。
+> 源代码仓库当前公开。公开访问源码或下载文件不代表安装包已经签名，也不会自动启用 updater、取得 OCR 资格或完成正式发布验收。正式发布前，不要把 CI fixture、调试构建、历史 candidate 或被重新命名的文件当作 `v0.4.0` 正式资产。
 
 ## 主要能力
 
@@ -25,16 +25,16 @@ Lawyer Assistance 是一款面向 Windows x86_64 的本地优先法律辅助工�
 
 ## 当前发布边界
 
-| 项目 | `0.4.0-beta.2` 状态 |
+| 项目 | `0.4.0` 当前源码/候选状态 |
 | --- | --- |
-| Windows x86_64 桌面应用 | 技术预发布 |
-| 安装包 | NSIS，当前未签名 |
+| Windows x86_64 桌面应用 | 已实现；正式签名资产及 clean-machine 验收仍待外部门禁闭合 |
+| 安装包 | 正式目标为 Authenticode + RFC3161 时间戳的 NSIS 安装包；尚未宣称已发布 |
 | 本地法律检索与案件工作台 | 可用 |
 | BYOK 普通聊天与案件助理 | 已实现；调用所选 Provider 时会联网，案件助理仅使用明确选择的已批准材料 |
 | 隐私批准链与 approved MCP | 已实现；默认关闭并严格资格门控 |
 | `diagram_authoring` | 仅限合成/公开数据 |
-| 生产 OCR | 未启用；扫描件/纯图像 PDF 不应视为已支持 |
-| 自动更新 | 未启用；请手动检查 Releases |
+| 生产 OCR | 默认阻断；最终 MinerU v4 资产、签名、许可审批和目标 GPU 资格仍待完成 |
+| 自动更新 | 正式链路已按 installer-bound `.sig`/`latest.json` 设计；发布端点验收前不得视为可用 |
 
 本项目不是律师替代品，也不保证检索结果、模型输出或生成文书适用于具体案件。重要结论应由具备相应资质的专业人员核对原文、效力状态和案件事实。
 
@@ -48,13 +48,24 @@ Lawyer Assistance 是一款面向 Windows x86_64 的本地优先法律辅助工�
 
 ### 下载
 
-前往 [GitHub Releases](https://github.com/shilittle/Lawyer-Assistance/releases)，下载与 `0.4.0-beta.2` 对应的以下文件：
+只有当 [GitHub Releases](https://github.com/shilittle/Lawyer-Assistance/releases) 中同一个 `v0.4.0` Release 已明确提升为 stable/latest，且服务端回读验证通过时，以下 12 项自定义 App/MCP 资产才构成正式 allowlist（GitHub 自动生成的 source archive 不计）：
 
-- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe`
-- 同名 `.sha256`
-- 同名 `.manifest.json`
+```text
+Lawyer.Assistance_0.4.0_x64-setup.exe
+Lawyer.Assistance_0.4.0_x64-setup.exe.sha256
+Lawyer.Assistance_0.4.0_x64-setup.exe.sig
+latest.json
+Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip
+Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip.sha256
+lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip
+lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip.sha256
+lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz
+lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz.sha256
+```
 
-如果 Releases 中不存在这些精确资产，请不要使用来源不明或被重新命名的安装包。当前预发布版不会生成可用的 updater `.sig` 或 `latest.json`。
+正式 MinerU 组件使用独立的 `mineru-components-v0.4.0` tag/Release，只允许已签名的 `mineru-component-catalog.json`、`mineru-component-provenance.json`、各自的 `.minisig`、catalog 指定的唯一 `lawyer-assistance-mineru-0.4.0-windows-x86_64.laocrpkg.laocrparts` descriptor，以及 descriptor/catalog 精确列出的全部有序 `.partNNNN-of-NNNN`。若 Release 不存在、仍为 draft/prerelease、名称集合不精确、签名或哈希不通过，请不要把其中的文件当作正式资产。
 
 ### 校验
 
@@ -62,17 +73,11 @@ Lawyer Assistance 是一款面向 Windows x86_64 的本地优先法律辅助工�
 
 ```powershell
 Get-FileHash `
-  .\Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe `
+  .\Lawyer.Assistance_0.4.0_x64-setup.exe `
   -Algorithm SHA256
 ```
 
-将结果与 `.sha256` 文件比较，并确认 manifest 中：
-
-- `version` 为 `0.4.0-beta.2`
-- `signed` 为 `false`
-- `updaterArtifactGenerated` 为 `false`
-
-校验通过后运行安装包。它采用当前用户安装模式。由于安装包尚未签名，Windows 可能显示未知发布者提示；请先确认文件名、来源和哈希，不要绕过来源不明文件的安全警告。
+将结果与 `Lawyer.Assistance_0.4.0_x64-setup.exe.sha256` 比较；随后验证安装包 Authenticode 链、发布者与 RFC3161 时间戳。`Lawyer.Assistance_0.4.0_x64-setup.exe.sig` 必须签署该已签名 installer 的精确 bytes，`latest.json` 必须声明版本 `0.4.0`、指向同名公开资产并携带匹配签名。任一名称、哈希、签名、时间戳、URL 或版本不匹配都应停止安装或更新并报告问题。当前正式 Release 尚未确认时，不应通过忽略未知发布者警告来使用候选包。
 
 ## 快速开始
 
@@ -109,6 +114,7 @@ legal_get_relations
 - [法律数据集与运行时数据库](docs/data/legal-corpus.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全问题报告](SECURITY.md)
+- [变更日志](CHANGELOG.md)
 - [版本说明](RELEASE_NOTES.md)
 - [MCP 总览](docs/mcp/README.md)
 - [MCP 安装与运行](docs/mcp/installation.md)
@@ -154,7 +160,7 @@ pnpm build
 cargo build --locked -p legal-mcp --bin lawyer-assistance-mcp
 ```
 
-构建明确标记为未签名的 Windows 技术安装包：
+构建仅用于本地验证、明确标记为未签名的 Windows 候选安装包：
 
 ```powershell
 pnpm --filter @lawyer-assistance/desktop release:installer:unsigned

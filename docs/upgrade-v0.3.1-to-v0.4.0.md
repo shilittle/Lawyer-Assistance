@@ -35,6 +35,10 @@ v0.4.0 在普通启动初始化之前识别 exact v0.3.1 profile。写入任何�
 - Vault、approved workspace 与 work-products 已按目标 schema 建立；
 - 重启不会产生第二条绑定、第二份材料、第二个 generation 或第二条 terminal receipt。
 
+exact v0.3.1 本地复核可能没有可恢复的源显示名或 Privacy CaseId。此类材料会明确保持未归属，
+直到用户手动归入项目；应用可以显示经过认证的“旧版名称不可用”占位，但不会用哈希伪造旧文件名，
+也不会据此猜测绑定。
+
 ## 显式恢复到 v0.3.1
 
 完整恢复是维护操作，不是普通 `.lavbackup` restore。它只在已完成升级并重新认证当前五槽后可用。

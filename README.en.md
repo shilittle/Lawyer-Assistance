@@ -4,12 +4,12 @@
 
 Lawyer Assistance is a local-first legal assistance workstation for Windows x86_64. It brings public-law research, case organization, citation verification, document and diagram work products, privacy approval, and controlled MCP/model access into one desktop application.
 
-Current version: `0.4.0-beta.2`
+Current version: `0.4.0`
 
 > [!WARNING]
-> This version is a technical prerelease. The current Windows installer is not Authenticode-signed and has no trusted publisher identity. Production OCR and automatic updates are not enabled. Download files only from the project Releases page, and verify the SHA-256 checksum and manifest before installation.
+> The repository carries the stable-version `0.4.0` source candidate, but the stable Release is not published until exact-main CI, external signing, server readback, Windows 10/11 clean-machine, updater, and final MinerU qualification gates all have recorded evidence. Do not treat a locally built, CI, historical, or prerelease asset as the published stable package.
 >
-> The source repository is public. Public access to source code or downloadable files does not make an installer signed, activate the updater, qualify OCR, or satisfy formal-release acceptance.
+> The source repository is public. Public access to source code or downloadable files does not make an installer signed, activate the updater, qualify OCR, or satisfy stable-release acceptance.
 
 ## Highlights
 
@@ -25,17 +25,17 @@ Current version: `0.4.0-beta.2`
 
 ## Release status
 
-| Area | `0.4.0-beta.2` status |
+| Area | `0.4.0` source-candidate status |
 | --- | --- |
-| Windows x86_64 desktop App | Technical prerelease |
-| Installer | NSIS, currently unsigned |
+| Windows x86_64 desktop App | Implemented in source; published-stable acceptance remains pending |
+| Installer | NSIS release path implemented; no stable asset is accepted until Authenticode and RFC 3161 verification pass |
 | Local legal research and case workspace | Available |
 | Ordinary Assistant chat and explicit attachments | Available with BYOK; no case is required, and selected content is sent to the Provider over the network |
 | Approved-only Case Assistant | Implemented under Case Work; source and Provider authorization are rechecked before transport |
 | Privacy approval and approved MCP | Implemented; disabled by default and qualification-gated |
 | `diagram_authoring` | Synthetic/public data only |
-| Production OCR | Not enabled; scanned/image-only PDFs should not be treated as supported |
-| Automatic updates | Not enabled; check Releases manually |
+| Production OCR | Not qualified; scanned/image-only PDFs remain blocked unless every current qualification gate passes |
+| Automatic updates | Release path implemented; no active stable update chain exists before signed `latest.json` publication and readback |
 
 This project is not a substitute for a lawyer and does not guarantee that search results, model output, or generated documents are suitable for a particular matter. Important conclusions should be checked by a qualified professional against authoritative text, current legal effect, and the actual case record.
 
@@ -49,31 +49,42 @@ This project is not a substitute for a lawyer and does not guarantee that search
 
 ### Download
 
-Open [GitHub Releases](https://github.com/shilittle/Lawyer-Assistance/releases) and download the following assets for `0.4.0-beta.2`:
+The stable `v0.4.0` package must not be treated as available merely because the repository or an individual file is public. When the project reports that the stable Release has passed every gate, open [GitHub Releases](https://github.com/shilittle/Lawyer-Assistance/releases) and require this exact 12-asset App/MCP allowlist (GitHub-generated source archives do not count):
 
-- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe`
-- The adjacent `.sha256` file
-- The adjacent `.manifest.json` file
+```text
+Lawyer.Assistance_0.4.0_x64-setup.exe
+Lawyer.Assistance_0.4.0_x64-setup.exe.sha256
+Lawyer.Assistance_0.4.0_x64-setup.exe.sig
+latest.json
+Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip
+Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip.sha256
+lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip
+lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip.sha256
+lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz
+lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz.sha256
+```
 
-Do not use a renamed installer or one obtained from another source. If these exact assets are not present, no supported public installer is available there. This prerelease does not produce a usable updater `.sig` or `latest.json`.
+Do not use a renamed installer or one obtained from another source. The official publication process rereads every asset from the service before promotion. If the exact set is incomplete, the Release is still a draft/prerelease, or the project has not reported final readback success, no supported stable installer is available there. Never substitute an unsigned technical build or an older beta.
 
 ### Verify
 
-Calculate the installer hash in PowerShell:
+After stable publication, calculate the installer hash and inspect its Windows signature in PowerShell:
 
 ```powershell
 Get-FileHash `
-  .\Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe `
+  .\Lawyer.Assistance_0.4.0_x64-setup.exe `
   -Algorithm SHA256
+
+Get-AuthenticodeSignature `
+  .\Lawyer.Assistance_0.4.0_x64-setup.exe | `
+  Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
 ```
 
-Compare the result with the `.sha256` file and confirm that the manifest reports:
+Compare the digest with `Lawyer.Assistance_0.4.0_x64-setup.exe.sha256`. Continue only when the signature status is `Valid`, the expected publisher identity is present, and a trusted timestamp is shown. The Release verifier also binds `latest.json` and its updater signature to these exact installer bytes; do not edit or rename any asset.
 
-- `version` is `0.4.0-beta.2`
-- `signed` is `false`
-- `updaterArtifactGenerated` is `false`
-
-After verification, run the installer. It uses current-user installation mode. Because the installer is unsigned, Windows may show an unknown-publisher warning. Confirm the exact filename, source, and checksum first, and never bypass a warning for an installer of unknown origin.
+After verification, run the installer. It uses current-user installation mode. Stop if Windows reports an unknown publisher, an invalid or missing signature, an unexpected signer, or an untrusted timestamp; those results do not match the stable asset contract.
 
 ## Quick start
 
@@ -82,7 +93,7 @@ After verification, run the installer. It uses current-user installation mode. B
 3. To include an ordinary attachment, import it into that conversation and explicitly select it for the current send. The App shows its name, type, and size and states that locally extracted text will be sent; cancelling or leaving it unselected sends no attachment body or local path. Ordinary attachments do not become case materials automatically.
 4. Keep the Provider disclosure beside the composer in view: ordinary chat is sent through the selected Provider API and must not contain unredacted case material.
 5. Use **Legal Library** for offline laws, versions, effective periods, relations, and source review.
-6. For a real matter, create a case and open **Cases → Materials & Redaction**. Import the material, complete local text extraction, review the redaction, and approve an immutable generation. Do not rely on production OCR in this prerelease.
+6. For a real matter, create a case and open **Cases → Materials & Redaction**. Import the material, complete local text extraction, review the redaction, and approve an immutable generation. Do not rely on production OCR until the exact final component and current machine both pass every qualification gate.
 7. Open **Cases → Case Work → Case Assistant**, explicitly select approved/current generations for that request, and choose **Select and send**. Only those approved projections and confirmed case data may be used. Applying analysis, document, or diagram output remains a separate confirmation step.
 8. For public-law access from an external host, start the default `public_law_only` MCP:
 
@@ -121,10 +132,12 @@ Approval in one mode never authorizes another mode or provides a fallback route.
 - [User documentation home](docs/README.en.md)
 - [Full getting-started guide](docs/getting-started.en.md)
 - [Current release status](docs/release-status.en.md)
+- [Upgrade from v0.3.1 to v0.4.0](docs/upgrade-v0.3.1-to-v0.4.0.en.md)
 - [User security and privacy guide](docs/security-and-privacy.en.md)
 - [Legal corpus and runtime database](docs/data/legal-corpus.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
 - [Release notes](RELEASE_NOTES.md)
 - [MCP overview](docs/mcp/README.md)
 - [MCP installation and operation](docs/mcp/installation.md)
@@ -170,11 +183,13 @@ Build the standalone MCP binary:
 cargo build --locked -p legal-mcp --bin lawyer-assistance-mcp
 ```
 
-Build an explicitly unsigned Windows technical installer:
+Build an explicitly unsigned Windows technical artifact for local validation only:
 
 ```powershell
 pnpm --filter @lawyer-assistance/desktop release:installer:unsigned
 ```
+
+This command does not create a stable installer, updater metadata, or publication evidence. The stable workflow requires external Authenticode and updater credentials, exact asset allowlists, signature verification, service-side readback, and the remaining release gates described in [Current release status](docs/release-status.en.md).
 
 A formal desktop build requires these generated and verified resources:
 

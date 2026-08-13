@@ -1,16 +1,18 @@
-# Lawyer Assistance 0.4.0-beta.2
+# Lawyer Assistance 0.4.0
 
 ## 中文概览
 
-这是一个面向 Windows x86_64 的信息架构与隐私工作流技术预发行版。默认 MCP 表面仍只开放只读公共法律检索，但应用内三种执行模式各自使用独立边界：普通聊天无需案件或资格授权，只向所选 BYOK Provider 发送用户主动输入和本次显式选择的普通附件；案件助理只使用当前案件本次显式选择的 approved/current generation 和最小已确认数据；只有 approved automation/MCP 继续要求完整 qualification、grant、ticket 与受保护成果链。
+这是 Lawyer Assistance `0.4.0` 稳定版本目标的发行说明。当前仓库已固定稳定源码与发布契约；只有 exact final `main`、签名资产、服务端回读、Windows 10/11 干净机和最终 MinerU 门禁全部取得真实证据后，对应 GitHub Release 才能提升为 stable/latest。在此之前不得把源码候选或未签名产物称为正式发布。
+
+默认 MCP 表面仍只开放只读公共法律检索，但应用内三种执行模式各自使用独立边界：普通聊天无需案件或资格授权，只向所选 BYOK Provider 发送用户主动输入和本次显式选择的普通附件；案件助理只使用当前案件本次显式选择的 approved/current generation 和最小已确认数据；只有 approved automation/MCP 继续要求完整 qualification、grant、ticket 与受保护成果链。
 
 - 安装包和便携包内置 runtime-slim 法律数据库，可直接完成公共法律检索；完整归档数据库不随桌面发行版分发。
-- 本地 MinerU OCR 已接入资格校验流程，但本版本不声明生产级 OCR 资格。
-- 安装包尚未经过受信任发布者的 Authenticode 签名，Windows 可能显示未知发布者提示；本版本也不发布自动更新签名文件。
+- 本地 MinerU OCR 已接入资格校验流程；生产级 OCR 资格仍要求独立 component Release 的最终批准资产、签名链、GPU/driver 与当前机器资格证据。
+- 正式 App Release 只接受 Authenticode/RFC3161 已验证的 installer、App 与 paired MCP，并要求 updater `.sig` 精确绑定已签名 installer bytes。仓库内不保存这些私钥。
 - 仓库验收只使用合成数据。真实或待审核案件材料不得进入 GitHub、浏览器/搜索引擎、远程 OCR、云存储或任何未经批准的 Provider、MCP 与自动化上下文。
 - 请通过发布页提供的 SHA-256 文件核对下载完整性，并阅读[发布状态](docs/release-status.md)与[入门指南](docs/getting-started.md)了解支持边界和安装步骤。
 
-> **Information-architecture and Privacy vNext functional prerelease.** This release separates `interactive_chat`, `interactive_case_work`, and `approved_automation`. Ordinary chat needs a configured BYOK Provider but no case, redaction approval, MCP grant, or OCR qualification. Case Assistant restores only the current request's explicitly selected approved generations and revalidates their project binding and revocation before transport; it does not reuse automation grants or tickets. Approved Provider automation and approved MCP retain exact qualification, publication, destination/purpose, grant, ticket, expiry, revocation, and protected-output gates. No production-OCR qualification is shipped with this prerelease.
+> **Stable `0.4.0` release contract.** The repository has frozen the stable source and asset contract, but a GitHub Release may be promoted to stable/latest only after exact-final-main CI, real signing, server readback, clean-machine, and final MinerU evidence exist. This release separates `interactive_chat`, `interactive_case_work`, and `approved_automation`. Ordinary chat needs a configured BYOK Provider but no case, redaction approval, MCP grant, or OCR qualification. Case Assistant restores only the current request's explicitly selected approved generations and revalidates their project binding and revocation before transport; it does not reuse automation grants or tickets. Approved Provider automation and approved MCP retain exact qualification, publication, destination/purpose, grant, ticket, expiry, revocation, and protected-output gates.
 
 > **Acceptance uses synthetic data only.** Repository tests and machine canaries must never contain real client or case material. Raw or pending material must not enter GitHub, WorkBuddy, Codex, OpenCode, a browser/search engine, remote OCR, cloud storage, another MCP/Skill, memory, subagent, screenshot, terminal output, or log.
 
@@ -34,6 +36,8 @@
 - Safe reconstructed PDF, DOCX, TXT and Markdown exports reload the protected approval server-side, refuse unsafe/overwrite/link/cloud destinations, reread the installed file, compare content/hash, rescan residual risk, and append a generation-bound audit.
 - Privacy lifecycle UI covers retention, legal holds, expiry sweeps, protected output/work-product lifecycle, mapping reveal/revoke, mapping-key rotation/destruction, and crash recovery. It does not claim forensic media erasure.
 - `.lavbackup` V3 authenticates and encrypts five components as one DPAPI-current-user set: the `user.sqlite` snapshot, encrypted privacy bundle, ciphertext-only case Vault archive, approved-workspace archive, and encrypted work-products archive. Every component uses independent chunk AAD under the same fresh backup key. Restore is staged, reverified on restart, installed as one transaction and rolls back all five components on any failure. V2 three-component bundles are accepted only for read/restore compatibility; new complete backups are V3. V1 fails closed. `.lavprivacy` remains a privacy-only maintenance format.
+- An exact v0.3.1 profile is authenticated before any source write. The upgrader installs a five-slot original-state recovery point, migrates Privacy and the audited one-to-one `ProjectId ↔ PrivacyCaseId` binding, and commits User schema 10→11 only in the last transaction. An exact legacy review without a recoverable CaseId/display name remains unassigned and uses an authenticated unknown-name presentation; no name or binding is fabricated from hashes.
+- Explicit v0.3.1 recovery creates a current five-component Safety backup and credential archive, drains MCP admission and writes, then enters a recovery-only `apply-and-exit` startup. It atomically restores all five original slots, exits successfully, permits a real v0.3.1 reopen, and supports a new, idempotent v0.4.0 upgrade lineage. It never performs SQL down-migration or single-database rollback.
 - WorkBuddy, Codex and OpenCode keep separate public and approved packages. Approved packages are Windows stdio only, begin with opaque IDs, stop on contaminated context, and explicitly forbid attachments, paste, host files, browser/search, remote OCR, another MCP/Skill, memory, subagents and unapproved Providers.
 
 The public release status and supported boundaries are maintained in the [release status](docs/release-status.md). Packaging success does not qualify production OCR, establish a trusted Windows publisher, or replace clean-machine acceptance.
@@ -53,9 +57,9 @@ All images below were captured on 2026-08-01 from production UI components with 
 
 ## Compatibility contract
 
-| Item | `0.4.0-beta.2` value |
+| Item | `0.4.0` value |
 |---|---|
-| Binary release | `0.4.0-beta.2` |
+| Binary release | `0.4.0` |
 | MCP protocol metadata | `2025-11-25` |
 | Public service schema | `1` |
 | Legal archive schema | `4` |
@@ -135,8 +139,8 @@ See the [privacy operations guide](docs/privacy-vnext/OPERATIONS.md) for the end
 
 ### Desktop
 
-1. Verify the downloaded artifact and its adjacent SHA-256/manifest.
-2. For the unsigned technical prerelease, confirm the filename contains `unsigned`, the manifest says `signed=false`, and no updater artifact is present. Windows publisher identity is not established for that artifact.
+1. Verify the downloaded artifact, its adjacent SHA-256 where specified, and every applicable embedded manifest.
+2. For the formal installer, require the exact GitHub filename `Lawyer.Assistance_0.4.0_x64-setup.exe`, its canonical checksum and detached updater signature. Verify Windows publisher identity, Authenticode policy, RFC3161 timestamp, and the updater signature over the exact installer bytes before execution.
 3. Install or unpack under the current Windows user. Do not copy a real `user.sqlite`, privacy store, `.lavbackup`, `.lavprivacy`, case material, Provider credential or session descriptor into the installation tree.
 4. On first start, let the App migrate the local databases and initialize the encrypted case Vault, approved workspace, and encrypted work-product store. Create a new five-component `.lavbackup` V3 before relying on restart restore. V2 three-component bundles remain read/restore-compatible but are not newly emitted as the complete format; legacy single-database and V1 bundles fail closed.
 5. Use **设置 → 本地处理环境与 OCR 组件** to discover, save, trust, isolate and qualify the local OCR installation. Do not process a visual case PDF until all required backend gates are current.
@@ -169,34 +173,42 @@ See the [privacy operations guide](docs/privacy-vnext/OPERATIONS.md) for the end
 
 ## Release assets and acceptance checklist
 
-Expected unsigned prerelease artifacts from a clean final commit:
+The App Release custom-asset allowlist is exactly these 12 names (GitHub-generated source archives are not counted):
 
-- `Lawyer-Assistance_0.4.0-beta.2_windows-x86_64-portable.zip`
-- `Lawyer-Assistance_0.4.0-beta.2_windows-x86_64-portable.zip.sha256`
-- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe`
-- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe.sha256`
-- `Lawyer.Assistance_0.4.0-beta.2_windows-x86_64-unsigned-setup.exe.manifest.json`
-- `lawyer-assistance-mcp-v0.4.0-beta.2-x86_64-pc-windows-msvc.zip`
-- `lawyer-assistance-mcp-v0.4.0-beta.2-x86_64-pc-windows-msvc.zip.sha256`
+- `Lawyer.Assistance_0.4.0_x64-setup.exe`
+- `Lawyer.Assistance_0.4.0_x64-setup.exe.sha256`
+- `Lawyer.Assistance_0.4.0_x64-setup.exe.sig`
+- `latest.json`
+- `Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip`
+- `Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip.sha256`
+- `lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip`
+- `lawyer-assistance-mcp-v0.4.0-x86_64-pc-windows-msvc.zip.sha256`
+- `lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz`
+- `lawyer-assistance-mcp-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256`
+- `lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz`
+- `lawyer-assistance-mcp-v0.4.0-aarch64-apple-darwin.tar.gz.sha256`
 
-After the formal Authenticode-signed build succeeds, also expect the signed installer (uploaded as `Lawyer.Assistance_0.4.0-beta.2_x64-setup.exe`), its updater `.sig`, and `latest.json`. Those outputs require an external code-signing certificate and updater credentials that are not stored in the repository. Do not publish `latest.json` for the unsigned installer and do not label an unsigned artifact as signed.
+Tauri produces the local installer as `Lawyer Assistance_0.4.0_x64-setup.exe`; the release staging process makes and re-verifies the independent dot-name copy above. The `.sha256`, `.sig`, `latest.json` URL/signature, and dot-name installer must all bind the same bytes.
+
+The separate `mineru-components-v0.4.0` Release contains only `mineru-component-catalog.json`, `mineru-component-catalog.json.minisig`, `mineru-component-provenance.json`, `mineru-component-provenance.json.minisig`, the catalog-selected single `.laocrparts` descriptor, and every descriptor-ordered `.partNNNN-of-NNNN`. It must not contain an unsharded `.laocrpkg`, historical candidate, placeholder/synthetic model, or unapproved runtime/model/license/provenance.
 
 Before upload:
 
 - verify every adjacent checksum and embedded/archive manifest;
 - reject traversal, duplicate, database, secret, session, credential, case-content and stale-member entries;
-- confirm the portable and installer executable ProductVersion is `0.4.0-beta.2`;
-- confirm the unsigned manifest records `signed=false` and `updaterArtifactGenerated=false`, or verify Authenticode and Minisign for the signed path;
+- confirm the portable and installer executable ProductVersion is `0.4.0`;
+- verify Authenticode and RFC3161 for the installer, portable App, and paired MCP, and require the same publisher identity;
+- verify the updater `.sig` and `latest.json` signature against the exact signed installer bytes, filename, version, and canonical URL;
 - install/start the installer and portable build, run local health/privacy smoke tests, and run the actual MCP binary stdio/HTTP canaries;
-- re-fetch the GitHub Release after upload and compare every asset name and byte size.
+- download the GitHub Release into a fresh directory, compare exact names, count, size, and SHA-256, then rerun the Authenticode/updater, portable, three-platform MCP, and MinerU catalog/provenance/parts validators.
 
 MCP archives contain no legal/user/privacy database, case material, exported document, token, Provider credential, App-issued session descriptor, secret, or machine-local configuration.
 
 ## External signing requirements
 
-This technical prerelease is published without an Authenticode code-signing certificate or updater private key. These secrets are intentionally outside the repository. Final installer `.sig` and `latest.json` remain pending because they must bind the exact final Authenticode-signed installer.
+Release secrets are intentionally outside the repository. A formal build requires an Authenticode certificate with a readable private key and trusted RFC3161 timestamp capability, plus the Tauri updater private key/password matching the embedded public key. The final installer `.sig` and `latest.json` must bind the exact final Authenticode-signed installer.
 
-Missing signing credentials block the trusted-publisher installer and installer-bound updater outputs. They do not block privacy functionality, automated tests, portable/MCP archives, or the explicitly named unsigned installer. The stable signing workflow is documented in the [release-signing guide](docs/development/release-signing.md).
+Missing signing credentials block the complete 12-asset App set, trusted publisher, updater outputs, draft readback, and any stable/latest promotion. They do not invalidate the implemented privacy code or credential-free tests, but no unsigned artifact may be renamed to a formal asset or presented as the stable release. The signed workflow is documented in the [release-signing guide](docs/development/release-signing.md).
 
 ## Known limits
 
@@ -206,4 +218,4 @@ Missing signing credentials block the trusted-publisher installer and installer-
 - Qualification is machine/user/install specific. Copying a report, session ID, database or model tree to another environment does not transfer qualification.
 - Public-law host packages remain intentionally case-free even though the separate approved-session implementation exists.
 - Real client material is excluded from release acceptance. Synthetic positive E2E proves the implemented chain, not legal accuracy for every handwriting, stamp, scan quality or jurisdictional document form; low confidence and unsupported cases must fail closed and receive human review.
-- An unsigned installer has no verified Windows publisher identity and may trigger SmartScreen/AV warnings. Authenticode and clean-machine Windows 10/11 reputation qualification are release-operations evidence, not privacy feature claims.
+- Authenticode validity does not by itself establish SmartScreen reputation or clean-machine compatibility. Windows 10/11 publisher, timestamp, install/upgrade/recovery/portable/updater/interruption/uninstall and AV/EDR evidence remains a release-operations gate, not a privacy feature claim.
