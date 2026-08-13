@@ -492,6 +492,191 @@ checkpoint、Step-8 predecessor sidecar 和 Receipt-9 evidence sidecar，且没�
 只可在 payload 与预期完全相等时续作；incoming 与 final 同时存在必败。receipt 时间戳必须
 单调不减，允许相邻 receipt 时间相等，不允许回退。
 
+## R3 显式恢复 wire 与提交边界
+
+### 命名空间与用户意图
+
+R3 保留 R2 已冻结的正式 marker basename
+`<app-root>/v031-migration-recovery-pending.dpapi`。它的两级安装 basename 固定为
+`v031-migration-recovery-pending.dpapi.incoming.staging` 与
+`v031-migration-recovery-pending.dpapi.incoming`，不得使用随机临时名或其他扩展名。
+用户只能在已经通过普通完成态启动 gate 的 v0.4.0 UI 中输入精确确认短语
+`恢复到 v0.3.1 并退出当前应用` 后调用 `stage_v031_migration_recovery`。该命令不接受路径、
+lineage、workspace、Privacy CaseId、credential 或 backup bytes；后端从 user audit、Privacy
+lineage 和完整 terminal history 中重新认证与当前 workspace 唯一匹配的完成态 lineage。
+
+每次意图创建一个 `rcv_` 加 32 位 CSPRNG lowercase hex 的 `recoveryId`，并使用：
+
+```text
+<app-root>/v031-migration-recovery-audit/<recoveryId>/
+  current-v040-safety-v3.lavbackup
+  current-v040-credentials.dpapi
+  abort-to-current.evidence.dpapi
+  five-slot-commit.evidence.dpapi
+  applied-downgrade.report.dpapi
+  aborted-current-restored.report.dpapi
+```
+
+四个 evidence/report final 文件各自只有两级固定安装路径 `<final>.incoming.staging` 与
+`<final>.incoming`。安装链严格为 create-new inner staging、回读 canonical/DPAPI payload、
+no-replacement rename 到 incoming、再次回读，再 no-replacement rename 到 final 并回读；只有
+经过认证的 final 是对应 commit、abort intent 或 report 的权威证据。单独或伴随 final 出现的
+incoming/inner staging 都只是安装 residue，不得授权提交、反向恢复或完成报告；它们必须按当前
+正式 marker 与 authenticated final 状态确定性清理，并在终态证明 absent。正式 marker absent
+时，即使审计目录中存在 authenticated final，它也只作为审计材料保留，不授予 active mutation。
+正式 marker 存在且仍在 commit 前时，任一 evidence/report residue 都按持久化中断处理：不能继续
+正向 swap，必须先安装/认证 abort intent，再恢复 stage 时完整 current 五槽。
+
+该目录不属于 `migration-backups` terminal lineage；普通启动不得把已经完成或在正式 marker
+安装前中断的 audit 目录当作升级 receipt。安全备份复用普通 V3 wire，但其构建使用同一个
+application-backup write barrier：在 barrier 内捕获五个 active 物理槽位的 exact fingerprint、
+user/Privacy/Vault/Approved/WorkProducts component identity 和备份内容，并在释放 barrier 前重捕
+五槽、证明前后逐项相等。Safety proof 除普通 V3 metadata/bundle hash/长度外，固定增加
+`componentIdentitySha256` 与五槽 canonical inventory 的 `stageSlotInventorySha256`；marker 必须
+绑定整个 proof。这样 safety 内容、component identity 和将被交换的五个物理槽位属于同一写屏障，
+不能以只认证 bundle metadata 代替该绑定。
+
+Safety 的固定三段安装路径是：
+
+```text
+current-v040-safety-v3.lavbackup.incoming.staging
+current-v040-safety-v3.lavbackup.incoming
+current-v040-safety-v3.lavbackup
+```
+
+必须 create-new 写 inner staging 并认证回读，no-replacement rename 到 incoming、同步 audit directory
+并再次认证回读，再 no-replacement rename 到 final、同步目录并最终认证回读；创建 marker 前必须
+证明两个中间路径 absent。任何中断只发生在正式 marker 创建前，残留 safety inner staging/incoming
+都没有 mutation authority，普通 startup 不得据此进入 recovery-only。
+
+credential archive 是独立 canonical JSON + DPAPI CurrentUser 文件，按
+固定顺序恰好保存 ApprovedManifest、WorkProductManifest、McpTicket、
+QualificationRevocationEpoch 四个 32-byte value。明文使用 zeroizing buffer，外层 marker 只绑定
+protected file 的 basename、长度和 SHA-256。
+
+安装顺序固定为：创建并回读 V3 safety、创建并回读 credential archive、重验当前五槽与完整
+terminal anchors、create-new 写 marker inner staging 并回读认证、以 no-replacement/write-through
+rename 提升为 `.incoming` 并再次回读、把 exit coordinator 从 Idle 原子转为 Draining、关闭新的
+MCP/standalone provisioning 准入、等待 embedded MCP 请求结束、撤销全部仍 active 的
+authenticated standalone descriptor、取得 User、Privacy/Vault、Approved/Work-Products 写屏障
+（其取得必须线性化在既有业务写入及跨进程 Approved operation lock 之后，并从此拒绝新的五槽
+写入）、在屏障内最终重验 terminal/V2/Safety/
+四凭据/current 五槽，最后才以 no-replacement/write-through rename 把 `.incoming` 提升为正式
+marker。正式 marker absent 时，`.incoming` 和 inner staging 一律没有 mutation authority；R3
+startup observer 必须直接返回 absent，普通启动继续，且不得解析、提升、删除或因损坏 residue
+而阻断。只有后续新的显式 staging 请求可以先清理二者，再重新认证并建立意图。前两项完成而正式
+marker 尚未出现时也没有 mutation authority；可保留为审计材料，当前 profile 未改变。
+Idle→Draining 转换失败、任一排空超时或最终复证失败时必须保持正式 marker absent，删除并回读
+证明 `.incoming` 与 inner staging absent，再仅请求普通受控 restart。正式 marker 提升后，三类
+写屏障与 migration mutex 保留到进程退出，命令请求 restart，不再返回可继续业务操作的正常 UI
+状态。该顺序是数据安全澄清：exit coordinator 本身不等价于 MCP/standalone 排空，正式 authority
+不得早于实际 quiescence。
+
+### Marker canonical payload
+
+`V031MigrationRecoveryPendingV1` 使用 `camelCase`、`deny_unknown_fields`、canonical UTF-8 JSON、
+DPAPI CurrentUser 和 64 KiB protected-file 上限；解封后重编码必须逐字节相等，`Debug` 不显示
+案件内容、ID、路径或 secret。schema 固定为
+`lawyer-assistance-v031-migration-recovery-pending-v1`，`formatVersion = 1`，creator/target 固定为
+`0.4.0`/`0.3.1`。Payload 至少绑定 migration/recovery/lineage/envelope/source-profile、Receipt 9
+protected/evidence、Step-8 predecessor 与 Receipt-9 sidecar protected hash、V2 identity/bundle、
+V2 user v10/Privacy v1 的长度与 hash、workspace、stage 时 fresh five-slot manifest、V3 safety
+metadata/bundle hash/长度、credential archive protected hash/长度、固定 slot count 5、phase 和
+该 phase 已完成的精确 rename/cleanup prefix；不保存绝对路径、正文、文件原名、token、ticket、
+key 或 Privacy CaseId。
+
+Marker phase 的唯一顺序为：`requested`、`user_v10_staged`、`sources_staged`、`commit_ready`、
+`user_moved_to_rollback`、`user_installed`、`privacy_moved_to_rollback`、`privacy_installed`、
+`vault_moved_to_rollback`、`approved_moved_to_rollback`、`work_products_moved_to_rollback`、
+`five_slot_committed`、五个固定 rollback-cleanup prefix、两个 auxiliary-cleanup prefix、四个固定
+credential-delete prefix、`target_verified`、`report_installed`。每次更新必须 create-new 写
+inner staging，回读后 no-replacement rename 为 `.incoming`，认证它是现 marker 的唯一直接后继，
+再用同卷 write-through atomic replace。正式 main 单独存在，或 main 加其精确直接后继时才能
+确定性续作；正式 main absent 始终按上述 R3 absent 规则处理，incoming-only 不可提升。其他
+duplicate、skipped、stale、unknown phase 或 payload 漂移均 fail closed。若 main 与唯一直接后继
+`.incoming` 并存，且 main 所绑定 recovery 已有 authenticated abort intent，则 main 保持权威；
+observer 必须绑定两代 protected hash、验证直接后继关系并丢弃 `.incoming`，不得把正向后继提升。
+没有 abort intent 时才把已认证直接后继 atomic replace 为正式 main。Inner staging 从不构成
+后继 authority；commit 前存在时强制走 authenticated abort，且在提升或丢弃 `.incoming` 前必须
+先证明 inner staging absent。
+
+### Startup observer 与五槽交换
+
+生产 startup 先运行 R3 observer；R3 present 时认证恢复 authority 后立即独占返回，不得再由普通
+observer 读取已经交换或正在交换的槽位。R3 absent 时才认证 terminal history，并运行普通 full、legacy
+与 Privacy restore observer；R3 present 时由 R3 observer 自行证明这些普通 marker absent 并独占
+ADR 已冻结的十个 application-restore slots。它保留 marker protected proof、terminal inventory、
+offline predecessor/Receipt-9 anchors、解封后的 V2 source image capability、V3 safety proof、
+credential archive proof、phase 与 exact slot inventory；对路由层只暴露
+`AuthenticatedPresence::Authenticated`，summary 不构成 mutation authority。
+
+受控 restart 已关闭 manager 后，首次 swap 前必须证明 user/Privacy active、incoming、rollback
+各自所有 `-wal`、`-shm`、`-journal` sidecar absent。两个 incoming main file 分别从已认证 V2
+user v10 与 Privacy v1 create-new 写入固定 `<incoming>.staging`，用 exact validator/fingerprint
+回读后，才以 no-replacement rename 提升为 incoming。固定 inner staging 为
+`user.sqlite.application-restore-incoming.staging` 与
+`privacy/privacy-workflow.sqlite.application-restore-incoming.staging`；它们从不构成 source
+authority，incoming 接受前和第一次 active rename 前都必须 absent。第一次 rename 前再次认证
+全部静态 anchors、stage 时 current manifest、V3 safety、credential archive、两个 incoming image
+和七次 rename 尚未开始；不允许只移动 SQLite main 而忽略存在的 sidecar。
+
+正式 marker 存在时，任一 user/Privacy `<incoming>.staging` 也只表示中断安装，不得当作 source
+image；commit 前它与 marker/evidence inner staging 一样强制进入 authenticated abort-to-current。
+
+七次 rename 严格为：
+
+1. user active → user rollback；
+2. user incoming → user active；
+3. Privacy active → Privacy rollback；
+4. Privacy incoming → Privacy active；
+5. Vault active → Vault rollback；
+6. Approved active → Approved rollback；
+7. WorkProducts active → WorkProducts rollback。
+
+每次 rename 前后都要重观察对应 phase、fixed path、ordinary/single-link/reparse proof，并在 rename
+后先持久化下一 phase 才进行下一次。完成七次 rename 并重新证明 canonical user v10、Privacy
+v1 与三个 target active absent 后，安装/回读
+`five-slot-commit.evidence.dpapi`，再进入 `five_slot_committed`。该 evidence 是不可逆提交点；
+`abort-to-current.evidence.dpapi` 是与它互斥的 authenticated abort intent。提交证据出现前一旦
+决定反向恢复，必须先 create-new 安装并回读认证 abort intent，使其绑定 recovery/lineage、
+stage 时 current manifest、V3 safety、credential archive、commit evidence authenticated-absent
+证明以及当时的 exact phase/slot inventory；此后任何 restart 只能继续反向恢复，不能恢复正向
+swap 或安装 commit evidence：
+
+- commit evidence 之前的任何执行错误或 crash prefix，安装上述 abort intent 后逆序恢复五个原 v0.4 active
+  槽、清理两个 incoming，恢复/回读四凭据并证明 stage 时 current manifest，写
+  `aborted-current-restored.report.dpapi` 后删除 marker；abort intent 作为审计证据保留；
+- commit evidence 之后 active source profile 已完整，不得因 cleanup 中断而反向恢复；保留 marker，按
+  phase 单调续作，直到所有 residue 清理完毕。这样 cleanup 故障不会产生可启动的混合状态。
+
+提交后的 rollback 清理顺序固定为 WorkProducts、Approved、Vault、Privacy、user。前三个目录
+不得直接递归删除 rollback；必须先认证 rollback 与 stage 时 current fingerprint 相等，再以
+no-replacement/write-through rename 分别移入固定 tombstone：
+
+```text
+privacy/approved-mcp/work-products.application-restore-cleanup
+privacy/approved-mcp/approved-generations.application-restore-cleanup
+case-vault-v2.application-restore-cleanup
+```
+
+每次 tombstone rename 完成后先持久化对应 cleanup phase；重启允许 tombstone 已部分删除，但只可
+幂等续删该固定、ordinary、非 reparse 目录，并须在开始下一目录前证明 rollback 与 tombstone
+同时 absent。Privacy/user 普通文件 rollback 仍按固定槽位删除并回读 absent。随后只删除
+V3 明确排除的 `ticket-sessions`、`qualification` 两个固定 auxiliary directory，并按
+QualificationRevocationEpoch、McpTicket、WorkProductManifest、ApprovedManifest 顺序删除、
+回读四个 credential。不得递归猜测或删除未知目录；`privacy/approved-mcp` 只有在所有已知 target、
+auxiliary 和 restore residue absent 且目录为空时才可移除。最后认证 user v10/marker、Privacy v1、
+后三组件、四凭据、十个 swap slot、marker inner staging/`.incoming` 与全部 evidence/report
+install residue 都处于目标状态，安装/回读
+`applied-downgrade.report.dpapi`，再删除正式 marker。
+
+`AppliedDowngrade { target_app_version: "0.3.1" }` 的构造器只存在于上述最终 proof 之后。
+Production startup 消耗它后释放 migration guard、把 exit coordinator 标记为 Finalizing 并调用
+`app.exit(0)`；不调用 restart，且本进程 current manager、migration、maintenance、UI 和后台任务
+调用数必须为零。原 V2、V3 safety、credential archive、abort/commit/report 和迁移报告保留审计；
+这些文件不得进入 exact-source target absence 或 terminal-lineage 阻断集合，因而后续显式 v0.4
+启动可以新建不同 lineage 并重新完整升级。
+
 ## R2、R3 与 R7 验收归属
 
 R2 只交付并测试原态 V2、identity/bundle 安装恢复、十 receipt chain、启动仲裁/升级 resume
