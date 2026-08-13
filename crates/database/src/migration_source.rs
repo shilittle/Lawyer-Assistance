@@ -5,10 +5,12 @@ use super::{
     USER_CANONICAL_SCHEMA_MARKER_KEY, USER_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
+#[cfg(any(windows, test))]
+use std::fs::OpenOptions;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Cursor, Read},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -883,6 +885,11 @@ fn migration_source_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn migration_source_metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
