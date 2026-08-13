@@ -255,7 +255,7 @@ function Assert-RemoteAnnotatedReleaseTag {
   if ($Tag -cnotmatch '^(?:v0\.4\.0|mineru-components-v0\.4\.0)$') {
     throw "The release tag is outside the frozen v0.4.0 contract."
   }
-  $originUrl = (& $GitText -Arguments @("-C", $ProjectRoot, "remote", "get-url", "--fetch", "origin")).Trim()
+  $originUrl = (& $GitText -Arguments @("-C", $ProjectRoot, "remote", "get-url", "--no-push", "origin")).Trim()
   if ($originUrl -cne $RepositoryUrl) {
     throw "The local origin does not match the frozen release repository."
   }

@@ -68,6 +68,7 @@ function New-FakePublicationRemote([string]$Root) {
     NextId = 100
     UploadCount = 0
     Commands = [Collections.Generic.List[object]]::new()
+    GitCommands = [Collections.Generic.List[object]]::new()
     OriginUrl = "https://github.com/shilittle/Lawyer-Assistance.git"
   }
 }
@@ -78,9 +79,12 @@ function Get-FakeReleaseJson($State) {
 }
 
 function New-FakeGitText($State) {
+  $fixtureRoot = [IO.Path]::GetFullPath($script:testRoot)
   return {
     param([string[]]$Arguments)
-    if ($Arguments -contains "get-url") { return $State.OriginUrl }
+    [void]$State.GitCommands.Add(@($Arguments))
+    $expectedOriginArguments = @("-C", $fixtureRoot, "remote", "get-url", "--no-push", "origin")
+    if (($Arguments -join "`0") -ceq ($expectedOriginArguments -join "`0")) { return $State.OriginUrl }
     if ($Arguments -contains "rev-parse") { return $State.Head }
     if ($Arguments -contains "ls-remote") {
       $tag = @($Arguments | Where-Object { $_ -match '^refs/tags/' -and $_ -notmatch '\^\{\}$' })[0]
@@ -288,6 +292,17 @@ try {
       $result.assetCount -ne 12 -or
       $state.UploadCount -ne 12) {
     throw "Fresh draft publication did not produce exact verified evidence."
+  }
+  $originQueries = @($state.GitCommands | Where-Object { $_ -ccontains "get-url" })
+  if ($originQueries.Count -lt 1) {
+    throw "Draft publication did not query the origin fetch URL."
+  }
+  foreach ($originQuery in $originQueries) {
+    $expectedOriginQuery = @("-C", $script:testRoot, "remote", "get-url", "--no-push", "origin")
+    if (($originQuery -join "`0") -cne ($expectedOriginQuery -join "`0") -or
+        $originQuery -ccontains "--fetch") {
+      throw "Draft publication used unsupported origin fetch URL arguments."
+    }
   }
   $savedTitle = [string]$state.Release.name
   $state.Release.name = "Wrong release title"

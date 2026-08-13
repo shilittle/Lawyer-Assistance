@@ -717,7 +717,7 @@ function Assert-LawyerAssistanceFetchedMain {
   param([string]$ProjectRoot, [hashtable]$Adapters)
 
   $originUrl = Get-LawyerAssistanceGitText $ProjectRoot $Adapters @(
-    "remote", "get-url", "--fetch", "origin"
+    "remote", "get-url", "--no-push", "origin"
   ) "REL-REPOSITORY-INVALID" $script:LawyerAssistanceReleaseExitCodes.RepositoryInvalid "The origin fetch URL could not be read."
   if ($originUrl -cne $script:LawyerAssistanceReleaseContract.RepositoryUrl) {
     Throw-LawyerAssistanceReleaseFailure "REL-REPOSITORY-INVALID" $script:LawyerAssistanceReleaseExitCodes.RepositoryInvalid "The origin fetch URL does not match the frozen release repository."

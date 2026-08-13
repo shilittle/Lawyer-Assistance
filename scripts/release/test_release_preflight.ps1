@@ -115,6 +115,7 @@ function New-PreflightAdapters {
   param([hashtable]$State)
 
   $fixtureHead = $script:Head
+  $fixtureRoot = [IO.Path]::GetFullPath($script:TestRoot)
   $isWindows = { return [bool]$State.IsWindows }.GetNewClosure()
   $getCertificates = { return @($State.Certificates) }.GetNewClosure()
   $testPrivateKey = { param($Certificate) return [bool]$State.PrivateKeyReadable }.GetNewClosure()
@@ -155,7 +156,8 @@ function New-PreflightAdapters {
         $exitCode = 99
       }
     } elseif ($FilePath -ceq "git") {
-      if ($joined -match '(?m)^remote$' -and $joined -match '(?m)^get-url$') {
+      $expectedOriginArguments = @("-C", $fixtureRoot, "remote", "get-url", "--no-push", "origin")
+      if (($ArgumentList -join "`0") -ceq ($expectedOriginArguments -join "`0")) {
         $output = [string]$State.OriginUrl
       } elseif ($joined -match '(?m)^symbolic-ref$') {
         $output = [string]$State.Branch
@@ -296,6 +298,13 @@ try {
     $formal = @($state.Calls | Where-Object { $_.FilePath -ceq "python" -and $_.Arguments[0] -like "*check_release_contract.py" })
     Assert-Equal 1 $formal.Count "Formal contract checker call count"
     Assert-True (($formal[0].Arguments -join "|") -match '\|--contract\|.*release-contract-v0\.4\.0\.json\|--mode\|formal$') "Formal checker arguments were not fixed"
+    $originQueries = @($state.Calls | Where-Object {
+      $_.FilePath -ceq "git" -and $_.Arguments -ccontains "get-url"
+    })
+    Assert-Equal 1 $originQueries.Count "Origin fetch URL query call count"
+    $expectedOriginQuery = @("-C", [IO.Path]::GetFullPath($script:TestRoot), "remote", "get-url", "--no-push", "origin")
+    Assert-Equal ($expectedOriginQuery -join "`0") ($originQueries[0].Arguments -join "`0") "Origin fetch URL query arguments"
+    Assert-True ($originQueries[0].Arguments -cnotcontains "--fetch") "Origin fetch URL query used an unsupported Git option"
     $authenticodeProbes = @($state.CredentialProbeCalls | Where-Object { $_.Kind -ceq "Authenticode" })
     $updaterProbes = @($state.CredentialProbeCalls | Where-Object { $_.Kind -ceq "Updater" })
     Assert-Equal 1 $authenticodeProbes.Count "Authenticode credential probe call count"
@@ -322,6 +331,29 @@ try {
     $authenticodeProbe = @($state.CredentialProbeCalls | Where-Object { $_.Kind -ceq "Authenticode" })
     Assert-Equal 1 $authenticodeProbe.Count "Normalized Authenticode probe call count"
     Assert-Equal $script:Thumbprint $authenticodeProbe[0].Thumbprint "Normalized thumbprint was not used by the real capability seam"
+  }
+  Invoke-TestCase "real Git accepts the frozen fetch URL query syntax" {
+    $gitRoot = Join-Path ([IO.Path]::GetTempPath()) ("lawyer-assistance-git-origin-probe-" + [Guid]::NewGuid().ToString("N"))
+    try {
+      New-Item -ItemType Directory -Path $gitRoot | Out-Null
+      & git -C $gitRoot init --quiet
+      Assert-Equal 0 $LASTEXITCODE "Temporary Git repository initialization"
+      & git -C $gitRoot remote add origin "https://github.com/shilittle/Lawyer-Assistance.git"
+      Assert-Equal 0 $LASTEXITCODE "Temporary Git origin creation"
+      $actualOrigin = (& git -C $gitRoot remote get-url --no-push origin).Trim()
+      Assert-Equal 0 $LASTEXITCODE "Real Git fetch URL query exit code"
+      Assert-Equal "https://github.com/shilittle/Lawyer-Assistance.git" $actualOrigin "Real Git fetch URL query result"
+    } finally {
+      if (Test-Path -LiteralPath $gitRoot -PathType Container) {
+        $resolvedGitRoot = [IO.Path]::GetFullPath($gitRoot)
+        $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        if (-not $resolvedGitRoot.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -or
+            [IO.Path]::GetFileName($resolvedGitRoot) -notlike "lawyer-assistance-git-origin-probe-*") {
+          throw "Refusing to remove an unexpected Git syntax fixture root"
+        }
+        Remove-Item -LiteralPath $resolvedGitRoot -Recurse -Force
+      }
+    }
   }
   Invoke-TestCase "preflight consumes immutable identity from the checked-in contract" {
     $contractPath = Join-Path $script:TestRoot "scripts\release\release-contract-v0.4.0.json"
