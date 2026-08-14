@@ -334,10 +334,14 @@ class McpCiReleaseContractPathTests(unittest.TestCase):
         self.assertIn("--expected-commit '${{ github.sha }}'", workflow)
 
 
-class MainCiV031RestartIsolationTests(unittest.TestCase):
-    TEST_NAME = (
+class MainCiIntegrationIsolationTests(unittest.TestCase):
+    RESTART_TEST_NAME = (
         "commands::v031_user_upgrade::tests::"
         "real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env"
+    )
+    HTTP_TEST_NAME = (
+        "approved_backend::tests::"
+        "approved_streamable_http_tcp_reads_writes_rereads_and_rejects_replay"
     )
 
     @classmethod
@@ -361,34 +365,21 @@ class MainCiV031RestartIsolationTests(unittest.TestCase):
                 break
         return "\n".join(lines[start:end])
 
-    def test_broad_and_isolated_rust_gates_are_exact_and_ordered(self) -> None:
-        broad_name = "Test Rust except the real OS restart parent"
-        isolated_name = (
-            "Test the real OS restart parent without sibling credential contention"
-        )
-        broad = self.workflow_step(broad_name)
-        isolated = self.workflow_step(isolated_name)
-        broad_command = (
-            "cargo test --locked --workspace --all-targets --all-features -- --skip "
-            + self.TEST_NAME
-        )
+    def assert_isolated_step(
+        self,
+        isolated: str,
+        test_name: str,
+        package: str,
+    ) -> None:
         inventory_command = (
-            "& cargo test --locked -p lawyer-assistance-desktop --lib --all-features "
+            f"& cargo test --locked -p {package} --lib --all-features "
             "$testName -- --exact --list --format terse"
         )
         isolated_command = (
-            "& cargo test --locked -p lawyer-assistance-desktop --lib --all-features "
+            f"& cargo test --locked -p {package} --lib --all-features "
             "$testName -- --exact --nocapture --test-threads=1"
         )
-
-        workflow = self.workflow()
-        self.assertLess(workflow.index(broad), workflow.index(isolated))
-        self.assertEqual(workflow.count(broad_command), 1)
-        self.assertIn(f"run: {broad_command}", broad)
-        self.assertEqual(
-            isolated.count(f"$testName = '{self.TEST_NAME}'"),
-            1,
-        )
+        self.assertEqual(isolated.count(f"$testName = '{test_name}'"), 1)
         self.assertEqual(isolated.count(inventory_command), 1)
         self.assertEqual(isolated.count(isolated_command), 1)
         self.assertIn(
@@ -397,12 +388,45 @@ class MainCiV031RestartIsolationTests(unittest.TestCase):
         )
         self.assertIn("$matches.Count -ne 1", isolated)
         self.assertEqual(isolated.count("$LASTEXITCODE -ne 0"), 2)
+        self.assertEqual(isolated.count("--test-threads=1"), 1)
 
-        combined = f"{broad}\n{isolated}".lower()
+    def test_broad_and_isolated_rust_gates_are_exact_and_ordered(self) -> None:
+        broad_name = "Test Rust except the isolated integration parents"
+        restart_name = (
+            "Test the real OS restart parent without sibling credential contention"
+        )
+        http_name = "Test approved MCP streamable HTTP without sibling load"
+        broad = self.workflow_step(broad_name)
+        restart = self.workflow_step(restart_name)
+        http = self.workflow_step(http_name)
+        broad_command = (
+            "cargo test --locked --workspace --all-targets --all-features -- --skip "
+            + self.RESTART_TEST_NAME
+            + " --skip "
+            + self.HTTP_TEST_NAME
+        )
+
+        workflow = self.workflow()
+        self.assertLess(workflow.index(broad), workflow.index(restart))
+        self.assertLess(workflow.index(restart), workflow.index(http))
+        self.assertEqual(workflow.count(broad_command), 1)
+        self.assertIn(f"run: {broad_command}", broad)
+        self.assertEqual(
+            workflow.count(f"--skip {self.RESTART_TEST_NAME}"),
+            1,
+        )
+        self.assertEqual(workflow.count(f"--skip {self.HTTP_TEST_NAME}"), 1)
+        self.assert_isolated_step(
+            restart,
+            self.RESTART_TEST_NAME,
+            "lawyer-assistance-desktop",
+        )
+        self.assert_isolated_step(http, self.HTTP_TEST_NAME, "legal-mcp")
+
+        combined = f"{broad}\n{restart}\n{http}".lower()
         self.assertNotIn("continue-on-error", combined)
         self.assertNotIn("retry", combined)
         self.assertEqual(broad.count("--test-threads=1"), 0)
-        self.assertEqual(isolated.count("--test-threads=1"), 1)
 
 
 if __name__ == "__main__":

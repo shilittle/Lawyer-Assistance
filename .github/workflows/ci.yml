@@ -375,8 +375,8 @@ jobs:
       - name: Lint Rust
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test Rust except the real OS restart parent
-        run: cargo test --locked --workspace --all-targets --all-features -- --skip commands::v031_user_upgrade::tests::real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env
+      - name: Test Rust except the isolated integration parents
+        run: cargo test --locked --workspace --all-targets --all-features -- --skip commands::v031_user_upgrade::tests::real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env --skip approved_backend::tests::approved_streamable_http_tcp_reads_writes_rereads_and_rejects_replay
 
       - name: Test the real OS restart parent without sibling credential contention
         shell: powershell
@@ -393,6 +393,23 @@ jobs:
           & cargo test --locked -p lawyer-assistance-desktop --lib --all-features $testName -- --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) {
             throw 'V031 restart parent test failed in isolation.'
+          }
+
+      - name: Test approved MCP streamable HTTP without sibling load
+        shell: powershell
+        run: |
+          $testName = 'approved_backend::tests::approved_streamable_http_tcp_reads_writes_rereads_and_rejects_replay'
+          $inventory = @(& cargo test --locked -p legal-mcp --lib --all-features $testName -- --exact --list --format terse)
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Approved HTTP test inventory failed.'
+          }
+          $matches = @($inventory | Where-Object { [string]$_ -ceq "${testName}: test" })
+          if ($matches.Count -ne 1) {
+            throw "Expected exactly one approved HTTP test, found $($matches.Count)."
+          }
+          & cargo test --locked -p legal-mcp --lib --all-features $testName -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Approved HTTP test failed in isolation.'
           }
 
       - name: Test the actual approved-workspace MCP binary over stdio and HTTP
