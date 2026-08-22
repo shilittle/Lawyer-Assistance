@@ -10,6 +10,16 @@ Stable-version source identity is not stable-publication evidence. Final local c
 
 The GitHub repository is public. Repository visibility and the ability to download a file are distribution facts only; they do not establish a trusted publisher, updater readiness, OCR qualification, clean-machine acceptance, or stable-release status.
 
+## 2026-08-14 to 2026-08-22 evaluation release and local validation
+
+The [main CI](https://github.com/shilittle/Lawyer-Assistance/actions/runs/31762817709) and [MCP server CI](https://github.com/shilittle/Lawyer-Assistance/actions/runs/31762817760) succeeded for exact `main@4fd0d88caef5bca6d874e7f1bc290d604e9b172b`; the MCP run covered Windows, Linux, and macOS. This evidence is bound only to that exact SHA, so any later commit merged into `main` requires fresh matching CI evidence.
+
+The project published the public, non-draft, non-latest [`v0.4.0-unsigned-evaluation.1`](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v0.4.0-unsigned-evaluation.1) prerelease. It contains only an unsigned installer, its manifest, and a SHA-256 sidecar. It is not the formal `v0.4.0` Release and does not satisfy the frozen 12-item App/MCP allowlist.
+
+The installer was applied locally as version `0.4.0`. Both the App and paired MCP are `NotSigned`, and MCP `--version` reports `0.4.0`. The App encountered the existing mixed prerelease profile (User schema 10, Privacy schema 4, and existing Vault/Approved state), failed closed with exit code 101, and created no window. Post-run auditing detected no persistent profile write, credential-entry count change, Windows crash report, or residual process. Because complete pre-launch file-hash baselines were not recorded, this is not described as byte-for-byte before/after identity.
+
+See the [development and release audit log](development/development-log-2026-08-22.md) for exact hashes, evidence, and limitations.
+
 ## Implemented source-candidate capabilities
 
 | Capability | Status |
@@ -75,7 +85,7 @@ The desktop application uses the `runtime-slim-v1` projection. The full archival
 
 ### CI and clean-machine acceptance
 
-The exact final `main` commit must pass main CI and MCP Linux/Windows/macOS CI. Windows 10 and Windows 11 clean machines must then cover new install, publisher/timestamp inspection, first launch, exact v0.3.1 upgrade, complete recovery, real v0.3.1 reopen, re-upgrade, portable mode, updater, interrupted installation, uninstall, and SmartScreen/AV/EDR behavior. The final target GPU environment must separately complete MinerU acceptance.
+The eventual exact final `main` commit must pass main CI and MCP Linux/Windows/macOS CI. Commit `4fd0d88…` has successful evidence, but any later final `main` SHA must close the gate again. Windows 10 and Windows 11 clean machines must then cover new install, publisher/timestamp inspection, first launch, exact v0.3.1 upgrade, complete recovery, real v0.3.1 reopen, re-upgrade, portable mode, updater, interrupted installation, uninstall, and SmartScreen/AV/EDR behavior. The final target GPU environment must separately complete MinerU acceptance.
 
 ## Publication sequence
 

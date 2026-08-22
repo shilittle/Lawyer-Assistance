@@ -10,6 +10,16 @@
 
 GitHub 仓库当前为公开仓库。仓库可见性和资产可下载性只属于分发事实，并不等于已建立可信发布者签名、可用自动更新、OCR 资格、干净机器验收或正式发布状态。
 
+## 2026-08-14 至 2026-08-22 评估发布与本机验证
+
+`main@4fd0d88caef5bca6d874e7f1bc290d604e9b172b` 的[主 CI](https://github.com/shilittle/Lawyer-Assistance/actions/runs/31762817709)与 [MCP server CI](https://github.com/shilittle/Lawyer-Assistance/actions/runs/31762817760)已经成功；后者覆盖 Windows、Linux 和 macOS 三个平台。该证据只绑定这一 exact SHA，后续提交进入 `main` 后必须重新取得对应 CI 证据。
+
+项目已发布公开、非草稿、非 latest 的 [`v0.4.0-unsigned-evaluation.1`](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v0.4.0-unsigned-evaluation.1) 评估预发布。它只包含未签名安装包、manifest 和 SHA-256 sidecar，不是正式 `v0.4.0` Release，也不满足正式 12 项 App/MCP allowlist。
+
+该安装包已在本机覆盖安装为 `0.4.0`；App 与配对 MCP 均为 `NotSigned`，MCP `--version` 返回 `0.4.0`。App 在既有 User schema 10、Privacy schema 4 且已有 Vault/Approved 状态的混合预发布 profile 上以退出码 101 失败关闭，未创建窗口。后验审计未检测到持久化 profile 写入、凭据条目增删、Windows crash report 或残留进程；由于启动前未为全部核心文件保存哈希基线，不将该结论扩大为字节级前后同一证明。
+
+完整证据、哈希和限制见[开发与发布审计日志](development/development-log-2026-08-22.md)。
+
 ## 当前可用能力
 
 | 能力 | 状态 |
@@ -91,9 +101,9 @@ Tauri 本地产物 `Lawyer Assistance_0.4.0_x64-setup.exe` 必须在发布时映
 
 ### 最终环境验收
 
-正式发布仍需要为 exact final `main` commit 完成：
+正式发布仍需要为届时的 exact final `main` commit 完成：
 
-- 主 CI 与 MCP Linux/Windows/macOS CI 全绿，并从该 exact run 收集跨平台 MCP archive；
+- 主 CI 与 MCP Linux/Windows/macOS CI 全绿，并从该 exact run 收集跨平台 MCP archive；`4fd0d88…` 已有成功证据，但任何后续 final `main` SHA 都必须重新闭合；
 - 从干净发布源生成、签名并核验完整 12 项 App/MCP allowlist 和 MinerU 组件资产；
 - Windows 10/11 clean-machine 安装、启动、升级、回滚和卸载；
 - Authenticode、时间戳、SmartScreen、AV/EDR 与 updater 精确资产验证；
