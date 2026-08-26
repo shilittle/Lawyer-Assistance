@@ -122,6 +122,10 @@ impl v031_startup::StartupActions for RecoveryOnlyChildActions {
         Err(self.forbidden("ordinary-restore"))
     }
 
+    fn repair_empty_legacy_bootstrap(&mut self) -> Result<(), Self::Error> {
+        Err(self.forbidden("empty-legacy-bootstrap"))
+    }
+
     fn advance_upgrade_through_receipt_eight(
         &mut self,
         _next_ordinal: u8,

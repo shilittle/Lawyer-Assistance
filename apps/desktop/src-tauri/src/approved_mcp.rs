@@ -1008,6 +1008,10 @@ pub(crate) struct V031ApprovedMcpCredentialProbe {
 
 impl V031ApprovedMcpCredentialProbe {
     pub(crate) fn new() -> Self {
+        #[cfg(test)]
+        if let Some(provider) = V031_RECOVERY_TEST_KEY_PROVIDER.with(|slot| slot.borrow().clone()) {
+            return Self { provider };
+        }
         Self {
             provider: Arc::new(WindowsApprovedMcpKeyProvider::new()),
         }
@@ -2035,6 +2039,14 @@ impl V031CrossProcessCredentialHarness {
 
     pub(crate) fn credential_probe(&self) -> V031ApprovedMcpCredentialProbe {
         V031ApprovedMcpCredentialProbe::from_provider(self.provider.clone())
+    }
+
+    pub(crate) fn seed_v031_target_credentials_for_test(&self) -> Result<(), ApprovedMcpError> {
+        for role in V031_TARGET_CREDENTIAL_ROLES {
+            let mut key = self.provider.load_or_create(role)?;
+            zeroize(&mut key);
+        }
+        Ok(())
     }
 
     pub(crate) fn recovery_credential_override_factory_for_test(
@@ -3109,8 +3121,28 @@ impl ApprovedMcpWorkspace {
     pub(crate) fn new_with_mcp_binary_for_test(
         app_local_data_directory: PathBuf,
         binary_path: PathBuf,
-    ) -> Self {
-        Self::new_with_binary(app_local_data_directory, binary_path)
+    ) -> Result<Self, ApprovedMcpError> {
+        let service_prefix =
+            legal_mcp::standalone_approved::standalone_mcp_e2e_credential_service_prefix()
+                .map_err(|_| key_store_error())?;
+        let keys: Arc<dyn ApprovedMcpKeyProvider> = Arc::new(
+            WindowsApprovedMcpKeyProvider::with_service_prefix(service_prefix),
+        );
+        let qualification_control =
+            Arc::new(qualification::DesktopApprovedMcpQualificationProvider::new(
+                app_local_data_directory
+                    .join("privacy")
+                    .join("approved-mcp")
+                    .join("qualification"),
+                Arc::clone(&keys),
+                binary_path,
+            ));
+        Ok(Self::from_parts(
+            app_local_data_directory,
+            qualification_control.clone(),
+            keys,
+            Some(qualification_control),
+        ))
     }
 
     fn from_parts(

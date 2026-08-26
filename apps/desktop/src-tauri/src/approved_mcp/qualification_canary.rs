@@ -385,7 +385,7 @@ fn external_command(
     canary_id: &str,
     server_id: &str,
     subcommand: &str,
-) -> ProcessCommand {
+) -> Result<ProcessCommand, ApprovedMcpError> {
     let mut command = ProcessCommand::new(binary);
     command
         .arg("--privacy-profile")
@@ -396,7 +396,24 @@ fn external_command(
         .arg(canary_id)
         .arg(subcommand)
         .env("LAWYER_ASSISTANCE_MCP_LOG", "off");
-    command
+    bind_e2e_credential_prefix(&mut command)?;
+    Ok(command)
+}
+
+#[cfg(feature = "standalone-mcp-e2e")]
+fn bind_e2e_credential_prefix(command: &mut ProcessCommand) -> Result<(), ApprovedMcpError> {
+    let prefix = legal_mcp::standalone_approved::standalone_mcp_e2e_credential_service_prefix()
+        .map_err(|_| canary_error())?;
+    command.env(
+        legal_mcp::standalone_approved::STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_ENV,
+        prefix,
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "standalone-mcp-e2e"))]
+fn bind_e2e_credential_prefix(_command: &mut ProcessCommand) -> Result<(), ApprovedMcpError> {
+    Ok(())
 }
 
 fn run_external_stdio(
@@ -405,7 +422,7 @@ fn run_external_stdio(
     server_id: &str,
     ids: &CanaryIds,
 ) -> Result<(), ApprovedMcpError> {
-    let mut child = external_command(binary, canary_id, server_id, "stdio")
+    let mut child = external_command(binary, canary_id, server_id, "stdio")?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -582,7 +599,7 @@ async fn run_external_http(
     bearer: &str,
     ids: &CanaryIds,
 ) -> Result<(), ApprovedMcpError> {
-    let mut child = external_command(binary, canary_id, server_id, "serve")
+    let mut child = external_command(binary, canary_id, server_id, "serve")?
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

@@ -21,6 +21,7 @@ mod approved_mcp;
 mod atomic_file;
 mod commands;
 mod crash_log;
+mod empty_legacy_bootstrap;
 mod mcp_manager;
 mod mineru_components;
 mod privacy_manager;
@@ -770,6 +771,29 @@ impl v031_startup::StartupActions for ProductionStartupActions<'_> {
             }
         }
         Ok(())
+    }
+
+    fn repair_empty_legacy_bootstrap(&mut self) -> Result<(), Self::Error> {
+        let gate = self
+            .observed
+            .as_mut()
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "empty legacy bootstrap repair was requested before read-only observation",
+                )
+            })?
+            .take_empty_legacy_bootstrap_gate()
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "the empty legacy bootstrap route has no authenticated capability",
+                )
+            })?;
+        match empty_legacy_bootstrap::repair_observed_interrupted_empty_legacy_profile(
+            &self.app_local_data_dir,
+            gate,
+        )? {
+            empty_legacy_bootstrap::EmptyLegacyBootstrapOutcome::Completed => Ok(()),
+        }
     }
 
     fn advance_upgrade_through_receipt_eight(

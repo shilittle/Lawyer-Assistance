@@ -12,12 +12,15 @@ use crate::{
     },
 };
 use legal_mcp::standalone_approved::{
-    default_app_local_data_directory, ApprovedMcpGrantGroupV1, APP_IDENTIFIER,
-    STANDALONE_DESCRIPTOR_FILE, WIRE_REPLAY_DATABASE_FILE,
+    default_app_local_data_directory, install_standalone_mcp_e2e_credential_service_prefix,
+    ApprovedMcpGrantGroupV1, StandaloneMcpE2eCredentialPrefixGuard, APP_IDENTIFIER,
+    STANDALONE_DESCRIPTOR_FILE, STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_ENV,
+    STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_STEM, WIRE_REPLAY_DATABASE_FILE,
 };
 use privacy::{DestinationKind, ReviewActionV1};
 use serde_json::{json, Value};
 use std::{
+    ffi::c_void,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
@@ -26,6 +29,12 @@ use std::{
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::{GetLastError, ERROR_NOT_FOUND},
+    Security::Credentials::{
+        CredDeleteW, CredEnumerateW, CredFree, CREDENTIALW, CRED_TYPE_GENERIC,
+    },
 };
 
 const RAW_PARTY: &str = "SYNTHETIC_PRIVATE_CLIENT_9482";
@@ -70,13 +79,43 @@ fn approved_diagram_spec(publication_id: &str) -> Value {
 
 struct E2eAppRoot {
     path: PathBuf,
+    credential_prefix: String,
+    _credential_prefix_guard: StandaloneMcpE2eCredentialPrefixGuard,
+    production_credential_targets_before: Vec<String>,
+    credentials_cleaned: bool,
+    app_root_created: bool,
 }
 
 impl E2eAppRoot {
     fn create() -> Self {
+        let credential_prefix = format!(
+            "{}{}",
+            STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_STEM,
+            Uuid::new_v4().hyphenated()
+        );
+        validate_e2e_credential_prefix(&credential_prefix)
+            .expect("create a canonical UUID-isolated credential namespace");
+        let credential_prefix_guard =
+            install_standalone_mcp_e2e_credential_service_prefix(credential_prefix.clone())
+                .expect("reserve the UUID-isolated credential namespace for one E2E test");
+        let production_credential_targets_before = credential_targets(KEY_SERVICE_PREFIX)
+            .expect("snapshot production ApprovedMcp credential target names");
         let path = default_app_local_data_directory().expect("fixed E2E Known Folder root");
+        let mut root = Self {
+            path,
+            credential_prefix,
+            _credential_prefix_guard: credential_prefix_guard,
+            production_credential_targets_before,
+            credentials_cleaned: false,
+            app_root_created: false,
+        };
         assert_eq!(
-            path.file_name().and_then(|name| name.to_str()),
+            legal_mcp::standalone_approved::standalone_mcp_e2e_credential_service_prefix()
+                .expect("read UUID-isolated credential namespace"),
+            root.credential_prefix
+        );
+        assert_eq!(
+            root.path.file_name().and_then(|name| name.to_str()),
             Some(APP_IDENTIFIER)
         );
         assert!(
@@ -84,25 +123,181 @@ impl E2eAppRoot {
             "E2E feature must never target production App data"
         );
         assert!(
-            !path.exists(),
+            !root.path.exists(),
             "stale E2E App root must be inspected explicitly"
         );
-        fs::create_dir(&path).expect("create isolated Known Folder E2E root");
-        Self { path }
+        fs::create_dir(&root.path).expect("create isolated Known Folder E2E root");
+        root.app_root_created = true;
+        root
+    }
+
+    fn finish_credential_cleanup(&mut self) {
+        cleanup_e2e_credential_namespace(&self.credential_prefix)
+            .expect("delete only this E2E UUID credential namespace");
+        assert_eq!(
+            credential_targets(KEY_SERVICE_PREFIX)
+                .expect("resnapshot production ApprovedMcp credential target names"),
+            self.production_credential_targets_before,
+            "standalone MCP E2E must not add, delete, or rename production credentials"
+        );
+        self.credentials_cleaned = true;
     }
 }
 
 impl Drop for E2eAppRoot {
     fn drop(&mut self) {
+        if !self.credentials_cleaned {
+            let _ = cleanup_e2e_credential_namespace(&self.credential_prefix);
+        }
         let safe = self
             .path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == APP_IDENTIFIER && name.ends_with(".mcp-e2e"));
-        if safe && self.path.is_dir() {
+        if self.app_root_created && safe && self.path.is_dir() {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+}
+
+fn validate_e2e_credential_prefix(prefix: &str) -> Result<(), String> {
+    let suffix = prefix
+        .strip_prefix(STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_STEM)
+        .ok_or_else(|| "credential prefix is outside the E2E namespace".to_owned())?;
+    let identifier = Uuid::parse_str(suffix)
+        .map_err(|_| "credential prefix does not end in a UUID".to_owned())?;
+    if identifier.hyphenated().to_string() != suffix || prefix == KEY_SERVICE_PREFIX {
+        return Err("credential prefix is not a canonical isolated E2E UUID".to_owned());
+    }
+    Ok(())
+}
+
+fn credential_targets(service_prefix: &str) -> Result<Vec<String>, String> {
+    let filter = format!("{service_prefix}/*")
+        .encode_utf16()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let mut count = 0_u32;
+    let mut credentials: *mut *mut CREDENTIALW = std::ptr::null_mut();
+    let ok = unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut credentials) };
+    if ok == 0 {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "Credential Manager enumeration failed with Windows error {error}"
+        ));
+    }
+
+    let result = (|| {
+        if credentials.is_null() || count > 4096 {
+            return Err("Credential Manager returned an invalid bounded result".to_owned());
+        }
+        let expected_prefix = format!("{service_prefix}/provider/");
+        let mut targets = Vec::with_capacity(count as usize);
+        for &credential in unsafe { std::slice::from_raw_parts(credentials, count as usize) } {
+            if credential.is_null() {
+                return Err("Credential Manager returned a null credential".to_owned());
+            }
+            let credential = unsafe { &*credential };
+            if credential.Type != CRED_TYPE_GENERIC {
+                return Err("credential namespace contained a non-generic target".to_owned());
+            }
+            let target = wide_target_name(credential.TargetName)?;
+            if !target.starts_with(&expected_prefix) {
+                return Err("credential enumeration escaped the requested namespace".to_owned());
+            }
+            targets.push(target);
+        }
+        targets.sort();
+        targets.dedup();
+        Ok(targets)
+    })();
+    if !credentials.is_null() {
+        unsafe {
+            CredFree(credentials.cast::<c_void>());
+        }
+    }
+    result
+}
+
+fn wide_target_name(value: *const u16) -> Result<String, String> {
+    if value.is_null() {
+        return Err("Credential Manager target name was null".to_owned());
+    }
+    let length = (0..=32_767)
+        .find(|&index| unsafe { *value.add(index) == 0 })
+        .ok_or_else(|| "Credential Manager target name was not bounded".to_owned())?;
+    String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
+        .map_err(|_| "Credential Manager target name was not UTF-16".to_owned())
+}
+
+fn cleanup_e2e_credential_namespace(service_prefix: &str) -> Result<(), String> {
+    validate_e2e_credential_prefix(service_prefix)?;
+    for target in credential_targets(service_prefix)? {
+        let target = target.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+        if ok == 0 {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_NOT_FOUND {
+                return Err(format!(
+                    "Credential Manager cleanup failed with Windows error {error}"
+                ));
+            }
+        }
+    }
+    if !credential_targets(service_prefix)?.is_empty() {
+        return Err("E2E credential namespace remained after cleanup".to_owned());
+    }
+    Ok(())
+}
+
+#[test]
+fn e2e_root_drop_uses_unique_prefix_and_cleans_exact_credential_namespace() {
+    let production_before =
+        credential_targets(KEY_SERVICE_PREFIX).expect("snapshot production credential targets");
+    let mut prefixes = Vec::new();
+    for _ in 0..2 {
+        let root = E2eAppRoot::create();
+        let prefix = root.credential_prefix.clone();
+        let store = WindowsCredentialStore::with_service_prefix(prefix.clone());
+        store
+            .write_api_key(
+                &ProviderCredentialKey::new("drop-cleanup-probe", "synthetic"),
+                ApiSecret::new(format!("synthetic-e2e-{}", Uuid::new_v4().simple())),
+            )
+            .expect("write a synthetic credential inside the E2E namespace");
+        assert_eq!(
+            credential_targets(&prefix).expect("enumerate the E2E credential namespace"),
+            vec![format!(
+                "{prefix}/provider/drop-cleanup-probe/account/synthetic"
+            )]
+        );
+        drop(root);
+        assert!(
+            credential_targets(&prefix)
+                .expect("verify the dropped E2E credential namespace")
+                .is_empty(),
+            "E2E root Drop must remove its exact UUID credential namespace"
+        );
+        assert!(
+            !default_app_local_data_directory()
+                .expect("fixed E2E Known Folder root")
+                .exists(),
+            "E2E root Drop must remove only the root created by the test"
+        );
+        prefixes.push(prefix);
+    }
+    assert_ne!(
+        prefixes[0], prefixes[1],
+        "every E2E uses a fresh UUID prefix"
+    );
+    assert_eq!(
+        credential_targets(KEY_SERVICE_PREFIX).expect("resnapshot production credential targets"),
+        production_before,
+        "Drop cleanup must leave the production namespace unchanged"
+    );
 }
 
 struct ServiceFixture {
@@ -378,14 +573,15 @@ async fn explicit_binary_qualification_canary_is_fail_closed() {
     );
 
     let directory = tempfile::tempdir().expect("create qualification fixture parent");
-    let e2e_app_root = E2eAppRoot::create();
+    let mut e2e_app_root = E2eAppRoot::create();
     let binary_directory = directory.path().join("fixed-install");
     fs::create_dir(&binary_directory).expect("create fixed MCP install directory");
     let binary = binary_directory.join(legal_mcp::release_binary::binary_file_name());
     fs::copy(&built_binary, &binary).expect("install exact MCP release binary");
 
     let workspace =
-        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(e2e_app_root.path.clone(), binary);
+        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(e2e_app_root.path.clone(), binary)
+            .expect("create UUID-isolated qualification workspace");
     let qualification = workspace
         .run_qualification(10 * 60)
         .await
@@ -403,6 +599,8 @@ async fn explicit_binary_qualification_canary_is_fail_closed() {
         qualification.mcp_binary_sha256.as_deref(),
         Some(expected_sha256.as_str())
     );
+    drop(workspace);
+    e2e_app_root.finish_credential_cleanup();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -416,7 +614,7 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
     let directory = tempfile::tempdir().expect("create synthetic service fixture parent");
     let local_app_data = directory.path().join("host-controlled-local-app-data");
     fs::create_dir_all(&local_app_data).expect("create hostile environment override root");
-    let e2e_app_root = E2eAppRoot::create();
+    let mut e2e_app_root = E2eAppRoot::create();
     let app_directory = e2e_app_root.path.clone();
     assert!(
         !app_directory.starts_with(&local_app_data),
@@ -437,7 +635,8 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
     )
     .expect("install wrong-version executable");
     let wrong_workspace =
-        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(app_directory.clone(), wrong_binary);
+        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(app_directory.clone(), wrong_binary)
+            .expect("create UUID-isolated wrong-version workspace");
     assert_eq!(
         wrong_workspace
             .run_qualification(10 * 60)
@@ -452,7 +651,8 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
     let corrupt_binary = corrupt_directory.join(legal_mcp::release_binary::binary_file_name());
     fs::write(&corrupt_binary, b"not a Windows executable").expect("install corrupt executable");
     let corrupt_workspace =
-        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(app_directory.clone(), corrupt_binary);
+        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(app_directory.clone(), corrupt_binary)
+            .expect("create UUID-isolated corrupt-binary workspace");
     assert_eq!(
         corrupt_workspace
             .run_qualification(10 * 60)
@@ -463,7 +663,8 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
     );
 
     let workspace =
-        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(app_directory.clone(), binary.clone());
+        ApprovedMcpWorkspace::new_with_mcp_binary_for_test(app_directory.clone(), binary.clone())
+            .expect("create UUID-isolated standalone MCP workspace");
     let qualification = workspace
         .run_qualification(10 * 60)
         .await
@@ -624,6 +825,12 @@ async fn app_approval_to_real_stdio_and_http_binary_is_fail_closed() {
             .code(),
         "approved_mcp_not_qualified"
     );
+    drop(reaper);
+    drop(workflow);
+    drop(workspace);
+    drop(corrupt_workspace);
+    drop(wrong_workspace);
+    e2e_app_root.finish_credential_cleanup();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1514,6 +1721,9 @@ fn binary_command(
     server_id: &str,
     subcommand: &str,
 ) -> ProcessCommand {
+    let credential_prefix =
+        legal_mcp::standalone_approved::standalone_mcp_e2e_credential_service_prefix()
+            .expect("bind child process to the current UUID-isolated credential namespace");
     let mut command = ProcessCommand::new(binary);
     command
         .arg("--privacy-profile")
@@ -1522,6 +1732,7 @@ fn binary_command(
         .arg(server_id)
         .arg(subcommand)
         .env("LOCALAPPDATA", local_app_data)
+        .env(STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_ENV, credential_prefix)
         .env("LAWYER_ASSISTANCE_MCP_LOG", "off");
     command
 }

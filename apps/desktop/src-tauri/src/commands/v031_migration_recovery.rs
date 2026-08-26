@@ -4313,6 +4313,10 @@ mod tests {
             Err(self.forbidden("forbidden:ordinary-restore"))
         }
 
+        fn repair_empty_legacy_bootstrap(&mut self) -> Result<(), Self::Error> {
+            Err(self.forbidden("forbidden:empty-legacy-bootstrap"))
+        }
+
         fn advance_upgrade_through_receipt_eight(
             &mut self,
             _next_ordinal: u8,

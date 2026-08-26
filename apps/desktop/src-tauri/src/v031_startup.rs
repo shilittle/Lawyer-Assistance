@@ -100,6 +100,9 @@ pub(crate) enum InstalledProfile {
     GenuineFresh,
     ExactV031Source,
     ExactCurrent,
+    /// A DPAPI-authenticated recovery or the exact read-only candidate for the
+    /// empty-v10/missing-Privacy development-era bootstrap.
+    EmptyLegacyBootstrap,
     /// A nonterminal, receipt-bound schema combination. The next opaque gate
     /// must re-authenticate its exact live shape before any stage write.
     AuthenticatedUpgradeState,
@@ -751,6 +754,7 @@ pub(crate) struct StartupObservation {
 pub(crate) enum StartupRoute {
     ApplyExplicitRecoveryAndExit,
     ApplyCurrentRestoreAndReclassify(CurrentRestoreKind),
+    RepairEmptyLegacyBootstrapAndRestart,
     AdvanceUpgradeThroughReceiptEight { next_ordinal: u8 },
     RunStepEightAndInstallReceiptNine,
     InitializeCurrent,
@@ -831,6 +835,7 @@ pub(crate) struct ProductionStartupObservation {
     exact_v031_source: Option<ExactV031SourceProfileGate>,
     exact_current: Option<ExactCurrentProfileGate>,
     authenticated_upgrade: Option<AuthenticatedUpgradeProfileGate>,
+    empty_legacy_bootstrap: Option<crate::empty_legacy_bootstrap::EmptyLegacyBootstrapGate>,
 }
 
 impl fmt::Debug for ProductionStartupObservation {
@@ -859,6 +864,10 @@ impl fmt::Debug for ProductionStartupObservation {
                 "authenticated_upgrade",
                 &self.authenticated_upgrade.is_some(),
             )
+            .field(
+                "empty_legacy_bootstrap",
+                &self.empty_legacy_bootstrap.is_some(),
+            )
             .finish()
     }
 }
@@ -870,6 +879,12 @@ impl ProductionStartupObservation {
 
     pub(crate) fn take_explicit_recovery_gate(&mut self) -> Option<V031MigrationRecoveryGate> {
         self.explicit_recovery.take()
+    }
+
+    pub(crate) fn take_empty_legacy_bootstrap_gate(
+        &mut self,
+    ) -> Option<crate::empty_legacy_bootstrap::EmptyLegacyBootstrapGate> {
+        self.empty_legacy_bootstrap.take()
     }
 
     pub(crate) fn full_application_restore_gate(&self) -> Option<&PendingApplicationRestoreGate> {
@@ -919,6 +934,7 @@ pub(crate) enum ProductionStartupObservationError {
     V031SourceProfile,
     CurrentProfile,
     ActiveUpgradeProfile,
+    EmptyLegacyBootstrap,
 }
 
 impl fmt::Display for ProductionStartupObservationError {
@@ -940,6 +956,7 @@ impl fmt::Display for ProductionStartupObservationError {
             Self::V031SourceProfile => "the exact v0.3.1 source profile proof failed",
             Self::CurrentProfile => "the exact current profile proof failed",
             Self::ActiveUpgradeProfile => "the active upgrade profile proof failed",
+            Self::EmptyLegacyBootstrap => "the interrupted empty legacy bootstrap proof failed",
         })
     }
 }
@@ -952,6 +969,7 @@ pub(crate) fn observe_production_startup_read_only(
     observe_production_startup_with_credentials_read_only(
         app_local_data_dir,
         &V031ApprovedMcpCredentialProbe::new(),
+        true,
     )
 }
 
@@ -966,7 +984,7 @@ pub(crate) fn observe_production_startup_with_credential_probe_for_test<
     app_local_data_dir: &Path,
     credentials: &P,
 ) -> Result<ProductionStartupObservation, ProductionStartupObservationError> {
-    observe_production_startup_with_credentials_read_only(app_local_data_dir, credentials)
+    observe_production_startup_with_credentials_read_only(app_local_data_dir, credentials, false)
 }
 
 fn observe_production_startup_with_credentials_read_only<
@@ -974,6 +992,7 @@ fn observe_production_startup_with_credentials_read_only<
 >(
     app_local_data_dir: &Path,
     fresh_credentials: &P,
+    observe_empty_legacy_bootstrap: bool,
 ) -> Result<ProductionStartupObservation, ProductionStartupObservationError> {
     if !crate::privacy_manager::is_normal_local_absolute(app_local_data_dir)
         || !crate::privacy_manager::local_path_chain_is_ordinary(app_local_data_dir)
@@ -1028,6 +1047,7 @@ fn observe_production_startup_with_credentials_read_only<
             exact_v031_source: None,
             exact_current: None,
             authenticated_upgrade: None,
+            empty_legacy_bootstrap: None,
         });
     }
 
@@ -1104,7 +1124,45 @@ fn observe_production_startup_with_credentials_read_only<
             exact_v031_source: None,
             exact_current: None,
             authenticated_upgrade: None,
+            empty_legacy_bootstrap: None,
         });
+    }
+
+    if observe_empty_legacy_bootstrap {
+        let empty_legacy_bootstrap =
+            match crate::empty_legacy_bootstrap::observe_interrupted_empty_legacy_profile_read_only(
+                app_local_data_dir,
+            )
+            .map_err(|_| ProductionStartupObservationError::EmptyLegacyBootstrap)?
+            {
+                crate::empty_legacy_bootstrap::EmptyLegacyBootstrapObservation::Absent => None,
+                crate::empty_legacy_bootstrap::EmptyLegacyBootstrapObservation::Authenticated(
+                    gate,
+                ) => Some(gate),
+            };
+        if let Some(gate) = empty_legacy_bootstrap {
+            if upgrade.active.is_some() || upgrade.terminal_lineage_count != 0 {
+                return Err(ProductionStartupObservationError::EmptyLegacyBootstrap);
+            }
+            return Ok(ProductionStartupObservation {
+                summary: StartupObservation {
+                    restores,
+                    upgrade,
+                    profile: InstalledProfile::EmptyLegacyBootstrap,
+                    unknown_marker_or_sibling: false,
+                },
+                explicit_recovery: None,
+                full_application_restore: None,
+                legacy_user_database_restore: None,
+                standalone_privacy_restore: None,
+                process_start_upgrade: Some(process_start_upgrade),
+                genuine_fresh: None,
+                exact_v031_source: None,
+                exact_current: None,
+                authenticated_upgrade: None,
+                empty_legacy_bootstrap: Some(gate),
+            });
+        }
     }
 
     let mut genuine_fresh = None;
@@ -1245,6 +1303,7 @@ fn observe_production_startup_with_credentials_read_only<
         exact_v031_source,
         exact_current,
         authenticated_upgrade,
+        empty_legacy_bootstrap: None,
     })
 }
 
@@ -1795,6 +1854,7 @@ pub(crate) fn run_step_eight_and_install_receipt_nine(
 pub(crate) enum StartupExecutionOutcome {
     ExplicitRecoveryAppliedAndExited,
     RestoreAppliedAndRestartRequested,
+    EmptyLegacyBootstrapRepairedAndRestartRequested,
     ReceiptEightInstalledAndRestartRequested,
     Ready,
 }
@@ -1816,6 +1876,7 @@ pub(crate) trait StartupActions {
     fn observe_read_only(&mut self) -> Result<StartupObservation, Self::Error>;
     fn apply_explicit_recovery_and_exit(&mut self) -> Result<(), Self::Error>;
     fn apply_current_restore(&mut self, kind: CurrentRestoreKind) -> Result<(), Self::Error>;
+    fn repair_empty_legacy_bootstrap(&mut self) -> Result<(), Self::Error>;
     fn advance_upgrade_through_receipt_eight(
         &mut self,
         next_ordinal: u8,
@@ -1847,6 +1908,15 @@ pub(crate) fn execute_startup<A: StartupActions>(
                 .request_controlled_restart()
                 .map_err(StartupExecutionError::Action)?;
             Ok(StartupExecutionOutcome::RestoreAppliedAndRestartRequested)
+        }
+        StartupRoute::RepairEmptyLegacyBootstrapAndRestart => {
+            actions
+                .repair_empty_legacy_bootstrap()
+                .map_err(StartupExecutionError::Action)?;
+            actions
+                .request_controlled_restart()
+                .map_err(StartupExecutionError::Action)?;
+            Ok(StartupExecutionOutcome::EmptyLegacyBootstrapRepairedAndRestartRequested)
         }
         StartupRoute::AdvanceUpgradeThroughReceiptEight { next_ordinal } => {
             actions
@@ -1951,6 +2021,12 @@ pub(crate) fn classify_startup(
     }
 
     match observed.profile {
+        InstalledProfile::EmptyLegacyBootstrap if observed.upgrade.terminal_lineage_count == 0 => {
+            Ok(StartupRoute::RepairEmptyLegacyBootstrapAndRestart)
+        }
+        InstalledProfile::EmptyLegacyBootstrap => {
+            Err(StartupClassificationError::ProfileDoesNotMatchReceipts)
+        }
         InstalledProfile::ExactV031Source => {
             Ok(StartupRoute::AdvanceUpgradeThroughReceiptEight { next_ordinal: 0 })
         }
@@ -2105,7 +2181,7 @@ mod tests {
         let target_before = exact_windows_tree_observation(target_root);
         let probe = FreshCredentialProbe::default();
         assert!(matches!(
-            observe_production_startup_with_credentials_read_only(root, &probe),
+            observe_production_startup_with_credentials_read_only(root, &probe, false),
             Err(ProductionStartupObservationError::UpgradeHistory)
         ));
         assert!(
@@ -2291,8 +2367,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let missing_root = directory.path().join("never-created-production-root");
         let probe = FreshCredentialProbe::default();
-        let observed = observe_production_startup_with_credentials_read_only(&missing_root, &probe)
-            .expect("missing root production observation");
+        let observed =
+            observe_production_startup_with_credentials_read_only(&missing_root, &probe, false)
+                .expect("missing root production observation");
 
         assert_eq!(observed.summary().profile, InstalledProfile::GenuineFresh);
         assert_eq!(
@@ -2312,7 +2389,7 @@ mod tests {
         create_exact_v031_source_fixture(directory.path());
         let probe = FreshCredentialProbe::default();
         let observed =
-            observe_production_startup_with_credentials_read_only(directory.path(), &probe)
+            observe_production_startup_with_credentials_read_only(directory.path(), &probe, false)
                 .expect("exact v0.3.1 production observation");
 
         assert_eq!(
@@ -2349,7 +2426,7 @@ mod tests {
 
         let probe = FreshCredentialProbe::default();
         assert!(matches!(
-            observe_production_startup_with_credentials_read_only(&junction, &probe),
+            observe_production_startup_with_credentials_read_only(&junction, &probe, false),
             Err(ProductionStartupObservationError::Root)
         ));
         assert!(probe.calls.lock().unwrap().is_empty());
@@ -2550,6 +2627,13 @@ mod tests {
             Ok(())
         }
 
+        fn repair_empty_legacy_bootstrap(&mut self) -> Result<(), Self::Error> {
+            self.writes += 1;
+            self.credential_calls += 1;
+            self.events.push("empty-legacy-bootstrap".to_owned());
+            Ok(())
+        }
+
         fn advance_upgrade_through_receipt_eight(
             &mut self,
             next_ordinal: u8,
@@ -2628,6 +2712,15 @@ mod tests {
         assert_eq!(
             classify_startup(restore),
             Err(StartupClassificationError::MixedRecoveryFlows)
+        );
+
+        let mut interrupted = observation(InstalledProfile::EmptyLegacyBootstrap);
+        interrupted.restores.standalone_privacy = AuthenticatedPresence::Authenticated;
+        assert_eq!(
+            classify_startup(interrupted),
+            Ok(StartupRoute::ApplyCurrentRestoreAndReclassify(
+                CurrentRestoreKind::StandalonePrivacy
+            ))
         );
     }
 
@@ -2715,6 +2808,7 @@ mod tests {
     fn every_active_receipt_count_rejects_profiles_outside_the_frozen_crash_matrix() {
         let profiles = [
             InstalledProfile::GenuineFresh,
+            InstalledProfile::EmptyLegacyBootstrap,
             InstalledProfile::ExactV031Source,
             InstalledProfile::ExactCurrent,
             InstalledProfile::AuthenticatedUpgradeState,
@@ -2779,6 +2873,17 @@ mod tests {
         residue.upgrade.terminal_lineage_count = 1;
         assert_eq!(
             classify_startup(residue),
+            Err(StartupClassificationError::ProfileDoesNotMatchReceipts)
+        );
+
+        assert_eq!(
+            classify_startup(observation(InstalledProfile::EmptyLegacyBootstrap)),
+            Ok(StartupRoute::RepairEmptyLegacyBootstrapAndRestart)
+        );
+        let mut legacy_with_terminal = observation(InstalledProfile::EmptyLegacyBootstrap);
+        legacy_with_terminal.upgrade.terminal_lineage_count = 1;
+        assert_eq!(
+            classify_startup(legacy_with_terminal),
             Err(StartupClassificationError::ProfileDoesNotMatchReceipts)
         );
     }
@@ -2863,6 +2968,19 @@ mod tests {
             ["classify", "receipts-0-through-8", "controlled-restart"]
         );
         assert_eq!(actions.writes, 9);
+
+        let mut repair = CountingActions::new(observation(InstalledProfile::EmptyLegacyBootstrap));
+        assert_eq!(
+            execute_startup(&mut repair),
+            Ok(StartupExecutionOutcome::EmptyLegacyBootstrapRepairedAndRestartRequested)
+        );
+        assert_eq!(
+            repair.events,
+            ["classify", "empty-legacy-bootstrap", "controlled-restart"]
+        );
+        assert_eq!(repair.writes, 1);
+        assert_eq!(repair.credential_calls, 1);
+        assert_eq!(repair.ordinary_manager_initializations, 0);
     }
 
     #[test]

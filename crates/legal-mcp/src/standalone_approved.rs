@@ -82,6 +82,13 @@ const MAX_WIRE_REPLAY_DATABASE_BYTES: u64 = 8 * 1024 * 1024;
 const EVIDENCE_FILE: &str = "active-evidence-v1.json";
 const TICKET_DATABASE_FILE: &str = "mcp-access-tickets.sqlite";
 const KEY_SERVICE_PREFIX: &str = "LawyerAssistanceApprovedMcp";
+#[cfg(feature = "standalone-mcp-e2e")]
+pub const STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_ENV: &str =
+    "LAWYER_ASSISTANCE_APPROVED_MCP_E2E_CREDENTIAL_PREFIX";
+#[cfg(feature = "standalone-mcp-e2e")]
+pub const STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_STEM: &str = "LawyerAssistanceApprovedMcpE2e-";
+#[cfg(feature = "standalone-mcp-e2e")]
+static STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
 const KEY_ACCOUNT: &str = "user-boundary-v1";
 const KEY_FORMAT_PREFIX: &str = "approved-mcp-key-v1.";
 const SESSION_SECRET_PREFIX: &str = "approved-mcp-session-secret-v1.";
@@ -1365,9 +1372,77 @@ fn verify_hmac(key: &[u8; 32], bytes: &[u8], expected_hex: &str) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
+#[cfg(feature = "standalone-mcp-e2e")]
+pub struct StandaloneMcpE2eCredentialPrefixGuard {
+    prefix: String,
+}
+
+#[cfg(feature = "standalone-mcp-e2e")]
+impl Drop for StandaloneMcpE2eCredentialPrefixGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_OVERRIDE.lock() {
+            if active.as_deref() == Some(self.prefix.as_str()) {
+                *active = None;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "standalone-mcp-e2e")]
+pub fn install_standalone_mcp_e2e_credential_service_prefix(
+    prefix: String,
+) -> Result<StandaloneMcpE2eCredentialPrefixGuard, StandaloneApprovedError> {
+    validate_standalone_mcp_e2e_credential_service_prefix(&prefix)?;
+    let mut active = STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_OVERRIDE
+        .lock()
+        .map_err(|_| StandaloneApprovedError::Unavailable)?;
+    if active.is_some() {
+        return Err(StandaloneApprovedError::Unavailable);
+    }
+    *active = Some(prefix.clone());
+    Ok(StandaloneMcpE2eCredentialPrefixGuard { prefix })
+}
+
+#[cfg(feature = "standalone-mcp-e2e")]
+pub fn standalone_mcp_e2e_credential_service_prefix() -> Result<String, StandaloneApprovedError> {
+    if let Some(prefix) = STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_OVERRIDE
+        .lock()
+        .map_err(|_| StandaloneApprovedError::Unavailable)?
+        .clone()
+    {
+        return Ok(prefix);
+    }
+    let prefix = std::env::var(STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_ENV)
+        .map_err(|_| StandaloneApprovedError::Unavailable)?;
+    validate_standalone_mcp_e2e_credential_service_prefix(&prefix)?;
+    Ok(prefix)
+}
+
+#[cfg(feature = "standalone-mcp-e2e")]
+fn validate_standalone_mcp_e2e_credential_service_prefix(
+    prefix: &str,
+) -> Result<(), StandaloneApprovedError> {
+    let suffix = prefix
+        .strip_prefix(STANDALONE_MCP_E2E_CREDENTIAL_PREFIX_STEM)
+        .ok_or(StandaloneApprovedError::Unavailable)?;
+    let identifier = Uuid::parse_str(suffix).map_err(|_| StandaloneApprovedError::Unavailable)?;
+    if identifier.hyphenated().to_string() != suffix || prefix == KEY_SERVICE_PREFIX {
+        return Err(StandaloneApprovedError::Unavailable);
+    }
+    Ok(())
+}
+
+fn approved_mcp_credential_store() -> Result<WindowsCredentialStore, StandaloneApprovedError> {
+    #[cfg(feature = "standalone-mcp-e2e")]
+    let prefix = standalone_mcp_e2e_credential_service_prefix()?;
+    #[cfg(not(feature = "standalone-mcp-e2e"))]
+    let prefix = KEY_SERVICE_PREFIX.to_owned();
+    Ok(WindowsCredentialStore::with_service_prefix(prefix))
+}
+
 fn load_key_ring() -> Result<ApprovedKeyRing, StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    let store = WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX);
+    let store = approved_mcp_credential_store()?;
     Ok(ApprovedKeyRing {
         manifest: read_core_key(&store, "approved-manifest")?,
         work_product: read_core_key(&store, "work-product-manifest")?,
@@ -1389,7 +1464,7 @@ fn read_core_key(
 
 fn create_session_secret(server_id: &str) -> Result<[u8; 32], StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    let store = WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX);
+    let store = approved_mcp_credential_store()?;
     let key = ProviderCredentialKey::new(SESSION_SECRET_PROVIDER, server_id);
     if store
         .read_api_key(&key)
@@ -1410,7 +1485,7 @@ fn create_session_secret(server_id: &str) -> Result<[u8; 32], StandaloneApproved
 
 fn read_session_secret(server_id: &str) -> Result<Option<[u8; 32]>, StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    let store = WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX);
+    let store = approved_mcp_credential_store()?;
     store
         .read_api_key(&ProviderCredentialKey::new(
             SESSION_SECRET_PROVIDER,
@@ -1423,7 +1498,7 @@ fn read_session_secret(server_id: &str) -> Result<Option<[u8; 32]>, StandaloneAp
 
 fn delete_session_secret(server_id: &str) -> Result<(), StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX)
+    approved_mcp_credential_store()?
         .delete_api_key(&ProviderCredentialKey::new(
             SESSION_SECRET_PROVIDER,
             server_id,
@@ -2314,7 +2389,7 @@ fn create_wire_replay_state(
     auth_key: &[u8; 32],
 ) -> Result<(), StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    let store = WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX);
+    let store = approved_mcp_credential_store()?;
     let key = replay_state_key(&state.server_instance_id);
     if store
         .read_api_key(&key)
@@ -2335,7 +2410,7 @@ fn replace_wire_replay_state(
         return Err(StandaloneApprovedError::Unavailable);
     }
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    let store = WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX);
+    let store = approved_mcp_credential_store()?;
     let key = replay_state_key(&expected.server_instance_id);
     let current = read_wire_replay_state_locked(&store, &key, auth_key)?;
     if current.as_ref() != Some(expected) {
@@ -2369,7 +2444,7 @@ fn read_wire_replay_state(
     auth_key: &[u8; 32],
 ) -> Result<Option<WireReplayCredentialStateV2>, StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    let store = WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX);
+    let store = approved_mcp_credential_store()?;
     read_wire_replay_state_locked(&store, &replay_state_key(server_instance_id), auth_key)
 }
 
@@ -2444,7 +2519,7 @@ fn validate_wire_replay_state(
 
 fn delete_wire_replay_state(server_instance_id: &str) -> Result<(), StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX)
+    approved_mcp_credential_store()?
         .delete_api_key(&replay_state_key(server_instance_id))
         .map_err(|_| StandaloneApprovedError::Unavailable)
 }
@@ -2453,7 +2528,7 @@ fn delete_legacy_wire_replay_state(
     server_instance_id: &str,
 ) -> Result<(), StandaloneApprovedError> {
     let _lock = ProviderStoreLock::acquire().map_err(|_| StandaloneApprovedError::Unavailable)?;
-    WindowsCredentialStore::with_service_prefix(KEY_SERVICE_PREFIX)
+    approved_mcp_credential_store()?
         .delete_api_key(&legacy_replay_state_key(server_instance_id))
         .map_err(|_| StandaloneApprovedError::Unavailable)
 }
