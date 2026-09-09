@@ -1,122 +1,52 @@
 # 快速开始
 
-## 1. 使用前确认
+## 运行便携包
 
-`0.4.0` 面向 Windows x86_64。仓库源码已使用稳定版本号，但正式 `v0.4.0` Release 仍须完成外部门禁；在 Release 明确提升为 stable/latest 之前，只能按正式发布候选处理：
+1. 下载并在 Windows x86_64 上解压 GitHub Release 资产 `Lawyer-Assistance_1.0.0_windows-x86_64-portable.zip`。
+2. 使用同名 `.zip.sha256` 校验 ZIP；再查看包内 `MANIFEST.sha256` 和 `portable.manifest.json`。
+3. 双击 `Lawyer-Assistance.vbs`。它通过 `wscript.exe` 隐藏窗口运行 `lawyer-assistance.exe serve --open --port 8877`。
+4. 浏览器访问 `http://127.0.0.1:8877`。数据目录默认是 `%LOCALAPPDATA%\LawyerAssistanceWeb`。便携包为未签名产物，不含安装器或自动更新器。
 
-- 不把未通过 Authenticode、RFC3161 时间戳和服务端回读的候选安装程序视为正式资产；未知或不匹配的发布者应立即阻断。
-- 不把候选 `latest.json` 或 updater `.sig` 视为可用更新链；只有 stable/latest 端点最终验收通过后才能使用自动更新。
-- 生产扫描件 OCR 仍须 final MinerU v4 资产、签名、许可审批、隔离和目标 GPU 资格全部通过。没有在 App 中看到全部当前资格门通过时，不要用它处理扫描或视觉 PDF。
-- 桌面应用资产使用 `runtime-slim-v1` 法律库，不包含完整归档数据库。
+停止服务时双击 `Stop-Lawyer-Assistance.vbs`，或者执行 `lawyer-assistance.exe stop`。停止请求必须通过当前用户加密连接描述符、loopback 会话和 CSRF 校验；该命令不会调用 `taskkill`。
 
-下载或接收安装包时，应同时核对 stable/latest 状态、版本、精确文件名、SHA-256、签名、时间戳和 `latest.json`。不要把 draft/prerelease、CI fixture、调试程序、历史 candidate 或历史 OCR 组件当作正式产品资产。
+已有服务运行时，可双击或在 PowerShell 运行 `lawyer-assistance.exe login`。旧 Tauri 数据目录不会被读取、迁移或覆盖。
 
-Windows 正式安装入口必须精确为 `Lawyer.Assistance_0.4.0_x64-setup.exe`，并同时取得 `Lawyer.Assistance_0.4.0_x64-setup.exe.sha256`、`Lawyer.Assistance_0.4.0_x64-setup.exe.sig` 和 `latest.json`；便携包必须精确为 `Lawyer-Assistance_0.4.0_windows-x86_64-portable.zip` 及其同名 `.sha256`。配对 MCP 的三平台正式文件名和完整 12 项 allowlist 见[当前发布状态](release-status.md)。
+## 从源码启动
 
-## 2. 首次启动
+```powershell
+pnpm install
+cargo run --release --locked -p lawyer-assistance-server --bin lawyer-assistance -- serve `
+  --open --port 8877 `
+  --data-dir "$env:LOCALAPPDATA\LawyerAssistanceWeb" `
+  --legal-db "$pwd\data\runtime\legal_core.sqlite"
+```
 
-1. 仅使用已经通过正式资产核验的安装或便携包启动 Lawyer Assistance，确认版本显示为 `0.4.0`。
-2. 打开应用健康或版本信息，确认运行时法律库已加载。
-3. 阅读隐私提示，确认应用的数据保留和外发边界符合当前工作要求。
-4. 如需使用模型 Provider，打开“设置 → Provider 与凭据”，创建自己的 Provider 配置并保存 API Key。密钥由 Windows Credential Manager 管理，前端只显示掩码状态。
-5. 在使用案件、Provider、MCP 或 OCR 前，分别检查对应的资格和授权状态。一个能力通过不代表其他能力自动通过。
+省略 `--legal-db` 时，server 会依次查找可执行文件旁的 `data/runtime/legal_core.sqlite` 和当前目录下的同名路径。法律库缺失只会阻断法律检索，不会改写用户工作区。
 
-## 3. 公开法律检索
+## 材料脱敏
 
-公开法律检索可以离线读取运行时法律库，用于：
+1. 在“材料脱敏”中创建材料组并维护组级词典。
+2. 选择 TXT 或 DOCX 文件，提交导入任务。TXT 编码不明时选择编码后重试；不会静默吞掉乱码。DOCX 的正文和表格会提取，图片、嵌入对象、修订或不支持结构会在任务状态中明确标记。
+3. 查看识别出的姓名、机构、地址、电话、邮箱、证件、案号和账户等片段。系统为同组实体分配稳定别名，并在本地执行替换和残留检查。
+4. 对待复核片段补充词典、修改别名、标记误报，或者为当前材料版本和具体 Provider/模型/用途授权一次云辅助。云辅助只接收提取文本，返回的候选必须由本地验证后才能替换。
+5. 提取完整、无冲突、别名一致且残留检查通过时，任务生成不可变可用结果。失败或待复核状态不能从 MCP 读取。
+6. 在结果页导出 TXT、Markdown、重建 DOCX，或选择多个可用结果导出 ZIP。导出会重新读取并检查生成文件。
 
-- 检索法律和条文；
-- 查看版本及效力信息；
-- 查看法律关系和来源引用；
-- 为公开法律问题准备带来源的研究材料。
+## 法律检索、模板和对话
 
-检索结果需要律师结合官方现行文本和具体事实复核。运行时精简库服务于应用查询，不是完整归档审计库的替代品。
+法律检索支持关键字、法律/条文详情、历史版本、效力日期和关联法规；结果可收藏和复制引用。固定模板从表单生成预览并导出 TXT/Markdown/DOCX。Provider 对话只发送用户主动输入以及明确选择的法条和有效脱敏结果，不自动读取原始材料。本次公开发布未完成真实 Provider 联调，相关验证使用可控模拟服务。
 
-## 4. 普通聊天与普通附件
+## MCP
 
-普通聊天不要求先创建案件、上传案件文件或取得脱敏批准：
+公开 profile 使用独立程序：
 
-1. 打开“助理”，新建普通会话并选择已保存的 Provider。
-2. 在“普通聊天消息”中输入问题。输入区附近会持续显示：内容将通过 API 发送至所选模型供应商服务器，请勿输入或上传未脱敏案件材料。
-3. 直接发送时，应用只使用当前消息和同一普通会话内有界的成功文本历史，不读取 Case Workspace、CaseMaterial、Privacy、Vault、approved generation 或 MCP 状态。
-4. 如需普通附件，必须在本次请求中显式选择支持的 TXT/PDF 等文件。页面会列出将发送正文的文件名、类型和大小；用户可以发送或取消。
-5. 普通附件不会自动登记为案件材料，也不会强制跳转到脱敏页面。附件若属于真实案件、包含客户信息或无法确认范围，不得从普通聊天发送，应改到“案件工作台 → 材料与脱敏”处理。
+```powershell
+lawyer-assistance-mcp --privacy-profile public_law_only `
+  --legal-db "$pwd\data\runtime\legal_core.sqlite" stdio
+```
 
-普通聊天经 `interactive_chat` 边界发送用户主动提供的内容。它不是公开法律数据，也不会被伪装成 `ProductPublic`；请求仍受 Provider endpoint、凭据隔离、SSRF/private-network 许可、大小、取消、审计、响应限额和错误脱敏约束。
+它固定暴露五个公开法律只读工具。`privacy_workspace` profile 共八个工具（五个公开工具加上 submit/status/read_result），要先在“设置”创建客户端 token，再通过已运行的 loopback server 调用；配置收件目录和材料组后，只使用目录下相对路径。该 profile 不会读取原文、映射、原始文件名或磁盘路径。
 
-## 5. 案件工作区
+## 限制
 
-案件工作区内部固定分为“概览”“材料与脱敏”“案件工作”和“成果”。建议按以下顺序使用：
-
-1. 创建案件并录入必要的结构化信息。
-2. 打开“案件工作台 → 材料与脱敏”，导入 PDF、DOCX、UTF-8 TXT 或 Markdown。
-3. 检查本地提取结果、敏感信息发现和别名映射；正文、复核和版本历史只在当前案件材料页显示，不进入设置页。
-4. 人工复核脱敏范围，只批准确实需要进入后续流程的不可变 generation。
-5. 打开“案件工作台 → 案件工作”，创建独立案件助理会话，为本次请求明确勾选当前案件的 approved/current generation，并选择输出类型。
-6. 案件助理只发送本次选择的 approved-only 投影、最小已确认案件数据、同一案件工作会话的有界历史和当前指令，不读取原件、Vault 对象、路径、普通聊天附件或 MCP 授权。
-7. 模型输出先保存为待确认状态。只有单独确认并再次通过来源、版本、撤销和 workspace CAS 校验后，才会写入案件或成果。
-8. generation 被撤销、删除、阻断或变旧后，刷新会清除失效选择；新的请求必须停止并提示“请重新选择材料”。
-
-本地批准不等于允许把正文粘贴到普通聊天、普通附件、浏览器、其他 MCP 或任意 Provider。案件助理、自动化出站批准和 approved MCP 各自重新验证精确 generation、目的地、用途和当前状态，不能互相借用授权。
-
-## 6. BYOK Provider
-
-Lawyer Assistance 采用 BYOK（自带密钥）方式连接兼容 Provider：
-
-- 由用户提供 Provider 账户和 API Key；
-- API Key 不写入普通配置、日志或数据库正文；
-- 普通聊天只发送用户输入、同一普通会话的有界文本历史和本次显式选择的普通附件正文；
-- 案件助理只发送本次明确选择的 approved-only 投影和最小已确认案件数据；
-- “设置 → MCP 与自动化 → 自动化出站批准”保留固定任务、单次批准、派发和历史输出，服务于 `approved_automation`，不是普通聊天或案件助理的必经页面；
-- 每种模式都在后端独立构造 authority/classification，并在发送前核对 Provider、endpoint、model、用途、来源范围和当前撤销状态。
-
-Provider 是外部服务。使用前请核对其数据保留、访问控制、区域和计费政策。不要把本地批准理解为对所有 Provider 的通用许可。
-
-## 7. MCP 与宿主集成
-
-Lawyer Assistance 提供四个不同的 MCP profile：
-
-| Profile | 工具数 | 用途 |
-|---|---:|---|
-| `public_law_only` | 5 | 默认公开法律只读检索，不含案件数据 |
-| `redacted_case` | 6 | 兼容实验 profile；当前 App 不提供其正向用途票据 |
-| `diagram_authoring` | 11 | 只处理纯合成或公开数据，生成本地明文图示 bundle |
-| `approved_case_workspace` | 21 | 经 App 资格、session、grant 和逐调用 ticket 约束的批准案件工作区 |
-
-WorkBuddy、Codex 和 OpenCode 的默认示例使用 `public_law_only`。应用内的本地 MCP、自动化出站批准和 Approved MCP 位于“设置 → MCP 与自动化”，但三者保持独立 activity 和授权边界。批准案件配置是独立、默认禁用的 Windows stdio 配置。使用批准工作区时：
-
-1. 从 App 创建当前 standalone session。
-2. 新建只含 opaque ID 的干净宿主任务。
-3. 不粘贴、不附加、不从宿主文件系统读取案件正文。
-4. 只信当前任务中 `case_read_approved_material` 的直接响应。
-5. 只通过受控 work-product 或 approved diagram 工具保存成果，并复读精确版本。
-
-## 8. 法律图示
-
-- `diagram_authoring` 只允许纯合成或公开法律数据。它的 HTML 是本地明文制品，不能承载真实案件内容。
-- 真实批准案件图示只能使用 `approved_case_workspace`。
-- 批准案件的 `diagram.render` 和 `diagram.update` 保存加密的受保护 HTML work product。
-- `diagram.export` 只返回经过验证的 descriptor metadata，不返回 HTML、文件路径或 URI。
-
-## 9. OCR
-
-可靠原生文本层可以由本地解析器处理。扫描或视觉 PDF 只有在 App 显示当前 worker、模型、组件完整性、Windows Firewall 隔离、合成 canary 和环境复测全部通过时，才可进入本地 MinerU。
-
-OCR 配置、组件导入/安装/回滚/卸载、信任、防火墙隔离和资格运行统一位于“设置 → 本地处理环境与 OCR 组件”。配置草稿、组件 mutation 和资格 mutation 相互隔离；任一写入进行时不得并行启动另一类写入。
-
-在 final MinerU v4 签名资产、许可审批、Windows 10/11 clean-machine 和目标 GPU qualification 留下完整证据前，不得宣称 `0.4.0` 已取得生产 OCR 资格。不得用历史组件、GPU 诊断、用户同意或远程 OCR 代替资格门；失败时应用应阻断，而不是静默上传或远程回退。
-
-## 10. 备份与恢复
-
-“设置 → 版本、备份与诊断”同时承载应用更新/诊断和 Privacy 生命周期维护，但两类 mutation 互相禁用。该页面提供本地、认证加密的 `.lavbackup` 备份，覆盖用户数据库、隐私状态、加密 Vault、批准工作区和加密 work products；另有用于隐私维护的 `.lavprivacy` 格式。
-
-- 备份前结束正在进行的写入并使用应用提供的导出入口。
-- 把备份保存在受控位置，不要上传到未经批准的云盘、聊天或工单。
-- 恢复后检查案件、Vault、批准 generation、work products 和授权状态。
-- 备份与逻辑删除不等于对 SSD、外部副本、宿主缓存或云端历史的取证级擦除。
-
-## 11. 遇到阻断时
-
-`PROFILE_NOT_QUALIFIED`、过期、撤销、重放、完整性或残留扫描错误都表示对应案件或自动化流程必须停止。不要降级到普通聊天、普通附件、粘贴、文件路径、浏览器、远程 OCR、其他 MCP 或另一个 Provider。普通聊天自己的非案件内容不受 MCP 资格控制，但绝不能被用来绕过案件材料边界。
-
-进一步信息请参阅[安全与隐私](security-and-privacy.md)和[当前发布状态](release-status.md)。
+当前不接受 PDF/图片、扫描件 OCR 或原件版式保留。OCR 只保留扩展接口。疑难云辅助使用可控模拟服务验证；合成材料的通过率、误报和漏检报告不能作为真实案件精度保证。不要把便携 ZIP 或源码构建称为签名安装器、正式 updater 或 OCR 资格资产。

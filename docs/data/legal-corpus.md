@@ -1,74 +1,47 @@
-# 法律数据集与运行时数据库 / Legal corpus and runtime database
+# 法律数据与运行时数据库 / Legal corpus and runtime database
 
-Lawyer Assistance 使用公开、可追溯的官方法律来源构建本地只读索引。应用安装包只包含
-运行时投影，不包含构建过程中的抓取状态、审计原文或完整归档数据库。
+Lawyer Assistance 使用公开、可追溯的官方法律来源构建本地只读索引。Web 便携包只包含运行时投影，不包含抓取状态、审计原文或完整归档数据库。
 
-## 两类数据库
+## 运行时投影
 
-### 运行时投影
-
-应用使用 `runtime-slim-v1` 投影：
+运行时数据库位于 `data/runtime/legal_core.sqlite`，发行身份由 [`data/generated/legal_core_distribution_manifest.json`](../../data/generated/legal_core_distribution_manifest.json) 固定：
 
 ```text
-path: apps/desktop/src-tauri/resources/legal_core.sqlite
+dataset: official-china-legal-core
+version: 2026.07.14-stage1c.2
+runtime_profile: runtime-slim-v1
 size: 1,775,419,392 bytes
 sha256: 86574bba91950b194c6530586eebbae31c689a5bd2a485877b3eed6b611f7d3c
+source_manifest_sha256: 011551065b404507bce7b2cf542cb3b18da79a14437d094d067e685a438cd9fa
 ```
 
-其身份由 `data/generated/legal_core_distribution_manifest.json` 固定。正式打包脚本会在
-编译前重新验证大小、SHA-256、schema、记录数量与 FTS 一致性。
+实际值以发行清单为准；示例包或 CI fixture 不得替代正式库。便携打包脚本会校验文件大小、SHA-256 和 SQLite `database_metadata.source_manifest_sha256`，不匹配时失败关闭。
 
-### 完整归档库
-
-完整归档与审计权威由以下 manifest 描述：
-
-```text
-path: data/generated/legal_core_full.sqlite
-expected size: 4,512,894,976 bytes
-expected sha256: 31cf1995cc09f0e3e00f70bfcf20cf67548f1a6362706ccc11d1fd3b2ebc26ac
-```
-
-完整归档库不打包进桌面应用，也不作为普通 Git blob 提交。公开源码仓库中的 manifest、
-schema、构建器和来源清单用于重建与核验；缺少完整归档库时不得声称完成 strict
-archival/provenance audit。
-
-## 来源与许可
+## 来源、构建与许可
 
 - 来源清单：[`data/sources/source_manifest.md`](../../data/sources/source_manifest.md)
+- 覆盖说明：[`data/sources/coverage.md`](../../data/sources/coverage.md)
 - 数据 schema：[`data/schema/legal_core.sql`](../../data/schema/legal_core.sql)
-- 运行时分发 manifest：
-  [`data/generated/legal_core_distribution_manifest.json`](../../data/generated/legal_core_distribution_manifest.json)
-- 完整归档 manifest：
-  [`data/generated/legal_core_full_manifest.json`](../../data/generated/legal_core_full_manifest.json)
-- 安装包数据说明：
-  [`apps/desktop/src-tauri/resources/DATA_SOURCES.md`](../../apps/desktop/src-tauri/resources/DATA_SOURCES.md)
+- 运行时许可证/来源说明：[`data/runtime/DATA_SOURCES.md`](../../data/runtime/DATA_SOURCES.md)
+- 构建、压缩、严格审计工具：`data/build/`
 
-法律文本及其来源受相应官方站点、法律法规与数据许可条件约束。仓库的 MIT 许可证仅适用
-于本项目代码，不重新许可第三方法律文本、字体、模型或其他外部内容。
+完整归档库及其 manifest 仅用于数据构建和审计，不随产品包提供，也不作为普通 Git blob。`data/build` 中少数历史默认输出仍可能记录旧桌面路径；这些路径只属于数据构建工具，不影响产品运行时和便携打包路径，后续数据构建迁移由维护者单独处理。
 
-## 验证
+法律文本及来源受官方站点、法律法规和各自许可约束。仓库 MIT 许可证只适用于本项目代码，不重新许可第三方法律文本、字体、模型或外部内容。
 
-在运行时数据库已放置到固定资源路径后执行：
+## 本地验证
+
+准备好 `data/runtime/legal_core.sqlite` 后，可以直接运行便携打包自检（不重新编译）：
 
 ```powershell
-python apps\desktop\scripts\verify_legal_resource.py `
-  --resource apps\desktop\src-tauri\resources\legal_core.sqlite `
-  --manifest data\generated\legal_core_distribution_manifest.json
+python -m unittest scripts.test_package_portable -v
+python scripts/package_portable.py --skip-build
 ```
 
 ## English
 
-Lawyer Assistance builds its local read-only legal index from traceable public
-official sources. The desktop installer contains only the `runtime-slim-v1`
-projection. It does not bundle crawler state, audit payloads, or the full
-archival database.
+Lawyer Assistance builds a local read-only index from traceable official public sources. The Web portable package contains only the runtime projection, not crawler state, audit payloads, or the full archival database.
 
-The runtime projection is fixed by
-`data/generated/legal_core_distribution_manifest.json`; formal packaging
-rechecks its size, SHA-256, schema, row counts, and FTS consistency. The full
-archive is described by `legal_core_full_manifest.json`, remains outside normal
-Git objects and the desktop package, and is required only for strict archival
-and provenance audits.
+The runtime file is `data/runtime/legal_core.sqlite`; its identity is fixed by `data/generated/legal_core_distribution_manifest.json`. Packaging verifies its size, SHA-256, and the SQLite `database_metadata.source_manifest_sha256`. The full archive and build/audit state stay outside the product package.
 
-The repository MIT license covers project code only. It does not relicense
-third-party legal text, fonts, models, or other external content.
+Source coverage, schema, and licensing constraints are documented under `data/sources/`, `data/schema/`, and `data/runtime/`. The MIT license applies to project code only and does not relicense third-party legal text, fonts, models, or other external content.

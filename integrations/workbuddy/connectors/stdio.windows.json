@@ -2,15 +2,10 @@
   "mcpServers": {
     "lawyer_assistance": {
       "type": "stdio",
-      "description": "Lawyer Assistance public-law-only MCP server (Windows; exactly five read-only tools)",
+      "description": "Lawyer Assistance public legal MCP (Windows; exactly five offline tools)",
       "command": "C:/LawyerAssistance/bin/lawyer-assistance-mcp.exe",
       "args": ["--privacy-profile", "public_law_only", "stdio"],
-      "env": {
-        "LAWYER_ASSISTANCE_LEGAL_DB": "C:/LawyerAssistance/data/legal_core.sqlite",
-        "LAWYER_ASSISTANCE_USER_DB": "C:/LawyerAssistance/data/user.sqlite",
-        "LAWYER_ASSISTANCE_ALLOWED_ROOTS": "C:/LawyerAssistance/cases",
-        "LAWYER_ASSISTANCE_OUTPUT_ROOT": "C:/LawyerAssistance/exports"
-      }
+      "env": { "LEGAL_DB": "C:/LawyerAssistance/data/runtime/legal_core.sqlite" }
     }
   }
 }

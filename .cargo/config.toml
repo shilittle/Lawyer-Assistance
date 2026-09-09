@@ -1,2 +1,6 @@
 [build]
 target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+# The portable executables must run without installing the Visual C++ runtime.
+rustflags = ["-C", "target-feature=+crt-static"]

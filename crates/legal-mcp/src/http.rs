@@ -1,7 +1,9 @@
 use crate::{
-    config::{normalize_request_origin, ResolvedConfig},
+    config::{parse_bearer, BearerSecret, Limits, ResolvedConfig},
     handler::{LegalMcpServer, STABLE_PROTOCOL_VERSION},
-    service_adapter::InFlightOperations,
+    privacy_backend::DaemonPrivacyBackendFactory,
+    registry::{PrivacyProfile, ToolRegistry},
+    service_adapter::{InFlightOperations, PrivacyWorkspaceError, ServiceAdapter},
 };
 use axum::{
     body::{to_bytes, Body},
@@ -14,41 +16,87 @@ use axum::{
     response::{IntoResponse, Response},
     Json, Router,
 };
+use legal_services::LegalServices;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use serde_json::json;
-use std::{sync::Arc, time::Instant};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+use url::Url;
 
 pub const MCP_PATH: &str = "/mcp";
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 
+/// Request-only capability selected before rmcp sees a message. `Privacy` is
+/// only a candidate: every private tools/call still creates a request-scoped
+/// backend and the local application verifies that bearer token and group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpClientScope {
+    Public,
+    Privacy,
+}
+
+/// Configuration for embedding one Streamable HTTP endpoint in the application
+/// server. A public token, when configured, is explicitly restricted to the
+/// five public tools. Any other syntactically valid bearer is passed only to a
+/// new request-scoped daemon adapter for a privacy tool; it is never saved in
+/// router state or used for another request.
 #[derive(Debug, Clone)]
+pub struct ProxyRouterConfig {
+    pub daemon_url: Url,
+    pub limits: Limits,
+    pub public_token: Option<BearerSecret>,
+}
+
+impl ProxyRouterConfig {
+    pub fn new(daemon_url: Url, limits: Limits) -> Self {
+        Self {
+            daemon_url,
+            limits,
+            public_token: None,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct HttpSecurity {
-    allowed_origins: Arc<Vec<String>>,
-    allowed_hosts: Arc<Vec<String>>,
-    bearer: Option<crate::config::BearerSecret>,
+    bind: SocketAddr,
+    public_token: Option<BearerSecret>,
     max_body_bytes: usize,
     request_timeout: std::time::Duration,
     concurrency: Arc<Semaphore>,
     in_flight: InFlightOperations,
 }
 
-impl HttpSecurity {
-    fn from_config(config: &ResolvedConfig, in_flight: InFlightOperations) -> Self {
-        Self {
-            allowed_origins: Arc::new(config.allowed_origins.clone()),
-            allowed_hosts: Arc::new(config.allowed_hosts.clone()),
-            bearer: config.bearer.clone(),
-            max_body_bytes: config.limits.max_body_bytes,
-            request_timeout: config.limits.request_timeout,
-            concurrency: Arc::new(Semaphore::new(config.limits.max_concurrency)),
-            in_flight,
-        }
+/// Build a server-owned privacy MCP router. It does not open the application's
+/// private database. Legal queries use `LegalServices`; each privacy call is
+/// routed through the supplied loopback daemon origin.
+pub fn build_proxy_router(
+    legal_services: LegalServices,
+    bind: SocketAddr,
+    proxy: ProxyRouterConfig,
+    cancellation: CancellationToken,
+) -> Result<Router, PrivacyWorkspaceError> {
+    if !bind.ip().is_loopback() {
+        return Err(PrivacyWorkspaceError::new(
+            "invalid_daemon_configuration",
+            false,
+        ));
     }
+    let factory = DaemonPrivacyBackendFactory::new(proxy.daemon_url, proxy.limits.clone())?;
+    let server = LegalMcpServer::new(
+        ToolRegistry::for_profile(PrivacyProfile::PrivacyWorkspace),
+        ServiceAdapter::for_privacy_workspace_proxy(legal_services, Arc::new(factory)),
+    );
+    Ok(build_router_with_security(
+        server,
+        bind,
+        proxy.public_token,
+        proxy.limits,
+        cancellation,
+    ))
 }
 
 pub async fn serve_http(
@@ -68,57 +116,72 @@ pub async fn serve_http(
     }
 }
 
-/// Serve an embedded HTTP MCP endpoint on an already-bound listener until the
-/// caller cancels `cancellation`.
-///
-/// This entry point deliberately does not install a process signal handler.
-/// Binding before calling it lets an embedding application report startup
-/// failures and the listener's actual address before it marks the service as
-/// running.
 pub async fn serve_http_on_listener(
     server: LegalMcpServer,
     config: &ResolvedConfig,
     listener: tokio::net::TcpListener,
     cancellation: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    let address = listener.local_addr()?;
     let in_flight = server.in_flight_operations();
     let router = build_router(server, config, cancellation.child_token());
-    let address = listener.local_addr()?;
     tracing::info!(bind = %address, endpoint = MCP_PATH, "MCP HTTP server listening");
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move { cancellation.cancelled().await })
         .await;
-    // `spawn_blocking` service calls cannot be aborted. Close the admission
-    // gate and wait for every request/operation guard before the embedding
-    // application is allowed to report a fully stopped server.
     in_flight.close_and_wait().await;
     result
 }
 
+/// Build the standalone binary router. `privacy_workspace` is request scoped
+/// only when the caller constructed its adapter with
+/// `ServiceAdapter::for_privacy_workspace_proxy`; the packaged binary does so
+/// for HTTP while stdio uses a token loaded once from a file/environment.
 pub fn build_router(
     server: LegalMcpServer,
     config: &ResolvedConfig,
     cancellation: CancellationToken,
 ) -> Router {
+    build_router_with_security(
+        server,
+        config.bind,
+        None,
+        config.limits.clone(),
+        cancellation,
+    )
+}
+
+fn build_router_with_security(
+    server: LegalMcpServer,
+    bind: SocketAddr,
+    public_token: Option<BearerSecret>,
+    limits: Limits,
+    cancellation: CancellationToken,
+) -> Router {
     let in_flight = server.in_flight_operations();
-    let mcp_config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
-        .with_json_response(true)
-        .with_sse_keep_alive(None)
-        .with_sse_retry(None)
-        .with_allowed_hosts(config.allowed_hosts.clone())
-        .with_allowed_origins(config.allowed_origins.clone())
-        .with_cancellation_token(cancellation);
     let service: StreamableHttpService<LegalMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Arc::new(LocalSessionManager::default()),
-            mcp_config,
+            StreamableHttpServerConfig::default()
+                .with_stateful_mode(false)
+                .with_json_response(true)
+                .with_sse_keep_alive(None)
+                .with_sse_retry(None)
+                .with_allowed_hosts(default_allowed_hosts(bind))
+                .with_cancellation_token(cancellation),
         );
     Router::new()
         .nest_service(MCP_PATH, service)
         .layer(middleware::from_fn_with_state(
-            HttpSecurity::from_config(config, in_flight),
+            HttpSecurity {
+                bind,
+                public_token,
+                max_body_bytes: limits.max_body_bytes,
+                request_timeout: limits.request_timeout,
+                concurrency: Arc::new(Semaphore::new(limits.max_concurrency)),
+                in_flight,
+            },
             enforce_http_boundary,
         ))
 }
@@ -128,23 +191,17 @@ async fn enforce_http_boundary(
     request: Request,
     next: Next,
 ) -> Response {
-    let request_id = Uuid::new_v4().to_string();
     let started = Instant::now();
-    let method = request.method().clone();
-
     if request.uri().path() != MCP_PATH {
-        return rejection(StatusCode::NOT_FOUND, "not_found", &request_id, false);
+        return rejection(StatusCode::NOT_FOUND, "not_found", false);
     }
-    if let Err((status, code)) = validate_host(request.headers(), &security.allowed_hosts) {
-        return rejection(status, code, &request_id, false);
+    if !valid_host(request.headers(), security.bind) || !valid_origin(request.headers()) {
+        return rejection(StatusCode::FORBIDDEN, "origin_not_allowed", false);
     }
-    if let Err((status, code)) = validate_origin(request.headers(), &security.allowed_origins) {
-        return rejection(status, code, &request_id, false);
-    }
-    if let Err((status, code)) = validate_authorization(request.headers(), security.bearer.as_ref())
-    {
-        return rejection(status, code, &request_id, true);
-    }
+    let scope = match classify_client(request.headers(), security.public_token.as_ref()) {
+        Ok(scope) => scope,
+        Err(()) => return rejection(StatusCode::UNAUTHORIZED, "unauthorized", true),
+    };
     if request
         .headers()
         .get(CONTENT_LENGTH)
@@ -155,112 +212,64 @@ async fn enforce_http_boundary(
         return rejection(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_body_too_large",
-            &request_id,
             false,
         );
     }
-
     let Ok(permit) = Arc::clone(&security.concurrency).try_acquire_owned() else {
-        let mut response = rejection(
+        return rejection(
             StatusCode::TOO_MANY_REQUESTS,
             "concurrency_limit_exceeded",
-            &request_id,
             false,
         );
-        response
-            .headers_mut()
-            .insert("retry-after", HeaderValue::from_static("1"));
-        return response;
     };
-
+    let Some(request_guard) = security.in_flight.try_begin() else {
+        drop(permit);
+        return rejection(StatusCode::SERVICE_UNAVAILABLE, "server_stopping", false);
+    };
     let deadline = tokio::time::Instant::now() + security.request_timeout;
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let body =
         match tokio::time::timeout_at(deadline, to_bytes(body, security.max_body_bytes)).await {
             Ok(Ok(body)) => body,
             Ok(Err(_)) => {
+                drop(permit);
                 return rejection(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request_body_too_large",
-                    &request_id,
                     false,
-                )
+                );
             }
             Err(_) => {
-                return rejection(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "request_timeout",
-                    &request_id,
-                    false,
-                )
+                drop(permit);
+                return rejection(StatusCode::REQUEST_TIMEOUT, "request_timeout", false);
             }
         };
-    let initialize = body_is_initialize(&body);
-    if let Err((status, code)) = validate_protocol_header(&parts.headers, initialize) {
-        return rejection(status, code, &request_id, false);
-    }
-    let body = if initialize {
-        match normalize_initialize_protocol(&body) {
-            Some(body) if body.len() <= security.max_body_bytes => body,
-            Some(_) => {
-                return rejection(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_body_too_large",
-                    &request_id,
-                    false,
-                )
-            }
-            None => body.to_vec(),
-        }
-    } else {
-        body.to_vec()
-    };
-    let timeout_details = timeout_details(&body);
-    let request = Request::from_parts(parts, Body::from(body));
-    // Run the downstream request in its own task. If the client-facing deadline
-    // expires, the task is deliberately allowed to finish while retaining the
-    // concurrency permit. Dropping the future here could detach a
-    // `spawn_blocking` database write and falsely advertise free capacity.
-    let Some(request_guard) = security.in_flight.try_begin() else {
+    if !valid_protocol_header(&parts.headers, &body) {
         drop(permit);
         return rejection(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_stopping",
-            &request_id,
+            StatusCode::BAD_REQUEST,
+            "unsupported_protocol_version",
             false,
         );
-    };
-    let mut request_task = tokio::spawn(async move {
+    }
+    parts.extensions.insert(scope);
+    let request = Request::from_parts(parts, Body::from(body));
+    let mut task = tokio::spawn(async move {
+        // Keep the admission permit with the detached task. A timeout only
+        // ends the client response; it must not advertise free capacity while
+        // the local daemon request may still be processing the operation.
+        let _permit = permit;
         let _request_guard = request_guard;
         next.run(request).await
     });
-    let mut response = match tokio::time::timeout_at(deadline, &mut request_task).await {
-        Ok(Ok(response)) => {
-            drop(permit);
-            response
-        }
-        Ok(Err(_)) => {
-            drop(permit);
-            rejection(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_server_error",
-                &request_id,
-                false,
-            )
-        }
-        Err(_) => {
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _ = request_task.await;
-            });
-            rejection_with_details(
-                StatusCode::GATEWAY_TIMEOUT,
-                "request_timeout",
-                &request_id,
-                false,
-                timeout_details,
-            )
-        }
+    let mut response = match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => rejection(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_server_error",
+            false,
+        ),
+        Err(_) => rejection(StatusCode::REQUEST_TIMEOUT, "request_timeout", false),
     };
     response
         .headers_mut()
@@ -269,109 +278,77 @@ async fn enforce_http_boundary(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    tracing::info!(
-        request_id = %request_id,
-        method = %method,
-        status = response.status().as_u16(),
+    tracing::debug!(
         elapsed_ms = started.elapsed().as_millis(),
         "MCP HTTP request completed"
     );
     response
 }
 
-fn validate_host(
+fn classify_client(
     headers: &HeaderMap,
-    allowed_hosts: &[String],
-) -> Result<(), (StatusCode, &'static str)> {
-    let values = headers.get_all(HOST).iter().collect::<Vec<_>>();
-    if values.len() != 1 {
-        return Err((StatusCode::BAD_REQUEST, "invalid_host"));
-    }
-    let host = values[0]
-        .to_str()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid_host"))?
-        .trim()
-        .to_ascii_lowercase();
-    if host.is_empty()
-        || host.len() > 255
-        || host.contains('/')
-        || host.contains('\\')
-        || host.contains('@')
-        || host.bytes().any(|byte| byte.is_ascii_whitespace())
-    {
-        return Err((StatusCode::BAD_REQUEST, "invalid_host"));
-    }
-    if !allowed_hosts.iter().any(|allowed| allowed == &host) {
-        return Err((StatusCode::FORBIDDEN, "host_not_allowed"));
-    }
-    Ok(())
-}
-
-fn validate_origin(
-    headers: &HeaderMap,
-    allowed_origins: &[String],
-) -> Result<(), (StatusCode, &'static str)> {
-    let values = headers.get_all(ORIGIN).iter().collect::<Vec<_>>();
-    if values.is_empty() {
-        return Ok(());
-    }
-    if values.len() != 1 {
-        return Err((StatusCode::FORBIDDEN, "origin_not_allowed"));
-    }
-    let raw = values[0]
-        .to_str()
-        .map_err(|_| (StatusCode::FORBIDDEN, "origin_not_allowed"))?;
-    let normalized =
-        normalize_request_origin(raw).ok_or((StatusCode::FORBIDDEN, "origin_not_allowed"))?;
-    if !allowed_origins.iter().any(|allowed| allowed == &normalized) {
-        return Err((StatusCode::FORBIDDEN, "origin_not_allowed"));
-    }
-    Ok(())
-}
-
-fn validate_authorization(
-    headers: &HeaderMap,
-    bearer: Option<&crate::config::BearerSecret>,
-) -> Result<(), (StatusCode, &'static str)> {
-    let Some(bearer) = bearer else {
-        return Ok(());
-    };
+    public_token: Option<&BearerSecret>,
+) -> Result<HttpClientScope, ()> {
     let values = headers.get_all(AUTHORIZATION).iter().collect::<Vec<_>>();
-    if values.len() != 1 {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    match values.as_slice() {
+        [] => Ok(HttpClientScope::Public),
+        [value] => {
+            let value = value.to_str().map_err(|_| ())?;
+            if public_token.is_some_and(|token| token.authorizes(value)) {
+                return Ok(HttpClientScope::Public);
+            }
+            if parse_bearer(value).is_some() {
+                Ok(HttpClientScope::Privacy)
+            } else {
+                Err(())
+            }
+        }
+        _ => Err(()),
     }
-    let header = values[0]
-        .to_str()
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "unauthorized"))?;
-    if !bearer.authorizes(header) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
-    }
-    Ok(())
 }
 
-fn validate_protocol_header(
-    headers: &HeaderMap,
-    initialize: bool,
-) -> Result<(), (StatusCode, &'static str)> {
+fn valid_host(headers: &HeaderMap, bind: SocketAddr) -> bool {
+    let values = headers.get_all(HOST).iter().collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => true,
+        [value] => value.to_str().ok().is_some_and(|host| {
+            default_allowed_hosts(bind)
+                .iter()
+                .any(|allowed| allowed == host)
+        }),
+        _ => false,
+    }
+}
+
+fn valid_origin(headers: &HeaderMap) -> bool {
+    let values = headers.get_all(ORIGIN).iter().collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => true,
+        [value] => value.to_str().ok().is_some_and(|origin| {
+            let Ok(url) = Url::parse(origin) else {
+                return false;
+            };
+            url.scheme() == "http"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && matches!(url.path(), "" | "/")
+                && url
+                    .host_str()
+                    .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                    .is_some_and(|address| address.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+fn valid_protocol_header(headers: &HeaderMap, body: &[u8]) -> bool {
     let values = headers.get_all(PROTOCOL_HEADER).iter().collect::<Vec<_>>();
     if values.len() > 1 {
-        return Err((StatusCode::BAD_REQUEST, "unsupported_protocol_version"));
+        return false;
     }
-    if initialize {
-        return Ok(());
-    }
-    let version = values
-        .first()
-        .and_then(|value| value.to_str().ok())
-        .ok_or((StatusCode::BAD_REQUEST, "unsupported_protocol_version"))?;
-    if version != STABLE_PROTOCOL_VERSION {
-        return Err((StatusCode::BAD_REQUEST, "unsupported_protocol_version"));
-    }
-    Ok(())
-}
-
-fn body_is_initialize(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
+    let initialize = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
             value
@@ -379,94 +356,37 @@ fn body_is_initialize(body: &[u8]) -> bool {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
-        .is_some_and(|method| method == "initialize")
-}
-
-fn normalize_initialize_protocol(body: &[u8]) -> Option<Vec<u8>> {
-    let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    if value.get("method").and_then(serde_json::Value::as_str) != Some("initialize") {
-        return None;
+        .is_some_and(|method| method == "initialize");
+    if initialize {
+        return true;
     }
-    value.get_mut("params")?.as_object_mut()?.insert(
-        "protocolVersion".to_owned(),
-        serde_json::Value::String(STABLE_PROTOCOL_VERSION.to_owned()),
-    );
-    serde_json::to_vec(&value).ok()
+    values
+        .first()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|version| version == STABLE_PROTOCOL_VERSION)
 }
 
-fn timeout_details(body: &[u8]) -> serde_json::Value {
-    let tool_name = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .filter(|value| {
-            value.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
-        })
-        .and_then(|value| {
-            value
-                .get("params")
-                .and_then(|params| params.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        });
-    if matches!(
-        tool_name.as_deref(),
-        Some("case_apply_patch" | "document_export")
-    ) {
-        json!({
-            "outcome": "unknown",
-            "remediation": "retry_same_idempotency_key",
-            "idempotency_key_contract": "reuse the exact original idempotency_key and arguments"
-        })
-    } else {
-        json!({"outcome":"unknown"})
+fn default_allowed_hosts(bind: SocketAddr) -> Vec<String> {
+    let mut hosts = vec![
+        format!("127.0.0.1:{}", bind.port()),
+        format!("localhost:{}", bind.port()),
+    ];
+    if bind.ip().is_ipv6() {
+        hosts.push(format!("[::1]:{}", bind.port()));
     }
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
-fn rejection(
-    status: StatusCode,
-    code: &'static str,
-    request_id: &str,
-    authenticate: bool,
-) -> Response {
-    rejection_with_details(status, code, request_id, authenticate, json!({}))
-}
-
-fn rejection_with_details(
-    status: StatusCode,
-    code: &'static str,
-    request_id: &str,
-    authenticate: bool,
-    details: serde_json::Value,
-) -> Response {
-    let message = match code {
-        "not_found" => "未找到请求的服务。",
-        "invalid_host" | "host_not_allowed" | "origin_not_allowed" => "当前访问来源不受允许。",
-        "unauthorized" => "请先完成访问授权。",
-        "request_body_too_large" => "提交内容超过单次处理上限。",
-        "concurrency_limit_exceeded" => "当前请求较多，请稍后重试。",
-        "unsupported_protocol_version" => "当前客户端版本不受支持，请更新后重试。",
-        "request_timeout" => "本次处理超时，请稍后重试。",
-        "server_stopping" => "服务正在停止，请稍后重试。",
-        "internal_server_error" => "服务暂时无法完成操作，请稍后重试。",
-        _ => "本次请求未能受理。",
-    };
+fn rejection(status: StatusCode, code: &'static str, authenticate: bool) -> Response {
     let retryable = matches!(
         code,
         "concurrency_limit_exceeded" | "request_timeout" | "server_stopping"
     );
     let mut response = (
         status,
-        Json(json!({
-            "schema_version": 1,
-            "ok": false,
-            "error": {
-                "code": code,
-                "message": message,
-                "retryable": retryable,
-                "details": details
-            },
-            "request_id": request_id,
-            "warnings": []
-        })),
+        Json(json!({"error":{"code":code,"retryable":retryable}})),
     )
         .into_response();
     response
@@ -486,281 +406,157 @@ fn rejection_with_details(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::{
-        config::{BearerSecret, Command, Limits},
-        registry::ToolRegistry,
-        service_adapter::ServiceAdapter,
-    };
-    use axum::{routing::post, Router};
-    use legal_services::{LegalServices, ServiceConfig};
-    use std::{
-        fs,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
+    use axum::{
+        http::{
+            header::{ACCEPT, CONTENT_TYPE},
+            Method,
         },
-        time::Duration,
+        routing::post,
     };
-    use tokio::sync::Notify;
+    use std::path::PathBuf;
     use tower::ServiceExt;
-    use zeroize::Zeroizing;
 
-    fn security(authenticated: bool) -> HttpSecurity {
-        HttpSecurity {
-            allowed_origins: Arc::new(vec!["https://client.example".into()]),
-            allowed_hosts: Arc::new(vec!["127.0.0.1:8787".into()]),
-            bearer: authenticated
-                .then(|| BearerSecret::new(Zeroizing::new(vec![b'x'; 32])).unwrap()),
+    fn limits() -> Limits {
+        Limits {
             max_body_bytes: 16 * 1024,
-            request_timeout: Duration::from_secs(1),
-            concurrency: Arc::new(Semaphore::new(1)),
-            in_flight: InFlightOperations::default(),
+            request_timeout: std::time::Duration::from_secs(2),
+            max_concurrency: 2,
+            max_daemon_response_bytes: 16 * 1024,
         }
     }
 
-    fn app(state: HttpSecurity) -> Router {
-        Router::new()
-            .route(MCP_PATH, post(|| async { StatusCode::OK }))
-            .layer(middleware::from_fn_with_state(state, enforce_http_boundary))
-    }
-
-    fn request() -> axum::http::request::Builder {
-        Request::builder()
-            .method("POST")
-            .uri(MCP_PATH)
-            .header(HOST, "127.0.0.1:8787")
-            .header(PROTOCOL_HEADER, STABLE_PROTOCOL_VERSION)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-    }
-
-    #[tokio::test]
-    async fn bearer_and_origin_are_enforced() {
-        let state = security(true);
-        let response = app(state.clone())
-            .oneshot(request().body(Body::from("{}")).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        let response = app(state.clone())
-            .oneshot(
-                request()
-                    .header(AUTHORIZATION, format!("Bearer {}", "x".repeat(32)))
-                    .header(ORIGIN, "https://evil.example")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        let response = app(state)
-            .oneshot(
-                request()
-                    .header(AUTHORIZATION, format!("Bearer {}", "x".repeat(32)))
-                    .header(ORIGIN, "https://client.example")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+    fn router() -> Router {
+        let services = LegalServices::new_public(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("legal.sqlite"),
+        )
+        .expect("service");
+        build_proxy_router(
+            services,
+            "127.0.0.1:8787".parse().expect("bind"),
+            ProxyRouterConfig::new(
+                Url::parse("http://127.0.0.1:8877").expect("daemon"),
+                limits(),
+            ),
+            CancellationToken::new(),
+        )
+        .expect("router")
     }
 
     #[tokio::test]
-    async fn body_concurrency_and_protocol_limits_are_enforced() {
-        let state = security(false);
-        let response = app(state.clone())
-            .oneshot(
-                request()
-                    .body(Body::from(vec![b'x'; 16 * 1024 + 1]))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-        let permit = Arc::clone(&state.concurrency)
-            .acquire_owned()
-            .await
-            .unwrap();
-        let response = app(state.clone())
-            .oneshot(request().body(Body::from("{}")).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        drop(permit);
-
-        let response = app(state)
+    async fn public_and_privacy_bearers_see_different_tool_lists() {
+        let public = router()
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method(Method::POST)
                     .uri(MCP_PATH)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(ACCEPT, "application/json, text/event-stream")
                     .header(HOST, "127.0.0.1:8787")
+                    .header(PROTOCOL_HEADER, STABLE_PROTOCOL_VERSION)
                     .body(Body::from(
-                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
                     ))
-                    .unwrap(),
+                    .expect("request"),
             )
             .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            .expect("response");
+        assert_eq!(public.status(), StatusCode::OK);
+        let bytes = to_bytes(public.into_body(), 64 * 1024).await.expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(value["result"]["tools"].as_array().map(Vec::len), Some(5));
+
+        let privacy = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(MCP_PATH)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(ACCEPT, "application/json, text/event-stream")
+                    .header(HOST, "127.0.0.1:8787")
+                    .header(PROTOCOL_HEADER, STABLE_PROTOCOL_VERSION)
+                    .header(AUTHORIZATION, "Bearer 0123456789abcdef0123456789abcdef")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = to_bytes(privacy.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(value["result"]["tools"].as_array().map(Vec::len), Some(8));
+    }
+
+    #[test]
+    fn malformed_or_multiple_auth_headers_are_rejected_without_echo() {
+        let mut headers = HeaderMap::new();
+        headers.append(AUTHORIZATION, HeaderValue::from_static("Bearer one"));
+        headers.append(AUTHORIZATION, HeaderValue::from_static("Bearer two"));
+        assert!(classify_client(&headers, None).is_err());
+        headers.clear();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer C:\\secret"));
+        assert!(classify_client(&headers, None).is_err());
     }
 
     #[tokio::test]
-    async fn timed_out_write_retains_capacity_until_work_finishes() {
-        let mut state = security(false);
-        state.request_timeout = Duration::from_millis(80);
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler_entered = Arc::clone(&entered);
-        let handler_release = Arc::clone(&release);
-        let handler_calls = Arc::clone(&calls);
-        let app = Router::new()
-            .route(
-                MCP_PATH,
-                post(move || {
-                    let entered = Arc::clone(&handler_entered);
-                    let release = Arc::clone(&handler_release);
-                    let call = handler_calls.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        if call == 0 {
-                            entered.notify_one();
-                            release.notified().await;
-                        }
-                        StatusCode::OK
-                    }
+    async fn timeout_keeps_the_concurrency_permit_until_the_daemon_call_finishes() {
+        let daemon_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("daemon listener");
+        let daemon_address = daemon_listener.local_addr().expect("daemon address");
+        let daemon = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/api/v1/mcp/status",
+                post(|| async {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    Json(json!({"status":"processing"}))
                 }),
-            )
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                enforce_http_boundary,
-            ));
-        let write_body = Body::from(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"document_export","arguments":{"idempotency_key":"retry-key-123456"}}}"#,
-        );
-        let first_app = app.clone();
-        let first = tokio::spawn(async move {
-            first_app
-                .oneshot(request().body(write_body).unwrap())
-                .await
-                .unwrap()
+            );
+            let _ = axum::serve(daemon_listener, app).await;
         });
-        entered.notified().await;
-        let first = first.await.unwrap();
-        assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
-        let first_body = to_bytes(first.into_body(), 16 * 1024).await.unwrap();
-        let timeout: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
-        assert_eq!(timeout["error"]["details"]["outcome"], "unknown");
-        assert_eq!(
-            timeout["error"]["details"]["remediation"],
-            "retry_same_idempotency_key"
-        );
-
-        let second = app
-            .clone()
-            .oneshot(request().body(Body::from("{}")).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while state.concurrency.available_permits() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let third = app
-            .oneshot(request().body(Body::from("{}")).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(third.status(), StatusCode::OK);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn externally_cancelled_listener_server_releases_its_socket() {
-        let temporary = tempfile::tempdir().unwrap();
-        let legal_db = temporary.path().join("legal_core.sqlite");
-        let user_db = temporary.path().join("user.sqlite");
-        let materials = temporary.path().join("materials");
-        let output = temporary.path().join("exports");
-        fs::write(&legal_db, []).unwrap();
-        fs::write(&user_db, []).unwrap();
-        fs::create_dir(&materials).unwrap();
-        fs::create_dir(&output).unwrap();
-
-        let services = LegalServices::new(ServiceConfig {
-            legal_core_path: legal_db.clone(),
-            user_database_path: user_db.clone(),
-            allowed_file_roots: vec![materials.clone()],
-            allowed_output_root: output.clone(),
-        })
-        .unwrap();
-        let server = LegalMcpServer::new(ToolRegistry::new(), ServiceAdapter::new(services));
-        let in_flight = server.in_flight_operations();
-        let pending_operation = in_flight
-            .try_begin()
-            .expect("server initially admits an operation");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let config = ResolvedConfig {
-            legal_db,
-            user_db,
-            allowed_roots: vec![materials],
-            output_root: output,
-            privacy_profile: crate::registry::PrivacyProfile::default(),
-            bind: address,
-            allowed_origins: Vec::new(),
-            allowed_hosts: vec![address.to_string()],
-            bearer: None,
-            dangerously_allow_insecure_non_loopback_http: false,
-            limits: Limits {
-                max_body_bytes: 16 * 1024,
-                request_timeout: Duration::from_secs(1),
-                max_concurrency: 1,
-            },
-            command: Command::Serve {
-                bind: Some(address),
-            },
+        let mut slow_limits = limits();
+        slow_limits.request_timeout = std::time::Duration::from_millis(40);
+        slow_limits.max_concurrency = 1;
+        let services = LegalServices::new_public(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("legal.sqlite"),
+        )
+        .expect("service");
+        let app = build_proxy_router(
+            services,
+            "127.0.0.1:8787".parse().expect("bind"),
+            ProxyRouterConfig::new(
+                Url::parse(&format!("http://{daemon_address}")).expect("daemon URL"),
+                slow_limits,
+            ),
+            CancellationToken::new(),
+        )
+        .expect("router");
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri(MCP_PATH)
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "application/json, text/event-stream")
+                .header(HOST, "127.0.0.1:8787")
+                .header(PROTOCOL_HEADER, STABLE_PROTOCOL_VERSION)
+                .header(AUTHORIZATION, "Bearer 0123456789abcdef0123456789abcdef")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"privacy_workspace.status","arguments":{"task_id":"task_1"}}}"#,
+                ))
+                .expect("request")
         };
-        let cancellation = CancellationToken::new();
-        let server_cancellation = cancellation.clone();
-        let mut task = tokio::spawn(async move {
-            serve_http_on_listener(server, &config, listener, server_cancellation).await
-        });
-
-        tokio::task::yield_now().await;
-        cancellation.cancel();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while in_flight.is_accepting() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("shutdown closes operation admission");
-        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task)
+        let timed_out = app
+            .clone()
+            .oneshot(request())
             .await
-            .is_err());
-        assert!(in_flight.try_begin().is_none());
-
-        drop(pending_operation);
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .expect("external cancellation stops the listener server")
-            .expect("listener task joins")
-            .expect("listener server shuts down cleanly");
-
-        let rebound = tokio::net::TcpListener::bind(address)
-            .await
-            .expect("cancelled server releases its listener");
-        drop(rebound);
+            .expect("timeout response");
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        let rejected = app.oneshot(request()).await.expect("capacity response");
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        daemon.abort();
     }
 }

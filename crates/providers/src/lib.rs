@@ -7,10 +7,11 @@ pub mod types;
 pub mod windows_credentials;
 
 pub use adapter::{
-    authorize_approved_chat, parse_chat_completion, prepare_approved_chat,
-    provider_endpoint_origin, ChatTransport, OpenAiCompatibleAdapter, ProviderAdapter,
-    RequestCancellation, ReqwestStreamingTransport, ReqwestTransport, StreamingTransportResponse,
-    TransportHeader, TransportRequest, TransportResponse, MAX_CHAT_COMPLETION_CONTENT_BYTES,
+    authorize_approved_chat, authorize_workspace_request, parse_chat_completion,
+    prepare_approved_chat, provider_endpoint_origin, ChatTransport, OpenAiCompatibleAdapter,
+    ProviderAdapter, RequestCancellation, ReqwestStreamingTransport, ReqwestTransport,
+    StreamingTransportResponse, TransportHeader, TransportRequest, TransportResponse,
+    MAX_CHAT_COMPLETION_CONTENT_BYTES,
 };
 pub use credentials::{ApiSecret, CredentialStore, ProviderCredentialKey};
 pub use operation_lock::ProviderStoreLock;
@@ -20,5 +21,5 @@ pub use types::{
     ApprovedChatBinding, ApprovedChatDraft, ApprovedChatRequest, ChatCompletion, ChatMessage,
     ChatMessageRole, ChatRequest, ChatUsage, ConnectionTest, ConnectionTestStatus,
     ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderKind, ProviderOptions,
-    ProviderProfile, ReasoningEffort,
+    ProviderProfile, ReasoningEffort, WorkspaceAuthorizedRequest,
 };

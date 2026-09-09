@@ -1,36 +1,35 @@
 [workspace]
 members = [
-  "apps/desktop/src-tauri",
+  "apps/server",
+  "crates/workspace-service",
+  "crates/privacy-text",
   "crates/assistant",
   "crates/citations",
   "crates/database",
   "crates/domain",
-  "crates/diagrams",
   "crates/file-ingest",
   "crates/legal-mcp",
-  "crates/material-processing",
   "crates/privacy",
   "crates/legal-services",
   "crates/providers",
   "crates/retrieval",
-  "vendor/minisign-verify",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.4.0"
+version = "1.0.0"
 
 [workspace.dependencies]
+workspace-service = { path = "crates/workspace-service" }
+privacy-text = { path = "crates/privacy-text" }
 assistant = { path = "crates/assistant" }
 citations = { path = "crates/citations" }
 database = { path = "crates/database" }
 domain = { path = "crates/domain" }
-diagrams = { path = "crates/diagrams" }
 file-ingest = { path = "crates/file-ingest" }
 legal-mcp = { path = "crates/legal-mcp" }
-material-processing = { path = "crates/material-processing" }
 privacy = { path = "crates/privacy" }
 legal-services = { path = "crates/legal-services" }
 providers = { path = "crates/providers" }
@@ -39,17 +38,12 @@ retrieval = { path = "crates/retrieval" }
 rusqlite = { version = "0.40.1", features = ["bundled", "backup", "functions", "serialize"] }
 base64 = "0.22.1"
 jsonschema = { version = "=0.48.2", default-features = false }
-minisign-verify = { path = "vendor/minisign-verify" }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 regex = "1.12.4"
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
-tauri = "2.11.5"
-tauri-build = "2.6.3"
-tauri-plugin-dialog = "=2.7.1"
-tauri-plugin-single-instance = "2.4.3"
 tempfile = "3.23.0"
 uuid = { version = "1.19.0", features = ["v4"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
@@ -71,10 +65,6 @@ codegen-units = 4
 opt-level = 2
 codegen-units = 4
 
-[profile.release.package.urlpattern]
-# The transitive urlpattern crate trips Windows MSVC LLVM/O3 during desktop release packaging.
-opt-level = 2
-codegen-units = 4
 [profile.release]
 # Windows MSVC release/O3 is unstable for this workspace on the release machine.
 opt-level = 2

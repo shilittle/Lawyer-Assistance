@@ -2,15 +2,10 @@
   "mcpServers": {
     "lawyer_assistance": {
       "type": "stdio",
-      "description": "Lawyer Assistance public-law-only MCP server (macOS or Linux; exactly five read-only tools)",
+      "description": "Lawyer Assistance public legal MCP (macOS/Linux; exactly five offline tools)",
       "command": "/opt/lawyer-assistance/bin/lawyer-assistance-mcp",
       "args": ["--privacy-profile", "public_law_only", "stdio"],
-      "env": {
-        "LAWYER_ASSISTANCE_LEGAL_DB": "/opt/lawyer-assistance/data/legal_core.sqlite",
-        "LAWYER_ASSISTANCE_USER_DB": "/opt/lawyer-assistance/data/user.sqlite",
-        "LAWYER_ASSISTANCE_ALLOWED_ROOTS": "/srv/lawyer-assistance/cases",
-        "LAWYER_ASSISTANCE_OUTPUT_ROOT": "/srv/lawyer-assistance/exports"
-      }
+      "env": { "LEGAL_DB": "/opt/lawyer-assistance/data/runtime/legal_core.sqlite" }
     }
   }
 }

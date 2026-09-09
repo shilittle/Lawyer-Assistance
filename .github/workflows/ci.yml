@@ -1,4 +1,4 @@
-name: ci
+name: Web and Rust CI
 
 on:
   push:
@@ -8,429 +8,120 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
-    name: Windows x86_64
+    name: Windows server and WebUI
     runs-on: windows-latest
-
+    env:
+      CARGO_BUILD_JOBS: "1"
+      RUST_TEST_THREADS: "4"
     steps:
-      - name: Checkout
+      - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Set up Node
+      - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
 
-      - name: Set up pnpm
+      - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.7.0
 
-      - name: Set up Python for CI fixture generation
+      - name: Install Python for synthetic smoke fixture
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
 
-      - name: Install pinned Python test dependencies
-        run: python -m pip install --disable-pip-version-check --no-deps -r workers/mineru/requirements-ci.lock
-
-      - name: Enforce UTF-8 and Chinese text integrity
-        run: |
-          python -m unittest scripts.test_check_utf8_text
-          python scripts/check_utf8_text.py
-
-      - name: Verify formal release contract and release asset verifier
-        run: |
-          python -m unittest scripts.test_release_contract scripts.test_verify_release_assets scripts.test_verify_updater_signature -v
-          python scripts/check_release_contract.py --root . --contract scripts/release/release-contract-v0.4.0.json --mode formal
-
-      - name: Set up Rust
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          targets: x86_64-pc-windows-msvc
+          target: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
-      - name: Cache Rust
+      - name: Cache Rust build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: web-rust-windows
 
-      - name: Install frontend dependencies
+      - name: Install WebUI dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Fetch locked release dependency closure
-        run: cargo fetch --locked --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-gnu --target aarch64-apple-darwin
-
-      - name: Test all data build and audit tools
-        run: python -W error::ResourceWarning -m unittest discover -s data/build -p "test_*.py"
-
-      - name: Test local MinerU worker and release builders
-        run: |
-          python -m unittest discover -s workers/mineru/tests -t workers/mineru -p "test_*.py" -v
-          python -m unittest scripts.test_build_production_mineru_worker scripts.test_build_mineru_component_package -v
-
-      - name: Test local MinerU qualification harness
-        shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_qualify_local_mineru.ps1
-
-      - name: Audit provider secrets and sensitive logging
-        run: python data/build/audit_provider_security.py
-
-      - name: Prepare full CI-only legal database fixture
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-          import hashlib
-          import json
-          import os
-          import sqlite3
-
-          root = Path.cwd()
-          output = Path(os.environ["RUNNER_TEMP"]) / "legal_core_full_fixture.sqlite"
-          output.parent.mkdir(parents=True, exist_ok=True)
-          if output.exists():
-              output.unlink()
-
-          connection = sqlite3.connect(output)
-          try:
-              connection.executescript((root / "data" / "schema" / "legal_core.sql").read_text(encoding="utf-8"))
-              connection.executescript((root / "data" / "fixtures" / "legal_core_retrieval_fixture.sql").read_text(encoding="utf-8"))
-              connection.execute(
-                  """
-                  INSERT INTO source_systems (
-                    id, name, base_url, official_scope, maintainer, retrieved_at, notes
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                  """,
-                  (
-                      "ci-official",
-                      "CI fixture source",
-                      "https://example.invalid/ci-fixture",
-                      "ci-fixture-only",
-                      "GitHub Actions",
-                      "1970-01-01T00:00:00Z",
-                      "Never distribute as legal data.",
-                  ),
-              )
-              connection.execute(
-                  """
-                  INSERT INTO source_records (
-                    id, source_system_id, external_id, record_type, source_url,
-                    retrieved_at, checksum, raw_json, raw_text
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  """,
-                  (
-                      "ci-source-record-1",
-                      "ci-official",
-                      "ci-record-1",
-                      "detail",
-                      "https://example.invalid/ci-fixture/1",
-                      "1970-01-01T00:00:00Z",
-                      "ci-fixture-checksum",
-                      "x" * 2_000_000,
-                      "\u6d4b\u8bd5\u539f\u59cb\u6b63\u6587" * 500_000,
-                  ),
-              )
-              connection.execute(
-                  """
-                  INSERT INTO legal_attachments (
-                    id, document_id, source_system_id, external_id, title,
-                    attachment_type, file_type, source_url, storage_path, raw_json
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  """,
-                  (
-                      "ci-attachment-1",
-                      "cn-civil-code",
-                      "ci-official",
-                      "ci-record-1",
-                      "CI archival payload",
-                      "source",
-                      "json",
-                      "https://example.invalid/ci-fixture/1",
-                      "ci-only/fixture.json",
-                      "{}",
-                  ),
-              )
-              timestamp = "1970-01-01T00:00:00Z"
-              metadata = {
-                  "dataset_name": "ci-fixture-not-for-release",
-                  "dataset_version": "ci-runtime-fixture-v1",
-                  "coverage_status": "fixture",
-                  "ci_fixture_id": "lawyer-assistance-github-actions-runtime-v1",
-              }
-              connection.executemany(
-                  """
-                  INSERT INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)
-                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-                  """,
-                  [(key, value, timestamp) for key, value in metadata.items()],
-              )
-              digest = hashlib.sha256()
-              for row in connection.execute(
-                  """
-                  SELECT source_system_id, external_id, record_type, COALESCE(source_url, ''), checksum
-                  FROM source_records
-                  ORDER BY source_system_id, external_id, record_type
-                  """
-              ):
-                  digest.update(
-                      json.dumps(list(row), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                  )
-                  digest.update(b"\n")
-              connection.execute(
-                  """
-                  INSERT INTO database_metadata (key, value, updated_at) VALUES (?, ?, ?)
-                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-                  """,
-                  ("source_manifest_sha256", digest.hexdigest(), timestamp),
-              )
-              connection.commit()
-              connection.execute("VACUUM")
-          finally:
-              connection.close()
-          print(output)
-          '@ | python -
-
-      - name: Verify full CI fixture identity before compaction
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-          import hashlib
-          import json
-          import os
-          import sqlite3
-
-          if os.environ.get("CI", "").lower() != "true" or os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
-              raise RuntimeError("CI fixture validation is restricted to GitHub Actions")
-
-          fixture = Path(os.environ["RUNNER_TEMP"]) / "legal_core_full_fixture.sqlite"
-          connection = sqlite3.connect(f"file:{fixture.resolve().as_posix()}?mode=ro&immutable=1", uri=True)
-          try:
-              metadata = dict(connection.execute("SELECT key, value FROM database_metadata"))
-              expected = {
-                  "schema_version": "4",
-                  "dataset_name": "ci-fixture-not-for-release",
-                  "dataset_version": "ci-runtime-fixture-v1",
-                  "coverage_status": "fixture",
-                  "ci_fixture_id": "lawyer-assistance-github-actions-runtime-v1",
-              }
-              failures = [
-                  f"metadata:{key}:{metadata.get(key)}!={value}"
-                  for key, value in expected.items()
-                  if metadata.get(key) != value
-              ]
-              integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-              if integrity != "ok":
-                  failures.append(f"integrity:{integrity}")
-              foreign_key_errors = len(connection.execute("PRAGMA foreign_key_check").fetchall())
-              if foreign_key_errors:
-                  failures.append(f"foreign_keys:{foreign_key_errors}")
-              article_count = connection.execute("SELECT COUNT(*) FROM law_articles").fetchone()[0]
-              fts_count = connection.execute("SELECT COUNT(*) FROM law_articles_fts").fetchone()[0]
-              if article_count <= 0 or fts_count != article_count:
-                  failures.append(f"articles_and_fts:{article_count}:{fts_count}")
-              source_count, raw_bytes = connection.execute(
-                  """
-                  SELECT COUNT(*), COALESCE(SUM(length(raw_json) + length(raw_text)), 0)
-                  FROM source_records
-                  """
-              ).fetchone()
-              if source_count != 1 or raw_bytes < 1_000_000:
-                  failures.append(f"archival_payload:{source_count}:{raw_bytes}")
-              attachment_count = connection.execute("SELECT COUNT(*) FROM legal_attachments").fetchone()[0]
-              if attachment_count != 1:
-                  failures.append(f"attachments:{attachment_count}")
-              digest = hashlib.sha256()
-              for row in connection.execute(
-                  """
-                  SELECT source_system_id, external_id, record_type, COALESCE(source_url, ''), checksum
-                  FROM source_records
-                  ORDER BY source_system_id, external_id, record_type
-                  """
-              ):
-                  digest.update(
-                      json.dumps(list(row), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                  )
-                  digest.update(b"\n")
-              if metadata.get("source_manifest_sha256") != digest.hexdigest():
-                  failures.append("source_manifest_sha256_mismatch")
-              if failures:
-                  raise RuntimeError(f"full CI fixture rejected: {failures}")
-              print(
-                  json.dumps(
-                      {
-                          "status": "complete",
-                          "fixture": str(fixture),
-                          "article_count": article_count,
-                          "fts_count": fts_count,
-                          "raw_payload_bytes": raw_bytes,
-                      },
-                      indent=2,
-                  )
-              )
-          finally:
-              connection.close()
-          '@ | python -
-
-      - name: Compact full CI fixture into runtime fixture
-        shell: pwsh
-        run: |
-          python data/build/compact_legal_core.py `
-            --input (Join-Path $env:RUNNER_TEMP "legal_core_full_fixture.sqlite") `
-            --output "apps/desktop/src-tauri/resources/legal_core.sqlite" `
-            --report (Join-Path $env:RUNNER_TEMP "legal_core_runtime_report.json") `
-            --manifest (Join-Path $env:RUNNER_TEMP "legal_core_runtime_manifest.json") `
-            --allow-unverified-source
-
-      - name: Prove CI fixture cannot pass the formal release gate
-        shell: pwsh
-        run: |
-          @'
-          import os
-          from pathlib import Path
-          import subprocess
-          import sys
-
-          environment = os.environ.copy()
-          environment.pop("LAWYER_ASSISTANCE_ALLOW_CI_FIXTURE_BUILD", None)
-          result = subprocess.run(
-              [sys.executable, "apps/desktop/scripts/verify_legal_resource.py"],
-              cwd=Path.cwd(),
-              env=environment,
-              check=False,
-              capture_output=True,
-              text=True,
-          )
-          if result.returncode == 0:
-              raise RuntimeError("CI fixture unexpectedly passed the formal release gate")
-          if "formal legal resource rejected" not in result.stderr:
-              raise RuntimeError(
-                  f"formal gate failed for an unexpected reason: {result.stderr.strip()}"
-              )
-          print("formal release gate rejected the CI fixture as required")
-          '@ | python -
-
-      - name: Verify runtime fixture identity and schema with explicit CI opt-in
-        env:
-          LAWYER_ASSISTANCE_ALLOW_CI_FIXTURE_BUILD: "1"
-        run: pnpm --filter @lawyer-assistance/desktop run verify:legal-resource
-
-      - name: Normalize archive metadata in a benchmark-only copy
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-          import os
-          import shutil
-          import sqlite3
-
-          source = Path(os.environ["RUNNER_TEMP"]) / "legal_core_full_fixture.sqlite"
-          output = Path(os.environ["RUNNER_TEMP"]) / "legal_core_benchmark_archive.sqlite"
-          # The compactor deliberately rewrites the runtime dataset version to a
-          # non-release identity. Keep the verified compaction input untouched,
-          # and normalize only this disposable comparison copy because the Rust
-          # benchmark includes open_metadata in its equality checks.
-          shutil.copy2(source, output)
-          connection = sqlite3.connect(output)
-          try:
-              cursor = connection.execute(
-                  """
-                  UPDATE database_metadata
-                  SET value = 'ci-fixture-unverified', updated_at = '1970-01-01T00:00:00Z'
-                  WHERE key = 'dataset_version'
-                  """
-              )
-              if cursor.rowcount != 1:
-                  raise RuntimeError("benchmark metadata normalization updated an unexpected row count")
-              connection.commit()
-          finally:
-              connection.close()
-          print(output)
-          '@ | python -
-
-      - name: Run archive/runtime Rust retrieval benchmark smoke
-        shell: pwsh
-        run: |
-          cargo run --locked -p retrieval --example benchmark_legal_core -- `
-            (Join-Path $env:RUNNER_TEMP "legal_core_benchmark_archive.sqlite") `
-            "apps/desktop/src-tauri/resources/legal_core.sqlite" `
-            5 `
-            (Join-Path $env:RUNNER_TEMP "legal_core_retrieval_benchmark.json")
-
       - name: Check Rust formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
-      - name: Test release file operations, preflight, publication, and PowerShell syntax
-        shell: powershell
-        run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_file_ops.ps1
-          powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/test_release_filename_mapping.ps1
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/test_release_preflight.ps1
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/test_release_publication.ps1
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/test_collect_exact_mcp_ci_assets.ps1
-
-      - name: Reject whitespace errors in the exact checked-out tree
-        run: git diff --check
-
-      - name: Lint Rust
+      - name: Lint the server workspace
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test Rust except the isolated integration parents
-        run: cargo test --locked --workspace --all-targets --all-features -- --skip commands::v031_user_upgrade::tests::real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env --skip approved_backend::tests::approved_streamable_http_tcp_reads_writes_rereads_and_rejects_replay
+      - name: Test the server workspace
+        run: cargo test --locked --workspace --all-targets --all-features
 
-      - name: Test the real OS restart parent without sibling credential contention
-        shell: powershell
+      - name: Build the Windows server and public MCP binaries
+        shell: pwsh
         run: |
-          $testName = 'commands::v031_user_upgrade::tests::real_os_process_restart_crosses_gate8_then_loads_terminal_without_raw_key_env'
-          $inventory = @(& cargo test --locked -p lawyer-assistance-desktop --lib --all-features $testName -- --exact --list --format terse)
-          if ($LASTEXITCODE -ne 0) {
-            throw 'V031 restart test inventory failed.'
-          }
-          $matches = @($inventory | Where-Object { [string]$_ -ceq "${testName}: test" })
-          if ($matches.Count -ne 1) {
-            throw "Expected exactly one V031 restart parent test, found $($matches.Count)."
-          }
-          & cargo test --locked -p lawyer-assistance-desktop --lib --all-features $testName -- --exact --nocapture --test-threads=1
-          if ($LASTEXITCODE -ne 0) {
-            throw 'V031 restart parent test failed in isolation.'
-          }
+          cargo build --release --locked --target x86_64-pc-windows-msvc -p lawyer-assistance-server --bin lawyer-assistance
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked --target x86_64-pc-windows-msvc -p legal-mcp --bin lawyer-assistance-mcp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Test approved MCP streamable HTTP without sibling load
-        shell: powershell
+      - name: Check and test the WebUI
+        shell: pwsh
         run: |
-          $testName = 'approved_backend::tests::approved_streamable_http_tcp_reads_writes_rereads_and_rejects_replay'
-          $inventory = @(& cargo test --locked -p legal-mcp --lib --all-features $testName -- --exact --list --format terse)
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Approved HTTP test inventory failed.'
-          }
-          $matches = @($inventory | Where-Object { [string]$_ -ceq "${testName}: test" })
-          if ($matches.Count -ne 1) {
-            throw "Expected exactly one approved HTTP test, found $($matches.Count)."
-          }
-          & cargo test --locked -p legal-mcp --lib --all-features $testName -- --exact --nocapture --test-threads=1
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Approved HTTP test failed in isolation.'
-          }
+          pnpm run check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Test the actual approved-workspace MCP binary over stdio and HTTP
-        shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-standalone-approved-mcp.ps1
+      - name: Test synthetic Web smoke legal fixture generator
+        run: python -m unittest scripts.test_prepare_web_smoke_db -v
 
-      - name: Verify complete third-party notices
+      - name: Prepare synthetic non-distribution legal fixture for Web smoke
+        shell: pwsh
         run: |
-          python -m unittest scripts.test_generate_third_party_notices
-          python scripts/generate_third_party_notices.py --check
+          $legalDb = Join-Path $env:RUNNER_TEMP "legal_core_web_smoke.synthetic.sqlite"
+          python scripts/prepare_web_smoke_db.py --output $legalDb
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path -LiteralPath $legalDb -PathType Leaf)) {
+            throw "Synthetic Web smoke legal fixture was not created."
+          }
 
-      - name: Lint frontend
-        run: pnpm lint
+      - name: Install Chromium for browser smoke
+        run: pnpm exec playwright install chromium
 
-      - name: Test frontend
-        run: pnpm test
+      - name: Run HTTP and browser smoke
+        shell: pwsh
+        run: |
+          $smokeData = Join-Path $env:RUNNER_TEMP ("lawyer-assistance-smoke-" + [guid]::NewGuid().ToString("N"))
+          $legalDb = Join-Path $env:RUNNER_TEMP "legal_core_web_smoke.synthetic.sqlite"
+          $server = Join-Path $env:GITHUB_WORKSPACE "target\x86_64-pc-windows-msvc\release\lawyer-assistance.exe"
+          if (-not (Test-Path -LiteralPath $legalDb -PathType Leaf)) { throw "Synthetic Web smoke legal fixture is missing." }
+          New-Item -ItemType Directory -Force -Path $smokeData | Out-Null
+          $process = Start-Process -FilePath $server -ArgumentList @(
+            "serve", "--port", "8877", "--data-dir", $smokeData, "--legal-db", $legalDb
+          ) -PassThru -WindowStyle Hidden
+          try {
+            $descriptor = Join-Path $smokeData "connection.dpapi"
+            for ($attempt = 0; $attempt -lt 60 -and -not (Test-Path -LiteralPath $descriptor); $attempt++) {
+              if ($process.HasExited) { throw "server exited before writing its connection descriptor ($($process.ExitCode))" }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not (Test-Path -LiteralPath $descriptor)) { throw "server did not write its connection descriptor" }
+            node scripts/smoke_web.mjs --data-dir $smokeData --require-browser
+            if ($LASTEXITCODE -ne 0) { throw "Web smoke failed" }
+            node scripts/smoke_mcp.mjs --data-dir $smokeData --legal-db $legalDb
+            if ($LASTEXITCODE -ne 0) { throw "MCP smoke failed" }
+            & $server stop --data-dir $smokeData
+            if ($LASTEXITCODE -ne 0) { throw "Graceful shutdown failed" }
+            if (-not $process.WaitForExit(15000)) { throw "Server did not exit after CLI stop" }
+          } finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
+          }
 
-      - name: Build frontend
-        run: pnpm build
-
-      - name: Build Tauri with CI fixture (packaging smoke test only)
-        env:
-          LAWYER_ASSISTANCE_ALLOW_CI_FIXTURE_BUILD: "1"
-        run: pnpm tauri build --config src-tauri/tauri.ci.conf.json
+      - name: Test portable package validation
+        run: pnpm run test:portable

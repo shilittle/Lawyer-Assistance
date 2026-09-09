@@ -1,7 +1,7 @@
 # Source Manifest
 
 The canonical source manifest for the bundled legal database is stored inside
-`apps/desktop/src-tauri/resources/legal_core.sqlite`.
+`data/runtime/legal_core.sqlite`.
 
 Tables:
 

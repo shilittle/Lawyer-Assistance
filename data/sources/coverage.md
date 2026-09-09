@@ -9,7 +9,7 @@ Current Stage 1C reports: `data/generated/stage_1c_history_report.json`,
 
 Archival/audit database: `data/generated/legal_core_full.sqlite`
 
-Bundled runtime projection: `apps/desktop/src-tauri/resources/legal_core.sqlite`
+Bundled runtime projection: `data/runtime/legal_core.sqlite`
 
 - Archival size/SHA-256: `4512894976` /
   `31cf1995cc09f0e3e00f70bfcf20cf67548f1a6362706ccc11d1fd3b2ebc26ac`
@@ -139,5 +139,5 @@ strict audit:
 
 ```powershell
 python data\build\compact_legal_core.py
-python data\build\verify_legal_core_distribution.py --source apps\desktop\src-tauri\resources\legal_core.sqlite
+python data\build\verify_legal_core_distribution.py --source data\runtime\legal_core.sqlite
 ```

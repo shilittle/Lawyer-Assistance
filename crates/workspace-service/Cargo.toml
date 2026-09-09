@@ -1,0 +1,27 @@
+[package]
+name = "workspace-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+domain.workspace = true
+legal-services.workspace = true
+privacy.workspace = true
+privacy-text.workspace = true
+providers.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+windows-sys.workspace = true
+subtle = "2.6"
+tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = "0.7"
+zip = { version = "=2.4.2", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true

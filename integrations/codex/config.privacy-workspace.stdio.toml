@@ -1,0 +1,18 @@
+[mcp_servers.lawyer_assistance_privacy_workspace]
+command = "/absolute/path/to/lawyer-assistance-mcp"
+args = ["--privacy-profile", "privacy_workspace", "--daemon-url", "http://127.0.0.1:8877", "--client-token-file", "/absolute/path/to/privacy-workspace-token.txt", "stdio"]
+env = { LEGAL_DB = "/absolute/path/to/legal_core.sqlite" }
+enabled = true
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+enabled_tools = [
+  "system_status",
+  "legal_search",
+  "legal_get_article",
+  "legal_get_versions",
+  "legal_get_relations",
+  "privacy_workspace.submit",
+  "privacy_workspace.status",
+  "privacy_workspace.read_result",
+]

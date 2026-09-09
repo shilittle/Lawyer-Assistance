@@ -1,8 +1,0 @@
-# Runtime versions qualified by this worker release. The component builder
-# additionally records every installed distribution, file hash, and license in
-# runtime/sbom-python.json and licenses/python-distributions.json.
-mineru==3.4.3
-torch==2.8.0+cu128
-pypdfium2==5.10.1
-Pillow==12.2.0
-loguru==0.7.3

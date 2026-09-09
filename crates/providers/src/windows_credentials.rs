@@ -174,7 +174,22 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        struct CredentialCleanup {
+            store: WindowsCredentialStore,
+            key: ProviderCredentialKey,
+        }
+
+        impl Drop for CredentialCleanup {
+            fn drop(&mut self) {
+                let _ = self.store.delete_api_key(&self.key);
+            }
+        }
 
         fn test_store() -> (String, WindowsCredentialStore, ProviderCredentialKey) {
             let suffix = SystemTime::now()
@@ -230,6 +245,56 @@ mod platform {
                 .read_api_key(&key)
                 .expect("deleted credential can be queried")
                 .is_none());
+        }
+
+        #[test]
+        fn credential_manager_keeps_concurrent_targets_readable_after_write() {
+            const WORKERS: usize = 4;
+            const ROUNDS: usize = 12;
+
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is after epoch")
+                .as_nanos();
+            let prefix = format!(
+                "LawyerAssistanceTest-{}-{suffix}-concurrent",
+                std::process::id()
+            );
+            let barrier = Arc::new(Barrier::new(WORKERS));
+            let mut workers = Vec::new();
+
+            for worker in 0..WORKERS {
+                let store = WindowsCredentialStore::with_service_prefix(prefix.clone());
+                let key = ProviderCredentialKey::new(format!("parallel-{worker}"), "default");
+                let barrier = Arc::clone(&barrier);
+                workers.push(thread::spawn(move || {
+                    let cleanup = CredentialCleanup {
+                        store: store.clone(),
+                        key: key.clone(),
+                    };
+                    // The test prefix is unique per process and invocation, so there is no
+                    // pre-existing target to delete before synchronizing the workers.
+                    barrier.wait();
+
+                    for round in 0..ROUNDS {
+                        let expected =
+                            ApiSecret::new(format!("parallel-test-key-{worker}-{round}"));
+                        cleanup
+                            .store
+                            .write_api_key(&cleanup.key, expected.clone())
+                            .expect("parallel credential writes");
+                        let actual = cleanup
+                            .store
+                            .read_api_key(&cleanup.key)
+                            .expect("parallel credential reads");
+                        assert_eq!(actual.as_ref(), Some(&expected));
+                    }
+                }));
+            }
+
+            for worker in workers {
+                worker.join().expect("parallel credential worker exits");
+            }
         }
     }
 }

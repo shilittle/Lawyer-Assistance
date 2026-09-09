@@ -1,7 +1,9 @@
 use crate::{
-    registry::ToolRegistry,
+    http::HttpClientScope,
+    registry::{PrivacyProfile, ToolRegistry},
     service_adapter::{InFlightOperations, ServiceAdapter},
 };
+use axum::http::{header::AUTHORIZATION, request::Parts};
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, ErrorCode, Implementation, InitializeRequestParams,
@@ -32,6 +34,16 @@ impl LegalMcpServer {
     pub(crate) fn in_flight_operations(&self) -> InFlightOperations {
         self.adapter.in_flight_operations()
     }
+
+    fn registry_for_context(&self, context: &RequestContext<RoleServer>) -> ToolRegistry {
+        if self.registry.profile() == PrivacyProfile::PrivacyWorkspace
+            && request_scope(context) == Some(HttpClientScope::Public)
+        {
+            ToolRegistry::for_profile(PrivacyProfile::PublicLawOnly)
+        } else {
+            self.registry.clone()
+        }
+    }
 }
 
 impl ServerHandler for LegalMcpServer {
@@ -40,34 +52,28 @@ impl ServerHandler for LegalMcpServer {
         if let Some(tools) = capabilities.tools.as_mut() {
             tools.list_changed = Some(false);
         }
-        let profile_instructions = match self.registry.profile() {
-            crate::registry::PrivacyProfile::PublicLawOnly => {
-                "Public-law-only profile. Strict rule (\u{4e25}\u{7981}): never request, read, upload, or relay raw case material. Case and document tools are unavailable. Both MCP result channels are privacy-scanned."
+        let instructions = match self.registry.profile() {
+            PrivacyProfile::PublicLawOnly => {
+                "Public-law-only profile. Strict rule: never request, read, upload, or relay raw case material. Exactly five offline legal tools are available."
             }
-            crate::registry::PrivacyProfile::RedactedCase => {
-                "Redacted-case profile. Only citation_validate is added, and every call requires an App-issued rct_v1 receipt bound to the exact approved CitationValidateRequest bytes, ExternalMcpHost destination, fixed purpose, and TTL. Page-material receipts cannot be reused. If the Windows receipt key or persisted receipt state is unavailable, the tool remains listed but every call fails closed. Raw OCR, paths, case state, writes, generation, and export remain unavailable. Both result channels are privacy-scanned."
+            PrivacyProfile::PrivacyWorkspace => {
+                "Privacy-workspace profile. The five offline legal tools remain available. Three workspace tools call only the local backend with the current client's bearer authorization. They accept no original-text read, mapping, manual approval, or cloud-authorization operation, and return only published redacted results."
             }
-            crate::registry::PrivacyProfile::ApprovedCaseWorkspace => {
-                "Approved-case-workspace profile. Ten opaque-ID-only case/work-product tools and six approved-diagram tools execute only through signed approved generations and exact App-signed grants. Diagram inputs are bound to approved source references; rendered HTML is stored only as an encrypted protected work product. Send only each tool's declared business arguments: access_ticket is an internal broker capability and is rejected on the host wire. The broker validates the live descriptor, qualification, revocation epoch, transport, JSON-RPC request identity, canonical request, tool and purpose before issuing and immediately consuming a one-time internal ticket. Missing qualification, grant mismatch, expiry, revocation, binding mismatch, or replay fails closed. Paths, filenames, artifact URIs, raw OCR, pending review content, private mappings, and vault diagnostics are never accepted or returned. Both result channels are independently privacy-scanned."
-            }
-            crate::registry::PrivacyProfile::DiagramAuthoring => {
-                "Diagram-authoring profile. This explicit opt-in adds deterministic local validation, rendering, update, and export only for synthetic/public DiagramSpec data. It writes a plaintext local artifact.diagram.json/artifact.html bundle and returns content-addressed artifact references. Never place real case material in this profile, even after App approval; use approved_case_workspace for every approved case diagram. Tools never fetch source URIs; model-visible results contain only fixed metadata, validation codes/paths, statistics, hashes, and content-addressed artifact references, and both result channels are privacy-scanned."
-            }
+            PrivacyProfile::RedactedCase
+            | PrivacyProfile::ApprovedCaseWorkspace
+            | PrivacyProfile::DiagramAuthoring => "This profile is disabled.",
         };
-
         ServerInfo::new(capabilities)
             .with_protocol_version(ProtocolVersion::V_2025_11_25)
             .with_server_info(
                 Implementation::new("lawyer-assistance-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("Lawyer Assistance MCP")
-                    .with_description(
-                        "Local-first offline public-law research with optional receipt-gated citation validation",
-                    ),
+                    .with_description("Local-first legal research and published-redaction workspace access"),
             )
             .with_instructions(
                 [
-                "本服务当前只公开离线法规检索工具。严禁读取、上传、转发或要求用户粘贴任何未经脱敏的案件材料、当事人信息或法律文书；案件与文书工具在完成本地脱敏审核门禁前不可用。content 与 structuredContent 仍须经过本地隐私边界检查，引用结论需人工复核。",
-                    profile_instructions,
+                    "严禁读取、上传、转发或要求用户粘贴未经脱敏的案件材料、当事人信息或法律文书。公开法规检索不使用互联网；脱敏工作区只能读取已发布的脱敏文本。",
+                    instructions,
                 ]
                 .join("\n\n"),
             )
@@ -78,8 +84,6 @@ impl ServerHandler for LegalMcpServer {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        // This server deliberately supports only the latest stable protocol.
-        // Unsupported older, future, and RC versions negotiate down to it.
         context.peer.set_peer_info(request);
         Ok(self.get_info())
     }
@@ -87,7 +91,7 @@ impl ServerHandler for LegalMcpServer {
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         if request.and_then(|request| request.cursor).is_some() {
             return Err(ErrorData::invalid_params(
@@ -95,7 +99,9 @@ impl ServerHandler for LegalMcpServer {
                 None,
             ));
         }
-        Ok(ListToolsResult::with_all_items(self.registry.list()))
+        Ok(ListToolsResult::with_all_items(
+            self.registry_for_context(&context).list(),
+        ))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -107,96 +113,55 @@ impl ServerHandler for LegalMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let mut request_params = serde_json::to_value(&request)
-            .map_err(|_| ErrorData::invalid_params("Invalid tools/call params.", None))?;
-        let request_meta = serde_json::to_value(&context.meta)
-            .map_err(|_| ErrorData::invalid_params("Invalid tools/call metadata.", None))?;
-        if request_meta
-            .as_object()
-            .is_some_and(|meta| !meta.is_empty())
-        {
-            request_params
-                .as_object_mut()
-                .ok_or_else(|| ErrorData::invalid_params("Invalid tools/call params.", None))?
-                .insert("_meta".to_owned(), request_meta);
-        }
         let name = request.name.into_owned();
-        if self.registry.get(&name).is_none() {
+        if self.registry_for_context(&context).get(&name).is_none() {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 "未识别的功能请求。",
                 None,
             ));
         }
-        let request_id = serde_json::to_value(context.id)
-            .map_err(|_| ErrorData::invalid_params("Invalid JSON-RPC request id.", None))?;
+        let authorization = context
+            .extensions
+            .get::<Parts>()
+            .and_then(|parts| parts.headers.get(AUTHORIZATION))
+            .and_then(|value| value.to_str().ok());
         self.adapter
-            .call_with_request_id(
-                &name,
-                request.arguments,
-                Some(request_id),
-                Some(request_params),
-            )
+            .call_with_request_id(&name, request.arguments, authorization)
             .await
     }
+}
+
+fn request_scope(context: &RequestContext<RoleServer>) -> Option<HttpClientScope> {
+    context
+        .extensions
+        .get::<Parts>()
+        .and_then(|parts| parts.extensions.get::<HttpClientScope>())
+        .copied()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::PrivacyProfile;
+    use crate::service_adapter::ServiceAdapter;
+    use legal_services::LegalServices;
+    use std::path::PathBuf;
 
-    const ABSOLUTE_RAW_CASE_BAN: &str =
-        "\u{4e25}\u{7981}\u{8bfb}\u{53d6}\u{3001}\u{4e0a}\u{4f20}\u{3001}\u{8f6c}\u{53d1}";
-
-    fn server_info_for_profile(profile: PrivacyProfile) -> ServerInfo {
-        let directory = tempfile::tempdir().expect("temporary service root");
-        let services = legal_services::LegalServices::new(legal_services::ServiceConfig {
-            legal_core_path: directory.path().join("legal.sqlite"),
-            user_database_path: directory.path().join("user.sqlite"),
-            allowed_file_roots: Vec::new(),
-            allowed_output_root: directory.path().to_path_buf(),
-        })
-        .expect("valid test service configuration");
+    #[test]
+    fn info_advertises_only_the_new_profile_contracts() {
+        let service = LegalServices::new_public(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("legal.sqlite"),
+        )
+        .expect("service");
         let server = LegalMcpServer::new(
-            ToolRegistry::for_profile(profile),
-            ServiceAdapter::for_profile(services, profile),
+            ToolRegistry::for_profile(PrivacyProfile::PublicLawOnly),
+            ServiceAdapter::new(service),
         );
-        server.get_info()
-    }
-
-    #[test]
-    fn public_law_only_server_info_keeps_absolute_ban_and_profile_constraints() {
-        let info = server_info_for_profile(PrivacyProfile::PublicLawOnly);
-        assert_eq!(info.protocol_version.as_str(), STABLE_PROTOCOL_VERSION);
-        assert!(info.capabilities.tools.is_some());
-        assert!(info.capabilities.prompts.is_none());
-        assert!(info.capabilities.resources.is_none());
-        assert!(info.capabilities.tasks.is_none());
-        assert!(info.capabilities.experimental.is_none());
-
-        let instructions = info.instructions.as_deref().expect("server instructions");
-        assert!(instructions.contains(ABSOLUTE_RAW_CASE_BAN));
-        assert!(instructions.contains("Public-law-only profile"));
-        assert!(instructions.contains("never request, read, upload, or relay raw case material"));
-        assert!(instructions.contains("Case and document tools are unavailable"));
-        assert!(!instructions.contains("Redacted-case profile"));
-    }
-
-    #[test]
-    fn redacted_case_server_info_keeps_absolute_ban_and_receipt_constraints() {
-        let info = server_info_for_profile(PrivacyProfile::RedactedCase);
-        let instructions = info.instructions.as_deref().expect("server instructions");
-
-        assert!(instructions.contains(ABSOLUTE_RAW_CASE_BAN));
-        assert!(instructions.contains("Redacted-case profile"));
-        assert!(instructions.contains("Only citation_validate is added"));
-        assert!(instructions.contains("rct_v1"));
-        assert!(instructions.contains("ExternalMcpHost"));
-        assert!(instructions.contains("every call fails closed"));
-        assert!(instructions.contains(
-            "Raw OCR, paths, case state, writes, generation, and export remain unavailable"
-        ));
-        assert!(!instructions.contains("Public-law-only profile"));
+        let instructions = server.get_info().instructions.expect("instructions");
+        assert!(instructions.contains("Exactly five"));
+        assert_eq!(
+            server.get_info().protocol_version.as_str(),
+            STABLE_PROTOCOL_VERSION
+        );
     }
 }

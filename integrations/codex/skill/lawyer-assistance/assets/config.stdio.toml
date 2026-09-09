@@ -1,7 +1,7 @@
 [mcp_servers.lawyer_assistance]
 command = "/absolute/path/to/lawyer-assistance-mcp"
 args = ["--privacy-profile", "public_law_only", "stdio"]
-env = { LAWYER_ASSISTANCE_LEGAL_DB = "/absolute/path/to/legal_core.sqlite", LAWYER_ASSISTANCE_USER_DB = "/absolute/path/to/user.sqlite", LAWYER_ASSISTANCE_ALLOWED_ROOTS = "/absolute/path/to/cases", LAWYER_ASSISTANCE_OUTPUT_ROOT = "/absolute/path/to/exports" }
+env = { LEGAL_DB = "/absolute/path/to/legal_core.sqlite" }
 enabled = true
 required = true
 startup_timeout_sec = 20
@@ -13,4 +13,3 @@ enabled_tools = [
   "legal_get_versions",
   "legal_get_relations",
 ]
-default_tools_approval_mode = "writes"

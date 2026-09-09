@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "lawyer_assistance_privacy_workspace": {
+      "type": "stdio",
+      "description": "Lawyer Assistance privacy workspace MCP (Windows; eight tools including published-result access)",
+      "command": "C:/LawyerAssistance/bin/lawyer-assistance-mcp.exe",
+      "args": ["--privacy-profile", "privacy_workspace", "--daemon-url", "http://127.0.0.1:8877", "--client-token-file", "C:/LawyerAssistance/config/privacy-workspace-token.txt", "stdio"],
+      "env": { "LEGAL_DB": "C:/LawyerAssistance/data/runtime/legal_core.sqlite" }
+    }
+  }
+}

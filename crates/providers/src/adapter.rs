@@ -4,8 +4,8 @@ use crate::{
     types::{
         ApprovedChatBinding, ApprovedChatDraft, ApprovedChatRequest, ChatCompletion, ChatMessage,
         ChatMessageRole, ChatRequest, ChatRequestAuthority, ChatUsage, ConnectionTest,
-        ProviderCapabilities, ProviderError, ProviderErrorKind, ProviderKind, ProviderOptions,
-        ProviderProfile,
+        ProviderError, ProviderErrorKind, ProviderKind, ProviderOptions, ProviderProfile,
+        WorkspaceAuthorizedRequest,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,10 @@ static SYNCHRONOUS_TRANSPORT_RUNTIME: OnceLock<
 > = OnceLock::new();
 
 const APPROVED_CHAT_SCHEMA_VERSION: u16 = 1;
+const WORKSPACE_AUTHORIZED_SCHEMA_VERSION: u16 = 1;
 const EXTERNAL_PROVIDER_DESTINATION: &str = "external_provider";
+const WORKSPACE_REDACTION_ASSISTANCE_PURPOSE: &str = "redaction_assistance";
+const WORKSPACE_SELECTED_CONTEXT_CHAT_PURPOSE: &str = "selected_context_chat";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -57,6 +60,24 @@ struct CanonicalApprovedChatEnvelopeV1 {
     approval_generation_id: String,
     approved_redacted_content_sha256: String,
     ocr_provenance_sha256: String,
+    expires_at_unix: u64,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalWorkspaceAuthorizedEnvelopeV1 {
+    schema_version: u16,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    transport_body_sha256: String,
+    profile_sha256: String,
+    provider_id: String,
+    provider_kind: ProviderKind,
+    model_id: String,
+    endpoint_origin: String,
+    destination_kind: String,
+    purpose: String,
+    source_binding_sha256: String,
     expires_at_unix: u64,
 }
 
@@ -148,6 +169,22 @@ struct ApprovedTransportAuthorization {
 }
 
 #[derive(Clone)]
+struct WorkspaceTransportAuthorization {
+    canonical_payload: Arc<[u8]>,
+    canonical_payload_sha256: String,
+    body_sha256: String,
+    profile_sha256: String,
+    provider_id: String,
+    provider_kind: ProviderKind,
+    model_id: String,
+    endpoint_origin: String,
+    purpose: String,
+    source_binding_sha256: String,
+    expires_at_unix: u64,
+    transport_consumed: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
 enum TransportAuthorization {
     Public {
         body_sha256: String,
@@ -155,6 +192,7 @@ enum TransportAuthorization {
         authority: ChatRequestAuthority,
     },
     Approved(Box<ApprovedTransportAuthorization>),
+    WorkspaceAuthorized(Box<WorkspaceTransportAuthorization>),
 }
 
 #[derive(Clone)]
@@ -206,6 +244,7 @@ impl fmt::Debug for TransportRequest {
         let authorization = match &self.authorization {
             TransportAuthorization::Public { .. } => "public",
             TransportAuthorization::Approved(_) => "approved_case",
+            TransportAuthorization::WorkspaceAuthorized(_) => "workspace_authorized",
         };
         formatter
             .debug_struct("TransportRequest")
@@ -354,6 +393,19 @@ impl ReqwestStreamingTransport {
         request: &ApprovedChatRequest,
     ) -> Result<StreamingTransportResponse, ProviderError> {
         let request = build_approved_transport_request(profile, secret, request)?;
+        self.send_transport_request(secret, request).await
+    }
+
+    /// Sends a request produced by the trusted workspace-authorization
+    /// boundary. This is the only provider path that may carry original
+    /// material for `redaction_assistance`.
+    pub async fn send_workspace_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &WorkspaceAuthorizedRequest,
+    ) -> Result<StreamingTransportResponse, ProviderError> {
+        let request = build_workspace_transport_request(profile, secret, request)?;
         self.send_transport_request(secret, request).await
     }
 
@@ -736,6 +788,14 @@ where
         build_approved_transport_request(profile, secret, request)
     }
 
+    fn build_workspace_transport_request(
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &WorkspaceAuthorizedRequest,
+    ) -> Result<TransportRequest, ProviderError> {
+        build_workspace_transport_request(profile, secret, request)
+    }
+
     pub fn send_chat(
         &self,
         profile: &ProviderProfile,
@@ -753,6 +813,19 @@ where
         request: &ApprovedChatRequest,
     ) -> Result<TransportResponse, ProviderError> {
         let transport_request = Self::build_approved_transport_request(profile, secret, request)?;
+        self.transport.send(transport_request)
+    }
+
+    /// Synchronously sends an opaque trusted-workspace authorization. Unlike
+    /// `send_chat`, this is the sole synchronous entry point for original
+    /// material authorized for redaction assistance.
+    pub fn send_workspace_chat(
+        &self,
+        profile: &ProviderProfile,
+        secret: &ApiSecret,
+        request: &WorkspaceAuthorizedRequest,
+    ) -> Result<TransportResponse, ProviderError> {
+        let transport_request = Self::build_workspace_transport_request(profile, secret, request)?;
         self.transport.send(transport_request)
     }
 
@@ -930,7 +1003,8 @@ fn build_transport_request(
     }
     let url = chat_completions_url(profile)?;
     let endpoint_origin = provider_endpoint_origin(profile)?;
-    let body = serde_json::to_string(&build_chat_body(profile, request, false)?).map_err(|_| {
+    let body = serde_json::to_string(&build_chat_body(profile, request, ChatBodyPath::Ordinary)?)
+        .map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "provider request serialization failed",
@@ -960,7 +1034,12 @@ fn build_approved_transport_request(
     validate_approved_request_for_profile(profile, approved)?;
     let request = &approved.draft.request;
     let url = chat_completions_url(profile)?;
-    let body = serde_json::to_string(&build_chat_body(profile, request, true)?).map_err(|_| {
+    let body = serde_json::to_string(&build_chat_body(
+        profile,
+        request,
+        ChatBodyPath::ApprovedCase,
+    )?)
+    .map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "approved provider request serialization failed",
@@ -1017,6 +1096,61 @@ fn build_approved_transport_request(
     })
 }
 
+fn build_workspace_transport_request(
+    profile: &ProviderProfile,
+    secret: &ApiSecret,
+    workspace: &WorkspaceAuthorizedRequest,
+) -> Result<TransportRequest, ProviderError> {
+    validate_workspace_request_for_profile(profile, workspace)?;
+    let request = &workspace.request;
+    let url = chat_completions_url(profile)?;
+    let body = serde_json::to_string(&build_chat_body(
+        profile,
+        request,
+        ChatBodyPath::WorkspaceAuthorized,
+    )?)
+    .map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request serialization failed",
+        )
+    })?;
+    if workspace
+        .consumed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request has already been consumed",
+        ));
+    }
+    let authorization =
+        TransportAuthorization::WorkspaceAuthorized(Box::new(WorkspaceTransportAuthorization {
+            canonical_payload: workspace.canonical_payload.clone(),
+            canonical_payload_sha256: workspace.canonical_payload_sha256.clone(),
+            body_sha256: privacy::sha256_hex(body.as_bytes()),
+            profile_sha256: workspace.profile_sha256.clone(),
+            provider_id: workspace.provider_id.clone(),
+            provider_kind: workspace.provider_kind,
+            model_id: workspace.model_id.clone(),
+            endpoint_origin: workspace.endpoint_origin.clone(),
+            purpose: workspace.purpose.clone(),
+            source_binding_sha256: workspace.source_binding_sha256.clone(),
+            expires_at_unix: workspace.expires_at_unix,
+            transport_consumed: Arc::new(AtomicBool::new(false)),
+        }));
+    Ok(TransportRequest {
+        method: "POST".to_owned(),
+        url,
+        headers: provider_headers(secret, request.stream),
+        body,
+        expects_stream: request.stream,
+        allow_private_network: private_network_is_explicitly_allowed(profile),
+        authorization,
+    })
+}
+
 fn validate_approved_request_for_profile(
     profile: &ProviderProfile,
     approved: &ApprovedChatRequest,
@@ -1042,6 +1176,32 @@ fn validate_approved_request_for_profile(
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "approved provider request no longer matches the active provider profile",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_request_for_profile(
+    profile: &ProviderProfile,
+    workspace: &WorkspaceAuthorizedRequest,
+) -> Result<(), ProviderError> {
+    validate_workspace_request(workspace)?;
+    let now_unix = system_unix_time()?;
+    let endpoint_origin = provider_endpoint_origin(profile)?;
+    let active_profile_sha256 = workspace_profile_sha256(profile)?;
+    let active_transport_body_sha256 =
+        workspace_transport_body_sha256(profile, &workspace.request)?;
+    if profile.id != workspace.provider_id
+        || profile.kind != workspace.provider_kind
+        || effective_model_id(profile) != workspace.model_id
+        || endpoint_origin != workspace.endpoint_origin
+        || active_profile_sha256 != workspace.profile_sha256
+        || workspace.expires_at_unix <= now_unix
+        || active_transport_body_sha256 != workspace.transport_body_sha256
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request no longer matches the active provider profile",
         ));
     }
     Ok(())
@@ -1074,7 +1234,7 @@ fn approved_transport_body_sha256(
     profile: &ProviderProfile,
     request: &ChatRequest,
 ) -> Result<String, ProviderError> {
-    let body = build_chat_body(profile, request, true)?;
+    let body = build_chat_body(profile, request, ChatBodyPath::ApprovedCase)?;
     let bytes = serde_json::to_vec(&body).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::InvalidRequest,
@@ -1082,6 +1242,118 @@ fn approved_transport_body_sha256(
         )
     })?;
     Ok(privacy::sha256_hex(&bytes))
+}
+
+fn workspace_transport_body_sha256(
+    profile: &ProviderProfile,
+    request: &ChatRequest,
+) -> Result<String, ProviderError> {
+    let body = build_chat_body(profile, request, ChatBodyPath::WorkspaceAuthorized)?;
+    let bytes = serde_json::to_vec(&body).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request serialization failed",
+        )
+    })?;
+    Ok(privacy::sha256_hex(&bytes))
+}
+
+fn workspace_profile_sha256(profile: &ProviderProfile) -> Result<String, ProviderError> {
+    let bytes = serde_json::to_vec(profile).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidProfile,
+            "provider profile canonicalization failed",
+        )
+    })?;
+    Ok(privacy::sha256_hex(&bytes))
+}
+
+/// Builds the opaque one-shot authorization required to send sensitive
+/// workspace content to a Provider.
+///
+/// This function is intentionally a trusted backend boundary. Its caller must
+/// already have atomically consumed a persisted, version-bound workspace batch
+/// authorization and verified that the current source material corresponds to
+/// `source_binding_sha256`. WebUI and MCP request handlers must never accept a
+/// serialized form of `WorkspaceAuthorizedRequest`, must not create it from
+/// client input directly, and remain responsible for confirming that selected
+/// redacted context is active before using `selected_context_chat`.
+pub fn authorize_workspace_request(
+    profile: &ProviderProfile,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    purpose: &str,
+    source_binding_sha256: &str,
+    expires_at_unix: u64,
+) -> Result<WorkspaceAuthorizedRequest, ProviderError> {
+    validate_workspace_purpose(purpose)?;
+    if !valid_lower_sha256(source_binding_sha256) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace source binding is invalid",
+        ));
+    }
+    if expires_at_unix <= system_unix_time()? {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request expiry must be in the future",
+        ));
+    }
+    validate_chat_shape(&messages, None, None)?;
+    let endpoint_origin = provider_endpoint_origin(profile)?;
+    let model_id = effective_model_id(profile).to_owned();
+    validate_provider_binding_text("provider ID", &profile.id)?;
+    validate_provider_binding_text("model ID", &model_id)?;
+    let profile_sha256 = workspace_profile_sha256(profile)?;
+
+    let request = ChatRequest {
+        messages,
+        stream,
+        temperature: None,
+        max_tokens: None,
+        authority: ChatRequestAuthority::WorkspaceAuthorized,
+    };
+    // The exact opaque workspace authority is the only non-interactive path
+    // permitted to carry residual PII. `build_chat_body` still validates the
+    // full request shape and provider-specific options before it is bound.
+    let transport_body_sha256 = workspace_transport_body_sha256(profile, &request)?;
+    let envelope = CanonicalWorkspaceAuthorizedEnvelopeV1 {
+        schema_version: WORKSPACE_AUTHORIZED_SCHEMA_VERSION,
+        messages: request.messages.clone(),
+        stream: request.stream,
+        transport_body_sha256: transport_body_sha256.clone(),
+        profile_sha256: profile_sha256.clone(),
+        provider_id: profile.id.clone(),
+        provider_kind: profile.kind,
+        model_id: model_id.clone(),
+        endpoint_origin: endpoint_origin.clone(),
+        destination_kind: EXTERNAL_PROVIDER_DESTINATION.to_owned(),
+        purpose: purpose.to_owned(),
+        source_binding_sha256: source_binding_sha256.to_owned(),
+        expires_at_unix,
+    };
+    let canonical_payload = serde_json::to_vec(&envelope).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request canonicalization failed",
+        )
+    })?;
+    let canonical_payload_sha256 = privacy::sha256_hex(&canonical_payload);
+    Ok(WorkspaceAuthorizedRequest {
+        request,
+        canonical_payload: Arc::from(canonical_payload),
+        canonical_payload_sha256,
+        transport_body_sha256,
+        profile_sha256,
+        provider_id: profile.id.clone(),
+        provider_kind: profile.kind,
+        model_id,
+        endpoint_origin,
+        purpose: purpose.to_owned(),
+        source_binding_sha256: source_binding_sha256.to_owned(),
+        expires_at_unix,
+        consumed: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 pub fn prepare_approved_chat(
@@ -1276,6 +1548,66 @@ fn validate_approved_draft(draft: &ApprovedChatDraft) -> Result<(), ProviderErro
     Ok(())
 }
 
+fn validate_workspace_request(workspace: &WorkspaceAuthorizedRequest) -> Result<(), ProviderError> {
+    validate_workspace_purpose(&workspace.purpose)?;
+    validate_provider_binding_text("provider ID", &workspace.provider_id)?;
+    validate_provider_binding_text("model ID", &workspace.model_id)?;
+    if !valid_lower_sha256(&workspace.source_binding_sha256)
+        || !valid_lower_sha256(&workspace.transport_body_sha256)
+        || !valid_lower_sha256(&workspace.profile_sha256)
+        || workspace.expires_at_unix == 0
+        || workspace.request.authority != ChatRequestAuthority::WorkspaceAuthorized
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request binding is invalid",
+        ));
+    }
+    validate_chat_shape(
+        &workspace.request.messages,
+        workspace.request.temperature,
+        workspace.request.max_tokens,
+    )?;
+    let expected = CanonicalWorkspaceAuthorizedEnvelopeV1 {
+        schema_version: WORKSPACE_AUTHORIZED_SCHEMA_VERSION,
+        messages: workspace.request.messages.clone(),
+        stream: workspace.request.stream,
+        transport_body_sha256: workspace.transport_body_sha256.clone(),
+        profile_sha256: workspace.profile_sha256.clone(),
+        provider_id: workspace.provider_id.clone(),
+        provider_kind: workspace.provider_kind,
+        model_id: workspace.model_id.clone(),
+        endpoint_origin: workspace.endpoint_origin.clone(),
+        destination_kind: EXTERNAL_PROVIDER_DESTINATION.to_owned(),
+        purpose: workspace.purpose.clone(),
+        source_binding_sha256: workspace.source_binding_sha256.clone(),
+        expires_at_unix: workspace.expires_at_unix,
+    };
+    let decoded: CanonicalWorkspaceAuthorizedEnvelopeV1 =
+        serde_json::from_slice(&workspace.canonical_payload).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "workspace provider request canonical payload is invalid",
+            )
+        })?;
+    let rebuilt = serde_json::to_vec(&expected).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request canonicalization failed",
+        )
+    })?;
+    if decoded != expected
+        || rebuilt.as_slice() != workspace.canonical_payload.as_ref()
+        || privacy::sha256_hex(&workspace.canonical_payload) != workspace.canonical_payload_sha256
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request canonical payload mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_approved_binding(binding: &ApprovedChatBinding) -> Result<(), ProviderError> {
     validate_provider_binding_text("purpose", &binding.purpose)?;
     validate_provider_binding_text("policy ID", &binding.policy_id)?;
@@ -1293,6 +1625,20 @@ fn validate_approved_binding(binding: &ApprovedChatBinding) -> Result<(), Provid
         ));
     }
     Ok(())
+}
+
+fn validate_workspace_purpose(purpose: &str) -> Result<(), ProviderError> {
+    if matches!(
+        purpose,
+        WORKSPACE_REDACTION_ASSISTANCE_PURPOSE | WORKSPACE_SELECTED_CONTEXT_CHAT_PURPOSE
+    ) {
+        Ok(())
+    } else {
+        Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "workspace provider request purpose is invalid",
+        ))
+    }
 }
 
 fn validate_provider_binding_text(name: &str, value: &str) -> Result<(), ProviderError> {
@@ -1367,7 +1713,7 @@ fn parsed_provider_base_url(
 
     match parsed.scheme() {
         "https" => {}
-        "http" if approved_qualification_loopback_http_is_allowed(profile, &parsed) => {}
+        "http" if literal_loopback_http_is_explicitly_allowed(profile, &parsed) => {}
         "http" => {
             return Err(ProviderError::new(
                 ProviderErrorKind::InvalidProfile,
@@ -1391,7 +1737,11 @@ fn parsed_provider_base_url(
     Ok((trimmed, parsed))
 }
 
-fn approved_qualification_loopback_http_is_allowed(
+/// Plain HTTP is allowed solely for an explicit custom profile targeting a
+/// literal loopback IP. `localhost` and names ending in `.localhost` are
+/// deliberately rejected: the URL parser alone cannot prove the resolver will
+/// not later select a non-loopback address.
+fn literal_loopback_http_is_explicitly_allowed(
     profile: &ProviderProfile,
     parsed: &reqwest::Url,
 ) -> bool {
@@ -1402,25 +1752,11 @@ fn approved_qualification_loopback_http_is_allowed(
                 .strip_prefix('[')
                 .and_then(|value| value.strip_suffix(']'))
                 .unwrap_or(host);
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
+            host.parse::<IpAddr>().is_ok_and(|address| match address {
+                IpAddr::V4(address) => address == Ipv4Addr::LOCALHOST,
+                IpAddr::V6(address) => address == Ipv6Addr::LOCALHOST,
+            })
         })
-        && (cfg!(test)
-            || (profile.id == "internal-provider-qualification-canary-v1"
-                && profile.display_name == "Internal Provider Qualification Canary"
-                && profile.model_id == "local-qualification-model-v1"
-                && profile.credential_account_id == "internal-canary"
-                && profile.capabilities
-                    == ProviderCapabilities::custom_openai_compatible_defaults()
-                && profile.options
-                    == (ProviderOptions {
-                        allow_private_network: Some(true),
-                        ..ProviderOptions::default()
-                    })
-                && parsed.port().is_some()
-                && parsed.path() == "/v1"))
 }
 
 fn private_network_is_explicitly_allowed(profile: &ProviderProfile) -> bool {
@@ -1528,6 +1864,61 @@ fn validate_transport_authorization(
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
                     "approved provider request has already been consumed",
+                ));
+            }
+        }
+        TransportAuthorization::WorkspaceAuthorized(authorization) => {
+            let now_unix = system_unix_time()?;
+            let canonical_sha256 = privacy::sha256_hex(&authorization.canonical_payload);
+            let envelope: CanonicalWorkspaceAuthorizedEnvelopeV1 =
+                serde_json::from_slice(&authorization.canonical_payload)
+                    .map_err(|_| transport_authorization_error())?;
+            let rebuilt_canonical =
+                serde_json::to_vec(&envelope).map_err(|_| transport_authorization_error())?;
+            let canonical_bytes: &[u8] = authorization.canonical_payload.as_ref();
+            let body_matches_envelope = body_sha256 == envelope.transport_body_sha256;
+            let body: Value =
+                serde_json::from_str(&request.body).map_err(|_| transport_authorization_error())?;
+            if canonical_sha256 != authorization.canonical_payload_sha256
+                || rebuilt_canonical.as_slice() != canonical_bytes
+                || !body_matches_envelope
+                || envelope.transport_body_sha256 != authorization.body_sha256
+                || body_sha256 != authorization.body_sha256
+                || endpoint_origin != authorization.endpoint_origin
+                || envelope.schema_version != WORKSPACE_AUTHORIZED_SCHEMA_VERSION
+                || envelope.destination_kind != EXTERNAL_PROVIDER_DESTINATION
+                || envelope.profile_sha256 != authorization.profile_sha256
+                || envelope.provider_id != authorization.provider_id
+                || envelope.provider_kind != authorization.provider_kind
+                || envelope.model_id != authorization.model_id
+                || envelope.endpoint_origin != authorization.endpoint_origin
+                || envelope.purpose != authorization.purpose
+                || envelope.source_binding_sha256 != authorization.source_binding_sha256
+                || !valid_lower_sha256(&envelope.profile_sha256)
+                || !valid_lower_sha256(&envelope.source_binding_sha256)
+                || envelope.expires_at_unix != authorization.expires_at_unix
+                || envelope.expires_at_unix <= now_unix
+                || !matches!(
+                    envelope.purpose.as_str(),
+                    WORKSPACE_REDACTION_ASSISTANCE_PURPOSE
+                        | WORKSPACE_SELECTED_CONTEXT_CHAT_PURPOSE
+                )
+                || body.get("model").and_then(Value::as_str)
+                    != Some(authorization.model_id.as_str())
+                || body.get("stream").and_then(Value::as_bool) != Some(envelope.stream)
+                || request.expects_stream != envelope.stream
+            {
+                return Err(transport_authorization_error());
+            }
+            if consume_approved
+                && authorization
+                    .transport_consumed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "workspace provider request has already been consumed",
                 ));
             }
         }
@@ -1658,21 +2049,30 @@ fn resolve_base_url(profile: &ProviderProfile) -> Result<String, ProviderError> 
         .replace("{WorkspaceId}", workspace_id))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatBodyPath {
+    Ordinary,
+    ApprovedCase,
+    WorkspaceAuthorized,
+}
+
 fn build_chat_body(
     profile: &ProviderProfile,
     request: &ChatRequest,
-    approved_case: bool,
+    path: ChatBodyPath,
 ) -> Result<Value, ProviderError> {
-    let authority_matches = if approved_case {
-        request.authority == ChatRequestAuthority::ApprovedCase
-    } else {
-        matches!(
+    let authority_matches = match path {
+        ChatBodyPath::Ordinary => matches!(
             request.authority,
             ChatRequestAuthority::ConnectionProbe
                 | ChatRequestAuthority::LegalPublic
                 | ChatRequestAuthority::ProductPublic
                 | ChatRequestAuthority::InteractiveUserContent
-        )
+        ),
+        ChatBodyPath::ApprovedCase => request.authority == ChatRequestAuthority::ApprovedCase,
+        ChatBodyPath::WorkspaceAuthorized => {
+            request.authority == ChatRequestAuthority::WorkspaceAuthorized
+        }
     };
     if !authority_matches {
         return Err(ProviderError::new(
@@ -1756,7 +2156,11 @@ fn build_chat_body(
             "provider request privacy validation failed",
         )
     })?;
-    if request.authority != ChatRequestAuthority::InteractiveUserContent && !residual.passed {
+    if !matches!(
+        request.authority,
+        ChatRequestAuthority::InteractiveUserContent | ChatRequestAuthority::WorkspaceAuthorized
+    ) && !residual.passed
+    {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "provider request rejected by privacy policy",
@@ -1807,7 +2211,11 @@ fn scan_message_content(
             "provider message privacy validation failed",
         )
     })?;
-    if authority != ChatRequestAuthority::InteractiveUserContent && !residual.passed {
+    if !matches!(
+        authority,
+        ChatRequestAuthority::InteractiveUserContent | ChatRequestAuthority::WorkspaceAuthorized
+    ) && !residual.passed
+    {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "provider message contains residual sensitive content",
@@ -2298,6 +2706,25 @@ mod tests {
         value
     }
 
+    fn workspace_test_request(
+        provider_profile: &ProviderProfile,
+        stream: bool,
+    ) -> WorkspaceAuthorizedRequest {
+        authorize_workspace_request(
+            provider_profile,
+            vec![ChatMessage {
+                role: ChatMessageRole::User,
+                content: "Original material: client phone 13800138000. RAW_WORKSPACE_CANARY."
+                    .to_owned(),
+            }],
+            stream,
+            WORKSPACE_REDACTION_ASSISTANCE_PURPOSE,
+            &privacy::sha256_hex(b"workspace-material-v1"),
+            system_unix_time().expect("system time") + 300,
+        )
+        .expect("trusted workspace authorization builds")
+    }
+
     fn approved_test_binding(expires_at_unix: u64) -> ApprovedChatBinding {
         ApprovedChatBinding {
             purpose: "assistant_chat".to_owned(),
@@ -2653,6 +3080,191 @@ mod tests {
     }
 
     #[test]
+    fn raw_workspace_content_requires_the_opaque_workspace_authorization_and_is_one_shot() {
+        const RAW_MARKER: &str = "RAW_WORKSPACE_CANARY";
+        let provider_profile = approved_test_profile("https://provider.example/v1");
+        let secret = ApiSecret::new("synthetic-secret");
+        let raw_messages = vec![ChatMessage {
+            role: ChatMessageRole::User,
+            content: "Original material: client phone 13800138000. RAW_WORKSPACE_CANARY."
+                .to_owned(),
+        }];
+        let transport = MockTransport::new(TransportResponse {
+            status: 200,
+            body: r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 1,
+        });
+        let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+
+        let public = ChatRequest::product_public(raw_messages, false, None, None);
+        let error = adapter
+            .send_chat(&provider_profile, &secret, &public)
+            .expect_err("ordinary public chat must never send original workspace material");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(transport.requests.lock().expect("requests lock").is_empty());
+
+        let workspace = workspace_test_request(&provider_profile, false);
+        let debug = format!("{workspace:?}");
+        assert!(!debug.contains(RAW_MARKER));
+        assert!(!debug.contains("13800138000"));
+        assert_eq!(workspace.purpose(), WORKSPACE_REDACTION_ASSISTANCE_PURPOSE);
+
+        adapter
+            .send_workspace_chat(&provider_profile, &secret, &workspace)
+            .expect("opaque workspace authorization may send raw redaction input");
+        let replay = adapter
+            .send_workspace_chat(&provider_profile, &secret, &workspace)
+            .expect_err("workspace authorization is one-shot");
+        assert_eq!(replay.kind, ProviderErrorKind::InvalidRequest);
+        assert!(replay.to_string().contains("already been consumed"));
+
+        let requests = transport.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].body().contains(RAW_MARKER));
+        assert!(!format!("{:?}", requests[0]).contains(RAW_MARKER));
+        assert!(!format!("{:?}", requests[0]).contains("13800138000"));
+    }
+
+    #[test]
+    fn workspace_authorization_rejects_invalid_purpose_expiry_and_complete_profile_drift() {
+        let provider_profile = approved_test_profile("https://provider.example/v1");
+        let source_binding_sha256 = privacy::sha256_hex(b"workspace-material-v1");
+        let messages = vec![ChatMessage {
+            role: ChatMessageRole::User,
+            content: "Original material: phone 13800138000.".to_owned(),
+        }];
+        let now = system_unix_time().expect("system time");
+
+        let purpose_error = authorize_workspace_request(
+            &provider_profile,
+            messages.clone(),
+            false,
+            "assistant_chat",
+            &source_binding_sha256,
+            now + 300,
+        )
+        .expect_err("only the explicit workspace purposes are allowed");
+        assert_eq!(purpose_error.kind, ProviderErrorKind::InvalidRequest);
+
+        let expiry_error = authorize_workspace_request(
+            &provider_profile,
+            messages,
+            false,
+            WORKSPACE_REDACTION_ASSISTANCE_PURPOSE,
+            &source_binding_sha256,
+            now.saturating_sub(1),
+        )
+        .expect_err("expired workspace authority is rejected at construction");
+        assert_eq!(expiry_error.kind, ProviderErrorKind::InvalidRequest);
+
+        let workspace = workspace_test_request(&provider_profile, false);
+        let mut drifted = provider_profile.clone();
+        drifted.display_name = "edited display name also changes full profile binding".to_owned();
+        let transport = MockTransport::new(TransportResponse {
+            status: 200,
+            body: "transport must not run".to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 0,
+        });
+        let error = OpenAiCompatibleAdapter::new(transport.clone())
+            .send_workspace_chat(&drifted, &ApiSecret::new("synthetic-secret"), &workspace)
+            .expect_err("any provider profile drift invalidates the workspace authorization");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(transport.requests.lock().expect("requests lock").is_empty());
+        assert!(!error.to_string().contains("13800138000"));
+    }
+
+    #[test]
+    fn workspace_transport_rejects_tampering_and_expiry_before_loopback_io() {
+        let fixture = spawn_approved_json_fixture();
+        let provider_profile = approved_test_profile(fixture.base_url.clone());
+        let secret = ApiSecret::new("synthetic-loopback-secret");
+        let workspace = workspace_test_request(&provider_profile, false);
+        let mut tampered =
+            OpenAiCompatibleAdapter::<ReqwestTransport>::build_workspace_transport_request(
+                &provider_profile,
+                &secret,
+                &workspace,
+            )
+            .expect("workspace transport request builds");
+        tampered.body.push(' ');
+
+        let transport =
+            ReqwestTransport::new_with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+                .expect("transport builds");
+        let tamper_error = transport
+            .send(tampered)
+            .expect_err("tampered workspace body is rejected before network I/O");
+        assert_eq!(tamper_error.kind, ProviderErrorKind::InvalidRequest);
+
+        let workspace = workspace_test_request(&provider_profile, false);
+        let mut expired =
+            OpenAiCompatibleAdapter::<ReqwestTransport>::build_workspace_transport_request(
+                &provider_profile,
+                &secret,
+                &workspace,
+            )
+            .expect("workspace transport request builds");
+        let expired_at = system_unix_time().expect("system time").saturating_sub(1);
+        let authorization = match &mut expired.authorization {
+            TransportAuthorization::WorkspaceAuthorized(value) => value,
+            _ => panic!("workspace authorization expected"),
+        };
+        let mut envelope: CanonicalWorkspaceAuthorizedEnvelopeV1 =
+            serde_json::from_slice(&authorization.canonical_payload)
+                .expect("workspace canonical envelope parses");
+        envelope.expires_at_unix = expired_at;
+        let canonical_payload =
+            serde_json::to_vec(&envelope).expect("workspace canonical envelope serializes");
+        authorization.canonical_payload_sha256 = privacy::sha256_hex(&canonical_payload);
+        authorization.canonical_payload = Arc::<[u8]>::from(canonical_payload);
+        authorization.expires_at_unix = expired_at;
+        let expiry_error = transport
+            .send(expired)
+            .expect_err("expired workspace authorization is rejected before network I/O");
+        assert_eq!(expiry_error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(fixture.finish().is_empty());
+    }
+
+    #[test]
+    fn streaming_workspace_chat_reads_a_non_streaming_provider_body() {
+        let fixture = spawn_approved_json_fixture();
+        let provider_profile = approved_test_profile(fixture.base_url.clone());
+        let workspace = workspace_test_request(&provider_profile, false);
+        let transport = ReqwestStreamingTransport::new_with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("streaming transport builds");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+
+        let (status, body) = runtime.block_on(async {
+            let mut response = transport
+                .send_workspace_chat(
+                    &provider_profile,
+                    &ApiSecret::new("synthetic-loopback-secret"),
+                    &workspace,
+                )
+                .await
+                .expect("non-stream workspace request reaches the provider");
+            let status = response.status();
+            let mut body = Vec::new();
+            while let Some(chunk) = response.next_chunk().await.expect("response chunk reads") {
+                body.extend_from_slice(&chunk);
+            }
+            (status, body)
+        });
+
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("\"content\":\"ok\""));
+        assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[test]
     fn approved_receipt_purpose_mismatch_never_reaches_transport() {
         let provider_profile = approved_test_profile("https://provider.example/v1");
         let expires_at_unix = system_unix_time().expect("system time") + 300;
@@ -2804,6 +3416,9 @@ mod tests {
         let authorization = match &mut request.authorization {
             TransportAuthorization::Approved(value) => value,
             TransportAuthorization::Public { .. } => panic!("approved authorization expected"),
+            TransportAuthorization::WorkspaceAuthorized(_) => {
+                panic!("approved authorization expected")
+            }
         };
         let mut envelope: CanonicalApprovedChatEnvelopeV1 =
             serde_json::from_slice(&authorization.canonical_payload)
@@ -3070,6 +3685,54 @@ mod tests {
             assert!(request.url.ends_with("/chat/completions"));
             assert!(request.allow_private_network);
         }
+    }
+
+    #[test]
+    fn plain_http_requires_explicit_custom_literal_loopback_target() {
+        for endpoint in ["http://127.0.0.1:3000/v1", "http://[::1]:3000/v1"] {
+            let mut profile = profile(ProviderKind::Custom);
+            profile.base_url = endpoint.to_owned();
+            profile.options.allow_private_network = Some(true);
+
+            let request = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
+                &profile,
+                &ApiSecret::new("contract-secret-1234"),
+                &request_for_contract(),
+            )
+            .expect("explicit custom literal-loopback HTTP endpoint builds");
+            assert!(request.url.starts_with(endpoint));
+        }
+
+        for endpoint in [
+            "http://localhost:3000/v1",
+            "http://localhost.:3000/v1",
+            "http://127.0.0.2:3000/v1",
+            "http://192.168.10.20:3000/v1",
+            "http://provider.example/v1",
+        ] {
+            let mut profile = profile(ProviderKind::Custom);
+            profile.base_url = endpoint.to_owned();
+            profile.options.allow_private_network = Some(true);
+
+            let error = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
+                &profile,
+                &ApiSecret::new("contract-secret-1234"),
+                &request_for_contract(),
+            )
+            .expect_err("plain HTTP outside literal loopback is rejected");
+            assert_eq!(error.kind, ProviderErrorKind::InvalidProfile);
+        }
+
+        let mut built_in = profile(ProviderKind::DeepSeek);
+        built_in.base_url = "http://127.0.0.1:3000/v1".to_owned();
+        built_in.options.allow_private_network = Some(true);
+        let error = OpenAiCompatibleAdapter::<MockTransport>::build_transport_request(
+            &built_in,
+            &ApiSecret::new("contract-secret-1234"),
+            &request_for_contract(),
+        )
+        .expect_err("built-in provider cannot use loopback HTTP");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidProfile);
     }
 
     #[test]

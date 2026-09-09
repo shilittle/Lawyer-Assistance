@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "data" / "generated" / "legal_core_distribution_manifest.json"
-DEFAULT_OUTPUT = ROOT / "apps" / "desktop" / "src-tauri" / "resources" / "legal_core.sqlite"
+DEFAULT_OUTPUT = ROOT / "data" / "runtime" / "legal_core.sqlite"
 RUNTIME_PROFILE = "runtime-slim-v1"
 RUNTIME_SCHEMA_VERSION = "1"
 OFFICIAL_DATASET_NAME = "official-china-legal-core"

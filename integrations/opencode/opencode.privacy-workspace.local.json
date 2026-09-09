@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "mcp": {
+    "lawyer_assistance_privacy_workspace": {
+      "type": "local",
+      "command": ["/absolute/path/to/lawyer-assistance-mcp", "--privacy-profile", "privacy_workspace", "--daemon-url", "http://127.0.0.1:8877", "--client-token-file", "/absolute/path/to/privacy-workspace-token.txt", "stdio"],
+      "enabled": false,
+      "timeout": 30000,
+      "environment": { "LEGAL_DB": "/absolute/path/to/legal_core.sqlite" }
+    }
+  },
+  "permission": {
+    "lawyer_assistance_privacy_workspace_*": "deny",
+    "lawyer_assistance_privacy_workspace_system_status": "allow",
+    "lawyer_assistance_privacy_workspace_legal_search": "allow",
+    "lawyer_assistance_privacy_workspace_legal_get_article": "allow",
+    "lawyer_assistance_privacy_workspace_legal_get_versions": "allow",
+    "lawyer_assistance_privacy_workspace_legal_get_relations": "allow",
+    "lawyer_assistance_privacy_workspace_privacy_workspace_submit": "ask",
+    "lawyer_assistance_privacy_workspace_privacy_workspace_status": "allow",
+    "lawyer_assistance_privacy_workspace_privacy_workspace_read_result": "allow"
+  }
+}

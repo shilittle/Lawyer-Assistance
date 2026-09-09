@@ -2,6 +2,10 @@ use crate::{ExtractedSegment, Extraction, IngestError, Limits};
 
 pub(super) fn extract(bytes: &[u8], limits: Limits) -> Result<Extraction, IngestError> {
     let decoded = std::str::from_utf8(bytes).map_err(|_| IngestError::InvalidUtf8)?;
+    extract_decoded(decoded, limits)
+}
+
+pub(super) fn extract_decoded(decoded: &str, limits: Limits) -> Result<Extraction, IngestError> {
     let decoded = decoded.strip_prefix('\u{feff}').unwrap_or(decoded);
     let normalized = normalize_line_endings(decoded, limits.max_text_bytes)?;
     let segments = segment_lines(

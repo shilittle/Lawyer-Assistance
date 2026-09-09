@@ -11,13 +11,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / "apps" / "desktop" / "src-tauri" / "resources" / "THIRD_PARTY_NOTICES.txt"
-FONT_ASSET_DIR = ROOT / "crates" / "material-processing" / "assets" / "fonts"
-SAFE_EXPORT_FONT_SHA256 = "c7763f454946833081cc90e73186615f8e1189de9c5e5a5a8752871fd79fddbc"
+OUTPUT = ROOT / "data" / "runtime" / "THIRD_PARTY_NOTICES.txt"
 NOTICE_NAMES = re.compile(r"^(licen[cs]e|copying|copyright|notice)([._-].*)?$", re.IGNORECASE)
 CARGO_RELEASE_TARGET_PRODUCTS: tuple[tuple[str, frozenset[str]], ...] = (
-    ("x86_64-pc-windows-msvc", frozenset({"lawyer-assistance-desktop", "legal-mcp"})),
-    ("x86_64-unknown-linux-gnu", frozenset({"legal-mcp"})),
+    ("x86_64-pc-windows-msvc", frozenset({"lawyer-assistance-server", "legal-mcp"})),
+    ("x86_64-unknown-linux-gnu", frozenset({"lawyer-assistance-server", "legal-mcp"})),
     ("aarch64-apple-darwin", frozenset({"legal-mcp"})),
 )
 
@@ -59,28 +57,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE."""
-
-WEBVIEW2_MIT = """MIT License
-
-Copyright (c) 2021 Bill Avery
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE."""
 
 NUGINE_SIMD_MIT = """MIT License
 
@@ -263,29 +239,6 @@ def readable_notices(directory: Path) -> tuple[tuple[str, str], ...]:
     return tuple(notices)
 
 
-def bundled_asset_components() -> list[Component]:
-    font_path = FONT_ASSET_DIR / "NotoSansSC-Regular.ttf"
-    if not font_path.is_file():
-        raise RuntimeError("bundled safe-export font is missing")
-    digest = hashlib.sha256(font_path.read_bytes()).hexdigest()
-    if digest != SAFE_EXPORT_FONT_SHA256:
-        raise RuntimeError("bundled safe-export font SHA-256 does not match the reviewed binary")
-    texts = readable_notices(FONT_ASSET_DIR)
-    text_names = {name for name, _ in texts}
-    required = {"LICENSE-OFL-1.1.txt", "NOTICE-NOTO-SANS-SC.txt"}
-    if not required.issubset(text_names):
-        raise RuntimeError("bundled safe-export font license or notice is missing")
-    return [
-        Component(
-            "Bundled Font",
-            "Noto Sans SC Regular",
-            "2.004",
-            "OFL-1.1",
-            "https://github.com/notofonts/noto-cjk/tree/Sans2.004",
-            texts,
-        )
-    ]
-
 def cargo_metadata_for_target(target: str) -> dict:
     command = [
         "cargo",
@@ -375,11 +328,11 @@ def cargo_components() -> list[Component]:
 
 
 def npm_package_directories() -> list[Path]:
-    desktop_modules = ROOT / "apps" / "desktop" / "node_modules"
-    app_manifest_path = ROOT / "apps" / "desktop" / "package.json"
+    node_modules = ROOT / "node_modules"
+    app_manifest_path = ROOT / "package.json"
     app_manifest = json.loads(app_manifest_path.read_text(encoding="utf-8"))
     pending: list[tuple[Path, str, bool]] = [
-        (desktop_modules, name, False)
+        (node_modules, name, False)
         for name in sorted(app_manifest.get("dependencies", {}))
     ]
     candidates: dict[Path, Path] = {}
@@ -398,7 +351,7 @@ def npm_package_directories() -> list[Path]:
             search_paths.append(ancestor.joinpath(*parts))
             if ancestor == ROOT:
                 break
-        search_paths.append(desktop_modules.joinpath(*parts))
+        search_paths.append(node_modules.joinpath(*parts))
         dependency = next((candidate for candidate in search_paths if candidate.is_dir()), None)
         if dependency is None:
             if optional:
@@ -528,11 +481,6 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
             # Apache-2.0 option using the canonical text already present in
             # another locked dependency.
             texts = (("SPDX-Apache-2.0", apache),)
-        elif not texts and component.name == "tauri-plugin" and component.version == "2.6.3":
-            # tauri-plugin offers Apache-2.0 OR MIT.  The published crate omits
-            # both license files, so use the canonical Apache-2.0 text already
-            # present in this exact locked dependency closure.
-            texts = (("SPDX-Apache-2.0", apache),)
         elif (
             not texts
             and component.name == "jsonschema-regex"
@@ -564,12 +512,6 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
             # duplicate license file. Reuse the canonical Apache text from
             # this exact locked closure and distribute under that option.
             texts = (("SPDX-Apache-2.0", apache),)
-        elif not texts and component.name in {
-            "webview2-com",
-            "webview2-com-macros",
-            "webview2-com-sys",
-        }:
-            texts = (("UPSTREAM-LICENSE-MIT", WEBVIEW2_MIT),)
         if not texts:
             raise RuntimeError(
                 f"{component.ecosystem} dependency {component.name} {component.version} "
@@ -591,18 +533,7 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
 def render() -> str:
     cargo_lock = ROOT / "Cargo.lock"
     pnpm_lock = ROOT / "pnpm-lock.yaml"
-    components = cargo_components() + npm_components() + bundled_asset_components()
-    vendor = ROOT / "vendor" / "minisign-verify"
-    components.append(
-        Component(
-            "Vendored Rust",
-            "minisign-verify",
-            "0.2.5",
-            "MIT",
-            "https://github.com/jedisct1/rust-minisign-verify",
-            readable_notices(vendor),
-        )
-    )
+    components = cargo_components() + npm_components()
     components = complete_missing_license_texts(components)
     components.sort(key=lambda item: (item.ecosystem, item.name.casefold(), item.version))
 

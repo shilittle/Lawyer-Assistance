@@ -74,38 +74,53 @@ impl LegalServices {
                 error: Some(error),
             },
         };
-        let user = match open_validated_user_database_read_only(self.user_database_path()) {
-            Ok(connection) => {
-                let version = connection
-                    .query_row(
-                        "SELECT value FROM user_database_metadata WHERE key = 'schema_version'",
-                        [],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .ok();
-                DatabaseStatus {
-                    available: true,
-                    schema_version: version,
-                    runtime_schema_version: None,
-                    dataset_name: None,
-                    dataset_version: None,
-                    distribution_profile: None,
-                    error: None,
-                }
-            }
-            Err(error) => DatabaseStatus {
+        let user = if self.is_public_law_only() {
+            // Public-law MCP deliberately has no private workspace.  Preserve
+            // the wire DTO while making the absence explicit without probing
+            // a path or making legal readiness degraded.
+            DatabaseStatus {
                 available: false,
                 schema_version: None,
                 runtime_schema_version: None,
                 dataset_name: None,
                 dataset_version: None,
                 distribution_profile: None,
-                error: Some(error),
-            },
+                error: None,
+            }
+        } else {
+            match open_validated_user_database_read_only(self.user_database_path()) {
+                Ok(connection) => {
+                    let version = connection
+                        .query_row(
+                            "SELECT value FROM user_database_metadata WHERE key = 'schema_version'",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok();
+                    DatabaseStatus {
+                        available: true,
+                        schema_version: version,
+                        runtime_schema_version: None,
+                        dataset_name: None,
+                        dataset_version: None,
+                        distribution_profile: None,
+                        error: None,
+                    }
+                }
+                Err(error) => DatabaseStatus {
+                    available: false,
+                    schema_version: None,
+                    runtime_schema_version: None,
+                    dataset_name: None,
+                    dataset_version: None,
+                    distribution_profile: None,
+                    error: Some(error),
+                },
+            }
         };
         Ok(SystemStatusResponse {
             schema_version: SERVICE_SCHEMA_VERSION,
-            status: if legal.available && user.available {
+            status: if legal.available && (self.is_public_law_only() || user.available) {
                 "ready"
             } else {
                 "degraded"
@@ -296,4 +311,20 @@ fn require_legal_database_object(
         "expectedType": expected_type,
         "foundType": actual_type,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::LegalServices;
+
+    #[test]
+    fn public_status_does_not_require_or_open_a_user_database() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let legal_path = temporary.path().join("missing-legal-core.sqlite");
+        let services = LegalServices::new_public(legal_path).expect("public service initializes");
+        let status = services.system_status().expect("status response");
+        assert!(!status.legal_database.available);
+        assert!(!status.user_database.available);
+        assert!(status.user_database.error.is_none());
+    }
 }

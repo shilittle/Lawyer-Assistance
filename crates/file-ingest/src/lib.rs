@@ -138,6 +138,8 @@ pub enum IngestError {
     ActiveContentNotAllowed,
     XmlDoctypeNotAllowed,
     InvalidUtf8,
+    UnsupportedTextEncoding,
+    InvalidTextEncoding,
     NulByteNotAllowed,
     TextLimitExceeded,
     SegmentLimitExceeded,
@@ -169,6 +171,8 @@ impl IngestError {
             Self::ActiveContentNotAllowed => "active_content_not_allowed",
             Self::XmlDoctypeNotAllowed => "xml_doctype_not_allowed",
             Self::InvalidUtf8 => "invalid_utf8",
+            Self::UnsupportedTextEncoding => "unsupported_text_encoding",
+            Self::InvalidTextEncoding => "invalid_text_encoding",
             Self::NulByteNotAllowed => "nul_byte_not_allowed",
             Self::TextLimitExceeded => "text_limit_exceeded",
             Self::SegmentLimitExceeded => "segment_limit_exceeded",
@@ -204,6 +208,8 @@ impl IngestError {
             Self::ActiveContentNotAllowed => "Active or embedded DOCX content is not allowed.",
             Self::XmlDoctypeNotAllowed => "DOCX XML document type declarations are not allowed.",
             Self::InvalidUtf8 => "The text file is not valid UTF-8.",
+            Self::UnsupportedTextEncoding => "The requested text encoding is not supported.",
+            Self::InvalidTextEncoding => "The text file is not valid in the requested encoding.",
             Self::NulByteNotAllowed => "NUL bytes are not allowed in text attachments.",
             Self::TextLimitExceeded => "The extracted text exceeds the size limit.",
             Self::SegmentLimitExceeded => "The extracted text exceeds the segment limit.",
@@ -248,6 +254,80 @@ pub fn detect_format(file_name: &str) -> Result<FileFormat, IngestError> {
 /// Validate, hash and extract an attachment from original bytes.
 pub fn ingest_bytes(file_name: &str, bytes: &[u8]) -> Result<ExtractedDocument, IngestError> {
     ingest_bytes_with_limits(file_name, bytes, Limits::default())
+}
+
+/// Extract plaintext accepted by the new privacy workspace.
+///
+/// TXT requires strict decoding: without an explicit encoding it is UTF-8 only. The accepted
+/// explicit labels are UTF-8, GB18030, UTF-16, UTF-16LE and UTF-16BE. DOCX has no external text
+/// encoding and is parsed through the guarded OOXML extractor; passing an encoding for DOCX is
+/// rejected to avoid giving callers a false sense that container bytes were decoded as text.
+pub fn extract_plain_text(
+    file_name: &str,
+    bytes: &[u8],
+    encoding: Option<&str>,
+) -> Result<String, IngestError> {
+    let format = detect_format(file_name)?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(IngestError::FileTooLarge);
+    }
+    match format {
+        FileFormat::Txt => {
+            if infer::get(bytes).is_some() {
+                return Err(IngestError::FormatMismatch);
+            }
+            let decoded = decode_text(bytes, encoding)?;
+            Ok(text::extract_decoded(&decoded, Limits::default())?.text)
+        }
+        FileFormat::Docx => {
+            if encoding.is_some() {
+                return Err(IngestError::UnsupportedTextEncoding);
+            }
+            Ok(ingest_bytes_with_limits(file_name, bytes, Limits::default())?.text)
+        }
+        _ => Err(IngestError::UnsupportedExtension),
+    }
+}
+
+fn decode_text(bytes: &[u8], encoding: Option<&str>) -> Result<String, IngestError> {
+    let label = encoding.unwrap_or("utf-8").trim().to_ascii_lowercase();
+    match label.as_str() {
+        "utf-8" | "utf8" => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| IngestError::InvalidUtf8),
+        "gb18030" => encoding_rs::GB18030
+            .decode_without_bom_handling_and_without_replacement(bytes)
+            .map(|value| value.into_owned())
+            .ok_or(IngestError::InvalidTextEncoding),
+        "utf-16" | "utf16" => decode_utf16_with_bom(bytes),
+        "utf-16le" | "utf16le" => decode_with_encoding(encoding_rs::UTF_16LE, bytes),
+        "utf-16be" | "utf16be" => decode_with_encoding(encoding_rs::UTF_16BE, bytes),
+        _ => Err(IngestError::UnsupportedTextEncoding),
+    }
+}
+
+fn decode_utf16_with_bom(bytes: &[u8]) -> Result<String, IngestError> {
+    let Some((first, second)) = bytes.first().zip(bytes.get(1)) else {
+        return Err(IngestError::InvalidTextEncoding);
+    };
+    match (*first, *second) {
+        (0xff, 0xfe) => decode_with_encoding(encoding_rs::UTF_16LE, &bytes[2..]),
+        (0xfe, 0xff) => decode_with_encoding(encoding_rs::UTF_16BE, &bytes[2..]),
+        _ => Err(IngestError::InvalidTextEncoding),
+    }
+}
+
+fn decode_with_encoding(
+    encoding: &'static encoding_rs::Encoding,
+    bytes: &[u8],
+) -> Result<String, IngestError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(IngestError::InvalidTextEncoding);
+    }
+    encoding
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(|value| value.into_owned())
+        .ok_or(IngestError::InvalidTextEncoding)
 }
 
 fn ingest_bytes_with_limits(

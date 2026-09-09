@@ -188,6 +188,7 @@ pub(crate) enum ChatRequestAuthority {
     ProductPublic,
     InteractiveUserContent,
     ApprovedCase,
+    WorkspaceAuthorized,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -342,6 +343,14 @@ impl ChatRequest {
                 privacy::DataClassification::InteractiveUserProvided
             }
             ChatRequestAuthority::ApprovedCase => privacy::DataClassification::CaseRedactedApproved,
+            // Workspace-authorized traffic never travels through the ordinary
+            // `ChatRequest` API. The legacy classification accessor has no
+            // workspace variant and is deliberately fail-closed for the
+            // opaque authority rather than relabeling original material as
+            // interactive or public content.
+            ChatRequestAuthority::WorkspaceAuthorized => {
+                panic!("workspace-authorized content requires its opaque send path")
+            }
         }
     }
 
@@ -460,6 +469,74 @@ impl ApprovedChatRequest {
 
     pub const fn expires_at_unix(&self) -> u64 {
         self.draft.binding.expires_at_unix
+    }
+}
+
+/// An opaque, one-use authorization for sensitive workspace content sent to a
+/// configured provider.
+///
+/// `authorize_workspace_request` is a trusted-backend-only boundary. The
+/// workspace service must first persist, validate, and consume its batch
+/// authorization before constructing this value. Browser and MCP input must
+/// never deserialize or construct it: there is intentionally no serde
+/// deserialization implementation and the sensitive messages remain private.
+pub struct WorkspaceAuthorizedRequest {
+    pub(crate) request: ChatRequest,
+    pub(crate) canonical_payload: Arc<[u8]>,
+    pub(crate) canonical_payload_sha256: String,
+    pub(crate) transport_body_sha256: String,
+    pub(crate) profile_sha256: String,
+    pub(crate) provider_id: String,
+    pub(crate) provider_kind: ProviderKind,
+    pub(crate) model_id: String,
+    pub(crate) endpoint_origin: String,
+    pub(crate) purpose: String,
+    pub(crate) source_binding_sha256: String,
+    pub(crate) expires_at_unix: u64,
+    pub(crate) consumed: Arc<AtomicBool>,
+}
+
+impl WorkspaceAuthorizedRequest {
+    /// Hash of the canonical payload, which includes the complete messages,
+    /// active provider configuration binding, source binding, purpose, and
+    /// expiry without exposing those messages to callers.
+    pub fn canonical_payload_sha256(&self) -> &str {
+        &self.canonical_payload_sha256
+    }
+
+    pub fn source_binding_sha256(&self) -> &str {
+        &self.source_binding_sha256
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn purpose(&self) -> &str {
+        &self.purpose
+    }
+
+    pub const fn expires_at_unix(&self) -> u64 {
+        self.expires_at_unix
+    }
+}
+
+impl fmt::Debug for WorkspaceAuthorizedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceAuthorizedRequest")
+            .field("canonical_payload", &"<redacted>")
+            .field("canonical_payload_sha256", &self.canonical_payload_sha256)
+            .field("transport_body_sha256", &self.transport_body_sha256)
+            .field("profile_sha256", &self.profile_sha256)
+            .field("provider_id", &self.provider_id)
+            .field("provider_kind", &self.provider_kind)
+            .field("model_id", &self.model_id)
+            .field("endpoint_origin", &self.endpoint_origin)
+            .field("purpose", &self.purpose)
+            .field("source_binding_sha256", &self.source_binding_sha256)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
     }
 }
 

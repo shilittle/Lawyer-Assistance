@@ -4,13 +4,10 @@
   "mcp": {
     "lawyer_assistance": {
       "type": "remote",
-      "url": "http://127.0.0.1:8787/mcp",
+      "url": "http://127.0.0.1:8877/mcp",
       "enabled": true,
       "timeout": 30000,
-      "oauth": false,
-      "headers": {
-        "Authorization": "Bearer {env:LAWYER_ASSISTANCE_MCP_TOKEN}"
-      }
+      "oauth": false
     }
   },
   "permission": {

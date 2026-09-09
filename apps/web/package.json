@@ -1,0 +1,10 @@
+{
+  "name": "@lawyer-assistance/web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check app.js && node --check api.js",
+    "test": "node --test"
+  }
+}

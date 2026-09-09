@@ -1,0 +1,129 @@
+{
+  "schemaVersion": "privacy-text-synthetic-regression-v1",
+  "syntheticOnly": true,
+  "cases": [
+    {
+      "id": "deterministic-identifiers",
+      "category": "numeric_identifier_positive",
+      "text": "身份证号：11010519491231002X，联系电话：13800138000。",
+      "dictionary": [],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": [
+        {"text": "11010519491231002X", "kind": "identity_number", "strategy": "deterministic"},
+        {"text": "13800138000", "kind": "phone_number", "strategy": "deterministic"}
+      ]
+    },
+    {
+      "id": "person-cross-paragraph-dictionary",
+      "category": "person_cross_paragraph_positive",
+      "text": "原告：张三提交材料。\n\n第二段仍由张三说明。",
+      "dictionary": [
+        {"text": "张三", "kind": "person_name"}
+      ],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": [
+        {"text": "张三", "kind": "person_name", "strategy": "dictionary"},
+        {"text": "张三", "kind": "person_name", "strategy": "dictionary"}
+      ]
+    },
+    {
+      "id": "organization-dictionary",
+      "category": "organization_positive",
+      "text": "委托人单位：蓝湾数据有限公司，授权范围见附件。",
+      "dictionary": [
+        {"text": "蓝湾数据有限公司", "kind": "organization_name"}
+      ],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": [
+        {"text": "蓝湾数据有限公司", "kind": "organization_name", "strategy": "dictionary"}
+      ]
+    },
+    {
+      "id": "address-dictionary",
+      "category": "address_positive",
+      "text": "送达地址：海滨市新城区建设路九号。",
+      "dictionary": [
+        {"text": "海滨市新城区建设路九号", "kind": "address"}
+      ],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": [
+        {"text": "海滨市新城区建设路九号", "kind": "address", "strategy": "dictionary"}
+      ]
+    },
+    {
+      "id": "confusable-person-cloud-corroborated",
+      "category": "confusable_positive",
+      "text": "原告姓名：张​Ｓ，今日到庭。",
+      "dictionary": [],
+      "cloud": [
+        {"text": "张​Ｓ", "kind": "person_name"}
+      ],
+      "expectedNeedsReview": false,
+      "expected": [
+        {"text": "张​Ｓ", "kind": "person_name", "strategy": "cloud_ner"}
+      ]
+    },
+    {
+      "id": "person-ner-pending",
+      "category": "person_difficult_pending",
+      "text": "申请人：王伟，请求依法裁判。",
+      "dictionary": [],
+      "cloud": [],
+      "expectedNeedsReview": true,
+      "expected": [
+        {"text": "王伟", "kind": "person_name", "strategy": "pending"}
+      ]
+    },
+    {
+      "id": "confusable-person-pending",
+      "category": "confusable_difficult_pending",
+      "text": "原告姓名：张​Ｓ，今日到庭。",
+      "dictionary": [],
+      "cloud": [],
+      "expectedNeedsReview": true,
+      "expected": [
+        {"text": "张​Ｓ", "kind": "person_name", "strategy": "pending"}
+      ]
+    },
+    {
+      "id": "legal-text-negative",
+      "category": "organization_negative",
+      "text": "人民法院应当依法保障当事人诉讼权利。",
+      "dictionary": [],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": []
+    },
+    {
+      "id": "date-and-article-negative",
+      "category": "numeric_identifier_negative",
+      "text": "本院于2026年7月22日公开开庭审理，依据第五百七十七条裁判。",
+      "dictionary": [],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": []
+    },
+    {
+      "id": "address-label-without-value-negative",
+      "category": "address_negative",
+      "text": "送达地址已另案保管，详见回证。",
+      "dictionary": [],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": []
+    },
+    {
+      "id": "cross-paragraph-no-entity-negative",
+      "category": "person_cross_paragraph_negative",
+      "text": "第一段为程序说明。\n\n第二段继续说明送达安排。",
+      "dictionary": [],
+      "cloud": [],
+      "expectedNeedsReview": false,
+      "expected": []
+    }
+  ]
+}

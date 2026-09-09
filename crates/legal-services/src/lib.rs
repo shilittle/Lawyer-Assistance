@@ -31,6 +31,10 @@ pub const SERVICE_SCHEMA_VERSION: u16 = 1;
 pub struct LegalServices {
     config: ServiceConfig,
     audit_origin: ServiceOrigin,
+    /// A public-law service deliberately has no user workspace.  It may only
+    /// execute the read-only legal methods and reports that workspace storage
+    /// is not applicable from `system_status`.
+    public_law_only: bool,
 }
 
 impl LegalServices {
@@ -45,11 +49,46 @@ impl LegalServices {
         Ok(Self {
             config: config.validate()?,
             audit_origin,
+            public_law_only: false,
+        })
+    }
+
+    /// Construct the read-only legal service used by public MCP transports.
+    ///
+    /// This constructor intentionally does not require, create, or open a
+    /// user/workspace database or an output directory.  The legal database is
+    /// validated when a legal operation actually opens it, so a missing
+    /// runtime legal database is surfaced as the ordinary legal availability
+    /// error instead of preventing the MCP process from starting.
+    pub fn new_public(legal_core_path: std::path::PathBuf) -> Result<Self, ServiceError> {
+        if !legal_core_path.is_absolute() || legal_core_path.file_name().is_none() {
+            return Err(ServiceError::new(
+                "invalid_configuration",
+                "legal database path must be absolute and name a file",
+                false,
+            ));
+        }
+        Ok(Self {
+            config: ServiceConfig {
+                legal_core_path,
+                // These placeholders are never opened by a public-only
+                // service.  Keeping ServiceConfig stable avoids changing the
+                // existing case/document service contract.
+                user_database_path: std::path::PathBuf::new(),
+                allowed_file_roots: Vec::new(),
+                allowed_output_root: std::path::PathBuf::new(),
+            },
+            audit_origin: ServiceOrigin::Mcp,
+            public_law_only: true,
         })
     }
 
     pub fn config(&self) -> &ServiceConfig {
         &self.config
+    }
+
+    pub fn is_public_law_only(&self) -> bool {
+        self.public_law_only
     }
 
     pub(crate) fn legal_core_path(&self) -> &Path {

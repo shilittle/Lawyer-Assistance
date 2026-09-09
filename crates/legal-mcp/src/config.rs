@@ -6,7 +6,6 @@ use std::{
     env, fmt, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    str::FromStr,
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -14,65 +13,73 @@ use url::Url;
 use zeroize::Zeroizing;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
-pub const DEFAULT_BEARER_ENV: &str = "LAWYER_ASSISTANCE_MCP_TOKEN";
+pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8877";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
-const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+pub const DEFAULT_DAEMON_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_BYTES: usize = 512;
-const MAX_ALLOWLIST_ENTRIES: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "lawyer-assistance-mcp",
     version,
-    about = "Local-first MCP server for Lawyer Assistance"
+    about = "Local MCP server for public legal research and approved privacy workspace access"
 )]
 pub struct Cli {
-    /// Optional TOML or JSON configuration file.
+    /// Compatibility TOML or JSON configuration file. Only legal_db and the
+    /// new MCP settings are read; old user/workspace fields are ignored.
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Offline legal corpus. Defaults to data/runtime/legal_core.sqlite or LEGAL_DB.
     #[arg(long, global = true)]
     pub legal_db: Option<PathBuf>,
 
-    #[arg(long, global = true)]
-    pub user_db: Option<PathBuf>,
-
-    #[arg(long, global = true, action = ArgAction::Append)]
-    pub allowed_root: Vec<PathBuf>,
-
-    #[arg(long, global = true)]
-    pub output_dir: Option<PathBuf>,
-
-    /// MCP data-exposure profile. Defaults to public_law_only; redacted_case is explicit.
+    /// MCP data-exposure profile. The legacy sensitive profiles are disabled.
     #[arg(long, global = true, value_enum)]
     pub privacy_profile: Option<PrivacyProfile>,
 
-    /// Opaque App-issued standalone session id. The binary resolves its
-    /// descriptor only below the fixed per-user App data directory.
+    /// Loopback Lawyer Assistance backend for privacy_workspace.
     #[arg(long, global = true)]
-    pub approved_session_id: Option<String>,
+    pub daemon_url: Option<String>,
 
-    /// Internal fixed-root qualification canary. This never accepts a path.
+    /// A file containing the client bearer token for privacy_workspace.
+    #[arg(long, global = true)]
+    pub client_token_file: Option<PathBuf>,
+
+    /// Deprecated compatibility option. The public MCP profile never opens a
+    /// user database, so this value is deliberately ignored.
     #[arg(long, global = true, hide = true)]
-    pub approved_qualification_canary_id: Option<String>,
+    pub user_db: Option<PathBuf>,
 
-    /// Name of the environment variable containing the bearer token.
-    #[arg(long, global = true)]
+    /// Deprecated compatibility option, ignored by the public MCP profile.
+    #[arg(long, global = true, hide = true, action = ArgAction::Append)]
+    pub allowed_root: Vec<PathBuf>,
+
+    /// Deprecated compatibility option, ignored by the public MCP profile.
+    #[arg(long, global = true, hide = true)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Deprecated compatibility option. Use MCP_TOKEN or --client-token-file
+    /// for privacy_workspace stdio instead.
+    #[arg(long, global = true, hide = true)]
     pub bearer_env: Option<String>,
 
-    /// Read the bearer token from this file if the selected environment variable is unset.
-    #[arg(long, global = true)]
+    /// Deprecated compatibility spelling for --client-token-file.
+    #[arg(long, global = true, hide = true)]
     pub bearer_token_file: Option<PathBuf>,
 
-    #[arg(long, global = true, action = ArgAction::Append)]
+    #[arg(long, global = true, hide = true, action = ArgAction::Append)]
     pub allowed_origin: Vec<String>,
 
-    #[arg(long, global = true, action = ArgAction::Append)]
+    #[arg(long, global = true, hide = true, action = ArgAction::Append)]
     pub allowed_host: Vec<String>,
+
+    #[arg(long, global = true, hide = true, action = ArgAction::SetTrue)]
+    pub dangerously_allow_insecure_non_loopback_http: bool,
 
     #[arg(long, global = true)]
     pub max_body_bytes: Option<usize>,
@@ -83,26 +90,19 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub max_concurrency: Option<usize>,
 
-    /// DANGEROUS: allow this cleartext HTTP server to bind to a non-loopback address.
-    /// A bearer token is still required. Prefer a loopback bind behind a TLS reverse proxy.
-    #[arg(long, global = true, action = ArgAction::SetTrue)]
-    pub dangerously_allow_insecure_non_loopback_http: bool,
-
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Serve MCP over stdin/stdout. Protocol output is the only stdout output.
+    /// Serve MCP over stdin/stdout. Protocol frames are the only stdout output.
     Stdio,
-    /// Serve stateless Streamable HTTP at /mcp.
+    /// Serve Streamable HTTP at /mcp. This endpoint binds loopback only.
     Serve {
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
-    /// Explicitly create or migrate the configured user database, then exit.
-    InitUserDb,
 }
 
 #[derive(Debug, Clone)]
@@ -110,8 +110,11 @@ pub struct Limits {
     pub max_body_bytes: usize,
     pub request_timeout: Duration,
     pub max_concurrency: usize,
+    pub max_daemon_response_bytes: usize,
 }
 
+/// Digest-only token matcher for the optional public HTTP client class.
+/// It never exposes token bytes in Debug or error output.
 #[derive(Clone)]
 pub struct BearerSecret {
     digest: [u8; 32],
@@ -125,124 +128,96 @@ impl fmt::Debug for BearerSecret {
 
 impl BearerSecret {
     pub fn from_token_bytes(raw: Vec<u8>) -> Result<Self, ConfigError> {
-        Self::new(Zeroizing::new(raw))
-    }
-
-    pub(crate) fn new(raw: Zeroizing<Vec<u8>>) -> Result<Self, ConfigError> {
-        if !(MIN_TOKEN_BYTES..=MAX_TOKEN_BYTES).contains(&raw.len()) {
-            return Err(ConfigError::Invalid(
-                "bearer token must contain 32 to 512 bytes".to_owned(),
-            ));
-        }
-        if raw.iter().any(|byte| !(0x21..=0x7e).contains(byte)) {
-            return Err(ConfigError::Invalid(
-                "bearer token must contain only visible ASCII characters".to_owned(),
-            ));
-        }
-        let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
-        Ok(Self { digest })
+        validate_token(&raw)?;
+        Ok(Self {
+            digest: Sha256::digest(&raw).into(),
+        })
     }
 
     pub fn authorizes(&self, header: &str) -> bool {
-        if header.len() > MAX_TOKEN_BYTES + 16 {
-            return false;
-        }
-        let Some((scheme, candidate)) = header.split_once(' ') else {
+        let Some(token) = parse_bearer(header) else {
             return false;
         };
-        if !scheme.eq_ignore_ascii_case("bearer")
-            || candidate.is_empty()
-            || candidate.bytes().any(|byte| byte.is_ascii_whitespace())
-        {
-            return false;
-        }
-        let candidate_digest: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
-        bool::from(self.digest.ct_eq(&candidate_digest))
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        bool::from(self.digest.ct_eq(&digest))
     }
 }
 
-#[derive(Debug, Clone)]
+/// A token loaded from a file or MCP_TOKEN. It is only used for the lifetime
+/// of a stdio process; the HTTP proxy creates a fresh backend per request.
+pub struct ClientToken(Zeroizing<String>);
+
+impl fmt::Debug for ClientToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientToken([REDACTED])")
+    }
+}
+
+impl ClientToken {
+    pub fn from_token_bytes(raw: Vec<u8>) -> Result<Self, ConfigError> {
+        validate_token(&raw)?;
+        let value = String::from_utf8(raw)
+            .map_err(|_| ConfigError::Invalid("client token must be visible ASCII".to_owned()))?;
+        Ok(Self(Zeroizing::new(value)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Debug)]
 pub struct ResolvedConfig {
     pub legal_db: PathBuf,
-    pub user_db: PathBuf,
-    pub allowed_roots: Vec<PathBuf>,
-    pub output_root: PathBuf,
     pub privacy_profile: PrivacyProfile,
+    pub daemon_url: Url,
+    pub client_token: Option<ClientToken>,
     pub bind: SocketAddr,
-    pub allowed_origins: Vec<String>,
-    pub allowed_hosts: Vec<String>,
-    pub bearer: Option<BearerSecret>,
-    pub dangerously_allow_insecure_non_loopback_http: bool,
     pub limits: Limits,
     pub command: Command,
 }
 
-impl ResolvedConfig {
-    pub fn is_http(&self) -> bool {
-        matches!(self.command, Command::Serve { .. })
-    }
-
-    pub fn bind_is_loopback(&self) -> bool {
-        self.bind.ip().is_loopback()
-    }
-}
-
-/// Complete, environment-independent configuration for an HTTP server embedded
-/// in another Rust application.
-///
-/// Unlike [`Cli::resolve`], this boundary never reads process arguments,
-/// environment variables, a configuration file, or the current working
-/// directory. The caller must provide absolute filesystem paths. Embedded
-/// servers are deliberately restricted to IPv4 loopback and cannot enable the
-/// standalone server's dangerous non-loopback cleartext opt-in.
+/// Ambient-state-free configuration for an application embedding the MCP
+/// HTTP router. Authentication is supplied separately through
+/// `ProxyRouterConfig`, so each incoming bearer token can receive its own
+/// backend instance.
 #[derive(Debug, Clone)]
 pub struct EmbeddedHttpConfig {
     pub legal_db: PathBuf,
-    pub user_db: PathBuf,
-    pub allowed_roots: Vec<PathBuf>,
-    pub output_root: PathBuf,
     pub port: u16,
-    pub allowed_origins: Vec<String>,
-    pub bearer: Option<BearerSecret>,
     pub max_body_bytes: usize,
     pub request_timeout_ms: u64,
     pub max_concurrency: usize,
 }
 
 impl EmbeddedHttpConfig {
-    /// Validate and resolve an embedded server configuration without consulting
-    /// any ambient process state.
     pub fn resolve(self) -> Result<ResolvedConfig, ConfigError> {
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port);
-        let allowed_origins = normalize_allowed_origins(self.allowed_origins)?;
-        let allowed_hosts = default_allowed_hosts(bind);
+        if !self.legal_db.is_absolute() || self.legal_db.file_name().is_none() {
+            return Err(ConfigError::Invalid(
+                "legal database path must be absolute and name a file".to_owned(),
+            ));
+        }
         validate_limits(
             self.max_body_bytes,
             self.request_timeout_ms,
             self.max_concurrency,
         )?;
-
-        let resolved = ResolvedConfig {
+        Ok(ResolvedConfig {
             legal_db: self.legal_db,
-            user_db: self.user_db,
-            allowed_roots: self.allowed_roots,
-            output_root: self.output_root,
-            privacy_profile: PrivacyProfile::default(),
-            bind,
-            allowed_origins,
-            allowed_hosts,
-            bearer: self.bearer,
-            dangerously_allow_insecure_non_loopback_http: false,
+            privacy_profile: PrivacyProfile::PublicLawOnly,
+            daemon_url: validate_daemon_url(DEFAULT_DAEMON_URL)?,
+            client_token: None,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port),
             limits: Limits {
                 max_body_bytes: self.max_body_bytes,
                 request_timeout: Duration::from_millis(self.request_timeout_ms),
                 max_concurrency: self.max_concurrency,
+                max_daemon_response_bytes: DEFAULT_DAEMON_RESPONSE_BYTES,
             },
-            command: Command::Serve { bind: Some(bind) },
-        };
-        validate_runtime_paths(&resolved)?;
-        validate_http_auth_requirement(true, resolved.bind, resolved.bearer.as_ref(), false)?;
-        Ok(resolved)
+            command: Command::Serve {
+                bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port)),
+            },
+        })
     }
 }
 
@@ -250,478 +225,244 @@ impl EmbeddedHttpConfig {
 pub enum ConfigError {
     #[error("configuration is invalid: {0}")]
     Invalid(String),
-    #[error("failed to read configuration file")]
-    ReadConfig(#[source] std::io::Error),
-    #[error("configuration file is not valid TOML or JSON")]
-    ParseConfig,
-    #[error("failed to read bearer token file")]
+    #[error("failed to read client token file")]
     ReadToken(#[source] std::io::Error),
+    #[error("failed to read compatibility configuration file")]
+    ReadConfig(#[source] std::io::Error),
+    #[error("compatibility configuration file is not valid TOML")]
+    ParseConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileConfig {
+struct CompatibilityFileConfig {
     legal_db: Option<PathBuf>,
-    user_db: Option<PathBuf>,
-    #[serde(default)]
-    allowed_roots: Vec<PathBuf>,
-    output_root: Option<PathBuf>,
     privacy_profile: Option<PrivacyProfile>,
-    bind: Option<String>,
-    bearer_env: Option<String>,
+    daemon_url: Option<String>,
+    client_token_file: Option<PathBuf>,
     bearer_token_file: Option<PathBuf>,
-    #[serde(default)]
-    allowed_origins: Vec<String>,
-    #[serde(default)]
-    allowed_hosts: Vec<String>,
-    #[serde(default)]
-    dangerously_allow_insecure_non_loopback_http: bool,
-    limits: Option<FileLimits>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileLimits {
-    max_body_bytes: Option<usize>,
-    request_timeout_ms: Option<u64>,
-    max_concurrency: Option<usize>,
+    bind: Option<String>,
 }
 
 impl Cli {
     pub fn resolve(self) -> Result<ResolvedConfig, ConfigError> {
+        let cwd = env::current_dir().map_err(ConfigError::ReadToken)?;
         let config_path = self
             .config
-            .clone()
             .or_else(|| env_path("LAWYER_ASSISTANCE_MCP_CONFIG"));
-        let mut file = match config_path.as_deref() {
-            Some(path) => load_file_config(path)?,
-            None => FileConfig::default(),
-        };
-        if let Some(path) = config_path.as_deref() {
-            resolve_file_relative_paths(&mut file, path)?;
-        }
-
-        let cwd = env::current_dir().map_err(ConfigError::ReadConfig)?;
+        let file = config_path
+            .as_deref()
+            .map(load_compatibility_file)
+            .transpose()?;
+        let config_base = config_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|path| absolutize(path.to_path_buf(), &cwd))
+            .unwrap_or_else(|| cwd.clone());
         let legal_db = absolutize(
             self.legal_db
+                .or_else(|| env_path("LEGAL_DB"))
                 .or_else(|| env_path("LAWYER_ASSISTANCE_LEGAL_DB"))
-                .or(file.legal_db)
-                .ok_or_else(|| ConfigError::Invalid("legal database path is required".into()))?,
-            &cwd,
+                .or_else(|| file.as_ref().and_then(|file| file.legal_db.clone()))
+                .unwrap_or_else(|| PathBuf::from("data/runtime/legal_core.sqlite")),
+            &config_base,
         );
-        let user_db = absolutize(
-            self.user_db
-                .or_else(|| env_path("LAWYER_ASSISTANCE_USER_DB"))
-                .or(file.user_db)
-                .ok_or_else(|| ConfigError::Invalid("user database path is required".into()))?,
-            &cwd,
-        );
-        let output_root = absolutize(
-            self.output_dir
-                .or_else(|| env_path("LAWYER_ASSISTANCE_OUTPUT_ROOT"))
-                .or(file.output_root)
-                .ok_or_else(|| ConfigError::Invalid("output root is required".into()))?,
-            &cwd,
-        );
-
+        if legal_db.file_name().is_none() {
+            return Err(ConfigError::Invalid(
+                "legal database path must name a file".to_owned(),
+            ));
+        }
         let privacy_profile = self
             .privacy_profile
-            .or(env_parse("LAWYER_ASSISTANCE_MCP_PRIVACY_PROFILE")?)
-            .or(file.privacy_profile)
+            .or_else(|| env_parse_profile("LAWYER_ASSISTANCE_MCP_PRIVACY_PROFILE"))
+            .or_else(|| file.as_ref().and_then(|file| file.privacy_profile))
             .unwrap_or_default();
-        let allowed_roots = choose_paths(
-            self.allowed_root,
-            env::var_os("LAWYER_ASSISTANCE_ALLOWED_ROOTS")
-                .map(|value| env::split_paths(&value).collect()),
-            file.allowed_roots,
-        )
-        .into_iter()
-        .map(|path| absolutize(path, &cwd))
-        .collect::<Vec<_>>();
-
+        let daemon_url_setting = self
+            .daemon_url
+            .or_else(|| env::var("LAWYER_ASSISTANCE_DAEMON_URL").ok())
+            .or_else(|| file.as_ref().and_then(|file| file.daemon_url.clone()))
+            .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+        let daemon_url = validate_daemon_url(&daemon_url_setting)?;
         let command_bind = match &self.command {
+            Command::Stdio => None,
             Command::Serve { bind } => *bind,
-            Command::Stdio | Command::InitUserDb => None,
         };
-        let environment_bind: Option<SocketAddr> = env_parse("LAWYER_ASSISTANCE_MCP_BIND")?;
-        let file_bind = file
-            .bind
-            .as_deref()
-            .map(|value| {
-                value
-                    .parse::<SocketAddr>()
-                    .map_err(|_| ConfigError::Invalid("bind address is invalid".into()))
-            })
-            .transpose()?;
         let bind = command_bind
-            .or(environment_bind)
-            .or(file_bind)
-            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787));
-
-        let allowed_origins = normalize_allowed_origins(choose_strings(
-            self.allowed_origin,
-            env_csv("LAWYER_ASSISTANCE_MCP_ALLOWED_ORIGINS"),
-            file.allowed_origins,
-        ))?;
-        let mut allowed_hosts = normalize_hosts(choose_strings(
-            self.allowed_host,
-            env_csv("LAWYER_ASSISTANCE_MCP_ALLOWED_HOSTS"),
-            file.allowed_hosts,
-        ))?;
-        if allowed_hosts.is_empty() {
-            allowed_hosts = default_allowed_hosts(bind);
+            .or_else(|| env::var("LAWYER_ASSISTANCE_MCP_BIND").ok()?.parse().ok())
+            .or_else(|| {
+                file.as_ref()
+                    .and_then(|file| file.bind.as_deref())
+                    .and_then(|bind| bind.parse().ok())
+            })
+            .unwrap_or_else(|| DEFAULT_BIND.parse().expect("fixed loopback bind is valid"));
+        if self.dangerously_allow_insecure_non_loopback_http || !bind.ip().is_loopback() {
+            return Err(ConfigError::Invalid(
+                "MCP HTTP server may bind only a loopback address".to_owned(),
+            ));
         }
-
-        let file_limits = file.limits.unwrap_or_default();
         let max_body_bytes = self
             .max_body_bytes
-            .or(env_parse("LAWYER_ASSISTANCE_MCP_MAX_BODY_BYTES")?)
-            .or(file_limits.max_body_bytes)
+            .or_else(|| env_parse("LAWYER_ASSISTANCE_MCP_MAX_BODY_BYTES"))
             .unwrap_or(DEFAULT_MAX_BODY_BYTES);
         let request_timeout_ms = self
             .request_timeout_ms
-            .or(env_parse("LAWYER_ASSISTANCE_MCP_REQUEST_TIMEOUT_MS")?)
-            .or(file_limits.request_timeout_ms)
+            .or_else(|| env_parse("LAWYER_ASSISTANCE_MCP_REQUEST_TIMEOUT_MS"))
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
         let max_concurrency = self
             .max_concurrency
-            .or(env_parse("LAWYER_ASSISTANCE_MCP_MAX_CONCURRENCY")?)
-            .or(file_limits.max_concurrency)
+            .or_else(|| env_parse("LAWYER_ASSISTANCE_MCP_MAX_CONCURRENCY"))
             .unwrap_or(DEFAULT_MAX_CONCURRENCY);
         validate_limits(max_body_bytes, request_timeout_ms, max_concurrency)?;
 
-        let bearer_env = self
-            .bearer_env
-            .or_else(|| env::var("LAWYER_ASSISTANCE_MCP_BEARER_ENV").ok())
-            .or(file.bearer_env)
-            .unwrap_or_else(|| DEFAULT_BEARER_ENV.to_owned());
-        validate_env_name(&bearer_env)?;
         let token_file = self
-            .bearer_token_file
-            .or_else(|| env_path("LAWYER_ASSISTANCE_MCP_TOKEN_FILE"))
-            .or(file.bearer_token_file)
-            .map(|path| absolutize(path, &cwd));
-        let bearer = load_bearer(&bearer_env, token_file.as_deref())?;
-        let dangerously_allow_insecure_non_loopback_http = self
-            .dangerously_allow_insecure_non_loopback_http
-            || env_parse::<bool>(
-                "LAWYER_ASSISTANCE_MCP_DANGEROUSLY_ALLOW_INSECURE_NON_LOOPBACK_HTTP",
-            )?
-            .unwrap_or(false)
-            || file.dangerously_allow_insecure_non_loopback_http;
+            .client_token_file
+            .or(self.bearer_token_file)
+            .or_else(|| env_path("LAWYER_ASSISTANCE_MCP_CLIENT_TOKEN_FILE"))
+            .or_else(|| {
+                file.as_ref()
+                    .and_then(|file| file.client_token_file.clone())
+            })
+            .or_else(|| {
+                file.as_ref()
+                    .and_then(|file| file.bearer_token_file.clone())
+            })
+            .map(|path| absolutize(path, &config_base));
+        let client_token = load_client_token(token_file.as_deref())?;
+        if privacy_profile == PrivacyProfile::PrivacyWorkspace
+            && matches!(&self.command, Command::Stdio)
+            && client_token.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "privacy_workspace requires --client-token-file or MCP_TOKEN".to_owned(),
+            ));
+        }
 
-        let resolved = ResolvedConfig {
+        Ok(ResolvedConfig {
             legal_db,
-            user_db,
-            allowed_roots,
-            output_root,
             privacy_profile,
+            daemon_url,
+            client_token,
             bind,
-            allowed_origins,
-            allowed_hosts,
-            bearer,
-            dangerously_allow_insecure_non_loopback_http,
             limits: Limits {
                 max_body_bytes,
                 request_timeout: Duration::from_millis(request_timeout_ms),
                 max_concurrency,
+                max_daemon_response_bytes: DEFAULT_DAEMON_RESPONSE_BYTES,
             },
             command: self.command,
-        };
-        validate_runtime_paths(&resolved)?;
-        validate_http_auth_requirement(
-            resolved.is_http(),
-            resolved.bind,
-            resolved.bearer.as_ref(),
-            resolved.dangerously_allow_insecure_non_loopback_http,
-        )?;
-        Ok(resolved)
-    }
-
-    pub fn resolve_user_db_only(self) -> Result<PathBuf, ConfigError> {
-        let config_path = self
-            .config
-            .clone()
-            .or_else(|| env_path("LAWYER_ASSISTANCE_MCP_CONFIG"));
-        let mut file = match config_path.as_deref() {
-            Some(path) => load_file_config(path)?,
-            None => FileConfig::default(),
-        };
-        if let Some(path) = config_path.as_deref() {
-            resolve_file_relative_paths(&mut file, path)?;
-        }
-        let cwd = env::current_dir().map_err(ConfigError::ReadConfig)?;
-        Ok(absolutize(
-            self.user_db
-                .or_else(|| env_path("LAWYER_ASSISTANCE_USER_DB"))
-                .or(file.user_db)
-                .ok_or_else(|| ConfigError::Invalid("user database path is required".into()))?,
-            &cwd,
-        ))
+        })
     }
 }
 
-fn load_file_config(path: &Path) -> Result<FileConfig, ConfigError> {
-    let metadata = fs::metadata(path).map_err(ConfigError::ReadConfig)?;
-    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+fn load_compatibility_file(path: &Path) -> Result<CompatibilityFileConfig, ConfigError> {
+    let bytes = fs::read(path).map_err(ConfigError::ReadConfig)?;
+    if bytes.len() > 256 * 1024 {
         return Err(ConfigError::Invalid(
-            "configuration file must be a regular file no larger than 256 KiB".into(),
+            "compatibility configuration file must be at most 256 KiB".to_owned(),
         ));
     }
-    let bytes = fs::read(path).map_err(ConfigError::ReadConfig)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| ConfigError::ParseConfig)?;
-    if path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-    {
+    if text.trim_start().starts_with('{') {
         serde_json::from_str(text).map_err(|_| ConfigError::ParseConfig)
     } else {
         toml::from_str(text).map_err(|_| ConfigError::ParseConfig)
     }
 }
 
-fn resolve_file_relative_paths(
-    file: &mut FileConfig,
-    config_path: &Path,
-) -> Result<(), ConfigError> {
-    let absolute_config = if config_path.is_absolute() {
-        config_path.to_path_buf()
-    } else {
-        env::current_dir()
-            .map_err(ConfigError::ReadConfig)?
-            .join(config_path)
+pub fn validate_daemon_url(raw: &str) -> Result<Url, ConfigError> {
+    let url =
+        Url::parse(raw).map_err(|_| ConfigError::Invalid("daemon URL is invalid".to_owned()))?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(ConfigError::Invalid(
+            "daemon URL must be a bare loopback http origin".to_owned(),
+        ));
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
     };
-    let base = absolute_config.parent().ok_or_else(|| {
-        ConfigError::Invalid("configuration file path has no parent directory".into())
-    })?;
-    for path in [&mut file.legal_db, &mut file.user_db, &mut file.output_root] {
-        if let Some(value) = path.take() {
-            *path = Some(absolutize(value, base));
-        }
+    if !loopback {
+        return Err(ConfigError::Invalid(
+            "daemon URL must use a literal loopback IP address".to_owned(),
+        ));
     }
-    if let Some(value) = file.bearer_token_file.take() {
-        file.bearer_token_file = Some(absolutize(value, base));
+    Ok(url)
+}
+
+fn load_client_token(file: Option<&Path>) -> Result<Option<ClientToken>, ConfigError> {
+    if let Some(value) = env::var_os("MCP_TOKEN").filter(|value| !value.is_empty()) {
+        return ClientToken::from_token_bytes(value.to_string_lossy().as_bytes().to_vec())
+            .map(Some);
     }
-    file.allowed_roots = file
-        .allowed_roots
-        .drain(..)
-        .map(|value| absolutize(value, base))
-        .collect();
+    let Some(file) = file else {
+        return Ok(None);
+    };
+    let metadata = fs::metadata(file).map_err(ConfigError::ReadToken)?;
+    if !metadata.is_file() || metadata.len() > MAX_TOKEN_FILE_BYTES {
+        return Err(ConfigError::Invalid(
+            "client token file must be a regular file no larger than 4096 bytes".to_owned(),
+        ));
+    }
+    let mut token = fs::read(file).map_err(ConfigError::ReadToken)?;
+    while token
+        .last()
+        .is_some_and(|byte| matches!(*byte, b'\r' | b'\n'))
+    {
+        token.pop();
+    }
+    ClientToken::from_token_bytes(token).map(Some)
+}
+
+fn validate_token(raw: &[u8]) -> Result<(), ConfigError> {
+    if !(MIN_TOKEN_BYTES..=MAX_TOKEN_BYTES).contains(&raw.len())
+        || raw.iter().any(|byte| !safe_token_byte(*byte))
+    {
+        return Err(ConfigError::Invalid(
+            "client token must contain 32 to 512 visible ASCII characters".to_owned(),
+        ));
+    }
     Ok(())
 }
 
-fn validate_runtime_paths(config: &ResolvedConfig) -> Result<(), ConfigError> {
-    if !config.legal_db.is_absolute()
-        || !config.user_db.is_absolute()
-        || !config.output_root.is_absolute()
-        || config.allowed_roots.iter().any(|path| !path.is_absolute())
+pub fn parse_bearer(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer")
+        || token.is_empty()
+        || !(MIN_TOKEN_BYTES..=MAX_TOKEN_BYTES).contains(&token.len())
+        || token.bytes().any(|byte| !safe_token_byte(byte))
     {
-        return Err(ConfigError::Invalid(
-            "database, allowed root, and output paths must be absolute".into(),
-        ));
+        return None;
     }
-    if config.legal_db.file_name().is_none() {
-        return Err(ConfigError::Invalid(
-            "legal database path must name a file".into(),
-        ));
-    }
-    if config.user_db.file_name().is_none() {
-        return Err(ConfigError::Invalid(
-            "user database path must name a file".into(),
-        ));
-    }
-    if config.allowed_roots.len() > MAX_ALLOWLIST_ENTRIES {
-        return Err(ConfigError::Invalid(
-            "allowed roots contains too many entries".into(),
-        ));
-    }
-    Ok(())
+    Some(token)
+}
+
+fn safe_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'~')
 }
 
 fn validate_limits(body: usize, timeout_ms: u64, concurrency: usize) -> Result<(), ConfigError> {
     if !(16 * 1024..=16 * 1024 * 1024).contains(&body) {
         return Err(ConfigError::Invalid(
-            "max_body_bytes must be between 16384 and 16777216".into(),
+            "max_body_bytes must be between 16384 and 16777216".to_owned(),
         ));
     }
     if !(100..=120_000).contains(&timeout_ms) {
         return Err(ConfigError::Invalid(
-            "request_timeout_ms must be between 100 and 120000".into(),
+            "request_timeout_ms must be between 100 and 120000".to_owned(),
         ));
     }
     if !(1..=64).contains(&concurrency) {
         return Err(ConfigError::Invalid(
-            "max_concurrency must be between 1 and 64".into(),
+            "max_concurrency must be between 1 and 64".to_owned(),
         ));
     }
     Ok(())
-}
-
-fn validate_http_auth_requirement(
-    is_http: bool,
-    bind: SocketAddr,
-    bearer: Option<&BearerSecret>,
-    dangerously_allow_insecure_non_loopback_http: bool,
-) -> Result<(), ConfigError> {
-    if !is_http || bind.ip().is_loopback() {
-        return Ok(());
-    }
-    if !dangerously_allow_insecure_non_loopback_http {
-        return Err(ConfigError::Invalid(
-            "cleartext HTTP binding to a non-loopback address is disabled; bind to loopback behind a TLS reverse proxy, or explicitly opt in with --dangerously-allow-insecure-non-loopback-http only on a trusted network"
-                .to_owned(),
-        ));
-    }
-    if bearer.is_none() {
-        return Err(ConfigError::Invalid(
-            "insecure non-loopback HTTP opt-in also requires bearer authentication".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn load_bearer(
-    env_name: &str,
-    token_file: Option<&Path>,
-) -> Result<Option<BearerSecret>, ConfigError> {
-    if let Some(value) = env::var_os(env_name) {
-        let text = value.into_string().map_err(|_| {
-            ConfigError::Invalid("bearer token environment variable is not valid UTF-8".into())
-        })?;
-        return BearerSecret::new(Zeroizing::new(text.into_bytes())).map(Some);
-    }
-    let Some(path) = token_file else {
-        return Ok(None);
-    };
-    let link_metadata = fs::symlink_metadata(path).map_err(ConfigError::ReadToken)?;
-    if link_metadata.file_type().is_symlink()
-        || !link_metadata.is_file()
-        || link_metadata.len() > MAX_TOKEN_FILE_BYTES
-    {
-        return Err(ConfigError::Invalid(
-            "bearer token file must be a non-symlink regular file no larger than 4096 bytes".into(),
-        ));
-    }
-    let mut bytes = Zeroizing::new(fs::read(path).map_err(ConfigError::ReadToken)?);
-    while matches!(bytes.last(), Some(b'\r' | b'\n')) {
-        bytes.pop();
-    }
-    BearerSecret::new(bytes).map(Some)
-}
-
-fn validate_env_name(name: &str) -> Result<(), ConfigError> {
-    if name.is_empty()
-        || name.len() > 128
-        || !name
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-    {
-        return Err(ConfigError::Invalid(
-            "bearer environment variable name is invalid".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Validate and canonicalize the exact browser origins allowed to call an
-/// HTTP MCP endpoint. App-issued standalone sessions share this validator so
-/// descriptors never persist a non-canonical host-supplied allowlist.
-pub fn normalize_allowed_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
-    if values.len() > MAX_ALLOWLIST_ENTRIES {
-        return Err(ConfigError::Invalid(
-            "allowed origins contains too many entries".into(),
-        ));
-    }
-    let mut normalized = Vec::with_capacity(values.len());
-    for raw in values {
-        let parsed = Url::parse(raw.trim())
-            .map_err(|_| ConfigError::Invalid("allowed origin is not a valid URL origin".into()))?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || parsed.path() != "/"
-        {
-            return Err(ConfigError::Invalid(
-                "allowed origin must contain only an http(s) scheme, host, and optional port"
-                    .into(),
-            ));
-        }
-        let origin = parsed.origin().ascii_serialization().to_ascii_lowercase();
-        if !normalized.contains(&origin) {
-            normalized.push(origin);
-        }
-    }
-    Ok(normalized)
-}
-
-fn normalize_hosts(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
-    if values.len() > MAX_ALLOWLIST_ENTRIES {
-        return Err(ConfigError::Invalid(
-            "allowed hosts contains too many entries".into(),
-        ));
-    }
-    let mut normalized = Vec::with_capacity(values.len());
-    for raw in values {
-        let host = raw.trim().to_ascii_lowercase();
-        if host.is_empty()
-            || host.len() > 255
-            || host.contains('/')
-            || host.contains('\\')
-            || host.contains('@')
-            || host.bytes().any(|byte| byte.is_ascii_whitespace())
-        {
-            return Err(ConfigError::Invalid("allowed host is invalid".into()));
-        }
-        if !normalized.contains(&host) {
-            normalized.push(host);
-        }
-    }
-    Ok(normalized)
-}
-
-fn default_allowed_hosts(bind: SocketAddr) -> Vec<String> {
-    let mut hosts = vec![bind.to_string().to_ascii_lowercase()];
-    if bind.ip().is_loopback() {
-        hosts.push(format!("localhost:{}", bind.port()));
-        match bind.ip() {
-            IpAddr::V4(_) => hosts.push(format!("127.0.0.1:{}", bind.port())),
-            IpAddr::V6(_) => hosts.push(format!("[::1]:{}", bind.port())),
-        }
-    }
-    hosts.sort();
-    hosts.dedup();
-    hosts
-}
-
-fn choose_paths(
-    cli: Vec<PathBuf>,
-    environment: Option<Vec<PathBuf>>,
-    file: Vec<PathBuf>,
-) -> Vec<PathBuf> {
-    if !cli.is_empty() {
-        cli
-    } else if let Some(environment) = environment.filter(|values| !values.is_empty()) {
-        environment
-    } else {
-        file
-    }
-}
-
-fn choose_strings(
-    cli: Vec<String>,
-    environment: Option<Vec<String>>,
-    file: Vec<String>,
-) -> Vec<String> {
-    if !cli.is_empty() {
-        cli
-    } else if let Some(environment) = environment.filter(|values| !values.is_empty()) {
-        environment
-    } else {
-        file
-    }
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -730,29 +471,12 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn env_csv(name: &str) -> Option<Vec<String>> {
-    env::var(name).ok().map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(ToOwned::to_owned)
-            .collect()
-    })
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    env::var(name).ok()?.parse().ok()
 }
 
-fn env_parse<T>(name: &str) -> Result<Option<T>, ConfigError>
-where
-    T: FromStr,
-{
-    env::var(name)
-        .ok()
-        .map(|value| {
-            value.parse().map_err(|_| {
-                ConfigError::Invalid(format!("environment variable {name} has an invalid value"))
-            })
-        })
-        .transpose()
+fn env_parse_profile(name: &str) -> Option<PrivacyProfile> {
+    env::var(name).ok()?.parse().ok()
 }
 
 fn absolutize(path: PathBuf, base: &Path) -> PathBuf {
@@ -763,142 +487,79 @@ fn absolutize(path: PathBuf, base: &Path) -> PathBuf {
     }
 }
 
-pub fn normalize_request_origin(raw: &str) -> Option<String> {
-    let parsed = Url::parse(raw).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || parsed.path() != "/"
-    {
-        return None;
-    }
-    Some(parsed.origin().ascii_serialization().to_ascii_lowercase())
-}
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
-    fn embedded_config() -> EmbeddedHttpConfig {
-        #[cfg(windows)]
-        let root = PathBuf::from(r"C:\lawyer-assistance-embedded-config-test");
-        #[cfg(not(windows))]
-        let root = PathBuf::from("/tmp/lawyer-assistance-embedded-config-test");
-        EmbeddedHttpConfig {
-            legal_db: root.join("legal_core.sqlite"),
-            user_db: root.join("user.sqlite"),
-            allowed_roots: vec![root.join("materials")],
-            output_root: root.join("exports"),
-            port: 9876,
-            allowed_origins: vec!["HTTPS://CLIENT.EXAMPLE:443".to_owned()],
-            bearer: Some(BearerSecret::new(Zeroizing::new(vec![b'x'; 32])).expect("valid token")),
-            max_body_bytes: 64 * 1024,
-            request_timeout_ms: 4_000,
-            max_concurrency: 3,
+    #[test]
+    fn daemon_url_accepts_only_literal_loopback_http_origins() {
+        assert!(validate_daemon_url("http://127.0.0.1:8877").is_ok());
+        assert!(validate_daemon_url("http://[::1]:8877").is_ok());
+        for invalid in [
+            "https://127.0.0.1:8877",
+            "http://localhost:8877",
+            "http://127.0.0.1:8877/path",
+            "http://example.com:8877",
+            "http://127.0.0.1:8877/?q=1",
+        ] {
+            assert!(validate_daemon_url(invalid).is_err(), "{invalid}");
         }
     }
 
     #[test]
-    fn bearer_comparison_accepts_only_exact_token() {
-        let secret = BearerSecret::new(Zeroizing::new(vec![b'x'; 32])).expect("valid token");
+    fn bearer_secret_never_accepts_a_near_match() {
+        let secret = BearerSecret::from_token_bytes(vec![b'x'; 32]).expect("valid token");
         assert!(secret.authorizes(&format!("Bearer {}", "x".repeat(32))));
-        assert!(secret.authorizes(&format!("bearer {}", "x".repeat(32))));
         assert!(!secret.authorizes(&format!("Bearer {}", "y".repeat(32))));
-        assert!(!secret.authorizes(&format!("Basic {}", "x".repeat(32))));
+        assert!(!secret.authorizes("Basic xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
     }
 
     #[test]
-    fn origins_are_canonical_and_pathless() {
-        assert_eq!(
-            normalize_allowed_origins(vec!["HTTPS://EXAMPLE.COM:443".into()])
-                .expect("valid origin"),
-            vec!["https://example.com"]
-        );
-        assert!(normalize_allowed_origins(vec!["https://example.com/path".into()]).is_err());
-        assert!(normalize_request_origin("null").is_none());
-    }
-
-    #[test]
-    fn non_loopback_plain_http_requires_explicit_dangerous_opt_in_and_auth() {
-        let bind = "0.0.0.0:8787".parse::<SocketAddr>().expect("valid bind");
-        let token = BearerSecret::new(Zeroizing::new(vec![b'x'; 32])).expect("valid token");
-        assert!(validate_http_auth_requirement(true, bind, None, false).is_err());
-        assert!(validate_http_auth_requirement(true, bind, Some(&token), false).is_err());
-        assert!(validate_http_auth_requirement(true, bind, None, true).is_err());
-        assert!(validate_http_auth_requirement(true, bind, Some(&token), true).is_ok());
-        assert!(validate_http_auth_requirement(false, bind, None, false).is_ok());
-        assert!(validate_http_auth_requirement(
-            true,
-            "127.0.0.1:8787".parse().unwrap(),
-            None,
-            false
+    fn old_public_launcher_options_are_accepted_but_do_not_select_private_storage() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config_path = temporary.path().join("legacy.toml");
+        std::fs::write(
+            &config_path,
+            "legal_db = \"legal.sqlite\"\nuser_db = \"private.sqlite\"\n",
         )
-        .is_ok());
-    }
-
-    #[test]
-    fn insecure_non_loopback_opt_in_is_explicit_in_cli_and_file_config() {
+        .expect("compatibility config");
         let cli = Cli::try_parse_from([
             "lawyer-assistance-mcp",
-            "--dangerously-allow-insecure-non-loopback-http",
+            "--config",
+            config_path.to_str().expect("path"),
+            "--user-db",
+            "another-private.sqlite",
+            "--allowed-root",
+            "private-cases",
+            "--output-dir",
+            "private-exports",
             "stdio",
         ])
-        .unwrap();
-        assert!(cli.dangerously_allow_insecure_non_loopback_http);
-
-        let file: FileConfig =
-            toml::from_str("dangerously_allow_insecure_non_loopback_http = true\n").unwrap();
-        assert!(file.dangerously_allow_insecure_non_loopback_http);
+        .expect("legacy launcher syntax");
+        let resolved = cli.resolve().expect("public launcher resolves");
+        assert_eq!(resolved.privacy_profile, PrivacyProfile::PublicLawOnly);
+        assert_eq!(resolved.legal_db, temporary.path().join("legal.sqlite"));
     }
 
     #[test]
-    fn embedded_http_configuration_is_loopback_only_and_ambient_state_independent() {
-        let expected = embedded_config();
-        let resolved = expected
-            .clone()
-            .resolve()
-            .expect("embedded config resolves");
-
-        assert_eq!(resolved.legal_db, expected.legal_db);
-        assert_eq!(resolved.user_db, expected.user_db);
-        assert_eq!(resolved.allowed_roots, expected.allowed_roots);
-        assert_eq!(resolved.output_root, expected.output_root);
-        assert_eq!(resolved.bind, "127.0.0.1:9876".parse().unwrap());
+    fn legacy_json_config_still_supplies_the_public_legal_database() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config_path = temporary.path().join("legacy.json");
+        std::fs::write(
+            &config_path,
+            r#"{"legal_db":"legal.sqlite","user_db":"private.sqlite","output_root":"exports"}"#,
+        )
+        .expect("compatibility config");
+        let cli = Cli::try_parse_from([
+            "lawyer-assistance-mcp",
+            "--config",
+            config_path.to_str().expect("path"),
+            "stdio",
+        ])
+        .expect("legacy JSON syntax");
         assert_eq!(
-            resolved.allowed_origins,
-            vec!["https://client.example".to_owned()]
+            cli.resolve().expect("public launcher resolves").legal_db,
+            temporary.path().join("legal.sqlite")
         );
-        assert_eq!(
-            resolved.allowed_hosts,
-            vec!["127.0.0.1:9876".to_owned(), "localhost:9876".to_owned()]
-        );
-        assert!(resolved.bearer.is_some());
-        assert!(!resolved.dangerously_allow_insecure_non_loopback_http);
-        assert_eq!(resolved.limits.max_body_bytes, 64 * 1024);
-        assert_eq!(resolved.limits.request_timeout, Duration::from_secs(4));
-        assert_eq!(resolved.limits.max_concurrency, 3);
-        assert!(matches!(
-            resolved.command,
-            Command::Serve { bind: Some(bind) } if bind == resolved.bind
-        ));
-    }
-
-    #[test]
-    fn embedded_http_configuration_reuses_origin_limit_and_path_validation() {
-        let mut invalid_origin = embedded_config();
-        invalid_origin.allowed_origins = vec!["https://client.example/path".to_owned()];
-        assert!(invalid_origin.resolve().is_err());
-
-        let mut invalid_limits = embedded_config();
-        invalid_limits.max_concurrency = 0;
-        assert!(invalid_limits.resolve().is_err());
-
-        let mut relative_path = embedded_config();
-        relative_path.legal_db = PathBuf::from("legal_core.sqlite");
-        assert!(relative_path.resolve().is_err());
     }
 }

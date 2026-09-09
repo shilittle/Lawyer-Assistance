@@ -619,6 +619,9 @@ fn extract_document_xml(bytes: &[u8], limits: Limits) -> Result<Extraction, Inge
                 if is_word && is_revision_element(local_name.as_ref()) {
                     return Err(IngestError::IncompleteDocxExtraction);
                 }
+                if is_word && is_unhandled_document_content(local_name.as_ref()) {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
                 if !saw_document_root {
                     if !is_word || local_name.as_ref() != b"document" {
                         return Err(IngestError::CorruptDocx);
@@ -644,6 +647,9 @@ fn extract_document_xml(bytes: &[u8], limits: Limits) -> Result<Extraction, Inge
             }
             Event::Empty(element) if is_word => {
                 if is_revision_element(element.local_name().as_ref()) {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
+                if is_unhandled_document_content(element.local_name().as_ref()) {
                     return Err(IngestError::IncompleteDocxExtraction);
                 }
                 match element.local_name().as_ref() {
@@ -679,8 +685,10 @@ fn extract_document_xml(bytes: &[u8], limits: Limits) -> Result<Extraction, Inge
                 if in_text {
                     return Err(IngestError::CorruptDocx);
                 }
+                // Text extraction is the redaction source of truth. Do not trim runs here:
+                // leading/trailing whitespace and explicit line breaks can be material in legal
+                // text and the minimal exporter verifies an exact extraction round-trip.
                 let paragraph_text = paragraph.take().ok_or(IngestError::CorruptDocx)?;
-                let paragraph_text = paragraph_text.trim().to_owned();
                 if !paragraph_text.is_empty() {
                     builder.push(
                         format!("paragraph:{paragraph_number}"),
@@ -747,6 +755,25 @@ fn is_revision_element(local_name: &[u8]) -> bool {
             | b"tcPrChange"
             | b"sectPrChange"
             | b"numberingChange"
+    )
+}
+
+/// These WordprocessingML constructs either contain text outside the literal paragraph/run
+/// stream or draw/compute visible content. The workspace deliberately rebuilds a minimal DOCX,
+/// so accepting any of them would silently lose potentially sensitive material.
+fn is_unhandled_document_content(local_name: &[u8]) -> bool {
+    matches!(
+        local_name,
+        b"drawing"
+            | b"pict"
+            | b"object"
+            | b"altChunk"
+            | b"txbxContent"
+            | b"fldSimple"
+            | b"instrText"
+            | b"fldChar"
+            | b"ruby"
+            | b"annotationRef"
     )
 }
 fn is_word_namespace(resolution: &ResolveResult<'_>) -> bool {

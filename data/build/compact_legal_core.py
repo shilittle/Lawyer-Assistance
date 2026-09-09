@@ -18,7 +18,7 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_SCHEMA = ROOT / "data" / "schema" / "legal_core_runtime.sql"
 DEFAULT_INPUT = ROOT / "data" / "generated" / "legal_core_full.sqlite"
-DEFAULT_OUTPUT = ROOT / "apps" / "desktop" / "src-tauri" / "resources" / "legal_core.sqlite"
+DEFAULT_OUTPUT = ROOT / "data" / "runtime" / "legal_core.sqlite"
 DEFAULT_REPORT = ROOT / "data" / "generated" / "legal_core_runtime_report.json"
 DEFAULT_MANIFEST = ROOT / "data" / "generated" / "legal_core_distribution_manifest.json"
 DEFAULT_ARCHIVAL_MANIFEST = ROOT / "data" / "generated" / "legal_core_full_manifest.json"

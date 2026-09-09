@@ -1,4 +1,0 @@
-# Python dependencies used only by the MinerU worker and release-builder
-# test suite. Runtime dependencies remain in requirements.lock.
-packaging==26.2
-Pillow==12.2.0

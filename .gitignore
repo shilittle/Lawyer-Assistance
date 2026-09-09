@@ -17,16 +17,8 @@
 **/dist/
 **/target/
 
-apps/desktop/frontend-dist/*
-!apps/desktop/frontend-dist/.gitkeep
-apps/desktop/src-tauri/gen/
-apps/desktop/src-tauri/binaries/*.exe
-!apps/desktop/src-tauri/binaries/.gitkeep
-apps/desktop/src-tauri/resources/*
-!apps/desktop/src-tauri/resources/.gitkeep
-!apps/desktop/src-tauri/resources/LICENSE.txt
-!apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt
-!apps/desktop/src-tauri/resources/DATA_SOURCES.md
+# Ignore retained local build/data residue from the retired desktop application.
+/apps/desktop/
 data/build/cache/
 data/build/state/
 data/generated/*
@@ -47,6 +39,9 @@ data/generated/*
 **/user.sqlite-shm
 **/user.sqlite-wal
 **/user.sqlite-journal
+**/workspace.sqlite*
+**/workspace.lock
+**/connection.dpapi
 **/legal_core.sqlite
 **/legal_core.sqlite-shm
 **/legal_core.sqlite-wal

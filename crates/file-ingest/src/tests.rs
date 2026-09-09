@@ -218,6 +218,25 @@ fn extracts_deflated_docx_with_physical_paragraph_locators() {
 }
 
 #[test]
+fn extracts_table_cells_in_document_order_without_dropping_following_paragraphs() {
+    let xml = word_document(
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>first cell</w:t></w:r></w:p></w:tc>\
+         <w:tc><w:p><w:r><w:t>second cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+         <w:p><w:r><w:t>after table</w:t></w:r></w:p>",
+    );
+    let document = ingest_bytes("table.docx", &make_docx(&xml)).unwrap();
+    assert_eq!(document.text, "first cell\nsecond cell\nafter table");
+    assert_eq!(
+        document
+            .segments
+            .iter()
+            .map(|segment| segment.locator.as_str())
+            .collect::<Vec<_>>(),
+        ["paragraph:1", "paragraph:2", "paragraph:3"]
+    );
+}
+
+#[test]
 fn extracts_utf8_txt_and_normalizes_line_endings() {
     let input = (1..=41)
         .map(|line| format!("line {line}"))
@@ -379,37 +398,63 @@ fn rejects_docx_macro_embedding_doctype_and_zip_bomb() {
     );
 }
 
-#[test]
-fn rejects_docx_parts_and_revisions_that_are_not_fully_extracted() {
+fn assert_incomplete_docx_part(name: &str, data: &[u8]) {
     let xml = word_document("<w:p><w:r><w:t>visible</w:t></w:r></w:p>");
-    for (name, data) in [
-        ("word/header1.xml", b"<w:hdr>secret</w:hdr>".as_slice()),
-        (
-            "word/comments.xml",
-            b"<w:comments>secret</w:comments>".as_slice(),
-        ),
-        ("word/media/image1.png", b"not-a-real-image".as_slice()),
-        (
-            "word/footnotes.xml",
-            b"<w:footnotes>secret</w:footnotes>".as_slice(),
-        ),
-    ] {
-        let bytes = make_docx_with(
-            &xml,
-            DOCX_MAIN_CONTENT_TYPE,
-            &[(name, data)],
-            CompressionMethod::Deflated,
-        );
-        assert_eq!(
-            ingest_bytes("incomplete.docx", &bytes).unwrap_err(),
-            IngestError::IncompleteDocxExtraction,
-            "entry {name} must fail closed"
-        );
-    }
+    let bytes = make_docx_with(
+        &xml,
+        DOCX_MAIN_CONTENT_TYPE,
+        &[(name, data)],
+        CompressionMethod::Deflated,
+    );
+    assert_eq!(
+        ingest_bytes("incomplete.docx", &bytes).unwrap_err(),
+        IngestError::IncompleteDocxExtraction,
+        "entry {name} must fail closed"
+    );
+}
 
+#[test]
+fn rejects_docx_header_text_that_is_not_fully_extracted() {
+    assert_incomplete_docx_part("word/header1.xml", b"<w:hdr>secret</w:hdr>");
+}
+
+#[test]
+fn rejects_docx_footer_text_that_is_not_fully_extracted() {
+    assert_incomplete_docx_part("word/footer1.xml", b"<w:ftr>secret</w:ftr>");
+}
+
+#[test]
+fn rejects_docx_comment_text_that_is_not_fully_extracted() {
+    assert_incomplete_docx_part("word/comments.xml", b"<w:comments>secret</w:comments>");
+}
+
+#[test]
+fn rejects_docx_footnote_text_that_is_not_fully_extracted() {
+    assert_incomplete_docx_part("word/footnotes.xml", b"<w:footnotes>secret</w:footnotes>");
+}
+
+#[test]
+fn rejects_docx_endnote_text_that_is_not_fully_extracted() {
+    assert_incomplete_docx_part("word/endnotes.xml", b"<w:endnotes>secret</w:endnotes>");
+}
+
+#[test]
+fn rejects_docx_image_parts_that_are_not_fully_extracted() {
+    assert_incomplete_docx_part("word/media/image1.png", b"not-a-real-image");
+}
+
+#[test]
+fn rejects_docx_revisions_that_are_not_fully_extracted() {
     let tracked = word_document("<w:p><w:ins><w:r><w:t>inserted secret</w:t></w:r></w:ins></w:p>");
     assert_eq!(
-        ingest_bytes("tracked.docx", &make_docx(&tracked)).unwrap_err(),
+        ingest_bytes("tracked-insert.docx", &make_docx(&tracked)).unwrap_err(),
+        IngestError::IncompleteDocxExtraction
+    );
+
+    let tracked =
+        word_document("<w:p><w:del><w:r><w:delText>deleted secret</w:delText></w:r></w:del></w:p>");
+    assert_eq!(
+        ingest_bytes("tracked-delete.docx", &make_docx(&tracked)).unwrap_err(),
         IngestError::IncompleteDocxExtraction
     );
 }
@@ -723,5 +768,47 @@ fn image_extensions_require_magic_match_and_local_ocr() {
     assert_eq!(
         ingest_bytes("renamed.jpg", png).unwrap_err(),
         IngestError::FormatMismatch
+    );
+}
+
+#[test]
+fn strict_explicit_txt_encodings_do_not_guess_or_replace_invalid_bytes() {
+    assert_eq!(
+        extract_plain_text("gb.txt", &[0xc4, 0xe3, 0xba, 0xc3], Some("GB18030")).unwrap(),
+        "你好"
+    );
+    assert_eq!(
+        extract_plain_text(
+            "utf16.txt",
+            &[0xff, 0xfe, b'A', 0, b'\n', 0],
+            Some("utf-16")
+        )
+        .unwrap(),
+        "A\n"
+    );
+    assert_eq!(
+        extract_plain_text("invalid.txt", &[0xff], Some("gb18030")).unwrap_err(),
+        IngestError::InvalidTextEncoding
+    );
+    assert_eq!(
+        extract_plain_text("invalid-utf16.txt", &[0x00], Some("utf-16le")).unwrap_err(),
+        IngestError::InvalidTextEncoding
+    );
+    assert_eq!(
+        extract_plain_text("missing-bom.txt", &[b'A', 0], Some("utf-16")).unwrap_err(),
+        IngestError::InvalidTextEncoding
+    );
+    assert_eq!(
+        extract_plain_text("ambiguous.txt", &[0xc4, 0xe3], None).unwrap_err(),
+        IngestError::InvalidUtf8
+    );
+}
+
+#[test]
+fn rejects_drawing_content_even_when_no_media_part_is_present() {
+    let xml = word_document("<w:p><w:r><w:t>visible</w:t></w:r><w:r><w:drawing/></w:r></w:p>");
+    assert_eq!(
+        ingest_bytes("drawing.docx", &make_docx(&xml)).unwrap_err(),
+        IngestError::IncompleteDocxExtraction
     );
 }

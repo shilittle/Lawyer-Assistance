@@ -4,10 +4,55 @@
   "http_endpoint": "/mcp",
   "privacy_profile": "public_law_only",
   "tools": [
-    { "name": "system_status", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
-    { "name": "legal_search", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
-    { "name": "legal_get_article", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
-    { "name": "legal_get_versions", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false },
-    { "name": "legal_get_relations", "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }, "confirmation_required": false }
+    {
+      "name": "system_status",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "confirmation_required": false
+    },
+    {
+      "name": "legal_search",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "confirmation_required": false
+    },
+    {
+      "name": "legal_get_article",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "confirmation_required": false
+    },
+    {
+      "name": "legal_get_versions",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "confirmation_required": false
+    },
+    {
+      "name": "legal_get_relations",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "confirmation_required": false
+    }
   ]
 }

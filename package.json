@@ -1,13 +1,21 @@
 {
   "name": "lawyer-assistance-workspace",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "private": true,
   "packageManager": "pnpm@11.7.0",
   "scripts": {
-    "build": "pnpm --filter @lawyer-assistance/desktop build",
-    "lint": "pnpm --filter @lawyer-assistance/desktop lint",
-    "tauri": "pnpm --filter @lawyer-assistance/desktop tauri",
-    "test": "pnpm --filter @lawyer-assistance/desktop test"
+    "build": "pnpm run build:server && pnpm run build:mcp",
+    "build:server": "cargo build --release --locked -j 1 -p lawyer-assistance-server --bin lawyer-assistance",
+    "build:mcp": "cargo build --release --locked -j 1 -p legal-mcp --bin lawyer-assistance-mcp",
+    "check": "pnpm --filter @lawyer-assistance/web check",
+    "lint": "pnpm run check",
+    "test": "pnpm --filter @lawyer-assistance/web test",
+    "test:portable": "python -m unittest scripts.test_package_portable -v",
+    "package:portable": "python scripts/package_portable.py",
+    "package:portable:skip-build": "python scripts/package_portable.py --skip-build"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
   },
   "engines": {
     "node": ">=24.0.0",

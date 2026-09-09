@@ -1,45 +1,25 @@
 # Lawyer Assistance 文档
 
-Lawyer Assistance 是面向 Windows x86_64 的本地法律辅助应用。它提供离线公开法律检索、无需案件即可使用的普通聊天、案件材料与脱敏、approved-only 案件助理、法律图示、成果管理与加密备份。默认数据边界是本地处理；普通聊天、案件工作和 approved automation 使用互不混用的出站边界，任何 Provider 或宿主集成都必须经过明确配置和对应授权。
-
-当前版本为 `0.4.0`。仓库内版本源已进入稳定版正式发布候选阶段，但这不代表 `v0.4.0` GitHub Release 已经完成签名、发布或提升为 stable/latest。开始使用或核验候选资产前，请先阅读[当前发布状态](release-status.md)。
-
-源代码仓库当前公开。公开可见性只说明源码和已实际发布的文件可供检查，并不建立可信 Windows publisher、可用 updater 签名、OCR 资格、干净机器验收或正式发布状态。
+当前版本 `0.4.0` 是本机 Web 重构版本：Rust server 提供业务和 HTTP/MCP 接口，`apps/web` 提供无需构建的普通 HTML/CSS/JavaScript 界面。产品首要目标是 TXT/DOCX 脱敏和本地法律检索。
 
 ## 用户文档
 
-- [快速开始](getting-started.md)：安装、普通聊天与附件、材料与脱敏、案件助理、BYOK Provider、MCP、OCR 与备份。
-- [安全与隐私](security-and-privacy.md)：普通聊天、案件工作、自动化三种出站边界，以及本地数据、OCR、宿主集成和备份规则。
-- [当前发布状态](release-status.md)：`0.4.0` 当前源码状态、正式资产契约、默认禁用项和外部门禁。
-- [从 v0.3.1 升级到 v0.4.0](upgrade-v0.3.1-to-v0.4.0.md)：exact profile 自动升级、完整五槽恢复、旧版重开与再次升级。
-- [English documentation](README.en.md)
+- [快速开始](getting-started.md)：启动服务、导入材料、复核、导出和使用 MCP。
+- [安全与隐私](security-and-privacy.md)：数据存储、云辅助授权、会话和 MCP 边界。
+- [法律数据与运行时数据库](data/legal-corpus.md)：来源、发行清单和审计命令。
+- [Web API 文档](web/README.md)：若该目录已生成，记录 HTTP 请求和响应契约。
+- [MCP 文档](mcp/README.md)：公开法律和 `privacy_workspace` 工具、传输和安全说明。
 
-## 功能参考
+## 开发文档
 
-- [MCP 概览](mcp/README.md)
-- [MCP 安装与运行](mcp/installation.md)
-- [MCP 工具与 profile 契约](mcp/tools.md)
-- [批准案件工作区](mcp/approved-case-workspace.md)
-- [图示系统架构](diagrams/architecture.md)
-- [图示系统安全模型](diagrams/security-model.md)
-- [隐私工作区与 MCP 边界](privacy-vnext/WORKSPACE_AND_MCP.md)
-- [隐私运维说明](privacy-vnext/OPERATIONS.md)：本地处理、案件材料、案件助理、自动化和维护入口。
-- [法律数据集与运行时数据库](data/legal-corpus.md)
-- [仓库结构与目录规范](development/repository-layout.md)
-- [Windows 发布签名](development/release-signing.md)
+- [仓库结构](development/repository-layout.md)
+- [贡献指南](../CONTRIBUTING.md)
+- [安全政策](../SECURITY.md)
 
-## 宿主集成
+## 支持范围
 
-仓库提供 WorkBuddy、Codex 和 OpenCode 的功能性集成示例。默认集成都固定为不含案件数据的 `public_law_only`；批准案件工作区使用独立、默认禁用且需要 App 当前授权的配置。
+当前只支持 TXT、DOCX、公开法律检索、简单模板、Provider 对话和指定的 MCP 工具。PDF、图片、扫描件 OCR、原件版式保留、复杂案件工作台、法律图谱和自动办案流程不在首版范围。没有 Tauri 安装器、签名/updater 发布链或 OCR 运行时。
 
-- [WorkBuddy](../integrations/workbuddy/README.md)
-- [Codex](../integrations/codex/README.md)
-- [OpenCode](../integrations/opencode/README.md)
+## 数据和许可证
 
-## 法律与数据说明
-
-应用内容仅用于辅助检索和律师复核，不替代对现行官方文本、案件事实和专业判断的核验。桌面应用资产使用经过验证的 `runtime-slim-v1` 运行时法律库；完整归档数据库不随 App Release 提供。数据来源和版本身份以仓库中的 source manifest、distribution manifest、正式资产清单和应用内版本信息为准。
-
-- [数据来源清单](../data/sources/source_manifest.md)
-- [发布说明](../RELEASE_NOTES.md)
-- [许可证](../LICENSE)
+运行时只读法律库与许可证位于 `data/runtime/`。法律数据来源和构建/审计工具保留在 `data/sources/`、`data/build/`；这些工具不应在应用运行期间写入用户数据目录。

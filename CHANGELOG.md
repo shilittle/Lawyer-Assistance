@@ -1,27 +1,33 @@
 # Changelog
 
-本文件记录面向用户的正式版本变化。历史预发布构建只作为开发与验收事实保留，不作为稳定版本支持线。
+本文件记录 Lawyer Assistance 的用户可见变化。
 
-## [Unreleased]
-
-### Target: 0.4.0
+## [1.0.0] - 2026-09-09
 
 ### Added
 
-- 四个顶层工作区：助理、案件、法律资料库和设置；普通聊天、案件助理与 approved automation/MCP 使用相互独立的执行边界。
-- 审计型、一对一、双向唯一的 `ProjectId ↔ PrivacyCaseId` 持久化绑定，以及案件材料归属、保护显示名和迁移证据链。
-- exact v0.3.1 自动升级、写入前五槽原态恢复点、recovery-only `apply-and-exit`、旧版重开与再次升级流程。
-- `.lavbackup` V3 五组件备份、加密 work-products、approved MCP policy v2/replay journal v2，以及本地 MinerU 组件的签名、隔离和资格链。
-- 统一 stable version gate、精确发布资产 allowlist、不可覆盖的 draft 上传和全新目录服务端回读验证。
+- Rust `lawyer-assistance` 本机后台服务，提供 loopback HTTP API、会话认证、任务恢复和嵌入式静态 WebUI。
+- 普通 HTML/CSS/JavaScript WebUI，直接嵌入 server 二进制，不依赖 Tauri、WebView2 或前端开发服务器。
+- TXT/DOCX 导入、正文和表格提取、规则与词典识别、稳定别名、替换、残留检查、复核、撤销，以及 TXT/Markdown/重建 DOCX/ZIP 导出。
+- 本地只读法律检索、条文详情、历史版本、效力日期、关联法规和收藏。
+- `privacy_workspace` MCP 的 `submit`、`status`、`read_result` 三个工作区工具，同时保留公开法律五工具；私有 profile 共八个工具。
+- Windows 无窗口 `Lawyer-Assistance.vbs` 启动器、认证 `Stop-Lawyer-Assistance.vbs` 停止器，以及包含运行时法律库和当前文档的 x86_64 便携 ZIP 打包流程。
 
 ### Changed
 
-- User 数据库目标 schema 升至 11；Privacy 数据库依次迁移至 schema 5/6，并在最后事务中才提交 User schema 10→11。
-- approved case workspace 固定为 21 个工具；旧 approved MCP session 必须撤销并以 policy v2 重建。
-- Windows 正式发布只接受 exact `0.4.0`、干净且同步的 `main`、exact-HEAD CI、Authenticode/RFC3161、installer-bound updater 签名与固定资产名。
+- 工作区数据使用 `%LOCALAPPDATA%\LawyerAssistanceWeb`；旧 Tauri 案件、材料、映射、授权和其他用户数据保持不变，不读取、不迁移、不覆盖。
+- MCP public/private profile 共用本机后台的业务边界；`approved_case_workspace`、`redacted_case` 和 `diagram_authoring` 明确停用，不兼容映射。
+- 版本与结果流程支持任务恢复、取消、重试、冲突复核、结果撤销和有效版本检查。
 
-### Security
+### Breaking changes
 
-- 无法唯一认证的旧数据库、混合版本目录、身份冲突、回放、篡改、残留或不完整恢复状态均失败关闭。
-- 真实案件材料仍禁止进入仓库、日志、浏览器/搜索、远程 OCR、云存储或未经批准的 Provider/MCP/自动化上下文。
-- 稳定发布的外部凭据、最终 MinerU 资产、clean-machine 和服务端证据必须真实满足；测试 key、占位模型或本机普通 smoke test 不构成替代。
+- Tauri 窗口、IPC、WebView2、安装器、签名、updater 和旧资格发布链不再属于 v1.0.0 运行或发布路径。
+- 首版输入限定 TXT 和 DOCX；PDF、图片、扫描件 OCR、原件版式保留、复杂案件工作台、法律图谱和自动办案流程没有入口。OCR 仅保留扩展接口，不安装或发布运行时。
+- 公开法律 MCP 固定为五个工具；`privacy_workspace` 固定为八个工具。停用的旧 profile 返回 `profile_disabled`。
+
+### Security and release boundaries
+
+- Provider 密钥保存后读回校验，无法读取或内容不一致时明确返回保存失败。
+- 原始材料、映射、凭据和用户数据不进入便携包、日志、公开 MCP 或未经授权的 Provider；MCP 私有结果只返回已发布脱敏文本。
+- 便携包未签名，不提供安装器或自动更新器；发布资产须通过 ZIP SHA-256 和包内 manifest 校验。
+- 本次公开发布未完成真实 Provider 联调；疑难云辅助和自动化回归使用可控模拟服务。合成材料的通过率、误报和漏检统计用于回归验证，不构成真实案件精度保证。

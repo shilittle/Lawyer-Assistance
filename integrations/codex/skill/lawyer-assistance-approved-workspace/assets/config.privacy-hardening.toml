@@ -1,5 +1,0 @@
-[history]
-persistence = "none"
-
-[memories]
-disable_on_external_context = true

@@ -7,12 +7,7 @@
       "command": ["/absolute/path/to/lawyer-assistance-mcp", "--privacy-profile", "public_law_only", "stdio"],
       "enabled": true,
       "timeout": 30000,
-      "environment": {
-        "LAWYER_ASSISTANCE_LEGAL_DB": "/absolute/path/to/legal_core.sqlite",
-        "LAWYER_ASSISTANCE_USER_DB": "/absolute/path/to/user.sqlite",
-        "LAWYER_ASSISTANCE_ALLOWED_ROOTS": "/absolute/path/to/cases",
-        "LAWYER_ASSISTANCE_OUTPUT_ROOT": "/absolute/path/to/exports"
-      }
+      "environment": { "LEGAL_DB": "/absolute/path/to/legal_core.sqlite" }
     }
   },
   "permission": {
