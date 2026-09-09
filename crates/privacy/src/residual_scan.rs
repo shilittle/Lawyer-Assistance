@@ -475,9 +475,9 @@ mod tests {
 
     #[test]
     fn independent_scan_finds_dictionary_id_path_filename_and_broken_aliases_without_echo() {
-        let pages = vec![format!(
-            "subject-one 11010519491231002X C:\\Cases\\secret.pdf secret.pdf [BROKEN"
-        )];
+        let pages = vec![
+            "subject-one 11010519491231002X C:\\Cases\\secret.pdf secret.pdf [BROKEN".to_owned(),
+        ];
         let variants = ["subject-1"];
         let terms = [
             ResidualDictionaryTermV1 {
