@@ -139,6 +139,17 @@ pub struct ChatRequest {
     pub article_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseUnderstandingRequest {
+    pub query: String,
+    pub provider_id: String,
+    pub model: String,
+    pub case_type: Option<String>,
+    #[serde(default)]
+    pub include_withdrawn: bool,
+}
+
 /// Future OCR adapters must report completeness; no production adapter is registered in v1.
 pub trait OcrAdapter: Send + Sync {
     fn extract(&self, bytes: &[u8], mime: &str) -> crate::Result<OcrText>;

@@ -11523,8 +11523,17 @@ fn existing_user_schema_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const TEST_PRIVACY_DELETION_ID: &str = "pdel_00000000000000000000000000000000";
+    static CANONICAL_MIGRATION_BUSY_HANDLER_HIT: AtomicBool = AtomicBool::new(false);
+
+    fn canonical_migration_busy_handler(_: i32) -> bool {
+        CANONICAL_MIGRATION_BUSY_HANDLER_HIT.store(true, Ordering::SeqCst);
+        // Do not spin while the test deliberately retains the competing writer.
+        std::thread::sleep(Duration::from_millis(1));
+        true
+    }
 
     fn retirement_authorized(
         connection: &rusqlite::Connection,
@@ -11868,12 +11877,18 @@ mod tests {
             )
             .expect("legacy writer updates while holding transaction");
 
-        let directory_path = directory.path().to_path_buf();
+        CANONICAL_MIGRATION_BUSY_HANDLER_HIT.store(false, Ordering::SeqCst);
+        let contender_path = database_path.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let contender = std::thread::spawn(move || {
-            started_tx.send(()).expect("migration start signal sends");
-            let result = ensure_user_database(&directory_path).map_err(|error| error.to_string());
+            let result = (|| -> Result<(), DatabaseInitError> {
+                let mut contender = open_user_database(&contender_path)?;
+                contender.busy_handler(Some(canonical_migration_busy_handler))?;
+                started_tx.send(()).expect("migration connection opens");
+                run_user_migrations(&mut contender)
+            })()
+            .map_err(|error| error.to_string());
             finished_tx
                 .send(result)
                 .expect("migration completion signal sends");
@@ -11881,15 +11896,26 @@ mod tests {
 
         started_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("migration starts");
+            .expect("migration connection opens");
+        let busy_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !CANONICAL_MIGRATION_BUSY_HANDLER_HIT.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < busy_deadline,
+                "migration must attempt the writer lock before it is released"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(finished_rx
             .recv_timeout(Duration::from_millis(150))
             .is_err());
         first_write.commit().expect("first writer releases lock");
         finished_rx
-            .recv_timeout(Duration::from_secs(2))
+            // The busy handler above proves the migration was blocked before release. This is a
+            // deadlock guard, not a rebuild performance budget: full parallel suites can delay
+            // the CPU-heavy canonical DDL well beyond the old two-second assumption.
+            .recv_timeout(Duration::from_secs(10))
             .expect("migration finishes after lock release")
-            .expect("migration succeeds within busy timeout");
+            .expect("migration succeeds after competing writer release");
         contender.join().expect("migration contender exits");
 
         assert_rebuilt_unversioned_project_database(&database_path);

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use workspace_service::{Error, Result, Workspace};
@@ -37,9 +37,108 @@ struct Connection {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run(Cli::parse()).await {
+    let cli = Cli::parse();
+    // The portable VBS launcher intentionally hides the console.  Keep its
+    // error path visible without changing the normal CLI behavior.
+    let should_show_launch_error = cli.open && !matches!(cli.command.as_ref(), Some(Command::Stop));
+    if let Err(e) = run(cli).await {
         eprintln!("{}", e.code);
+        if should_show_launch_error {
+            show_launch_error(&e.code);
+        }
         std::process::exit(1);
+    }
+}
+
+fn launch_error_message(code: &str) -> String {
+    match code {
+        "workspace_owned_by_other_installation" => concat!(
+            "检测到另一安装目录中的“律师助手”正在使用当前数据工作区。\n\n",
+            "为保护资料，本程序不会停止或接管那个服务。请到旧安装目录双击 ",
+            "Stop-Lawyer-Assistance.vbs 停止旧服务，然后重新启动本程序。\n\n",
+            "错误代码：workspace_owned_by_other_installation"
+        )
+        .to_owned(),
+        "port_in_use" => concat!(
+            "律师助手未能启动，因为本机端口已被占用。\n\n",
+            "请先关闭占用该端口的程序，或使用其他端口后重试。\n\n",
+            "错误代码：port_in_use"
+        )
+        .to_owned(),
+        _ => format!(
+            "律师助手未能启动。请确认便携包已完整解压，并在关闭相关服务后重试。\n\n错误代码：{code}"
+        ),
+    }
+}
+
+fn browser_open_warning(origin: &str, code: &str) -> String {
+    format!(
+        "律师助手已经在后台启动，但未能自动打开浏览器。\n\n请手动访问：{origin}\n\n错误代码：{code}"
+    )
+}
+
+fn show_launch_error(code: &str) {
+    #[cfg(windows)]
+    show_windows_message(&launch_error_message(code), "律师助手启动失败", true);
+
+    #[cfg(not(windows))]
+    {
+        let _ = code;
+    }
+}
+
+fn show_browser_open_warning(origin: &str, code: &str) {
+    #[cfg(windows)]
+    show_windows_message(&browser_open_warning(origin, code), "律师助手已启动", false);
+
+    #[cfg(not(windows))]
+    {
+        let _ = (origin, code);
+    }
+}
+
+#[cfg(windows)]
+fn show_browser_open_warning_nonblocking(origin: String, code: String) {
+    // Do not show a modal dialog on the server task before it begins serving
+    // HTTP.  Dropping the thread handle deliberately detaches this optional
+    // notification from the service lifecycle.
+    let _ = std::thread::Builder::new()
+        .name("lawyer-assistance-browser-warning".to_owned())
+        .spawn(move || {
+            show_windows_message(
+                &browser_open_warning(&origin, &code),
+                "律师助手已启动",
+                false,
+            )
+        });
+}
+
+#[cfg(not(windows))]
+fn show_browser_open_warning_nonblocking(_origin: String, _code: String) {}
+
+#[cfg(windows)]
+fn show_windows_message(message: &str, title: &str, error: bool) {
+    use std::{ffi::OsStr, iter, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_ICONWARNING, MB_OK,
+    };
+
+    let message = OsStr::new(message)
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let title = OsStr::new(title)
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let style = MB_OK | if error { MB_ICONERROR } else { MB_ICONWARNING };
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            style,
+        );
     }
 }
 
@@ -144,10 +243,14 @@ async fn run(cli: Cli) -> Result<()> {
     let worker = workspace.start_worker();
     eprintln!("Lawyer Assistance listening at {origin}");
     if cli.open {
-        open_browser(&format!(
-            "{}#token={}",
-            connection.origin, connection.bootstrap
-        ))?;
+        let url = format!("{}#token={}", connection.origin, connection.bootstrap);
+        if let Err(error) = open_browser(&url) {
+            // A browser launch is a convenience.  The server and its accepted
+            // background work must remain available if Windows cannot open it.
+            let code = error.code;
+            eprintln!("{code}");
+            show_browser_open_warning_nonblocking(connection.origin.clone(), code);
+        }
     }
     let signal = shutdown.clone();
     let result = axum::serve(listener, app)
@@ -163,14 +266,16 @@ async fn run(cli: Cli) -> Result<()> {
     shutdown.cancel();
     result.map_err(|_| Error::new("server_failed"))
 }
-fn open_saved(root: &std::path::Path) -> Result<()> {
+fn open_saved(root: &Path) -> Result<()> {
     let (connection, _lock) = saved_connection(root)?;
-    open_browser(&format!(
-        "{}#token={}",
-        connection.origin, connection.bootstrap
-    ))
+    let url = format!("{}#token={}", connection.origin, connection.bootstrap);
+    if let Err(error) = open_browser(&url) {
+        eprintln!("{}", error.code);
+        show_browser_open_warning(&connection.origin, &error.code);
+    }
+    Ok(())
 }
-fn running_lock(root: &std::path::Path) -> Result<File> {
+fn running_lock(root: &Path) -> Result<File> {
     let lock_path = root.join("workspace.lock");
     workspace_service::filesystem::ordinary_chain(&lock_path)?;
     let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
@@ -179,15 +284,19 @@ fn running_lock(root: &std::path::Path) -> Result<File> {
     }
     Ok(lock)
 }
-fn saved_connection(root: &std::path::Path) -> Result<(Connection, File)> {
+fn saved_connection(root: &Path) -> Result<(Connection, File)> {
     let lock = running_lock(root)?;
     let path = root.join("connection.dpapi");
     workspace_service::filesystem::ordinary_chain(&path)?;
     let bytes = privacy::unprotect_local(&std::fs::read(path)?)
         .map_err(|_| Error::new("login_unavailable"))?;
     let connection: Connection = serde_json::from_slice(&bytes)?;
-    if !owner_running(connection.pid)? {
-        return Err(Error::new("server_not_running"));
+    match owner_status(connection.pid)? {
+        OwnerStatus::CurrentExecutable => {}
+        OwnerStatus::OtherExecutable => {
+            return Err(Error::new("workspace_owned_by_other_installation"));
+        }
+        OwnerStatus::NotRunning => return Err(Error::new("server_not_running")),
     }
     validate_origin(&connection.origin)?;
     Ok((connection, lock))
@@ -226,7 +335,7 @@ fn session_cookie(headers: &reqwest::header::HeaderMap) -> Result<String> {
     }
     Err(Error::new("shutdown_unavailable"))
 }
-async fn stop_saved(root: &std::path::Path) -> Result<()> {
+async fn stop_saved(root: &Path) -> Result<()> {
     let (connection, _lock) = saved_connection(root)?;
     let origin = validate_origin(&connection.origin)?;
     let client = reqwest::Client::builder()
@@ -281,7 +390,18 @@ async fn stop_saved(root: &std::path::Path) -> Result<()> {
     }
     Err(Error::new("shutdown_timeout"))
 }
-fn owner_running(pid: u32) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerStatus {
+    NotRunning,
+    CurrentExecutable,
+    OtherExecutable,
+}
+
+fn same_executable_path(actual: &Path, current: &Path) -> Result<bool> {
+    Ok(std::fs::canonicalize(actual)? == std::fs::canonicalize(current)?)
+}
+
+fn owner_status(pid: u32) -> Result<OwnerStatus> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStringExt;
@@ -294,14 +414,14 @@ fn owner_running(pid: u32) -> Result<bool> {
         };
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if process.is_null() {
-            return Ok(false);
+            return Ok(OwnerStatus::NotRunning);
         }
         let mut exit_code = 0;
         if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 || exit_code != 259 {
             unsafe {
                 CloseHandle(process);
             }
-            return Ok(false);
+            return Ok(OwnerStatus::NotRunning);
         }
         let mut name = vec![0u16; 32768];
         let mut len = name.len() as u32;
@@ -311,16 +431,24 @@ fn owner_running(pid: u32) -> Result<bool> {
             CloseHandle(process);
         }
         if success == 0 {
-            return Ok(false);
+            return Ok(OwnerStatus::NotRunning);
         }
         let actual = PathBuf::from(std::ffi::OsString::from_wide(&name[..len as usize]));
-        Ok(std::fs::canonicalize(actual)? == std::fs::canonicalize(std::env::current_exe()?)?)
+        if same_executable_path(&actual, &std::env::current_exe()?)? {
+            Ok(OwnerStatus::CurrentExecutable)
+        } else {
+            Ok(OwnerStatus::OtherExecutable)
+        }
     }
     #[cfg(not(windows))]
     {
         let _ = pid;
-        Ok(false)
+        Ok(OwnerStatus::NotRunning)
     }
+}
+
+fn owner_running(pid: u32) -> Result<bool> {
+    Ok(owner_status(pid)? == OwnerStatus::CurrentExecutable)
 }
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(windows)]
@@ -337,5 +465,49 @@ fn open_browser(url: &str) -> Result<()> {
     {
         let _ = url;
         Err(Error::new("windows_required"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn other_installation_error_explains_the_safe_recovery() {
+        let message = launch_error_message("workspace_owned_by_other_installation");
+        assert!(message.contains("Stop-Lawyer-Assistance.vbs"));
+        assert!(message.contains("不会停止或接管"));
+        assert!(message.contains("错误代码：workspace_owned_by_other_installation"));
+    }
+
+    #[test]
+    fn generic_launch_errors_remain_actionable_and_include_the_code() {
+        let generic = launch_error_message("local_encryption_failed");
+        assert!(generic.contains("未能启动"));
+        assert!(generic.contains("错误代码：local_encryption_failed"));
+
+        let port = launch_error_message("port_in_use");
+        assert!(port.contains("端口已被占用"));
+        assert!(port.contains("错误代码：port_in_use"));
+    }
+
+    #[test]
+    fn browser_failure_warning_keeps_a_safe_manual_url() {
+        let message = browser_open_warning("http://127.0.0.1:8877", "browser_open_failed");
+        assert!(message.contains("已经在后台启动"));
+        assert!(message.contains("http://127.0.0.1:8877"));
+        assert!(message.contains("错误代码：browser_open_failed"));
+    }
+
+    #[test]
+    fn executable_comparison_requires_the_same_resolved_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let current = directory.path().join("current.exe");
+        let other = directory.path().join("other.exe");
+        std::fs::write(&current, b"current").expect("write current executable fixture");
+        std::fs::write(&other, b"other").expect("write other executable fixture");
+
+        assert!(same_executable_path(&current, &current).expect("compare same file"));
+        assert!(!same_executable_path(&other, &current).expect("compare distinct files"));
     }
 }

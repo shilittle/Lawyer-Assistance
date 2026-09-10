@@ -54,10 +54,10 @@ impl ServerHandler for LegalMcpServer {
         }
         let instructions = match self.registry.profile() {
             PrivacyProfile::PublicLawOnly => {
-                "Public-law-only profile. Strict rule: never request, read, upload, or relay raw case material. Exactly five offline legal tools are available."
+                "Public-law-only profile. Strict rule: never request, read, upload, or relay private case material. Seven local legal and Supreme People's Court case-research tools are available."
             }
             PrivacyProfile::PrivacyWorkspace => {
-                "Privacy-workspace profile. The five offline legal tools remain available. Three workspace tools call only the local backend with the current client's bearer authorization. They accept no original-text read, mapping, manual approval, or cloud-authorization operation, and return only published redacted results."
+                "Privacy-workspace profile. The seven local legal and Supreme People's Court case-research tools remain available. Three workspace tools call only the local backend with the current client's bearer authorization. They accept no original-text read, mapping, manual approval, or cloud-authorization operation, and return only published redacted results."
             }
             PrivacyProfile::RedactedCase
             | PrivacyProfile::ApprovedCaseWorkspace
@@ -158,7 +158,7 @@ mod tests {
             ServiceAdapter::new(service),
         );
         let instructions = server.get_info().instructions.expect("instructions");
-        assert!(instructions.contains("Exactly five"));
+        assert!(instructions.contains("Seven local"));
         assert_eq!(
             server.get_info().protocol_version.as_str(),
             STABLE_PROTOCOL_VERSION

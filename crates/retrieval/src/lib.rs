@@ -13,6 +13,14 @@ use domain::law::{
 };
 use rusqlite::{named_params, types::Value, OptionalExtension, ToSql};
 
+mod paged;
+
+pub use paged::{
+    search_page, version_articles, LawSearchGroup, PagedSearchRequest, PagedSearchResponse,
+    SearchIndex, SearchSort, SearchView, VersionArticlesRequest, VersionArticlesResponse,
+    DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, SEARCH_INDEX_FILE_NAME,
+};
+
 const DEFAULT_SEARCH_LIMIT: u32 = 20;
 const MAX_SEARCH_LIMIT: u32 = 50;
 const MAX_SEARCH_TERMS: usize = 16;

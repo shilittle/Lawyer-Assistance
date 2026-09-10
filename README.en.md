@@ -4,21 +4,15 @@
 
 Lawyer Assistance is a Windows single-user legal tool built around one Rust backend, a plain HTML WebUI, and an independently callable MCP program. This release focuses on material redaction and local legal research.
 
-The current release is `1.0.0`, the public Web major release after the Tauri refactor. Windows artifacts are unsigned portable packages; there is no installer or automatic updater.
+The current incremental version is `1.2.0`: model-led redaction with cloud visual OCR, complete paged legal retrieval, AI legal research, document writing, and persistent conversations with local legal tools. Download the portable package, source, and validation evidence from the [v1.2.0 release](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.0).
 
-## Product boundary
+TXT, DOCX, PDF, PNG, JPEG and WebP inputs produce plain UTF-8 redacted TXT. Document writing renders one shared Markdown structure to safe preview HTML, plain TXT, structured DOCX and default A4 PDF. Provider presets discover available models using the supplied key and support separate chat, redaction, writing and OCR defaults. Trusted domestic official endpoints may receive explicitly selected originals; other providers require valid redacted references. User data remains protected by the local Windows service.
 
-- **Material redaction:** import TXT and DOCX, extract body text and tables, detect common names, organizations, contact details, identity numbers, case numbers, and account identifiers, replace them with stable group aliases, and run a residual scan before publishing a result.
-- **Review and export:** add sensitive terms, edit aliases, resolve difficult findings, or revoke a result in the WebUI. Export TXT, Markdown, reconstructed DOCX, or a batch ZIP.
-- **Legal research:** query the read-only `legal_core.sqlite` runtime database for laws, articles, versions, effective dates, relations, and bookmarks.
-- **Small utilities:** six fixed document templates and a simple Provider conversation whose context can include explicitly selected legal articles and valid redacted results. Real Provider integration has not been completed for this public release; validation uses a controllable simulation service.
-- **MCP:** `public_law_only` exposes five read-only public-law tools. `privacy_workspace` exposes eight tools in total: those five public tools plus submit, status, and paged result-reading.
-
-PDF/image input, scanned-document OCR, original-layout preservation, complex case management, legal graphs, and autonomous legal workflows are outside v1.0.0. OCR is only an extension boundary; no OCR runtime is installed or published. Cloud assistance is validated with a controllable simulation service; synthetic-material pass, false-positive, and missed-detection reports are regression evidence, not a real-case accuracy guarantee.
+The existing seven public MCP tools and ten privacy-workspace tools remain compatible. The official SPC sidecar contains 759 primary cases/articles: 279 guiding cases, 61 reference cases, and 419 typical-case collections, with 834 retained TXT source entries. Typical collections may contain multiple cases and are retrieved as one article; Guiding Case 45 retains its official Luoyang Intermediate People's Court repost. See the [upgrade guide](docs/web/ai-upgrade.md), [AI validation report](docs/web/ai-validation.md), and the source manifests.
 
 ## Portable Windows package
 
-Download `Lawyer-Assistance_1.0.0_windows-x86_64-portable.zip`. The Windows x86_64 portable ZIP contains two release executables, the runtime legal database, licenses/notices, current documentation and MCP examples, `Lawyer-Assistance.vbs`, and `Stop-Lawyer-Assistance.vbs`. Extract it and double-click a launcher; it invokes `wscript.exe` with a hidden window:
+The local builder `scripts/package_portable.py` produces `Lawyer-Assistance_1.2.0_windows-x86_64-portable.zip`. Delivery consists of the ZIP, its adjacent `.zip.sha256`, and the JSON manifests, available together on the release page. The Windows x86_64 portable ZIP contains two release executables, `legal_core.sqlite`, the sibling `judicial_cases.sqlite` sidecar, its source note and distribution manifest, the derived retrieval index, licenses/notices, current documentation and MCP examples, `Lawyer-Assistance.vbs`, and `Stop-Lawyer-Assistance.vbs`. Extract it and double-click a launcher; it invokes `wscript.exe` with a hidden window:
 
 ```powershell
 lawyer-assistance.exe serve --open --port 8877 --data-dir "$env:LOCALAPPDATA\LawyerAssistanceWeb" --legal-db "<package>\data\runtime\legal_core.sqlite"
@@ -28,7 +22,7 @@ User data is stored under `%LOCALAPPDATA%\LawyerAssistanceWeb`; the package does
 
 To stop the service, double-click `Stop-Lawyer-Assistance.vbs` or run `lawyer-assistance.exe stop`. The command reads the current user's encrypted connection descriptor and sends an authenticated loopback session/CSRF shutdown request to the matching server process; it never kills an arbitrary process.
 
-Verify the adjacent `.zip.sha256`, then inspect `MANIFEST.sha256` and `portable.manifest.json` inside the archive. The v1.0.0 public artifact is an unsigned local portable package; it has no installer, signature file, or updater file.
+After receiving the ZIP, verify the adjacent `.zip.sha256`, then inspect `MANIFEST.sha256` and `portable.manifest.json` inside the archive. The portable manifest must include size, SHA-256, schema, count, and official-source identity for both databases. The v1.2.0 delivery artifact is an unsigned local portable package; it has no installer, signature file, or updater file.
 
 ## Development
 
@@ -75,7 +69,7 @@ lawyer-assistance-mcp --privacy-profile public_law_only `
   --legal-db "$pwd\data\runtime\legal_core.sqlite" stdio
 ```
 
-The fixed public profile contains five tools: `system_status`, `legal_search`, `legal_get_article`, `legal_get_versions`, and `legal_get_relations`. The `privacy_workspace` profile contains eight tools in total, adding `privacy_workspace.submit`, `privacy_workspace.status`, and `privacy_workspace.read_result`.
+The fixed public profile contains seven tools: `system_status`, `legal_search`, `legal_get_article`, `legal_get_versions`, `legal_get_relations`, `legal_search_cases`, and `legal_get_case`. The `privacy_workspace` profile contains ten tools in total, adding `privacy_workspace.submit`, `privacy_workspace.status`, and `privacy_workspace.read_result`. The original five legal tool names and I/O contracts remain unchanged; a missing case sidecar is reported as unavailable while the statute database identity remains unchanged.
 
 `privacy_workspace` uses a client token created by the WebUI and proxies requests to a running local backend. It accepts only relative paths below the configured inbox, returns task status, and pages through published redacted text. It never returns original text, mappings, original filenames, or disk paths. The old `approved_case_workspace`, `redacted_case`, and `diagram_authoring` profiles are disabled and are not silently mapped to the new profile.
 
@@ -88,13 +82,14 @@ See the [MCP documentation](docs/mcp/README.md) for the protocol and tool contra
 - [Legal data and runtime database](docs/data/legal-corpus.md)
 - [MCP documentation](docs/mcp/README.md)
 - [Web core and operating boundaries](docs/web/README.md)
+- [AI incremental validation report](docs/web/ai-validation.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
-- [v1.0.0 release notes](RELEASE_NOTES.md)
+- [v1.2.0 release notes](RELEASE_NOTES.md)
 
 Legal data supports research and lawyer review; it does not replace checking current official text, facts, or professional advice.
 
 ## License
 
-Source code is MIT licensed. Runtime legal-data provenance, licensing, and third-party notices are shipped under `data/runtime/` and documented in [DATA_SOURCES.md](data/runtime/DATA_SOURCES.md) and the [legal-data guide](docs/data/legal-corpus.md).
+Source code is MIT licensed. Runtime legal-data provenance, licensing, and third-party notices are shipped under `data/runtime/` and documented in [legal-data sources](data/runtime/DATA_SOURCES.md), [case sources](data/runtime/CASE_DATA_SOURCES.md), and the [legal-data guide](docs/data/legal-corpus.md).

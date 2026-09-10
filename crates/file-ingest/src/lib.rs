@@ -10,7 +10,12 @@ mod pdf;
 mod text;
 
 use sha2::{Digest, Sha256};
-use std::fmt::{self, Write as _};
+use std::{
+    fmt::{self, Write as _},
+    io::Cursor,
+    path::Path,
+    sync::{Mutex, OnceLock},
+};
 
 /// Maximum accepted size of one source file (20 MiB).
 pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
@@ -34,6 +39,14 @@ pub const MAX_SEGMENTS: usize = 5_000;
 pub const TEXT_LINES_PER_SEGMENT: usize = 40;
 /// Maximum accepted basename length in UTF-8 bytes.
 pub const MAX_FILE_NAME_BYTES: usize = 255;
+/// Maximum rendered OCR image width or height.
+pub const MAX_OCR_IMAGE_DIMENSION: u32 = 12_000;
+/// Maximum rendered OCR image pixels.
+pub const MAX_OCR_IMAGE_PIXELS: u64 = 80_000_000;
+/// Maximum encoded page image sent to a vision provider.
+pub const MAX_OCR_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+/// Maximum aggregate rendered image bytes retained for one PDF OCR job.
+pub const MAX_OCR_DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
 
 const PDF_MIME: &str = "application/pdf";
 const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -41,6 +54,7 @@ const TXT_MIME: &str = "text/plain; charset=utf-8";
 const MARKDOWN_MIME: &str = "text/markdown; charset=utf-8";
 const PNG_MIME: &str = "image/png";
 const JPEG_MIME: &str = "image/jpeg";
+const WEBP_MIME: &str = "image/webp";
 
 /// A format accepted by the Stage 8 attachment importer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,6 +65,7 @@ pub enum FileFormat {
     Markdown,
     Png,
     Jpeg,
+    Webp,
 }
 
 impl FileFormat {
@@ -63,6 +78,7 @@ impl FileFormat {
             Self::Markdown => "md",
             Self::Png => "png",
             Self::Jpeg => "jpeg",
+            Self::Webp => "webp",
         }
     }
 
@@ -75,6 +91,7 @@ impl FileFormat {
             Self::Markdown => MARKDOWN_MIME,
             Self::Png => PNG_MIME,
             Self::Jpeg => JPEG_MIME,
+            Self::Webp => WEBP_MIME,
         }
     }
 }
@@ -112,6 +129,39 @@ pub struct ExtractedDocument {
     pub segments: Vec<ExtractedSegment>,
 }
 
+/// An image extracted from an attachment for a separately authorized vision request.
+///
+/// The bytes are sensitive and deliberately do not implement `Debug`. `locator` is a stable
+/// page/media position and never contains a source path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OcrAsset {
+    pub locator: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Internal marker inserted into DOCX body text at the position of a validated embedded image.
+///
+/// The marker is never derived from a document relationship ID or source path.  The OCR pipeline
+/// replaces it only after it has obtained the separately authorized visual transcription, so a
+/// drawing stays at its original reading position instead of being appended to the document.
+pub fn docx_ocr_placeholder(locator: &str) -> Option<String> {
+    let index = locator.strip_prefix("docx-image:")?;
+    if index.is_empty()
+        || index.starts_with('0')
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let index = index.parse::<usize>().ok()?;
+    if index == 0 {
+        return None;
+    }
+    Some(format!("\u{e000}LA_DOCX_OCR_IMAGE_{index}\u{e001}"))
+}
+
 /// Stable, payload-free failures suitable for conversion into sanitized IPC errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -119,6 +169,10 @@ pub enum IngestError {
     InvalidFileName,
     UnsupportedExtension,
     ImageRequiresLocalOcr,
+    CorruptImage,
+    ImageDimensionLimitExceeded,
+    PdfiumUnavailable,
+    PdfRenderFailed,
     FormatMismatch,
     FileTooLarge,
     CorruptPdf,
@@ -152,6 +206,10 @@ impl IngestError {
             Self::InvalidFileName => "invalid_file_name",
             Self::UnsupportedExtension => "unsupported_extension",
             Self::ImageRequiresLocalOcr => "image_requires_local_ocr",
+            Self::CorruptImage => "corrupt_image",
+            Self::ImageDimensionLimitExceeded => "image_dimension_limit_exceeded",
+            Self::PdfiumUnavailable => "pdfium_unavailable",
+            Self::PdfRenderFailed => "pdf_render_failed",
             Self::FormatMismatch => "format_mismatch",
             Self::FileTooLarge => "file_too_large",
             Self::CorruptPdf => "corrupt_pdf",
@@ -185,8 +243,12 @@ impl IngestError {
             Self::InvalidFileName => "The file name must be a safe basename.",
             Self::UnsupportedExtension => "This file extension is not supported.",
             Self::ImageRequiresLocalOcr => {
-                "PNG and JPEG images require the isolated local OCR worker."
+                "PNG, JPEG and WebP images require the isolated local OCR worker."
             }
+            Self::CorruptImage => "The image is malformed or unsupported.",
+            Self::ImageDimensionLimitExceeded => "The image exceeds the safe OCR dimensions.",
+            Self::PdfiumUnavailable => "The bundled PDF renderer is unavailable.",
+            Self::PdfRenderFailed => "The PDF page could not be rendered for OCR.",
             Self::FormatMismatch => "The file extension does not match its content.",
             Self::FileTooLarge => "The file exceeds the attachment size limit.",
             Self::CorruptPdf => "The PDF is malformed or unsupported.",
@@ -246,6 +308,8 @@ pub fn detect_format(file_name: &str) -> Result<FileFormat, IngestError> {
         Ok(FileFormat::Png)
     } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
         Ok(FileFormat::Jpeg)
+    } else if extension.eq_ignore_ascii_case("webp") {
+        Ok(FileFormat::Webp)
     } else {
         Err(IngestError::UnsupportedExtension)
     }
@@ -287,6 +351,276 @@ pub fn extract_plain_text(
         }
         _ => Err(IngestError::UnsupportedExtension),
     }
+}
+
+/// Extract the textual body of a DOCX while returning validated embedded PNG/JPEG assets for a
+/// separately authorized vision request. The normal extractor continues to reject uninspected
+/// media; callers must opt into this API explicitly when the AI OCR pipeline is enabled.
+pub fn extract_plain_text_with_media(
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(String, Vec<OcrAsset>), IngestError> {
+    if detect_format(file_name)? != FileFormat::Docx {
+        return Err(IngestError::UnsupportedExtension);
+    }
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(IngestError::FileTooLarge);
+    }
+    verify_magic(FileFormat::Docx, bytes)?;
+    let (extraction, media) = docx::extract_with_media(bytes, Limits::default())?;
+    Ok((extraction.text, media))
+}
+
+/// Validate an image and return its dimensions without decoding the full pixel buffer. This is
+/// used immediately before any remote OCR request; the legacy importer intentionally keeps its
+/// `ImageRequiresLocalOcr` error for compatibility.
+pub fn inspect_ocr_image(file_name: &str, bytes: &[u8]) -> Result<OcrAsset, IngestError> {
+    let format = detect_format(file_name)?;
+    if bytes.len() > MAX_OCR_IMAGE_BYTES {
+        return Err(IngestError::FileTooLarge);
+    }
+    let (mime_type, width, height, ocr_bytes) = match format {
+        FileFormat::Png => {
+            verify_magic(format, bytes)?;
+            let (width, height) = png_dimensions(bytes)?;
+            (PNG_MIME, width, height, bytes.to_vec())
+        }
+        FileFormat::Jpeg => {
+            verify_magic(format, bytes)?;
+            let (width, height) = jpeg_dimensions(bytes)?;
+            (JPEG_MIME, width, height, bytes.to_vec())
+        }
+        FileFormat::Webp => {
+            verify_magic(format, bytes)?;
+            let (png, width, height) = decode_webp_for_ocr(bytes)?;
+            (PNG_MIME, width, height, png)
+        }
+        _ => return Err(IngestError::UnsupportedExtension),
+    };
+    validate_image_dimensions(width, height)?;
+    Ok(OcrAsset {
+        locator: "page:1".to_owned(),
+        mime_type: mime_type.to_owned(),
+        bytes: ocr_bytes,
+        width,
+        height,
+    })
+}
+
+/// Decode WebP only after its extension and RIFF signature have been checked, then send a PNG
+/// to the vision provider. This avoids relying on a provider-specific WebP implementation while
+/// preserving the same locally enforced source-size and dimension limits as other OCR images.
+fn decode_webp_for_ocr(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), IngestError> {
+    let dimensions = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::WebP)
+        .into_dimensions()
+        .map_err(|_| IngestError::CorruptImage)?;
+    validate_image_dimensions(dimensions.0, dimensions.1)?;
+
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::WebP);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_OCR_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_OCR_IMAGE_DIMENSION);
+    limits.max_alloc = Some(
+        MAX_OCR_IMAGE_PIXELS
+            .checked_mul(4)
+            .ok_or(IngestError::ImageDimensionLimitExceeded)?,
+    );
+    reader.limits(limits);
+    let image = reader.decode().map_err(|_| IngestError::CorruptImage)?;
+    if (image.width(), image.height()) != dimensions {
+        return Err(IngestError::CorruptImage);
+    }
+    let mut encoded = Cursor::new(Vec::new());
+    image
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .map_err(|_| IngestError::CorruptImage)?;
+    let encoded = encoded.into_inner();
+    if encoded.len() > MAX_OCR_IMAGE_BYTES {
+        return Err(IngestError::ImageDimensionLimitExceeded);
+    }
+    Ok((encoded, dimensions.0, dimensions.1))
+}
+
+/// Render every PDF page to a bounded PNG for cloud vision OCR. The caller supplies the path to
+/// the packaged Pdfium DLL; no system installation is searched implicitly. Rendering is kept in
+/// this crate so the workspace service can authorize and persist the resulting text without
+/// exposing a parser or filesystem path to the browser.
+pub fn render_pdf_pages(bytes: &[u8], pdfium_library: &Path) -> Result<Vec<OcrAsset>, IngestError> {
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(IngestError::FileTooLarge);
+    }
+    verify_magic(FileFormat::Pdf, bytes)?;
+    if !pdfium_library.is_absolute() || !pdfium_library.is_file() {
+        return Err(IngestError::PdfiumUnavailable);
+    }
+    let pdfium = bind_pdfium(pdfium_library)?;
+    let document = pdfium
+        .load_pdf_from_byte_slice(bytes, None)
+        .map_err(|_| IngestError::PdfRenderFailed)?;
+    let page_count = document.pages().len();
+    let page_count = usize::try_from(page_count).map_err(|_| IngestError::PdfPageLimitExceeded)?;
+    if page_count > MAX_PDF_PAGES {
+        return Err(IngestError::PdfPageLimitExceeded);
+    }
+    let mut assets = Vec::with_capacity(page_count);
+    let mut total_encoded = 0usize;
+    for (index, page) in document.pages().iter().enumerate() {
+        let bitmap = page
+            .render_with_config(
+                &pdfium_render::prelude::PdfRenderConfig::new()
+                    .set_target_width(1_600)
+                    .set_maximum_width(2_400)
+                    .set_maximum_height(3_200),
+            )
+            .map_err(|_| IngestError::PdfRenderFailed)?;
+        let image = bitmap
+            .as_image()
+            .map_err(|_| IngestError::PdfRenderFailed)?;
+        let (width, height) = (image.width(), image.height());
+        validate_image_dimensions(width, height)?;
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .map_err(|_| IngestError::PdfRenderFailed)?;
+        let encoded = encoded.into_inner();
+        if encoded.len() > MAX_OCR_IMAGE_BYTES {
+            return Err(IngestError::ImageDimensionLimitExceeded);
+        }
+        total_encoded = total_encoded
+            .checked_add(encoded.len())
+            .ok_or(IngestError::FileTooLarge)?;
+        if total_encoded > MAX_OCR_DOCUMENT_BYTES {
+            return Err(IngestError::FileTooLarge);
+        }
+        assets.push(OcrAsset {
+            locator: format!("page:{}", index + 1),
+            mime_type: PNG_MIME.to_owned(),
+            bytes: encoded,
+            width,
+            height,
+        });
+    }
+    Ok(assets)
+}
+
+fn bind_pdfium(pdfium_library: &Path) -> Result<pdfium_render::prelude::Pdfium, IngestError> {
+    static BOUND_PATH: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+    let state = BOUND_PATH.get_or_init(|| Mutex::new(None));
+    let mut bound_path = state.lock().map_err(|_| IngestError::PdfiumUnavailable)?;
+    if let Some(existing) = bound_path.as_ref() {
+        return if existing == pdfium_library {
+            Ok(pdfium_render::prelude::Pdfium::default())
+        } else {
+            Err(IngestError::PdfiumUnavailable)
+        };
+    }
+    let bindings = pdfium_render::prelude::Pdfium::bind_to_library(pdfium_library)
+        .map_err(|_| IngestError::PdfiumUnavailable)?;
+    let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+    *bound_path = Some(pdfium_library.to_owned());
+    Ok(pdfium)
+}
+
+fn validate_image_dimensions(width: u32, height: u32) -> Result<(), IngestError> {
+    if width == 0
+        || height == 0
+        || width > MAX_OCR_IMAGE_DIMENSION
+        || height > MAX_OCR_IMAGE_DIMENSION
+        || u64::from(width)
+            .checked_mul(u64::from(height))
+            .is_none_or(|pixels| pixels > MAX_OCR_IMAGE_PIXELS)
+    {
+        return Err(IngestError::ImageDimensionLimitExceeded);
+    }
+    Ok(())
+}
+
+pub(crate) fn inspect_image_payload(
+    _name: &str,
+    bytes: &[u8],
+) -> Result<(String, u32, u32), IngestError> {
+    if bytes.len() > MAX_OCR_IMAGE_BYTES {
+        return Err(IngestError::FileTooLarge);
+    }
+    let Some(kind) = infer::get(bytes) else {
+        return Err(IngestError::CorruptImage);
+    };
+    let mime = kind.mime_type();
+    let (width, height) = match mime {
+        PNG_MIME => png_dimensions(bytes)?,
+        JPEG_MIME => jpeg_dimensions(bytes)?,
+        _ => return Err(IngestError::CorruptImage),
+    };
+    validate_image_dimensions(width, height)?;
+    Ok((mime.to_owned(), width, height))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), IngestError> {
+    if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
+        return Err(IngestError::CorruptImage);
+    }
+    let width = u32::from_be_bytes(
+        bytes[16..20]
+            .try_into()
+            .map_err(|_| IngestError::CorruptImage)?,
+    );
+    let height = u32::from_be_bytes(
+        bytes[20..24]
+            .try_into()
+            .map_err(|_| IngestError::CorruptImage)?,
+    );
+    Ok((width, height))
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32), IngestError> {
+    if bytes.len() < 4 || !bytes.starts_with(b"\xff\xd8\xff") || !bytes.ends_with(b"\xff\xd9") {
+        return Err(IngestError::CorruptImage);
+    }
+    let mut cursor = 2usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor] != 0xff {
+            cursor += 1;
+        }
+        while cursor < bytes.len() && bytes[cursor] == 0xff {
+            cursor += 1;
+        }
+        let marker = *bytes.get(cursor).ok_or(IngestError::CorruptImage)?;
+        cursor += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if marker == 0x00 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([
+            *bytes.get(cursor).ok_or(IngestError::CorruptImage)?,
+            *bytes.get(cursor + 1).ok_or(IngestError::CorruptImage)?,
+        ]));
+        if length < 2
+            || cursor
+                .checked_add(length)
+                .is_none_or(|end| end > bytes.len())
+        {
+            return Err(IngestError::CorruptImage);
+        }
+        let is_sof = matches!(
+            marker,
+            0xc0..=0xc3
+                | 0xc5..=0xc7
+                | 0xc9..=0xcb
+                | 0xcd..=0xcf
+        );
+        if is_sof {
+            if length < 7 {
+                return Err(IngestError::CorruptImage);
+            }
+            let height = u32::from(u16::from_be_bytes([bytes[cursor + 3], bytes[cursor + 4]]));
+            let width = u32::from(u16::from_be_bytes([bytes[cursor + 5], bytes[cursor + 6]]));
+            return Ok((width, height));
+        }
+        cursor += length;
+    }
+    Err(IngestError::CorruptImage)
 }
 
 fn decode_text(bytes: &[u8], encoding: Option<&str>) -> Result<String, IngestError> {
@@ -345,7 +679,9 @@ fn ingest_bytes_with_limits(
         FileFormat::Pdf => pdf::extract(bytes, limits)?,
         FileFormat::Docx => docx::extract(bytes, limits)?,
         FileFormat::Txt | FileFormat::Markdown => text::extract(bytes, limits)?,
-        FileFormat::Png | FileFormat::Jpeg => return Err(IngestError::ImageRequiresLocalOcr),
+        FileFormat::Png | FileFormat::Jpeg | FileFormat::Webp => {
+            return Err(IngestError::ImageRequiresLocalOcr);
+        }
     };
 
     let size_bytes = u64::try_from(bytes.len()).map_err(|_| IngestError::FileTooLarge)?;
@@ -413,6 +749,16 @@ fn verify_magic(format: FileFormat, bytes: &[u8]) -> Result<(), IngestError> {
             if !bytes.starts_with(b"\xff\xd8\xff")
                 || !bytes.ends_with(b"\xff\xd9")
                 || !inferred_jpeg
+            {
+                return Err(IngestError::FormatMismatch);
+            }
+        }
+        FileFormat::Webp => {
+            let inferred_webp = inferred.is_some_and(|kind| kind.mime_type() == WEBP_MIME);
+            if bytes.len() < 12
+                || !bytes.starts_with(b"RIFF")
+                || bytes.get(8..12) != Some(b"WEBP".as_slice())
+                || !inferred_webp
             {
                 return Err(IngestError::FormatMismatch);
             }

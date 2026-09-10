@@ -3,7 +3,10 @@ use crate::docx::{CONTENT_TYPES_PATH, DOCUMENT_PATH, DOCX_MAIN_CONTENT_TYPE, ROO
 use lopdf::{
     dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream,
 };
-use std::io::{Cursor, Write};
+use std::{
+    io::{Cursor, Write},
+    path::Path,
+};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -27,6 +30,24 @@ fn word_document(body: &str) -> String {
 </w:document>"#
     )
 }
+
+fn word_document_with_drawing(body: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>{body}<w:sectPr/></w:body>
+</w:document>"#
+    )
+}
+
+const DOCUMENT_IMAGE_RELATIONSHIPS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdImage1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>"#;
+
+const IMAGE_DRAWING: &str = r#"<w:r><w:drawing><a:graphic><a:graphicData><a:blip r:embed="rIdImage1"/></a:graphicData></a:graphic></w:drawing></w:r>"#;
 
 fn make_docx(document_xml: &str) -> Vec<u8> {
     make_docx_with(
@@ -753,6 +774,7 @@ fn image_extensions_require_magic_match_and_local_ocr() {
     assert_eq!(detect_format("scan.PNG").unwrap(), FileFormat::Png);
     assert_eq!(detect_format("photo.jpg").unwrap(), FileFormat::Jpeg);
     assert_eq!(detect_format("photo.JPEG").unwrap(), FileFormat::Jpeg);
+    assert_eq!(detect_format("scan.WEBP").unwrap(), FileFormat::Webp);
 
     let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01";
     assert_eq!(
@@ -769,6 +791,152 @@ fn image_extensions_require_magic_match_and_local_ocr() {
         ingest_bytes("renamed.jpg", png).unwrap_err(),
         IngestError::FormatMismatch
     );
+}
+
+#[test]
+fn real_webp_fixture_is_transcoded_to_bounded_png_for_visual_ocr() {
+    let fixture = include_bytes!("../fixtures/C09_scan.webp");
+    let asset = inspect_ocr_image("C09_scan.webp", fixture).expect("real WebP fixture");
+
+    assert_eq!(asset.locator, "page:1");
+    assert_eq!(asset.mime_type, PNG_MIME);
+    assert!(asset.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(asset.bytes.len() <= MAX_OCR_IMAGE_BYTES);
+    assert!(asset.width > 0 && asset.height > 0);
+    assert!(asset.width <= MAX_OCR_IMAGE_DIMENSION);
+    assert!(asset.height <= MAX_OCR_IMAGE_DIMENSION);
+    assert!(u64::from(asset.width) * u64::from(asset.height) <= MAX_OCR_IMAGE_PIXELS);
+
+    let (mime, width, height) =
+        inspect_image_payload("converted.png", &asset.bytes).expect("transcoded OCR payload");
+    assert_eq!(mime, PNG_MIME);
+    assert_eq!((width, height), (asset.width, asset.height));
+    assert_eq!(
+        ingest_bytes("C09_scan.webp", fixture).unwrap_err(),
+        IngestError::ImageRequiresLocalOcr
+    );
+
+    // The fixture is a static VP8 WebP: its frame width is the little-endian 14-bit value after
+    // the VP8 keyframe signature. `inspect_ocr_image` reads dimensions before a full decode, so
+    // this forged header must fail at the policy boundary instead of allocating a large bitmap.
+    let mut oversized = fixture.to_vec();
+    let oversized_width = u16::try_from(MAX_OCR_IMAGE_DIMENSION + 1)
+        .expect("test width fits the VP8 14-bit field")
+        .to_le_bytes();
+    oversized[26..28].copy_from_slice(&oversized_width);
+    assert!(matches!(
+        inspect_ocr_image("oversized.webp", &oversized),
+        Err(IngestError::ImageDimensionLimitExceeded)
+    ));
+}
+
+#[test]
+fn ai_ocr_image_inspection_enforces_dimensions_before_remote_use() {
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01";
+    let asset = inspect_ocr_image("scan.png", png).expect("bounded PNG metadata");
+    assert_eq!((asset.width, asset.height), (1, 1));
+    assert_eq!(asset.locator, "page:1");
+
+    let mut zero = png.to_vec();
+    zero[19] = 0;
+    zero[23] = 0;
+    assert!(matches!(
+        inspect_ocr_image("empty.png", &zero),
+        Err(IngestError::ImageDimensionLimitExceeded)
+    ));
+}
+
+#[test]
+fn ai_ocr_docx_path_returns_validated_media_and_body_text() {
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01";
+    let empty_custom_xml = br#"<b:Sources xmlns:b="http://schemas.openxmlformats.org/officeDocument/2006/bibliography"/>"#;
+    let xml = word_document_with_drawing(&format!(
+        "<w:p><w:r><w:t>正文A</w:t></w:r>{IMAGE_DRAWING}<w:r><w:t>正文B</w:t></w:r></w:p>"
+    ));
+    let bytes = make_docx_with(
+        &xml,
+        DOCX_MAIN_CONTENT_TYPE,
+        &[
+            (
+                "word/_rels/document.xml.rels",
+                DOCUMENT_IMAGE_RELATIONSHIPS.as_bytes(),
+            ),
+            ("word/media/image1.png", png),
+            ("customXml/item1.xml", empty_custom_xml),
+        ],
+        CompressionMethod::Deflated,
+    );
+    let (text, media) = extract_plain_text_with_media("attachment.docx", &bytes)
+        .expect("DOCX media OCR inspection");
+    let marker = docx_ocr_placeholder("docx-image:1").expect("internal marker");
+    assert_eq!(text, format!("正文A{marker}正文B"));
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0].locator, "docx-image:1");
+    assert_eq!(media[0].mime_type, "image/png");
+}
+
+#[test]
+fn ai_ocr_docx_rejects_media_that_is_not_at_a_document_drawing_position() {
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01";
+    let xml = word_document("<w:p><w:r><w:t>正文</w:t></w:r></w:p>");
+    let bytes = make_docx_with(
+        &xml,
+        DOCX_MAIN_CONTENT_TYPE,
+        &[("word/media/image1.png", png)],
+        CompressionMethod::Deflated,
+    );
+    assert!(matches!(
+        extract_plain_text_with_media("attachment.docx", &bytes),
+        Err(IngestError::IncompleteDocxExtraction)
+    ));
+}
+
+#[test]
+fn ai_ocr_docx_rejects_nonempty_custom_xml_instead_of_omitting_it() {
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01";
+    let custom_xml =
+        "<metadata xmlns=\"urn:test\"><sensitive>隐藏内容</sensitive></metadata>".as_bytes();
+    let xml = word_document("<w:p><w:r><w:t>正文</w:t></w:r></w:p>");
+    let bytes = make_docx_with(
+        &xml,
+        DOCX_MAIN_CONTENT_TYPE,
+        &[
+            ("word/media/image1.png", png),
+            ("customXml/item1.xml", custom_xml),
+        ],
+        CompressionMethod::Deflated,
+    );
+    assert!(matches!(
+        extract_plain_text_with_media("attachment.docx", &bytes),
+        Err(IngestError::IncompleteDocxExtraction)
+    ));
+}
+
+#[test]
+fn pdf_ocr_fails_closed_when_the_bundled_renderer_is_missing() {
+    let pdf = make_pdf(&[Some("synthetic OCR page")]);
+    assert!(matches!(
+        render_pdf_pages(&pdf, Path::new("C:\\missing\\pdfium.dll")),
+        Err(IngestError::PdfiumUnavailable)
+    ));
+}
+
+#[test]
+#[ignore = "requires the pinned Pdfium DLL from scripts/fetch_pdfium.py"]
+fn pdf_ocr_renders_each_synthetic_page_with_bounded_png_output() {
+    let library = std::env::var_os("LAWYER_ASSISTANCE_PDFIUM")
+        .map(std::path::PathBuf::from)
+        .expect("LAWYER_ASSISTANCE_PDFIUM must point to the bundled DLL");
+    let pdf = make_pdf(&[Some("synthetic OCR page one"), Some("page two")]);
+    let assets = render_pdf_pages(&pdf, &library).expect("Pdfium renders synthetic PDF");
+    assert_eq!(assets.len(), 2);
+    assert_eq!(assets[0].locator, "page:1");
+    assert_eq!(assets[1].locator, "page:2");
+    assert!(assets.iter().all(|asset| asset.mime_type == "image/png"));
+    assert!(assets.iter().all(|asset| !asset.bytes.is_empty()));
+    let second_assets = render_pdf_pages(&make_pdf(&[Some("second PDF")]), &library)
+        .expect("reuses the pinned Pdfium binding");
+    assert_eq!(second_assets.len(), 1);
 }
 
 #[test]

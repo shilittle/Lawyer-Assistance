@@ -1,3 +1,4 @@
+mod ai_routes;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
@@ -104,6 +105,7 @@ impl AppState {
 }
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(ai_routes::routes())
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles))
@@ -138,6 +140,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/results/{id}/export", get(export_result))
         .route("/api/v1/exports", post(export_batch))
         .route("/api/v1/legal/search", get(legal_search))
+        .route("/api/v1/legal/cases", get(judicial_case_search))
+        .route("/api/v1/legal/cases/status", get(judicial_case_status))
+        .route(
+            "/api/v1/legal/cases/understand",
+            post(judicial_case_understand),
+        )
+        .route("/api/v1/legal/cases/{id}", get(judicial_case_get))
         .route("/api/v1/legal/articles/{id}", get(legal_article))
         .route("/api/v1/legal/versions/{id}", get(legal_versions))
         .route("/api/v1/legal/relations/{id}", get(legal_relations))
@@ -356,7 +365,7 @@ async fn materials(State(s): State<AppState>, Query(q): Query<MaterialQuery>) ->
     val(s.workspace.materials(q.group_id.as_deref())?)
 }
 async fn material(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    val(s.workspace.material(&id)?)
+    val(s.workspace.material_view(&id)?)
 }
 async fn review(
     State(s): State<AppState>,
@@ -511,6 +520,7 @@ fn download(bytes: Vec<u8>, format: &str, name: &str) -> Result<Response, ApiErr
     let mime = match format {
         "txt" => "text/plain; charset=utf-8",
         "md" => "text/markdown; charset=utf-8",
+        "pdf" => "application/pdf",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "zip" => "application/zip",
         _ => return Err(Error::new("unsupported_format").into()),
@@ -560,6 +570,56 @@ struct Search {
 }
 fn legal_error(_: legal_services::ServiceError) -> ApiError {
     Error::new("legal_query_failed").into()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseSearch {
+    query: String,
+    case_type: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    include_withdrawn: Option<bool>,
+}
+fn case_error(error: legal_services::ServiceError) -> ApiError {
+    // Keep errors actionable without returning database paths or diagnostics.
+    Error::new(&error.code).into()
+}
+async fn judicial_case_search(State(s): State<AppState>, Query(q): Query<CaseSearch>) -> ApiResult {
+    val(s
+        .workspace
+        .legal()
+        .judicial_case_search(legal_services::JudicialCaseSearchRequest {
+            schema_version: 1,
+            query: q.query,
+            case_type: q.case_type.filter(|v| !v.is_empty()),
+            limit: q.limit,
+            offset: q.offset,
+            include_withdrawn: q.include_withdrawn,
+        })
+        .map_err(case_error)?)
+}
+async fn judicial_case_get(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    val(s
+        .workspace
+        .legal()
+        .judicial_case_get(legal_services::JudicialCaseGetRequest {
+            schema_version: 1,
+            case_id: id,
+        })
+        .map_err(case_error)?)
+}
+async fn judicial_case_status(State(s): State<AppState>) -> ApiResult {
+    val(s
+        .workspace
+        .legal()
+        .judicial_case_status()
+        .map_err(case_error)?)
+}
+async fn judicial_case_understand(
+    State(s): State<AppState>,
+    Input(request): Input<workspace_service::CaseUnderstandingRequest>,
+) -> ApiResult {
+    val(s.workspace.understand_cases(request).await?)
 }
 async fn legal_search(State(s): State<AppState>, Query(q): Query<Search>) -> ApiResult {
     val(s

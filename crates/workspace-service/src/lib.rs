@@ -1,3 +1,12 @@
+mod ai_legal_tools;
+mod ai_provider;
+mod ai_runs;
+mod case_search;
+mod document_render;
+mod ocr;
+mod redaction_ai;
+pub use ai_provider::*;
+pub use ai_runs::*;
 mod error;
 pub mod filesystem;
 mod provider;
@@ -26,6 +35,7 @@ pub struct Workspace {
     pub(crate) wake: Notify,
     pub(crate) cancellations: Mutex<HashMap<String, CancellationToken>>,
     pub(crate) chat_cancellations: Mutex<HashMap<String, CancellationToken>>,
+    pub(crate) ai_slots: tokio::sync::Semaphore,
     pub(crate) credentials: providers::windows_credentials::WindowsCredentialStore,
     legal: legal_services::LegalServices,
 }
@@ -79,6 +89,7 @@ impl Workspace {
             wake: Notify::new(),
             cancellations: Mutex::new(HashMap::new()),
             chat_cancellations: Mutex::new(HashMap::new()),
+            ai_slots: tokio::sync::Semaphore::new(2),
             credentials:
                 providers::windows_credentials::WindowsCredentialStore::with_service_prefix(prefix),
             legal,
@@ -98,6 +109,9 @@ impl Workspace {
                 this.store.save("material", &material.id, &material)?;
             }
         }
+        this.migrate_ai_settings()?;
+        this.recover_ai_runs()?;
+        redaction_ai::recover_ai_stages(&this)?;
         Ok(this)
     }
     pub fn root(&self) -> &Path {
@@ -112,7 +126,16 @@ impl Workspace {
             .map_err(|_| Error::new("workspace_unavailable"))
     }
     pub fn health(&self) -> Value {
-        json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"legal_ready":self.legal.system_status().map(|s|s.legal_database.available).unwrap_or(false),"ocr":{"available":false},"formats":["txt","docx"]})
+        let defaults = self.ai_defaults().unwrap_or_default();
+        let purposes = defaults.keys().cloned().collect::<Vec<_>>();
+        json!({
+            "status":"ready",
+            "version":env!("CARGO_PKG_VERSION"),
+            "legal_ready":self.legal.system_status().map(|s|s.legal_database.available).unwrap_or(false),
+            "ai":{"configured":!defaults.is_empty(),"purposes":purposes},
+            "ocr":ocr::health_status(self),
+            "formats":["txt","docx","pdf","png","jpeg","webp"]
+        })
     }
     pub fn groups(&self) -> Result<Value> {
         Ok(
@@ -195,12 +218,49 @@ impl Workspace {
         Ok(())
     }
     pub fn materials(&self, group_id: Option<&str>) -> Result<Value> {
-        Ok(
-            json!({"materials":self.store.list::<Material>("material")?.iter().filter(|m|group_id.is_none_or(|g|m.group_id==g)).map(|m|material_summary(&self.display_material(m.clone()))).collect::<Vec<_>>()}),
-        )
+        let materials = self
+            .store
+            .list::<Material>("material")?
+            .into_iter()
+            .filter(|m| group_id.is_none_or(|g| m.group_id == g))
+            .map(|m| {
+                let m = self.display_material(m);
+                self.with_material_progress(&m, material_summary(&m))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({"materials":materials}))
     }
     pub fn material(&self, material_id: &str) -> Result<Material> {
         self.store.get("material", material_id)
+    }
+    pub fn material_view(&self, material_id: &str) -> Result<Value> {
+        let m = self.display_material(self.material(material_id)?);
+        self.with_material_progress(&m, serde_json::to_value(&m)?)
+    }
+    fn with_material_progress(&self, material: &Material, mut value: Value) -> Result<Value> {
+        let stage = self
+            .store
+            .maybe::<Value>("ai_stage", &material.id)?
+            .filter(|record| {
+                record["revision"] == material.revision
+                    && record["source_sha256"] == material.source_sha256
+            });
+        if let Some(stage) = stage {
+            value["processing_method"] = json!("llm");
+            value["processing_method_label"] = json!("大模型识别与本地核验");
+            value["stage"] = stage["stage"].clone();
+            value["stage_updated_at"] = stage["updated_at"].clone();
+            value["stage_error_code"] = stage["error_code"].clone();
+        } else {
+            value["processing_method"] = json!("local");
+            value["processing_method_label"] = json!("本地算法处理");
+            value["stage"] = json!(if material.analysis.is_some() {
+                "本地识别与残留检查"
+            } else {
+                "等待材料处理"
+            });
+        }
+        Ok(value)
     }
     pub fn task_status(&self, task_id: &str) -> Result<Value> {
         let task: Task = self.store.get("task", task_id)?;
@@ -210,9 +270,11 @@ impl Workspace {
             .map(|i| self.material(i).map(|m| self.display_material(m)))
             .collect::<Result<Vec<_>>>()?;
         let status = aggregate(&materials);
-        Ok(
-            json!({"id":task.id,"task_id":task.id,"status":status,"materials":materials.iter().map(material_summary).collect::<Vec<_>>()}),
-        )
+        let summaries = materials
+            .iter()
+            .map(|m| self.with_material_progress(m, material_summary(m)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({"id":task.id,"task_id":task.id,"status":status,"materials":summaries}))
     }
     fn display_material(&self, mut m: Material) -> Material {
         if m.status == "ready" {
@@ -265,6 +327,7 @@ impl Workspace {
         let analysis = privacy_text::Analysis {
             text: result.text.clone(),
             findings: result.findings.clone(),
+            ai_findings: None,
             replacements: result.replacements.clone(),
             needs_review: false,
             source_sha256: result.source_sha256.clone(),

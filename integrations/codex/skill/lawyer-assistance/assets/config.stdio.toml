@@ -12,4 +12,6 @@ enabled_tools = [
   "legal_get_article",
   "legal_get_versions",
   "legal_get_relations",
+  "legal_search_cases",
+  "legal_get_case",
 ]

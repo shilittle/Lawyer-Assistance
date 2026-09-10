@@ -12,6 +12,8 @@ enabled_tools = [
   "legal_get_article",
   "legal_get_versions",
   "legal_get_relations",
+  "legal_search_cases",
+  "legal_get_case",
   "privacy_workspace.submit",
   "privacy_workspace.status",
   "privacy_workspace.read_result",

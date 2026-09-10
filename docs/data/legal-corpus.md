@@ -1,6 +1,6 @@
 # 法律数据与运行时数据库 / Legal corpus and runtime database
 
-Lawyer Assistance 使用公开、可追溯的官方法律来源构建本地只读索引。Web 便携包只包含运行时投影，不包含抓取状态、审计原文或完整归档数据库。
+Lawyer Assistance 使用公开、可追溯的官方法律来源构建本地只读索引。Web 便携包只包含法条和案例运行时投影，不包含抓取状态、审计原文或完整归档数据库。
 
 ## 运行时投影
 
@@ -29,9 +29,17 @@ source_manifest_sha256: 011551065b404507bce7b2cf542cb3b18da79a14437d094d067e685a
 
 法律文本及来源受官方站点、法律法规和各自许可约束。仓库 MIT 许可证只适用于本项目代码，不重新许可第三方法律文本、字体、模型或外部内容。
 
+## 最高人民法院案例 sidecar
+
+案例运行时文件为 `data/runtime/judicial_cases.sqlite`，与 `legal_core.sqlite` 同目录、独立更新和只读打开。其发行清单为 [`data/generated/judicial_cases_manifest.json`](../../data/generated/judicial_cases_manifest.json)，包内副本为 `data/runtime/judicial_cases_manifest.json`；`CASE_DATA_SOURCES.md` 随案例库发行并记录官方来源、抓取边界、许可和覆盖限制。
+
+打包前必须同时核对案例文件的 `size_bytes`、`sha256`、`schema_version`、`counts` 和官方最高人民法院 `source`。数据库还必须通过 SQLite 完整性检查、`database_metadata.schema_version`/`PRAGMA user_version` 检查以及 `judicial_cases` 表结构检查。案例记录数量以 manifest 为准，文档不硬编码会随官方快照变化的数量。
+
+当前案例范围以清单声明为准，重点覆盖最高人民法院指导案例，并可包含官方参考案例；它不宣称覆盖全国裁判文书全量，也不把模型生成内容写入案例库。案例库缺失或不兼容时，法条库仍保持原有身份和可用性，案例检索应明确报告不可用。
+
 ## 本地验证
 
-准备好 `data/runtime/legal_core.sqlite` 后，可以直接运行便携打包自检（不重新编译）：
+准备好 `data/runtime/legal_core.sqlite`、`data/runtime/judicial_cases.sqlite` 和对应 manifest 后，可以直接运行便携打包自检（不重新编译）：
 
 ```powershell
 python -m unittest scripts.test_package_portable -v
@@ -40,8 +48,10 @@ python scripts/package_portable.py --skip-build
 
 ## English
 
-Lawyer Assistance builds a local read-only index from traceable official public sources. The Web portable package contains only the runtime projection, not crawler state, audit payloads, or the full archival database.
+Lawyer Assistance builds local read-only statute and case indexes from traceable official public sources. The Web portable package contains only the runtime projections, not crawler state, audit payloads, or the full archival database.
 
 The runtime file is `data/runtime/legal_core.sqlite`; its identity is fixed by `data/generated/legal_core_distribution_manifest.json`. Packaging verifies its size, SHA-256, and the SQLite `database_metadata.source_manifest_sha256`. The full archive and build/audit state stay outside the product package.
+
+The judicial sidecar is `data/runtime/judicial_cases.sqlite`, discovered beside the statute database and kept independently replaceable. Its source manifest is `data/generated/judicial_cases_manifest.json`, with a packaged copy at `data/runtime/judicial_cases_manifest.json`; `CASE_DATA_SOURCES.md` records the official source and coverage boundary. Packaging verifies its declared size, SHA-256, schema version, record counts, and Supreme People's Court source, plus SQLite integrity, metadata/user schema version, and the `judicial_cases` table shape. Counts come from the manifest so they can follow the official snapshot without stale documentation. The corpus focuses on Supreme People's Court guiding cases and may include official reference cases; it is not a complete national judgment corpus. A missing or incompatible sidecar is reported as unavailable while the statute database identity remains unchanged.
 
 Source coverage, schema, and licensing constraints are documented under `data/sources/`, `data/schema/`, and `data/runtime/`. The MIT license applies to project code only and does not relicense third-party legal text, fonts, models, or other external content.

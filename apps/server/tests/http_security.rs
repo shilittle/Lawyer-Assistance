@@ -14,6 +14,78 @@ const HOST: &str = "127.0.0.1:8877";
 const ORIGIN: &str = "http://127.0.0.1:8877";
 const BOOTSTRAP: &str = "http-security-test-bootstrap";
 
+#[tokio::test]
+async fn judicial_case_routes_keep_auth_csrf_and_missing_corpus_boundaries() {
+    let fixture = fixture();
+    for path in [
+        "/api/v1/legal/cases?query=test",
+        "/api/v1/legal/cases/status",
+        "/api/v1/legal/cases/spc-guiding-1",
+    ] {
+        let response = send(&fixture.app, request(Method::GET, path, Body::empty())).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let (cookie, csrf) = login(&fixture.app).await;
+    let status = send(
+        &fixture.app,
+        json_request(
+            Method::GET,
+            "/api/v1/legal/cases/status",
+            Value::Null,
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(json_body(status).await["available"], false);
+    let response = send(
+        &fixture.app,
+        json_request(
+            Method::GET,
+            "/api/v1/legal/cases?query=test",
+            Value::Null,
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "judicial_case_database_missing");
+    assert!(!body.to_string().contains("sqlite"));
+    let input =
+        json!({"query":"劳动关系认定", "provider_id":"provider_test", "model":"test-model"});
+    let response = send(
+        &fixture.app,
+        json_request(
+            Method::POST,
+            "/api/v1/legal/cases/understand",
+            input.clone(),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = send(
+        &fixture.app,
+        json_request(
+            Method::POST,
+            "/api/v1/legal/cases/understand",
+            input,
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "judicial_case_database_missing"
+    );
+}
+
 struct Fixture {
     app: Router,
     workspace: Arc<Workspace>,

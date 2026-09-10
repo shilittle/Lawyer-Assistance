@@ -55,3 +55,7 @@ jobs:
       - name: Check the package validation tests on Linux
         if: matrix.os == 'ubuntu-latest'
         run: python -m unittest scripts.test_package_portable -v
+
+      - name: Check judicial corpus parser tests on Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m unittest data.build.test_build_judicial_cases -v

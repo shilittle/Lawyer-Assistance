@@ -32,6 +32,7 @@ data/generated/*
 !data/generated/legal_core_runtime_report.json
 !data/generated/legal_core_package_report.json
 !data/generated/legal_core_performance_report.json
+!data/generated/judicial_cases_manifest.json
 
 *.log
 *.tmp
@@ -43,9 +44,18 @@ data/generated/*
 **/workspace.lock
 **/connection.dpapi
 **/legal_core.sqlite
+**/legal_search_index.sqlite
+**/.legal_search_index.*.sqlite.tmp
 **/legal_core.sqlite-shm
 **/legal_core.sqlite-wal
 **/legal_core.sqlite-journal
+**/judicial_cases.sqlite
+**/judicial_cases.sqlite-shm
+**/judicial_cases.sqlite-wal
+**/judicial_cases.sqlite-journal
+**/cases/
+data/build/case-cache/
+data/build/cases-cache/
 __pycache__/
 *.pyc
 .DS_Store

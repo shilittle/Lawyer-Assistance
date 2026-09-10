@@ -80,6 +80,9 @@ jobs:
       - name: Test synthetic Web smoke legal fixture generator
         run: python -m unittest scripts.test_prepare_web_smoke_db -v
 
+      - name: Test official judicial case ingestion without network access
+        run: python -m unittest data.build.test_build_judicial_cases -v
+
       - name: Prepare synthetic non-distribution legal fixture for Web smoke
         shell: pwsh
         run: |

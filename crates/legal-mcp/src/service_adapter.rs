@@ -291,6 +291,18 @@ impl ServiceAdapter {
                 })
                 .await
             }
+            "legal_search_cases" => {
+                self.invoke("legal_search_cases", arguments, |services, request| {
+                    services.judicial_case_search(request)
+                })
+                .await
+            }
+            "legal_get_case" => {
+                self.invoke("legal_get_case", arguments, |services, request| {
+                    services.judicial_case_get(request)
+                })
+                .await
+            }
             name if PRIVACY_WORKSPACE_TOOL_NAMES.contains(&name) => {
                 self.privacy_call(name, arguments, authorization).await
             }
@@ -514,7 +526,19 @@ fn public_success<T: Serialize>(tool_name: &str, response: T) -> Result<CallTool
     let data = convert_object_keys(data, camel_to_snake);
     let public_text = public_output::success_text(tool_name, &data);
     let public_data = public_output::success_structured_content(tool_name, &data, &public_text);
-    if !privacy_gate::model_visible_output_is_safe(&public_text, &public_data)
+    let verified_public_case = public_output::verified_case_output_is_safe(tool_name, &data);
+    if matches!(tool_name, "legal_search_cases" | "legal_get_case") && !verified_public_case {
+        return Ok(public_error(
+            tool_name,
+            ServiceError::new(
+                "case_output_blocked",
+                "case output failed public-source boundary validation",
+                false,
+            ),
+        ));
+    }
+    if (!verified_public_case
+        && !privacy_gate::model_visible_output_is_safe(&public_text, &public_data))
         || serialized_len(&public_data) > MAX_TOOL_ENVELOPE_BYTES
     {
         return Ok(public_error(
@@ -759,5 +783,49 @@ mod tests {
         assert!(privacy_value_is_safe(
             &json!({"result_id":"result_1","status":"published"})
         ));
+    }
+
+    #[test]
+    fn verified_official_case_full_text_can_cross_the_public_boundary() {
+        let data = json!({
+            "case": {
+                "case_id":"spc-guiding-1", "title":"指导案例", "case_type":"guiding",
+                "guiding_number":1, "reference_number":null, "keywords":["劳动关系"],
+                "publication_date":"2026-09-09", "court":"最高人民法院", "case_number":null,
+                "status":"published", "source_url":"https://www.court.gov.cn/shenpan/1.html",
+                "matched_text":"劳动关系", "key_points":[], "basic_facts":"原告：张三",
+                "judgment_result":"", "reasoning":"", "related_laws":[],
+                "full_text":"原告：张三。公开指导案例全文。", "fetched_at":"2026-09-09T00:00:00Z"
+            }
+        });
+        assert!(!privacy_gate::model_visible_output_is_safe(
+            "原告：张三",
+            &data
+        ));
+        let result = public_success("legal_get_case", data).expect("official case result");
+        let value = serde_json::to_value(result).expect("result JSON");
+        assert_eq!(value["isError"], false);
+        assert!(value["structuredContent"]["内容"]["案例全文"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("公开指导案例全文"));
+    }
+
+    #[test]
+    fn case_tools_reject_unverified_sources_without_falling_back_to_the_general_gate() {
+        let data = json!({
+            "case": {
+                "case_id":"spc-guiding-1", "title":"指导案例", "case_type":"guiding",
+                "guiding_number":1, "reference_number":null, "keywords":[],
+                "status":"published", "source_url":"https://court.gov.cn.example.test/case/1",
+                "full_text":"公开文本", "fetched_at":"2026-09-09T00:00:00Z"
+            }
+        });
+        let result = public_success("legal_get_case", data).expect("blocked result");
+        let value = serde_json::to_value(result).expect("result JSON");
+        assert_eq!(value["isError"], true);
+        assert!(!serde_json::to_string(&value)
+            .expect("result JSON")
+            .contains("example.test"));
     }
 }

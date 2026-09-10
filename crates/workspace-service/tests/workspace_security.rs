@@ -18,6 +18,93 @@ use workspace_service::{
 const LOCAL_TEXT: &str = "请在联系时使用号码 13800138000。";
 const NER_TEXT: &str = "申请人：王伟，请求依法裁判。";
 
+fn case_fixture(fixture: &Fixture) {
+    let db = Connection::open(fixture.temp.path().join("judicial_cases.sqlite")).unwrap();
+    db.execute_batch(include_str!("../../../data/schema/judicial_cases.sql"))
+        .unwrap();
+    db.execute_batch("INSERT INTO database_metadata VALUES ('schema_version','1'), ('dataset_version','synthetic-case-test');").unwrap();
+    let text = "合成公开案例：根据实际用工事实认定劳动关系。";
+    db.execute(
+        "INSERT INTO judicial_cases (case_id,case_type,guiding_number,title,keywords_json,status,source_url,search_text,key_points_json,basic_facts,judgment_result,reasoning,related_laws_json,full_text,fetched_at,content_sha256) VALUES ('spc-guiding-1','guiding',1,'合成劳动关系案例','[\"劳动关系\"]','published','https://www.court.gov.cn/shenpan/xiangqing/1.html',?1,'[\"根据用工事实认定劳动关系\"]','合成事实','合成结果','合成理由','[]',?1,'2026-09-09T00:00:00Z',?2)",
+        rusqlite::params![text, workspace_service::hash(text.as_bytes())],
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn case_understanding_sends_only_explicit_input_and_returns_local_cases() {
+    let fixture = Fixture::new();
+    case_fixture(&fixture);
+    let group = fixture.create_group();
+    submit_single(
+        &fixture.workspace,
+        &group,
+        "case-context-isolation",
+        "PRIVATE_CASE_CANARY 13800138000",
+    );
+    let mock = CloudMock::start(r#"{"query":"劳动关系","issues":["是否建立劳动关系"]}"#);
+    let provider_id = fixture.save_mock_provider(mock.base_url.clone(), "workspace-test-model");
+    let request = || workspace_service::CaseUnderstandingRequest {
+        query: "外卖骑手和平台是不是劳动关系".into(),
+        provider_id: provider_id.clone(),
+        model: "workspace-test-model".into(),
+        case_type: Some("guiding".into()),
+        include_withdrawn: false,
+    };
+    let result = fixture.workspace.understand_cases(request()).await.unwrap();
+    assert_eq!(result["interpreted_query"], "劳动关系");
+    assert_eq!(result["results"]["cases"][0]["caseId"], "spc-guiding-1");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    let sent = String::from_utf8_lossy(&requests[0]);
+    assert!(!sent.contains("PRIVATE_CASE_CANARY"));
+    assert!(!sent.contains("13800138000"));
+    assert!(sent.contains("外卖骑手和平台是不是劳动关系"));
+    let mut mismatched = request();
+    mismatched.model = "unapproved-model".into();
+    assert_eq!(
+        fixture
+            .workspace
+            .understand_cases(mismatched)
+            .await
+            .unwrap_err()
+            .code,
+        "provider_changed"
+    );
+    assert_eq!(mock.request_count(), 1);
+}
+
+#[tokio::test]
+async fn case_understanding_rejects_generated_cases_and_credential_echo() {
+    for (reply, expected) in [
+        (
+            r#"{"query":"劳动关系","issues":[],"cases":["invented"]}"#,
+            "case_understanding_invalid",
+        ),
+        (
+            r#"{"query":"temporary-test-key-not-a-user-secret","issues":[]}"#,
+            "provider_secret_echo_blocked",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        case_fixture(&fixture);
+        let mock = CloudMock::start(reply);
+        let provider_id = fixture.save_mock_provider(mock.base_url.clone(), "workspace-test-model");
+        let error = fixture
+            .workspace
+            .understand_cases(workspace_service::CaseUnderstandingRequest {
+                query: "劳动关系".into(),
+                provider_id,
+                model: "workspace-test-model".into(),
+                case_type: None,
+                include_withdrawn: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, expected);
+        assert_eq!(mock.request_count(), 1);
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     workspace: Arc<Workspace>,

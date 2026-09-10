@@ -8,6 +8,7 @@ license.workspace = true
 file-ingest = { path = "../file-ingest" }
 privacy = { path = "../privacy" }
 serde.workspace = true
+regex.workspace = true
 zip = { version = "=2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
 
 [dev-dependencies]

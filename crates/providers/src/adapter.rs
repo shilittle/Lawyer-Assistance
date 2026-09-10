@@ -1,3 +1,6 @@
+mod workspace_json;
+pub use workspace_json::{authorize_workspace_json, AuthorizedWorkspaceJson};
+
 use crate::{
     credentials::ApiSecret,
     redaction::truncate_for_log,
@@ -38,6 +41,7 @@ const WORKSPACE_AUTHORIZED_SCHEMA_VERSION: u16 = 1;
 const EXTERNAL_PROVIDER_DESTINATION: &str = "external_provider";
 const WORKSPACE_REDACTION_ASSISTANCE_PURPOSE: &str = "redaction_assistance";
 const WORKSPACE_SELECTED_CONTEXT_CHAT_PURPOSE: &str = "selected_context_chat";
+const WORKSPACE_CASE_SEARCH_PURPOSE: &str = "case_search_understanding";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1630,7 +1634,9 @@ fn validate_approved_binding(binding: &ApprovedChatBinding) -> Result<(), Provid
 fn validate_workspace_purpose(purpose: &str) -> Result<(), ProviderError> {
     if matches!(
         purpose,
-        WORKSPACE_REDACTION_ASSISTANCE_PURPOSE | WORKSPACE_SELECTED_CONTEXT_CHAT_PURPOSE
+        WORKSPACE_REDACTION_ASSISTANCE_PURPOSE
+            | WORKSPACE_SELECTED_CONTEXT_CHAT_PURPOSE
+            | WORKSPACE_CASE_SEARCH_PURPOSE
     ) {
         Ok(())
     } else {
@@ -1902,6 +1908,7 @@ fn validate_transport_authorization(
                     envelope.purpose.as_str(),
                     WORKSPACE_REDACTION_ASSISTANCE_PURPOSE
                         | WORKSPACE_SELECTED_CONTEXT_CHAT_PURPOSE
+                        | WORKSPACE_CASE_SEARCH_PURPOSE
                 )
                 || body.get("model").and_then(Value::as_str)
                     != Some(authorization.model_id.as_str())
@@ -3124,6 +3131,45 @@ mod tests {
         assert!(requests[0].body().contains(RAW_MARKER));
         assert!(!format!("{:?}", requests[0]).contains(RAW_MARKER));
         assert!(!format!("{:?}", requests[0]).contains("13800138000"));
+    }
+
+    #[test]
+    fn case_understanding_authorization_is_bound_and_single_use() {
+        let provider_profile = approved_test_profile("https://provider.example/v1");
+        let messages = vec![ChatMessage {
+            role: ChatMessageRole::User,
+            content: "劳动关系认定的公开检索描述".to_owned(),
+        }];
+        let authorized = authorize_workspace_request(
+            &provider_profile,
+            messages,
+            false,
+            WORKSPACE_CASE_SEARCH_PURPOSE,
+            &privacy::sha256_hex(b"explicit-case-query"),
+            system_unix_time().unwrap() + 120,
+        )
+        .expect("case search purpose is supported");
+        let transport = MockTransport::new(TransportResponse {
+            status: 200,
+            body: r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_owned(),
+            first_content_token_latency_ms: None,
+            total_latency_ms: 1,
+        });
+        let adapter = OpenAiCompatibleAdapter::new(transport.clone());
+        let secret = ApiSecret::new("case-search-test-secret");
+        let mut changed = provider_profile.clone();
+        changed.model_id = "different-model".into();
+        assert!(adapter
+            .send_workspace_chat(&changed, &secret, &authorized)
+            .is_err());
+        assert!(transport.requests.lock().unwrap().is_empty());
+        adapter
+            .send_workspace_chat(&provider_profile, &secret, &authorized)
+            .expect("exact binding sends once");
+        assert!(adapter
+            .send_workspace_chat(&provider_profile, &secret, &authorized)
+            .is_err());
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
     }
 
     #[test]

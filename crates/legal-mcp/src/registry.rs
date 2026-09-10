@@ -8,20 +8,24 @@ const PUBLIC_OUTPUT_INSTRUCTION: &str = "content 与 structuredContent 只提供
 const PRIVACY_OUTPUT_INSTRUCTION: &str = "仅返回后台已发布的脱敏任务状态或脱敏文本。不得返回原文、映射、原始文件名、磁盘路径或后台诊断。";
 
 /// The public-law contract is frozen for existing integrations.
-pub const TOOL_NAMES: [&str; 5] = [
+pub const TOOL_NAMES: [&str; 7] = [
     "system_status",
     "legal_search",
     "legal_get_article",
     "legal_get_versions",
     "legal_get_relations",
+    "legal_search_cases",
+    "legal_get_case",
 ];
 
-pub const PRIVACY_WORKSPACE_TOOL_NAMES: [&str; 8] = [
+pub const PRIVACY_WORKSPACE_TOOL_NAMES: [&str; 10] = [
     "system_status",
     "legal_search",
     "legal_get_article",
     "legal_get_versions",
     "legal_get_relations",
+    "legal_search_cases",
+    "legal_get_case",
     "privacy_workspace.submit",
     "privacy_workspace.status",
     "privacy_workspace.read_result",
@@ -185,6 +189,38 @@ fn public_tools() -> Vec<Tool> {
                 "additionalProperties":false
             }),
         ),
+        public_tool(
+            "legal_search_cases",
+            "Search Supreme People's Court cases",
+            "Search the optional local Supreme People's Court case corpus. Query may contain AI-understood legal issues or Chinese keywords; results remain offline and source-addressable.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "schema_version":{"type":"integer","const":1},
+                    "query":{"type":"string","minLength":1,"maxLength":16384},
+                    "case_type":{"type":["string","null"],"enum":["guiding","reference","typical",null]},
+                    "limit":{"type":["integer","null"],"minimum":1,"maximum":50},
+                    "offset":{"type":["integer","null"],"minimum":0,"maximum":10000},
+                    "include_withdrawn":{"type":["boolean","null"]}
+                },
+                "required":["schema_version","query"],
+                "additionalProperties":false
+            }),
+        ),
+        public_tool(
+            "legal_get_case",
+            "Get Supreme People's Court case",
+            "Read one source-traceable case, including its official public full text, from the optional local Supreme People's Court case corpus.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "schema_version":{"type":"integer","const":1},
+                    "case_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.:-]+$"}
+                },
+                "required":["schema_version","case_id"],
+                "additionalProperties":false
+            }),
+        ),
     ]
 }
 
@@ -335,7 +371,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_contract_is_exactly_five_tools() {
+    fn public_contract_has_the_five_frozen_law_tools_and_two_case_tools() {
         let registry = ToolRegistry::for_profile(PrivacyProfile::PublicLawOnly);
         assert_eq!(
             registry
@@ -388,12 +424,20 @@ mod tests {
                     "legal_get_relations".to_owned(),
                     json!({"type":"object","properties":{"schema_version":{"type":"integer","const":1},"document_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.:-]+$"},"direction":{"type":["string","null"],"enum":["both","outgoing","incoming",null]}},"required":["schema_version","document_id"],"additionalProperties":false}),
                 ),
+                (
+                    "legal_search_cases".to_owned(),
+                    json!({"type":"object","properties":{"schema_version":{"type":"integer","const":1},"query":{"type":"string","minLength":1,"maxLength":16384},"case_type":{"type":["string","null"],"enum":["guiding","reference","typical",null]},"limit":{"type":["integer","null"],"minimum":1,"maximum":50},"offset":{"type":["integer","null"],"minimum":0,"maximum":10000},"include_withdrawn":{"type":["boolean","null"]}},"required":["schema_version","query"],"additionalProperties":false}),
+                ),
+                (
+                    "legal_get_case".to_owned(),
+                    json!({"type":"object","properties":{"schema_version":{"type":"integer","const":1},"case_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.:-]+$"}},"required":["schema_version","case_id"],"additionalProperties":false}),
+                ),
             ])
         );
     }
 
     #[test]
-    fn privacy_workspace_is_exactly_eight_tools_and_legacy_has_none() {
+    fn privacy_workspace_is_exactly_ten_tools_and_legacy_has_none() {
         let registry = ToolRegistry::for_profile(PrivacyProfile::PrivacyWorkspace);
         assert_eq!(
             registry

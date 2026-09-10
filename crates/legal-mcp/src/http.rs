@@ -40,7 +40,7 @@ pub enum HttpClientScope {
 
 /// Configuration for embedding one Streamable HTTP endpoint in the application
 /// server. A public token, when configured, is explicitly restricted to the
-/// five public tools. Any other syntactically valid bearer is passed only to a
+/// seven public tools. Any other syntactically valid bearer is passed only to a
 /// new request-scoped daemon adapter for a privacy tool; it is never saved in
 /// router state or used for another request.
 #[derive(Debug, Clone)]
@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(public.status(), StatusCode::OK);
         let bytes = to_bytes(public.into_body(), 64 * 1024).await.expect("body");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
-        assert_eq!(value["result"]["tools"].as_array().map(Vec::len), Some(5));
+        assert_eq!(value["result"]["tools"].as_array().map(Vec::len), Some(7));
 
         let privacy = router()
             .oneshot(
@@ -488,7 +488,7 @@ mod tests {
             .await
             .expect("body");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
-        assert_eq!(value["result"]["tools"].as_array().map(Vec::len), Some(8));
+        assert_eq!(value["result"]["tools"].as_array().map(Vec::len), Some(10));
     }
 
     #[test]

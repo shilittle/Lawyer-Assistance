@@ -1,5 +1,5 @@
-use crate::*;
-use privacy_text::{Analysis, CloudFinding};
+use crate::{redaction_ai::AiStageRecord, *};
+use privacy_text::{AiFinding, Analysis, CloudFinding};
 use serde::Deserialize;
 
 impl Workspace {
@@ -239,17 +239,22 @@ impl Workspace {
         {
             return Err(Error::new("material_not_reviewable"));
         }
+        // Capture the validated model evidence before a dictionary update increments every
+        // material revision and clears its cached analysis. An AI-stage material without this
+        // evidence must remain reviewable; treating it as local-only could expose an entity the
+        // model had already identified.
+        let (ai_findings, ai_stage) = self.review_ai_evidence_locked(&m)?;
         let mut group: Group = self.store.get("group", &m.group_id)?;
         if !request.dictionary.is_empty() {
             for entry in request.dictionary {
                 group.entries.retain(|e| e.text != entry.text);
                 group.entries.push(entry);
             }
-            privacy_text::analyze(
+            Self::analyze_review(
                 &m.original_text,
                 &group.namespace,
                 &group.entries,
-                &[],
+                ai_findings.as_deref(),
                 &request.dismissed,
             )
             .map_err(|e| Error::new(&e.to_string()))?;
@@ -257,18 +262,88 @@ impl Workspace {
             group = self.store.get("group", &m.group_id)?;
             m = self.material(material_id)?;
         }
-        let analysis = privacy_text::analyze(
+        let analysis = Self::analyze_review(
             &m.original_text,
             &group.namespace,
             &group.entries,
-            &[],
+            ai_findings.as_deref(),
             &request.dismissed,
         )
         .map_err(|e| Error::new(&e.to_string()))?;
         m.revision += 1;
         m.dismissed = request.dismissed;
+        let reviewed_revision = m.revision;
+        let reviewed_source = m.source_sha256.clone();
         self.finish_locked(m, &group, analysis, false)?;
+        if let Some(mut stage) = ai_stage {
+            stage.revision = reviewed_revision;
+            stage.source_sha256 = reviewed_source;
+            stage.stage = "reviewed".into();
+            stage.updated_at = now();
+            stage.error_code = None;
+            self.store.save("ai_stage", material_id, &stage)?;
+        }
         Ok(serde_json::to_value(self.material(material_id)?)?)
+    }
+
+    fn analyze_review(
+        text: &str,
+        namespace: &str,
+        dictionary: &[DictionaryEntry],
+        ai_findings: Option<&[AiFinding]>,
+        dismissed: &[String],
+    ) -> std::result::Result<Analysis, privacy_text::TextError> {
+        if let Some(ai_findings) = ai_findings {
+            privacy_text::analyze_with_ai(text, namespace, dictionary, ai_findings, dismissed)
+        } else {
+            privacy_text::analyze(text, namespace, dictionary, &[], dismissed)
+        }
+    }
+
+    fn review_ai_evidence_locked(
+        &self,
+        material: &Material,
+    ) -> Result<(Option<Vec<AiFinding>>, Option<AiStageRecord>)> {
+        let source = self
+            .store
+            .raw("source", &material.id)
+            .map_err(|_| Error::new("source_integrity_failed"))?;
+        if hash(&source) != material.source_sha256 {
+            return Err(Error::new("source_integrity_failed"));
+        }
+        let recorded_stage = self
+            .store
+            .maybe::<AiStageRecord>("ai_stage", &material.id)?;
+        // A stage for another source version cannot be reused or treated as local evidence. A
+        // replacement must complete a fresh AI pass before it can be manually reviewed.
+        if recorded_stage
+            .as_ref()
+            .is_some_and(|record| record.source_sha256 != material.source_sha256)
+        {
+            return Err(Error::new("ai_review_evidence_missing"));
+        }
+        // A dictionary-only revision changes neither source bytes nor model identity, so retain
+        // the same-source stage even when its revision is now stale.
+        let stage = recorded_stage.clone();
+        let Some(analysis) = material.analysis.as_ref() else {
+            return if recorded_stage.is_some() {
+                Err(Error::new("ai_review_evidence_missing"))
+            } else {
+                Ok((None, None))
+            };
+        };
+        let has_ai_evidence = recorded_stage.is_some() || analysis.ai_findings.is_some();
+        if !has_ai_evidence {
+            // Pre-AI local analyses may not carry source-range evidence. Re-analyzing from the
+            // current verified source preserves the legacy local review flow.
+            return Ok((None, None));
+        }
+        privacy_text::verify_analysis_source(&material.original_text, analysis)
+            .map_err(|_| Error::new("review_evidence_invalid"))?;
+        let Some(ai_findings) = analysis.ai_findings.clone() else {
+            return Err(Error::new("ai_review_evidence_missing"));
+        };
+        Ok((Some(ai_findings), stage))
     }
     pub fn consent(
         &self,
@@ -387,6 +462,142 @@ impl Workspace {
         }
         let name = m.name.clone();
         let encoding = m.encoding.clone();
+
+        // A configured AI model opts this material into the durable OCR + model-led path. If no
+        // redaction model is configured, preserve the legacy local-only behavior; any other
+        // configuration error is surfaced instead of silently reporting an AI success.
+        let ai_selection = match self.selected_ai_model("redaction") {
+            Ok(selection) => Some(selection),
+            Err(error) if error.code == "ai_model_required" => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(selection) = ai_selection {
+            self.save_ai_stage(
+                &m.id,
+                m.revision,
+                &m.source_sha256,
+                "ocr_running",
+                &selection,
+                None,
+                None,
+            )?;
+            let extracted = match self
+                .extract_ai_attachment_with_encoding(
+                    &name,
+                    &bytes,
+                    encoding.as_deref(),
+                    &selection,
+                    &cancel,
+                )
+                .await
+            {
+                Ok(text) => text,
+                Err(error) => {
+                    let _ = self.save_ai_stage(
+                        &m.id,
+                        m.revision,
+                        &m.source_sha256,
+                        "failed",
+                        &selection,
+                        None,
+                        Some(error.code.clone()),
+                    );
+                    return Err(error);
+                }
+            };
+            if cancel.is_cancelled() {
+                return Err(Error::new("cancelled"));
+            }
+            let text_sha256 = hash(extracted.as_bytes());
+            {
+                let _gate = self.lock()?;
+                let mut fresh = self.material(&m.id)?;
+                if fresh.revision != m.revision || fresh.status != "running" {
+                    return Ok(());
+                }
+                fresh.original_text = extracted;
+                self.store.save("material", &fresh.id, &fresh)?;
+                m = fresh;
+            }
+            self.save_ai_stage(
+                &m.id,
+                m.revision,
+                &m.source_sha256,
+                "text_ready",
+                &selection,
+                Some(text_sha256.clone()),
+                None,
+            )?;
+            self.save_ai_stage(
+                &m.id,
+                m.revision,
+                &m.source_sha256,
+                "redaction_running",
+                &selection,
+                Some(text_sha256.clone()),
+                None,
+            )?;
+            let analysis = match self
+                .redact_with_ai(
+                    &m.original_text,
+                    &g,
+                    &selection,
+                    &text_sha256,
+                    &m.dismissed,
+                    &cancel,
+                )
+                .await
+            {
+                Ok(analysis) => analysis,
+                Err(error) => {
+                    let _ = self.save_ai_stage(
+                        &m.id,
+                        m.revision,
+                        &m.source_sha256,
+                        "failed",
+                        &selection,
+                        Some(text_sha256),
+                        Some(error.code.clone()),
+                    );
+                    return Err(error);
+                }
+            };
+            let needs_review = analysis.needs_review;
+            let material_id = m.id.clone();
+            let material_revision = m.revision;
+            let source_sha256 = m.source_sha256.clone();
+            {
+                let _gate = self.lock()?;
+                let fresh = self.material(&m.id)?;
+                let current: Group = self.store.get("group", &m.group_id)?;
+                if fresh.revision != m.revision || fresh.status != "running" {
+                    return Ok(());
+                }
+                if current.dictionary_revision != g.dictionary_revision {
+                    let mut queued = fresh;
+                    queued.status = "queued".to_owned();
+                    self.store.save("material", &queued.id, &queued)?;
+                    self.wake.notify_one();
+                    return Ok(());
+                }
+                self.finish_locked(m, &g, analysis, false)?;
+            }
+            self.save_ai_stage(
+                &material_id,
+                material_revision,
+                &source_sha256,
+                if needs_review {
+                    "needs_review"
+                } else {
+                    "completed"
+                },
+                &selection,
+                Some(text_sha256),
+                None,
+            )?;
+            return Ok(());
+        }
+
         m.original_text = tokio::task::spawn_blocking(move || {
             privacy_text::extract(&name, &bytes, encoding.as_deref())
         })
@@ -629,5 +840,650 @@ impl Workspace {
             self.store.save("material", id, &m)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod review_ai_state_tests {
+    use super::*;
+    use privacy_text::{AiFinding, DictionaryEntry};
+
+    fn open_workspace() -> (tempfile::TempDir, std::sync::Arc<Workspace>) {
+        let temp = tempfile::tempdir().expect("temporary workspace directory");
+        let workspace = Workspace::open(
+            temp.path().join("workspace"),
+            temp.path().join("missing-legal.sqlite"),
+        )
+        .expect("workspace opens");
+        (temp, workspace)
+    }
+
+    fn create_material(workspace: &Workspace, source: &str) -> (Group, Material) {
+        let group_id = workspace
+            .create_group("review evidence test")
+            .expect("group creates")["id"]
+            .as_str()
+            .expect("group identifier")
+            .to_owned();
+        let submitted = workspace
+            .submit(
+                &group_id,
+                "review_ai_state",
+                vec![ImportFile {
+                    name: "source.txt".to_owned(),
+                    bytes: source.as_bytes().to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("source submits");
+        let material_id = submitted["materials"][0]["id"]
+            .as_str()
+            .expect("material identifier");
+        let material = workspace.material(material_id).expect("material exists");
+        let group = workspace
+            .store
+            .get("group", &group_id)
+            .expect("group exists");
+        (group, material)
+    }
+
+    fn ai_finding(source: &str, text: &str, kind: &str, confidence_ppm: u32) -> AiFinding {
+        let start = source.find(text).expect("synthetic AI text is present");
+        AiFinding {
+            text: text.to_owned(),
+            kind: kind.to_owned(),
+            start,
+            end: start + text.len(),
+            confidence_ppm: Some(confidence_ppm),
+        }
+    }
+
+    fn install_ai_review(
+        workspace: &Workspace,
+        mut material: Material,
+        analysis: Analysis,
+    ) -> Material {
+        material.status = "needs_review".to_owned();
+        material.reason_code = Some("manual_review_required".to_owned());
+        material.analysis = Some(analysis);
+        workspace
+            .store
+            .save("material", &material.id, &material)
+            .expect("review material saves");
+        workspace
+            .store
+            .save(
+                "ai_stage",
+                &material.id,
+                &AiStageRecord {
+                    material_id: material.id.clone(),
+                    revision: material.revision,
+                    source_sha256: material.source_sha256.clone(),
+                    stage: "needs_review".to_owned(),
+                    provider_id: "provider_test".to_owned(),
+                    model: "model_test".to_owned(),
+                    text_sha256: Some(hash(material.original_text.as_bytes())),
+                    updated_at: now(),
+                    error_code: None,
+                },
+            )
+            .expect("AI stage saves");
+        material
+    }
+
+    #[test]
+    fn dictionary_review_preserves_ai_only_entity_and_marks_stage_reviewed() {
+        let (_temp, workspace) = open_workspace();
+        let source = "北极星。履行日期为2025年1月8日。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let ai = vec![
+            ai_finding(source, "北极星", "organization_name", 950_000),
+            ai_finding(source, "2025年1月8日", "custom", 950_000),
+        ];
+        let local = privacy_text::analyze(source, &group.namespace, &[], &[], &[])
+            .expect("local baseline analysis");
+        assert!(
+            local.text.contains("北极星"),
+            "the synthetic entity must require retained AI evidence"
+        );
+        let analysis = privacy_text::analyze_with_ai(source, &group.namespace, &[], &ai, &[])
+            .expect("AI analysis");
+        assert!(
+            analysis.needs_review,
+            "model-only custom finding is reviewable"
+        );
+        assert!(!analysis.text.contains("北极星"));
+        let material = install_ai_review(&workspace, material, analysis);
+
+        workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: vec![DictionaryEntry {
+                        text: "2025年1月8日".to_owned(),
+                        kind: "custom".to_owned(),
+                        alias: Some("[CUSTOM_DATE]".to_owned()),
+                    }],
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect("dictionary review accepts retained AI evidence");
+
+        let reviewed = workspace.material(&material.id).expect("reviewed material");
+        let unresolved = reviewed
+            .analysis
+            .as_ref()
+            .expect("review analysis")
+            .findings
+            .iter()
+            .filter(|finding| !finding.resolved)
+            .map(|finding| format!("{}:{}", finding.kind, finding.source))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reviewed.status, "ready",
+            "unresolved findings: {unresolved:?}"
+        );
+        let result = workspace
+            .read_result(reviewed.result_id.as_deref().expect("ready result"))
+            .expect("reviewed output is readable");
+        assert!(!result.text.contains("北极星"));
+        assert!(!result.text.contains("2025年1月8日"));
+        let persisted_ai = &reviewed
+            .analysis
+            .as_ref()
+            .expect("review analysis")
+            .ai_findings
+            .as_ref()
+            .expect("persisted AI evidence");
+        assert_eq!(persisted_ai.len(), ai.len());
+        assert!(persisted_ai.iter().zip(&ai).all(|(actual, expected)| {
+            actual.text == expected.text
+                && actual.kind == expected.kind
+                && actual.start == expected.start
+                && actual.end == expected.end
+                && actual.confidence_ppm == expected.confidence_ppm
+        }));
+        let stage: AiStageRecord = workspace
+            .store
+            .get("ai_stage", &material.id)
+            .expect("reviewed AI stage");
+        assert_eq!(stage.revision, reviewed.revision);
+        assert_eq!(stage.source_sha256, reviewed.source_sha256);
+        assert_eq!(stage.stage, "reviewed");
+    }
+
+    #[test]
+    fn explicit_review_dismisses_model_only_custom_and_retains_ai_evidence() {
+        let (_temp, workspace) = open_workspace();
+        let source = "原告林砚应当陈述事实。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let ai = vec![
+            ai_finding(source, "原告", "custom", 900_000),
+            ai_finding(source, "林砚", "person_name", 990_000),
+        ];
+        let analysis = privacy_text::analyze_with_ai(source, &group.namespace, &[], &ai, &[])
+            .expect("AI analysis");
+        let dismissed_id = analysis
+            .findings
+            .iter()
+            .find(|finding| finding.text == "原告" && finding.source == "ai")
+            .expect("model-only custom review finding")
+            .id
+            .clone();
+        assert!(analysis.needs_review);
+        let material = install_ai_review(&workspace, material, analysis);
+
+        workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: Vec::new(),
+                    dismissed: vec![dismissed_id],
+                },
+            )
+            .expect("explicit custom dismissal completes review");
+
+        let reviewed = workspace.material(&material.id).expect("reviewed material");
+        assert_eq!(reviewed.status, "ready");
+        let analysis = reviewed.analysis.as_ref().expect("review analysis");
+        assert!(analysis
+            .findings
+            .iter()
+            .any(|finding| finding.text == "原告" && finding.dismissed && finding.resolved));
+        assert!(analysis.ai_findings.as_deref() == Some(ai.as_slice()));
+        let result = workspace
+            .read_result(reviewed.result_id.as_deref().expect("ready result"))
+            .expect("reviewed output is readable");
+        assert!(result.text.contains("原告"));
+        assert!(!result.text.contains("林砚"));
+        let stage: AiStageRecord = workspace
+            .store
+            .get("ai_stage", &material.id)
+            .expect("reviewed AI stage");
+        assert_eq!(stage.revision, reviewed.revision);
+        assert_eq!(stage.stage, "reviewed");
+    }
+
+    #[test]
+    fn review_rejects_source_hash_mismatch_before_dictionary_mutation() {
+        let (_temp, workspace) = open_workspace();
+        let source = "北极星。履行日期为2025年1月8日。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let analysis = privacy_text::analyze_with_ai(
+            source,
+            &group.namespace,
+            &[],
+            &[ai_finding(source, "北极星", "organization_name", 950_000)],
+            &[],
+        )
+        .expect("AI analysis");
+        material = install_ai_review(&workspace, material, analysis);
+        material.source_sha256 = hash(b"different source");
+        workspace
+            .store
+            .save("material", &material.id, &material)
+            .expect("tampered test material saves");
+
+        let error = workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: vec![DictionaryEntry {
+                        text: "2025年1月8日".to_owned(),
+                        kind: "custom".to_owned(),
+                        alias: Some("[CUSTOM_DATE]".to_owned()),
+                    }],
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect_err("mismatched source must not be reviewed");
+        assert_eq!(error.code, "source_integrity_failed");
+        assert!(
+            workspace
+                .dictionary(&material.group_id)
+                .expect("dictionary remains readable")["entries"]
+                .as_array()
+                .expect("dictionary entries")
+                .is_empty(),
+            "dictionary mutation must occur after source evidence validation"
+        );
+    }
+
+    #[test]
+    fn review_rejects_ai_analysis_bound_to_a_different_original_text() {
+        let (_temp, workspace) = open_workspace();
+        let source = "北极星。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let mut analysis = privacy_text::analyze_with_ai(
+            source,
+            &group.namespace,
+            &[],
+            &[ai_finding(source, "北极星", "organization_name", 950_000)],
+            &[],
+        )
+        .expect("AI analysis");
+        analysis.source_sha256 = hash(b"different extracted text");
+        let material = install_ai_review(&workspace, material, analysis);
+
+        let error = workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: Vec::new(),
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect_err("AI candidates from another original text must not be reused");
+        assert_eq!(error.code, "review_evidence_invalid");
+    }
+
+    #[test]
+    fn ai_stage_without_persisted_candidates_cannot_fall_back_to_local_ready() {
+        let (_temp, workspace) = open_workspace();
+        let source = "请在联系时使用号码 13800138000。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let local =
+            privacy_text::analyze(source, &group.namespace, &[], &[], &[]).expect("local analysis");
+        material = install_ai_review(&workspace, material, local);
+
+        let error = workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: Vec::new(),
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect_err("missing AI candidate evidence must block local fallback");
+        assert_eq!(error.code, "ai_review_evidence_missing");
+        assert_eq!(
+            workspace
+                .material(&material.id)
+                .expect("material remains readable")
+                .status,
+            "needs_review"
+        );
+    }
+
+    #[test]
+    fn independent_dictionary_change_with_stale_ai_stage_fails_closed() {
+        let (_temp, workspace) = open_workspace();
+        let source = "北极星。履行日期为2025年1月8日。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let analysis = privacy_text::analyze_with_ai(
+            source,
+            &group.namespace,
+            &[],
+            &[ai_finding(source, "北极星", "organization_name", 950_000)],
+            &[],
+        )
+        .expect("AI analysis");
+        let material = install_ai_review(&workspace, material, analysis);
+
+        workspace
+            .set_dictionary(
+                &group.id,
+                vec![DictionaryEntry {
+                    text: "已确认术语".to_owned(),
+                    kind: "custom".to_owned(),
+                    alias: Some("[CUSTOM_CONFIRMED]".to_owned()),
+                }],
+            )
+            .expect("independent dictionary update");
+        let stale = workspace.material(&material.id).expect("stale material");
+        assert!(
+            stale.analysis.is_none(),
+            "dictionary update clears cached analysis"
+        );
+
+        let error = workspace
+            .review(
+                &stale.id,
+                ReviewRequest {
+                    revision: stale.revision,
+                    dictionary: Vec::new(),
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect_err("stale AI stage cannot use local-only review");
+        assert_eq!(error.code, "ai_review_evidence_missing");
+    }
+
+    #[test]
+    fn group_dictionary_change_blocks_another_materials_stale_ai_stage() {
+        let (_temp, workspace) = open_workspace();
+        let first_source = "第一份本地材料。";
+        let (group, _first) = create_material(&workspace, first_source);
+        let second_source = "北极星。履行日期为2025年1月8日。";
+        let submitted = workspace
+            .submit(
+                &group.id,
+                "review_ai_state_second",
+                vec![ImportFile {
+                    name: "second.txt".to_owned(),
+                    bytes: second_source.as_bytes().to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("second source submits");
+        let second_id = submitted["materials"][0]["id"]
+            .as_str()
+            .expect("second material identifier");
+        let mut second = workspace.material(second_id).expect("second material");
+        second.original_text = second_source.to_owned();
+        let analysis = privacy_text::analyze_with_ai(
+            second_source,
+            &group.namespace,
+            &[],
+            &[ai_finding(
+                second_source,
+                "北极星",
+                "organization_name",
+                950_000,
+            )],
+            &[],
+        )
+        .expect("second AI analysis");
+        let second = install_ai_review(&workspace, second, analysis);
+
+        workspace
+            .set_dictionary(
+                &group.id,
+                vec![DictionaryEntry {
+                    text: "已确认术语".to_owned(),
+                    kind: "custom".to_owned(),
+                    alias: Some("[CUSTOM_CONFIRMED]".to_owned()),
+                }],
+            )
+            .expect("group dictionary update");
+        let stale = workspace
+            .material(&second.id)
+            .expect("second stale material");
+        assert!(stale.analysis.is_none());
+
+        let error = workspace
+            .review(
+                &stale.id,
+                ReviewRequest {
+                    revision: stale.revision,
+                    dictionary: Vec::new(),
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect_err("same-group dictionary update cannot downgrade AI material");
+        assert_eq!(error.code, "ai_review_evidence_missing");
+    }
+
+    #[test]
+    fn different_source_ai_stage_without_current_analysis_fails_closed() {
+        let (_temp, workspace) = open_workspace();
+        let source = "请在联系时使用号码 13800138000。";
+        let (_group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        material.status = "needs_review".to_owned();
+        material.analysis = None;
+        workspace
+            .store
+            .save("material", &material.id, &material)
+            .expect("current material saves");
+        workspace
+            .store
+            .save(
+                "ai_stage",
+                &material.id,
+                &AiStageRecord {
+                    material_id: material.id.clone(),
+                    revision: material.revision.saturating_sub(1),
+                    source_sha256: hash(b"prior source"),
+                    stage: "completed".to_owned(),
+                    provider_id: "provider_test".to_owned(),
+                    model: "model_test".to_owned(),
+                    text_sha256: Some(hash(b"prior source")),
+                    updated_at: now(),
+                    error_code: None,
+                },
+            )
+            .expect("prior AI stage saves");
+
+        let error = workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: Vec::new(),
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect_err("prior-source AI material needs a new AI analysis");
+        assert_eq!(error.code, "ai_review_evidence_missing");
+    }
+
+    #[test]
+    fn current_ai_empty_finding_set_is_valid_evidence() {
+        let (_temp, workspace) = open_workspace();
+        let source = "请在联系时使用号码 13800138000。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let analysis = privacy_text::analyze_with_ai(source, &group.namespace, &[], &[], &[])
+            .expect("validated empty AI response");
+        assert_eq!(analysis.ai_findings.as_ref().map(Vec::len), Some(0));
+        let material = install_ai_review(&workspace, material, analysis);
+
+        workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: Vec::new(),
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect("validated empty AI evidence is not legacy missing evidence");
+        let reviewed = workspace.material(&material.id).expect("reviewed material");
+        assert_eq!(reviewed.status, "ready");
+        assert_eq!(
+            reviewed
+                .analysis
+                .as_ref()
+                .expect("review analysis")
+                .ai_findings
+                .as_ref()
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn dictionary_confirmation_can_resolve_a_low_confidence_ai_entity() {
+        let (_temp, workspace) = open_workspace();
+        let source = "北极星。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let analysis = privacy_text::analyze_with_ai(
+            source,
+            &group.namespace,
+            &[],
+            &[ai_finding(source, "北极星", "organization_name", 899_999)],
+            &[],
+        )
+        .expect("low-confidence AI analysis");
+        assert!(analysis.needs_review);
+        let material = install_ai_review(&workspace, material, analysis);
+
+        workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: vec![DictionaryEntry {
+                        text: "北极星".to_owned(),
+                        kind: "organization_name".to_owned(),
+                        alias: Some("[ORG_CONFIRMED]".to_owned()),
+                    }],
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect("manual dictionary confirmation resolves low confidence");
+        let reviewed = workspace.material(&material.id).expect("reviewed material");
+        assert_eq!(reviewed.status, "ready");
+        let result = workspace
+            .read_result(reviewed.result_id.as_deref().expect("ready result"))
+            .expect("confirmed result");
+        assert!(!result.text.contains("北极星"));
+    }
+
+    #[test]
+    fn dictionary_confirmation_can_resolve_same_name_identity_ambiguity() {
+        let (_temp, workspace) = open_workspace();
+        let source = "甲方联系人：周宁；乙方联系人：周宁。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        let analysis = privacy_text::analyze_with_ai(
+            source,
+            &group.namespace,
+            &[],
+            &[
+                ai_finding(source, "周宁", "person_name", 950_000),
+                AiFinding {
+                    start: source.rfind("周宁").expect("second identity"),
+                    end: source.rfind("周宁").expect("second identity") + "周宁".len(),
+                    text: "周宁".to_owned(),
+                    kind: "person_name".to_owned(),
+                    confidence_ppm: Some(950_000),
+                },
+            ],
+            &[],
+        )
+        .expect("ambiguous AI analysis");
+        assert!(analysis.needs_review);
+        let material = install_ai_review(&workspace, material, analysis);
+
+        workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: vec![DictionaryEntry {
+                        text: "周宁".to_owned(),
+                        kind: "person_name".to_owned(),
+                        alias: Some("[PERSON_CONFIRMED]".to_owned()),
+                    }],
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect("manual dictionary confirmation resolves ambiguity");
+        let reviewed = workspace.material(&material.id).expect("reviewed material");
+        assert_eq!(reviewed.status, "ready");
+        let result = workspace
+            .read_result(reviewed.result_id.as_deref().expect("ready result"))
+            .expect("confirmed result");
+        assert!(!result.text.contains("周宁"));
+    }
+
+    #[test]
+    fn legacy_local_review_still_reanalyzes_and_publishes() {
+        let (_temp, workspace) = open_workspace();
+        let source = "请在联系时使用号码 13800138000。";
+        let (group, mut material) = create_material(&workspace, source);
+        material.original_text = source.to_owned();
+        material.status = "needs_review".to_owned();
+        material.analysis = Some(
+            privacy_text::analyze(source, &group.namespace, &[], &[], &[])
+                .expect("legacy local analysis"),
+        );
+        workspace
+            .store
+            .save("material", &material.id, &material)
+            .expect("legacy material saves");
+
+        workspace
+            .review(
+                &material.id,
+                ReviewRequest {
+                    revision: material.revision,
+                    dictionary: Vec::new(),
+                    dismissed: Vec::new(),
+                },
+            )
+            .expect("legacy local review remains supported");
+        let reviewed = workspace.material(&material.id).expect("reviewed material");
+        assert_eq!(reviewed.status, "ready");
+        let result = workspace
+            .read_result(reviewed.result_id.as_deref().expect("ready result"))
+            .expect("legacy reviewed result");
+        assert!(!result.text.contains("13800138000"));
     }
 }

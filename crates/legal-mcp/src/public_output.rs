@@ -1,7 +1,19 @@
+use regex::RegexSet;
 use serde_json::{json, Map, Value};
+use std::sync::LazyLock;
+use url::Url;
 
 const MAX_TEXT: usize = 128 * 1024;
 const MAX_ITEMS: usize = 50;
+
+static CREDENTIAL_VALUE_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)\bbearer\s+[a-z0-9._~+/-]{16,}",
+        r"(?i)\b(?:api[_ -]?key|client[_ -]?secret|credential|password)\s*[:=]\s*[^\s]{8,}",
+        r"(?i)\bauthorization\s*[:=]\s*bearer\s+[^\s]{8,}",
+    ])
+    .expect("credential patterns are valid")
+});
 
 /// Project legal-service responses to the stable, public MCP envelope.  The
 /// projection is deliberately limited to legal titles, provisions, dates,
@@ -28,6 +40,13 @@ pub(crate) fn success_text(tool_name: &str, data: &Value) -> String {
         "legal_get_relations" => {
             format!("找到 {} 项法规关联。", array_at(data, &["relations"]).len())
         }
+        "legal_search_cases" => {
+            format!(
+                "检索到 {} 个相关最高人民法院案例。",
+                array_at(data, &["cases"]).len()
+            )
+        }
+        "legal_get_case" => "已读取来源可追溯的最高人民法院案例全文。".to_owned(),
         _ => "操作已完成。".to_owned(),
     };
     bounded(text)
@@ -44,6 +63,8 @@ pub(crate) fn success_structured_content(
         "legal_get_article" => article_content(data),
         "legal_get_versions" => versions_content(data),
         "legal_get_relations" => relations_content(data),
+        "legal_search_cases" => case_search_content(data),
+        "legal_get_case" => case_content(data),
         _ => Value::Null,
     };
     object([
@@ -68,6 +89,7 @@ pub(crate) fn error_message(code: &str) -> &'static str {
         "invalid_request" | "unsupported_schema_version" => "请求参数不符合工具契约。",
         "legal_database_missing" | "legal_database_incompatible" => "本地法律数据库暂时不可用。",
         "not_found" => "未找到对应的公开法律资料。",
+        "case_output_blocked" => "案例结果未通过公开来源与输出边界核验。",
         "sensitive_content_blocked" => "结果未通过本地内容安全检查。",
         _ => "请求未完成，请检查本地服务状态后重试。",
     }
@@ -184,6 +206,171 @@ fn relations_content(data: &Value) -> Value {
             })
             .collect(),
     )
+}
+
+fn case_search_content(data: &Value) -> Value {
+    let cases = array_at(data, &["cases"])
+        .iter()
+        .take(MAX_ITEMS)
+        .filter(|case| official_case_source(case.get("source_url").and_then(Value::as_str)))
+        .map(case_summary_content)
+        .collect();
+    object([
+        (
+            "匹配总数",
+            data.get("total")
+                .cloned()
+                .filter(Value::is_number)
+                .unwrap_or_else(|| json!(0)),
+        ),
+        ("本页数量", json!(array_at(data, &["cases"]).len())),
+        ("数据库版本", string_value(data, "database_version", 256)),
+        ("提示", string_array(data, "warnings", 256)),
+        ("案例", Value::Array(cases)),
+    ])
+}
+
+fn case_content(data: &Value) -> Value {
+    let case = data.get("case").unwrap_or(&Value::Null);
+    if !official_case_source(case.get("source_url").and_then(Value::as_str)) {
+        return Value::Null;
+    }
+    object([
+        ("数据库版本", string_value(data, "database_version", 256)),
+        ("提示", string_array(data, "warnings", 256)),
+        ("案例", case_summary_content(case)),
+        ("裁判要点", string_array(case, "key_points", 1000)),
+        ("基本案情", string_value(case, "basic_facts", MAX_TEXT)),
+        ("裁判结果", string_value(case, "judgment_result", MAX_TEXT)),
+        ("裁判理由", string_value(case, "reasoning", MAX_TEXT)),
+        ("相关法条", string_array(case, "related_laws", 1000)),
+        ("案例全文", string_value(case, "full_text", MAX_TEXT)),
+        ("抓取时间", string_value(case, "fetched_at", 64)),
+    ])
+}
+
+fn case_summary_content(case: &Value) -> Value {
+    object([
+        ("案例编号", string_value(case, "case_id", 128)),
+        ("标题", string_value(case, "title", 512)),
+        (
+            "案例类型",
+            Value::String(
+                match case.get("case_type").and_then(Value::as_str) {
+                    Some("guiding") => "指导案例",
+                    Some("reference") => "参考案例",
+                    Some("typical") => "典型案例合集",
+                    _ => "案例",
+                }
+                .to_owned(),
+            ),
+        ),
+        (
+            "指导案例号",
+            case.get("guiding_number")
+                .cloned()
+                .filter(Value::is_number)
+                .unwrap_or(Value::Null),
+        ),
+        ("参考案例号", string_value(case, "reference_number", 256)),
+        ("关键词", string_array(case, "keywords", 256)),
+        ("发布日期", string_value(case, "publication_date", 64)),
+        ("审理法院", string_value(case, "court", 512)),
+        ("案号", string_value(case, "case_number", 512)),
+        ("状态", string_value(case, "status", 64)),
+        ("官方来源", string_value(case, "source_url", 2048)),
+        ("命中内容", string_value(case, "matched_text", 1500)),
+    ])
+}
+
+/// The services layer verifies this again while decoding database rows. This
+/// projection-side check prevents a future adapter bypass from making a
+/// non-official URL or arbitrary text model-visible.
+pub(crate) fn verified_case_output_is_safe(tool_name: &str, data: &Value) -> bool {
+    let evidence_valid = match tool_name {
+        "legal_search_cases" => array_at(data, &["cases"])
+            .iter()
+            .all(|case| official_case_source(case.get("source_url").and_then(Value::as_str))),
+        "legal_get_case" => official_case_source(
+            data.get("case")
+                .and_then(|case| case.get("source_url"))
+                .and_then(Value::as_str),
+        ),
+        _ => false,
+    };
+    evidence_valid && no_internal_case_data(data)
+}
+
+fn no_internal_case_data(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().all(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            let forbidden_key = key != "source_url"
+                && [
+                    "path",
+                    "filename",
+                    "file_name",
+                    "diagnostic",
+                    "stack",
+                    "trace",
+                    "credential",
+                    "secret",
+                    "token",
+                    "authorization",
+                    "api_key",
+                    "password",
+                    "workspace",
+                    "raw",
+                ]
+                .iter()
+                .any(|forbidden| key.contains(forbidden));
+            !forbidden_key && no_internal_case_data(value)
+        }),
+        Value::Array(items) => items.iter().all(no_internal_case_data),
+        Value::String(text) => {
+            !local_path_in_text(text) && !CREDENTIAL_VALUE_PATTERNS.is_match(text)
+        }
+        _ => true,
+    }
+}
+
+fn local_path_in_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    bytes.windows(3).enumerate().any(|(index, window)| {
+        (index == 0 || !bytes[index - 1].is_ascii_alphabetic())
+            && window[0].is_ascii_alphabetic()
+            && window[1] == b':'
+            && matches!(window[2], b'\\' | b'/')
+    }) || text.contains("\\\\")
+        || lower.contains("file://")
+        || ["/home/", "/users/", "/data/", "/private/", "/var/", "/tmp/"]
+            .iter()
+            .any(|prefix| lower.contains(prefix))
+}
+
+fn official_case_source(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some(
+                "court.gov.cn"
+                    | "www.court.gov.cn"
+                    | "gongbao.court.gov.cn"
+                    | "rmfyalk.court.gov.cn"
+                    | "ipc.court.gov.cn"
+                    | "hnlyzy.hncourt.gov.cn"
+            )
+        )
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
 }
 
 fn article_text(data: &Value) -> String {
@@ -317,5 +504,45 @@ mod tests {
         let wire = serde_json::to_string(&error).expect("JSON");
         assert_eq!(error["结果"], "未完成");
         assert!(!wire.contains("database_path_rejected"));
+    }
+
+    #[test]
+    fn official_case_evidence_does_not_whitelist_paths_or_credentials() {
+        let case = json!({
+            "case": {"source_url":"https://www.court.gov.cn/shenpan/1.html", "full_text":"原告：张三"}
+        });
+        assert!(verified_case_output_is_safe("legal_get_case", &case));
+        for unsafe_text in [
+            "D:\\workspace\\private.txt",
+            "Authorization: Bearer test-secret-value-1234",
+            "file:///data/private.txt",
+        ] {
+            let case = json!({
+                "case": {"source_url":"https://www.court.gov.cn/shenpan/1.html", "full_text":unsafe_text}
+            });
+            assert!(
+                !verified_case_output_is_safe("legal_get_case", &case),
+                "{unsafe_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_search_projection_keeps_pagination_and_dataset_context() {
+        let data = json!({
+            "total": 82,
+            "database_version": "spc-cases-v1",
+            "warnings": ["withdrawn_cases_excluded"],
+            "cases": [{
+                "case_id":"spc-guiding-1", "title":"指导案例", "case_type":"guiding",
+                "guiding_number":1, "keywords":[], "status":"published",
+                "source_url":"https://www.court.gov.cn/shenpan/1.html", "matched_text":"劳动关系"
+            }]
+        });
+        let content = case_search_content(&data);
+        assert_eq!(content["匹配总数"], 82);
+        assert_eq!(content["本页数量"], 1);
+        assert_eq!(content["数据库版本"], "spc-cases-v1");
+        assert_eq!(content["案例"][0]["案例编号"], "spc-guiding-1");
     }
 }

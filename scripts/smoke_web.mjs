@@ -234,7 +234,7 @@ async function runHttpSmoke(connection) {
   check(health.response.status === 200, `健康检查失败:${errorCode(health) || health.response.status}`);
   check(health.response.headers.get("cache-control") === "no-store", "敏感 API 缺少 no-store");
   check(health.response.headers.get("x-content-type-options") === "nosniff", "API 缺少 nosniff");
-  check(health.data?.ocr?.available === false, "OCR 状态不符合首版约束");
+  check(health.data?.ocr?.available === false, "未配置 OCR 模型的合成工作区不应报告已就绪");
 
   const missingCsrf = await client.request("/api/v1/groups", { method: "POST", body: { name: "csrf rejection" }, csrf: false });
   check(missingCsrf.response.status === 403 && errorCode(missingCsrf) === "csrf_rejected", "缺少 CSRF 未被拒绝");
@@ -358,7 +358,7 @@ async function runBrowserSmoke(connection, options) {
     const page = await browser.newPage();
     await page.goto(`${connection.baseUrl}/#token=${encodeURIComponent(connection.token)}`, { waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "材料脱敏", exact: true }).waitFor({ state: "visible", timeout: 15_000 });
-    for (const label of ["材料脱敏", "法律检索", "文书模板", "AI 对话", "设置"]) {
+    for (const label of ["材料脱敏", "法律检索", "文书写作", "AI 对话", "设置"]) {
       check(await page.getByRole("button", { name: label, exact: true }).count() === 1, `页面入口缺失:${label}`);
     }
 
@@ -366,7 +366,7 @@ async function runBrowserSmoke(connection, options) {
     await groupInput.fill("浏览器 smoke group");
     await page.getByRole("button", { name: "新建分组", exact: true }).click();
     await waitForText(page, "分组已创建");
-    const upload = page.locator('input[type="file"][accept=".txt,.docx"]').first();
+    const upload = page.locator('input[type="file"][accept*=".txt"]').first();
     await upload.setInputFiles({ name: "browser-smoke.txt", mimeType: "text/plain", buffer: Buffer.from(BROWSER_SOURCE, "utf8") });
     await page.getByRole("button", { name: "开始脱敏", exact: true }).click();
     const created = page.getByText(/任务已创建|任务：/u).first();
@@ -375,22 +375,37 @@ async function runBrowserSmoke(connection, options) {
     await page.getByRole("button", { name: "法律检索", exact: true }).click();
     await waitForHeading(page, "法律检索");
     await page.getByPlaceholder("输入法条、关键词或文号").fill("合同");
-    await page.getByRole("button", { name: "搜索", exact: true }).click();
-    await page.getByText(/找到 [1-9]\d* 条结果。/u).waitFor({ state: "visible", timeout: 20_000 });
-    const legalResult = page.locator(".result-button").first();
+    await page.getByRole("button", { name: "搜索法条", exact: true }).click();
+    await page.getByText(/命中 [1-9]\d* 部法律/u).waitFor({ state: "visible", timeout: 20_000 });
+    await page.getByRole("button", { name: "查看命中条文", exact: true }).first().click();
+    // The expanded group keeps its law-title button in the DOM. Scope the
+    // article click to the loaded group so the smoke does not click the title
+    // again and mistake the search-panel history checkbox for detail state.
+    const legalResult = page.locator(".legal-group-articles .legal-article-card .result-button").first();
     await legalResult.waitFor({ state: "visible", timeout: 10_000 });
     await legalResult.click();
-    await page.getByRole("button", { name: "查看历史版本", exact: true }).waitFor({ state: "visible", timeout: 15_000 });
-    await page.getByRole("button", { name: "查看历史版本", exact: true }).click();
-    await waitForText(page, "历史版本");
-    await page.getByRole("button", { name: "查看关联法规", exact: true }).click();
-    await waitForText(page, "关联法规");
-    await page.getByRole("button", { name: "文书模板", exact: true }).click();
-    await waitForHeading(page, "文书模板");
-    await page.getByPlaceholder("请输入文书标题").fill("浏览器 smoke 文书");
-    await page.getByPlaceholder("请填写事实经过").fill("浏览器 smoke 事实");
-    await page.getByRole("button", { name: "生成预览", exact: true }).click();
-    await waitForText(page, "预览已生成。");
+    await page.getByRole("checkbox", { name: "显示历史版本", exact: true }).last().waitFor({ state: "visible", timeout: 15_000 });
+    check(await page.getByRole("checkbox", { name: "显示历史版本", exact: true }).last().isChecked(), "历史版本默认开启");
+    const historyHeading = await waitForText(page, "历史版本");
+    const historyBody = page.locator(".detail-area .version-content");
+    await historyBody.waitFor({ state: "visible", timeout: 15_000 });
+    const historyBodyBefore = (await historyBody.innerText()).trim();
+    check(historyBodyBefore.length > 20 && !historyBodyBefore.includes("正在读取"), "历史版本正文已加载");
+    check(await page.getByRole("checkbox", { name: "显示关联法规", exact: true }).last().isChecked(), "关联法规默认开启");
+    const relationHeading = await waitForText(page, "关联法规");
+    // Keep the real detail mounted for a short interval. This catches a
+    // result/resize callback that would silently replace the detail column
+    // after the article request has completed.
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    check(await historyHeading.isVisible(), "历史版本正文稳定");
+    check(await relationHeading.isVisible(), "关联法规正文稳定");
+    const historyBodyAfter = (await historyBody.innerText()).trim();
+    check(historyBodyAfter.length > 20 && !historyBodyAfter.includes("正在读取"), "历史版本正文三秒后仍在");
+    await page.getByRole("button", { name: "文书写作", exact: true }).click();
+    await waitForHeading(page, "文书写作");
+    await page.getByRole("button", { name: "生成文书", exact: true }).waitFor({ state: "visible" });
+    // Offline CI checks the new writing entry; GLM generation and rendered exports
+    // are exercised by smoke_ai_live.mjs and verify_ai_exports.mjs.
 
     await page.getByRole("button", { name: "AI 对话", exact: true }).click();
     await waitForHeading(page, "AI 对话");

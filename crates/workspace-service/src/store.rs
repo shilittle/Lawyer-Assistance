@@ -1,6 +1,7 @@
 use crate::{Error, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     path::Path,
@@ -48,8 +49,16 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
-        if schema != "web-workspace-v1" {
+        if schema != "web-workspace-v1" && schema != "web-workspace-v2" {
             return Err(Error::new("unsupported_workspace_schema"));
+        }
+        if schema == "web-workspace-v1" {
+            let count: i64 =
+                connection.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?;
+            if count > 0 {
+                create_v1_backup(&connection, root)?;
+            }
+            connection.execute_batch("BEGIN IMMEDIATE; UPDATE web_metadata SET value='web-workspace-v2' WHERE key='schema'; COMMIT;")?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
@@ -130,6 +139,95 @@ impl Store {
             .execute("DELETE FROM objects WHERE kind=?1 AND id=?2", [kind, id])?;
         Ok(())
     }
+}
+
+/// Hash the logical rows rather than SQLite pages, which may legitimately
+/// differ after a backup/checkpoint while still representing the same v1 data.
+fn snapshot_fingerprint(connection: &Connection) -> Result<String> {
+    fn add(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    let mut metadata = connection.prepare("SELECT key,value FROM web_metadata ORDER BY key")?;
+    let rows = metadata.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (key, value) = row?;
+        add(&mut hasher, key.as_bytes());
+        add(&mut hasher, value.as_bytes());
+    }
+    let mut objects = connection.prepare("SELECT kind,id,body FROM objects ORDER BY kind,id")?;
+    let rows = objects.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, id, body) = row?;
+        add(&mut hasher, kind.as_bytes());
+        add(&mut hasher, id.as_bytes());
+        add(&mut hasher, &body);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn existing_backup_matches(backup: &Path, expected: &str) -> Result<bool> {
+    crate::filesystem::ordinary_chain(backup)?;
+    let connection = match Connection::open_with_flags(backup, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(connection) => connection,
+        Err(_) => return Ok(false),
+    };
+    let integrity: String = match connection.query_row("PRAGMA integrity_check", [], |r| r.get(0)) {
+        Ok(integrity) => integrity,
+        Err(_) => return Ok(false),
+    };
+    if integrity != "ok" {
+        return Ok(false);
+    }
+    Ok(snapshot_fingerprint(&connection).is_ok_and(|actual| actual == expected))
+}
+
+fn unique_v1_backup_path(root: &Path) -> std::path::PathBuf {
+    loop {
+        let path = root.join(format!(
+            "workspace.pre-ai-v1.{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        if !path.exists() {
+            return path;
+        }
+    }
+}
+
+fn create_v1_backup(connection: &Connection, root: &Path) -> Result<()> {
+    let expected = snapshot_fingerprint(connection)?;
+    let primary = root.join("workspace.pre-ai-v1.sqlite");
+    if primary.exists() && existing_backup_matches(&primary, &expected)? {
+        return Ok(());
+    }
+    // Preserve a damaged or stale backup for forensic recovery. Its replacement
+    // receives a fresh unique name and must prove both integrity and identity.
+    let backup = if primary.exists() {
+        unique_v1_backup_path(root)
+    } else {
+        primary
+    };
+    let mut destination = Connection::open(&backup)?;
+    rusqlite::backup::Backup::new(connection, &mut destination)?.run_to_completion(
+        128,
+        std::time::Duration::from_millis(10),
+        None,
+    )?;
+    drop(destination);
+    if !existing_backup_matches(&backup, &expected)? {
+        return Err(Error::new("workspace_backup_failed"));
+    }
+    Ok(())
 }
 
 fn seal(kind: &str, id: &str, bytes: &[u8]) -> Result<Vec<u8>> {

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 base64.workspace = true
 domain.workspace = true
+file-ingest.workspace = true
 legal-services.workspace = true
 privacy.workspace = true
 privacy-text.workspace = true
@@ -19,6 +20,8 @@ uuid.workspace = true
 zeroize.workspace = true
 windows-sys.workspace = true
 subtle = "2.6"
+pulldown-cmark = "=0.13.4"
+tempfile.workspace = true
 tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = "0.7"
 zip = { version = "=2.4.2", default-features = false }

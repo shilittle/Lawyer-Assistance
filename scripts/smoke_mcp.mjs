@@ -63,6 +63,21 @@ async function api(path, body, method = "POST") {
   return result;
 }
 const initialize = { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "synthetic-mcp-smoke", version: "1" } };
+const publicToolNames = [
+  "system_status",
+  "legal_search",
+  "legal_get_article",
+  "legal_get_versions",
+  "legal_get_relations",
+  "legal_search_cases",
+  "legal_get_case",
+];
+const privateToolNames = [
+  ...publicToolNames,
+  "privacy_workspace.submit",
+  "privacy_workspace.status",
+  "privacy_workspace.read_result",
+];
 async function http(method, params, token) {
   const response = await fetch(`${origin}/mcp`, { method: "POST", headers: {
     "content-type": "application/json", accept: "application/json, text/event-stream",
@@ -112,15 +127,19 @@ const publicClient = stdio("public_law_only");
 const privateClient = stdio("privacy_workspace", token);
 const offlineClient = stdio("privacy_workspace", token, "http://127.0.0.1:1");
 try {
-  for (const [transport, count] of [[publicClient, 5], [privateClient, 8]]) {
+  for (const [transport, names] of [[publicClient, publicToolNames], [privateClient, privateToolNames]]) {
     const init = await transport.request("initialize", initialize);
     assert.equal(init.result.protocolVersion, "2025-11-25"); transport.initialized();
-    const list = await transport.request("tools/list", {}); assert.equal(list.result.tools.length, count);
+    const list = await transport.request("tools/list", {});
+    assert.deepEqual(list.result.tools.map(tool => tool.name), names);
   }
   payload(await publicClient.request("tools/call", { name: "system_status", arguments: { schemaVersion: 1 } }));
-  for (const [credential, count] of [[undefined, 5], [token, 8]]) {
+  for (const [credential, names] of [[undefined, publicToolNames], [token, privateToolNames]]) {
     assert.equal((await http("initialize", initialize, credential)).result.protocolVersion, "2025-11-25");
-    assert.equal((await http("tools/list", {}, credential)).result.tools.length, count);
+    assert.deepEqual(
+      (await http("tools/list", {}, credential)).result.tools.map(tool => tool.name),
+      names,
+    );
   }
   const args = { request_id: `synthetic_transport_${Date.now()}`, inbox_relative_paths: ["synthetic.txt"] };
   const submitted = payload(await privateClient.request("tools/call", { name: "privacy_workspace.submit", arguments: args }));
@@ -146,7 +165,7 @@ try {
   await api(`/mcp/clients/${client.client.id}`, undefined, "DELETE");
   const revoked = await privateClient.request("tools/call", { name: "privacy_workspace.read_result", arguments: { result_id: resultId } });
   assert(revoked.error || revoked.result?.isError);
-  process.stdout.write("MCP smoke PASS: public 5/private 8, HTTP + stdio, submit/replay/status/read, scope isolation, offline daemon, revoked token.\n");
+  process.stdout.write("MCP smoke PASS: public 7/private 10, HTTP + stdio, submit/replay/status/read, scope isolation, offline daemon, revoked token.\n");
 } finally {
   await Promise.all([publicClient.close(), privateClient.close(), offlineClient.close()]);
 }

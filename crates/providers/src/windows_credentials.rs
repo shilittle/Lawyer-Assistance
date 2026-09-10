@@ -4,7 +4,11 @@ mod platform {
         credentials::{ApiSecret, CredentialStore, ProviderCredentialKey},
         types::{ProviderError, ProviderErrorKind},
     };
-    use std::{ffi::c_void, ptr, slice};
+    use std::{
+        ffi::c_void,
+        ptr, slice,
+        sync::{OnceLock, RwLock},
+    };
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_NOT_FOUND},
         Security::Credentials::{
@@ -47,6 +51,14 @@ mod platform {
         }
     }
 
+    // A credential update or deletion must not overlap a read in this process. Parallel
+    // workspace operations have otherwise observed a missing-key read after a successful
+    // write/read pair. Independent reads remain concurrent.
+    fn credential_manager_lock() -> &'static RwLock<()> {
+        static LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+        LOCK.get_or_init(|| RwLock::new(()))
+    }
+
     impl CredentialStore for WindowsCredentialStore {
         type Error = ProviderError;
 
@@ -54,6 +66,9 @@ mod platform {
             &self,
             key: &ProviderCredentialKey,
         ) -> Result<Option<ApiSecret>, Self::Error> {
+            let _lock = credential_manager_lock()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let target_name = wide_null(self.target_name(key));
             let mut credential_ptr: *mut CREDENTIALW = ptr::null_mut();
 
@@ -102,6 +117,9 @@ mod platform {
             key: &ProviderCredentialKey,
             secret: ApiSecret,
         ) -> Result<(), Self::Error> {
+            let _lock = credential_manager_lock()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut target_name = wide_null(self.target_name(key));
             let mut user_name = wide_null("Lawyer Assistance");
             let mut secret_bytes = secret.expose_secret().as_bytes().to_vec();
@@ -135,6 +153,9 @@ mod platform {
         }
 
         fn delete_api_key(&self, key: &ProviderCredentialKey) -> Result<(), Self::Error> {
+            let _lock = credential_manager_lock()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let target_name = wide_null(self.target_name(key));
             let ok = unsafe { CredDeleteW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0) };
 
@@ -175,6 +196,7 @@ mod platform {
     mod tests {
         use super::*;
         use std::{
+            collections::BTreeSet,
             sync::{Arc, Barrier},
             thread,
             time::{SystemTime, UNIX_EPOCH},
@@ -206,6 +228,31 @@ mod platform {
             )
         }
 
+        fn native_missing_key_error(
+            store: &WindowsCredentialStore,
+            key: &ProviderCredentialKey,
+        ) -> u32 {
+            let _lock = credential_manager_lock()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let target_name = wide_null(store.target_name(key));
+            let mut credential_ptr: *mut CREDENTIALW = ptr::null_mut();
+            let ok = unsafe {
+                CredReadW(
+                    target_name.as_ptr(),
+                    CRED_TYPE_GENERIC,
+                    0,
+                    &mut credential_ptr,
+                )
+            };
+            assert_eq!(
+                ok, 0,
+                "synthetic target must be absent before this diagnostic"
+            );
+            assert!(credential_ptr.is_null());
+            unsafe { GetLastError() }
+        }
+
         #[test]
         fn credential_manager_covers_write_query_overwrite_delete_and_missing_key() {
             let (prefix, store, key) = test_store();
@@ -217,6 +264,11 @@ mod platform {
                 .read_api_key(&key)
                 .expect("missing credential can be queried")
                 .is_none());
+            assert_eq!(
+                native_missing_key_error(&store, &key),
+                ERROR_NOT_FOUND,
+                "a missing synthetic target returns the Win32 error mapped to None"
+            );
 
             store
                 .write_api_key(&key, ApiSecret::new("cred-manager-secret-1111"))
@@ -249,23 +301,36 @@ mod platform {
 
         #[test]
         fn credential_manager_keeps_concurrent_targets_readable_after_write() {
-            const WORKERS: usize = 4;
+            const WORKERS: usize = 16;
             const ROUNDS: usize = 12;
 
             let suffix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time is after epoch")
                 .as_nanos();
-            let prefix = format!(
-                "LawyerAssistanceTest-{}-{suffix}-concurrent",
-                std::process::id()
-            );
             let barrier = Arc::new(Barrier::new(WORKERS));
             let mut workers = Vec::new();
+            let targets = (0..WORKERS)
+                .map(|worker| {
+                    let store = WindowsCredentialStore::with_service_prefix(format!(
+                        "LawyerAssistanceTest-{}-{suffix}-concurrent-{worker}",
+                        std::process::id()
+                    ));
+                    store.target_name(&ProviderCredentialKey::new("parallel", "default"))
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                targets.len(),
+                WORKERS,
+                "synthetic credential targets are unique"
+            );
 
             for worker in 0..WORKERS {
-                let store = WindowsCredentialStore::with_service_prefix(prefix.clone());
-                let key = ProviderCredentialKey::new(format!("parallel-{worker}"), "default");
+                let store = WindowsCredentialStore::with_service_prefix(format!(
+                    "LawyerAssistanceTest-{}-{suffix}-concurrent-{worker}",
+                    std::process::id()
+                ));
+                let key = ProviderCredentialKey::new("parallel", "default");
                 let barrier = Arc::clone(&barrier);
                 workers.push(thread::spawn(move || {
                     let cleanup = CredentialCleanup {
@@ -276,9 +341,8 @@ mod platform {
                     // pre-existing target to delete before synchronizing the workers.
                     barrier.wait();
 
-                    for round in 0..ROUNDS {
-                        let expected =
-                            ApiSecret::new(format!("parallel-test-key-{worker}-{round}"));
+                    for _round in 0..ROUNDS {
+                        let expected = ApiSecret::new("parallel-test-key");
                         cleanup
                             .store
                             .write_api_key(&cleanup.key, expected.clone())
@@ -289,6 +353,18 @@ mod platform {
                             .expect("parallel credential reads");
                         assert_eq!(actual.as_ref(), Some(&expected));
                     }
+                    // Half the fixtures finish and delete their own synthetic targets while
+                    // the other half performs a later read, mirroring concurrent workspaces
+                    // whose short requests finish before tool-assisted requests resume.
+                    if worker < WORKERS / 2 {
+                        return;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    let actual = cleanup
+                        .store
+                        .read_api_key(&cleanup.key)
+                        .expect("delayed parallel credential read");
+                    assert_eq!(actual.as_ref(), Some(&ApiSecret::new("parallel-test-key")));
                 }));
             }
 

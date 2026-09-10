@@ -3,13 +3,14 @@ use quick_xml::encoding::Decoder;
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::NsReader;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read};
 use zip::{CompressionMethod, ZipArchive};
 
 pub(super) const CONTENT_TYPES_PATH: &str = "[Content_Types].xml";
 pub(super) const ROOT_RELS_PATH: &str = "_rels/.rels";
 pub(super) const DOCUMENT_PATH: &str = "word/document.xml";
+const DOCUMENT_RELATIONSHIPS_PATH: &str = "word/_rels/document.xml.rels";
 pub(super) const DOCX_MAIN_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 const OFFICE_DOCUMENT_REL_SUFFIX: &str = "/officeDocument";
@@ -20,6 +21,9 @@ const PACKAGE_RELATIONSHIPS_NAMESPACE: &[u8] =
 const WORD_NAMESPACE_TRANSITIONAL: &[u8] =
     b"http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const WORD_NAMESPACE_STRICT: &[u8] = b"http://purl.oclc.org/ooxml/wordprocessingml/main";
+const DRAWING_NAMESPACE_TRANSITIONAL: &[u8] =
+    b"http://schemas.openxmlformats.org/drawingml/2006/main";
+const DRAWING_NAMESPACE_STRICT: &[u8] = b"http://purl.oclc.org/ooxml/drawingml/main";
 
 #[derive(Debug)]
 struct EntryMetadata {
@@ -30,14 +34,31 @@ struct EntryMetadata {
 }
 
 pub(super) fn extract(bytes: &[u8], limits: Limits) -> Result<Extraction, IngestError> {
+    extract_internal(bytes, limits, false).map(|(extraction, _)| extraction)
+}
+
+pub(super) fn extract_with_media(
+    bytes: &[u8],
+    limits: Limits,
+) -> Result<(Extraction, Vec<crate::OcrAsset>), IngestError> {
+    extract_internal(bytes, limits, true)
+}
+
+fn extract_internal(
+    bytes: &[u8],
+    limits: Limits,
+    allow_media: bool,
+) -> Result<(Extraction, Vec<crate::OcrAsset>), IngestError> {
     validate_declared_entry_count(bytes, limits.max_docx_entries)?;
     let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| IngestError::CorruptDocx)?;
-    let entries = scan_container(&mut archive, limits)?;
+    let entries = scan_container(&mut archive, limits, allow_media)?;
 
     let mut content_types = None;
     let mut root_relationships = None;
     let mut document_xml = None;
     let mut actual_total = 0u64;
+    let mut media_by_path = BTreeMap::new();
+    let mut document_relationships = None;
 
     for metadata in entries {
         if metadata.is_directory {
@@ -83,6 +104,31 @@ pub(super) fn extract(bytes: &[u8], limits: Limits) -> Result<Extraction, Ingest
             root_relationships = Some(data);
         } else if metadata.name == DOCUMENT_PATH {
             document_xml = Some(data);
+        } else if metadata.name == DOCUMENT_RELATIONSHIPS_PATH {
+            inspect_relationships(&data, false)?;
+            document_relationships = Some(data);
+        } else if allow_media && lowercase_name.starts_with("word/media/") {
+            let (mime_type, width, height) = crate::inspect_image_payload(&metadata.name, &data)?;
+            if media_by_path
+                .insert(
+                    metadata.name.clone(),
+                    crate::OcrAsset {
+                        locator: String::new(),
+                        mime_type,
+                        bytes: data,
+                        width,
+                        height,
+                    },
+                )
+                .is_some()
+            {
+                return Err(IngestError::CorruptDocx);
+            }
+        } else if allow_media && lowercase_name.starts_with("customxml/") {
+            // Custom XML is not rendered document text. Accept the empty metadata parts emitted
+            // by common DOCX producers, but reject any non-whitespace payload rather than
+            // silently omitting a possible sensitive field from the redaction source.
+            inspect_xml_without_text(&data)?;
         } else if lowercase_name.ends_with(".rels") {
             inspect_relationships(&data, false)?;
         }
@@ -93,7 +139,38 @@ pub(super) fn extract(bytes: &[u8], limits: Limits) -> Result<Extraction, Ingest
     let document_xml = document_xml.ok_or(IngestError::CorruptDocx)?;
     inspect_content_types(&content_types)?;
     inspect_relationships(&root_relationships, true)?;
-    extract_document_xml(&document_xml, limits)
+    let (media, drawing_markers) = if allow_media && !media_by_path.is_empty() {
+        let document_relationships = document_relationships
+            .as_deref()
+            .ok_or(IngestError::IncompleteDocxExtraction)?;
+        let image_relationships =
+            document_image_relationships(document_relationships, &media_by_path)?;
+        let mut media = Vec::with_capacity(image_relationships.len());
+        let mut drawing_markers = BTreeMap::new();
+        for (index, (relationship_id, target)) in image_relationships.into_iter().enumerate() {
+            let locator = format!("docx-image:{}", index + 1);
+            let marker = crate::docx_ocr_placeholder(&locator)
+                .ok_or(IngestError::IncompleteDocxExtraction)?;
+            let mut asset = media_by_path
+                .get(&target)
+                .cloned()
+                .ok_or(IngestError::IncompleteDocxExtraction)?;
+            asset.locator = locator;
+            if drawing_markers.insert(relationship_id, marker).is_some() {
+                return Err(IngestError::CorruptDocx);
+            }
+            media.push(asset);
+        }
+        (media, drawing_markers)
+    } else {
+        (Vec::new(), BTreeMap::new())
+    };
+    let extraction = extract_document_xml(
+        &document_xml,
+        limits,
+        (!drawing_markers.is_empty()).then_some(&drawing_markers),
+    )?;
+    Ok((extraction, media))
 }
 
 fn validate_declared_entry_count(bytes: &[u8], maximum_entries: usize) -> Result<(), IngestError> {
@@ -160,6 +237,7 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
 fn scan_container(
     archive: &mut ZipArchive<Cursor<&[u8]>>,
     limits: Limits,
+    allow_media: bool,
 ) -> Result<Vec<EntryMetadata>, IngestError> {
     if archive.len() > limits.max_docx_entries {
         return Err(IngestError::DocxEntryLimitExceeded);
@@ -218,7 +296,12 @@ fn scan_container(
         if exceeds_ratio(size, compressed_size, limits.max_docx_compression_ratio) {
             return Err(IngestError::DocxCompressionRatioExceeded);
         }
-        if entry.is_file() && is_uninspected_content_entry(&lowercase_name) {
+        if entry.is_file()
+            && is_uninspected_content_entry(&lowercase_name)
+            && !(allow_media
+                && (lowercase_name.starts_with("word/media/")
+                    || lowercase_name.starts_with("customxml/")))
+        {
             return Err(IngestError::IncompleteDocxExtraction);
         }
 
@@ -393,6 +476,36 @@ fn ensure_outer_xml_whitespace(content: &str) -> Result<(), IngestError> {
     }
 }
 
+fn inspect_xml_without_text(bytes: &[u8]) -> Result<(), IngestError> {
+    let mut reader = NsReader::from_reader(bytes);
+    loop {
+        let (_, event) = reader
+            .read_resolved_event()
+            .map_err(|_| IngestError::CorruptDocx)?;
+        match event {
+            Event::Text(text) => {
+                let decoded = text.xml_content().map_err(|_| IngestError::CorruptDocx)?;
+                let unescaped =
+                    quick_xml::escape::unescape(&decoded).map_err(|_| IngestError::CorruptDocx)?;
+                if !unescaped.trim().is_empty() {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
+            }
+            Event::CData(text) => {
+                let decoded = text.xml_content().map_err(|_| IngestError::CorruptDocx)?;
+                if !decoded.trim().is_empty() {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
+            }
+            Event::GeneralRef(_) => return Err(IngestError::IncompleteDocxExtraction),
+            Event::DocType(_) => return Err(IngestError::XmlDoctypeNotAllowed),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn inspect_content_types(bytes: &[u8]) -> Result<(), IngestError> {
     let mut reader = NsReader::from_reader(bytes);
     let decoder = reader.decoder();
@@ -537,6 +650,98 @@ fn inspect_relationships(bytes: &[u8], require_office_document: bool) -> Result<
     Ok(())
 }
 
+/// Resolve the document's embedded-image relationships before accepting their payloads for OCR.
+/// A ZIP entry order is not a document reading order, so callers must use this map together with
+/// the `a:blip r:embed` encountered in `word/document.xml`.
+fn document_image_relationships(
+    bytes: &[u8],
+    media_by_path: &BTreeMap<String, crate::OcrAsset>,
+) -> Result<BTreeMap<String, String>, IngestError> {
+    let mut reader = NsReader::from_reader(bytes);
+    let decoder = reader.decoder();
+    let mut saw_root = false;
+    let mut relationships = BTreeMap::new();
+
+    loop {
+        let (resolution, event) = reader
+            .read_resolved_event()
+            .map_err(|_| IngestError::CorruptDocx)?;
+        let is_relationships = is_bound_to(&resolution, PACKAGE_RELATIONSHIPS_NAMESPACE);
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let local_name = element.local_name();
+                if !saw_root {
+                    if local_name.as_ref() != b"Relationships" || !is_relationships {
+                        return Err(IngestError::CorruptDocx);
+                    }
+                    saw_root = true;
+                } else if local_name.as_ref() == b"Relationship" && is_relationships {
+                    let relationship_type = attribute_value(&element, b"Type", decoder)?
+                        .ok_or(IngestError::CorruptDocx)?;
+                    if relationship_type.to_ascii_lowercase().ends_with("/image") {
+                        let relationship_id = attribute_value(&element, b"Id", decoder)?
+                            .ok_or(IngestError::CorruptDocx)?;
+                        let target = attribute_value(&element, b"Target", decoder)?
+                            .ok_or(IngestError::CorruptDocx)?;
+                        let target_mode = attribute_value(&element, b"TargetMode", decoder)?;
+                        if target_mode
+                            .as_deref()
+                            .is_some_and(|mode| mode.eq_ignore_ascii_case("External"))
+                        {
+                            return Err(IngestError::IncompleteDocxExtraction);
+                        }
+                        let target = document_media_target(&target)?;
+                        if !media_by_path.contains_key(&target)
+                            || relationships.insert(relationship_id, target).is_some()
+                        {
+                            return Err(IngestError::IncompleteDocxExtraction);
+                        }
+                    }
+                } else {
+                    return Err(IngestError::CorruptDocx);
+                }
+            }
+            Event::DocType(_) => return Err(IngestError::XmlDoctypeNotAllowed),
+            Event::Text(text) => {
+                let content = text.xml_content().map_err(|_| IngestError::CorruptDocx)?;
+                ensure_outer_xml_whitespace(&content)?;
+            }
+            Event::CData(text) => {
+                let content = text.xml_content().map_err(|_| IngestError::CorruptDocx)?;
+                ensure_outer_xml_whitespace(&content)?;
+            }
+            Event::GeneralRef(_) => return Err(IngestError::CorruptDocx),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    let referenced_media = relationships.values().collect::<HashSet<_>>();
+    if !saw_root
+        || relationships.is_empty()
+        || referenced_media.len() != media_by_path.len()
+        || !media_by_path
+            .keys()
+            .all(|path| referenced_media.contains(path))
+    {
+        return Err(IngestError::IncompleteDocxExtraction);
+    }
+    Ok(relationships)
+}
+
+fn document_media_target(target: &str) -> Result<String, IngestError> {
+    if target.is_empty()
+        || target.starts_with('/')
+        || target.contains(['\\', ':', '\0'])
+        || target
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(IngestError::IncompleteDocxExtraction);
+    }
+    Ok(format!("word/{target}"))
+}
+
 fn is_bound_to(resolution: &ResolveResult<'_>, expected: &[u8]) -> bool {
     matches!(
         resolution,
@@ -593,7 +798,11 @@ fn attribute_value(
     Ok(value)
 }
 
-fn extract_document_xml(bytes: &[u8], limits: Limits) -> Result<Extraction, IngestError> {
+fn extract_document_xml(
+    bytes: &[u8],
+    limits: Limits,
+    drawing_markers: Option<&BTreeMap<String, String>>,
+) -> Result<Extraction, IngestError> {
     let mut reader = NsReader::from_reader(bytes);
     let mut builder = TextBuilder::new(limits);
     let mut saw_document_root = false;
@@ -601,6 +810,7 @@ fn extract_document_xml(bytes: &[u8], limits: Limits) -> Result<Extraction, Inge
     let mut paragraph_number = 0usize;
     let mut paragraph = None::<String>;
     let mut in_text = false;
+    let mut drawing_marker_counts = BTreeMap::<String, usize>::new();
 
     loop {
         let (resolution, event) = reader
@@ -618,6 +828,25 @@ fn extract_document_xml(bytes: &[u8], limits: Limits) -> Result<Extraction, Inge
                 let local_name = element.local_name();
                 if is_word && is_revision_element(local_name.as_ref()) {
                     return Err(IngestError::IncompleteDocxExtraction);
+                }
+                if is_word && local_name.as_ref() == b"drawing" {
+                    let drawing_markers =
+                        drawing_markers.ok_or(IngestError::IncompleteDocxExtraction)?;
+                    if paragraph.is_none() || in_text {
+                        return Err(IngestError::CorruptDocx);
+                    }
+                    let relationship_id = consume_drawing(&mut reader)?;
+                    let marker = drawing_markers
+                        .get(&relationship_id)
+                        .ok_or(IngestError::IncompleteDocxExtraction)?;
+                    append_paragraph_text(
+                        paragraph.as_mut().ok_or(IngestError::CorruptDocx)?,
+                        marker,
+                        limits.max_text_bytes,
+                    )?;
+                    let count = drawing_marker_counts.entry(marker.clone()).or_default();
+                    *count = count.checked_add(1).ok_or(IngestError::TextLimitExceeded)?;
+                    continue;
                 }
                 if is_word && is_unhandled_document_content(local_name.as_ref()) {
                     return Err(IngestError::IncompleteDocxExtraction);
@@ -733,7 +962,122 @@ fn extract_document_xml(bytes: &[u8], limits: Limits) -> Result<Extraction, Inge
     if !saw_document_root || !saw_body || paragraph.is_some() || in_text {
         return Err(IngestError::CorruptDocx);
     }
-    Ok(builder.finish(None))
+    let extraction = builder.finish(None);
+    if drawing_marker_counts
+        .iter()
+        .any(|(marker, expected_count)| {
+            extraction.text.match_indices(marker).count() != *expected_count
+        })
+    {
+        // A source run cannot be allowed to impersonate an internal image marker.  The count
+        // also makes sure a malformed drawing was not silently dropped while parsing.
+        return Err(IngestError::IncompleteDocxExtraction);
+    }
+    Ok(extraction)
+}
+
+fn consume_drawing(reader: &mut NsReader<&[u8]>) -> Result<String, IngestError> {
+    let decoder = reader.decoder();
+    let mut depth = 1usize;
+    let mut embedded_relationship = None;
+
+    loop {
+        let (resolution, event) = reader
+            .read_resolved_event()
+            .map_err(|_| IngestError::CorruptDocx)?;
+        if matches!(resolution, ResolveResult::Unknown(_))
+            && matches!(event, Event::Start(_) | Event::Empty(_) | Event::End(_))
+        {
+            return Err(IngestError::CorruptDocx);
+        }
+        let is_drawing = is_drawing_namespace(&resolution);
+        match event {
+            Event::Start(element) => {
+                if is_drawing && is_visual_text_element(&element) {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
+                if is_drawing && element.local_name().as_ref() == b"blip" {
+                    set_embedded_relationship(
+                        &mut embedded_relationship,
+                        drawing_embed_relationship(&element, decoder)?,
+                    )?;
+                }
+                depth = depth.checked_add(1).ok_or(IngestError::CorruptDocx)?;
+            }
+            Event::Empty(element) => {
+                if is_drawing && is_visual_text_element(&element) {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
+                if is_drawing && element.local_name().as_ref() == b"blip" {
+                    set_embedded_relationship(
+                        &mut embedded_relationship,
+                        drawing_embed_relationship(&element, decoder)?,
+                    )?;
+                }
+            }
+            Event::End(_) => {
+                depth = depth.checked_sub(1).ok_or(IngestError::CorruptDocx)?;
+                if depth == 0 {
+                    return embedded_relationship.ok_or(IngestError::IncompleteDocxExtraction);
+                }
+            }
+            Event::Text(text) => {
+                let content = text.xml_content().map_err(|_| IngestError::CorruptDocx)?;
+                if !content.trim().is_empty() {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
+            }
+            Event::CData(text) => {
+                let content = text.xml_content().map_err(|_| IngestError::CorruptDocx)?;
+                if !content.trim().is_empty() {
+                    return Err(IngestError::IncompleteDocxExtraction);
+                }
+            }
+            Event::GeneralRef(_) => return Err(IngestError::IncompleteDocxExtraction),
+            Event::DocType(_) => return Err(IngestError::XmlDoctypeNotAllowed),
+            Event::Eof => return Err(IngestError::CorruptDocx),
+            _ => {}
+        }
+    }
+}
+
+fn is_visual_text_element(element: &BytesStart<'_>) -> bool {
+    matches!(element.local_name().as_ref(), b"t" | b"txbxContent")
+}
+
+fn drawing_embed_relationship(
+    element: &BytesStart<'_>,
+    decoder: Decoder,
+) -> Result<Option<String>, IngestError> {
+    let mut relationship = None;
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|_| IngestError::CorruptDocx)?;
+        // DOCX DrawingML uses the relationships namespace through the conventional `r` prefix.
+        // An unqualified `embed` is intentionally not treated as a relationship.
+        if attribute.key.as_ref() == b"r:embed" {
+            if relationship.is_some() {
+                return Err(IngestError::CorruptDocx);
+            }
+            relationship = Some(
+                attribute
+                    .decode_and_unescape_value(decoder)
+                    .map_err(|_| IngestError::CorruptDocx)?
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(relationship)
+}
+
+fn set_embedded_relationship(
+    destination: &mut Option<String>,
+    relationship: Option<String>,
+) -> Result<(), IngestError> {
+    let relationship = relationship.ok_or(IngestError::IncompleteDocxExtraction)?;
+    if relationship.is_empty() || destination.replace(relationship).is_some() {
+        return Err(IngestError::IncompleteDocxExtraction);
+    }
+    Ok(())
 }
 
 fn is_revision_element(local_name: &[u8]) -> bool {
@@ -782,6 +1126,15 @@ fn is_word_namespace(resolution: &ResolveResult<'_>) -> bool {
         ResolveResult::Bound(namespace)
             if namespace.as_ref() == WORD_NAMESPACE_TRANSITIONAL
                 || namespace.as_ref() == WORD_NAMESPACE_STRICT
+    )
+}
+
+fn is_drawing_namespace(resolution: &ResolveResult<'_>) -> bool {
+    matches!(
+        resolution,
+        ResolveResult::Bound(namespace)
+            if namespace.as_ref() == DRAWING_NAMESPACE_TRANSITIONAL
+                || namespace.as_ref() == DRAWING_NAMESPACE_STRICT
     )
 }
 

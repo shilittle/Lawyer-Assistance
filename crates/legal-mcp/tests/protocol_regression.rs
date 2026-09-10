@@ -4,16 +4,18 @@ use std::{
     process::{Command, Stdio},
 };
 
-const PUBLIC_TOOLS: [&str; 5] = [
+const PUBLIC_TOOLS: [&str; 7] = [
     "system_status",
     "legal_search",
     "legal_get_article",
     "legal_get_versions",
     "legal_get_relations",
+    "legal_search_cases",
+    "legal_get_case",
 ];
 
 #[test]
-fn public_stdio_has_exactly_five_tools_and_stdout_is_only_jsonrpc() {
+fn public_stdio_has_seven_tools_and_stdout_is_only_jsonrpc() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let legal_db = temporary.path().join("legal_core.sqlite");
     let binary = env!("CARGO_BIN_EXE_lawyer-assistance-mcp");

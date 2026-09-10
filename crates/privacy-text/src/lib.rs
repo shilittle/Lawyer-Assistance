@@ -13,16 +13,19 @@ use privacy::{
     normalize_sensitive_text,
     residual_scan::{
         scan_independent_residuals, IndependentResidualScanInputV1, ResidualDictionaryTermV1,
+        ResidualHitV1, ResidualRiskClassV1,
     },
     sha256_hex,
     vnext::{CaseId, EntityType, MaterialId, ObjectId, PrivateValueRefV1, Sha256Hex},
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     io::{Cursor, Write},
+    sync::OnceLock,
 };
 use zip::{write::SimpleFileOptions, CompressionMethod, DateTime, ZipWriter};
 
@@ -31,6 +34,11 @@ const MAX_FINDINGS: usize = 100_000;
 const MAX_DICTIONARY_ENTRIES: usize = 4_096;
 const MAX_CLOUD_FINDINGS: usize = 4_096;
 const MAX_DISMISSED_FINDINGS: usize = 100_000;
+const MAX_AI_FINDINGS: usize = 8_192;
+const MAX_AI_FINDING_TEXT_BYTES: usize = 16 * 1024;
+// A model range below this confidence is retained for human review, but cannot independently
+// authorize a replacement. Dictionary and deterministic evidence keep their existing rules.
+const MIN_AI_AUTOMATIC_CONFIDENCE_PPM: u32 = 900_000;
 
 const CONTENT_TYPES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
@@ -110,8 +118,28 @@ pub struct CloudFinding {
     pub kind: String,
 }
 
+/// A model supplied entity occurrence. Unlike [`CloudFinding`], this value carries the exact
+/// UTF-8 byte range chosen by the model. The source text and range are still verified locally
+/// before this becomes a replacement candidate; the model never supplies the replacement alias.
+/// This type deliberately does not implement `Debug` because `text` is sensitive.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AiFinding {
+    /// Exact original UTF-8 substring copied by the model.
+    pub text: String,
+    pub kind: String,
+    /// Inclusive byte offset in the original UTF-8 source.
+    pub start: usize,
+    /// Exclusive byte offset in the original UTF-8 source.
+    pub end: usize,
+    /// Optional model confidence in parts per million. Values above 1_000_000 are rejected.
+    #[serde(default)]
+    pub confidence_ppm: Option<u32>,
+}
+
 /// One sensitive match. It is encrypted-persistence material, not a log or public API record.
-/// `dismissed` is allowed only for an uncorroborated local-NER semantic guess.
+/// `dismissed` is allowed for an uncorroborated local-NER semantic guess or a model-only
+/// `custom` candidate that a reviewer has explicitly assessed as ordinary text.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Finding {
@@ -146,6 +174,12 @@ pub struct Replacement {
 pub struct Analysis {
     pub text: String,
     pub findings: Vec<Finding>,
+    /// Exact model occurrences which were range-validated against this source version. This is
+    /// encrypted workspace evidence, used only to re-run a manual review after a dictionary
+    /// revision. `None` means the older record did not persist model evidence; `Some(vec![])`
+    /// means a current model pass was range-validated and reported no entities.
+    #[serde(default)]
+    pub ai_findings: Option<Vec<AiFinding>>,
     /// Actual substitutions, recorded during the replacement pass rather than reconstructed from
     /// text search. `default` keeps already-persisted pre-span analyses deserializable; callers
     /// must not treat such records as span-verified until re-analyzed.
@@ -253,7 +287,40 @@ pub fn analyze(
     cloud: &[CloudFinding],
     dismissed: &[String],
 ) -> Result<Analysis, TextError> {
+    analyze_internal(text, namespace, dictionary, cloud, &[], dismissed)
+}
+
+/// Analyze a text version with exact entity occurrences returned by the redaction model.
+///
+/// Model findings are primary semantic candidates, while deterministic rules and dictionary
+/// matches remain local safety coverage. Every model range is checked against the exact source
+/// bytes before it can be replaced. A model supplied alias or rewritten document is intentionally
+/// not accepted by this API.
+pub fn analyze_with_ai(
+    text: &str,
+    namespace: &str,
+    dictionary: &[DictionaryEntry],
+    ai: &[AiFinding],
+    dismissed: &[String],
+) -> Result<Analysis, TextError> {
+    let mut analysis = analyze_internal(text, namespace, dictionary, &[], ai, dismissed)?;
+    // `analyze_internal` verifies every exact span before constructing the result. Persist the
+    // verified model evidence alongside the analysis so a later dictionary edit cannot make an
+    // AI material silently fall back to local-only classification.
+    analysis.ai_findings = Some(ai.to_vec());
+    Ok(analysis)
+}
+
+fn analyze_internal(
+    text: &str,
+    namespace: &str,
+    dictionary: &[DictionaryEntry],
+    cloud: &[CloudFinding],
+    ai: &[AiFinding],
+    dismissed: &[String],
+) -> Result<Analysis, TextError> {
     validate_inputs(text, namespace, dictionary, cloud, dismissed)?;
+    validate_ai_inputs(text, ai)?;
     let mut candidates = Vec::new();
     let case_id = opaque_case_id(namespace)?;
     let material_id = opaque_material_id(text)?;
@@ -276,6 +343,21 @@ pub fn analyze(
     .map_err(|_| TextError::AnalysisFailed)?;
     for candidate in deterministic {
         push_privacy_candidate(&mut candidates, text, candidate, "deterministic", true)?;
+    }
+    for (start, end) in credential_assignment_matches(text).ok_or(TextError::AnalysisFailed)? {
+        let value = text.get(start..end).ok_or(TextError::AnalysisFailed)?;
+        push_candidate(
+            &mut candidates,
+            Candidate {
+                start,
+                end,
+                kind: EntityType::Custom,
+                source: "deterministic",
+                alias: stable_alias(namespace, EntityType::Custom, value),
+                deterministic: true,
+                automatic_allowed: true,
+            },
+        )?;
     }
 
     let pages = [LocalNerPageInputV1 {
@@ -346,14 +428,75 @@ pub fn analyze(
         }
     }
 
-    build_analysis(text, namespace, candidates, dismissed)
+    // An accepted model value establishes the entity spelling, but an occurrence number is only
+    // a locator supplied by the provider.  Once the exact spelling has been verified against
+    // this source version, cover every exact local occurrence.  The later identity-conflict gate
+    // keeps equal spellings in distinct party/identity contexts out of automatic publication.
+    for finding in ai {
+        let kind = parse_entity_kind(&finding.kind)?;
+        for (start, _) in text.match_indices(&finding.text) {
+            push_candidate(
+                &mut candidates,
+                Candidate {
+                    start,
+                    end: start + finding.text.len(),
+                    kind,
+                    source: "ai",
+                    alias: stable_alias(namespace, kind, &finding.text),
+                    deterministic: false,
+                    automatic_allowed: finding
+                        .confidence_ppm
+                        .is_some_and(|confidence| confidence >= MIN_AI_AUTOMATIC_CONFIDENCE_PPM),
+                },
+            )?;
+        }
+    }
+
+    // A compact mixed letter/number code is locally verifiable even when vision/text extraction
+    // omitted it from the model result.  Do not add a competing `custom` candidate where another
+    // detector or the model already established the exact range and entity kind.
+    for (start, end) in
+        structured_opaque_identifier_matches(text).ok_or(TextError::AnalysisFailed)?
+    {
+        if candidates.iter().any(|candidate| {
+            candidate.start == start
+                && candidate.end == end
+                && candidate.source != "local_ner"
+                && candidate.kind != EntityType::Custom
+        }) {
+            continue;
+        }
+        let value = text.get(start..end).ok_or(TextError::AnalysisFailed)?;
+        push_candidate(
+            &mut candidates,
+            Candidate {
+                start,
+                end,
+                kind: EntityType::Custom,
+                source: "deterministic",
+                alias: stable_alias(namespace, EntityType::Custom, value),
+                deterministic: true,
+                automatic_allowed: true,
+            },
+        )?;
+    }
+
+    let ambiguous_organization_values =
+        apply_explicit_organization_aliases(text, namespace, &mut candidates)?;
+    build_analysis(
+        text,
+        namespace,
+        candidates,
+        dismissed,
+        &ambiguous_organization_values,
+    )
 }
 
 /// Revalidate a persisted result before reading or exporting it. It rejects unresolved findings,
 /// verifies each actual replacement remains absent, and runs the independent residual scanner.
-/// An accepted NER dismissal remains meaningful: it does not require removal of that false
-/// positive's text, while deterministic findings can never be represented as dismissed by
-/// [`analyze`].
+/// An accepted semantic or model-only `custom` dismissal remains meaningful: it does not require
+/// removal of the reviewer-assessed ordinary text, while deterministic findings can never be
+/// represented as dismissed by [`analyze`].
 pub fn validate_result(text: &str, findings: &[Finding]) -> Result<(), TextError> {
     if text.len() > file_ingest::MAX_TEXT_BYTES || text.contains('\0') {
         return Err(TextError::InvalidInput);
@@ -388,18 +531,41 @@ pub fn validate_result(text: &str, findings: &[Finding]) -> Result<(), TextError
             }
         }
     }
-    let term_values = terms
+    // One stable alias may deliberately cover explicit name variants of the same entity, such as
+    // an organization full name and its declared abbreviation. Preserve every spelling for the
+    // residual dictionary scan, but give it one logical placeholder identity so the scanner does
+    // not mistake that verified relationship for an alias collision.
+    let mut residual_groups = BTreeMap::<(EntityType, String), Vec<String>>::new();
+    for (value, (kind, alias)) in terms {
+        residual_groups
+            .entry((kind, alias))
+            .or_default()
+            .push(value);
+    }
+    let residual_groups = residual_groups.into_iter().collect::<Vec<_>>();
+    let residual_variants = residual_groups
         .iter()
-        .map(|(value, (kind, alias))| (*kind, value.as_str(), alias.as_str()))
-        .collect::<Vec<_>>();
-    let residual_terms = term_values
-        .iter()
-        .map(|(kind, value, alias)| ResidualDictionaryTermV1 {
-            entity_type: *kind,
-            primary_value: value,
-            variants: &[],
-            expected_alias: alias,
+        .map(|(_, values)| {
+            values
+                .iter()
+                .skip(1)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
         })
+        .collect::<Vec<_>>();
+    let residual_terms = residual_groups
+        .iter()
+        .zip(&residual_variants)
+        .map(
+            |(((kind, alias), values), variants)| ResidualDictionaryTermV1 {
+                entity_type: *kind,
+                primary_value: values
+                    .first()
+                    .expect("a residual group has a primary value"),
+                variants,
+                expected_alias: alias,
+            },
+        )
         .collect::<Vec<_>>();
     let pages = [text.to_owned()];
     let report = scan_independent_residuals(IndependentResidualScanInputV1 {
@@ -408,11 +574,224 @@ pub fn validate_result(text: &str, findings: &[Finding]) -> Result<(), TextError
         source_names: &[],
     })
     .map_err(|_| TextError::AnalysisFailed)?;
-    if report.passed {
+    let has_blocking_residual = report
+        .hits
+        .iter()
+        .any(|hit| hit.blocking && !ignorable_residual_hit(&pages, hit))
+        || has_credential_residual(text);
+    if !has_blocking_residual {
         Ok(())
     } else {
         Err(TextError::ResidualRisk)
     }
+}
+
+fn ignorable_residual_hit(pages: &[String], hit: &ResidualHitV1) -> bool {
+    if hit.risk_class != ResidualRiskClassV1::LongDigitSequence {
+        return false;
+    }
+    let Ok(page_index) = usize::try_from(hit.page_index) else {
+        return false;
+    };
+    let Some(page) = pages.get(page_index) else {
+        return false;
+    };
+    let Ok(start) = usize::try_from(hit.start_offset) else {
+        return false;
+    };
+    let Ok(end) = usize::try_from(hit.end_offset) else {
+        return false;
+    };
+    let Some(candidate) = page.get(start..end) else {
+        return false;
+    };
+    let candidate =
+        candidate.trim_matches(|character: char| !character.is_ascii_digit() && character != '-');
+    is_iso_date(candidate)
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes[..4]
+        .iter()
+        .chain(&bytes[5..7])
+        .chain(&bytes[8..])
+        .all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let month = u16::from(bytes[5] - b'0') * 10 + u16::from(bytes[6] - b'0');
+    let day = u16::from(bytes[8] - b'0') * 10 + u16::from(bytes[9] - b'0');
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+const CREDENTIAL_ASSIGNMENT_PATTERN: &str = r"(?i)(?:\b(?:api[_-]?key|access[_-]?key|secret(?:[_-]?key)?|auth(?:entication)?[_-]?token|(?:access|refresh|id)?[_-]?token|password|passwd|pwd)\b|密钥|令牌|口令|密码)\s*[:=]\s*(?P<value>[^\s,;，；。]+)";
+const ORGANIZATION_ALIAS_PATTERN: &str = r"(?P<full>[\p{Han}A-Za-z0-9·（）()\- ]{2,100}?)[（(]\s*简称\s*[:：]?\s*(?P<short>[\p{Han}A-Za-z0-9·（）()\-]{1,40}?)[）)]";
+const STRUCTURED_OPAQUE_IDENTIFIER_PATTERN: &str = r"[A-Z]{2,12}(?:-[A-Z]{2,12})?-\d+(?:[-.]\d+)*";
+
+fn has_credential_residual(text: &str) -> bool {
+    credential_assignment_matches(text).is_none_or(|matches| !matches.is_empty())
+}
+
+fn credential_assignment_matches(text: &str) -> Option<Vec<(usize, usize)>> {
+    static PATTERN: OnceLock<Option<Regex>> = OnceLock::new();
+    let regex = PATTERN
+        .get_or_init(|| Regex::new(CREDENTIAL_ASSIGNMENT_PATTERN).ok())
+        .as_ref()?;
+    Some(
+        regex
+            .captures_iter(text)
+            .filter_map(|captures| {
+                let full = captures.get(0)?;
+                let value = captures.name("value")?;
+                (!is_alias_placeholder(value.as_str())).then_some((full.start(), full.end()))
+            })
+            .collect(),
+    )
+}
+
+fn structured_opaque_identifier_matches(text: &str) -> Option<Vec<(usize, usize)>> {
+    static PATTERN: OnceLock<Option<Regex>> = OnceLock::new();
+    let regex = PATTERN
+        .get_or_init(|| Regex::new(STRUCTURED_OPAQUE_IDENTIFIER_PATTERN).ok())
+        .as_ref()?;
+    Some(
+        regex
+            .find_iter(text)
+            .filter(|value| structured_identifier_has_boundaries(text, value.start(), value.end()))
+            .map(|value| (value.start(), value.end()))
+            .collect(),
+    )
+}
+
+fn structured_identifier_has_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let before = text
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back());
+    let after = text.get(end..).and_then(|suffix| suffix.chars().next());
+    before.is_none_or(|character| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '_' | '[')
+    }) && after.is_none_or(|character| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '_' | ']')
+    })
+}
+
+fn is_alias_placeholder(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let Some((kind, suffix)) = inner.split_once('_') else {
+        return false;
+    };
+    !kind.is_empty()
+        && kind.chars().all(|character| character.is_ascii_uppercase())
+        && suffix.len() >= 8
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_lowercase())
+}
+
+/// Apply only an explicit, unambiguous organization declaration such as
+/// `全称（简称简称）`. The declaration is evidence for alias identity, not evidence that the
+/// model found either occurrence: both the full and short form still need an independently
+/// validated candidate before their aliases are linked. An abbreviation declared for more than
+/// one full name is returned as ambiguous and remains unresolved.
+fn apply_explicit_organization_aliases(
+    text: &str,
+    namespace: &str,
+    candidates: &mut [Candidate],
+) -> Result<BTreeSet<String>, TextError> {
+    static PATTERN: OnceLock<Option<Regex>> = OnceLock::new();
+    let Some(regex) = PATTERN
+        .get_or_init(|| Regex::new(ORGANIZATION_ALIAS_PATTERN).ok())
+        .as_ref()
+    else {
+        return Err(TextError::AnalysisFailed);
+    };
+
+    let mut declarations = BTreeMap::<String, BTreeSet<String>>::new();
+    for captures in regex.captures_iter(text) {
+        let Some(full) = captures.name("full").map(|value| value.as_str().trim()) else {
+            continue;
+        };
+        let Some(short) = captures.name("short").map(|value| value.as_str().trim()) else {
+            continue;
+        };
+        if full != short && safe_term(full) && safe_term(short) {
+            declarations
+                .entry(short.to_owned())
+                .or_default()
+                .insert(full.to_owned());
+        }
+    }
+    if declarations.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let candidate_values = candidates
+        .iter()
+        .filter(|candidate| candidate.kind == EntityType::OrganizationName)
+        .filter_map(|candidate| text.get(candidate.start..candidate.end))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut canonical_aliases = BTreeMap::<String, String>::new();
+    let mut ambiguous_values = BTreeSet::new();
+    for (short, full_names) in declarations {
+        if full_names.len() > 1 {
+            ambiguous_values.insert(short);
+            continue;
+        }
+        let Some(full) = full_names.into_iter().next() else {
+            continue;
+        };
+        if !candidate_values.contains(&full) || !candidate_values.contains(&short) {
+            continue;
+        }
+        let dictionary_aliases = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == EntityType::OrganizationName
+                    && candidate.source == "dictionary"
+                    && text
+                        .get(candidate.start..candidate.end)
+                        .is_some_and(|value| value == full)
+            })
+            .map(|candidate| candidate.alias.clone())
+            .collect::<BTreeSet<_>>();
+        let canonical = if dictionary_aliases.len() == 1 {
+            dictionary_aliases
+                .into_iter()
+                .next()
+                .ok_or(TextError::AnalysisFailed)?
+        } else if dictionary_aliases.is_empty() {
+            stable_alias(namespace, EntityType::OrganizationName, &full)
+        } else {
+            // Conflicting explicit dictionary aliases are user evidence that must stay visible as
+            // a review decision; do not pick one merely because a declaration was present.
+            continue;
+        };
+        canonical_aliases.insert(full, canonical.clone());
+        canonical_aliases.insert(short, canonical);
+    }
+
+    for candidate in candidates.iter_mut() {
+        if candidate.kind != EntityType::OrganizationName || candidate.source == "dictionary" {
+            continue;
+        }
+        let Some(value) = text.get(candidate.start..candidate.end) else {
+            return Err(TextError::AnalysisFailed);
+        };
+        if let Some(alias) = canonical_aliases.get(value) {
+            candidate.alias = alias.clone();
+        }
+    }
+    Ok(ambiguous_values)
 }
 
 /// Validate a persisted, publishable analysis including its output hash and recorded replacement
@@ -495,7 +874,9 @@ fn build_analysis(
     namespace: &str,
     candidates: Vec<Candidate>,
     dismissed: &[String],
+    ambiguous_organization_values: &BTreeSet<String>,
 ) -> Result<Analysis, TextError> {
+    let candidates = suppress_redundant_local_ner(text, candidates);
     let mut grouped = BTreeMap::<(usize, usize), Vec<Candidate>>::new();
     for candidate in candidates {
         grouped
@@ -505,8 +886,6 @@ fn build_analysis(
     }
     let dismissed = dismissed.iter().collect::<BTreeSet<_>>();
     let mut groups = Vec::with_capacity(grouped.len());
-    let mut prior_end = 0usize;
-    let mut has_overlap = false;
 
     for ((start, end), values) in grouped {
         let value = text.get(start..end).ok_or(TextError::AnalysisFailed)?;
@@ -522,30 +901,53 @@ fn build_analysis(
             .iter()
             .map(|candidate| candidate.alias.as_str())
             .collect::<BTreeSet<_>>();
+        let dictionary_aliases = values
+            .iter()
+            .filter(|candidate| candidate.source == "dictionary")
+            .map(|candidate| candidate.alias.as_str())
+            .collect::<BTreeSet<_>>();
         let kind = *kinds.iter().next().ok_or(TextError::AnalysisFailed)?;
         let id = finding_id(namespace, start, end, kind, value);
         let only_ner = sources.len() == 1 && sources.contains("local_ner");
-        let dismissed = dismissed.contains(&id) && only_ner;
+        let model_only_custom =
+            sources.len() == 1 && sources.contains("ai") && kind == EntityType::Custom;
+        let dismissed = dismissed.contains(&id) && (only_ner || model_only_custom);
         let has_dictionary = sources.contains("dictionary");
         let has_ner = sources.contains("local_ner");
         let has_cloud = sources.contains("cloud");
+        let has_automatic_ai = values
+            .iter()
+            .any(|candidate| candidate.source == "ai" && candidate.automatic_allowed);
         let deterministic = values.iter().any(|candidate| candidate.deterministic);
         let deterministic_automatic = values
             .iter()
             .filter(|candidate| candidate.deterministic)
             .all(|candidate| candidate.automatic_allowed);
-        let alias = (aliases.len() == 1)
-            .then(|| aliases.iter().next().map(|value| (*value).to_owned()))
-            .flatten();
-        let automatic = kinds.len() == 1
+        // A single manually-confirmed dictionary alias is authoritative over a model-derived
+        // alias for the same exact value. Multiple dictionary aliases remain an explicit conflict
+        // and therefore stay in review.
+        let alias = if dictionary_aliases.len() == 1 {
+            dictionary_aliases
+                .iter()
+                .next()
+                .map(|value| (*value).to_owned())
+        } else if dictionary_aliases.is_empty() && aliases.len() == 1 {
+            aliases.iter().next().map(|value| (*value).to_owned())
+        } else {
+            None
+        };
+        let ambiguous_organization =
+            kind == EntityType::OrganizationName && ambiguous_organization_values.contains(value);
+        let automatic = !ambiguous_organization
+            && kinds.len() == 1
             && alias.is_some()
             && (has_dictionary
                 || (deterministic && deterministic_automatic)
-                || (!deterministic && has_ner && has_cloud));
-        if start < prior_end {
-            has_overlap = true;
-        }
-        prior_end = prior_end.max(end);
+                || (!deterministic && has_ner && (has_cloud || has_automatic_ai))
+                // `custom` has no bounded semantics.  A model-only custom value may be an
+                // ordinary date, amount, or other fact, so it needs local deterministic or
+                // dictionary corroboration before publication can remove it.
+                || (!deterministic && has_automatic_ai && kind != EntityType::Custom));
         groups.push(Group {
             start,
             end,
@@ -562,21 +964,17 @@ fn build_analysis(
         });
     }
 
-    // Ambiguous overlapping ranges are intentionally kept for review. Treating a larger match as
-    // evidence for a nested semantic match would make a cloud/dictionary decision unverifiable.
-    if has_overlap {
-        for group in &mut groups {
-            if !group.finding.dismissed {
-                group.finding.resolved = false;
-                group.replace = false;
-            }
-        }
-    }
+    mark_conflicting_repeated_people(text, &mut groups);
+    resolve_conflicting_replacement_overlaps(&mut groups);
 
+    // An unresolved local-NER range may enclose a separately confirmed entity.  Preserve the
+    // review finding while applying the independently verified, non-overlapping replacements;
+    // only two replacement candidates that overlap make their component unsafe to apply.
     let (output, replacements) = apply_replacements(text, &groups)?;
     let mut analysis = Analysis {
         text: output,
         findings: groups.into_iter().map(|group| group.finding).collect(),
+        ai_findings: None,
         replacements,
         needs_review: false,
         source_sha256: sha256_hex(text.as_bytes()),
@@ -592,6 +990,222 @@ fn build_analysis(
     Ok(analysis)
 }
 
+fn mark_conflicting_repeated_people(text: &str, groups: &mut [Group]) {
+    let mut occurrences = BTreeMap::<String, Vec<usize>>::new();
+    for (index, group) in groups.iter().enumerate() {
+        if group.finding.kind != entity_kind(EntityType::PersonName)
+            || group.finding.dismissed
+            || group
+                .finding
+                .source
+                .split('+')
+                .any(|source| source == "dictionary")
+            || !group
+                .finding
+                .source
+                .split('+')
+                .any(|source| matches!(source, "ai" | "local_ner"))
+        {
+            continue;
+        }
+        occurrences
+            .entry(group.finding.text.clone())
+            .or_default()
+            .push(index);
+    }
+    for indices in occurrences
+        .into_values()
+        .filter(|indices| indices.len() > 1)
+    {
+        let contexts = indices
+            .iter()
+            .filter_map(|index| {
+                groups
+                    .get(*index)
+                    .and_then(|group| person_party_context(text, group.start))
+            })
+            .collect::<BTreeSet<_>>();
+        let name = indices
+            .first()
+            .and_then(|index| groups.get(*index))
+            .map(|group| group.finding.text.as_str())
+            .unwrap_or_default();
+        if contexts.len() < 2 && !same_person_name_has_explicit_identity_ambiguity(text, name) {
+            continue;
+        }
+        for index in indices {
+            if let Some(group) = groups.get_mut(index) {
+                group.finding.resolved = false;
+                group.replace = false;
+            }
+        }
+    }
+}
+
+fn same_person_name_has_explicit_identity_ambiguity(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let paired_name_marker = ["两位", "两名", "两个", "多位", "多名"]
+        .into_iter()
+        .any(|count| text.contains(&format!("{count}姓名均为{name}")));
+    let another_occurrence = ["另一位", "另一名", "另一个"]
+        .into_iter()
+        .any(|prefix| text.contains(&format!("{prefix}{name}")));
+    let explicit_identity_conflict = [
+        "身份不同",
+        "不同身份",
+        "身份不一致",
+        "非同一人",
+        "不是同一人",
+        "并非同一人",
+    ]
+    .into_iter()
+    .any(|marker| text.contains(marker));
+    paired_name_marker
+        || another_occurrence
+        || (text.contains("同名") && explicit_identity_conflict)
+}
+
+fn resolve_conflicting_replacement_overlaps(groups: &mut [Group]) {
+    let mut component_start = 0usize;
+    while component_start < groups.len() {
+        let mut component_end = component_start + 1;
+        let mut farthest_end = groups[component_start].end;
+        while component_end < groups.len() && groups[component_end].start < farthest_end {
+            farthest_end = farthest_end.max(groups[component_end].end);
+            component_end += 1;
+        }
+        if component_end - component_start > 1 {
+            let conflicting_replacements = (component_start..component_end).any(|left| {
+                groups[left].replace
+                    && (left + 1..component_end).any(|right| {
+                        groups[right].replace
+                            && groups[right].start < groups[left].end
+                            && groups[left].start < groups[right].end
+                    })
+            });
+            if conflicting_replacements {
+                for group in &mut groups[component_start..component_end] {
+                    if !group.finding.dismissed {
+                        group.finding.resolved = false;
+                        group.replace = false;
+                    }
+                }
+            }
+        }
+        component_start = component_end;
+    }
+}
+
+fn person_party_context(text: &str, name_start: usize) -> Option<&'static str> {
+    let before_name = text.get(..name_start)?;
+    let segment_start = before_name
+        .char_indices()
+        .rev()
+        .find(|(_, character)| matches!(character, '\n' | '。' | '；' | ';'))
+        .map_or(0, |(offset, character)| offset + character.len_utf8());
+    let segment = before_name.get(segment_start..)?;
+    [
+        ("被申请人", "respondent"),
+        ("被上诉人", "appellee"),
+        ("第三人", "third_party"),
+        ("申请人", "applicant"),
+        ("上诉人", "appellant"),
+        ("委托人", "principal"),
+        ("受托人", "agent"),
+        ("原告", "plaintiff"),
+        ("被告", "defendant"),
+        ("甲方", "party_a"),
+        ("乙方", "party_b"),
+        ("丙方", "party_c"),
+    ]
+    .into_iter()
+    .filter_map(|(label, identity)| segment.rfind(label).map(|offset| (offset, label, identity)))
+    .max_by_key(|(offset, label, _)| (*offset, label.len()))
+    .map(|(_, _, identity)| identity)
+}
+
+fn suppress_redundant_local_ner(text: &str, candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let ai_ranges = candidates
+        .iter()
+        .filter(|candidate| candidate.source == "ai")
+        .map(|candidate| (candidate.start, candidate.end, candidate.kind))
+        .collect::<Vec<_>>();
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            if candidate.source != "local_ner" {
+                return true;
+            }
+            !ai_ranges.iter().any(|(ai_start, ai_end, ai_kind)| {
+                if *ai_kind != candidate.kind {
+                    return false;
+                }
+                if *ai_start <= candidate.start
+                    && *ai_end >= candidate.end
+                    && (*ai_start < candidate.start || *ai_end > candidate.end)
+                {
+                    return true;
+                }
+                candidate.start <= *ai_start
+                    && candidate.end >= *ai_end
+                    && (candidate.start < *ai_start || candidate.end > *ai_end)
+                    && local_ner_wrapper_is_safe(
+                        text,
+                        candidate.start,
+                        candidate.end,
+                        *ai_start,
+                        *ai_end,
+                    )
+            })
+        })
+        .collect()
+}
+
+fn local_ner_wrapper_is_safe(
+    text: &str,
+    local_start: usize,
+    local_end: usize,
+    ai_start: usize,
+    ai_end: usize,
+) -> bool {
+    let Some(prefix) = text.get(local_start..ai_start) else {
+        return false;
+    };
+    let Some(suffix) = text.get(ai_end..local_end) else {
+        return false;
+    };
+    is_known_ner_context(prefix) && is_known_ner_context(suffix)
+}
+
+fn is_known_ner_context(value: &str) -> bool {
+    let value = value.trim_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                ':' | '：' | ',' | '，' | ';' | '；' | '、' | '(' | '（' | ')' | '）'
+            )
+    });
+    matches!(
+        value,
+        "" | "与"
+            | "及"
+            | "和"
+            | "或"
+            | "简称"
+            | "全称"
+            | "原告"
+            | "被告"
+            | "甲方"
+            | "乙方"
+            | "申请人"
+            | "被申请人"
+            | "联系人"
+            | "法定代表人"
+    )
+}
+
 fn apply_replacements(
     text: &str,
     groups: &[Group],
@@ -599,7 +1213,7 @@ fn apply_replacements(
     let mut output = String::with_capacity(text.len());
     let mut replacements = Vec::new();
     let mut cursor = 0usize;
-    for group in groups {
+    for group in groups.iter().filter(|group| group.replace) {
         if group.start < cursor || group.end < group.start {
             return Err(TextError::AnalysisFailed);
         }
@@ -766,35 +1380,113 @@ fn local_ner_candidate_is_semantically_plausible(
     text: &str,
     candidate: &privacy::finding_engine::FindingCandidateV1,
 ) -> Result<bool, TextError> {
-    if candidate.entity_type != EntityType::Address {
-        return Ok(true);
-    }
     let start = usize::try_from(candidate.start_offset).map_err(|_| TextError::AnalysisFailed)?;
     let end = usize::try_from(candidate.end_offset).map_err(|_| TextError::AnalysisFailed)?;
     let value = text.get(start..end).ok_or(TextError::AnalysisFailed)?;
-    // A model-only address guess must carry at least one concrete Chinese location component.
-    // This rejects label-value prose such as “地址已另案保管”, which contains no location at all;
-    // verified dictionary, deterministic, and cloud candidates remain governed by their own
-    // evidence paths and are not filtered here.
-    Ok(value.chars().any(|character| {
+    match candidate.entity_type {
+        // A model-only address guess must carry at least one concrete Chinese location component.
+        // This rejects label-value prose such as “地址已另案保管”, which contains no location at all;
+        // verified dictionary, deterministic, and cloud candidates remain governed by their own
+        // evidence paths and are not filtered here.
+        EntityType::Address => Ok(value.chars().any(|character| {
+            matches!(
+                character,
+                '省' | '市'
+                    | '区'
+                    | '县'
+                    | '旗'
+                    | '乡'
+                    | '镇'
+                    | '村'
+                    | '街'
+                    | '路'
+                    | '巷'
+                    | '弄'
+                    | '号'
+                    | '栋'
+                    | '幢'
+            )
+        })),
+        // These are grammatical/field-label tokens, never standalone personal names.  The local
+        // model is deliberately a conservative candidate source; retaining these tokens would
+        // create a review-only false positive without adding privacy coverage.
+        EntityType::PersonName => Ok(!is_obvious_non_person_local_ner_token(value)),
+        // Reject a local NER span only when its own text is sentence syntax rather than an
+        // organization name.  We do not use a model range as proof that a broader local range is
+        // an entity, so a plausible uncorroborated organization still remains reviewable.
+        EntityType::OrganizationName => Ok(!has_non_organization_clause_syntax(value)),
+        _ => Ok(true),
+    }
+}
+
+fn is_obvious_non_person_local_ner_token(value: &str) -> bool {
+    matches!(
+        value,
+        "电话"
+            | "手机"
+            | "邮箱"
+            | "地址"
+            | "姓名"
+            | "人员"
+            | "联系人"
+            | "相同"
+            | "均为"
+            | "当成"
+            | "作为"
+            | "需要"
+            | "应当"
+            | "其中"
+            | "双方"
+            | "本案"
+            | "材料"
+    )
+}
+
+fn has_non_organization_clause_syntax(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.chars().next().is_some_and(|character| {
         matches!(
             character,
-            '省' | '市'
-                | '区'
-                | '县'
-                | '旗'
-                | '乡'
-                | '镇'
-                | '村'
-                | '街'
-                | '路'
-                | '巷'
-                | '弄'
-                | '号'
-                | '栋'
-                | '幢'
+            '与' | '和' | '及' | '或' | '向' | '由' | '在' | '对'
         )
-    }))
+    }) {
+        return true;
+    }
+    if [
+        "原告",
+        "被告",
+        "申请人",
+        "被申请人",
+        "上诉人",
+        "被上诉人",
+        "承租人",
+        "出租人",
+        "患者",
+        "联系人",
+        "法定代表人",
+    ]
+    .into_iter()
+    .any(|role| trimmed.contains(role))
+    {
+        return true;
+    }
+    if trimmed.contains('自')
+        && trimmed.contains('在')
+        && trimmed.chars().any(|character| character.is_ascii_digit())
+    {
+        return true;
+    }
+    trimmed
+        .split_once('与')
+        .is_some_and(|(left, right)| !right.is_empty() && looks_like_short_han_name(left))
+}
+
+fn looks_like_short_han_name(value: &str) -> bool {
+    let characters = value.chars().collect::<Vec<_>>();
+    (2..=4).contains(&characters.len())
+        && characters
+            .iter()
+            .all(|character| ('\u{4e00}'..='\u{9fff}').contains(character))
 }
 
 fn push_candidate(destination: &mut Vec<Candidate>, candidate: Candidate) -> Result<(), TextError> {
@@ -802,6 +1494,33 @@ fn push_candidate(destination: &mut Vec<Candidate>, candidate: Candidate) -> Res
         return Err(TextError::TooManyFindings);
     }
     destination.push(candidate);
+    Ok(())
+}
+
+fn validate_ai_inputs(text: &str, findings: &[AiFinding]) -> Result<(), TextError> {
+    if findings.len() > MAX_AI_FINDINGS {
+        return Err(TextError::TooManyFindings);
+    }
+    for finding in findings {
+        if finding.text.is_empty()
+            || finding.text.len() > MAX_AI_FINDING_TEXT_BYTES
+            || finding.text.contains('\0')
+            || finding.start >= finding.end
+            || finding.end > text.len()
+            || !text.is_char_boundary(finding.start)
+            || !text.is_char_boundary(finding.end)
+            || text.get(finding.start..finding.end) != Some(finding.text.as_str())
+        {
+            return Err(TextError::CloudFindingAbsent);
+        }
+        if finding
+            .confidence_ppm
+            .is_some_and(|confidence| confidence > 1_000_000)
+        {
+            return Err(TextError::InvalidInput);
+        }
+        parse_entity_kind(&finding.kind)?;
+    }
     Ok(())
 }
 
@@ -865,11 +1584,12 @@ fn validate_finding(finding: &Finding) -> Result<(), TextError> {
             .is_some_and(|alias| validate_alias(alias).is_err())
         || (finding.dismissed
             && (!finding.resolved
-                || finding.source != "local_ner"
-                || !matches!(
-                    kind,
-                    EntityType::PersonName | EntityType::OrganizationName | EntityType::Address
-                )))
+                || !((finding.source == "local_ner"
+                    && matches!(
+                        kind,
+                        EntityType::PersonName | EntityType::OrganizationName | EntityType::Address
+                    ))
+                    || (finding.source == "ai" && kind == EntityType::Custom))))
     {
         return Err(TextError::InvalidInput);
     }
@@ -885,7 +1605,12 @@ fn validate_export_text(text: &str) -> Result<(), TextError> {
         source_names: &[],
     })
     .map_err(|_| TextError::AnalysisFailed)?;
-    if report.passed {
+    let has_blocking_residual = report
+        .hits
+        .iter()
+        .any(|hit| hit.blocking && !ignorable_residual_hit(&pages, hit))
+        || has_credential_residual(text);
+    if !has_blocking_residual {
         Ok(())
     } else {
         Err(TextError::ResidualRisk)
@@ -1108,6 +1833,106 @@ fn entity_alias_stem(entity_type: EntityType) -> &'static str {
         EntityType::TrackingNumber => "TRACKING",
         EntityType::PropertyCertificateNumber => "PROPERTY",
         EntityType::Custom => "CUSTOM",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::{build_analysis, entity_kind, stable_alias, Candidate, EntityType};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn unresolved_local_overlap_does_not_block_a_separate_verified_replacement() {
+        let text = "甲方李明签署。";
+        let person_start = text.find("李明").expect("person");
+        let analysis = build_analysis(
+            text,
+            "overlap-component",
+            vec![
+                Candidate {
+                    start: 0,
+                    end: person_start + "李明".len(),
+                    kind: EntityType::OrganizationName,
+                    source: "local_ner",
+                    alias: stable_alias(
+                        "overlap-component",
+                        EntityType::OrganizationName,
+                        "甲方李明",
+                    ),
+                    deterministic: false,
+                    automatic_allowed: false,
+                },
+                Candidate {
+                    start: person_start,
+                    end: person_start + "李明".len(),
+                    kind: EntityType::PersonName,
+                    source: "ai",
+                    alias: stable_alias("overlap-component", EntityType::PersonName, "李明"),
+                    deterministic: false,
+                    automatic_allowed: true,
+                },
+            ],
+            &[],
+            &BTreeSet::new(),
+        )
+        .expect("overlap analysis");
+
+        assert!(analysis.needs_review);
+        assert_eq!(analysis.replacements.len(), 1);
+        assert!(!analysis.text.contains("李明"));
+        assert!(analysis.findings.iter().any(|finding| {
+            finding.source == "local_ner"
+                && finding.kind == entity_kind(EntityType::OrganizationName)
+                && !finding.resolved
+        }));
+        assert!(analysis.findings.iter().any(|finding| {
+            finding.source == "ai"
+                && finding.kind == entity_kind(EntityType::PersonName)
+                && finding.resolved
+        }));
+    }
+
+    #[test]
+    fn overlapping_verified_replacements_remain_for_review() {
+        let text = "甲方李明签署。";
+        let person_start = text.find("李明").expect("person");
+        let analysis = build_analysis(
+            text,
+            "conflicting-overlap",
+            vec![
+                Candidate {
+                    start: 0,
+                    end: person_start + "李明".len(),
+                    kind: EntityType::OrganizationName,
+                    source: "ai",
+                    alias: stable_alias(
+                        "conflicting-overlap",
+                        EntityType::OrganizationName,
+                        "甲方李明",
+                    ),
+                    deterministic: false,
+                    automatic_allowed: true,
+                },
+                Candidate {
+                    start: person_start,
+                    end: person_start + "李明".len(),
+                    kind: EntityType::PersonName,
+                    source: "ai",
+                    alias: stable_alias("conflicting-overlap", EntityType::PersonName, "李明"),
+                    deterministic: false,
+                    automatic_allowed: true,
+                },
+            ],
+            &[],
+            &BTreeSet::new(),
+        )
+        .expect("conflicting overlap analysis");
+
+        assert!(analysis.needs_review);
+        assert!(analysis.replacements.is_empty());
+        assert_eq!(analysis.text, text);
+        assert!(analysis.findings.iter().all(|finding| !finding.resolved));
     }
 }
 

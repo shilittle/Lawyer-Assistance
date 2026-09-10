@@ -53,6 +53,26 @@
         "openWorldHint": false
       },
       "confirmation_required": false
+    },
+    {
+      "name": "legal_search_cases",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "confirmation_required": false
+    },
+    {
+      "name": "legal_get_case",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "confirmation_required": false
     }
   ]
 }

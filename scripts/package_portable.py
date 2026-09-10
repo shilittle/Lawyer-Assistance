@@ -17,12 +17,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import tomllib
+import urllib.parse
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -37,6 +39,10 @@ RUNTIME_FILES = (
     Path("DATA_SOURCES.md"),
     Path("LICENSE.txt"),
     Path("THIRD_PARTY_NOTICES.txt"),
+)
+CASE_RUNTIME_FILES = (
+    Path("judicial_cases.sqlite"),
+    Path("CASE_DATA_SOURCES.md"),
 )
 PORTABLE_FILES = (
     # Root documentation linked by README.md/README.en.md.
@@ -65,6 +71,8 @@ PORTABLE_FILES = (
     (Path("docs/mcp/security-and-privacy.md"), Path("docs/mcp/security-and-privacy.md")),
     (Path("docs/mcp/tools.md"), Path("docs/mcp/tools.md")),
     (Path("docs/web/README.md"), Path("docs/web/README.md")),
+    (Path("docs/web/ai-upgrade.md"), Path("docs/web/ai-upgrade.md")),
+    (Path("docs/web/ai-validation.md"), Path("docs/web/ai-validation.md")),
     (Path("docs/web/redaction-quality.md"), Path("docs/web/redaction-quality.md")),
     (Path("docs/web/validation.md"), Path("docs/web/validation.md")),
     # Existing public/privacy configuration examples contain placeholders only.
@@ -83,7 +91,51 @@ PORTABLE_FILES = (
     ),
 )
 LEGAL_DISTRIBUTION_MANIFEST = Path("data/generated/legal_core_distribution_manifest.json")
+CASE_DISTRIBUTION_MANIFEST = Path("data/generated/judicial_cases_manifest.json")
+CASE_MANIFEST_DESTINATION = Path("judicial_cases_manifest.json")
 MAX_MANIFEST_FILE_BYTES = 8 * 1024 * 1024
+AI_TOOL_FILES = (
+    "typst.exe", "pdfium.dll", "fonts/SourceHanSerifSC-Regular.otf",
+    "fonts/SourceHanSerifSC-Bold.otf", "Typst-LICENSE.txt",
+    "SourceHanSerif-LICENSE.txt", "pdfium-LICENSE.txt",
+    "document-runtime.json", "pdfium.version.json",
+)
+
+
+def verify_ai_runtime(root: Path) -> tuple[Path, ...]:
+    tools = root / "output/runtime-tools"
+    paths = tuple(tools / name for name in AI_TOOL_FILES)
+    for item in paths:
+        if not item.is_file() or item.is_symlink() or item.stat().st_size == 0:
+            raise PackageError(f"required AI runtime resource missing: {item}")
+    try:
+        document = json.loads((tools / "document-runtime.json").read_text(encoding="utf-8"))
+        expected_paths = {"typst.exe", "fonts/SourceHanSerifSC-Regular.otf", "fonts/SourceHanSerifSC-Bold.otf"}
+        if {entry["path"] for entry in document} != expected_paths:
+            raise PackageError("document runtime manifest file set invalid")
+        for entry in document:
+            if sha256_file(tools / entry["path"]) != entry["sha256"]:
+                raise PackageError("document runtime checksum mismatch")
+        pdfium = json.loads((tools / "pdfium.version.json").read_text(encoding="utf-8"))
+        if sha256_file(tools / "pdfium.dll") != pdfium["dll_sha256"]:
+            raise PackageError("Pdfium runtime checksum mismatch")
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        raise PackageError("AI runtime manifest invalid") from error
+    index = root / "data/runtime/legal_search_index.sqlite"
+    index_manifest = root / "data/generated/legal_search_index_manifest.json"
+    if not index.is_file() or index.is_symlink() or not index_manifest.is_file():
+        raise PackageError("derived legal search index missing; run scripts/build_search_index.py")
+    connection = sqlite3.connect(f"file:{index.resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise PackageError("derived legal search index integrity check failed")
+        metadata = dict(connection.execute("SELECT key,value FROM search_index_metadata"))
+    finally:
+        connection.close()
+    expected = json.loads((root / "data/generated/legal_core_distribution_manifest.json").read_text(encoding="utf-8"))
+    if metadata.get("source_manifest_sha256") != expected["source_manifest_sha256"]:
+        raise PackageError("derived legal search index belongs to a different legal database")
+    return paths
 
 
 class PackageError(RuntimeError):
@@ -227,6 +279,237 @@ def verify_legal_runtime(root: Path) -> tuple[Path, dict[str, object]]:
     return database, expected
 
 
+_CASE_COLUMNS = (
+    "case_id",
+    "title",
+    "case_type",
+    "guiding_number",
+    "reference_number",
+    "keywords_json",
+    "publication_date",
+    "court",
+    "case_number",
+    "status",
+    "source_url",
+    "search_text",
+    "key_points_json",
+    "basic_facts",
+    "judgment_result",
+    "reasoning",
+    "related_laws_json",
+    "full_text",
+    "fetched_at",
+    "content_sha256",
+)
+_CASE_SCHEMA_VERSION = "1"
+_HEX_64 = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+
+
+def _case_manifest_path(root: Path) -> Path:
+    path = root / CASE_DISTRIBUTION_MANIFEST
+    if not path.is_file() or path.is_symlink():
+        raise PackageError(f"judicial case distribution manifest is missing: {path}")
+    return path
+
+
+def _case_manifest_schema_version(manifest: dict[str, object]) -> str:
+    value: object = manifest.get("schema_version")
+    if value != _CASE_SCHEMA_VERSION:
+        raise PackageError("judicial case manifest has an unsupported schema version")
+    return _CASE_SCHEMA_VERSION
+
+
+def _case_manifest_count(manifest: dict[str, object]) -> tuple[int, dict[str, int]]:
+    row_count = manifest.get("row_count")
+    if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count <= 0:
+        raise PackageError("judicial case manifest has no valid row_count")
+    raw_counts = manifest.get("counts")
+    if not isinstance(raw_counts, dict) or set(("guiding", "reference", "total")) - raw_counts.keys():
+        raise PackageError("judicial case manifest counts are incomplete")
+    counts: dict[str, int] = {}
+    for key in ("guiding", "reference", "typical", "total"):
+        value = raw_counts.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise PackageError("judicial case manifest has an invalid case count")
+        counts[key] = value
+    if counts["total"] != row_count or counts["guiding"] + counts["reference"] + counts["typical"] != row_count:
+        raise PackageError("judicial case manifest counts do not add up to row_count")
+    if counts["guiding"] <= 0:
+        raise PackageError("judicial case manifest must contain at least one guiding case")
+    return row_count, {key: counts[key] for key in ("guiding", "reference", "typical") if key != "typical" or "typical" in raw_counts}
+
+
+def _case_manifest_source(manifest: dict[str, object]) -> list[dict[str, object]]:
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise PackageError("judicial case manifest sources are missing")
+    sources: list[dict[str, object]] = []
+    for item in raw_sources:
+        if not isinstance(item, dict):
+            raise PackageError("judicial case manifest source entry is invalid")
+        url = item.get("url")
+        if not isinstance(url, str):
+            raise PackageError("judicial case manifest source URL is missing")
+        try:
+            parsed = urllib.parse.urlparse(url)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError as error:
+            raise PackageError("judicial case manifest source URL is malformed") from error
+        if (
+            parsed.scheme != "https"
+            or hostname not in {"court.gov.cn", "www.court.gov.cn", "gongbao.court.gov.cn", "rmfyalk.court.gov.cn", "ipc.court.gov.cn", "hnlyzy.hncourt.gov.cn"}
+            or parsed.username
+            or parsed.password
+            or port is not None
+        ):
+            raise PackageError("judicial case manifest source URL is not an official Supreme People's Court URL")
+        source_hash = item.get("sha256")
+        if not isinstance(source_hash, str) or not _HEX_64.fullmatch(source_hash):
+            raise PackageError("judicial case manifest source entry has an invalid hash")
+        fetched_at = item.get("fetched_at")
+        if not isinstance(fetched_at, str) or not fetched_at.strip():
+            raise PackageError("judicial case manifest source entry has no fetched_at")
+        sources.append(item)
+    return sources
+
+
+def _case_manifest_hash(manifest: dict[str, object], key: str) -> str:
+    value = manifest.get(key)
+    if not isinstance(value, str) or not _HEX_64.fullmatch(value):
+        raise PackageError(f"judicial case manifest has an invalid {key}")
+    return value.lower()
+
+
+def _case_schema_tables(manifest: dict[str, object]) -> tuple[str, ...]:
+    schema = manifest.get("schema")
+    if not isinstance(schema, dict):
+        return ()
+    tables = schema.get("tables")
+    if tables is None:
+        return ()
+    if not isinstance(tables, list) or any(not isinstance(table, str) or not table for table in tables):
+        raise PackageError("judicial case manifest schema tables are invalid")
+    return tuple(tables)
+
+
+def verify_case_runtime(root: Path) -> tuple[Path, dict[str, object]]:
+    """Validate the official Supreme People's Court case sidecar before packaging."""
+    runtime = root / "data" / "runtime"
+    database = runtime / "judicial_cases.sqlite"
+    if not database.is_file() or database.is_symlink():
+        raise PackageError(f"runtime judicial case database is missing: {database}")
+    manifest_path = _case_manifest_path(root)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PackageError("judicial case distribution manifest could not be read") from error
+    if not isinstance(manifest, dict):
+        raise PackageError("judicial case distribution manifest must be an object")
+    if manifest.get("filename") != "judicial_cases.sqlite":
+        raise PackageError("judicial case distribution manifest names an unexpected file")
+    try:
+        expected_size = manifest["size_bytes"]
+    except KeyError as error:
+        raise PackageError("judicial case manifest is missing size_bytes") from error
+    if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size <= 0:
+        raise PackageError("judicial case manifest has an invalid size_bytes")
+    expected_hash = _case_manifest_hash(manifest, "sha256")
+    schema_version = _case_manifest_schema_version(manifest)
+    expected_count, expected_categories = _case_manifest_count(manifest)
+    sources = _case_manifest_source(manifest)
+    source_hash = manifest.get("source_manifest_sha256")
+    if not isinstance(source_hash, str) or not _HEX_64.fullmatch(source_hash):
+        raise PackageError("judicial case manifest has an invalid source_manifest_sha256")
+    coverage_status = manifest.get("coverage_status")
+    if not isinstance(coverage_status, str) or not coverage_status.strip():
+        raise PackageError("judicial case manifest coverage_status is missing")
+    if coverage_status == "limited_build" or "synthetic" in coverage_status.lower():
+        raise PackageError("judicial case manifest is a limited or synthetic build")
+    for key in ("dataset_name", "dataset_version"):
+        value = manifest.get(key)
+        if isinstance(value, str) and "synthetic" in value.lower():
+            raise PackageError("judicial case manifest is a synthetic build")
+    actual_size = database.stat().st_size
+    if actual_size != expected_size:
+        raise PackageError(f"judicial case database size does not match manifest: {actual_size} != {expected_size}")
+    if sha256_file(database) != expected_hash:
+        raise PackageError("judicial case database SHA-256 does not match manifest")
+    try:
+        connection = sqlite3.connect(f"file:{database.resolve().as_posix()}?mode=ro&immutable=1", uri=True)
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or str(integrity[0]).lower() != "ok":
+                raise PackageError("judicial case database integrity check failed")
+            metadata_exists = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'database_metadata')"
+            ).fetchone()
+            if not metadata_exists or not bool(metadata_exists[0]):
+                raise PackageError("judicial case database metadata table is missing")
+            metadata = dict(connection.execute("SELECT key, value FROM database_metadata").fetchall())
+            if str(metadata.get("schema_version", "")) != schema_version:
+                raise PackageError("judicial case database schema does not match manifest")
+            user_version = connection.execute("PRAGMA user_version").fetchone()
+            if user_version is None or int(user_version[0]) != int(schema_version):
+                raise PackageError("judicial case database PRAGMA user_version does not match manifest")
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(judicial_cases)").fetchall()
+            }
+            if set(_CASE_COLUMNS) - columns:
+                raise PackageError("judicial case database schema is missing required columns")
+            for table in _case_schema_tables(manifest):
+                exists = connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+                    (table,),
+                ).fetchone()
+                if not exists or not bool(exists[0]):
+                    raise PackageError(f"judicial case database schema is missing table: {table}")
+            actual_count = int(connection.execute("SELECT COUNT(*) FROM judicial_cases").fetchone()[0])
+            if actual_count != expected_count:
+                raise PackageError(f"judicial case count does not match manifest: {actual_count} != {expected_count}")
+            for category, expected in expected_categories.items():
+                actual = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM judicial_cases WHERE case_type = ?",
+                        (category,),
+                    ).fetchone()[0]
+                )
+                if actual != expected:
+                    raise PackageError(
+                        f"judicial case {category} count does not match manifest: {actual} != {expected}"
+                    )
+            db_source_hash = metadata.get("source_manifest_sha256")
+            if db_source_hash is None or str(db_source_hash).lower() != str(source_hash).lower():
+                raise PackageError("judicial case source manifest hash does not match database metadata")
+        finally:
+            connection.close()
+    except PackageError:
+        raise
+    except (OSError, sqlite3.Error, ValueError) as error:
+        raise PackageError("judicial case database schema or count could not be read") from error
+    manifest = dict(manifest)
+    manifest["sources"] = sources
+    manifest["schema_version"] = schema_version
+    manifest["counts"] = dict(manifest["counts"])
+    return database, manifest
+
+
+def _case_portable_identity(expected_case: dict[str, object]) -> dict[str, object]:
+    return {
+        "filename": "data/runtime/judicial_cases.sqlite",
+        "manifest": "data/runtime/judicial_cases_manifest.json",
+        "size_bytes": expected_case["size_bytes"],
+        "sha256": expected_case["sha256"],
+        "schema_version": expected_case["schema_version"],
+        "row_count": expected_case["row_count"],
+        "counts": expected_case["counts"],
+        "coverage_status": expected_case["coverage_status"],
+        "sources": expected_case["sources"],
+        "source_manifest_sha256": expected_case["source_manifest_sha256"],
+    }
+
+
 def _ensure_regular_file(path: Path, label: str) -> None:
     if not path.is_file() or path.is_symlink():
         raise PackageError(f"{label} is missing or is a symlink: {path}")
@@ -315,7 +598,13 @@ def _write_embedded_manifest(stage: Path, entries: tuple[PackagedFile, ...]) -> 
     return path
 
 
-def _write_json_manifest(stage: Path, version: str, expected_legal: dict[str, object], entries: tuple[PackagedFile, ...]) -> Path:
+def _write_json_manifest(
+    stage: Path,
+    version: str,
+    expected_legal: dict[str, object],
+    expected_case: dict[str, object],
+    entries: tuple[PackagedFile, ...],
+) -> Path:
     path = stage / "portable.manifest.json"
     payload = {
         "format_version": 1,
@@ -332,6 +621,7 @@ def _write_json_manifest(stage: Path, version: str, expected_legal: dict[str, ob
             "sha256": expected_legal["sha256"],
             "source_manifest_sha256": expected_legal["source_manifest_sha256"],
         },
+        "judicial_cases_database": _case_portable_identity(expected_case),
         "files": [{"path": item.path, "size": item.size, "sha256": item.sha256} for item in entries],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -340,7 +630,7 @@ def _write_json_manifest(stage: Path, version: str, expected_legal: dict[str, ob
 
 def _zip_tree(stage: Path, archive: Path) -> None:
     archive.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as package:
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as package:
         for path in sorted(stage.rglob("*")):
             if not path.is_file():
                 continue
@@ -369,8 +659,13 @@ def build_package(
     server = release_binary_path(root, target, SERVER_BINARY)
     mcp = release_binary_path(root, target, MCP_BINARY)
     legal, expected_legal = verify_legal_runtime(root)
+    _case_database, expected_case = verify_case_runtime(root)
+    ai_tools = verify_ai_runtime(root)
     for relative in RUNTIME_FILES[1:]:
         _ensure_regular_file(root / "data" / "runtime" / relative, f"runtime resource {relative}")
+    for relative in CASE_RUNTIME_FILES[1:]:
+        _ensure_regular_file(root / "data" / "runtime" / relative, f"runtime case resource {relative}")
+    _ensure_regular_file(root / CASE_DISTRIBUTION_MANIFEST, "judicial case distribution manifest")
     for source, _destination in PORTABLE_FILES:
         _ensure_regular_file(root / source, f"portable document or example {source}")
 
@@ -387,17 +682,27 @@ def build_package(
         stage.mkdir()
         _copy_payload(server, stage / SERVER_BINARY)
         _copy_payload(mcp, stage / MCP_BINARY)
+        for resource in ai_tools:
+            _copy_payload(resource, stage / "tools" / resource.relative_to(root / "output/runtime-tools"))
+        _copy_payload(root / "data/runtime/legal_search_index.sqlite", stage / "data/runtime/legal_search_index.sqlite")
+        _copy_payload(root / "data/generated/legal_search_index_manifest.json", stage / "data/runtime/legal_search_index_manifest.json")
         for source, destination in PORTABLE_FILES:
             _copy_payload(root / source, stage / destination)
         for relative in RUNTIME_FILES:
             _copy_payload(root / "data" / "runtime" / relative, stage / "data" / "runtime" / relative)
+        for relative in CASE_RUNTIME_FILES:
+            _copy_payload(root / "data" / "runtime" / relative, stage / "data" / "runtime" / relative)
+        _copy_payload(
+            root / CASE_DISTRIBUTION_MANIFEST,
+            stage / "data" / "runtime" / CASE_MANIFEST_DESTINATION,
+        )
         (stage / "Lawyer-Assistance.vbs").write_text(launcher_text(), encoding="utf-8", newline="\r\n")
         (stage / "Stop-Lawyer-Assistance.vbs").write_text(
             stop_launcher_text(), encoding="utf-8", newline="\r\n"
         )
         entries = _manifest_entries(stage)
         _write_embedded_manifest(stage, entries)
-        _write_json_manifest(stage, version, expected_legal, entries)
+        _write_json_manifest(stage, version, expected_legal, expected_case, entries)
         # The JSON manifest itself is part of the hash manifest.  Rebuild the
         # hash list after writing it; the JSON's own files list intentionally
         # excludes its self-referential hash, while MANIFEST.sha256 covers it.
@@ -426,6 +731,7 @@ def build_package(
             "sha256": expected_legal["sha256"],
             "source_manifest_sha256": expected_legal["source_manifest_sha256"],
         },
+        "judicial_cases_database": _case_portable_identity(expected_case),
         "files": [
             {"path": entry.path, "size": entry.size, "sha256": entry.sha256}
             for entry in entries

@@ -11,14 +11,18 @@ mod config;
 mod document;
 mod error;
 mod filesystem;
+mod judicial;
 mod legal;
+mod paged;
 mod status;
 
 pub use case::*;
 pub use config::*;
 pub use document::*;
 pub use error::*;
+pub use judicial::*;
 pub use legal::*;
+pub use paged::*;
 pub use status::*;
 
 use std::path::Path;

@@ -1,41 +1,33 @@
-# Lawyer Assistance v1.0.0：Web 大版本发布 / Web Major Release
+# Lawyer Assistance v1.2.0：AI 工作流与完整法律检索
 
-Lawyer Assistance v1.0.0 是面向 Windows 本机单用户场景的 Web 大版本。它由 Rust 后台服务、普通 HTML WebUI 和可独立调用的 MCP 程序组成，首要用途是材料脱敏和本地法律检索。
+本轮以 V1.0.0 Web 版本为基础，完成六项 AI 工作流升级并实装最高人民法院案例库。Windows 便携包、增量源码和验收资料通过 [GitHub Release](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.0) 交付。
 
-## 下载与运行
+## 主要变化
 
-下载 GitHub Release 资产 `Lawyer-Assistance_1.0.0_windows-x86_64-portable.zip`，并核对同名 `.zip.sha256`。解压后：
+- 常见供应商预设、实际联网获取模型列表、多选启用以及对话、脱敏、写作、OCR 默认模型。
+- LLM 主导的材料脱敏，结合本地定位替换和残留校验；新增 PDF 与图片视觉 OCR、DOCX 内嵌图片，成品统一纯 TXT。
+- 完整法律检索计数与分页，按法律归组或逐条浏览，筛选和排序，历史版本实际正文及默认开启的关联开关。
+- 可读取案情、附件和已有材料的 AI 法律搜索；检索词调整、原文读取、数据库引用核验和持久历史。
+- 文书写作替代固定套用模板；版本保存、排版预览和正确的 TXT、DOCX、默认 PDF 导出。
+- 会话自动命名、手动改名、材料选择和附件，复用法律工具，后台任务独立于浏览器运行。
+- 案例 sidecar 去重后保留 279 个指导案例、61 个参考案例和 419 个典型案例合集，共 759 个主案例/合集；来源清单保留 834 个 TXT 来源条目。典型合集可能包含多个案件，不作为单独案件计数；指导案例 45 保留洛阳市中级人民法院官方转载来源。
 
-1. 双击 `Lawyer-Assistance.vbs` 启动服务；脚本通过 `wscript.exe` 隐藏窗口运行 `lawyer-assistance.exe serve --open --port 8877`。
-2. 浏览器访问 `http://127.0.0.1:8877`。默认工作区为 `%LOCALAPPDATA%\LawyerAssistanceWeb`。
-3. 双击 `Stop-Lawyer-Assistance.vbs` 优雅停止服务，也可执行 `lawyer-assistance.exe stop`。停止命令验证当前用户的加密连接描述符、loopback 会话和 CSRF 请求，只停止匹配的本机 server，不调用任意进程终止器。
+## 升级和运行
 
-ZIP 包含两个 release 可执行文件、运行时法律库及许可 notices、当前使用文档、MCP 配置示例、隐藏窗口启动/停止脚本，以及 `MANIFEST.sha256`、`portable.manifest.json`。它是未签名的 Windows x86_64 便携产物，不包含安装器、签名文件、自动更新器或 updater 资源。
+停止旧服务，使用 `scripts/package_portable.py` 生成或取得 `Lawyer-Assistance_1.2.0_windows-x86_64-portable.zip`，双击 `Lawyer-Assistance.vbs`。默认继续使用 `%LOCALAPPDATA%\LawyerAssistanceWeb`。V1 Web 数据库首次升级前自动备份，旧材料、字典、收藏和会话保留；旧 Tauri 数据目录不迁移。
 
-## 主要能力
+双击 `Stop-Lawyer-Assistance.vbs` 或执行 `lawyer-assistance.exe stop` 可通过已认证的本机接口优雅停止服务。浏览器关闭不会取消后台已接受的任务；服务重启后未知云请求需要用户点击继续。
 
-- **材料脱敏**：批量导入 TXT/DOCX，提取正文和表格，进行规则与词典识别、稳定别名替换、残留检查、人工复核和不可变结果发布；支持 TXT、Markdown、重建 DOCX 与批量 ZIP 导出。
-- **法律检索**：使用只读 `legal_core.sqlite` 查询法律、条文、历史版本、效力日期、关联法规和收藏。
-- **轻量业务**：六类固定模板、引用复制和简单 Provider 对话。对话上下文只能来自用户主动输入以及明确选择的法条和有效脱敏结果。
-- **MCP**：`public_law_only` 固定提供 5 个公开法律工具；`privacy_workspace` 共提供 8 个工具，即这 5 个公开工具加上 `privacy_workspace.submit`、`privacy_workspace.status`、`privacy_workspace.read_result`。私有工具只能通过已授权的本机后台读取已发布脱敏文本。
+便携包包含两个程序、法律库、官方案例库、派生检索索引、来源清单、Pdfium、Typst、中文字体和许可说明。核对相邻 `.zip.sha256`、包内 `MANIFEST.sha256` 和 `portable.manifest.json`。包内不含密钥、用户数据或测试工作区，也不包含安装器、签名或自动更新器。
 
-## Breaking changes
+## 兼容与发送策略
 
-- Tauri 桌面入口、窗口/IPC、WebView2、安装器、签名、updater 和旧资格发布链已从 v1.0.0 发布路径移除；使用本机 server、浏览器和 VBS 启动/停止脚本。
-- 工作区使用全新目录 `%LOCALAPPDATA%\LawyerAssistanceWeb`。旧 Tauri 案件、材料、映射、授权和其他用户数据保持原样，不读取、不迁移、不覆盖。
-- `approved_case_workspace`、`redacted_case`、`diagram_authoring` profile 已停用并返回 `profile_disabled`，不会静默映射到 `privacy_workspace`。
-- 首版输入范围为 TXT 和 DOCX；PDF、图片、扫描件 OCR、原件版式保留、复杂案件管理、法律图谱和自动办案流程不在 v1.0.0 范围内。OCR 只保留扩展接口，不安装或发布 OCR 运行时。
+国内官方预设默认信任所选原文发送；自定义地址确认归属，地址变化后重新判断。未信任服务使用有效脱敏材料。API Key 保存在 Windows 凭据管理器。原件、映射和历史继续由本机后台保护，材料内的伪造指令不获得权限。
 
-## 验证与已知边界
+公共 MCP 保持七个只读工具，私密工作区保持十个工具。案例库覆盖发行清单声明的 279 个指导案例、61 个参考案例和 419 个典型案例合集；834 个来源 TXT 条目包含重复来源变体，不表示全国裁判文书全量覆盖。典型合集按文章检索，指导案例 45 的洛阳中院官方转载来源保留在来源清单中。旧停用 profile 不重新启用。
 
-发布验证覆盖 Rust 全工作区、WebUI、Python 打包与集成用例，以及原生凭据并发读写；测试命令见 [开发与测试](docs/mcp/development-and-testing.md)，核心重构的既有验收见 [Web 验收记录](docs/web/validation.md)。MCP 验证覆盖公开 5 工具、私有 8 工具及 HTTP/stdio 调用边界。
+## 验证
 
-疑难云辅助使用可控模拟服务完成自动化验证，本次公开发布未完成真实 Provider 联调；真实凭据和测试材料不会随包提供。合成材料上的通过率、误报和漏检统计用于回归检查，不能作为真实案件精度保证。法律数据仍需结合官方现行文本、案件事实和律师复核。
+验收使用 `glm-5.3-flash`、`reasoning_effort=low` 和独立生成的虚构跨格式材料；案例 HTTP/MCP 检索和最大典型合集正文也已按来源清单核验。完整工作区 853 项 Rust 测试、17 项前端测试通过，并完成解压便携包的业务验证与逐文件哈希检查。已执行的命令、统计与限制以 [AI 增量验收报告](docs/web/ai-validation.md) 为准；能力、升级步骤与实现边界见 [升级说明](docs/web/ai-upgrade.md)。
 
-## 文档
-
-- [快速开始](docs/getting-started.md)
-- [安全与隐私](docs/security-and-privacy.md)
-- [MCP 工具与协议](docs/mcp/README.md)
-- [Web 核心功能与运行边界](docs/web/README.md)
-- [法律数据与运行时数据库](docs/data/legal-corpus.md)
+62 份跨格式模拟材料中，41 份自动完成、11 份待复核、10 份因 OCR 不完整或预设损坏失败；自动完成结果未残留已标注敏感信息。AI 输出的 70 个引用均经数据库核验，但部分法律分析仍需人工复核，不应直接作为定稿。
