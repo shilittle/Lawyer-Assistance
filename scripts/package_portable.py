@@ -73,6 +73,8 @@ PORTABLE_FILES = (
     (Path("docs/web/README.md"), Path("docs/web/README.md")),
     (Path("docs/web/ai-upgrade.md"), Path("docs/web/ai-upgrade.md")),
     (Path("docs/web/ai-validation.md"), Path("docs/web/ai-validation.md")),
+    (Path("docs/web/audit-1.2.1.md"), Path("docs/web/audit-1.2.1.md")),
+    (Path("docs/web/audit-1.2.1-contracts.md"), Path("docs/web/audit-1.2.1-contracts.md")),
     (Path("docs/web/redaction-quality.md"), Path("docs/web/redaction-quality.md")),
     (Path("docs/web/validation.md"), Path("docs/web/validation.md")),
     # Existing public/privacy configuration examples contain placeholders only.

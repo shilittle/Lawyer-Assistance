@@ -9,6 +9,7 @@ name = "lawyer-assistance"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = "0.1"
 workspace-service.workspace = true
 privacy-text.workspace = true
 privacy.workspace = true

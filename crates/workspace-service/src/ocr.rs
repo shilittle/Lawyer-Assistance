@@ -1,9 +1,11 @@
-use crate::{hash, AiModelSelection, Error, Result, Workspace};
+use crate::{
+    document_worker::PdfDocumentWorker, estimate_text_tokens, hash, AiModelSelection,
+    ContextExtractionPlan, Error, Result, Workspace,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use file_ingest::{self, FileFormat, OcrAsset, MAX_TEXT_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 const OCR_PURPOSE: &str = "ocr";
@@ -14,7 +16,8 @@ const MAX_OCR_PARSE_RETRIES: usize = 3;
 
 pub(crate) fn health_status(workspace: &Workspace) -> Value {
     let model_configured = workspace.selected_ai_model(OCR_PURPOSE).is_ok();
-    let renderer_available = workspace.pdfium_library().is_some();
+    let worker = crate::document_worker::health_status();
+    let renderer_available = worker["renderer_available"].as_bool().unwrap_or(false);
     let reason = if !model_configured {
         "ocr_model_not_configured"
     } else if !renderer_available {
@@ -27,6 +30,7 @@ pub(crate) fn health_status(workspace: &Workspace) -> Value {
         "model_configured": model_configured,
         "renderer_available": renderer_available,
         "pdf_available": model_configured && renderer_available,
+        "document_worker": worker,
         "reason": reason,
     })
 }
@@ -58,17 +62,28 @@ impl Workspace {
     /// Extract an attachment using the fixed public attachment API. Explicit text encodings are
     /// supplied by the material worker through `extract_ai_attachment_with_encoding`; callers
     /// that do not carry an encoding retain the strict UTF-8 default for TXT.
-    pub async fn extract_ai_attachment(
+    pub(crate) async fn extract_ai_attachment(
         &self,
         name: &str,
         bytes: &[u8],
         selection: &AiModelSelection,
         cancel: &CancellationToken,
+        context: Option<&ContextExtractionPlan>,
+        context_source_id: Option<&str>,
     ) -> Result<String> {
-        self.extract_ai_attachment_with_encoding(name, bytes, None, selection, cancel)
-            .await
+        self.extract_ai_attachment_with_encoding(
+            name,
+            bytes,
+            None,
+            selection,
+            cancel,
+            context,
+            context_source_id,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn extract_ai_attachment_with_encoding(
         &self,
         name: &str,
@@ -76,6 +91,8 @@ impl Workspace {
         encoding: Option<&str>,
         selection: &AiModelSelection,
         cancel: &CancellationToken,
+        context: Option<&ContextExtractionPlan>,
+        context_source_id: Option<&str>,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Err(Error::new("cancelled"));
@@ -94,32 +111,124 @@ impl Workspace {
             FileFormat::Docx => {
                 let (body, assets) = file_ingest::extract_plain_text_with_media(name, bytes)
                     .map_err(map_ingest_error)?;
-                self.ocr_assets(body, assets, selection, bytes, cancel)
-                    .await
+                self.ocr_assets(
+                    body,
+                    assets,
+                    selection,
+                    bytes,
+                    cancel,
+                    context,
+                    context_source_id,
+                )
+                .await
             }
             FileFormat::Png | FileFormat::Jpeg | FileFormat::Webp => {
                 let asset =
                     file_ingest::inspect_ocr_image(name, bytes).map_err(map_ingest_error)?;
-                self.ocr_assets(String::new(), vec![asset], selection, bytes, cancel)
-                    .await
+                self.ocr_assets(
+                    String::new(),
+                    vec![asset],
+                    selection,
+                    bytes,
+                    cancel,
+                    context,
+                    context_source_id,
+                )
+                .await
             }
             FileFormat::Pdf => {
-                let pdfium = self
-                    .pdfium_library()
-                    .ok_or_else(|| Error::new("pdfium_unavailable"))?;
-                let owned = bytes.to_vec();
-                let assets = tokio::task::spawn_blocking(move || {
-                    file_ingest::render_pdf_pages(&owned, &pdfium)
-                })
+                self.extract_pdf_attachment(
+                    bytes,
+                    Some(selection),
+                    cancel,
+                    context,
+                    context_source_id,
+                )
                 .await
-                .map_err(|_| Error::new("pdf_render_failed"))?
-                .map_err(map_ingest_error)?;
-                self.ocr_assets(String::new(), assets, selection, bytes, cancel)
-                    .await
             }
         }
     }
 
+    /// Local-only PDF extraction still goes through the isolated worker. Text-only pages are
+    /// accepted without Pdfium; a scanned or mixed page returns a stable authorization error
+    /// rather than silently dropping its visible content.
+    pub(crate) async fn extract_local_pdf_attachment(
+        &self,
+        bytes: &[u8],
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        self.extract_pdf_attachment(bytes, None, cancel, None, None)
+            .await
+    }
+
+    async fn extract_pdf_attachment(
+        &self,
+        bytes: &[u8],
+        redaction_selection: Option<&AiModelSelection>,
+        cancel: &CancellationToken,
+        context: Option<&ContextExtractionPlan>,
+        context_source_id: Option<&str>,
+    ) -> Result<String> {
+        let mut worker = PdfDocumentWorker::start(bytes, cancel).await?;
+        let result = async {
+            let source_hash = hash(bytes);
+            let ocr = redaction_selection
+                .map(|selection| self.ocr_configuration(selection))
+                .transpose()?;
+            let mut body = String::new();
+            loop {
+                let Some(page) = worker.next_page(cancel).await? else {
+                    break Ok(body);
+                };
+                if let (Some(context), Some(source_id)) = (context, context_source_id) {
+                    let reservation = context.reserve_text_segment(
+                        "attachment",
+                        source_id,
+                        &page.page.locator,
+                        &page.page.text,
+                    )?;
+                    reservation.record_text_result(estimate_text_tokens(&page.page.text))?;
+                }
+                append_text(&mut body, &page.page.text)?;
+                if let Some(asset) = page.ocr_asset {
+                    let redaction_selection = redaction_selection
+                        .ok_or_else(|| Error::new("ocr_model_not_configured"))?;
+                    let (ocr_selection, ocr_revision) = ocr
+                        .as_ref()
+                        .ok_or_else(|| Error::new("ocr_model_not_configured"))?;
+                    let request = self.ocr_asset_text(
+                        &asset,
+                        redaction_selection,
+                        ocr_selection,
+                        *ocr_revision,
+                        &source_hash,
+                        cancel,
+                        context,
+                        context_source_id,
+                    );
+                    tokio::pin!(request);
+                    let text = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(Error::new("cancelled")),
+                        _ = worker.wait_for_exit() => return Err(Error::new("document_worker_exited")),
+                        result = &mut request => result?,
+                    };
+                    append_text(&mut body, &text)?;
+                }
+                worker.acknowledge_page(cancel).await?;
+            }
+        }
+        .await;
+        match result {
+            Ok(text) => worker.finish().await.map(|()| text),
+            Err(error) => {
+                worker.abort().await;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn ocr_assets(
         &self,
         mut body: String,
@@ -127,6 +236,8 @@ impl Workspace {
         redaction_selection: &AiModelSelection,
         source_bytes: &[u8],
         cancel: &CancellationToken,
+        context: Option<&ContextExtractionPlan>,
+        context_source_id: Option<&str>,
     ) -> Result<String> {
         if assets.len() > MAX_OCR_ASSETS {
             return Err(Error::new("ocr_asset_limit_exceeded"));
@@ -134,6 +245,30 @@ impl Workspace {
         if assets.is_empty() {
             return Ok(body);
         }
+        let (ocr_selection, ocr_revision) = self.ocr_configuration(redaction_selection)?;
+        let source_hash = hash(source_bytes);
+        for asset in assets {
+            let text = self
+                .ocr_asset_text(
+                    &asset,
+                    redaction_selection,
+                    &ocr_selection,
+                    ocr_revision,
+                    &source_hash,
+                    cancel,
+                    context,
+                    context_source_id,
+                )
+                .await?;
+            insert_ocr_asset_text(&mut body, &asset, &text)?;
+        }
+        Ok(body)
+    }
+
+    fn ocr_configuration(
+        &self,
+        redaction_selection: &AiModelSelection,
+    ) -> Result<(AiModelSelection, u64)> {
         let ocr_selection = self.selected_ai_model(OCR_PURPOSE)?;
         let (ocr_config, _) = self.ai_config(&ocr_selection)?;
         if !self.ai_provider_is_trusted(redaction_selection)?
@@ -141,68 +276,90 @@ impl Workspace {
         {
             return Err(Error::new("ocr_requires_trusted_provider"));
         }
-        let source_hash = hash(source_bytes);
-        for asset in assets {
-            if cancel.is_cancelled() {
-                return Err(Error::new("cancelled"));
-            }
-            let asset_hash = hash(&asset.bytes);
-            let cache_id = hash(
-                format!(
-                    "{OCR_CACHE_VERSION}:{source_hash}:{}:{asset_hash}:{}",
-                    asset.locator, ocr_config.revision
-                )
-                .as_bytes(),
-            );
-            let text = match self
-                .store
-                .maybe::<OcrPageRecord>("ai_ocr_page", &cache_id)?
-            {
-                Some(cached)
-                    if cached.source_sha256 == source_hash
-                        && cached.locator == asset.locator
-                        && cached.asset_sha256 == asset_hash
-                        && cached.provider_id == ocr_selection.provider_id
-                        && cached.model == ocr_selection.model
-                        && cached.provider_revision == ocr_config.revision =>
-                {
-                    cached.text
-                }
-                _ => {
-                    if !self.ai_provider_is_trusted(redaction_selection)?
-                        || !self.ai_provider_is_trusted(&ocr_selection)?
-                    {
-                        return Err(Error::new("ocr_requires_trusted_provider"));
-                    }
-                    let binding = hash(
-                        format!(
-                            "{OCR_CACHE_VERSION}:{source_hash}:{}:{asset_hash}:{}",
-                            asset.locator, ocr_config.revision
-                        )
-                        .as_bytes(),
-                    );
-                    let text = self
-                        .ocr_asset(&asset, &ocr_selection, &binding, cancel)
-                        .await?;
-                    self.save_ocr_page(
-                        &cache_id,
-                        OcrPageRecord {
-                            source_sha256: source_hash.clone(),
-                            locator: asset.locator.clone(),
-                            asset_sha256: asset_hash,
-                            provider_id: ocr_selection.provider_id.clone(),
-                            model: ocr_selection.model.clone(),
-                            provider_revision: ocr_config.revision,
-                            text: text.clone(),
-                            completed_at: crate::now(),
-                        },
-                    )?;
-                    text
-                }
-            };
-            insert_ocr_asset_text(&mut body, &asset, &text)?;
+        Ok((ocr_selection, ocr_config.revision))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ocr_asset_text(
+        &self,
+        asset: &OcrAsset,
+        redaction_selection: &AiModelSelection,
+        ocr_selection: &AiModelSelection,
+        ocr_revision: u64,
+        source_hash: &str,
+        cancel: &CancellationToken,
+        context: Option<&ContextExtractionPlan>,
+        context_source_id: Option<&str>,
+    ) -> Result<String> {
+        if cancel.is_cancelled() {
+            return Err(Error::new("cancelled"));
         }
-        Ok(body)
+        let asset_hash = hash(&asset.bytes);
+        let cache_id = hash(
+            format!(
+                "{OCR_CACHE_VERSION}:{source_hash}:{}:{asset_hash}:{ocr_revision}",
+                asset.locator
+            )
+            .as_bytes(),
+        );
+        match self
+            .store
+            .maybe::<OcrPageRecord>("ai_ocr_page", &cache_id)?
+        {
+            Some(cached)
+                if cached.source_sha256 == source_hash
+                    && cached.locator == asset.locator
+                    && cached.asset_sha256 == asset_hash
+                    && cached.provider_id == ocr_selection.provider_id
+                    && cached.model == ocr_selection.model
+                    && cached.provider_revision == ocr_revision =>
+            {
+                Ok(cached.text)
+            }
+            _ => {
+                if !self.ai_provider_is_trusted(redaction_selection)?
+                    || !self.ai_provider_is_trusted(ocr_selection)?
+                {
+                    return Err(Error::new("ocr_requires_trusted_provider"));
+                }
+                let binding = hash(
+                    format!(
+                        "{OCR_CACHE_VERSION}:{source_hash}:{}:{asset_hash}:{ocr_revision}",
+                        asset.locator
+                    )
+                    .as_bytes(),
+                );
+                let reservation = match (context, context_source_id) {
+                    (Some(context), Some(source_id)) => Some(context.reserve_ocr_page(
+                        source_id,
+                        &asset.locator,
+                        0,
+                        asset.bytes.len(),
+                    )?),
+                    _ => None,
+                };
+                let text = self
+                    .ocr_asset(asset, ocr_selection, &binding, cancel)
+                    .await?;
+                self.save_ocr_page(
+                    &cache_id,
+                    OcrPageRecord {
+                        source_sha256: source_hash.to_owned(),
+                        locator: asset.locator.clone(),
+                        asset_sha256: asset_hash,
+                        provider_id: ocr_selection.provider_id.clone(),
+                        model: ocr_selection.model.clone(),
+                        provider_revision: ocr_revision,
+                        text: text.clone(),
+                        completed_at: crate::now(),
+                    },
+                )?;
+                if let Some(reservation) = reservation {
+                    reservation.record_ocr_result(estimate_text_tokens(&text))?;
+                }
+                Ok(text)
+            }
+        }
     }
 
     fn save_ocr_page(&self, cache_id: &str, record: OcrPageRecord) -> Result<()> {
@@ -269,36 +426,6 @@ impl Workspace {
             }
         }
         Err(last_invalid.unwrap_or_else(|| Error::new("ocr_response_invalid")))
-    }
-
-    fn pdfium_library(&self) -> Option<PathBuf> {
-        let mut candidates = Vec::new();
-        if let Some(path) = std::env::var_os("LAWYER_ASSISTANCE_PDFIUM") {
-            candidates.push(PathBuf::from(path));
-        }
-        if let Some(directory) = std::env::var_os("LAWYER_RUNTIME_TOOLS") {
-            let directory = PathBuf::from(directory);
-            candidates.push(directory.join("pdfium.dll"));
-            // Accept a directly supplied DLL path as a convenience for test and portable
-            // launchers while retaining the absolute-file check below.
-            candidates.push(directory);
-        }
-        candidates.push(self.root.join("runtime-tools").join("pdfium.dll"));
-        candidates.push(self.root.join("output/runtime-tools/pdfium.dll"));
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(parent) = executable.parent() {
-                candidates.push(parent.join("runtime-tools/pdfium.dll"));
-                candidates.push(parent.join("tools/pdfium.dll"));
-                candidates.push(parent.join("pdfium.dll"));
-            }
-        }
-        if let Ok(current) = std::env::current_dir() {
-            candidates.push(current.join("output/runtime-tools/pdfium.dll"));
-            candidates.push(current.join("runtime-tools/pdfium.dll"));
-        }
-        candidates
-            .into_iter()
-            .find(|path| path.is_absolute() && path.is_file())
     }
 }
 
@@ -484,6 +611,8 @@ mod tests {
                 Some("gb18030"),
                 &selection,
                 &CancellationToken::new(),
+                None,
+                None,
             )
             .await
             .expect("GB18030 text");

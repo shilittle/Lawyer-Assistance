@@ -142,6 +142,25 @@ pub struct OcrAsset {
     pub height: u32,
 }
 
+/// One inspected PDF page. `text` is normalized local text for the page; a page with no text or
+/// with an image XObject requires a visual OCR pass. The worker emits these records in page order
+/// and never retains their rendered image after the caller accepts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PdfPage {
+    pub number: u32,
+    pub locator: String,
+    pub text: String,
+    pub needs_ocr: bool,
+}
+
+/// A single streamed PDF page payload. The image is present only when [`PdfPage::needs_ocr`] is
+/// true. Keeping it in a per-page callback prevents an attachment from accumulating a document-
+/// sized `Vec<OcrAsset>` in the renderer or caller.
+pub struct PdfPageOutput {
+    pub page: PdfPage,
+    pub ocr_asset: Option<OcrAsset>,
+}
+
 /// Internal marker inserted into DOCX body text at the position of a validated embedded image.
 ///
 /// The marker is never derived from a document relationship ID or source path.  The OCR pipeline
@@ -441,66 +460,103 @@ fn decode_webp_for_ocr(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), IngestError>
     Ok((encoded, dimensions.0, dimensions.1))
 }
 
-/// Render every PDF page to a bounded PNG for cloud vision OCR. The caller supplies the path to
-/// the packaged Pdfium DLL; no system installation is searched implicitly. Rendering is kept in
-/// this crate so the workspace service can authorize and persist the resulting text without
-/// exposing a parser or filesystem path to the browser.
-pub fn render_pdf_pages(bytes: &[u8], pdfium_library: &Path) -> Result<Vec<OcrAsset>, IngestError> {
-    if bytes.len() > MAX_FILE_BYTES {
-        return Err(IngestError::FileTooLarge);
+/// Inspect PDF pages and stream only pages requiring visual OCR. The optional library is checked
+/// only when a page actually needs rendering, so text-only PDFs do not load Pdfium. `emit` is
+/// synchronous by design: an IPC writer can wait for its acknowledgement before the next page is
+/// rendered, giving the caller a fixed page-buffer bound.
+pub fn stream_pdf_pages<F>(
+    bytes: &[u8],
+    pdfium_library: Option<&Path>,
+    mut emit: F,
+) -> Result<(), IngestError>
+where
+    F: FnMut(PdfPageOutput) -> Result<(), IngestError>,
+{
+    let pages = inspect_pdf_pages(bytes)?;
+    let needs_renderer = pages.iter().any(|page| page.needs_ocr);
+
+    if !needs_renderer {
+        for page in pages {
+            emit(PdfPageOutput {
+                page,
+                ocr_asset: None,
+            })?;
+        }
+        return Ok(());
     }
-    verify_magic(FileFormat::Pdf, bytes)?;
-    if !pdfium_library.is_absolute() || !pdfium_library.is_file() {
-        return Err(IngestError::PdfiumUnavailable);
-    }
+
+    let pdfium_library = pdfium_library
+        .filter(|path| path.is_absolute() && path.is_file())
+        .ok_or(IngestError::PdfiumUnavailable)?;
     let pdfium = bind_pdfium(pdfium_library)?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(|_| IngestError::PdfRenderFailed)?;
-    let page_count = document.pages().len();
-    let page_count = usize::try_from(page_count).map_err(|_| IngestError::PdfPageLimitExceeded)?;
-    if page_count > MAX_PDF_PAGES {
-        return Err(IngestError::PdfPageLimitExceeded);
+    let rendered_page_count =
+        usize::try_from(document.pages().len()).map_err(|_| IngestError::PdfPageLimitExceeded)?;
+    if rendered_page_count != pages.len() || rendered_page_count > MAX_PDF_PAGES {
+        return Err(IngestError::PdfRenderFailed);
     }
-    let mut assets = Vec::with_capacity(page_count);
+
     let mut total_encoded = 0usize;
-    for (index, page) in document.pages().iter().enumerate() {
-        let bitmap = page
-            .render_with_config(
-                &pdfium_render::prelude::PdfRenderConfig::new()
-                    .set_target_width(1_600)
-                    .set_maximum_width(2_400)
-                    .set_maximum_height(3_200),
-            )
-            .map_err(|_| IngestError::PdfRenderFailed)?;
-        let image = bitmap
-            .as_image()
-            .map_err(|_| IngestError::PdfRenderFailed)?;
-        let (width, height) = (image.width(), image.height());
-        validate_image_dimensions(width, height)?;
-        let mut encoded = Cursor::new(Vec::new());
-        image
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .map_err(|_| IngestError::PdfRenderFailed)?;
-        let encoded = encoded.into_inner();
-        if encoded.len() > MAX_OCR_IMAGE_BYTES {
-            return Err(IngestError::ImageDimensionLimitExceeded);
-        }
-        total_encoded = total_encoded
-            .checked_add(encoded.len())
-            .ok_or(IngestError::FileTooLarge)?;
-        if total_encoded > MAX_OCR_DOCUMENT_BYTES {
-            return Err(IngestError::FileTooLarge);
-        }
-        assets.push(OcrAsset {
-            locator: format!("page:{}", index + 1),
-            mime_type: PNG_MIME.to_owned(),
-            bytes: encoded,
-            width,
-            height,
-        });
+    for page in pages {
+        let ocr_asset = if page.needs_ocr {
+            let index = i32::try_from(page.number.saturating_sub(1))
+                .map_err(|_| IngestError::PdfRenderFailed)?;
+            let rendered = document
+                .pages()
+                .get(index)
+                .map_err(|_| IngestError::PdfRenderFailed)?;
+            let bitmap = rendered
+                .render_with_config(
+                    &pdfium_render::prelude::PdfRenderConfig::new()
+                        .set_target_width(1_600)
+                        .set_maximum_width(2_400)
+                        .set_maximum_height(3_200),
+                )
+                .map_err(|_| IngestError::PdfRenderFailed)?;
+            let image = bitmap
+                .as_image()
+                .map_err(|_| IngestError::PdfRenderFailed)?;
+            let (width, height) = (image.width(), image.height());
+            validate_image_dimensions(width, height)?;
+            let mut encoded = Cursor::new(Vec::new());
+            image
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .map_err(|_| IngestError::PdfRenderFailed)?;
+            let encoded = encoded.into_inner();
+            if encoded.len() > MAX_OCR_IMAGE_BYTES {
+                return Err(IngestError::ImageDimensionLimitExceeded);
+            }
+            total_encoded = total_encoded
+                .checked_add(encoded.len())
+                .ok_or(IngestError::FileTooLarge)?;
+            if total_encoded > MAX_OCR_DOCUMENT_BYTES {
+                return Err(IngestError::FileTooLarge);
+            }
+            Some(OcrAsset {
+                locator: page.locator.clone(),
+                mime_type: PNG_MIME.to_owned(),
+                bytes: encoded,
+                width,
+                height,
+            })
+        } else {
+            None
+        };
+        emit(PdfPageOutput { page, ocr_asset })?;
     }
-    Ok(assets)
+    Ok(())
+}
+
+/// Inspect page-local text and visual content without binding Pdfium. This supports text-only
+/// local processing and lets the isolated renderer decide exactly which pages it must render.
+pub fn inspect_pdf_pages(bytes: &[u8]) -> Result<Vec<PdfPage>, IngestError> {
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(IngestError::FileTooLarge);
+    }
+    verify_magic(FileFormat::Pdf, bytes)?;
+    pdf::inspect_pages(bytes, Limits::default())
 }
 
 fn bind_pdfium(pdfium_library: &Path) -> Result<pdfium_render::prelude::Pdfium, IngestError> {

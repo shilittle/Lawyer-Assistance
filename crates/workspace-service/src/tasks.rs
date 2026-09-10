@@ -2,6 +2,23 @@ use crate::{redaction_ai::AiStageRecord, *};
 use privacy_text::{AiFinding, Analysis, CloudFinding};
 use serde::Deserialize;
 
+fn source_format(name: &str) -> String {
+    match name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "txt" | "md" | "markdown" | "docx" | "pdf" | "png" | "jpg" | "jpeg" | "webp" => name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        _ => "unknown".to_owned(),
+    }
+}
+
 impl Workspace {
     pub fn replace_material(
         &self,
@@ -27,9 +44,13 @@ impl Workspace {
             r.revoked = true;
             rows.push(Store::encoded("result", &rid, &r)?);
         }
+        let source_byte_len = u64::try_from(file.bytes.len()).unwrap_or(u64::MAX);
+        let source_format = source_format(&file.name);
         m.name = file.name;
         m.encoding = file.encoding;
         m.source_sha256 = hash(&file.bytes);
+        m.source_byte_len = source_byte_len;
+        m.source_format = source_format;
         m.revision += 1;
         m.original_text.clear();
         m.analysis = None;
@@ -99,6 +120,8 @@ impl Workspace {
         };
         let mut rows = Vec::new();
         for file in files {
+            let source_byte_len = u64::try_from(file.bytes.len()).unwrap_or(u64::MAX);
+            let source_format = source_format(&file.name);
             let material = Material {
                 id: id("mat"),
                 name: file.name,
@@ -108,6 +131,8 @@ impl Workspace {
                 reason_code: None,
                 revision: 1,
                 source_sha256: hash(&file.bytes),
+                source_byte_len,
+                source_format,
                 encoding: file.encoding,
                 original_text: String::new(),
                 analysis: None,
@@ -411,44 +436,109 @@ impl Workspace {
     }
     pub fn start_worker(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let service = Arc::clone(self);
-        tokio::spawn(async move {
+        self.supervisor
+            .spawn("material_worker", "worker".to_owned(), async move {
             loop {
                 match service.claim_next() {
                     Ok(Some((m, g, cancel))) => {
                         let id = m.id.clone();
+                        let task_id = m.task_id.clone();
                         let revision = m.revision;
-                        if let Err(error) = service.process_material(m, g, cancel).await {
-                            let _ = service.fail_material(&id, revision, &error.code);
+                        // A successful queue read, not merely the attempt to read it,
+                        // proves that this worker can currently accept work.
+                        service
+                            .supervisor
+                            .heartbeat("material_worker", "worker", "processing");
+                        service.supervisor.start("material", &task_id, "processing");
+                        if let Err(error) = service
+                            .process_material_with_heartbeat(m, g, cancel)
+                            .await
+                        {
+                            service.supervisor.operation_failed(
+                                "material",
+                                &task_id,
+                                "processing",
+                                &error,
+                            );
+                            match service.fail_material(&id, revision, &error.code) {
+                                Ok(true) => {
+                                    // The material failure is durable and the worker can continue.
+                                    service.supervisor.completed("material", &task_id, "failed_persisted");
+                                }
+                                Ok(false) => {
+                                    // A cancel/retry/replacement won the race.  The stale worker
+                                    // must not rewrite that terminal or newer state.
+                                    service.supervisor.completed("material", &task_id, "superseded");
+                                }
+                                Err(persist_error) => {
+                                    service.supervisor.operation_failed(
+                                        "material",
+                                        &task_id,
+                                        "persist_failure",
+                                        &persist_error,
+                                    );
+                                    service.supervisor.failed(
+                                        "material_worker",
+                                        "worker",
+                                        "persist_failure",
+                                        &persist_error,
+                                    );
+                                }
+                            }
+                        } else {
+                            service.supervisor.completed("material", &task_id, "completed");
                         }
                     }
-                    _ => {
+                    Ok(None) => {
+                        service
+                            .supervisor
+                            .heartbeat("material_worker", "worker", "idle");
+                        tokio::select! {_ = service.wake.notified()=>{},_ = tokio::time::sleep(std::time::Duration::from_secs(2))=>{}}
+                    }
+                    Err(error) => {
+                        // A storage failure is an operational fault, never an empty queue.
+                        // Retain the fault in local diagnostics and surface it through health;
+                        // a subsequent successful claim restores liveness.
+                        service.supervisor.failed(
+                            "material_worker",
+                            "worker",
+                            "claim_next",
+                            &error,
+                        );
                         tokio::select! {_ = service.wake.notified()=>{},_ = tokio::time::sleep(std::time::Duration::from_secs(2))=>{}}
                     }
                 }
             }
-        })
+        }, |_| Ok(()))
     }
     fn claim_next(&self) -> Result<Option<(Material, Group, CancellationToken)>> {
         let _gate = self.lock()?;
-        let next = self
-            .store
-            .list::<Material>("material")?
-            .into_iter()
-            .find(|m| m.status == "queued");
-        if let Some(mut m) = next {
-            let g: Group = self.store.get("group", &m.group_id)?;
-            m.status = "running".into();
-            m.dictionary_revision = g.dictionary_revision;
+        // The empty path reads only `object_index`; it never opens every
+        // encrypted material body just to discover an idle queue. The store
+        // rechecks the indexed status while it atomically transitions exactly
+        // one selected material to running.
+        for _ in 0..2 {
+            let Some((material_id, group_id)) = self.store.next_queued_material()? else {
+                return Ok(None);
+            };
+            let g: Group = self.store.get("group", &group_id)?;
+            let Some(m) = self
+                .store
+                .claim_queued_material(&material_id, g.dictionary_revision)?
+            else {
+                continue;
+            };
             let cancellation = CancellationToken::new();
             self.cancellations
                 .lock()
                 .map_err(|_| Error::new("workspace_unavailable"))?
                 .insert(m.task_id.clone(), cancellation.clone());
-            self.store.save("material", &m.id, &m)?;
-            Ok(Some((m, g, cancellation)))
-        } else {
-            Ok(None)
+            return Ok(Some((m, g, cancellation)));
         }
+        // A competing storage claimant can win the two conditional attempts.
+        // The worker wakes again rather than interpreting this as a durable
+        // empty queue.
+        Ok(None)
     }
     async fn process_material(
         &self,
@@ -456,13 +546,6 @@ impl Workspace {
         g: Group,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let bytes = self.store.raw("source", &m.id)?;
-        if hash(&bytes) != m.source_sha256 {
-            return Err(Error::new("source_integrity_failed"));
-        }
-        let name = m.name.clone();
-        let encoding = m.encoding.clone();
-
         // A configured AI model opts this material into the durable OCR + model-led path. If no
         // redaction model is configured, preserve the legacy local-only behavior; any other
         // configuration error is surfaced instead of silently reporting an AI success.
@@ -471,7 +554,31 @@ impl Workspace {
             Err(error) if error.code == "ai_model_required" => None,
             Err(error) => return Err(error),
         };
+
+        // All model-backed material work follows the same global order as AI runs: AI, then
+        // Parse.  In particular, do not hold the sole Parse permit while awaiting AI, because
+        // an AI run can already hold AI while awaiting Parse.  Model selection reads only small
+        // configuration records; protected source bytes remain closed until both required grants
+        // are active.  The AI grant stays alive through OCR and redaction; Parse is released once
+        // text extraction is complete below.
+        let _ai = match ai_selection.as_ref() {
+            Some(_) => Some(self.acquire_admission(AdmissionClass::Ai, &cancel).await?),
+            None => None,
+        };
+        let parse = self
+            .acquire_admission(AdmissionClass::Parse, &cancel)
+            .await?;
+        let bytes = self.store.raw("source", &m.id)?;
+        if hash(&bytes) != m.source_sha256 {
+            return Err(Error::new("source_integrity_failed"));
+        }
+        let name = m.name.clone();
+        let encoding = m.encoding.clone();
+
         if let Some(selection) = ai_selection {
+            // This covers OCR and redaction as one model-backed material job.
+            // ai_complete retains its request-level transport slot, while this
+            // admission bounds durable jobs and their waiting queue.
             self.save_ai_stage(
                 &m.id,
                 m.revision,
@@ -488,6 +595,8 @@ impl Workspace {
                     encoding.as_deref(),
                     &selection,
                     &cancel,
+                    None,
+                    None,
                 )
                 .await
             {
@@ -528,6 +637,7 @@ impl Workspace {
                 Some(text_sha256.clone()),
                 None,
             )?;
+            drop(parse);
             self.save_ai_stage(
                 &m.id,
                 m.revision,
@@ -598,12 +708,22 @@ impl Workspace {
             return Ok(());
         }
 
-        m.original_text = tokio::task::spawn_blocking(move || {
-            privacy_text::extract(&name, &bytes, encoding.as_deref())
-        })
-        .await
-        .map_err(|_| Error::new("extraction_failed"))?
-        .map_err(|e| Error::new(&e.to_string()))?;
+        // PDF text extraction is always delegated to the same isolated worker used by the
+        // model-backed path. A local-only job may accept text pages, but it fails explicitly when
+        // a scanned or mixed page would require an unconfigured OCR model.
+        m.original_text = if matches!(
+            file_ingest::detect_format(&name).map_err(|error| Error::new(error.code()))?,
+            file_ingest::FileFormat::Pdf
+        ) {
+            self.extract_local_pdf_attachment(&bytes, &cancel).await?
+        } else {
+            tokio::task::spawn_blocking(move || {
+                privacy_text::extract(&name, &bytes, encoding.as_deref())
+            })
+            .await
+            .map_err(|_| Error::new("extraction_failed"))?
+            .map_err(|e| Error::new(&e.to_string()))?
+        };
         let text = m.original_text.clone();
         let group = g.clone();
         let dismissed = m.dismissed.clone();
@@ -613,6 +733,7 @@ impl Workspace {
         .await
         .map_err(|_| Error::new("redaction_failed"))?
         .map_err(|e| Error::new(&e.to_string()))?;
+        drop(parse);
         let mut waiting = false;
         {
             let _gate = self.lock()?;
@@ -670,6 +791,25 @@ impl Workspace {
             waiting = false;
         }
         self.finish_locked(m, &g, analysis, waiting)
+    }
+    async fn process_material_with_heartbeat(
+        &self,
+        m: Material,
+        g: Group,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let task_id = m.task_id.clone();
+        let work = self.process_material(m, g, cancel);
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                result = &mut work => return result,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    self.supervisor.heartbeat("material_worker", "worker", "processing");
+                    self.supervisor.heartbeat("material", &task_id, "processing");
+                }
+            }
+        }
     }
     fn claim_cloud(&self, m: &Material) -> Result<Option<(CloudConsent, ProviderConfig)>> {
         let _gate = self.lock()?;
@@ -797,6 +937,7 @@ impl Workspace {
                 revision: m.revision,
                 dictionary_revision: g.dictionary_revision,
                 output_sha256: hash(analysis.text.as_bytes()),
+                text_byte_len: u64::try_from(analysis.text.len()).unwrap_or(u64::MAX),
                 text: analysis.text.clone(),
                 created_at: now(),
                 expires_at: now() + 30 * 24 * 3600,
@@ -831,15 +972,315 @@ impl Workspace {
         rows.push(Store::encoded("material", &m.id, &m)?);
         self.store.put_many(rows)
     }
-    fn fail_material(&self, id: &str, revision: u64, code: &str) -> Result<()> {
+    /// Returns whether this invocation won the state transition.  It writes only
+    /// a currently running revision, so an old worker result cannot overwrite a
+    /// cancellation, an explicit failure, a replacement, or a retry.
+    fn fail_material(&self, id: &str, revision: u64, code: &str) -> Result<bool> {
         let _gate = self.lock()?;
         let mut m = self.material(id)?;
         if m.revision == revision && m.status == "running" {
             m.status = "failed".into();
             m.reason_code = Some(code.into());
             self.store.save("material", id, &m)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod worker_supervision_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::time::Duration;
+
+    fn open_workspace() -> (tempfile::TempDir, Arc<Workspace>) {
+        let temporary = tempfile::tempdir().expect("temporary workspace directory");
+        let workspace = Workspace::open(
+            temporary.path().join("workspace"),
+            temporary.path().join("missing-legal.sqlite"),
+        )
+        .expect("workspace opens");
+        (temporary, workspace)
+    }
+
+    #[tokio::test]
+    async fn storage_failure_is_not_reported_as_an_empty_queue() {
+        let (_temporary, workspace) = open_workspace();
+        // This is an unindexed encrypted-object corruption, not an artificial
+        // `claim_next` return value.  The worker must quarantine and report
+        // it instead of treating an empty index as an idle queue.
+        let connection = Connection::open(workspace.root.join("workspace.sqlite"))
+            .expect("second SQLite connection opens");
+        connection
+            .execute(
+                "INSERT INTO objects(kind,id,body) VALUES('material','mat_broken',?1)",
+                rusqlite::params![vec![0_u8]],
+            )
+            .expect("broken synthetic encrypted record inserts");
+        drop(connection);
+
+        let worker = workspace.start_worker();
+        let mut observed_failure = false;
+        for _ in 0..50 {
+            let health = workspace.health();
+            if health["supervision"]["material_worker"]["status"] == "failed" {
+                observed_failure = true;
+                assert_eq!(health["status"], "degraded");
+                assert_eq!(
+                    health["supervision"]["material_worker"]["last_error_code"],
+                    "storage_object_corrupt"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        worker.abort();
+        let _ = worker.await;
+        assert!(
+            observed_failure,
+            "storage failure must remain visible to health"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_parse_queue_rejects_before_opening_encrypted_source() {
+        let (_temporary, workspace) = open_workspace();
+        let group_id = workspace
+            .create_group("parse-admission")
+            .expect("group creates")["id"]
+            .as_str()
+            .expect("group identifier")
+            .to_owned();
+        let task = workspace
+            .submit(
+                &group_id,
+                "parse_admission",
+                vec![ImportFile {
+                    name: "source.txt".to_owned(),
+                    bytes: b"this ciphertext must not be opened".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("material submits");
+        let material_id = task["materials"][0]["id"]
+            .as_str()
+            .expect("material identifier")
+            .to_owned();
+        let (material, group, _) = workspace
+            .claim_next()
+            .expect("claim reads storage")
+            .expect("material is claimed");
+
+        // If process_material reads the source before admission, this invalid
+        // ciphertext produces encrypted_object_invalid.  With the parser
+        // queue full it must instead fail at admission without touching it.
+        let connection = Connection::open(workspace.root.join("workspace.sqlite"))
+            .expect("second SQLite connection opens");
+        connection
+            .execute(
+                "UPDATE objects SET body=?1 WHERE kind='source' AND id=?2",
+                rusqlite::params![vec![0_u8], material_id],
+            )
+            .expect("source ciphertext corrupts for controlled test");
+        drop(connection);
+
+        let cancel = CancellationToken::new();
+        let active = workspace
+            .acquire_admission(AdmissionClass::Parse, &cancel)
+            .await
+            .expect("active parser slot fills");
+        let waiting_one = workspace
+            .admission
+            .reserve(AdmissionClass::Parse)
+            .expect("first parser wait place fills");
+        let waiting_two = workspace
+            .admission
+            .reserve(AdmissionClass::Parse)
+            .expect("second parser wait place fills");
+
+        let error = workspace
+            .process_material(material, group, CancellationToken::new())
+            .await
+            .expect_err("full parser queue rejects before source open");
+        assert_eq!(error.code, "capacity_exceeded");
+        drop((active, waiting_one, waiting_two));
+    }
+
+    fn configure_redaction_model(workspace: &Workspace) {
+        let selection = AiModelSelection {
+            provider_id: "admission_provider".to_owned(),
+            model: "admission_model".to_owned(),
+        };
+        workspace
+            .store
+            .save(
+                "provider",
+                &selection.provider_id,
+                &ProviderConfig {
+                    id: selection.provider_id.clone(),
+                    name: "admission test provider".to_owned(),
+                    base_url: "http://127.0.0.1:1".to_owned(),
+                    model: selection.model.clone(),
+                    allow_private_network: true,
+                    revision: 1,
+                },
+            )
+            .expect("synthetic provider configuration saves");
+        workspace
+            .store
+            .save(
+                "ai_provider",
+                &selection.provider_id,
+                &AiProviderMetadata {
+                    preset: "custom".to_owned(),
+                    enabled_models: vec![selection.model.clone()],
+                    trust_raw: true,
+                    base_url: "http://127.0.0.1:1".to_owned(),
+                    model_capabilities: std::collections::BTreeMap::new(),
+                },
+            )
+            .expect("synthetic AI metadata saves");
+        workspace
+            .store
+            .save(
+                "ai_defaults",
+                "default",
+                &std::collections::BTreeMap::from([("redaction".to_owned(), selection)]),
+            )
+            .expect("synthetic redaction default saves");
+    }
+
+    #[tokio::test]
+    async fn ai_material_waits_for_ai_before_parse_and_cancellation_releases_waiter() {
+        let (_temporary, workspace) = open_workspace();
+        configure_redaction_model(&workspace);
+        let group_id = workspace
+            .create_group("AI admission order")
+            .expect("group creates")["id"]
+            .as_str()
+            .expect("group identifier")
+            .to_owned();
+        let submitted = workspace
+            .submit(
+                &group_id,
+                "ai_admission_order",
+                vec![ImportFile {
+                    name: "source.txt".to_owned(),
+                    bytes: b"synthetic source that must stay unopened while waiting".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("material submits");
+        let material_id = submitted["materials"][0]["id"]
+            .as_str()
+            .expect("material identifier");
+        let material = workspace.material(material_id).expect("material reads");
+        let group = workspace
+            .store
+            .get("group", &group_id)
+            .expect("group reads");
+
+        // This represents AI runs that already own AI and await the sole parser.  The material
+        // must join AI's queue without occupying or queuing for Parse; the old Parse -> AI order
+        // would instead produce parse.waiting == 1 here.
+        let holder_cancel = CancellationToken::new();
+        let parse_holder = workspace
+            .acquire_admission(AdmissionClass::Parse, &holder_cancel)
+            .await
+            .expect("parser is held by another run");
+        let first_ai_holder = workspace
+            .acquire_admission(AdmissionClass::Ai, &holder_cancel)
+            .await
+            .expect("first AI slot is held by another run");
+        let second_ai_holder = workspace
+            .acquire_admission(AdmissionClass::Ai, &holder_cancel)
+            .await
+            .expect("second AI slot is held by another run");
+
+        let cancel = CancellationToken::new();
+        let service = Arc::clone(&workspace);
+        let worker_cancel = cancel.clone();
+        let work = tokio::spawn(async move {
+            service
+                .process_material(material, group, worker_cancel)
+                .await
+        });
+
+        for _ in 0..50 {
+            let snapshot = workspace.admission.snapshot();
+            if snapshot["ai"]["waiting"].as_u64() == Some(1)
+                && snapshot["parse"]["waiting"].as_u64() == Some(0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let snapshot = workspace.admission.snapshot();
+        assert_eq!(snapshot["ai"]["active"].as_u64(), Some(2));
+        assert_eq!(snapshot["ai"]["waiting"].as_u64(), Some(1));
+        assert_eq!(snapshot["parse"]["active"].as_u64(), Some(1));
+        assert_eq!(snapshot["parse"]["waiting"].as_u64(), Some(0));
+
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), work)
+            .await
+            .expect("cancelled waiter cannot deadlock")
+            .expect("worker task joins")
+            .expect_err("AI admission wait is cancelled");
+        assert_eq!(error.code, "cancelled");
+        drop((first_ai_holder, second_ai_holder, parse_holder));
+
+        let snapshot = workspace.admission.snapshot();
+        assert_eq!(snapshot["ai"]["active"].as_u64(), Some(0));
+        assert_eq!(snapshot["ai"]["waiting"].as_u64(), Some(0));
+        assert_eq!(snapshot["parse"]["active"].as_u64(), Some(0));
+        assert_eq!(snapshot["parse"]["waiting"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn cancellation_wins_against_a_late_material_failure_write() {
+        let (_temporary, workspace) = open_workspace();
+        let group_id = workspace
+            .create_group("late-write-race")
+            .expect("group creates")["id"]
+            .as_str()
+            .expect("group identifier")
+            .to_owned();
+        let task = workspace
+            .submit(
+                &group_id,
+                "late_write_race",
+                vec![ImportFile {
+                    name: "source.txt".to_owned(),
+                    bytes: b"ordinary local test text".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("material submits");
+        let material_id = task["materials"][0]["id"]
+            .as_str()
+            .expect("material identifier")
+            .to_owned();
+        let (claimed, _, _) = workspace
+            .claim_next()
+            .expect("claim reads storage")
+            .expect("submitted material is claimed");
+        workspace
+            .cancel_task(&claimed.task_id)
+            .expect("running task cancels");
+
+        assert!(!workspace
+            .fail_material(&material_id, claimed.revision, "task_panicked")
+            .expect("late write is evaluated"));
+        let material = workspace
+            .material(&material_id)
+            .expect("material remains readable");
+        assert_eq!(material.status, "cancelled");
+        assert_eq!(material.reason_code.as_deref(), Some("cancelled"));
     }
 }
 

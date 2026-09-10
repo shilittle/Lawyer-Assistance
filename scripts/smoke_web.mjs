@@ -374,6 +374,11 @@ async function runBrowserSmoke(connection, options) {
 
     await page.getByRole("button", { name: "法律检索", exact: true }).click();
     await waitForHeading(page, "法律检索");
+    // Current scope must be the default. Historical body access is an explicit
+    // scope choice in 1.2.1; current-scope details show historical metadata only.
+    const versionScope = page.getByRole("combobox", { name: "版本范围", exact: true });
+    check(await versionScope.inputValue() === "current", "默认版本范围应为当前有效");
+    await versionScope.selectOption("all");
     await page.getByPlaceholder("输入法条、关键词或文号").fill("合同");
     await page.getByRole("button", { name: "搜索法条", exact: true }).click();
     await page.getByText(/命中 [1-9]\d* 部法律/u).waitFor({ state: "visible", timeout: 20_000 });
@@ -404,8 +409,8 @@ async function runBrowserSmoke(connection, options) {
     await page.getByRole("button", { name: "文书写作", exact: true }).click();
     await waitForHeading(page, "文书写作");
     await page.getByRole("button", { name: "生成文书", exact: true }).waitFor({ state: "visible" });
-    // Offline CI checks the new writing entry; GLM generation and rendered exports
-    // are exercised by smoke_ai_live.mjs and verify_ai_exports.mjs.
+    // The repair native suite separately verifies generation and TXT/PDF/DOCX
+    // exports using a localhost synthetic model, without a paid endpoint.
 
     await page.getByRole("button", { name: "AI 对话", exact: true }).click();
     await waitForHeading(page, "AI 对话");

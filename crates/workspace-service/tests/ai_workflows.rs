@@ -3,7 +3,7 @@ use std::{
     collections::BTreeSet,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
@@ -11,8 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 use workspace_service::{
-    ai_tools, AiMaterialReference, AiModelSelection, AiProviderRequest, AiRunRequest, ImportFile,
-    SaveProviderRequest, Workspace,
+    ai_tools, AiCaseDateUpdate, AiDocumentEdit, AiMaterialReference, AiModelCapabilities,
+    AiModelSelection, AiProviderRequest, AiRunRequest, ImportFile, SaveProviderRequest, Workspace,
 };
 
 struct Mock {
@@ -196,6 +196,7 @@ struct Fixture {
     workspace: Arc<Workspace>,
     provider: String,
     credential_target: String,
+    legal_path: PathBuf,
     _temp: tempfile::TempDir,
 }
 
@@ -217,7 +218,7 @@ impl Fixture {
         let legal = temp.path().join("legal.sqlite");
         configure_legal(&legal);
         let root = temp.path().join("workspace");
-        let workspace = Workspace::open(root.clone(), legal).unwrap();
+        let workspace = Workspace::open(root.clone(), legal.clone()).unwrap();
         let saved = workspace
             .save_ai_provider(AiProviderRequest {
                 preset: "custom".into(),
@@ -244,6 +245,7 @@ impl Fixture {
             workspace,
             provider,
             credential_target,
+            legal_path: legal,
             _temp: temp,
         }
     }
@@ -389,12 +391,20 @@ async fn discovered_models_defaults_and_detached_chat_are_persisted() {
         .unwrap());
     let c = f.workspace.create_ai_conversation(None).unwrap();
     let cid = c["id"].as_str().unwrap();
+    let prepared = f
+        .workspace
+        .prepare_ai_conversation_context(cid, 1, None, None)
+        .unwrap();
     let r = f
         .workspace
         .start_ai_run(AiRunRequest {
             kind: "chat".into(),
             prompt: "整理这段合成描述".into(),
             conversation_id: Some(cid.into()),
+            context_revision: Some(1),
+            context_preparation_hash: Some(
+                prepared["preparation_hash"].as_str().unwrap().to_owned(),
+            ),
             ..Default::default()
         })
         .unwrap();
@@ -632,6 +642,23 @@ async fn citation_quote_cross_reference_is_not_treated_as_an_uncited_answer_prop
         completed["citations"][0]["quote"],
         "参见《中华人民共和国劳动合同法》第十条。"
     );
+    assert_eq!(
+        completed["citation_verification"]["state"], "pending",
+        "an omitted case date cannot be mechanically treated as time-verified"
+    );
+    assert!(completed["citation_verification"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "case_date_unknown"));
+    assert_eq!(
+        completed["citation_verification"]["sources"][0]["citation_match"],
+        "matched"
+    );
+    assert_eq!(
+        completed["citation_verification"]["sources"][0]["relevance"],
+        "manual_review_required"
+    );
 }
 
 fn legal_fixture_with_same_article_number(path: &Path) {
@@ -707,22 +734,528 @@ async fn document_edits_create_versions_and_exports_do_not_generate_again() {
     let r = wait_done(&f.workspace, r["id"].as_str().unwrap()).await;
     assert_eq!(r["status"], "completed");
     let id = r["id"].as_str().unwrap();
+    let revision = r["revision"].as_u64().unwrap();
     let before = mock.calls.load(Ordering::Relaxed);
-    let txt = f.workspace.export_ai_document(id, "txt").unwrap();
+    let txt = f.workspace.export_ai_document(id, revision, "txt").unwrap();
     assert!(!String::from_utf8(txt).unwrap().contains("**金额**"));
     assert!(f
         .workspace
-        .export_ai_document(id, "docx")
+        .export_ai_document(id, revision, "docx")
         .unwrap()
         .starts_with(b"PK"));
     assert_eq!(before, mock.calls.load(Ordering::Relaxed));
     let edited = f
         .workspace
-        .edit_ai_document(id, "# 修改稿\n\n金额仍为126800元。".into())
+        .edit_ai_document(
+            id,
+            AiDocumentEdit {
+                expected_revision: revision,
+                content: "# 修改稿\n\n金额仍为126800元。".into(),
+                case_date: AiCaseDateUpdate::Inherit,
+            },
+        )
         .unwrap();
     assert_ne!(edited["id"], r["id"]);
     assert_eq!(edited["parent_id"], r["id"]);
+    assert_eq!(edited["revision"], revision + 1);
+    assert!(edited["case_date"].is_null(), "omitted date inherits null");
+    assert_eq!(edited["version_scope"], "current");
+    let stale = f
+        .workspace
+        .export_ai_document(edited["id"].as_str().unwrap(), revision, "txt")
+        .unwrap_err();
+    assert_eq!(stale.code, "revision_conflict");
     assert_eq!(f.workspace.ai_run(id).unwrap()["content"], r["content"]);
+
+    let as_of = f
+        .workspace
+        .edit_ai_document(
+            edited["id"].as_str().unwrap(),
+            AiDocumentEdit {
+                expected_revision: edited["revision"].as_u64().unwrap(),
+                content: edited["content"].as_str().unwrap().to_owned(),
+                case_date: AiCaseDateUpdate::Set(Some("2026-08-11".into())),
+            },
+        )
+        .unwrap();
+    assert_eq!(as_of["case_date"], "2026-08-11");
+    assert_eq!(as_of["version_scope"], "as_of");
+    assert_eq!(
+        f.workspace.ai_run(edited["id"].as_str().unwrap()).unwrap()["version_scope"],
+        "current",
+        "an explicit date edit must leave the parent run unchanged"
+    );
+
+    let cleared = f
+        .workspace
+        .edit_ai_document(
+            as_of["id"].as_str().unwrap(),
+            AiDocumentEdit {
+                expected_revision: as_of["revision"].as_u64().unwrap(),
+                content: as_of["content"].as_str().unwrap().to_owned(),
+                case_date: AiCaseDateUpdate::Set(None),
+            },
+        )
+        .unwrap();
+    assert!(cleared["case_date"].is_null());
+    assert_eq!(cleared["version_scope"], "current");
+}
+
+#[tokio::test]
+async fn citation_recheck_binds_body_date_source_hash_and_revision() {
+    const QUOTE: &str = "当事人一方不履行合同义务或者履行合同义务不符合约定的";
+    fn reply(body: Value) -> Value {
+        let has_article = body["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+        if !has_article {
+            return json!({"model":"mock-model","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"read-577","type":"function","function":{"name":"legal_get_article","arguments":"{\"article_id\":\"cn-civil-code-20210101-577\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":10,"total_tokens":20}});
+        }
+        completion(
+            json!({"role":"assistant","content":serde_json::to_string(&json!({
+            "title":"引用证据",
+            "content":"依据《民法典》第577条分析，是否违约仍取决于待核实事实。",
+            "citations":[{"article_id":"cn-civil-code-20210101-577","reason":"违约责任","quote":QUOTE}]
+        })).unwrap()}),
+        )
+    }
+
+    let mock = Mock::new(reply);
+    let f = Fixture::new_with_legal(&mock, true, legal_fixture);
+    let started = f
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "writing".into(),
+            prompt: "引用证据回归".into(),
+            case_date: Some("2026-08-11".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let completed = wait_done(&f.workspace, started["id"].as_str().unwrap()).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    let id = completed["id"].as_str().unwrap();
+    let revision = completed["revision"].as_u64().unwrap();
+    let evidence = &completed["citation_verification"];
+    assert_eq!(evidence["state"], "passed", "{evidence}");
+    assert_eq!(evidence["run_revision"], revision);
+    assert_eq!(evidence["case_date"], "2026-08-11");
+    assert_eq!(evidence["sources"][0]["source_exists"], "passed");
+    assert_eq!(evidence["sources"][0]["full_text_read"], "passed");
+    assert_eq!(evidence["sources"][0]["citation_match"], "matched");
+    assert_eq!(evidence["sources"][0]["time_check"], "passed");
+    assert_eq!(
+        evidence["sources"][0]["relevance"],
+        "manual_review_required"
+    );
+    assert!(evidence["sources"][0]["source_full_text_sha256"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+    assert!(evidence["sources"][0]["matched_ranges"]
+        .as_array()
+        .is_some_and(|ranges| ranges.len() == 1));
+    assert!(!evidence.to_string().contains(QUOTE));
+
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    let conflict = f
+        .workspace
+        .recheck_ai_citations(id, revision + 1, &cancelled)
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code, "revision_conflict");
+
+    let database = rusqlite::Connection::open(&f.legal_path).unwrap();
+    database
+        .execute(
+            "UPDATE law_articles SET content = ?1 WHERE id = 'cn-civil-code-20210101-577'",
+            [format!("{QUOTE}。修订后的权威正文。")],
+        )
+        .unwrap();
+    drop(database);
+    let token = tokio_util::sync::CancellationToken::new();
+    let drifted = f
+        .workspace
+        .recheck_ai_citations(id, revision, &token)
+        .await
+        .unwrap();
+    assert_eq!(drifted["citation_verification"]["state"], "pending");
+    assert_eq!(
+        drifted["citation_verification"]["sources"][0]["source_content"],
+        "changed"
+    );
+    assert!(drifted["citation_verification"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "citation_source_changed"));
+
+    // A corpus read failure is not proof that the citation vanished. The
+    // recheck must publish only the explicit unavailable/unknown state.
+    let offline = f.legal_path.with_extension("offline");
+    std::fs::rename(&f.legal_path, &offline).unwrap();
+    let unavailable = f
+        .workspace
+        .recheck_ai_citations(id, revision, &tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(unavailable["citation_verification"]["state"], "pending");
+    assert_eq!(
+        unavailable["citation_verification"]["sources"][0]["source_exists"],
+        "unknown"
+    );
+    assert_eq!(
+        unavailable["citation_verification"]["sources"][0]["full_text_read"],
+        "unavailable"
+    );
+    assert_eq!(
+        unavailable["citation_verification"]["sources"][0]["error_category"],
+        "citation_source_unavailable"
+    );
+    let reasons = unavailable["citation_verification"]["reasons"]
+        .as_array()
+        .expect("explicit aggregate verification reasons");
+    assert!(reasons
+        .iter()
+        .any(|reason| reason == "citation_source_unavailable"));
+    assert!(!reasons
+        .iter()
+        .any(|reason| reason == "citation_source_missing"));
+    std::fs::rename(&offline, &f.legal_path).unwrap();
+
+    let edited = f
+        .workspace
+        .edit_ai_document(
+            id,
+            AiDocumentEdit {
+                expected_revision: revision,
+                content: format!(
+                    "{}\n\n补充事实待核实。",
+                    completed["content"].as_str().unwrap()
+                ),
+                case_date: AiCaseDateUpdate::Set(Some("2026-08-12".into())),
+            },
+        )
+        .unwrap();
+    assert_eq!(edited["citation_verification"]["state"], "stale");
+    assert_eq!(edited["citation_verification"]["case_date"], "2026-08-12");
+    assert!(edited["citation_verification"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "case_date_changed"));
+}
+
+#[test]
+fn encrypted_writing_draft_is_revision_bound_and_survives_workspace_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let legal = temp.path().join("absent.sqlite");
+    let workspace = Workspace::open(root.clone(), legal.clone()).unwrap();
+    let content = json!({
+        "document_type":"民事起诉状",
+        "prompt":"合成案情",
+        "requirements":"列出待补事实",
+        "case_date":"2026-09-10",
+        "provider_id":"provider_synthetic",
+        "model":"model_synthetic",
+        "materials":[],
+        "attachment_ids":[],
+        "run_id":"run_synthetic",
+        "run_revision":7,
+        "content":"# 未提交修改\n\nSYNTHETIC DRAFT ONLY",
+        "dirty":true
+    });
+    let saved = workspace
+        .save_ai_draft("writing-current", 0, content.clone())
+        .unwrap();
+    assert_eq!(saved["revision"], 1);
+    assert_eq!(saved["content"], content);
+    assert_eq!(
+        workspace
+            .save_ai_draft("writing-current", 0, content.clone())
+            .unwrap_err()
+            .code,
+        "revision_conflict"
+    );
+    drop(workspace);
+
+    let reopened = Workspace::open(root, legal).unwrap();
+    let restored = reopened.ai_draft("writing-current").unwrap();
+    assert_eq!(restored["revision"], 1);
+    assert_eq!(
+        restored["content"]["content"],
+        "# 未提交修改\n\nSYNTHETIC DRAFT ONLY"
+    );
+    assert_eq!(
+        reopened
+            .delete_ai_draft("writing-current", 0)
+            .unwrap_err()
+            .code,
+        "revision_conflict"
+    );
+    assert_eq!(
+        reopened.delete_ai_draft("writing-current", 1).unwrap()["deleted"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn replacing_chat_context_cancels_affected_run_and_requires_current_revision() {
+    fn delayed(body: Value) -> Value {
+        std::thread::sleep(Duration::from_millis(600));
+        good_reply(body)
+    }
+    let mock = Mock::new(delayed);
+    let f = Fixture::new(&mock, true);
+    let (material_id, _) = raw_material(&f, "context_replacement");
+    let conversation = f.workspace.create_ai_conversation(None).unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap();
+    let replacement = f
+        .workspace
+        .replace_ai_conversation_context(
+            conversation_id,
+            1,
+            vec![AiMaterialReference {
+                id: material_id.clone(),
+                source: "original".into(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(replacement["manifest"]["revision"], 2);
+    let prepared = f
+        .workspace
+        .prepare_ai_conversation_context(
+            conversation_id,
+            2,
+            Some(f.provider.clone()),
+            Some("mock-model".into()),
+        )
+        .unwrap();
+    assert_eq!(prepared["manifest"]["materials"][0]["id"], material_id);
+
+    let run = f
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "chat".into(),
+            prompt: "first message".into(),
+            provider_id: Some(f.provider.clone()),
+            model: Some("mock-model".into()),
+            conversation_id: Some(conversation_id.into()),
+            context_revision: Some(2),
+            context_preparation_hash: Some(
+                prepared["preparation_hash"].as_str().unwrap().to_owned(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_owned();
+    while mock.calls.load(Ordering::Relaxed) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let removed = f
+        .workspace
+        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new())
+        .unwrap();
+    assert_eq!(removed["manifest"]["revision"], 3);
+    assert!(removed["cancelled_run_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id == &run_id));
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let cancelled = f.workspace.ai_run(&run_id).unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["error_code"], "context_source_removed");
+
+    let stale = f
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "chat".into(),
+            prompt: "stale context".into(),
+            provider_id: Some(f.provider.clone()),
+            model: Some("mock-model".into()),
+            conversation_id: Some(conversation_id.into()),
+            context_revision: Some(2),
+            context_preparation_hash: Some(
+                prepared["preparation_hash"].as_str().unwrap().to_owned(),
+            ),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(stale.code, "revision_conflict");
+}
+
+#[tokio::test]
+async fn removed_context_excludes_the_entire_prior_turn_from_followup_history() {
+    let mock = Mock::new(good_reply);
+    let f = Fixture::new(&mock, true);
+    let (material_id, _) = raw_material(&f, "history_context_removal");
+    let conversation = f.workspace.create_ai_conversation(None).unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap();
+    let updated = f
+        .workspace
+        .replace_ai_conversation_context(
+            conversation_id,
+            1,
+            vec![AiMaterialReference {
+                id: material_id,
+                source: "original".into(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+    let prepared = f
+        .workspace
+        .prepare_ai_conversation_context(
+            conversation_id,
+            updated["manifest"]["revision"].as_u64().unwrap(),
+            Some(f.provider.clone()),
+            Some("mock-model".into()),
+        )
+        .unwrap();
+    let first = f
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "chat".into(),
+            prompt: "first turn uses removable material".into(),
+            provider_id: Some(f.provider.clone()),
+            model: Some("mock-model".into()),
+            conversation_id: Some(conversation_id.into()),
+            context_revision: Some(2),
+            context_preparation_hash: Some(
+                prepared["preparation_hash"].as_str().unwrap().to_owned(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let _ = wait_done(&f.workspace, first["id"].as_str().unwrap()).await;
+    for _ in 0..100 {
+        if f.workspace.ai_conversation(conversation_id).unwrap()["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let removed = f
+        .workspace
+        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new())
+        .unwrap();
+    let prepared = f
+        .workspace
+        .prepare_ai_conversation_context(
+            conversation_id,
+            removed["manifest"]["revision"].as_u64().unwrap(),
+            Some(f.provider.clone()),
+            Some("mock-model".into()),
+        )
+        .unwrap();
+    let followup = f
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "chat".into(),
+            prompt: "followup without removed material".into(),
+            provider_id: Some(f.provider.clone()),
+            model: Some("mock-model".into()),
+            conversation_id: Some(conversation_id.into()),
+            context_revision: Some(3),
+            context_preparation_hash: Some(
+                prepared["preparation_hash"].as_str().unwrap().to_owned(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let _ = wait_done(&f.workspace, followup["id"].as_str().unwrap()).await;
+    let latest_model_call = mock
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|body| body.get("tools").is_some())
+        .expect("followup completion request");
+    let sent = latest_model_call.to_string();
+    assert!(!sent.contains("SYNTHETIC ORIGINAL MATERIAL"));
+    assert!(!sent.contains("first turn uses removable material"));
+}
+
+#[tokio::test]
+async fn context_removal_before_model_slot_prevents_a_queued_dispatch() {
+    fn delayed(body: Value) -> Value {
+        std::thread::sleep(Duration::from_millis(650));
+        good_reply(body)
+    }
+    let mock = Mock::new(delayed);
+    let f = Fixture::new(&mock, true);
+    let (material_id, _) = raw_material(&f, "context_remove_before_dispatch");
+    let conversation = f.workspace.create_ai_conversation(None).unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap();
+    let updated = f
+        .workspace
+        .replace_ai_conversation_context(
+            conversation_id,
+            1,
+            vec![AiMaterialReference {
+                id: material_id,
+                source: "original".into(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+    let prepared = f
+        .workspace
+        .prepare_ai_conversation_context(
+            conversation_id,
+            updated["manifest"]["revision"].as_u64().unwrap(),
+            Some(f.provider.clone()),
+            Some("mock-model".into()),
+        )
+        .unwrap();
+
+    for prompt in ["hold model slot one", "hold model slot two"] {
+        f.workspace
+            .start_ai_run(AiRunRequest {
+                kind: "writing".into(),
+                prompt: prompt.into(),
+                provider_id: Some(f.provider.clone()),
+                model: Some("mock-model".into()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    while mock.calls.load(Ordering::Relaxed) < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let queued = f
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "chat".into(),
+            prompt: "must not reach provider".into(),
+            provider_id: Some(f.provider.clone()),
+            model: Some("mock-model".into()),
+            conversation_id: Some(conversation_id.into()),
+            context_revision: Some(2),
+            context_preparation_hash: Some(
+                prepared["preparation_hash"].as_str().unwrap().to_owned(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let removed = f
+        .workspace
+        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new())
+        .unwrap();
+    assert!(removed["cancelled_run_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id == &queued["id"]));
+    tokio::time::sleep(Duration::from_millis(850)).await;
+    assert_eq!(mock.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        f.workspace.ai_run(queued["id"].as_str().unwrap()).unwrap()["status"],
+        "cancelled"
+    );
 }
 
 #[test]
@@ -841,6 +1374,48 @@ async fn cancellation_stops_waiting_and_late_provider_result_cannot_publish() {
     let done = f.workspace.ai_run(id).unwrap();
     assert_eq!(done["status"], "cancelled");
     assert_eq!(done["content"], "");
+}
+
+#[tokio::test]
+async fn ai_submission_queue_rejects_the_ninth_run_before_provider_or_context_work() {
+    fn delayed(body: Value) -> Value {
+        std::thread::sleep(Duration::from_millis(400));
+        good_reply(body)
+    }
+
+    let mock = Mock::new(delayed);
+    let fixture = Fixture::new(&mock, true);
+    let mut accepted = Vec::new();
+    for number in 0..8 {
+        let run = fixture
+            .workspace
+            .start_ai_run(AiRunRequest {
+                kind: "writing".into(),
+                prompt: format!("bounded-run-{number}"),
+                ..Default::default()
+            })
+            .expect("two active and six waiting runs are accepted");
+        accepted.push(run["id"].as_str().expect("run id").to_owned());
+    }
+
+    // start_ai_run reserves AI capacity before resolving this request's
+    // provider or material policy.  A nonexistent provider would otherwise
+    // produce a provider error rather than a capacity rejection.
+    let error = fixture
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "writing".into(),
+            prompt: "must-fail-before-work".into(),
+            provider_id: Some("nonexistent-provider".into()),
+            model: Some("nonexistent-model".into()),
+            ..Default::default()
+        })
+        .expect_err("the ninth AI submission exceeds two active plus six waiting");
+    assert_eq!(error.code, "capacity_exceeded");
+
+    for id in accepted {
+        fixture.workspace.cancel_ai_run(&id).expect("run cancels");
+    }
 }
 
 #[tokio::test]
@@ -1072,4 +1647,223 @@ fn v1_upgrade_preserves_a_corrupt_backup_and_creates_a_verified_replacement() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn context_budget_rejects_oversized_prompt_before_any_model_dispatch() {
+    let mock = Mock::new(good_reply);
+    let fixture = Fixture::new(&mock, true);
+    let error = fixture
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "writing".into(),
+            prompt: "x".repeat(30_000),
+            ..Default::default()
+        })
+        .expect_err("30k conservative bytes exceed legacy 16k input budget");
+    assert_eq!(error.code, "context_budget_exceeded");
+    assert_eq!(mock.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn explicit_tool_capability_rejects_run_before_source_or_transport() {
+    let mock = Mock::new(good_reply);
+    let fixture = Fixture::new(&mock, true);
+    fixture
+        .workspace
+        .save_ai_provider(AiProviderRequest {
+            id: Some(fixture.provider.clone()),
+            preset: "custom".into(),
+            name: "capability mock".into(),
+            base_url: mock.url.clone(),
+            model: "mock-model".into(),
+            enabled_models: vec!["mock-model".into()],
+            model_capabilities: std::collections::BTreeMap::from([(
+                "mock-model".into(),
+                AiModelCapabilities {
+                    context_window_tokens: Some(20_480),
+                    max_output_tokens: Some(4_096),
+                    supports_tools: Some(false),
+                    supports_structured_output: None,
+                    supports_vision: None,
+                },
+            )]),
+            trust_raw: Some(true),
+            allow_private_network: true,
+            ..Default::default()
+        })
+        .expect("capability declaration persists");
+    let error = fixture
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "writing".into(),
+            prompt: "must not dispatch".into(),
+            provider_id: Some(fixture.provider.clone()),
+            model: Some("mock-model".into()),
+            ..Default::default()
+        })
+        .expect_err("explicit false tools cannot enter the provider transport");
+    assert_eq!(error.code, "model_tools_unsupported");
+    assert_eq!(mock.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn estimate_returns_safe_scope_and_stale_plan_hash_is_not_advisory() {
+    let mock = Mock::new(good_reply);
+    let fixture = Fixture::new(&mock, true);
+    let (material_id, _) = raw_material(&fixture, "context_estimate_safe");
+    let request = AiRunRequest {
+        kind: "writing".into(),
+        prompt: "核对材料".into(),
+        provider_id: Some(fixture.provider.clone()),
+        model: Some("mock-model".into()),
+        materials: vec![AiMaterialReference {
+            id: material_id.clone(),
+            source: "original".into(),
+        }],
+        ..Default::default()
+    };
+    let estimate = fixture
+        .workspace
+        .estimate_ai_context(&request)
+        .expect("summary-only estimate");
+    assert_eq!(estimate["capabilities"]["verified"], false);
+    assert_eq!(estimate["capabilities"]["max_input_tokens"], 16_384);
+    assert_eq!(estimate["capabilities"]["max_output_tokens"], 4_096);
+    assert_eq!(
+        estimate["selected_scope"]["materials"][0]["source_id"],
+        material_id
+    );
+    assert!(!estimate.to_string().contains("SYNTHETIC ORIGINAL MATERIAL"));
+    assert_eq!(mock.calls.load(Ordering::Relaxed), 0);
+
+    let mut stale = request;
+    stale.context_plan_hash = Some("not-the-current-summary-plan".into());
+    let error = fixture
+        .workspace
+        .start_ai_run(stale)
+        .expect_err("reviewed plan hash must be checked on start");
+    assert_eq!(error.code, "context_prepare_required");
+    assert_eq!(mock.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn visual_preflight_requires_scope_before_any_raw_or_model_work() {
+    let mock = Mock::new(good_reply);
+    let fixture = Fixture::new(&mock, true);
+    let attachment = fixture
+        .workspace
+        .save_ai_attachment("large-scan.png".into(), vec![0_u8; 1_000_000])
+        .expect("metadata-only attachment save");
+    let request = AiRunRequest {
+        kind: "writing".into(),
+        prompt: "核对扫描件".into(),
+        attachment_ids: vec![attachment["id"].as_str().unwrap().into()],
+        ..Default::default()
+    };
+    let estimate = fixture
+        .workspace
+        .estimate_ai_context(&request)
+        .expect("summary-only visual preflight");
+    assert_eq!(estimate["stage"], "scope_required");
+    assert_eq!(
+        estimate["omitted_scope"][0]["reason"],
+        "ocr_page_scope_required"
+    );
+    let error = fixture
+        .workspace
+        .start_ai_run(request)
+        .expect_err("oversized visual source must reject before a worker/model can start");
+    assert_eq!(error.code, "context_budget_exceeded");
+    assert_eq!(mock.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn visual_preflight_uses_full_estimate_instead_of_the_text_segment_cap() {
+    let mock = Mock::new(good_reply);
+    let fixture = Fixture::new(&mock, true);
+    let attachment = fixture
+        .workspace
+        .save_ai_attachment("medium-scan.png".into(), vec![0_u8; 300_000])
+        .expect("metadata-only attachment save");
+    let estimate = fixture
+        .workspace
+        .estimate_ai_context(&AiRunRequest {
+            kind: "writing".into(),
+            prompt: "核对扫描件".into(),
+            attachment_ids: vec![attachment["id"].as_str().unwrap().into()],
+            ..Default::default()
+        })
+        .expect("visual estimate stays summary-only");
+    assert_eq!(estimate["stage"], "conservative");
+    assert!(
+        estimate["selected_scope"]["attachments"][0]["estimated_tokens"]
+            .as_u64()
+            .unwrap()
+            > 4_096,
+        "visual sources reserve their complete conservative estimate"
+    );
+    assert_eq!(mock.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn completed_history_records_actual_hash_and_history_budget_without_replacing_preflight_hash()
+{
+    let mock = Mock::new(good_reply);
+    let fixture = Fixture::new(&mock, true);
+    let conversation = fixture.workspace.create_ai_conversation(None).unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap().to_owned();
+
+    let prepared = fixture
+        .workspace
+        .prepare_ai_conversation_context(&conversation_id, 1, None, None)
+        .unwrap();
+    let first = fixture
+        .workspace
+        .start_ai_run(AiRunRequest {
+            kind: "chat".into(),
+            prompt: "第一轮：合同解除条件".into(),
+            conversation_id: Some(conversation_id.clone()),
+            context_revision: Some(1),
+            context_preparation_hash: Some(
+                prepared["preparation_hash"].as_str().unwrap().to_owned(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_done(&fixture.workspace, &first_id).await["status"],
+        "completed"
+    );
+
+    let prepared = fixture
+        .workspace
+        .prepare_ai_conversation_context(&conversation_id, 1, None, None)
+        .unwrap();
+    let follow_up = AiRunRequest {
+        kind: "chat".into(),
+        prompt: "第二轮：补充违约责任".into(),
+        conversation_id: Some(conversation_id.clone()),
+        context_revision: Some(1),
+        context_preparation_hash: Some(prepared["preparation_hash"].as_str().unwrap().to_owned()),
+        ..Default::default()
+    };
+    let estimate = fixture.workspace.estimate_ai_context(&follow_up).unwrap();
+    let mut bound = follow_up;
+    bound.context_plan_hash = Some(estimate["plan_hash"].as_str().unwrap().to_owned());
+    let second = fixture.workspace.start_ai_run(bound).unwrap();
+    let second_id = second["id"].as_str().unwrap().to_owned();
+    let done = wait_done(&fixture.workspace, &second_id).await;
+    assert_eq!(done["status"], "completed");
+    let plan = &done["context_plan"];
+    assert_eq!(plan["plan_hash"], estimate["plan_hash"]);
+    assert!(plan["actual_plan_hash"].as_str().is_some());
+    assert_ne!(plan["actual_plan_hash"], plan["plan_hash"]);
+    assert!(plan["estimate"]["history_tokens"].as_u64().unwrap() > 0);
+    assert!(plan["selected_scope"]["history_run_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_str() == Some(first_id.as_str())));
 }

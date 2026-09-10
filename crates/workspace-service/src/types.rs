@@ -19,6 +19,13 @@ pub struct Material {
     pub reason_code: Option<String>,
     pub revision: u64,
     pub source_sha256: String,
+    /// Safe source descriptor recorded at ingestion.  It lets an AI preflight estimate work
+    /// without opening the encrypted source body.  Legacy rows intentionally deserialize as
+    /// unknown and are completed only during a bounded first use.
+    #[serde(default)]
+    pub source_byte_len: u64,
+    #[serde(default)]
+    pub source_format: String,
     pub encoding: Option<String>,
     pub original_text: String,
     pub analysis: Option<Analysis>,
@@ -44,6 +51,8 @@ pub struct ReadyResult {
     pub revision: u64,
     pub dictionary_revision: u64,
     pub output_sha256: String,
+    #[serde(default)]
+    pub text_byte_len: u64,
     pub text: String,
     pub created_at: u64,
     pub expires_at: u64,

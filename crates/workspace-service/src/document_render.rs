@@ -7,6 +7,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default, Serialize)]
 struct Span {
@@ -374,7 +375,49 @@ pub fn runtime_tools() -> PathBuf {
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../output/runtime-tools")
 }
-pub fn export_document(markdown: &str, format: &str, temp_root: &Path) -> Result<Vec<u8>> {
+struct ExportChild(std::process::Child);
+
+impl Drop for ExportChild {
+    fn drop(&mut self) {
+        // Also covers I/O errors and an unwinding blocking worker. The process
+        // handle, rather than a reused numeric PID, identifies our own child.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn wait_for_export_process(
+    child: &mut ExportChild,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        if cancel.is_cancelled() {
+            return Err(Error::new("cancelled"));
+        }
+        if let Some(status) = child.0.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(Error::new("pdf_render_failed"))
+            };
+        }
+        if Instant::now() > deadline {
+            return Err(Error::new("pdf_render_timeout"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub fn export_document(
+    markdown: &str,
+    format: &str,
+    temp_root: &Path,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>> {
+    if cancel.is_cancelled() {
+        return Err(Error::new("cancelled"));
+    }
     if markdown.len() > 2 * 1024 * 1024 {
         return Err(Error::new("document_too_large"));
     }
@@ -416,23 +459,18 @@ pub fn export_document(markdown: &str, format: &str, temp_root: &Path) -> Result
                 use std::os::windows::process::CommandExt;
                 command.creation_flags(0x08000000);
             }
-            let mut child = command
-                .spawn()
-                .map_err(|_| Error::new("pdf_runtime_failed"))?;
+            if cancel.is_cancelled() {
+                return Err(Error::new("cancelled"));
+            }
+            let mut child = ExportChild(
+                command
+                    .spawn()
+                    .map_err(|_| Error::new("pdf_runtime_failed"))?,
+            );
             let deadline = Instant::now() + Duration::from_secs(60);
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    if !status.success() {
-                        return Err(Error::new("pdf_render_failed"));
-                    }
-                    break;
-                }
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(Error::new("pdf_render_timeout"));
-                }
-                std::thread::sleep(Duration::from_millis(50));
+            wait_for_export_process(&mut child, cancel, deadline)?;
+            if cancel.is_cancelled() {
+                return Err(Error::new("cancelled"));
             }
             Ok(std::fs::read(temp.path().join("document.pdf"))?)
         }
@@ -442,6 +480,72 @@ pub fn export_document(markdown: &str, format: &str, temp_root: &Path) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_export_does_not_create_plaintext_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("not-created");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            export_document("synthetic", "pdf", &target, &cancel)
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelling_export_wait_kills_and_reaps_the_owned_process() {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+        let mut child = ExportChild(
+            Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 60",
+                ])
+                .creation_flags(0x08000000)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // Hold a handle to this exact process across guard destruction; no PID
+        // lookup after the exit can accidentally identify an unrelated process.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.0.id()) };
+        assert!(!handle.is_null());
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let notifier = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            signal.cancel();
+        });
+        let started = Instant::now();
+        let result = wait_for_export_process(
+            &mut child,
+            &cancel,
+            Instant::now() + Duration::from_secs(10),
+        );
+        drop(child);
+        notifier.join().unwrap();
+        let mut code = 259u32;
+        let queried = unsafe { GetExitCodeProcess(handle, &mut code) };
+        unsafe { CloseHandle(handle) };
+        assert_eq!(result.unwrap_err().code, "cancelled");
+        assert_ne!(queried, 0);
+        assert_ne!(code, 259, "owned child must no longer be active");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
     #[test]
     fn render_preserves_structure_and_escapes_html() {
         let md = "# 起诉状\n\n**事实**：价款126800元。\n\n| 项目 | 金额 |\n|---|---|\n| 欠款 | 126800 |\n\n<script>alert(1)</script>";

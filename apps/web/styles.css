@@ -600,3 +600,35 @@ input[type="checkbox"] { width: auto; min-width: 16px; accent-color: var(--accen
   .status-list dd { margin-bottom: 8px; }
   .case-detail-meta dd { margin-bottom: 6px; }
 }
+
+.context-estimate, .citation-verification {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.context-estimate h3, .context-estimate h4, .citation-verification h3 { margin: 2px 0; }
+
+.context-scope-list, .citation-verification-list, .citation-check-list {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.citation-verification-source { padding: 8px; border-left: 3px solid var(--accent); background: #fff; }
+.citation-check-list .passed { color: var(--success, #1f6b3a); }
+.citation-check-list .failed { color: var(--danger, #a23b3b); }
+.citation-check-list .warning { color: var(--warning); }
+.citation-check-list .unknown { color: var(--muted); }
+
+.model-capability-config { margin-top: 6px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 7px; background: #fff; }
+.model-capability-config summary { cursor: pointer; color: var(--accent-dark); }
+.model-capability-fields, .model-capability-flags { display: grid; gap: 7px; margin-top: 8px; }
+.model-capability-fields { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.model-capability-flags { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.model-option { display: grid; gap: 4px; padding: 7px 8px; border-bottom: 1px solid var(--line); }

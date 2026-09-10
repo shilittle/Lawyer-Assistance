@@ -1,3 +1,6 @@
+use crate::ai_context::{
+    UNKNOWN_CONTEXT_WINDOW_TOKENS, UNKNOWN_INPUT_TOKENS, UNKNOWN_MAX_OUTPUT_TOKENS,
+};
 use crate::*;
 use providers::{ApiSecret, ProviderKind, ProviderProfile, ReqwestStreamingTransport};
 use serde::{Deserialize, Serialize};
@@ -8,12 +11,33 @@ pub struct AiModelSelection {
     pub provider_id: String,
     pub model: String,
 }
+
+/// Explicit capability declarations are provider configuration, never model-name heuristics.
+/// Omitted values remain compatible with existing providers and resolve to the visible,
+/// conservative legacy budget in `resolved_model_capabilities`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AiModelCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_structured_output: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AiProviderMetadata {
     pub preset: String,
     pub enabled_models: Vec<String>,
     pub trust_raw: bool,
     pub base_url: String,
+    #[serde(default)]
+    pub model_capabilities: BTreeMap<String, AiModelCapabilities>,
 }
 pub struct AiCompletion {
     pub message: Value,
@@ -35,10 +59,20 @@ pub struct AiProviderRequest {
     pub model: String,
     #[serde(default)]
     pub enabled_models: Vec<String>,
+    #[serde(default)]
+    pub model_capabilities: BTreeMap<String, AiModelCapabilities>,
     pub api_key: Option<String>,
     pub trust_raw: Option<bool>,
     #[serde(default)]
     pub allow_private_network: bool,
+}
+
+/// A per-dispatch output ceiling supplied by the context planner.  It deliberately excludes
+/// prices and provider-specific tokenizers; its only purpose is to prevent one request from
+/// consuming output reserved for later tool rounds or the final answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AiDispatchBudget {
+    pub(crate) max_output_tokens: u32,
 }
 
 pub fn ai_presets() -> Value {
@@ -96,6 +130,108 @@ fn provider_error(e: providers::ProviderError) -> Error {
             }
             _ => Error::retry("provider_request_failed"),
         },
+    }
+}
+
+fn validate_capabilities(
+    enabled_models: &[String],
+    capabilities: &BTreeMap<String, AiModelCapabilities>,
+) -> Result<()> {
+    if capabilities
+        .keys()
+        .any(|model| !enabled_models.contains(model))
+    {
+        return Err(Error::new("model_capability_not_enabled"));
+    }
+    for capability in capabilities.values() {
+        if capability
+            .context_window_tokens
+            .is_some_and(|value| !(1_024..=10_000_000).contains(&value))
+            || capability
+                .max_output_tokens
+                .is_some_and(|value| !(1..=1_000_000).contains(&value))
+        {
+            return Err(Error::new("invalid_model_capabilities"));
+        }
+        if let (Some(context), Some(output)) = (
+            capability.context_window_tokens,
+            capability.max_output_tokens,
+        ) {
+            if output >= context {
+                return Err(Error::new("invalid_model_capabilities"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolved_model_capabilities(
+    metadata: &AiProviderMetadata,
+    model: &str,
+) -> Result<AiContextCapabilities> {
+    let configured = metadata
+        .model_capabilities
+        .get(model)
+        .cloned()
+        .unwrap_or_default();
+    let context_window_tokens = configured
+        .context_window_tokens
+        .unwrap_or(UNKNOWN_CONTEXT_WINDOW_TOKENS);
+    let max_output_tokens = configured
+        .max_output_tokens
+        .unwrap_or(UNKNOWN_MAX_OUTPUT_TOKENS);
+    if max_output_tokens >= context_window_tokens {
+        return Err(Error::new("invalid_model_capabilities"));
+    }
+    let max_input_tokens =
+        if configured.context_window_tokens.is_none() && configured.max_output_tokens.is_none() {
+            UNKNOWN_INPUT_TOKENS
+        } else {
+            context_window_tokens.saturating_sub(max_output_tokens)
+        };
+    // The legacy fallback is a deliberate 16k input/4k output contract.  A partially declared
+    // record remains unverified so the UI can avoid overstating provider support.
+    Ok(AiContextCapabilities {
+        verified: configured.context_window_tokens.is_some()
+            && configured.max_output_tokens.is_some(),
+        context_window_tokens,
+        max_input_tokens,
+        max_output_tokens,
+        supports_tools: configured.supports_tools,
+        supports_structured_output: configured.supports_structured_output,
+        supports_vision: configured.supports_vision,
+    })
+}
+
+fn validate_requested_features(
+    capabilities: &AiContextCapabilities,
+    tools: bool,
+    structured_output: bool,
+    vision: bool,
+) -> Result<()> {
+    if tools && capabilities.supports_tools == Some(false) {
+        return Err(Error::new("model_tools_unsupported"));
+    }
+    if structured_output && capabilities.supports_structured_output == Some(false) {
+        return Err(Error::new("model_structured_output_unsupported"));
+    }
+    if vision && capabilities.supports_vision == Some(false) {
+        return Err(Error::new("model_vision_unsupported"));
+    }
+    Ok(())
+}
+
+fn contains_image_input(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "image_url")
+                || object.values().any(contains_image_input)
+        }
+        Value::Array(values) => values.iter().any(contains_image_input),
+        _ => false,
     }
 }
 impl Workspace {
@@ -196,6 +332,7 @@ impl Workspace {
                 enabled_models: vec![config.model.clone()],
                 trust_raw: recognized_preset(&config.base_url).is_some(),
                 base_url: config.base_url.clone(),
+                model_capabilities: BTreeMap::new(),
             }))
     }
     pub(crate) fn ai_config(
@@ -209,6 +346,10 @@ impl Workspace {
         }
         Ok((config, metadata))
     }
+    pub fn ai_model_capabilities(&self, model: &AiModelSelection) -> Result<AiContextCapabilities> {
+        let (_, metadata) = self.ai_config(model)?;
+        resolved_model_capabilities(&metadata, &model.model)
+    }
     pub fn ai_provider_is_trusted(&self, model: &AiModelSelection) -> Result<bool> {
         Ok(self.ai_config(model)?.1.trust_raw)
     }
@@ -216,7 +357,16 @@ impl Workspace {
         let mut out = Vec::new();
         for config in self.store.list::<ProviderConfig>("provider")? {
             let m = self.ai_metadata(&config)?;
-            out.push(json!({"id":config.id,"name":config.name,"base_url":config.base_url,"model":config.model,"preset":m.preset,"enabled_models":m.enabled_models,"trust_raw":m.trust_raw,"allow_private_network":config.allow_private_network,"key_configured":self.api_key(&config.id).is_ok()}));
+            let capabilities = m
+                .enabled_models
+                .iter()
+                .filter_map(|model| {
+                    resolved_model_capabilities(&m, model)
+                        .ok()
+                        .map(|value| (model.clone(), value))
+                })
+                .collect::<BTreeMap<_, _>>();
+            out.push(json!({"id":config.id,"name":config.name,"base_url":config.base_url,"model":config.model,"preset":m.preset,"enabled_models":m.enabled_models,"model_capabilities":m.model_capabilities,"resolved_model_capabilities":capabilities,"trust_raw":m.trust_raw,"allow_private_network":config.allow_private_network,"key_configured":self.api_key(&config.id).is_ok()}));
         }
         Ok(json!({"providers":out,"presets":ai_presets(),"defaults":self.ai_defaults()?}))
     }
@@ -243,6 +393,7 @@ impl Workspace {
         {
             return Err(Error::new("enabled_models_required"));
         }
+        validate_capabilities(&r.enabled_models, &r.model_capabilities)?;
         let model = if r.enabled_models.contains(&r.model) {
             r.model.clone()
         } else {
@@ -278,6 +429,7 @@ impl Workspace {
                 enabled_models: r.enabled_models,
                 trust_raw,
                 base_url: r.base_url,
+                model_capabilities: r.model_capabilities,
             },
         )?;
         let mut defaults = self.ai_defaults()?;
@@ -380,12 +532,53 @@ impl Workspace {
         binding: &str,
         cancel: &CancellationToken,
     ) -> Result<AiCompletion> {
+        let capabilities = self.ai_model_capabilities(selection)?;
+        self.ai_complete_budgeted(
+            selection,
+            messages,
+            tools,
+            response_format,
+            purpose,
+            binding,
+            AiDispatchBudget {
+                max_output_tokens: capabilities.max_output_tokens,
+            },
+            cancel,
+        )
+        .await
+    }
+
+    /// Dispatch with an output ceiling calculated by the run-level context budget.  Older
+    /// callers retain `ai_complete` and receive the resolved model ceiling; new AI runs use this
+    /// method for every model/tool round.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn ai_complete_budgeted(
+        &self,
+        selection: &AiModelSelection,
+        messages: Value,
+        tools: Option<Value>,
+        response_format: Option<Value>,
+        purpose: &str,
+        binding: &str,
+        budget: AiDispatchBudget,
+        cancel: &CancellationToken,
+    ) -> Result<AiCompletion> {
         let _slot = tokio::select! {biased;_=cancel.cancelled()=>return Err(Error::new("cancelled")),slot=self.ai_slots.acquire()=>slot.map_err(|_|Error::new("workspace_unavailable"))?};
         let (config, metadata) = self.ai_config(selection)?;
+        let capabilities = resolved_model_capabilities(&metadata, &selection.model)?;
+        validate_requested_features(
+            &capabilities,
+            tools.is_some(),
+            response_format.is_some(),
+            contains_image_input(&messages),
+        )?;
+        let max_output_tokens = budget.max_output_tokens.min(capabilities.max_output_tokens);
+        if max_output_tokens == 0 {
+            return Err(Error::new("context_budget_exceeded"));
+        }
         let profile = profile_for(&config, &selection.model);
         let secret = self.api_key(&selection.provider_id)?;
-        let mut body =
-            json!({"model":selection.model,"messages":messages,"stream":false,"max_tokens":16384});
+        let mut body = json!({"model":selection.model,"messages":messages,"stream":false,"max_tokens":max_output_tokens});
         if metadata.preset == "glm" || selection.model.to_lowercase().contains("glm-5.3") {
             body["reasoning_effort"] = json!("low");
         } else if ["deepseek", "volcengine"].contains(&metadata.preset.as_str()) {
@@ -472,5 +665,61 @@ impl Workspace {
         }
         self.store.save("ai_dispatch", &dispatch_id, &dispatch)?;
         result
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn metadata(capabilities: BTreeMap<String, AiModelCapabilities>) -> AiProviderMetadata {
+        AiProviderMetadata {
+            preset: "custom".into(),
+            enabled_models: vec!["local".into()],
+            trust_raw: false,
+            base_url: "http://127.0.0.1".into(),
+            model_capabilities: capabilities,
+        }
+    }
+
+    #[test]
+    fn unknown_model_capability_is_visible_conservative_16k_input_4k_output() {
+        let resolved = resolved_model_capabilities(&metadata(BTreeMap::new()), "local")
+            .expect("legacy settings resolve without guessing model family");
+        assert!(!resolved.verified);
+        assert_eq!(resolved.context_window_tokens, 20_480);
+        assert_eq!(resolved.max_input_tokens, 16_384);
+        assert_eq!(resolved.max_output_tokens, 4_096);
+    }
+
+    #[test]
+    fn explicit_unsupported_features_reject_before_transport() {
+        let capabilities = AiContextCapabilities {
+            verified: true,
+            context_window_tokens: 32_768,
+            max_input_tokens: 28_672,
+            max_output_tokens: 4_096,
+            supports_tools: Some(false),
+            supports_structured_output: Some(false),
+            supports_vision: Some(false),
+        };
+        assert_eq!(
+            validate_requested_features(&capabilities, true, false, false)
+                .expect_err("tools must be rejected")
+                .code,
+            "model_tools_unsupported"
+        );
+        assert_eq!(
+            validate_requested_features(&capabilities, false, true, false)
+                .expect_err("json must be rejected")
+                .code,
+            "model_structured_output_unsupported"
+        );
+        assert_eq!(
+            validate_requested_features(&capabilities, false, false, true)
+                .expect_err("vision must be rejected")
+                .code,
+            "model_vision_unsupported"
+        );
     }
 }

@@ -1,10 +1,15 @@
 use crate::{filesystem::PathIdentityGuard, LegalServices, ServiceError, SERVICE_SCHEMA_VERSION};
+use retrieval::{CancellationRegistration, SearchCancellation};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
 const LEGAL_ARCHIVE_SCHEMA_VERSION: &str = "4";
 const LEGAL_RUNTIME_SCHEMA_VERSION: &str = "1";
+// `database::open_legal_core_read_only` sets a broad process-level default for
+// legacy callers. Public service requests are short-lived and concurrent, so
+// cap their per-connection mapping locally instead of changing that default.
+const LOCAL_LEGAL_READ_MMAP_BYTES: i64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -54,26 +59,35 @@ impl LegalDatabaseIdentity {
 
 impl LegalServices {
     pub fn system_status(&self) -> Result<SystemStatusResponse, ServiceError> {
-        let legal = match open_validated_legal_database(self.legal_core_path()) {
-            Ok((_, identity)) => DatabaseStatus {
-                available: true,
-                schema_version: Some(identity.schema_version),
-                runtime_schema_version: identity.runtime_schema_version,
-                dataset_name: identity.dataset_name,
-                dataset_version: identity.dataset_version,
-                distribution_profile: identity.distribution_profile,
-                error: None,
-            },
-            Err(error) => DatabaseStatus {
-                available: false,
-                schema_version: None,
-                runtime_schema_version: None,
-                dataset_name: None,
-                dataset_version: None,
-                distribution_profile: None,
-                error: Some(error),
-            },
-        };
+        self.system_status_cancellable(&SearchCancellation::new())
+    }
+
+    pub fn system_status_cancellable(
+        &self,
+        cancellation: &SearchCancellation,
+    ) -> Result<SystemStatusResponse, ServiceError> {
+        let legal =
+            match open_validated_legal_database_cancellable(self.legal_core_path(), cancellation) {
+                Ok((_, identity, _registration)) => DatabaseStatus {
+                    available: true,
+                    schema_version: Some(identity.schema_version),
+                    runtime_schema_version: identity.runtime_schema_version,
+                    dataset_name: identity.dataset_name,
+                    dataset_version: identity.dataset_version,
+                    distribution_profile: identity.distribution_profile,
+                    error: None,
+                },
+                Err(error) if error.code == "request_cancelled" => return Err(error),
+                Err(error) => DatabaseStatus {
+                    available: false,
+                    schema_version: None,
+                    runtime_schema_version: None,
+                    dataset_name: None,
+                    dataset_version: None,
+                    distribution_profile: None,
+                    error: Some(error),
+                },
+            };
         let user = if self.is_public_law_only() {
             // Public-law MCP deliberately has no private workspace.  Preserve
             // the wire DTO while making the absence explicit without probing
@@ -166,10 +180,64 @@ pub(crate) fn open_validated_legal_database(
     require_regular_database_file(path, "legal_database_missing")?;
     let guard = PathIdentityGuard::regular_file(path, true)?;
     let connection = database::open_legal_core_read_only(path)?;
+    configure_local_legal_read_connection(&connection)?;
     guard.verify()?;
     let identity = inspect_legal_database(&connection)?;
     guard.verify()?;
     Ok((connection, identity))
+}
+
+/// Open the same validated corpus connection as [`open_validated_legal_database`],
+/// while retaining one operation-scoped SQLite interrupt registration for all
+/// validation and read SQL that follows. The registration owns no connection,
+/// so it is safe to return alongside the connection and removes only itself
+/// when dropped.
+pub(crate) fn open_validated_legal_database_cancellable(
+    path: &Path,
+    cancellation: &SearchCancellation,
+) -> Result<
+    (
+        rusqlite::Connection,
+        LegalDatabaseIdentity,
+        CancellationRegistration,
+    ),
+    ServiceError,
+> {
+    if cancellation.is_cancelled() {
+        return Err(retrieval::RetrievalError::Cancelled.into());
+    }
+    require_regular_database_file(path, "legal_database_missing")?;
+    let guard = PathIdentityGuard::regular_file(path, true)?;
+    let connection = database::open_legal_core_read_only(path)?;
+    configure_local_legal_read_connection(&connection)?;
+    let registration = cancellation.register_connection(&connection)?;
+    guard.verify()?;
+    let identity = inspect_legal_database(&connection)?;
+    guard.verify()?;
+    Ok((connection, identity, registration))
+}
+
+fn configure_local_legal_read_connection(
+    connection: &rusqlite::Connection,
+) -> Result<(), ServiceError> {
+    connection.pragma_update(None, "mmap_size", LOCAL_LEGAL_READ_MMAP_BYTES)?;
+    let mapped: i64 = connection.pragma_query_value(None, "mmap_size", |row| row.get(0))?;
+    if mapped > LOCAL_LEGAL_READ_MMAP_BYTES {
+        return Err(ServiceError::new(
+            "legal_database_mmap_limit_failed",
+            "legal read connection mapping exceeds the local service limit",
+            false,
+        ));
+    }
+    let query_only: i64 = connection.pragma_query_value(None, "query_only", |row| row.get(0))?;
+    if query_only != 1 {
+        return Err(ServiceError::new(
+            "legal_database_read_only_required",
+            "legal read connection must remain query-only",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn require_regular_database_file(
@@ -315,7 +383,9 @@ fn require_legal_database_object(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::LegalServices;
+    use rusqlite::Connection;
 
     #[test]
     fn public_status_does_not_require_or_open_a_user_database() {
@@ -326,5 +396,43 @@ mod tests {
         assert!(!status.legal_database.available);
         assert!(!status.user_database.available);
         assert!(status.user_database.error.is_none());
+    }
+
+    #[test]
+    fn public_legal_read_connections_cap_mmap_and_remain_query_only() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let legal_path = temporary.path().join("legal-core.sqlite");
+        let connection = Connection::open(&legal_path).expect("fixture database opens");
+        database::initialize_legal_core_database(&connection).expect("fixture schema initializes");
+        connection
+            .execute_batch(include_str!("../tests/fixtures/legal_core.sql"))
+            .expect("fixture data initializes");
+        drop(connection);
+
+        let (connection, _) = open_validated_legal_database(&legal_path)
+            .expect("validated local legal read connection opens");
+        let mmap_size: i64 = connection
+            .pragma_query_value(None, "mmap_size", |row| row.get(0))
+            .expect("mmap size reads");
+        let query_only: i64 = connection
+            .pragma_query_value(None, "query_only", |row| row.get(0))
+            .expect("query-only pragma reads");
+        assert!(mmap_size <= LOCAL_LEGAL_READ_MMAP_BYTES);
+        assert_eq!(query_only, 1);
+    }
+
+    #[test]
+    fn cancelled_legal_connection_never_opens_or_registers() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let cancellation = SearchCancellation::new();
+        cancellation.cancel();
+        let result = open_validated_legal_database_cancellable(
+            &temporary.path().join("not-opened.sqlite"),
+            &cancellation,
+        );
+        assert!(matches!(
+            result,
+            Err(ServiceError { ref code, .. }) if code == "request_cancelled"
+        ));
     }
 }

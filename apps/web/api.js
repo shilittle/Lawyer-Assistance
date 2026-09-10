@@ -27,6 +27,7 @@ export const ERROR_MESSAGES = Object.freeze({
   legal_query_failed: "法律库查询失败，请稍后重试。",
   invalid_search_request: "法律检索条件无效，请调整后重试。",
   invalid_pagination: "分页参数无效，请重新加载。",
+  storage_object_corrupt: "本机存储中存在损坏记录，已跳过该记录；可检查工作区备份后重试。",
   legal_database_missing: "本地法律库尚未配置，请检查法律库文件后重试。",
   legal_database_unavailable: "本地法律库暂不可用，可使用官方入口查看案例。",
   unsupported_schema_version: "服务数据版本不兼容，请更新本机程序后重试。",
@@ -328,6 +329,10 @@ export class ApiClient {
     return this.request("/ai/providers", options);
   }
 
+  async listGroups({ limit, cursor, ...options } = {}) {
+    return this.request(`/groups${queryString({ limit, cursor })}`, options);
+  }
+
   async saveAiProvider(provider, options = {}) {
     return this.request("/ai/providers", { ...options, method: "POST", body: provider });
   }
@@ -344,8 +349,12 @@ export class ApiClient {
     return this.request("/ai/defaults", { ...options, method: "PUT", body: defaults });
   }
 
-  async listAiMaterials(options = {}) {
-    return this.request("/ai/materials", options);
+  async listMaterials(groupId = "", { limit, cursor, ...options } = {}) {
+    return this.request(`/materials${queryString({ group_id: groupId, limit, cursor })}`, options);
+  }
+
+  async listAiMaterials({ limit, cursor, ...options } = {}) {
+    return this.request(`/ai/materials${queryString({ limit, cursor })}`, options);
   }
 
   async uploadAiAttachment(formData, options = {}) {
@@ -356,8 +365,12 @@ export class ApiClient {
     return this.request("/ai/runs", { ...options, method: "POST", body: payload });
   }
 
-  async listAiRuns(kind = "", options = {}) {
-    const path = `/ai/runs${kind ? queryString({ kind }) : ""}`;
+  async estimateAiContext(payload, options = {}) {
+    return this.request("/ai/context/estimate", { ...options, method: "POST", body: payload });
+  }
+
+  async listAiRuns(kind = "", { limit, cursor, ...options } = {}) {
+    const path = `/ai/runs${queryString({ kind, limit, cursor })}`;
     return this.request(path, options);
   }
 
@@ -377,16 +390,22 @@ export class ApiClient {
     return this.request(`/ai/runs/${pathId(id)}/continue`, { ...options, method: "POST", body: options.body || {} });
   }
 
-  async updateAiRunContent(id, content, options = {}) {
-    return this.request(`/ai/runs/${pathId(id)}/content`, { ...options, method: "PUT", body: { content } });
+  async updateAiRunContent(id, content, expectedRevision, { caseDate, ...options } = {}) {
+    const body = { content, expected_revision: expectedRevision };
+    if (caseDate !== undefined) body.case_date = caseDate;
+    return this.request(`/ai/runs/${pathId(id)}/content`, { ...options, method: "PUT", body });
   }
 
-  async exportAiRun(id, format = "pdf", options = {}) {
-    return this.download(`/ai/runs/${pathId(id)}/export${queryString({ format })}`, options);
+  async recheckAiRunCitations(id, expectedRevision, options = {}) {
+    return this.request(`/ai/runs/${pathId(id)}/citations/recheck`, { ...options, method: "POST", body: { expected_revision: expectedRevision } });
   }
 
-  async listAiConversations(options = {}) {
-    return this.request("/ai/conversations", options);
+  async exportAiRun(id, format = "pdf", expectedRevision, options = {}) {
+    return this.download(`/ai/runs/${pathId(id)}/export${queryString({ format, expected_revision: expectedRevision })}`, options);
+  }
+
+  async listAiConversations({ limit, cursor, ...options } = {}) {
+    return this.request(`/ai/conversations${queryString({ limit, cursor })}`, options);
   }
 
   async createAiConversation(payload = {}, options = {}) {
@@ -399,6 +418,26 @@ export class ApiClient {
 
   async renameAiConversation(id, title, options = {}) {
     return this.request(`/ai/conversations/${pathId(id)}`, { ...options, method: "PATCH", body: { title } });
+  }
+
+  async updateAiConversationContext(id, payload, options = {}) {
+    return this.request(`/ai/conversations/${pathId(id)}/context`, { ...options, method: "PUT", body: payload });
+  }
+
+  async prepareAiConversationContext(id, payload, options = {}) {
+    return this.request(`/ai/conversations/${pathId(id)}/context/prepare`, { ...options, method: "POST", body: payload });
+  }
+
+  async getAiDraft(id, options = {}) {
+    return this.request(`/ai/drafts/${pathId(id)}`, options);
+  }
+
+  async saveAiDraft(id, payload, options = {}) {
+    return this.request(`/ai/drafts/${pathId(id)}`, { ...options, method: "PUT", body: payload });
+  }
+
+  async deleteAiDraft(id, expectedRevision, options = {}) {
+    return this.request(`/ai/drafts/${pathId(id)}${queryString({ expected_revision: expectedRevision })}`, { ...options, method: "DELETE" });
   }
 
   async streamChat(path, payload, { onDelta, onDone, onError, signal } = {}) {

@@ -125,6 +125,141 @@ export function aiRunTitle(run, fallback = "未命名任务") {
   return value || fallback;
 }
 
+const CITATION_VERIFICATION_STATE_LABELS = Object.freeze({
+  passed: "机械校验通过",
+  pending: "等待机械复核",
+  stale: "正文或日期已变化，待机械复核",
+  legacy_pending: "历史记录待机械复核"
+});
+
+const CITATION_VERIFICATION_REASON_LABELS = Object.freeze({
+  quote_mismatch: "引文与正文未匹配",
+  quote_ambiguous: "引文匹配不唯一",
+  case_date_unknown: "缺少文书适用日期",
+  source_changed: "引用来源已变化",
+  source_missing: "引用来源不存在",
+  source_full_text_unavailable: "未读取引用来源全文"
+});
+
+const CITATION_SOURCE_CHECK_STATES = Object.freeze({
+  sourceExists: Object.freeze(["passed", "not_found", "unknown"]),
+  fullTextRead: Object.freeze(["passed", "not_read", "unavailable", "not_found", "unknown"]),
+  citationMatch: Object.freeze(["matched", "mismatch", "ambiguous", "not_provided", "not_requested", "not_checked", "unknown"]),
+  timeCheck: Object.freeze(["passed", "outside_case_date", "outside", "not_applicable", "unknown"])
+});
+
+const CITATION_SOURCE_CHECK_LABELS = Object.freeze({
+  sourceExists: Object.freeze({ passed: "已找到", not_found: "未找到", unknown: "未核实" }),
+  fullTextRead: Object.freeze({ passed: "已读取", not_read: "未读取", unavailable: "全文不可用", not_found: "来源未找到", unknown: "未核实" }),
+  citationMatch: Object.freeze({ matched: "已匹配", mismatch: "不匹配", ambiguous: "匹配不唯一", not_provided: "未提供引文", not_requested: "未提供引文", not_checked: "未检查", unknown: "未核实" }),
+  timeCheck: Object.freeze({ passed: "通过", outside_case_date: "不在文书日期范围", outside: "不在文书日期范围", not_applicable: "不适用", unknown: "未核实" })
+});
+
+const CITATION_SOURCE_ERROR_LABELS = Object.freeze({
+  citation_not_found: "未找到引用来源",
+  citation_source_unavailable: "引用来源当前不可用"
+});
+
+function normalizeCitationCheckState(kind, value) {
+  const allowed = CITATION_SOURCE_CHECK_STATES[kind] || [];
+  if (allowed.includes(value)) return value;
+  // Pre-LA13 records used booleans. Preserve their conservative meaning while
+  // the public endpoint uses the stricter string-state contract.
+  if (value === true) return kind === "citationMatch" ? "matched" : "passed";
+  if (value === false) {
+    if (kind === "sourceExists") return "not_found";
+    if (kind === "fullTextRead") return "not_read";
+    if (kind === "citationMatch") return "mismatch";
+  }
+  return "unknown";
+}
+
+function citationCheckTone(kind, value) {
+  const state = normalizeCitationCheckState(kind, value);
+  if (["passed", "matched", "not_applicable"].includes(state)) return "passed";
+  if (["not_found", "mismatch", "outside_case_date", "outside"].includes(state)) return "failed";
+  return state === "unavailable" || state === "ambiguous" ? "warning" : "unknown";
+}
+
+function normalizeCitationErrorCategory(value) {
+  const category = textValue(value);
+  return Object.hasOwn(CITATION_SOURCE_ERROR_LABELS, category) ? category : "";
+}
+
+function normalizeSourceContentState(value) {
+  return textValue(value) === "changed" ? "changed" : "";
+}
+
+function safeVerificationHash(value) {
+  const hash = textValue(value).toLowerCase();
+  return /^[a-f0-9]{12,128}$/u.test(hash) ? hash : "";
+}
+
+function safeCitationLocator(value) {
+  const locator = textValue(value);
+  if (safeContextLocator(locator)) return locator;
+  if (/^law-article:[A-Za-z0-9._~-]+:[A-Za-z0-9._~-]+:[\p{L}\p{N}._~-]{1,80}$/u.test(locator)) return locator;
+  return /^judicial-case:[A-Za-z0-9._~-]+$/u.test(locator) ? locator : "";
+}
+
+function safeCitationRanges(value) {
+  const rows = Array.isArray(value) ? value : [];
+  return rows.map((row) => {
+    const start = Number(field(row, ["start_byte", "startByte"]));
+    const end = Number(field(row, ["end_byte", "endByte"]));
+    return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && end >= start ? { start, end } : null;
+  }).filter(Boolean);
+}
+
+export function citationVerificationStateLabel(state) {
+  return CITATION_VERIFICATION_STATE_LABELS[textValue(state)] || "引用校验状态未核实";
+}
+
+export function citationVerificationReasonLabel(reason) {
+  return CITATION_VERIFICATION_REASON_LABELS[textValue(reason)] || "需要重新机械核验";
+}
+
+export function citationCheckLabel(kind, value) {
+  if (value === undefined) return kind === true ? "通过" : kind === false ? "未通过" : "未核实";
+  const state = normalizeCitationCheckState(kind, value);
+  return CITATION_SOURCE_CHECK_LABELS[kind]?.[state] || "未核实";
+}
+
+export function citationErrorCategoryLabel(category) {
+  return CITATION_SOURCE_ERROR_LABELS[normalizeCitationErrorCategory(category)] || "";
+}
+
+export function normalizeCitationVerification(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const state = textValue(source.state, "legacy_pending");
+  const rawSources = Array.isArray(source.sources) ? source.sources : [];
+  return {
+    state: Object.hasOwn(CITATION_VERIFICATION_STATE_LABELS, state) ? state : "legacy_pending",
+    reasons: (Array.isArray(source.reasons) ? source.reasons : []).map((reason) => textValue(reason)).filter(Boolean),
+    bodySha256: safeVerificationHash(source.body_sha256 ?? source.bodySha256),
+    runRevision: aiRunRevision(source),
+    caseDate: legalDateValue(source.case_date ?? source.caseDate),
+    verifiedAt: textValue(source.verified_at ?? source.verifiedAt),
+    sources: rawSources.map((item) => ({
+      sourceKind: textValue(field(item, ["source_kind", "sourceKind"])),
+      sourceId: textValue(field(item, ["source_id", "sourceId"])),
+      documentId: textValue(field(item, ["document_id", "documentId"])),
+      versionId: textValue(field(item, ["version_id", "versionId"])),
+      sourceFullTextSha256: safeVerificationHash(field(item, ["source_full_text_sha256", "sourceFullTextSha256"])),
+      citationLocator: safeCitationLocator(field(item, ["citation_locator", "citationLocator"])),
+      quoteSha256: safeVerificationHash(field(item, ["quote_sha256", "quoteSha256"])),
+      matchedRanges: safeCitationRanges(field(item, ["matched_ranges", "matchedRanges"])),
+      sourceExists: normalizeCitationCheckState("sourceExists", field(item, ["source_exists", "sourceExists"])),
+      fullTextRead: normalizeCitationCheckState("fullTextRead", field(item, ["full_text_read", "fullTextRead"])),
+      citationMatch: normalizeCitationCheckState("citationMatch", field(item, ["citation_match", "citationMatch"])),
+      timeCheck: normalizeCitationCheckState("timeCheck", field(item, ["time_check", "timeCheck"])),
+      errorCategory: normalizeCitationErrorCategory(field(item, ["error_category", "errorCategory"])),
+      sourceContentState: normalizeSourceContentState(field(item, ["source_content", "sourceContent"])),
+      relevance: "manual_review_required"
+    })).filter((item) => item.sourceKind || item.sourceId || item.documentId)
+  };
+}
+
 export function normalizeAiRun(run) {
   if (!run || typeof run !== "object") return { id: "", kind: "", status: "failed", stage: "", prompt: "", title: "", content: "", html: "", citations: [], tool_steps: [], error_code: "", usage: null };
   const citations = Array.isArray(run.citations) ? run.citations : Array.isArray(run.references) ? run.references : [];
@@ -140,6 +275,7 @@ export function normalizeAiRun(run) {
     content: aiRunContent(run),
     html: textValue(field(run, ["html", "rendered_html"])),
     citations,
+    citationVerification: normalizeCitationVerification(field(run, ["citation_verification", "citationVerification"])),
     tool_steps: toolSteps,
     error_code: textValue(field(run, ["error_code", "errorCode"])),
     usage: run.usage && typeof run.usage === "object" ? run.usage : null
@@ -149,6 +285,211 @@ export function normalizeAiRun(run) {
 export function normalizeAiRunList(response) {
   const items = Array.isArray(response) ? response : response?.runs || response?.items || response?.tasks || [];
   return Array.isArray(items) ? items.map(normalizeAiRun) : [];
+}
+
+export function normalizeCursorPage(response, keys = [], defaults = {}) {
+  const source = response && typeof response === "object" ? response : {};
+  const names = Array.isArray(keys) ? keys : [keys];
+  const rawItems = Array.isArray(response)
+    ? response
+    : names.map((key) => source[key]).find(Array.isArray) || source.items || [];
+  const items = Array.isArray(rawItems) ? rawItems : [];
+  const parsedTotal = Number(source.total ?? source.total_items ?? source.totalItems);
+  const parsedCorrupt = Number(source.corrupt_count ?? source.corruptCount);
+  return {
+    items,
+    nextCursor: textValue(source.next_cursor ?? source.nextCursor),
+    total: Number.isSafeInteger(parsedTotal) && parsedTotal >= 0 ? parsedTotal : (Number(defaults.total) || items.length),
+    corruptCount: Number.isSafeInteger(parsedCorrupt) && parsedCorrupt >= 0 ? parsedCorrupt : 0
+  };
+}
+
+function appendUniqueById(current, next) {
+  const result = [];
+  const seen = new Set();
+  for (const item of [...(Array.isArray(current) ? current : []), ...(Array.isArray(next) ? next : [])]) {
+    const id = textValue(field(item, ["id", "run_id", "runId", "material_id", "materialId", "conversation_id", "conversationId"]));
+    const key = id || `index:${result.length}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+export function aiRunRevision(run, fallback = 0) {
+  const revision = Number(field(run, ["revision", "run_revision", "runRevision"]));
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : fallback;
+}
+
+export function conversationContextRevision(conversation, fallback = 0) {
+  const revision = Number(field(conversation, ["context_revision", "contextRevision", "revision"]));
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : fallback;
+}
+
+export function writingDraftContent(value = {}) {
+  const materials = Array.isArray(value.materials) ? value.materials
+    .map((reference) => ({
+      id: textValue(field(reference, ["id", "material_id", "materialId"])),
+      source: textValue(field(reference, ["source"]))
+    }))
+    .filter((reference) => reference.id && ["original", "redacted"].includes(reference.source)) : [];
+  const attachmentIds = Array.isArray(value.attachment_ids || value.attachmentIds)
+    ? (value.attachment_ids || value.attachmentIds).map((id) => textValue(id)).filter(Boolean) : [];
+  const runId = textValue(value.run_id ?? value.runId);
+  const runRevision = Number(field(value, ["run_revision", "runRevision", "revision"]));
+  return {
+    document_type: textValue(value.document_type ?? value.documentType),
+    prompt: textValue(value.prompt),
+    requirements: textValue(value.requirements),
+    case_date: textValue(value.case_date ?? value.caseDate),
+    provider_id: textValue(value.provider_id ?? value.providerId),
+    model: textValue(value.model),
+    materials,
+    attachment_ids: attachmentIds,
+    // These are optional as a pair.  JSON null maps to the service's
+    // Option fields; an empty string would be an invalid run identifier.
+    run_id: runId || null,
+    run_revision: runId && Number.isSafeInteger(runRevision) && runRevision >= 0 ? runRevision : null,
+    content: textValue(value.content),
+    dirty: value.dirty === true
+  };
+}
+
+export function writingDraftRestorePlan(draft, summaryRun = null, { hasLocalInput = false } = {}) {
+  const snapshot = writingDraftContent(draft);
+  if (hasLocalInput || !snapshot.dirty || !snapshot.run_id || !snapshot.content) return null;
+  const fallbackRevision = aiRunRevision(summaryRun, null);
+  const expectedRevision = Number.isSafeInteger(snapshot.run_revision) && snapshot.run_revision >= 0
+    ? snapshot.run_revision
+    : Number.isSafeInteger(fallbackRevision) && fallbackRevision >= 0 ? fallbackRevision : null;
+  return { runId: snapshot.run_id, expectedRevision, content: snapshot.content };
+}
+
+export const AI_RUN_POLL_MAX_CONSECUTIVE_FAILURES = 5;
+export const AI_RUN_POLL_RETRY_BASE_DELAY_MS = 1500;
+export const AI_RUN_POLL_RETRY_MAX_DELAY_MS = 30000;
+
+export function isRetryableAiPollError(error) {
+  return Boolean(error instanceof ApiError && error.retryable && ![401, 403, 404].includes(error.status));
+}
+
+export function aiRunPollBackoffDelay(consecutiveFailures, { baseDelayMs = AI_RUN_POLL_RETRY_BASE_DELAY_MS, maxDelayMs = AI_RUN_POLL_RETRY_MAX_DELAY_MS } = {}) {
+  const failures = Math.max(1, Number.isSafeInteger(Number(consecutiveFailures)) ? Number(consecutiveFailures) : 1);
+  const base = Math.max(1, Number(baseDelayMs) || AI_RUN_POLL_RETRY_BASE_DELAY_MS);
+  const max = Math.max(base, Number(maxDelayMs) || AI_RUN_POLL_RETRY_MAX_DELAY_MS);
+  return Math.min(max, base * (2 ** (failures - 1)));
+}
+
+// One poller owns at most one in-flight request per run. Views subscribe with a
+// scope and dispose that scope when their DOM is replaced, so detached panels
+// cannot keep mutating application state or retrying a terminal HTTP error.
+export class AiRunPoller {
+  constructor({ getRun, onRun = () => {}, setTimer = globalThis.setTimeout.bind(globalThis), clearTimer = globalThis.clearTimeout.bind(globalThis), maxConsecutiveFailures = AI_RUN_POLL_MAX_CONSECUTIVE_FAILURES, retryBaseDelayMs = AI_RUN_POLL_RETRY_BASE_DELAY_MS, retryMaxDelayMs = AI_RUN_POLL_RETRY_MAX_DELAY_MS } = {}) {
+    this.getRun = getRun;
+    this.onRun = onRun;
+    this.setTimer = setTimer;
+    this.clearTimer = clearTimer;
+    this.maxConsecutiveFailures = Math.max(1, Number(maxConsecutiveFailures) || AI_RUN_POLL_MAX_CONSECUTIVE_FAILURES);
+    this.retryBaseDelayMs = Math.max(1, Number(retryBaseDelayMs) || AI_RUN_POLL_RETRY_BASE_DELAY_MS);
+    this.retryMaxDelayMs = Math.max(this.retryBaseDelayMs, Number(retryMaxDelayMs) || AI_RUN_POLL_RETRY_MAX_DELAY_MS);
+    this.entries = new Map();
+  }
+
+  subscribe(id, { scope = "default", onUpdate, onDone, onError } = {}) {
+    const key = String(id || "");
+    if (!key) return () => {};
+    let entry = this.entries.get(key);
+    if (!entry) {
+      entry = { id: key, listeners: new Map(), timer: null, controller: null, inFlight: false, generation: 0, consecutiveFailures: 0 };
+      this.entries.set(key, entry);
+    }
+    entry.listeners.set(scope, { onUpdate, onDone, onError });
+    if (!entry.inFlight && !entry.timer) this.#poll(entry);
+    return () => this.unsubscribe(key, scope);
+  }
+
+  unsubscribe(id, scope) {
+    const entry = this.entries.get(String(id || ""));
+    if (!entry) return;
+    entry.listeners.delete(scope);
+    if (!entry.listeners.size) this.stop(entry.id);
+  }
+
+  disposeScope(scope) {
+    for (const [id, entry] of this.entries) {
+      entry.listeners.delete(scope);
+      if (!entry.listeners.size) this.stop(id);
+    }
+  }
+
+  stop(id) {
+    const entry = this.entries.get(String(id || ""));
+    if (!entry) return;
+    entry.generation += 1;
+    if (entry.timer) this.clearTimer(entry.timer);
+    entry.timer = null;
+    entry.controller?.abort();
+    entry.controller = null;
+    this.entries.delete(entry.id);
+  }
+
+  #emit(entry, kind, ...values) {
+    for (const listener of [...entry.listeners.values()]) listener[kind]?.(...values);
+  }
+
+  #schedule(entry, delay) {
+    if (this.entries.get(entry.id) !== entry || !entry.listeners.size) return;
+    entry.timer = this.setTimer(() => {
+      entry.timer = null;
+      this.#poll(entry);
+    }, delay);
+  }
+
+  #poll(entry) {
+    if (this.entries.get(entry.id) !== entry || entry.inFlight || !entry.listeners.size) return;
+    const generation = ++entry.generation;
+    const controller = new AbortController();
+    entry.controller = controller;
+    entry.inFlight = true;
+    // Capture a synchronous getRun throw in the same bounded failure path,
+    // while still starting an ordinary request immediately for subscribers.
+    let request;
+    try {
+      request = this.getRun(entry.id, { signal: controller.signal });
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    Promise.resolve(request)
+      .then((run) => {
+        if (this.entries.get(entry.id) !== entry || entry.generation !== generation) return;
+        entry.consecutiveFailures = 0;
+        this.onRun(run);
+        this.#emit(entry, "onUpdate", run);
+        if (aiRunIsTerminal(run)) {
+          this.#emit(entry, "onDone", run);
+          this.stop(entry.id);
+        } else this.#schedule(entry, 1500);
+      })
+      .catch((error) => {
+        if (this.entries.get(entry.id) !== entry || entry.generation !== generation || error?.name === "AbortError") return;
+        const retryable = isRetryableAiPollError(error);
+        entry.consecutiveFailures += 1;
+        const exhausted = !retryable || entry.consecutiveFailures >= this.maxConsecutiveFailures;
+        const retryDelayMs = retryable && !exhausted
+          ? aiRunPollBackoffDelay(entry.consecutiveFailures, { baseDelayMs: this.retryBaseDelayMs, maxDelayMs: this.retryMaxDelayMs })
+          : null;
+        this.#emit(entry, "onError", error, { retryable, consecutiveFailures: entry.consecutiveFailures, maxConsecutiveFailures: this.maxConsecutiveFailures, retryDelayMs, exhausted });
+        if (retryDelayMs !== null) this.#schedule(entry, retryDelayMs);
+        else this.stop(entry.id);
+      })
+      .finally(() => {
+        if (this.entries.get(entry.id) === entry && entry.generation === generation) {
+          entry.inFlight = false;
+          entry.controller = null;
+        }
+      });
+  }
 }
 
 export function aiRunElapsedSeconds(run, now = Date.now()) {
@@ -245,13 +586,169 @@ export function legalFacetLabel(kind, value) {
   return LEGAL_FACET_LABELS[kind]?.[text] || (text && /[\u3400-\u9fff]/u.test(text) ? text : text || "未知");
 }
 
-export function legalSearchPageParams({ query = "", documentId = "", caseDate = "", type = "", level = "", region = "", status = "", sort = "relevance", view = "grouped", pageSize = 20, offset = 0, includeHistory = true, includeRelations = true } = {}) {
+const LEGAL_MATCH_MODES = Object.freeze(["all", "any", "phrase"]);
+const LEGAL_VERSION_SCOPES = Object.freeze(["current", "as_of", "all"]);
+
+export function legalDateValue(value) {
+  const date = String(value || "").trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(date);
+  if (!match) return "";
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (!Number.isInteger(year) || year < 1 || month < 1 || month > 12 || day < 1) return "";
+  const monthDays = [31, (year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= monthDays[month - 1] ? date : "";
+}
+
+export function legalMatchMode(value) {
+  const mode = String(value || "").trim();
+  return LEGAL_MATCH_MODES.includes(mode) ? mode : "all";
+}
+
+export function legalVersionScope(value) {
+  const scope = String(value || "").trim();
+  return LEGAL_VERSION_SCOPES.includes(scope) ? scope : "current";
+}
+
+export function legalScopedReadParams(appliedQuery = {}) {
+  const scope = legalVersionScope(appliedQuery?.versionScope ?? appliedQuery?.version_scope);
+  const asOf = scope === "as_of" ? legalDateValue(appliedQuery?.asOf ?? appliedQuery?.as_of ?? appliedQuery?.caseDate ?? appliedQuery?.case_date) : "";
+  return {
+    versionScope: scope,
+    ...(asOf ? { caseDate: asOf } : {})
+  };
+}
+
+export function legalQueryScopeSummary(query = {}, { unknown = "该历史任务未记录检索范围。" } = {}) {
+  const source = query && typeof query === "object" ? query : {};
+  const recorded = ["match_mode", "matchMode", "version_scope", "versionScope", "version_status", "versionStatus", "case_date", "caseDate", "as_of", "asOf"].some((key) => Object.hasOwn(source, key));
+  if (!recorded) return unknown;
+  const matchMode = legalMatchMode(field(source, ["match_mode", "matchMode"]));
+  const versionScope = legalVersionScope(field(source, ["version_scope", "versionScope"]));
+  const caseDate = versionScope === "as_of" ? legalDateValue(field(source, ["case_date", "caseDate", "as_of", "asOf"])) : "";
+  const versionStatus = textValue(field(source, ["version_status", "versionStatus"]));
+  const matchText = matchMode === "any" ? "任一词匹配" : matchMode === "phrase" ? "完整短语匹配" : "全部词均匹配";
+  const scopeText = versionScope === "as_of" ? `适用日期 ${caseDate || "未知"}` : versionScope === "all" ? "全部版本" : "当前有效版本";
+  return `检索条件：${matchText} · ${scopeText}${versionStatus ? ` · 状态 ${legalStatusLabel(versionStatus)}` : ""}`;
+}
+
+const CONTEXT_BUDGET_STAGE_LABELS = Object.freeze({
+  ready: "预检通过",
+  conservative: "保守预检",
+  scope_required: "需要缩小范围",
+  budget_exceeded: "超出上下文预算"
+});
+
+const CONTEXT_OMISSION_REASON_LABELS = Object.freeze({
+  budget_cut: "受预算限制未采用",
+  metadata_unknown: "元数据不足，未读取正文",
+  ocr_page_scope_required: "材料超出预算，请拆分文件或减少材料",
+  no_relevant_segment: "未找到相关片段",
+  history_budget_cut: "受历史范围预算限制未采用"
+});
+
+function boundedTokenCount(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function safeContextLocator(value) {
+  const locator = textValue(value);
+  return /^(?:page|paragraph|docx-image):[1-9]\d*$|^line:[1-9]\d*-[1-9]\d*$/u.test(locator) ? locator : "";
+}
+
+function normalizeContextScopeItems(value, kind) {
+  const rows = Array.isArray(value) ? value : [];
+  return rows.map((item) => ({
+    id: textValue(field(item, ["id", "material_id", "materialId", "attachment_id", "attachmentId", "run_id", "runId"])),
+    source: textValue(field(item, ["source"])),
+    format: textValue(field(item, ["format", "content_type", "contentType"])),
+    locators: (Array.isArray(item?.locators) ? item.locators : []).map(safeContextLocator).filter(Boolean),
+    kind
+  })).filter((item) => item.id || item.locators.length);
+}
+
+export function contextBudgetStageLabel(stage) {
+  return CONTEXT_BUDGET_STAGE_LABELS[textValue(stage)] || "预检状态未核实";
+}
+
+export function contextOmissionReasonLabel(reason) {
+  return CONTEXT_OMISSION_REASON_LABELS[textValue(reason)] || "未采用原因未核实";
+}
+
+export function normalizeAiContextEstimate(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const rawCapabilities = source.capabilities && typeof source.capabilities === "object" ? source.capabilities : {};
+  const rawEstimate = source.estimate && typeof source.estimate === "object" ? source.estimate : {};
+  const selected = source.selected_scope && typeof source.selected_scope === "object" ? source.selected_scope : source.selectedScope && typeof source.selectedScope === "object" ? source.selectedScope : {};
+  const omitted = Array.isArray(source.omitted_scope) ? source.omitted_scope : Array.isArray(source.omittedScope) ? source.omittedScope : [];
+  const stage = textValue(source.stage, "conservative");
+  return {
+    providerId: textValue(source.provider_id ?? source.providerId),
+    model: textValue(source.model),
+    planHash: textValue(source.plan_hash ?? source.planHash),
+    stage: Object.hasOwn(CONTEXT_BUDGET_STAGE_LABELS, stage) ? stage : "conservative",
+    capabilities: {
+      verified: rawCapabilities.verified === true,
+      maxInputTokens: boundedTokenCount(rawCapabilities.max_input_tokens ?? rawCapabilities.maxInputTokens),
+      maxOutputTokens: boundedTokenCount(rawCapabilities.max_output_tokens ?? rawCapabilities.maxOutputTokens),
+      supportsTools: rawCapabilities.supports_tools === true || rawCapabilities.supportsTools === true,
+      supportsStructuredOutput: rawCapabilities.supports_structured_output === true || rawCapabilities.supportsStructuredOutput === true,
+      supportsVision: rawCapabilities.supports_vision === true || rawCapabilities.supportsVision === true
+    },
+    estimate: {
+      inputTokens: boundedTokenCount(rawEstimate.input_tokens ?? rawEstimate.inputTokens),
+      reservedOutputTokens: boundedTokenCount(rawEstimate.reserved_output_tokens ?? rawEstimate.reservedOutputTokens),
+      historyTokens: boundedTokenCount(rawEstimate.history_tokens ?? rawEstimate.historyTokens),
+      materialTokens: boundedTokenCount(rawEstimate.material_tokens ?? rawEstimate.materialTokens),
+      attachmentTokens: boundedTokenCount(rawEstimate.attachment_tokens ?? rawEstimate.attachmentTokens),
+      toolReserveTokens: boundedTokenCount(rawEstimate.tool_reserve_tokens ?? rawEstimate.toolReserveTokens)
+    },
+    selectedScope: {
+      materials: normalizeContextScopeItems(selected.materials, "material"),
+      attachments: normalizeContextScopeItems(selected.attachments, "attachment"),
+      historyRunIds: Array.isArray(selected.history_run_ids ?? selected.historyRunIds) ? (selected.history_run_ids ?? selected.historyRunIds).map((id) => textValue(id)).filter(Boolean) : []
+    },
+    omittedScope: omitted.map((item) => ({
+      sourceKind: textValue(field(item, ["source_kind", "sourceKind"])),
+      sourceId: textValue(field(item, ["source_id", "sourceId"])),
+      reason: textValue(field(item, ["reason"])),
+      estimatedTokens: boundedTokenCount(field(item, ["estimated_tokens", "estimatedTokens"]))
+    })).filter((item) => item.sourceKind || item.sourceId || item.reason)
+  };
+}
+
+export function contextEstimateCanProceed(estimate) {
+  return ["ready", "conservative"].includes(normalizeAiContextEstimate(estimate).stage);
+}
+
+export function modelCapabilitiesPayload(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const contextWindow = boundedTokenCount(source.context_window_tokens ?? source.contextWindowTokens);
+  const maxOutput = boundedTokenCount(source.max_output_tokens ?? source.maxOutputTokens);
+  if (!contextWindow || !maxOutput || maxOutput >= contextWindow) return null;
+  return {
+    context_window_tokens: contextWindow,
+    max_output_tokens: maxOutput,
+    supports_tools: source.supports_tools === true || source.supportsTools === true,
+    supports_structured_output: source.supports_structured_output === true || source.supportsStructuredOutput === true,
+    supports_vision: source.supports_vision === true || source.supportsVision === true
+  };
+}
+
+export function legalSearchPageParams({ query = "", documentId = "", caseDate = "", matchMode = "all", versionScope = "current", versionStatus = "", type = "", level = "", region = "", status = "", sort = "relevance", view = "grouped", pageSize = 20, offset = 0, includeHistory = true, includeRelations = true } = {}) {
   const safePageSize = Math.max(1, Math.min(100, Number.isFinite(Number(pageSize)) ? Math.floor(Number(pageSize)) : 20));
   const safeOffset = Math.max(0, Number.isFinite(Number(offset)) ? Math.floor(Number(offset)) : 0);
+  const scope = legalVersionScope(versionScope);
+  const asOf = scope === "as_of" ? legalDateValue(caseDate) : "";
   return {
     query: String(query || "").trim(),
     ...(String(documentId || "").trim() ? { document_id: String(documentId).trim() } : {}),
-    ...(String(caseDate || "").trim() ? { case_date: String(caseDate).trim() } : {}),
+    ...(asOf ? { case_date: asOf } : {}),
+    matchMode: legalMatchMode(matchMode),
+    versionScope: scope,
+    ...(scope !== "current" && String(versionStatus || "").trim() ? { versionStatus: String(versionStatus).trim() } : {}),
     ...(String(type || "").trim() ? { document_type: String(type).trim() } : {}),
     ...(String(level || "").trim() ? { effectiveness_level: String(level).trim() } : {}),
     ...(String(region || "").trim() ? { jurisdiction: String(region).trim() } : {}),
@@ -323,6 +820,17 @@ export function normalizeLegalPageResponse(response, defaults = {}) {
   const total = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? Math.floor(parsedTotal) : items.length;
   const parsedTotalLaws = Number(root.total_laws ?? root.totalLaws);
   const parsedTotalArticles = Number(root.total_articles ?? root.totalArticles);
+  const rawAppliedQuery = root.appliedQuery && typeof root.appliedQuery === "object"
+    ? root.appliedQuery
+    : response?.appliedQuery && typeof response.appliedQuery === "object" ? response.appliedQuery : {};
+  const rawAmbiguities = Array.isArray(root.ambiguities) ? root.ambiguities : Array.isArray(response?.ambiguities) ? response.ambiguities : [];
+  const ambiguities = rawAmbiguities.map((ambiguity) => {
+    const candidates = Array.isArray(ambiguity?.candidates) ? ambiguity.candidates.map((candidate) => ({
+      documentId: textValue(field(candidate, ["documentId", "document_id", "id"])),
+      title: textValue(field(candidate, ["title", "documentTitle", "document_title", "name"]))
+    })).filter((candidate) => candidate.documentId) : [];
+    return { query: textValue(field(ambiguity, ["query"])), candidates };
+  }).filter((ambiguity) => ambiguity.candidates.length);
   return {
     schemaVersion: textValue(root.schemaVersion ?? root.schema_version),
     items,
@@ -336,7 +844,15 @@ export function normalizeLegalPageResponse(response, defaults = {}) {
     view: textValue(root.view, defaults.view || "grouped"),
     databaseVersion: textValue(root.databaseVersion ?? root.database_version),
     warnings: caseTextList(root.warnings),
-    hasMore: root.has_more === true || root.hasMore === true || offset + limit < total
+    hasMore: root.has_more === true || root.hasMore === true || offset + limit < total,
+    appliedQuery: {
+      matchMode: legalMatchMode(field(rawAppliedQuery, ["matchMode", "match_mode"], defaults.matchMode || "all")),
+      versionScope: legalVersionScope(field(rawAppliedQuery, ["versionScope", "version_scope"], defaults.versionScope || "current")),
+      asOf: legalDateValue(field(rawAppliedQuery, ["asOf", "as_of", "caseDate", "case_date"], defaults.caseDate || "")),
+      resolvedDocumentId: textValue(field(rawAppliedQuery, ["resolvedDocumentId", "resolved_document_id", "documentId", "document_id"])),
+      exactArticleNumber: textValue(field(rawAppliedQuery, ["exactArticleNumber", "exact_article_number"]))
+    },
+    ambiguities
   };
 }
 
@@ -487,11 +1003,15 @@ function node(tag, options = {}, children = []) {
   if (options.multiple !== undefined) element.multiple = Boolean(options.multiple);
   if (options.rows !== undefined) element.rows = options.rows;
   if (options.cols !== undefined) element.cols = options.cols;
+  if (options.min !== undefined) element.min = options.min;
+  if (options.max !== undefined) element.max = options.max;
+  if (options.step !== undefined) element.step = options.step;
   if (options.accept) element.accept = options.accept;
   if (options.autocomplete) element.autocomplete = options.autocomplete;
   if (options.href) element.href = options.href;
   if (options.download) element.download = options.download;
   if (options.hidden !== undefined) element.hidden = Boolean(options.hidden);
+  if (options.open !== undefined) element.open = Boolean(options.open);
   if (options.readOnly !== undefined) element.readOnly = Boolean(options.readOnly);
   if (options.role) element.setAttribute("role", options.role);
   if (options.ariaLabel) element.setAttribute("aria-label", options.ariaLabel);
@@ -1049,8 +1569,11 @@ export class WebApp {
       view: "privacy",
       health: null,
       groups: [],
+      groupsPage: { items: [], nextCursor: "", total: 0, corruptCount: 0 },
       selectedGroupId: "",
       materials: [],
+      privacyMaterialPages: new Map(),
+      privacySelectedMaterialIds: new Map(),
       selectedMaterial: null,
       legalResults: [],
       legalCases: [],
@@ -1068,6 +1591,8 @@ export class WebApp {
       legalSearchAbort: null,
       legalArticleOffset: 0,
       legalArticleQuery: "",
+      legalQueryFilters: { caseDate: "", matchMode: "all", versionScope: "current", versionStatus: "", documentId: "", documentTitle: "", type: "", level: "", region: "", status: "", sort: "relevance", view: "grouped", includeHistory: true, includeRelations: true },
+      aiSearchFilters: { caseDate: "", matchMode: "all", versionScope: "current", versionStatus: "" },
       legalArticlePage: null,
       legalViewportCleanup: null,
       legalDetailOptions: { includeHistory: true, includeRelations: true },
@@ -1075,20 +1600,37 @@ export class WebApp {
       legalDetailAbort: null,
       providers: [],
       aiDefaults: {},
-      aiMaterials: [],
-      aiAttachments: [],
-      aiRuns: [],
-      selectedAiRun: null,
-      conversations: [],
-      selectedConversation: null,
-      mcpClients: [],
-      taskTimer: null,
-      chatAbort: null,
-      aiRunTimers: new Map(),
-      pendingMcpToken: null,
-      pendingCitation: null
-    };
-    this.api.onUnauthenticated = () => this.requireLogin();
+       aiMaterials: [],
+       aiMaterialsPage: { nextCursor: "", total: 0, corruptCount: 0, error: "", loaded: false },
+       aiAttachments: [],
+       aiRuns: [],
+       aiRunPages: new Map(),
+       runsById: new Map(),
+       pageRunIds: { writing: "", search: "", chat: "" },
+       conversations: [],
+       conversationPage: { nextCursor: "", total: 0, corruptCount: 0, loaded: false },
+       selectedConversation: null,
+       mcpClients: [],
+       taskTimer: null,
+       chatAbort: null,
+       activeRenderScope: "",
+       renderGeneration: 0,
+       providerLoadPromise: null,
+       writingDraft: { id: "writing-current", revision: 0, loaded: false, timer: null, saving: false, savingPromise: null, clearing: false, pending: null, sequence: 0, retryAttempts: 0, retryStopped: false },
+       pendingMcpToken: null,
+       pendingCitation: null
+     };
+     this.api.onUnauthenticated = () => this.requireLogin();
+     this.aiRunPoller = new AiRunPoller({
+       getRun: async (id, options) => {
+         const response = await this.api.getAiRun(id, options);
+         return normalizeAiRun(response?.run || response);
+       },
+       onRun: (run) => this.rememberAiRun(run)
+     });
+     globalThis.addEventListener?.("pagehide", () => {
+       void this.flushWritingDraft();
+     });
   }
 
   async start() {
@@ -1142,12 +1684,40 @@ export class WebApp {
 
   navigate(view) {
     if (!Object.prototype.hasOwnProperty.call(VIEWS, view)) return;
+    if (this.state.view === "templates") void this.flushWritingDraft();
     this.state.view = view;
     this.render();
   }
 
+  rememberAiRun(run) {
+    const normalized = normalizeAiRun(run);
+    if (normalized.id) this.state.runsById.set(normalized.id, normalized);
+    return normalized;
+  }
+
+  selectPageRun(page, run) {
+    const normalized = this.rememberAiRun(run);
+    if (normalized.id && Object.prototype.hasOwnProperty.call(this.state.pageRunIds, page)) {
+      this.state.pageRunIds[page] = normalized.id;
+    }
+    return normalized;
+  }
+
+  pageRun(page) {
+    const id = this.state.pageRunIds?.[page];
+    return id ? this.state.runsById.get(id) || null : null;
+  }
+
+  beginRenderScope() {
+    if (this.state.activeRenderScope) this.aiRunPoller.disposeScope(this.state.activeRenderScope);
+    const scope = `view-${++this.state.renderGeneration}`;
+    this.state.activeRenderScope = scope;
+    return scope;
+  }
+
   render() {
     this.teardownLegalViewport();
+    this.beginRenderScope();
     if (!this.state.authenticated) {
       this.renderLogin();
       return;
@@ -1232,7 +1802,12 @@ export class WebApp {
     groupRow.append(groupSelect);
     const refreshGroups = button("刷新", () => this.loadPrivacyData(groupSelect, materialsList, detail, dictionaryList, dictionaryStatus), "button subtle");
     groupRow.append(refreshGroups);
-    groupPanel.append(groupRow);
+    const loadMoreGroups = button("加载更多分组", () => this.loadPrivacyData(groupSelect, materialsList, detail, dictionaryList, dictionaryStatus, { appendGroups: true }), "button subtle");
+    loadMoreGroups.hidden = true;
+    const groupPageStatus = statusBox();
+    groupSelect.loadMoreControl = loadMoreGroups;
+    groupSelect.pageStatus = groupPageStatus;
+    groupPanel.append(groupRow, loadMoreGroups, groupPageStatus);
     const newGroupForm = node("form", { className: "inline-form" });
     const newGroupName = node("input", { type: "text", placeholder: "新分组名称", required: true });
     const addGroupButton = formButton("新建分组", "button secondary");
@@ -1383,10 +1958,28 @@ export class WebApp {
     }
   }
 
-  async loadPrivacyData(groupSelect, materialsList, detail, dictionaryList, dictionaryStatus) {
+  async loadGroupsPage({ append = false, limit = 50 } = {}) {
+    const previous = this.state.groupsPage;
+    const cursor = append ? textValue(previous.nextCursor) : "";
+    if (append && !cursor) return previous;
+    const response = await this.api.listGroups({ limit, cursor });
+    const page = normalizeCursorPage(response, ["groups"]);
+    const items = append ? appendUniqueById(previous.items, page.items) : page.items;
+    const next = { items, nextCursor: page.nextCursor, total: page.total, corruptCount: page.corruptCount };
+    this.state.groupsPage = next;
+    this.state.groups = items;
+    return next;
+  }
+
+  async loadPrivacyData(groupSelect, materialsList, detail, dictionaryList, dictionaryStatus, { appendGroups = false } = {}) {
     try {
-      const result = await this.api.request("/groups");
-      this.state.groups = parseJsonList(result?.groups);
+      const groupsPage = await this.loadGroupsPage({ append: appendGroups });
+      const loadMoreGroups = groupSelect.loadMoreControl;
+      if (loadMoreGroups) loadMoreGroups.hidden = !groupsPage.nextCursor;
+      if (groupSelect.pageStatus) {
+        const summary = `已加载 ${groupsPage.items.length}${groupsPage.total ? ` / ${groupsPage.total}` : ""} 个分组。`;
+        setStatus(groupSelect.pageStatus, groupsPage.corruptCount > 0 ? `${summary} 检测到 ${groupsPage.corruptCount} 个损坏分组记录，未显示。` : summary, groupsPage.corruptCount > 0 ? "warning" : "muted");
+      }
       replaceChildren(groupSelect);
       if (!this.state.groups.length) {
         appendOption(groupSelect, "", "暂无分组，请先新建");
@@ -1415,17 +2008,32 @@ export class WebApp {
     }
   }
 
-  async loadPrivacyMaterials(groupSelect, materialsList, detail) {
+  async loadPrivacyMaterials(groupSelect, materialsList, detail, { append = false } = {}) {
     if (!groupSelect.value) return;
-    replaceChildren(materialsList, [emptyState("正在加载材料…")]);
+    const groupIdValue = groupSelect.value;
+    const previous = this.state.privacyMaterialPages.get(groupIdValue) || { items: [], nextCursor: "", total: 0, corruptCount: 0 };
+    const cursor = append ? textValue(previous.nextCursor) : "";
+    if (append && !cursor) return;
+    if (!append) replaceChildren(materialsList, [emptyState("正在加载材料…")]);
     try {
-      const response = await this.api.request(`/materials${queryString({ group_id: groupSelect.value })}`);
-      this.state.materials = parseJsonList(response?.materials);
+      const response = await this.api.listMaterials(groupIdValue, { limit: 50, cursor });
+      const page = normalizeCursorPage(response, ["materials"]);
+      const items = append ? appendUniqueById(previous.items, page.items) : page.items;
+      const pageState = { items, nextCursor: page.nextCursor, total: page.total, corruptCount: page.corruptCount };
+      this.state.privacyMaterialPages.set(groupIdValue, pageState);
+      this.state.materials = items;
+      const selectedIds = this.state.privacySelectedMaterialIds.get(groupIdValue) || new Set();
+      this.state.privacySelectedMaterialIds.set(groupIdValue, selectedIds);
       const rows = [];
       for (const material of this.state.materials) {
         const id = textValue(field(material, ["id", "materialId", "material_id"]));
-        const checkbox = node("input", { type: "checkbox", ariaLabel: `选择${materialName(material)}` });
+        const checkbox = node("input", { type: "checkbox", ariaLabel: `选择${materialName(material)}`, checked: selectedIds.has(id) });
         checkbox.dataset.materialId = id;
+        checkbox.addEventListener("change", () => {
+          if (!id) return;
+          if (checkbox.checked) selectedIds.add(id);
+          else selectedIds.delete(id);
+        });
         const label = node("label", { className: "material-row" }, [
           checkbox,
           node("span", { className: "material-name", text: materialName(material) }),
@@ -1441,7 +2049,7 @@ export class WebApp {
       const format = node("select", { ariaLabel: "批量导出格式" });
       appendOption(format, "zip", "批量导出 ZIP");
       const exportButton = button("导出已选", async () => {
-        const materialIds = [...materialsList.querySelectorAll("input[data-material-id]:checked")].map((input) => input.dataset.materialId).filter(Boolean);
+        const materialIds = [...selectedIds];
         if (!materialIds.length) return;
         exportButton.disabled = true;
         try {
@@ -1455,7 +2063,10 @@ export class WebApp {
         }
       }, "button secondary");
       exportBar.append(format, exportButton);
-      replaceChildren(materialsList, [exportBar, ...rows]);
+      const pageSummary = node("p", { className: "muted small", text: `已加载 ${items.length}${pageState.total ? ` / ${pageState.total}` : ""} 个材料。` });
+      const corrupt = pageState.corruptCount > 0 ? statusBox(`检测到 ${pageState.corruptCount} 个损坏材料记录，未显示。`, "warning") : null;
+      const loadMore = pageState.nextCursor ? button("加载更多材料", () => this.loadPrivacyMaterials(groupSelect, materialsList, detail, { append: true }), "button subtle") : null;
+      replaceChildren(materialsList, [pageSummary, corrupt, exportBar, ...rows, loadMore]);
       if (this.state.selectedMaterial) await this.loadMaterialDetail(textValue(field(this.state.selectedMaterial, ["id", "materialId"])), detail);
       else replaceChildren(detail, [emptyState("选择材料后在这里复核。")]);
     } catch (error) {
@@ -1718,56 +2329,132 @@ export class WebApp {
   }
 
   async loadAiProviders() {
-    try {
-      const response = await this.api.listAiProviders();
-      const providers = response?.providers || response?.items || [];
-      this.state.providers = Array.isArray(providers) ? providers : [];
-      this.state.aiDefaults = response?.defaults && typeof response.defaults === "object" ? response.defaults : {};
-      this.state.providerPresets = Array.isArray(response?.presets) ? response.presets : AI_PROVIDER_PRESETS;
-    } catch (error) {
-      // The redaction consent panel still uses the v1 provider endpoint. Keep
-      // that legacy path available while an upgraded server is restarting.
+    if (this.state.providerLoadPromise) return this.state.providerLoadPromise;
+    const load = (async () => {
       try {
-        const response = await this.api.request("/providers");
-        this.state.providers = parseJsonList(response?.providers);
-      } catch {
-        this.state.providers = [];
+        const response = await this.api.listAiProviders();
+        const providers = response?.providers || response?.items || [];
+        this.state.providers = Array.isArray(providers) ? providers : [];
+        this.state.aiDefaults = response?.defaults && typeof response.defaults === "object" ? response.defaults : {};
+        this.state.providerPresets = Array.isArray(response?.presets) ? response.presets : AI_PROVIDER_PRESETS;
+      } catch (error) {
+        // The redaction consent panel still uses the v1 provider endpoint. Keep
+        // that legacy path available while an upgraded server is restarting.
+        try {
+          const response = await this.api.request("/providers");
+          this.state.providers = parseJsonList(response?.providers);
+        } catch {
+          this.state.providers = [];
+        }
+        throw error;
       }
-      throw error;
+      return this.state.providers;
+    })();
+    this.state.providerLoadPromise = load;
+    try {
+      return await load;
+    } finally {
+      if (this.state.providerLoadPromise === load) this.state.providerLoadPromise = null;
     }
-    return this.state.providers;
   }
 
-  async loadAiMaterials() {
+  async loadAiMaterials({ append = false, limit = 50 } = {}) {
+    const current = this.state.aiMaterialsPage;
+    const cursor = append ? textValue(current.nextCursor) : "";
+    if (append && !cursor) return this.state.aiMaterials;
     try {
-      const response = await this.api.listAiMaterials();
-      this.state.aiMaterials = normalizeAiMaterials(response);
-    } catch {
-      // A missing AI route should not make the regular material page unusable.
-      this.state.aiMaterials = [];
+      const response = await this.api.listAiMaterials({ limit, cursor });
+      const page = normalizeCursorPage(response, ["materials"]);
+      const next = normalizeAiMaterials({ materials: page.items });
+      this.state.aiMaterials = append ? appendUniqueById(this.state.aiMaterials, next) : next;
+      this.state.aiMaterialsPage = {
+        nextCursor: page.nextCursor,
+        total: page.total,
+        corruptCount: page.corruptCount,
+        error: "",
+        loaded: true
+      };
+    } catch (error) {
+      // Keep earlier pages selectable, including references retained from a
+      // draft or conversation, while making the local storage error visible.
+      const message = apiErrorMessage(error);
+      this.state.aiMaterialsPage = {
+        ...this.state.aiMaterialsPage,
+        ...(append ? {} : { nextCursor: "", total: 0, corruptCount: 0 }),
+        error: message,
+        loaded: true
+      };
+      if (!append) this.state.aiMaterials = [];
     }
     return this.state.aiMaterials;
   }
 
-  renderAiMaterialPicker(materials = this.state.aiMaterials, { multiple = true, title = "选择材料", preferRedacted = true } = {}) {
+  async loadAiRunPage(kind, { append = false, limit = 20 } = {}) {
+    const key = textValue(kind);
+    const previous = this.state.aiRunPages.get(key) || { items: [], nextCursor: "", total: 0, corruptCount: 0 };
+    const cursor = append ? textValue(previous.nextCursor) : "";
+    if (append && !cursor) return previous;
+    const response = await this.api.listAiRuns(key, { limit, cursor });
+    const page = normalizeCursorPage(response, ["runs", "tasks"]);
+    const received = page.items.map(normalizeAiRun);
+    const items = append ? appendUniqueById(previous.items, received) : received;
+    const next = { items, nextCursor: page.nextCursor, total: page.total, corruptCount: page.corruptCount };
+    this.state.aiRunPages.set(key, next);
+    this.state.aiRuns = [...this.state.aiRuns.filter((run) => run.kind !== key), ...items];
+    for (const run of items) this.rememberAiRun(run);
+    return next;
+  }
+
+  renderAiMaterialPicker(materials = this.state.aiMaterials, { multiple = true, title = "选择材料", preferRedacted = true, selectedValues = [], hasMore = false, total = 0, corruptCount = 0, errorMessage = "", onLoadMore = null, onChange = () => {} } = {}) {
     const picker = node("div", { className: "ai-material-picker" });
-    const selected = new Set();
+    const initialSources = new Map((Array.isArray(selectedValues) ? selectedValues : [])
+      .map((reference) => [textValue(field(reference, ["id", "material_id", "materialId"])), textValue(field(reference, ["source"]))])
+      .filter(([id]) => id));
     const rows = Array.isArray(materials) ? materials.filter((material) => material.id) : [];
+    const rowIds = new Set(rows.map((material) => material.id));
+    const retained = [...initialSources.entries()].filter(([id]) => !rowIds.has(id)).map(([id, source]) => ({ id, source: source || "redacted" }));
+    const options = { multiple, title, preferRedacted, selectedValues, hasMore, total, corruptCount, errorMessage, onLoadMore, onChange };
+    const selectedValuesForPicker = () => {
+      const selected = [...picker.querySelectorAll("input[data-material-id]:checked")].map((input) => {
+        const row = input.closest(".material-picker-row");
+        const material = rows.find((item) => item.id === input.dataset.materialId);
+        const source = row?.querySelector(".material-source")?.value || aiMaterialSource(material, preferRedacted);
+        return { id: input.dataset.materialId, source };
+      });
+      return multiple ? [...selected, ...retained] : selected.slice(0, 1);
+    };
     if (!rows.length) {
-      picker.append(emptyState("暂无可用材料；请先在“材料脱敏”中完成处理。"));
-      picker.values = () => [];
-      picker.refresh = (next) => this.renderAiMaterialPicker(next, { multiple, title, preferRedacted });
+      picker.append(retained.length
+        ? node("p", { className: "muted small", text: `已保留 ${retained.length} 个尚未加载的已选材料；加载更多后可取消。` })
+        : emptyState("暂无可用材料；请先在“材料脱敏”中完成处理。"));
+      picker.values = selectedValuesForPicker;
+      picker.notifySelection = () => onChange(picker.values());
+      picker.refresh = (next) => this.renderAiMaterialPicker(next, options);
+      if (errorMessage) picker.append(statusBox(errorMessage, "danger"));
+      if (hasMore && typeof onLoadMore === "function") {
+        const loadMore = button("加载更多材料", async () => {
+          loadMore.disabled = true;
+          try { await onLoadMore(picker.values()); } finally { loadMore.disabled = false; }
+        }, "button subtle");
+        picker.append(loadMore);
+      }
       return picker;
     }
-    const header = node("div", { className: "picker-heading" }, [node("strong", { text: title }), node("span", { className: "muted small", text: `${rows.length} 个材料` })]);
+    const count = Number.isSafeInteger(Number(total)) && Number(total) >= rows.length ? `${rows.length} / ${total} 个材料` : `${rows.length} 个材料`;
+    const header = node("div", { className: "picker-heading" }, [node("strong", { text: title }), node("span", { className: "muted small", text: count })]);
     picker.append(header);
+    if (retained.length) picker.append(node("p", { className: "muted small", text: `已保留 ${retained.length} 个尚未加载的已选材料；加载更多后可取消。` }));
+    if (Number(corruptCount) > 0) picker.append(statusBox(`检测到 ${Math.floor(Number(corruptCount))} 个损坏材料记录，未显示。`, "warning"));
+    if (errorMessage) picker.append(statusBox(errorMessage, "danger"));
     for (const material of rows) {
-      const check = node("input", { type: multiple ? "checkbox" : "radio", name: multiple ? undefined : `ai-material-${title}`, ariaLabel: `选择${material.name}` });
+      const initialSource = initialSources.get(material.id);
+      const check = node("input", { type: multiple ? "checkbox" : "radio", name: multiple ? undefined : `ai-material-${title}`, ariaLabel: `选择${material.name}`, checked: initialSources.has(material.id) });
       check.dataset.materialId = material.id;
       const source = node("select", { className: "material-source", ariaLabel: `${material.name}发送版本` });
       const hasRedacted = Boolean(material.result_id) && ["ready", "completed"].includes(String(material.status).toLowerCase());
       if (hasRedacted) appendOption(source, "redacted", "发送脱敏版", preferRedacted);
       if (material.has_original || !hasRedacted) appendOption(source, "original", "发送原文", !hasRedacted && !preferRedacted);
+      if (initialSource && [...source.options].some((option) => option.value === initialSource)) source.value = initialSource;
       if (!source.options.length) source.disabled = true;
       const label = node("label", { className: "material-picker-row" }, [check, node("span", { className: "material-picker-name", text: material.name }), node("span", { className: `status-pill ${materialStatusTone(material.status)}`, text: statusLabel(material.status) }), source]);
       picker.append(label);
@@ -1775,19 +2462,24 @@ export class WebApp {
         if (!multiple) {
           for (const other of picker.querySelectorAll("input[data-material-id]")) if (other !== check) other.checked = false;
         }
-        if (check.checked) selected.add(material.id); else selected.delete(material.id);
+        picker.notifySelection();
       });
+      source.addEventListener("change", () => picker.notifySelection());
     }
-    picker.values = () => [...picker.querySelectorAll("input[data-material-id]:checked")].map((input) => {
-      const row = input.closest(".material-picker-row");
-      const material = rows.find((item) => item.id === input.dataset.materialId);
-      const source = row?.querySelector(".material-source")?.value || aiMaterialSource(material, preferRedacted);
-      return { id: input.dataset.materialId, source };
-    });
+    picker.values = selectedValuesForPicker;
+    picker.notifySelection = () => onChange(picker.values());
+    picker.refresh = (next) => this.renderAiMaterialPicker(next, options);
+    if (hasMore && typeof onLoadMore === "function") {
+      const loadMore = button("加载更多材料", async () => {
+        loadMore.disabled = true;
+        try { await onLoadMore(picker.values()); } finally { loadMore.disabled = false; }
+      }, "button subtle");
+      picker.append(loadMore);
+    }
     return picker;
   }
 
-  applyMaterialTrust(picker, provider) {
+  applyMaterialTrust(picker, provider, { notify = true } = {}) {
     if (!picker) return;
     const allowRaw = provider?.trust_raw === true || provider?.trustRaw === true;
     for (const source of picker.querySelectorAll(".material-source")) {
@@ -1795,6 +2487,7 @@ export class WebApp {
       if (allowRaw && hasOriginal) source.value = "original";
       else if ([...source.options].some((option) => option.value === "redacted")) source.value = "redacted";
     }
+    if (notify) picker.notifySelection?.();
   }
 
   async uploadAiFiles(fileList, statusTarget) {
@@ -1819,17 +2512,21 @@ export class WebApp {
     return uploaded;
   }
 
-  renderAiAttachmentPicker({ accept = ".txt,.docx,.pdf,.png,.jpg,.jpeg,.webp", multiple = true } = {}) {
+  renderAiAttachmentPicker({ accept = ".txt,.docx,.pdf,.png,.jpg,.jpeg,.webp", multiple = true, initialAttachments = [], onChange = () => {} } = {}) {
     const wrapper = node("div", { className: "ai-attachment-picker" });
     const input = node("input", { type: "file", accept, multiple });
     const status = statusBox("附件仅在点击生成/发送后随任务提交。", "muted");
     const list = node("div", { className: "attachment-list" });
-    const selected = new Map();
+    const selected = new Map((Array.isArray(initialAttachments) ? initialAttachments : []).map((attachment) => {
+      const id = textValue(field(attachment, ["id", "attachment_id", "attachmentId"]));
+      return [id, { ...attachment, id, name: textValue(field(attachment, ["name", "filename"]), "已保存附件") }];
+    }).filter(([id]) => id));
     const renderSelected = () => {
       replaceChildren(list, [...selected.values()].map((item) => {
         const remove = button("移除", () => {
           selected.delete(item.id);
           renderSelected();
+          wrapper.notifySelection();
         }, "button subtle attachment-remove");
         return node("span", { className: "attachment-chip" }, [node("span", { text: item.name }), remove]);
       }));
@@ -1838,18 +2535,30 @@ export class WebApp {
       const uploaded = await this.uploadAiFiles(input.files, status);
       for (const item of uploaded) selected.set(item.id, item);
       renderSelected();
+      wrapper.notifySelection();
       input.value = "";
     });
     wrapper.append(labelFor("上传附件", input), list, status);
     wrapper.attachmentIds = () => [...selected.keys()];
+    wrapper.attachments = () => [...selected.values()];
+    wrapper.setAttachments = (attachments) => {
+      selected.clear();
+      for (const attachment of Array.isArray(attachments) ? attachments : []) {
+        const id = textValue(field(attachment, ["id", "attachment_id", "attachmentId"]));
+        if (id) selected.set(id, { ...attachment, id, name: textValue(field(attachment, ["name", "filename"]), "已保存附件") });
+      }
+      renderSelected();
+    };
+    wrapper.notifySelection = () => onChange(wrapper.attachmentIds());
+    renderSelected();
     return wrapper;
   }
 
-  async createAiRun(payload, { status, onUpdate, onDone } = {}) {
+  async createAiRun(payload, { page, status, onUpdate, onDone } = {}) {
     const response = await this.api.createAiRun(payload);
-    const run = normalizeAiRun(response?.run || response);
+    const run = this.rememberAiRun(response?.run || response);
     if (!run.id) throw new ApiError("run_id_missing", false, 200);
-    this.state.selectedAiRun = run;
+    if (page) this.selectPageRun(page, run);
     if (run.kind === AI_RUN_KINDS.chat) this.state.currentChatRunId = run.id;
     setStatus(status, `任务已创建：${aiRunStatusLabel(run.status)}`, "info");
     this.pollAiRun(run.id, { status, onUpdate, onDone });
@@ -1858,29 +2567,161 @@ export class WebApp {
 
   pollAiRun(id, { status, onUpdate, onDone } = {}) {
     const key = String(id || "");
-    if (!key) return;
-    const old = this.state.aiRunTimers.get(key);
-    if (old) clearTimeout(old);
-    const poll = async () => {
-      try {
-        const response = await this.api.getAiRun(key);
-        const run = normalizeAiRun(response?.run || response);
-        this.state.selectedAiRun = run;
-        onUpdate?.(run);
-        const terminal = aiRunIsTerminal(run);
-        setStatus(status, `${aiRunKindLabel(run.kind)}：${aiRunStatusLabel(run.status)}${run.stage ? ` · ${pipelineStageLabel(run.stage)}` : ""} · ${aiRunProgressText(run)}`, terminal && run.status === "completed" ? "success" : terminal ? "warning" : "info");
-        if (terminal) {
-          this.state.aiRunTimers.delete(key);
-          onDone?.(run);
-          return;
-        }
-        this.state.aiRunTimers.set(key, setTimeout(poll, 1500));
-      } catch (error) {
-        setStatus(status, apiErrorMessage(error), "danger");
-        this.state.aiRunTimers.set(key, setTimeout(poll, 3000));
-      }
+    if (!key) return () => {};
+    const scope = this.state.activeRenderScope || "detached";
+    let unsubscribe = () => {};
+    let retryControl = status?.aiRunPollRetryControl || null;
+    const ensureRetryControl = () => {
+      if (retryControl || !status?.parentElement) return retryControl;
+      retryControl = button("重新连接并更新状态", () => {
+        retryControl.disabled = true;
+        start();
+      }, "button subtle");
+      retryControl.hidden = true;
+      status.aiRunPollRetryControl = retryControl;
+      status.parentElement.insertBefore(retryControl, status.nextSibling);
+      return retryControl;
     };
-    poll();
+    const start = () => {
+      retryControl && (retryControl.hidden = true);
+      unsubscribe = this.aiRunPoller.subscribe(key, {
+        scope,
+        onUpdate: (run) => {
+          retryControl && (retryControl.hidden = true);
+          onUpdate?.(run);
+          const terminal = aiRunIsTerminal(run);
+          setStatus(status, `${aiRunKindLabel(run.kind)}：${aiRunStatusLabel(run.status)}${run.stage ? ` · ${pipelineStageLabel(run.stage)}` : ""} · ${aiRunProgressText(run)}`, terminal && run.status === "completed" ? "success" : terminal ? "warning" : "info");
+        },
+        onDone,
+        onError: (error, detail = {}) => {
+          if (detail.retryable && !detail.exhausted) {
+            const seconds = Math.max(1, Math.ceil(Number(detail.retryDelayMs || 0) / 1000));
+            setStatus(status, `连接暂时失败（第 ${detail.consecutiveFailures}/${detail.maxConsecutiveFailures} 次），将在约 ${seconds} 秒后重试。`, "warning");
+            return;
+          }
+          if (detail.retryable && detail.exhausted) {
+            const control = ensureRetryControl();
+            if (control) {
+              control.disabled = false;
+              control.hidden = false;
+            }
+            setStatus(status, "与本机服务连接异常，已停止自动更新。请检查服务后重新连接。", "danger");
+            return;
+          }
+          setStatus(status, apiErrorMessage(error), "danger");
+        }
+      });
+      return unsubscribe;
+    };
+    start();
+    return () => {
+      unsubscribe();
+      retryControl?.remove();
+      if (status?.aiRunPollRetryControl === retryControl) delete status.aiRunPollRetryControl;
+    };
+  }
+
+  async loadWritingDraft() {
+    const draft = this.state.writingDraft;
+    try {
+      const response = await this.api.getAiDraft(draft.id);
+      const record = response?.draft || response || {};
+      draft.revision = aiRunRevision(record, 0);
+      draft.loaded = true;
+      return writingDraftContent(record.content || record);
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.code === "not_found")) {
+        draft.revision = 0;
+        draft.loaded = true;
+        return writingDraftContent();
+      }
+      throw error;
+    }
+  }
+
+  queueWritingDraft(content, status) {
+    const draft = this.state.writingDraft;
+    if (draft.clearing) return;
+    draft.pending = { content: writingDraftContent(content), status, sequence: ++draft.sequence };
+    draft.retryAttempts = 0;
+    draft.retryStopped = false;
+    status?.retryControl && (status.retryControl.hidden = true);
+    if (draft.timer) clearTimeout(draft.timer);
+    setStatus(status, "草稿待保存…", "info");
+    draft.timer = setTimeout(() => {
+      draft.timer = null;
+      void this.flushWritingDraft();
+    }, 500);
+  }
+
+  async flushWritingDraft() {
+    const draft = this.state.writingDraft;
+    if (draft.clearing || draft.saving || !draft.pending) return draft.savingPromise;
+    const pending = draft.pending;
+    draft.pending = null;
+    draft.saving = true;
+    setStatus(pending.status, "草稿保存中…", "info");
+    const save = this.api.saveAiDraft(draft.id, {
+      expected_revision: draft.revision,
+      content: pending.content
+    });
+    draft.savingPromise = save;
+    try {
+      const response = await save;
+      const record = response?.draft || response || {};
+      draft.revision = aiRunRevision(record, draft.revision + 1);
+      draft.loaded = true;
+      draft.retryAttempts = 0;
+      pending.status?.retryControl && (pending.status.retryControl.hidden = true);
+      setStatus(pending.status, "草稿已加密保存到本机。", "success");
+    } catch (error) {
+      // A newer edit wins over the failed write; never revive an older body.
+      if (!draft.clearing && (!draft.pending || draft.pending.sequence <= pending.sequence)) draft.pending = pending;
+      const retryable = isRetryableAiPollError(error);
+      draft.retryAttempts = retryable ? draft.retryAttempts + 1 : 0;
+      draft.retryStopped = !retryable || draft.retryAttempts >= 3;
+      if (draft.retryStopped && pending.status?.retryControl) pending.status.retryControl.hidden = false;
+      setStatus(pending.status, `草稿未保存：${apiErrorMessage(error)}`, "danger");
+    } finally {
+      draft.saving = false;
+      draft.savingPromise = null;
+      if (draft.pending && !draft.timer && !draft.clearing && !draft.retryStopped) {
+        const delay = 1000 * (3 ** Math.max(0, draft.retryAttempts - 1));
+        draft.timer = setTimeout(() => {
+          draft.timer = null;
+          void this.flushWritingDraft();
+        }, delay);
+      }
+    }
+  }
+
+  async clearWritingDraft(status) {
+    const draft = this.state.writingDraft;
+    draft.clearing = true;
+    if (draft.timer) clearTimeout(draft.timer);
+    draft.timer = null;
+    draft.pending = null;
+    try {
+      // Wait for the write continuation too: it advances revision after the
+      // HTTP promise settles.  Deleting with the advanced revision prevents a
+      // late in-flight PUT from recreating a cleared draft.
+      if (draft.savingPromise) {
+        await draft.savingPromise.catch(() => {});
+        await Promise.resolve();
+      }
+      await this.api.deleteAiDraft(draft.id, draft.revision);
+      draft.revision = 0;
+      draft.loaded = true;
+      setStatus(status, "本机草稿已清除。", "success");
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.code === "not_found")) {
+        draft.revision = 0;
+        return;
+      }
+      setStatus(status, apiErrorMessage(error), "danger");
+    } finally {
+      draft.clearing = false;
+    }
   }
 
   renderRunCitations(target, citations = []) {
@@ -1897,6 +2738,125 @@ export class WebApp {
       const open = id ? button(`${title}${article ? ` · ${article}` : ""}`, () => this.openCitation(citation), "link-button") : node("strong", { text: `${title}${article ? ` · ${article}` : ""}` });
       return node("div", { className: "citation-item" }, [open, reason ? node("p", { className: "result-meta", text: reason }) : null]);
     })]);
+  }
+
+  renderCitationVerification(target, run, { locallyPending = false, onUpdated = null } = {}) {
+    if (!target) return null;
+    const normalizedRun = normalizeAiRun(run);
+    const verification = normalizeCitationVerification(normalizedRun.citationVerification);
+    const hasVerification = Boolean(field(normalizedRun, ["citation_verification", "citationVerification"])) || normalizedRun.citations.length > 0;
+    if (!hasVerification) {
+      replaceChildren(target);
+      return verification;
+    }
+    const state = locallyPending ? "stale" : verification.state;
+    const binding = [
+      verification.bodySha256 ? `正文校验 ${verification.bodySha256.slice(0, 12)}` : "正文校验未返回",
+      `文书版本 ${verification.runRevision || aiRunRevision(normalizedRun) || "未返回"}`,
+      verification.caseDate ? `文书适用日期 ${verification.caseDate}` : "文书适用日期未设置"
+    ];
+    const reasons = verification.reasons.map(citationVerificationReasonLabel);
+    const sourceRows = verification.sources.map((source) => {
+      const sourceName = [source.sourceKind || "来源", source.sourceId || source.documentId || "未命名"].filter(Boolean).join(" · ");
+      const checks = [
+        ["来源存在", "sourceExists", source.sourceExists],
+        ["全文读取", "fullTextRead", source.fullTextRead],
+        ["引文匹配", "citationMatch", source.citationMatch],
+        ["时间核验", "timeCheck", source.timeCheck]
+      ];
+      const details = [
+        source.citationLocator ? `定位 ${source.citationLocator}` : "定位信息未返回",
+        source.matchedRanges.length ? `匹配区间 ${source.matchedRanges.map((range) => `${range.start}–${range.end} bytes`).join("、")}` : "未返回匹配区间",
+        source.sourceFullTextSha256 ? `来源全文校验 ${source.sourceFullTextSha256.slice(0, 12)}` : "来源全文校验未返回",
+        source.quoteSha256 ? `引文校验 ${source.quoteSha256.slice(0, 12)}` : "引文校验未返回",
+        source.sourceContentState === "changed" ? "引用来源内容已变动，待重新核验" : "",
+        citationErrorCategoryLabel(source.errorCategory)
+      ].filter(Boolean);
+      return node("li", { className: "citation-verification-source" }, [
+        node("strong", { text: sourceName }),
+        node("ul", { className: "citation-check-list" }, checks.map(([label, kind, value]) => node("li", { className: citationCheckTone(kind, value), text: `${label}：${citationCheckLabel(kind, value)}` }))),
+        node("p", { className: "muted small", text: details.join(" · ") })
+      ]);
+    });
+    const recheck = button("重新机械核验", async () => {
+      recheck.disabled = true;
+      try {
+        const response = await this.api.recheckAiRunCitations(normalizedRun.id, aiRunRevision(normalizedRun));
+        const next = normalizeAiRun(response?.run || response);
+        if (!next.id) throw new ApiError("run_id_missing", false, 200);
+        await onUpdated?.(next);
+      } catch (error) {
+        target.prepend(statusBox(apiErrorMessage(error), "danger"));
+      } finally {
+        recheck.disabled = false;
+      }
+    }, "button subtle");
+    recheck.disabled = !normalizedRun.id || locallyPending;
+    replaceChildren(target, [
+      heading(3, "引用机械核验"),
+      statusBox(`${citationVerificationStateLabel(state)}${locallyPending ? "。本地正文或日期已变更，旧校验不能继续使用。" : "。"}`, state === "passed" ? "success" : state === "pending" ? "info" : "warning"),
+      node("p", { className: "muted small", text: binding.join(" · ") }),
+      reasons.length ? node("p", { className: "muted small", text: `待处理原因：${reasons.join("；")}` }) : null,
+      sourceRows.length ? node("ul", { className: "citation-verification-list" }, sourceRows) : node("p", { className: "muted small", text: "本结果没有可机械核验的来源记录。" }),
+      node("p", { className: "muted small", text: `机械校验不判断论证相关性；引用与论证的相关性始终需要人工复核。${verification.verifiedAt ? ` 最近核验：${verification.verifiedAt}` : ""}` }),
+      recheck
+    ]);
+    return verification;
+  }
+
+  renderContextEstimate(target, value) {
+    if (!target) return null;
+    const estimate = normalizeAiContextEstimate(value);
+    const tone = estimate.stage === "ready" ? "success" : estimate.stage === "conservative" ? "warning" : "danger";
+    const capabilityText = estimate.capabilities.verified
+      ? `模型上下文能力已配置：输入上限 ${estimate.capabilities.maxInputTokens || "未返回"} tokens，预留输出 ${estimate.capabilities.maxOutputTokens || "未返回"} tokens。`
+      : "模型上下文能力未核实；本机按输入 16k、输出 4k 的保守上限预检。";
+    const totals = [
+      `预计输入 ${estimate.estimate.inputTokens} tokens`,
+      `预留输出 ${estimate.estimate.reservedOutputTokens} tokens`,
+      `历史 ${estimate.estimate.historyTokens}`,
+      `材料 ${estimate.estimate.materialTokens}`,
+      `附件 ${estimate.estimate.attachmentTokens}`,
+      `工具预留 ${estimate.estimate.toolReserveTokens}`
+    ];
+    const selectedRows = [];
+    for (const item of estimate.selectedScope.materials) selectedRows.push(node("li", { text: `材料 ${item.id || "未命名"}${item.source ? ` · ${item.source === "original" ? "原文" : "脱敏版"}` : ""}${item.locators.length ? ` · ${item.locators.join("、")}` : ""}` }));
+    for (const item of estimate.selectedScope.attachments) selectedRows.push(node("li", { text: `附件 ${item.id || "未命名"}${item.format ? ` · ${item.format}` : ""}${item.locators.length ? ` · ${item.locators.join("、")}` : ""}` }));
+    if (estimate.selectedScope.historyRunIds.length) selectedRows.push(node("li", { text: `保留历史轮次：${estimate.selectedScope.historyRunIds.join("、")}` }));
+    const omittedRows = estimate.omittedScope.map((item) => node("li", { text: `${item.sourceKind || "上下文"}${item.sourceId ? ` ${item.sourceId}` : ""} · ${contextOmissionReasonLabel(item.reason)}${item.estimatedTokens ? ` · 约 ${item.estimatedTokens} tokens` : ""}` }));
+    replaceChildren(target, [
+      heading(3, "上下文预算预检"),
+      statusBox(`${contextBudgetStageLabel(estimate.stage)}。${capabilityText}`, tone),
+      node("p", { className: "muted small", text: totals.join(" · ") }),
+      heading(4, "本次实际采用范围"),
+      selectedRows.length ? node("ul", { className: "context-scope-list" }, selectedRows) : node("p", { className: "muted small", text: "本次未采用材料、附件或历史轮次。" }),
+      heading(4, "未采用范围及原因"),
+      omittedRows.length ? node("ul", { className: "context-scope-list" }, omittedRows) : node("p", { className: "muted small", text: "没有因预算或元数据限制省略的范围。" }),
+      node("p", { className: "muted small", text: "相关性判断始终由人工负责；本预检只说明本次可读取的上下文范围。" })
+    ]);
+    return estimate;
+  }
+
+  async preflightAiContext(payload, target, status) {
+    setStatus(status, "正在预检本次上下文范围…", "info");
+    try {
+      const response = await this.api.estimateAiContext(payload);
+      const estimate = this.renderContextEstimate(target, response);
+      if (!contextEstimateCanProceed(estimate)) {
+        setStatus(status, `${contextBudgetStageLabel(estimate.stage)}，请调整材料、页码范围或历史范围后重试。`, "warning");
+        return null;
+      }
+      if (!estimate.planHash) {
+        setStatus(status, "上下文预算预检未返回可绑定的计划标识，未提交生成请求。", "danger");
+        return null;
+      }
+      setStatus(status, estimate.capabilities.verified ? "上下文预算已按已配置模型能力预检。" : "上下文预算按保守上限预检，模型能力尚未核实。", estimate.capabilities.verified ? "success" : "warning");
+      return estimate;
+    } catch (error) {
+      replaceChildren(target, [heading(3, "上下文预算预检"), statusBox(apiErrorMessage(error), "danger")]);
+      setStatus(status, `无法完成上下文预算预检：${apiErrorMessage(error)}`, "danger");
+      return null;
+    }
   }
 
   async openCitation(citation) {
@@ -1932,8 +2892,17 @@ export class WebApp {
     modeSwitcher.append(statuteMode, aiMode, caseMode);
 
     const searchForm = node("form", { className: "search-form" });
-    const query = node("input", { type: "search", placeholder: "输入法条、关键词或文号", required: true, autocomplete: "off" });
-    const caseDate = node("input", { type: "date" });
+    const filters = this.state.legalQueryFilters;
+    const query = node("input", { type: "search", placeholder: "输入法条、关键词或文号", required: true, autocomplete: "off", value: this.state.legalMode === LEGAL_SEARCH_MODES.case ? this.state.legalCaseQuery : this.state.legalArticleQuery });
+    query.addEventListener("input", () => {
+      if (this.state.legalMode === LEGAL_SEARCH_MODES.case) this.state.legalCaseQuery = query.value;
+      else if (this.state.legalMode === LEGAL_SEARCH_MODES.statute) {
+        this.state.legalArticleQuery = query.value;
+        this.state.legalQueryFilters.documentId = "";
+        this.state.legalQueryFilters.documentTitle = "";
+      }
+    });
+    const caseDate = node("input", { type: "date", value: filters.caseDate });
     const caseType = node("select", { required: true });
     appendOption(caseType, CASE_TYPES.all, "全部（指导、参考及典型案例）", this.state.legalCaseType === CASE_TYPES.all);
     appendOption(caseType, CASE_TYPES.guiding, "仅指导案例", this.state.legalCaseType === CASE_TYPES.guiding);
@@ -1941,29 +2910,108 @@ export class WebApp {
     appendOption(caseType, CASE_TYPES.typical, "仅典型案例合集", this.state.legalCaseType === CASE_TYPES.typical);
     const includeWithdrawn = node("input", { type: "checkbox", checked: this.state.legalIncludeWithdrawn === true, ariaLabel: "包含不再参照的历史案例" });
     const includeWithdrawnLabel = node("label", { className: "checkbox-label" }, [includeWithdrawn, node("span", { text: "包含不再参照的历史案例" })]);
-    const lawOptions = node("div", { className: "legal-law-options" }, [labelFor("案件日期（可选）", caseDate)]);
+    const lawOptions = node("div", { className: "legal-law-options" }, [labelFor("适用日期（选择“按日期范围”后使用）", caseDate)]);
     const caseOptions = node("div", { className: "legal-case-options" }, [labelFor("案例分类", caseType), includeWithdrawnLabel]);
     const statuteFilters = node("div", { className: "legal-statute-filters" });
-    const typeFilter = node("select", { ariaLabel: "法律类型" });
+    const matchModeFilter = node("select", { ariaLabel: "关键词匹配方式", value: legalMatchMode(filters.matchMode) });
+    appendOption(matchModeFilter, "all", "全部词均匹配（默认）", legalMatchMode(filters.matchMode) === "all");
+    appendOption(matchModeFilter, "any", "任一词匹配", legalMatchMode(filters.matchMode) === "any");
+    appendOption(matchModeFilter, "phrase", "按完整短语匹配", legalMatchMode(filters.matchMode) === "phrase");
+    const versionScopeFilter = node("select", { ariaLabel: "版本范围", value: legalVersionScope(filters.versionScope) });
+    appendOption(versionScopeFilter, "current", "当前有效版本（默认）", legalVersionScope(filters.versionScope) === "current");
+    appendOption(versionScopeFilter, "as_of", "按日期范围", legalVersionScope(filters.versionScope) === "as_of");
+    appendOption(versionScopeFilter, "all", "全部版本", legalVersionScope(filters.versionScope) === "all");
+    const versionStatusFilter = node("select", { ariaLabel: "版本状态", value: filters.versionStatus });
+    const addVersionStatusOptions = (entries = []) => {
+      const selected = versionStatusFilter.value || filters.versionStatus;
+      replaceChildren(versionStatusFilter);
+      appendOption(versionStatusFilter, "", "全部版本状态");
+      const values = entries.length ? entries : ["in_force", "amended", "not_yet_effective", "repealed", "unspecified"];
+      for (const entry of values) {
+        const id = typeof entry === "string" ? entry : textValue(field(entry, ["id", "value", "code", "key"]));
+        const label = typeof entry === "string" ? legalStatusLabel(entry) : textValue(field(entry, ["label", "name", "title"]), legalStatusLabel(id));
+        if (id) appendOption(versionStatusFilter, id, label, id === selected);
+      }
+      versionStatusFilter.value = selected;
+    };
+    addVersionStatusOptions();
+    const versionStatusRow = labelFor("版本状态", versionStatusFilter);
+    const documentScope = node("div", { className: "legal-document-scope" });
+    const typeFilter = node("select", { ariaLabel: "法律类型", value: filters.type });
     for (const [value, label] of LEGAL_FILTER_OPTIONS.type) appendOption(typeFilter, value, label);
-    const levelFilter = node("select", { ariaLabel: "效力层级" });
+    const levelFilter = node("select", { ariaLabel: "效力层级", value: filters.level });
     for (const [value, label] of LEGAL_FILTER_OPTIONS.level) appendOption(levelFilter, value, label);
-    const regionFilter = node("input", { type: "search", placeholder: "地域（可选）", ariaLabel: "地域" });
-    const statusFilter = node("select", { ariaLabel: "有效状态" });
+    const regionFilter = node("input", { type: "search", placeholder: "地域（可选）", ariaLabel: "地域", value: filters.region });
+    const statusFilter = node("select", { ariaLabel: "有效状态", value: filters.status });
     for (const [value, label] of LEGAL_FILTER_OPTIONS.status) appendOption(statusFilter, value, label);
-    const sortFilter = node("select", { ariaLabel: "排序方式" });
+    const sortFilter = node("select", { ariaLabel: "排序方式", value: filters.sort });
     for (const [value, label] of LEGAL_FILTER_OPTIONS.sort) appendOption(sortFilter, value, label);
-    const viewFilter = node("select", { ariaLabel: "结果视图" });
-    for (const [value, label] of LEGAL_FILTER_OPTIONS.view) appendOption(viewFilter, value, label, value === "grouped");
-    const includeHistory = node("input", { type: "checkbox", checked: true, ariaLabel: "显示历史版本" });
-    const includeRelations = node("input", { type: "checkbox", checked: true, ariaLabel: "显示关联法规" });
+    const viewFilter = node("select", { ariaLabel: "结果视图", value: filters.view });
+    for (const [value, label] of LEGAL_FILTER_OPTIONS.view) appendOption(viewFilter, value, label, value === filters.view);
+    const includeHistory = node("input", { type: "checkbox", checked: filters.includeHistory, ariaLabel: "显示历史版本" });
+    const includeRelations = node("input", { type: "checkbox", checked: filters.includeRelations, ariaLabel: "显示关联法规" });
     const filterToggles = node("div", { className: "legal-filter-toggles" }, [
       node("label", { className: "checkbox-label" }, [includeHistory, node("span", { text: "查看历史版本" })]),
       node("label", { className: "checkbox-label" }, [includeRelations, node("span", { text: "查看关联法规" })])
     ]);
     const jurisdictionList = node("datalist", { id: "legal-jurisdictions" });
     regionFilter.setAttribute("list", "legal-jurisdictions");
-    statuteFilters.append(labelFor("法律类型", typeFilter), labelFor("效力层级", levelFilter), labelFor("地域", regionFilter), jurisdictionList, labelFor("有效状态", statusFilter), labelFor("排序", sortFilter), labelFor("显示方式", viewFilter), filterToggles);
+    statuteFilters.append(labelFor("关键词匹配", matchModeFilter), labelFor("版本范围", versionScopeFilter), versionStatusRow, documentScope, labelFor("法律类型", typeFilter), labelFor("效力层级", levelFilter), labelFor("地域", regionFilter), jurisdictionList, labelFor("有效状态", statusFilter), labelFor("排序", sortFilter), labelFor("显示方式", viewFilter), filterToggles);
+    typeFilter.value = filters.type;
+    levelFilter.value = filters.level;
+    statusFilter.value = filters.status;
+    sortFilter.value = filters.sort;
+    viewFilter.value = filters.view;
+    const persistLegalFilters = () => {
+      this.state.legalQueryFilters = {
+        caseDate: caseDate.value,
+        matchMode: legalMatchMode(matchModeFilter.value),
+        versionScope: legalVersionScope(versionScopeFilter.value),
+        versionStatus: versionStatusFilter.value,
+        documentId: this.state.legalQueryFilters.documentId,
+        documentTitle: this.state.legalQueryFilters.documentTitle,
+        type: typeFilter.value,
+        level: levelFilter.value,
+        region: regionFilter.value,
+        status: statusFilter.value,
+        sort: sortFilter.value,
+        view: viewFilter.value,
+        includeHistory: includeHistory.checked,
+        includeRelations: includeRelations.checked
+      };
+    };
+    const renderDocumentScope = () => {
+      const documentId = textValue(this.state.legalQueryFilters.documentId);
+      const title = textValue(this.state.legalQueryFilters.documentTitle, documentId);
+      if (!documentId) {
+        replaceChildren(documentScope);
+        return;
+      }
+      const clear = button("取消限定", () => {
+        this.state.legalQueryFilters.documentId = "";
+        this.state.legalQueryFilters.documentTitle = "";
+        persistLegalFilters();
+        renderDocumentScope();
+      }, "button subtle");
+      replaceChildren(documentScope, [node("p", { className: "muted small", text: `已限定法律：${title}` }), clear]);
+    };
+    const syncVersionControls = () => {
+      const scope = legalVersionScope(versionScopeFilter.value);
+      versionScopeFilter.value = scope;
+      versionStatusRow.hidden = scope === "current";
+      caseDate.title = scope === "as_of" ? "该日期会作为版本适用日期发送。" : "当前范围不使用日期；填写日期会自动切换到“按日期范围”。";
+    };
+    for (const control of [matchModeFilter, versionStatusFilter, typeFilter, levelFilter, regionFilter, statusFilter, sortFilter, viewFilter, includeHistory, includeRelations]) {
+      control.addEventListener(control === regionFilter ? "input" : "change", persistLegalFilters);
+    }
+    versionScopeFilter.addEventListener("change", () => { syncVersionControls(); persistLegalFilters(); });
+    caseDate.addEventListener("change", () => {
+      if (legalDateValue(caseDate.value)) versionScopeFilter.value = "as_of";
+      syncVersionControls();
+      persistLegalFilters();
+    });
+    renderDocumentScope();
+    syncVersionControls();
     const loadLegalFilters = async () => {
       try {
         const response = await this.api.request("/legal/filters");
@@ -1980,6 +3028,12 @@ export class WebApp {
         apply(typeFilter, values(response?.documentTypes || response?.document_types), "全部类型", "type");
         apply(levelFilter, values(response?.effectivenessLevels || response?.effectiveness_levels), "全部效力层级", "level");
         apply(statusFilter, values(response?.statuses), "全部状态", "status");
+        const versionStatuses = response?.versionStatuses || response?.version_statuses || [];
+        addVersionStatusOptions(versionStatuses);
+        addAiVersionStatusOptions(versionStatuses);
+        typeFilter.value = this.state.legalQueryFilters.type;
+        levelFilter.value = this.state.legalQueryFilters.level;
+        statusFilter.value = this.state.legalQueryFilters.status;
         const jurisdictions = values(response?.jurisdictions || response?.regions);
         replaceChildren(jurisdictionList, jurisdictions.map(([id, label]) => node("option", { value: id, text: label || id })));
       } catch {
@@ -2011,15 +3065,65 @@ export class WebApp {
     const aiSearchModel = node("select", { required: true, ariaLabel: "AI 法律搜索模型" });
     appendOption(aiSearchModel, "", "选择 Provider 后载入模型");
     const aiSearchPrompt = node("textarea", { rows: 5, placeholder: "描述事件、争议焦点或想确认的法律问题", required: true });
+    const aiSearchFilters = this.state.aiSearchFilters;
+    const aiSearchMatchMode = node("select", { ariaLabel: "AI 搜索关键词匹配方式", value: legalMatchMode(aiSearchFilters.matchMode) });
+    appendOption(aiSearchMatchMode, "all", "全部词均匹配（默认）", legalMatchMode(aiSearchFilters.matchMode) === "all");
+    appendOption(aiSearchMatchMode, "any", "任一词匹配", legalMatchMode(aiSearchFilters.matchMode) === "any");
+    appendOption(aiSearchMatchMode, "phrase", "按完整短语匹配", legalMatchMode(aiSearchFilters.matchMode) === "phrase");
+    const aiSearchVersionScope = node("select", { ariaLabel: "AI 搜索版本范围", value: legalVersionScope(aiSearchFilters.versionScope) });
+    appendOption(aiSearchVersionScope, "current", "当前有效版本（默认）", legalVersionScope(aiSearchFilters.versionScope) === "current");
+    appendOption(aiSearchVersionScope, "as_of", "按日期范围", legalVersionScope(aiSearchFilters.versionScope) === "as_of");
+    appendOption(aiSearchVersionScope, "all", "全部版本", legalVersionScope(aiSearchFilters.versionScope) === "all");
+    const aiSearchVersionStatus = node("select", { ariaLabel: "AI 搜索版本状态", value: aiSearchFilters.versionStatus });
+    const addAiVersionStatusOptions = (entries = []) => {
+      const selected = aiSearchVersionStatus.value || aiSearchFilters.versionStatus;
+      replaceChildren(aiSearchVersionStatus);
+      appendOption(aiSearchVersionStatus, "", "全部版本状态");
+      const values = entries.length ? entries : ["in_force", "amended", "not_yet_effective", "repealed", "unspecified"];
+      for (const entry of values) {
+        const id = typeof entry === "string" ? entry : textValue(field(entry, ["id", "value", "code", "key"]));
+        const label = typeof entry === "string" ? legalStatusLabel(entry) : textValue(field(entry, ["label", "name", "title"]), legalStatusLabel(id));
+        if (id) appendOption(aiSearchVersionStatus, id, label, id === selected);
+      }
+      aiSearchVersionStatus.value = selected;
+    };
+    addAiVersionStatusOptions();
+    const aiSearchVersionStatusRow = labelFor("版本状态", aiSearchVersionStatus);
+    const aiSearchCaseDate = node("input", { type: "date", ariaLabel: "AI 搜索案件日期", value: aiSearchFilters.caseDate });
+    const syncAiSearchVersionControls = () => {
+      const scope = legalVersionScope(aiSearchVersionScope.value);
+      aiSearchVersionScope.value = scope;
+      aiSearchVersionStatusRow.hidden = scope === "current";
+      aiSearchCaseDate.title = scope === "as_of" ? "该日期会作为 AI 法律检索的版本适用日期发送。" : "当前范围不使用日期；填写日期会自动切换到“按日期范围”。";
+    };
+    const persistAiSearchFilters = () => {
+      this.state.aiSearchFilters = {
+        caseDate: aiSearchCaseDate.value,
+        matchMode: legalMatchMode(aiSearchMatchMode.value),
+        versionScope: legalVersionScope(aiSearchVersionScope.value),
+        versionStatus: aiSearchVersionStatus.value
+      };
+    };
+    for (const control of [aiSearchMatchMode, aiSearchVersionStatus]) control.addEventListener("change", persistAiSearchFilters);
+    aiSearchVersionScope.addEventListener("change", () => { syncAiSearchVersionControls(); persistAiSearchFilters(); });
+    aiSearchCaseDate.addEventListener("change", () => {
+      if (legalDateValue(aiSearchCaseDate.value)) aiSearchVersionScope.value = "as_of";
+      syncAiSearchVersionControls();
+      persistAiSearchFilters();
+    });
+    syncAiSearchVersionControls();
     const aiSearchMaterialHost = node("div", { className: "ai-material-host" }, [emptyState("正在加载可用材料…")]);
     let aiSearchPicker = null;
     const aiSearchAttachment = this.renderAiAttachmentPicker();
+    const aiSearchContextEstimate = node("div", { className: "context-estimate" }, [emptyState("提交前会显示本次采用的材料、页码或段落范围及上下文预算。")]);
     const aiSearchButton = formButton("开始 AI 法律搜索", "button primary");
     const aiSearchStatus = statusBox();
     const aiSearchOutput = node("article", { className: "ai-run-output" }, [emptyState("提交案情后显示检索结果。")]);
+    const aiSearchRunScope = node("p", { className: "muted small", text: "" });
     const aiSearchCitations = node("div", { className: "citation-list" });
+    const aiSearchVerification = node("div", { className: "citation-verification" });
     const aiSearchHistory = node("div", { className: "ai-history-list" });
-    aiSearchForm.append(labelFor("Provider", aiSearchProvider), labelFor("模型", aiSearchModel), labelFor("案情或事件", aiSearchPrompt), aiSearchMaterialHost, aiSearchAttachment, aiSearchButton, aiSearchStatus, aiSearchOutput, aiSearchCitations, heading(3, "AI 搜索历史"), aiSearchHistory);
+    aiSearchForm.append(labelFor("Provider", aiSearchProvider), labelFor("模型", aiSearchModel), labelFor("案情或事件", aiSearchPrompt), labelFor("关键词匹配", aiSearchMatchMode), labelFor("版本范围", aiSearchVersionScope), labelFor("适用日期（选择“按日期范围”后使用）", aiSearchCaseDate), aiSearchVersionStatusRow, aiSearchMaterialHost, aiSearchAttachment, aiSearchContextEstimate, aiSearchButton, aiSearchStatus, aiSearchRunScope, aiSearchOutput, aiSearchCitations, aiSearchVerification, heading(3, "AI 搜索历史"), aiSearchHistory);
     aiSearchPanel.append(aiSearchForm);
 
     const resultsPanel = panel("搜索结果", [], "panel results-panel");
@@ -2059,6 +3163,9 @@ export class WebApp {
 
     const setMode = (mode) => {
       const nextMode = [LEGAL_SEARCH_MODES.statute, LEGAL_SEARCH_MODES.ai, LEGAL_SEARCH_MODES.case].includes(mode) ? mode : LEGAL_SEARCH_MODES.statute;
+      const previousMode = this.state.legalMode;
+      if (previousMode === LEGAL_SEARCH_MODES.case) this.state.legalCaseQuery = query.value.trim();
+      else if (previousMode === LEGAL_SEARCH_MODES.statute) this.state.legalArticleQuery = query.value.trim();
       this.cancelLegalRequests();
       this.state.legalMode = nextMode;
       this.state.legalCaseOffset = 0;
@@ -2067,7 +3174,8 @@ export class WebApp {
       this.state.selectedArticle = null;
       this.state.selectedCase = null;
       this.state.legalArticlePage = null;
-      this.state.legalArticleQuery = "";
+      if (nextMode === LEGAL_SEARCH_MODES.case) query.value = this.state.legalCaseQuery;
+      else if (nextMode === LEGAL_SEARCH_MODES.statute) query.value = this.state.legalArticleQuery;
       aiButton.disabled = false;
       searchButton.disabled = false;
       setModeButton(statuteMode, nextMode === LEGAL_SEARCH_MODES.statute);
@@ -2093,6 +3201,9 @@ export class WebApp {
       interpretation.hidden = true;
       replaceChildren(pagination);
       replaceChildren(detail, [emptyState(nextMode === LEGAL_SEARCH_MODES.case ? "选择一条案例查看原文详情。" : nextMode === LEGAL_SEARCH_MODES.ai ? "AI 搜索结果显示在左侧面板。" : "选择一条法规查看详情。")]);
+      if (nextMode === LEGAL_SEARCH_MODES.ai || nextMode === LEGAL_SEARCH_MODES.case) void loadAiSurface();
+      if (nextMode === LEGAL_SEARCH_MODES.case) void loadCaseSurface();
+      if (nextMode !== LEGAL_SEARCH_MODES.ai) void this.loadBookmarks(bookmarks);
     };
 
     const setModeButton = (control, active) => {
@@ -2148,65 +3259,85 @@ export class WebApp {
       if (generation === this.state.legalSearchGeneration) searchButton.disabled = false;
     };
 
+    const articleSearchParams = ({ queryText, documentId = "", view = viewFilter.value, pageSize, offset }) => legalSearchPageParams({
+      query: queryText,
+      documentId: documentId || textValue(this.state.legalQueryFilters.documentId),
+      caseDate: caseDate.value,
+      matchMode: matchModeFilter.value,
+      versionScope: versionScopeFilter.value,
+      versionStatus: versionStatusFilter.value,
+      type: typeFilter.value,
+      level: levelFilter.value,
+      region: regionFilter.value,
+      status: statusFilter.value,
+      sort: sortFilter.value,
+      view,
+      pageSize,
+      offset,
+      includeHistory: includeHistory.checked,
+      includeRelations: includeRelations.checked
+    });
+    const validateArticleVersionScope = () => {
+      if (legalVersionScope(versionScopeFilter.value) !== "as_of") return true;
+      if (legalDateValue(caseDate.value)) return true;
+      setStatus(searchStatus, "请选择有效的适用日期；“未知”不能作为按日期范围的查询条件。", "warning");
+      caseDate.focus();
+      return false;
+    };
+    const appliedQueryText = (appliedQuery) => {
+      const matchLabels = {
+        all: "全部词均匹配",
+        any: "任一词匹配",
+        phrase: "完整短语匹配"
+      };
+      const scopeLabels = {
+        current: "当前有效版本",
+        as_of: "按日期范围",
+        all: "全部版本"
+      };
+      const match = legalMatchMode(appliedQuery?.matchMode);
+      const scope = legalVersionScope(appliedQuery?.versionScope);
+      const parts = [`匹配：${matchLabels[match] || match}`, `版本：${scopeLabels[scope] || scope}`];
+      const asOf = legalDateValue(appliedQuery?.asOf);
+      if (asOf) parts.push(`适用日期：${asOf}`);
+      const documentId = textValue(appliedQuery?.resolvedDocumentId);
+      if (documentId) parts.push(`限定法律：${documentId}`);
+      const articleNumber = textValue(appliedQuery?.exactArticleNumber);
+      if (articleNumber) parts.push(`精确条号：${articleNumber}`);
+      return parts.join(" · ");
+    };
+    const renderArticleSearchMeta = (normalized) => {
+      const resultCount = normalized.view === "grouped" ? normalized.totalLaws : normalized.totalArticles;
+      const children = [node("span", { className: "muted small", text: normalized.view === "grouped" ? `命中 ${resultCount} 部法律 · ${normalized.totalArticles} 条文` : `命中 ${resultCount} 条文` }), node("p", { className: "muted small", text: appliedQueryText(normalized.appliedQuery) })];
+      for (const ambiguity of normalized.ambiguities || []) {
+        const options = ambiguity.candidates.map((candidate) => button(candidate.title || candidate.documentId, () => {
+          this.state.legalQueryFilters.documentId = candidate.documentId;
+          this.state.legalQueryFilters.documentTitle = candidate.title || candidate.documentId;
+          persistLegalFilters();
+          renderDocumentScope();
+          void runArticlePage(0);
+        }, "button subtle"));
+        children.push(node("div", { className: "legal-ambiguity" }, [node("p", { className: "status-message warning", text: `“${ambiguity.query || query.value.trim()}”对应多个法律，请选择后继续检索。` }), node("div", { className: "button-row" }, options)]));
+      }
+      replaceChildren(responseMeta, children);
+    };
+
     searchForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       if (this.state.legalMode === LEGAL_SEARCH_MODES.case) {
         await runCasePage(0);
         return;
       }
+      await runArticlePage(0);
+    });
+
+    const runArticlePage = async (offset = 0, { pageSizeOverride = 0, reason = "" } = {}) => {
       const queryText = query.value.trim();
       if (!queryText) {
         setStatus(searchStatus, "请输入法条关键词。", "warning");
         return;
       }
-      this.state.legalArticleQuery = queryText;
-      searchButton.disabled = true;
-      setStatus(searchStatus, "正在查询法条…");
-      this.state.legalArticleOffset = 0;
-      const generation = this.beginLegalSearch();
-      try {
-        const pageSize = adaptiveLegalPageSize(results, 12);
-        const pageParams = legalSearchPageParams({
-          query: queryText,
-          caseDate: caseDate.value,
-          type: typeFilter.value,
-          level: levelFilter.value,
-          region: regionFilter.value,
-          status: statusFilter.value,
-          sort: sortFilter.value,
-          view: viewFilter.value,
-          pageSize,
-          offset: this.state.legalArticleOffset || 0,
-          includeHistory: includeHistory.checked,
-          includeRelations: includeRelations.checked
-        });
-        const response = await this.api.request(`/legal/search/page${queryString(pageParams)}`, { signal: this.state.legalSearchAbort.signal });
-        if (generation !== this.state.legalSearchGeneration) return;
-        const normalized = normalizeLegalPageResponse(response, { pageSize, offset: pageParams.offset, view: viewFilter.value });
-        this.state.legalResults = normalized.items;
-        this.state.legalArticlePage = normalized;
-        this.state.legalArticleOffset = normalized.offset;
-        this.renderLegalPage(normalized, results, detail, { includeHistory: includeHistory.checked, includeRelations: includeRelations.checked, onPage: runArticlePage, onGroupPage: runGroupPage });
-        const resultCount = normalized.view === "grouped" ? normalized.totalLaws : normalized.totalArticles;
-        replaceChildren(responseMeta, [node("span", { className: "muted small", text: normalized.view === "grouped" ? `命中 ${resultCount} 部法律 · ${normalized.totalArticles} 条文` : `命中 ${resultCount} 条文` })]);
-        replaceChildren(interpretation);
-        interpretation.hidden = true;
-        this.renderLegalPagination(normalized, pagination, runArticlePage);
-        setStatus(searchStatus, normalized.view === "grouped" ? `找到 ${normalized.totalLaws} 部法律，本页显示 ${normalized.groups.length} 部。` : `找到 ${normalized.totalArticles} 条法条，本页显示 ${normalized.items.length} 条。`, "success");
-      } catch (error) {
-        if (generation !== this.state.legalSearchGeneration || error?.name === "AbortError") return;
-        setStatus(searchStatus, apiErrorMessage(error), "danger");
-      } finally {
-        if (generation === this.state.legalSearchGeneration) {
-          this.state.legalSearchAbort = null;
-          searchButton.disabled = false;
-        }
-      }
-    });
-
-    const runArticlePage = async (offset = 0, { pageSizeOverride = 0, reason = "" } = {}) => {
-      const queryText = query.value.trim();
-      if (!queryText) return;
+      if (!validateArticleVersionScope()) return;
       this.state.legalArticleQuery = queryText;
       this.state.legalArticleOffset = Math.max(0, Number(offset) || 0);
       searchButton.disabled = true;
@@ -2216,17 +3347,16 @@ export class WebApp {
         : adaptiveLegalPageSize(results, 12);
       const generation = this.beginLegalSearch();
       try {
-        const params = legalSearchPageParams({ query: queryText, caseDate: caseDate.value, type: typeFilter.value, level: levelFilter.value, region: regionFilter.value, status: statusFilter.value, sort: sortFilter.value, view: viewFilter.value, pageSize, offset: this.state.legalArticleOffset, includeHistory: includeHistory.checked, includeRelations: includeRelations.checked });
+        const params = articleSearchParams({ queryText, pageSize, offset: this.state.legalArticleOffset });
         const response = await this.api.request(`/legal/search/page${queryString(params)}`, { signal: this.state.legalSearchAbort.signal });
         if (generation !== this.state.legalSearchGeneration) return;
-        const normalized = normalizeLegalPageResponse(response, { pageSize, offset: params.offset, view: viewFilter.value });
+        const normalized = normalizeLegalPageResponse(response, { pageSize, offset: params.offset, view: viewFilter.value, matchMode: params.matchMode, versionScope: params.versionScope, caseDate: params.case_date });
         this.state.legalResults = normalized.items;
         this.state.legalArticlePage = normalized;
         this.state.legalArticleOffset = normalized.offset;
-        this.renderLegalPage(normalized, results, detail, { includeHistory: includeHistory.checked, includeRelations: includeRelations.checked, onPage: runArticlePage, onGroupPage: runGroupPage });
+        this.renderLegalPage(normalized, results, detail, { includeHistory: includeHistory.checked, includeRelations: includeRelations.checked, queryContext: normalized.appliedQuery, onPage: runArticlePage, onGroupPage: runGroupPage });
         this.renderLegalPagination(normalized, pagination, runArticlePage);
-        const resultCount = normalized.view === "grouped" ? normalized.totalLaws : normalized.totalArticles;
-        replaceChildren(responseMeta, [node("span", { className: "muted small", text: normalized.view === "grouped" ? `命中 ${resultCount} 部法律 · ${normalized.totalArticles} 条文` : `命中 ${resultCount} 条文` })]);
+        renderArticleSearchMeta(normalized);
         setStatus(searchStatus, normalized.view === "grouped" ? `找到 ${normalized.totalLaws} 部法律，本页显示 ${normalized.groups.length} 部。` : `找到 ${normalized.totalArticles} 条法条，本页显示 ${normalized.items.length} 条。`, "success");
       } catch (error) {
         if (generation !== this.state.legalSearchGeneration || error?.name === "AbortError") return;
@@ -2239,6 +3369,7 @@ export class WebApp {
     const runGroupPage = async (documentId, offset, groupTarget, groupPagination) => {
       const queryText = query.value.trim();
       if (!queryText || !documentId || !groupTarget) return;
+      if (!validateArticleVersionScope()) return;
       const safeOffset = Math.max(0, Number(offset) || 0);
       groupTarget.hidden = false;
       if (groupPagination) groupPagination.hidden = false;
@@ -2249,10 +3380,10 @@ export class WebApp {
       const pageSize = hasRenderedArticles ? adaptiveLegalPageSize(groupTarget, 8) : 8;
       try {
         replaceChildren(groupTarget, [emptyState("正在加载该法律的命中条文…")]);
-        const params = legalSearchPageParams({ documentId, query: queryText, caseDate: caseDate.value, type: typeFilter.value, level: levelFilter.value, region: regionFilter.value, status: statusFilter.value, sort: sortFilter.value, view: "flat", pageSize, offset: safeOffset });
+        const params = articleSearchParams({ documentId, queryText, view: "flat", pageSize, offset: safeOffset });
         const response = await this.api.request(`/legal/search/page${queryString(params)}`);
-        const normalized = normalizeLegalPageResponse(response, { pageSize, offset: safeOffset, view: "flat" });
-        this.renderLegalResults(normalized.items, groupTarget, detail);
+        const normalized = normalizeLegalPageResponse(response, { pageSize, offset: safeOffset, view: "flat", matchMode: params.matchMode, versionScope: params.versionScope, caseDate: params.case_date });
+        this.renderLegalResults(normalized.items, groupTarget, detail, normalized.appliedQuery);
         this.renderLegalPagination(normalized, groupPagination, (nextOffset) => runGroupPage(documentId, nextOffset, groupTarget, groupPagination));
       } catch (error) {
         replaceChildren(groupTarget, [statusBox(apiErrorMessage(error), "danger")]);
@@ -2372,12 +3503,18 @@ export class WebApp {
       this.applyMaterialTrust(aiSearchPicker, provider);
     };
     const showAiSearchRun = (run, { resume = true } = {}) => {
-      const normalized = normalizeAiRun(run);
-      this.state.selectedAiRun = normalized;
+      const normalized = this.selectPageRun("search", run);
+      aiSearchRunScope.textContent = legalQueryScopeSummary(normalized);
       renderRenderedContent(aiSearchOutput, normalized.html, normalized.content, "该任务尚无正文结果。");
       this.renderRunCitations(aiSearchCitations, normalized.citations);
+      this.renderCitationVerification(aiSearchVerification, normalized, { onUpdated: (next) => showAiSearchRun(next, { resume: false }) });
       setStatus(aiSearchStatus, `${aiRunKindLabel(normalized.kind)}：${aiRunStatusLabel(normalized.status)}${normalized.stage ? ` · ${pipelineStageLabel(normalized.stage)}` : ""} · ${aiRunProgressText(normalized)}`, normalized.status === "completed" ? "success" : aiRunIsTerminal(normalized) ? "warning" : "info");
-      if (resume && !aiRunIsTerminal(normalized)) this.pollAiRun(normalized.id, { status: aiSearchStatus, onUpdate: (next) => showAiSearchRun(next, { resume: false }) });
+      if (resume && !aiRunIsTerminal(normalized)) this.pollAiRun(normalized.id, {
+        status: aiSearchStatus,
+        onUpdate: (next) => {
+          if (this.state.pageRunIds.search === next.id) showAiSearchRun(next, { resume: false });
+        }
+      });
       return normalized;
     };
     const continueAiSearchRun = async (run) => {
@@ -2392,12 +3529,11 @@ export class WebApp {
         setStatus(aiSearchStatus, apiErrorMessage(error), "danger");
       }
     };
-    const refreshAiSearchHistory = async () => {
+    const refreshAiSearchHistory = async ({ append = false } = {}) => {
       try {
-        const response = await this.api.listAiRuns("search");
-        const runs = normalizeAiRunList(response);
-        this.state.aiRuns = [...this.state.aiRuns.filter((item) => item.kind !== "search"), ...runs];
-        replaceChildren(aiSearchHistory, runs.length ? runs.slice(0, 10).map((run) => {
+        const page = await this.loadAiRunPage("search", { append, limit: 10 });
+        const runs = page.items;
+        const rows = runs.length ? runs.map((run) => {
           const open = button(`${run.title || "未命名搜索"} · ${aiRunStatusLabel(run.status)}`, async () => {
             const loaded = await this.api.getAiRun(run.id).catch(() => run);
             showAiSearchRun(loaded?.run || loaded);
@@ -2409,12 +3545,30 @@ export class WebApp {
             catch (error) { setStatus(aiSearchStatus, apiErrorMessage(error), "danger"); }
           }, "button danger"));
           return row;
-        }) : [emptyState("还没有 AI 法律搜索记录。 ")]);
+        }) : [emptyState("还没有 AI 法律搜索记录。")];
+        if (page.corruptCount > 0) rows.unshift(statusBox(`检测到 ${page.corruptCount} 个损坏搜索记录，未显示。`, "warning"));
+        if (page.nextCursor) rows.push(button("加载更多搜索历史", () => refreshAiSearchHistory({ append: true }), "button subtle"));
+        replaceChildren(aiSearchHistory, rows);
       } catch (error) {
         replaceChildren(aiSearchHistory, [statusBox(apiErrorMessage(error), "danger")]);
       }
     };
     aiSearchProvider.addEventListener("change", () => syncAiSearchModel());
+    const aiSearchRetrievalPayload = () => {
+      const versionScope = legalVersionScope(aiSearchVersionScope.value);
+      const caseDate = versionScope === "as_of" ? legalDateValue(aiSearchCaseDate.value) : "";
+      if (versionScope === "as_of" && !caseDate) {
+        setStatus(aiSearchStatus, "请选择有效的适用日期；“未知”不能作为按日期范围的查询条件。", "warning");
+        aiSearchCaseDate.focus();
+        return null;
+      }
+      return {
+        match_mode: legalMatchMode(aiSearchMatchMode.value),
+        version_scope: versionScope,
+        ...(versionScope !== "current" && aiSearchVersionStatus.value ? { version_status: aiSearchVersionStatus.value } : {}),
+        ...(caseDate ? { case_date: caseDate } : {})
+      };
+    };
     aiSearchForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const provider = this.state.providers.find((item) => textValue(field(item, ["id"])) === aiSearchProvider.value);
@@ -2432,17 +3586,30 @@ export class WebApp {
         setStatus(aiSearchStatus, model ? "所选模型未启用，请前往设置勾选后重试。" : "所选模型服务尚未选择模型。", "warning");
         return;
       }
+      const retrievalPayload = aiSearchRetrievalPayload();
+      if (!retrievalPayload) return;
       aiSearchButton.disabled = true;
       try {
-        await this.createAiRun({ kind: AI_RUN_KINDS.search, prompt, provider_id: aiSearchProvider.value, model, materials: aiSearchPicker?.values?.() || [], attachment_ids: aiSearchAttachment.attachmentIds?.() || [], case_date: caseDate.value || undefined }, {
+        const payload = { kind: AI_RUN_KINDS.search, prompt, provider_id: aiSearchProvider.value, model, materials: aiSearchPicker?.values?.() || [], attachment_ids: aiSearchAttachment.attachmentIds?.() || [], ...retrievalPayload };
+        const contextEstimate = await this.preflightAiContext(payload, aiSearchContextEstimate, aiSearchStatus);
+        if (!contextEstimate) return;
+        payload.context_plan_hash = contextEstimate.planHash;
+        await this.createAiRun(payload, {
+          page: "search",
           status: aiSearchStatus,
           onUpdate: (run) => {
+            if (this.state.pageRunIds.search !== run.id) return;
+            aiSearchRunScope.textContent = legalQueryScopeSummary(run);
             if (run.content || run.html) renderRenderedContent(aiSearchOutput, run.html, run.content, "该任务尚无正文结果。");
             this.renderRunCitations(aiSearchCitations, run.citations);
+            this.renderCitationVerification(aiSearchVerification, run, { onUpdated: (next) => showAiSearchRun(next, { resume: false }) });
           },
           onDone: (run) => {
+            if (this.state.pageRunIds.search !== run.id) return;
+            aiSearchRunScope.textContent = legalQueryScopeSummary(run);
             if (run.content || run.html) renderRenderedContent(aiSearchOutput, run.html, run.content, "该任务尚无正文结果。");
             this.renderRunCitations(aiSearchCitations, run.citations);
+            this.renderCitationVerification(aiSearchVerification, run, { onUpdated: (next) => showAiSearchRun(next, { resume: false }) });
             refreshAiSearchHistory();
           }
         });
@@ -2453,20 +3620,51 @@ export class WebApp {
       }
     });
 
+    const renderAiSearchMaterialPicker = (selectedValues = aiSearchPicker?.values?.() || []) => {
+      const page = this.state.aiMaterialsPage;
+      aiSearchPicker = this.renderAiMaterialPicker(this.state.aiMaterials, {
+        title: "选择材料（默认脱敏版）",
+        selectedValues,
+        hasMore: Boolean(page.nextCursor),
+        total: page.total,
+        corruptCount: page.corruptCount,
+        errorMessage: page.error,
+        onLoadMore: async (preservedValues) => {
+          await this.loadAiMaterials({ append: true });
+          renderAiSearchMaterialPicker(preservedValues);
+          syncAiSearchModel({ preserveModel: true });
+        }
+      });
+      replaceChildren(aiSearchMaterialHost, [aiSearchPicker]);
+    };
+
+    let aiSurfaceLoad = null;
+    const loadAiSurface = async () => {
+      if (aiSurfaceLoad) return aiSurfaceLoad;
+      aiSurfaceLoad = (async () => {
+        await Promise.all([
+          this.loadProvidersInto(providerSelect, "chat"),
+          this.loadProvidersInto(aiSearchProvider, "chat")
+        ]);
+        syncProviderModel({ preserveModel: true });
+        syncAiSearchModel({ preserveModel: true });
+        await this.loadAiMaterials();
+        renderAiSearchMaterialPicker();
+        syncAiSearchModel({ preserveModel: true });
+        await refreshAiSearchHistory();
+      })().catch((error) => {
+        setStatus(aiSearchStatus, apiErrorMessage(error), "danger");
+      }).finally(() => {
+        aiSurfaceLoad = null;
+      });
+      return aiSurfaceLoad;
+    };
+    const loadCaseSurface = async () => {
+      await this.loadCaseStatus(caseStatus);
+    };
+
     setMode(this.state.legalMode);
-    await this.loadProvidersInto(providerSelect, "chat");
-    await this.loadProvidersInto(aiSearchProvider, "chat");
-    syncProviderModel();
-    syncAiSearchModel();
-    loadLegalFilters();
-    const aiMaterials = await this.loadAiMaterials();
-    aiSearchPicker = this.renderAiMaterialPicker(aiMaterials, { title: "选择材料（默认脱敏版）" });
-    replaceChildren(aiSearchMaterialHost, [aiSearchPicker]);
-    syncAiSearchModel({ preserveModel: true });
-    refreshAiSearchHistory();
-    syncProviderModel({ preserveModel: true });
-    this.loadCaseStatus(caseStatus);
-    await this.loadBookmarks(bookmarks);
+    void loadLegalFilters();
     const pendingCitation = this.state.pendingCitation;
     this.state.pendingCitation = null;
     if (pendingCitation?.article) this.loadArticle(pendingCitation.article, detail);
@@ -2754,7 +3952,7 @@ export class WebApp {
     }
   }
 
-  renderLegalPage(page, target, detail, { includeHistory = true, includeRelations = true, onPage, onGroupPage } = {}) {
+  renderLegalPage(page, target, detail, { includeHistory = true, includeRelations = true, queryContext = null, onPage, onGroupPage } = {}) {
     const normalized = page && page.items ? page : normalizeLegalPageResponse(page);
     if (normalized.groups.length && normalized.view === "grouped") {
       const groups = normalized.groups.map((group) => {
@@ -2796,7 +3994,7 @@ export class WebApp {
       });
       replaceChildren(target, groups);
     } else {
-      this.renderLegalResults(normalized.items, target, detail);
+      this.renderLegalResults(normalized.items, target, detail, queryContext);
     }
     if (!normalized.items.length && !normalized.groups.length) replaceChildren(target, [emptyState("没有找到匹配条文，可调整筛选条件或搜索词。")]);
     // These flags are retained on the page for the next selected article;
@@ -2816,7 +4014,7 @@ export class WebApp {
     replaceChildren(target, [previous, node("span", { className: "muted small", text: `${label} · 每页 ${response.limit} 条` }), next]);
   }
 
-  renderLegalArticleCard(article, detail) {
+  renderLegalArticleCard(article, detail, queryContext = null) {
     const id = articleId(article);
     const title = legalArticleDisplayTitle(article);
     const source = textValue(field(article, ["documentTitle", "document_title", "lawName", "law_name"]));
@@ -2824,35 +4022,41 @@ export class WebApp {
     const statusKey = textValue(field(article, ["versionStatus", "version_status", "status"]));
     const status = statusKey ? legalStatusLabel(statusKey) : "";
     const relevance = field(article, ["relevance", "score", "rank"], "");
-    const titleNode = id ? button(title, () => this.loadArticle(id, detail), "result-button") : node("strong", { text: title });
-    const metadata = [source, effective ? `生效：${effective}` : "", status ? `状态：${status}` : "", relevance !== "" ? `相关性：${textValue(relevance)}` : ""].filter(Boolean).join(" · ");
+    const titleNode = id ? button(title, () => this.loadArticle(id, detail, queryContext), "result-button") : node("strong", { text: title });
+    const effectiveLabel = legalDateValue(effective) ? `生效：${effective}` : "生效日期：未知";
+    const metadata = [source, effectiveLabel, status ? `状态：${status}` : "", relevance !== "" ? `相关性：${textValue(relevance)}` : ""].filter(Boolean).join(" · ");
     const snippet = textValue(field(article, ["snippet", "summary", "content_preview"]));
     return node("article", { className: "result-card legal-article-card" }, [titleNode, metadata ? node("p", { className: "result-meta", text: metadata }) : null, snippet ? node("p", { className: "legal-snippet", text: snippet }) : null]);
   }
 
-  renderLegalResults(items, target, detail) {
+  renderLegalResults(items, target, detail, queryContext = null) {
     if (!items.length) {
       replaceChildren(target, [emptyState("没有找到匹配条文。")]);
       return;
     }
-    const rows = items.map((article) => this.renderLegalArticleCard(article, detail));
+    const rows = items.map((article) => this.renderLegalArticleCard(article, detail, queryContext));
     replaceChildren(target, rows);
   }
 
-  async loadArticle(id, detail) {
+  async loadArticle(id, detail, queryContext = null) {
     if (!id) return;
     replaceChildren(detail, [emptyState("正在加载条文…")]);
     try {
-      const response = await this.api.request(`/legal/articles/${pathId(id)}`);
+      const scoped = legalScopedReadParams(queryContext || {});
+      if (scoped.versionScope === "as_of" && !scoped.caseDate) {
+        replaceChildren(detail, [statusBox("检索结果未返回有效适用日期，不能在未确定日期下读取历史条文。", "warning")]);
+        return;
+      }
+      const response = await this.api.request(`/legal/articles/${pathId(id)}${queryString(scoped)}`);
       const article = response?.article && typeof response.article === "object" ? response.article : response;
       this.state.selectedArticle = article;
-      this.renderArticleDetail(article, detail);
+      this.renderArticleDetail(article, detail, queryContext);
     } catch (error) {
       replaceChildren(detail, [statusBox(apiErrorMessage(error), "danger")]);
     }
   }
 
-  renderArticleDetail(article, detail) {
+  renderArticleDetail(article, detail, queryContext = null) {
     const id = articleId(article);
     const documentId = legalArticleDocumentId(article);
     const title = legalArticleDisplayTitle(article);
@@ -2861,7 +4065,11 @@ export class WebApp {
     const effective = textValue(field(article, ["effectiveFrom", "effective_from"]));
     const statusKey = textValue(field(article, ["versionStatus", "version_status", "status"]));
     const status = legalStatusLabel(statusKey);
-    const headingBlock = node("div", { className: "detail-heading" }, [heading(2, title), node("p", { className: "muted", text: [source, effective ? `生效：${effective}` : "", status ? `状态：${status}` : ""].filter(Boolean).join(" · ") })]);
+    const effectiveLabel = legalDateValue(effective) ? `生效：${effective}` : "生效日期：未知";
+    const headingBlock = node("div", { className: "detail-heading" }, [heading(2, title), node("p", { className: "muted", text: [source, effectiveLabel, status ? `状态：${status}` : ""].filter(Boolean).join(" · ") })]);
+    const queryScope = queryContext && typeof queryContext === "object"
+      ? node("p", { className: "muted small", text: `本条文来自检索范围：${legalMatchMode(queryContext.matchMode) === "all" ? "全部词均匹配" : legalMatchMode(queryContext.matchMode) === "any" ? "任一词匹配" : "完整短语匹配"} · ${legalVersionScope(queryContext.versionScope) === "as_of" ? `适用日期 ${legalDateValue(queryContext.asOf) || "未知"}` : legalVersionScope(queryContext.versionScope) === "all" ? "全部版本" : "当前有效版本"}` })
+      : null;
     const actions = node("div", { className: "button-row" });
     const bookmark = button("收藏条文", async () => {
       bookmark.disabled = true;
@@ -2890,8 +4098,12 @@ export class WebApp {
     const text = node("pre", { className: "legal-text", text: content });
     const versionBox = node("div", { className: "related-box" });
     const relationBox = node("div", { className: "related-box" });
-    replaceChildren(detail, [headingBlock, actions, text, versionBox, relationBox]);
+    replaceChildren(detail, [headingBlock, queryScope, actions, text, versionBox, relationBox]);
     let versionRequestGeneration = 0;
+    const scopedRead = legalScopedReadParams(queryContext || {});
+    const missingAsOfDate = scopedRead.versionScope === "as_of" && !scopedRead.caseDate;
+    const historyReadable = scopedRead.versionScope !== "current" && !missingAsOfDate;
+    const historyHeading = historyReadable ? "历史版本" : "历史版本（元数据）";
 
     const loadHistory = async () => {
       const generation = ++versionRequestGeneration;
@@ -2900,16 +4112,16 @@ export class WebApp {
         return;
       }
       if (!documentId) {
-        replaceChildren(versionBox, [heading(3, "历史版本"), emptyState("该条文没有可用的法律文书 ID。")]);
+        replaceChildren(versionBox, [heading(3, historyHeading), emptyState("该条文没有可用的法律文书 ID。")]);
         return;
       }
-      replaceChildren(versionBox, [heading(3, "历史版本"), statusBox("正在读取历史版本…")]);
+      replaceChildren(versionBox, [heading(3, historyHeading), statusBox("正在读取历史版本…")]);
       try {
         const response = await this.api.request(`/legal/versions/${pathId(documentId)}`);
         if (generation !== versionRequestGeneration || !historyToggle.checked) return;
         const items = responseList(response, ["versions", "items"]);
         if (!items.length) {
-          replaceChildren(versionBox, [heading(3, "历史版本"), emptyState("没有历史版本记录。")]);
+          replaceChildren(versionBox, [heading(3, historyHeading), emptyState("没有历史版本记录。")]);
           return;
         }
         const versionContent = node("pre", { className: "legal-text version-content", text: "点击版本查看该版本的具体条文内容。" });
@@ -2943,7 +4155,7 @@ export class WebApp {
           replaceChildren(versionPagination);
           try {
             const pageSize = adaptiveLegalPageSize(versionContent, 12);
-            const loaded = await this.api.request(`/legal/version-articles/${pathId(versionId)}${queryString({ limit: pageSize, offset: safeOffset })}`);
+            const loaded = await this.api.request(`/legal/version-articles/${pathId(versionId)}${queryString({ ...scopedRead, limit: pageSize, offset: safeOffset })}`);
             if (generation !== versionRequestGeneration) return;
             const loadedArticles = Array.isArray(loaded?.articles)
               ? loaded.articles
@@ -2972,18 +4184,25 @@ export class WebApp {
           const to = textValue(field(version, ["effectiveTo", "effective_to"]));
           const metadata = [versionTitle, versionStatus ? legalStatusLabel(versionStatus) : "", from, to ? `至 ${to}` : ""].filter(Boolean).join(" · ");
           const show = button(metadata, async () => {
+            if (!historyReadable) {
+              versionContent.textContent = missingAsOfDate
+                ? "检索结果未返回有效适用日期，不能读取历史正文。"
+                : "当前有效版本范围只显示历史版本元数据。请在法律检索中选择“按日期范围”或“全部版本”后，再读取历史正文。";
+              replaceChildren(versionPagination);
+              return;
+            }
             const fallback = textValue(field(version, ["content", "text", "body"]), "暂无该版本正文。");
             if (versionId) await loadVersionPage(versionId, 0, fallback, show);
             else renderVersionBody([version], fallback);
           }, "version-button");
           return node("div", { className: "version-item" }, [show]);
         });
-        replaceChildren(versionBox, [heading(3, "历史版本"), node("div", { className: "version-list" }, rows), versionContent, versionPagination]);
+        replaceChildren(versionBox, [heading(3, historyHeading), node("div", { className: "version-list" }, rows), versionContent, versionPagination]);
         // Loading the first entry makes the default-open switch useful without
         // requiring a second click merely to see whether content is available.
         versionBox.querySelector(".version-button")?.click();
       } catch (error) {
-        if (generation === versionRequestGeneration && historyToggle.checked) replaceChildren(versionBox, [heading(3, "历史版本"), statusBox(apiErrorMessage(error), "danger")]);
+        if (generation === versionRequestGeneration && historyToggle.checked) replaceChildren(versionBox, [heading(3, historyHeading), statusBox(apiErrorMessage(error), "danger")]);
       }
     };
     const loadRelations = async () => {
@@ -3002,7 +4221,7 @@ export class WebApp {
         replaceChildren(relationBox, [heading(3, "关联法规"), ...(items.length ? items.map((related) => {
           const target = legalRelationTarget(related, documentId);
           const relationText = [textValue(field(related, ["relationType", "relation_type"])), textValue(field(related, ["description"])), textValue(field(related, ["sourceReference", "source_reference"]))].filter(Boolean).join(" · ");
-          const targetButton = button(target.title, () => this.loadArticle(target.documentId, detail), "link-button");
+          const targetButton = button(target.title, () => this.loadArticle(target.documentId, detail, queryContext), "link-button");
           return node("div", { className: "version-item" }, [targetButton, relationText ? node("p", { className: "result-meta", text: relationText }) : null]);
         }) : [emptyState("没有关联法规记录。")])]);
       } catch (error) {
@@ -3052,6 +4271,7 @@ export class WebApp {
     const previewColumn = node("div", { className: "workspace-column" });
     layout.append(editorColumn, previewColumn);
     main.append(title, layout);
+    const draftLoad = this.loadWritingDraft();
 
     const editor = panel("案件与写作要求");
     const form = node("form", { className: "stack-form" });
@@ -3059,16 +4279,36 @@ export class WebApp {
     for (const value of ["民事起诉状", "民事答辩状", "劳动仲裁申请书", "律师函", "合同审查意见", "法律意见书"]) appendOption(documentType, value, value);
     const caseDescription = node("textarea", { rows: 10, placeholder: "说明当事人、时间、事实经过、争议焦点、请求和证据。可以直接粘贴已脱敏材料摘要。", required: true });
     const requirements = node("textarea", { rows: 5, placeholder: "例如：使用正式法律文书格式；缺失事实标记为【待补充】；引用现行有效法条。" });
+    const caseDate = node("input", { type: "date", ariaLabel: "文书适用日期" });
     const providerSelect = node("select", { required: true });
     appendOption(providerSelect, "", "选择写作模型服务");
     const modelInput = node("select", { required: true, ariaLabel: "文书写作模型" });
     appendOption(modelInput, "", "选择 Provider 后载入模型");
     const materialHost = node("div", { className: "ai-material-host" }, [emptyState("正在加载可用材料…")]);
     let materialPicker = null;
-    const attachmentPicker = this.renderAiAttachmentPicker();
+    let hasLocalDraftInput = false;
+    // Programmatic source selection during initial recovery must not be
+    // treated as a user edit: it would overwrite a dirty body before it can
+    // be restored. User input is recorded immediately and flushed once the
+    // recovery sequence reaches a stable snapshot.
+    let writingDraftReady = false;
+    let queueDraft = () => {};
+    const noteDraftInput = () => {
+      hasLocalDraftInput = true;
+      if (writingDraftReady) queueDraft();
+    };
+    const attachmentPicker = this.renderAiAttachmentPicker({ onChange: noteDraftInput });
+    const writingContextEstimate = node("div", { className: "context-estimate" }, [emptyState("提交前会显示本次采用的材料、页码或段落范围及上下文预算。")]);
     const generateButton = formButton("生成文书", "button primary");
     const status = statusBox();
-    form.append(labelFor("文书类型", documentType), labelFor("案情描述", caseDescription), labelFor("写作要求", requirements), labelFor("Provider", providerSelect), labelFor("模型", modelInput), materialHost, attachmentPicker, generateButton, status);
+    const draftStatus = statusBox("正在恢复本机加密草稿…", "muted");
+    const retryDraft = button("重试保存草稿", () => {
+      this.queueWritingDraft(draftSnapshot(), draftStatus);
+      void this.flushWritingDraft();
+    }, "button subtle");
+    retryDraft.hidden = true;
+    draftStatus.retryControl = retryDraft;
+    form.append(labelFor("文书类型", documentType), labelFor("案情描述", caseDescription), labelFor("写作要求", requirements), labelFor("文书适用日期（可选；修改已有文书后须保存为新版本）", caseDate), labelFor("Provider", providerSelect), labelFor("模型", modelInput), materialHost, attachmentPicker, writingContextEstimate, generateButton, status, draftStatus, retryDraft);
     editor.append(form);
     editorColumn.append(editor);
 
@@ -3076,18 +4316,32 @@ export class WebApp {
     const runStatus = statusBox("尚未生成文书。", "muted");
     const preview = node("article", { className: "document-preview document-rendered" }, [emptyState("填写案件并生成文书。")]);
     const contentEditor = node("textarea", { className: "document-content-editor", rows: 22, hidden: true, placeholder: "在此修改 Markdown 正文后保存" });
+    let writingCitationPending = false;
+    let writingDateChanged = false;
+    let renderWritingCitation = () => {};
     const saveContent = button("保存正文修改", async () => {
-      const run = this.state.selectedAiRun;
+      const editingRunId = textValue(contentEditor.dataset.runId);
+      const run = editingRunId ? this.state.runsById.get(editingRunId) : null;
       if (!run?.id) return;
       saveContent.disabled = true;
       try {
-        const response = await this.api.updateAiRunContent(run.id, contentEditor.value);
-        this.state.selectedAiRun = normalizeAiRun(response?.run || response);
-        renderRenderedContent(preview, this.state.selectedAiRun.html, this.state.selectedAiRun.content);
+        const expectedRevision = Number(contentEditor.dataset.expectedRevision);
+        const changedDate = writingDateChanged ? (legalDateValue(caseDate.value) || null) : undefined;
+        const response = await this.api.updateAiRunContent(run.id, contentEditor.value, Number.isSafeInteger(expectedRevision) ? expectedRevision : aiRunRevision(run), { caseDate: changedDate });
+        const saved = this.selectPageRun("writing", response?.run || response);
+        contentEditor.dataset.runId = saved.id;
+        contentEditor.dataset.expectedRevision = String(aiRunRevision(saved));
+        if (changedDate !== undefined) caseDate.value = legalDateValue(field(saved, ["case_date", "caseDate"])) || changedDate || "";
+        writingCitationPending = false;
+        writingDateChanged = false;
+        renderRenderedContent(preview, saved.html, saved.content);
+        renderWritingCitation(saved);
         await refreshHistory();
-        setStatus(runStatus, "正文修改已保存。", "success");
+        setStatus(runStatus, changedDate === undefined ? "正文修改已保存。" : "正文与文书适用日期已保存为新版本。", "success");
         contentEditor.hidden = true;
         saveContent.hidden = true;
+        this.queueWritingDraft(draftSnapshot(), draftStatus);
+        void this.flushWritingDraft();
       } catch (error) {
         setStatus(runStatus, apiErrorMessage(error), "danger");
       } finally {
@@ -3096,9 +4350,11 @@ export class WebApp {
     }, "button secondary");
     saveContent.hidden = true;
     const editContent = button("编辑正文", () => {
-      const run = this.state.selectedAiRun;
+      const run = this.pageRun("writing");
       if (!run?.id) return;
       contentEditor.value = run.content;
+      contentEditor.dataset.runId = run.id;
+      contentEditor.dataset.expectedRevision = String(aiRunRevision(run));
       contentEditor.hidden = false;
       saveContent.hidden = false;
       contentEditor.focus();
@@ -3110,16 +4366,19 @@ export class WebApp {
     appendOption(format, "txt", "TXT");
     appendOption(format, "md", "Markdown");
     const exportButton = button("导出", async () => {
-      const run = this.state.selectedAiRun;
+      const run = this.pageRun("writing");
       if (!run?.id) {
         setStatus(runStatus, "请先生成文书。", "warning");
         return;
       }
+      const verification = normalizeCitationVerification(run.citationVerification);
+      const verificationPending = verification.state !== "passed" || (run.id === this.pageRun("writing")?.id && (writingCitationPending || writingDateChanged));
       exportButton.disabled = true;
       try {
-        const blob = await this.api.exportAiRun(run.id, format.value);
+        if (verificationPending) setStatus(runStatus, "引用机械核验待复核，仍可导出；当前导出在界面中标记为待复核。", "warning");
+        const blob = await this.api.exportAiRun(run.id, format.value, aiRunRevision(run));
         await downloadBlob(blob, safeFilename(run.title || documentType.value || "文书", format.value));
-        setStatus(runStatus, `已导出 ${format.value.toUpperCase()}。`, "success");
+        setStatus(runStatus, verificationPending ? `已导出 ${format.value.toUpperCase()}；引用机械核验仍待复核。` : `已导出 ${format.value.toUpperCase()}。`, verificationPending ? "warning" : "success");
       } catch (error) {
         setStatus(runStatus, apiErrorMessage(error), "danger");
       } finally {
@@ -3128,8 +4387,9 @@ export class WebApp {
     }, "button secondary");
     exportRow.append(editContent, format, exportButton);
     const citations = node("div", { className: "citation-list" });
+    const citationVerification = node("div", { className: "citation-verification" });
     const toolSteps = node("details", { className: "tool-steps" }, [node("summary", { text: "查看检索过程" })]);
-    previewPanel.append(runStatus, preview, contentEditor, saveContent, citations, toolSteps, exportRow);
+    previewPanel.append(runStatus, preview, contentEditor, saveContent, citations, citationVerification, toolSteps, exportRow);
     previewColumn.append(previewPanel);
 
     const historyPanel = panel("写作历史", [], "panel ai-history-panel");
@@ -3137,15 +4397,47 @@ export class WebApp {
     historyPanel.append(historyList);
     editorColumn.append(historyPanel);
     const showWritingRun = (run, { resume = true } = {}) => {
-      const loaded = normalizeAiRun(run);
-      this.state.selectedAiRun = loaded;
+      const previousRunId = this.state.pageRunIds.writing;
+      const loaded = this.selectPageRun("writing", run);
+      if (previousRunId && previousRunId !== loaded.id) {
+        writingCitationPending = false;
+        writingDateChanged = false;
+      }
+      if (contentEditor.dataset.runId && contentEditor.dataset.runId !== loaded.id) {
+        contentEditor.hidden = true;
+        saveContent.hidden = true;
+        delete contentEditor.dataset.runId;
+        delete contentEditor.dataset.expectedRevision;
+      }
       renderRenderedContent(preview, loaded.html, loaded.content, "该任务尚无正文结果。");
+      if (!writingDateChanged) caseDate.value = legalDateValue(field(loaded, ["case_date", "caseDate"]));
       contentEditor.value = loaded.content;
       this.renderRunCitations(citations, loaded.citations);
+      renderWritingCitation(loaded);
       replaceChildren(toolSteps, [node("summary", { text: "查看检索过程" }), ...(loaded.tool_steps || []).map((step) => node("p", { className: "tool-step", text: textValue(field(step, ["summary", "query", "action"]), aiToolLabel(field(step, ["tool", "name"]))) }))]);
       setStatus(runStatus, `${aiRunKindLabel(loaded.kind)}：${aiRunStatusLabel(loaded.status)}${loaded.stage ? ` · ${pipelineStageLabel(loaded.stage)}` : ""} · ${aiRunProgressText(loaded)}`, loaded.status === "completed" ? "success" : aiRunIsTerminal(loaded) ? "warning" : "info");
-      if (resume && !aiRunIsTerminal(loaded)) this.pollAiRun(loaded.id, { status: runStatus, onUpdate: (next) => showWritingRun(next, { resume: false }) });
+      if (resume && !aiRunIsTerminal(loaded)) this.pollAiRun(loaded.id, {
+        status: runStatus,
+        onUpdate: (next) => {
+          if (this.state.pageRunIds.writing === next.id) showWritingRun(next, { resume: false });
+        }
+      });
       return loaded;
+    };
+    renderWritingCitation = (run) => {
+      const activeRun = normalizeAiRun(run || this.pageRun("writing"));
+      const isCurrentRun = Boolean(activeRun.id && activeRun.id === this.pageRun("writing")?.id);
+      const hasUnsavedBody = Boolean(activeRun.id && activeRun.id === textValue(contentEditor.dataset.runId) && writingCitationPending);
+      this.renderCitationVerification(citationVerification, activeRun, {
+        locallyPending: Boolean((isCurrentRun && writingDateChanged) || hasUnsavedBody),
+        onUpdated: async (next) => {
+          writingCitationPending = false;
+          writingDateChanged = false;
+          showWritingRun(next, { resume: false });
+          await refreshHistory();
+          setStatus(runStatus, "引用机械核验已更新；论证相关性仍需人工复核。", "success");
+        }
+      });
     };
     const continueWritingRun = async (run) => {
       try {
@@ -3167,12 +4459,11 @@ export class WebApp {
         setStatus(runStatus, apiErrorMessage(error), "danger");
       }
     };
-    const refreshHistory = async () => {
+    const refreshHistory = async ({ append = false } = {}) => {
       try {
-        const response = await this.api.listAiRuns("writing");
-        const runs = normalizeAiRunList(response);
-        this.state.aiRuns = [...this.state.aiRuns.filter((item) => item.kind !== "writing"), ...runs];
-        replaceChildren(historyList, runs.length ? runs.slice(0, 20).map((run) => {
+        const page = await this.loadAiRunPage("writing", { append, limit: 20 });
+        const runs = page.items;
+        const rows = runs.length ? runs.map((run) => {
           const open = button(`${run.title || documentType.value} · ${aiRunStatusLabel(run.status)}`, () => openRun(run), "conversation-item");
           const row = node("div", { className: "ai-history-row" }, [open]);
           if (["paused", "interrupted", "failed"].includes(String(run.status).toLowerCase())) row.append(button("继续", () => continueWritingRun(run), "button subtle"));
@@ -3181,7 +4472,10 @@ export class WebApp {
             catch (error) { setStatus(runStatus, apiErrorMessage(error), "danger"); }
           }, "button danger"));
           return row;
-        }) : [emptyState("还没有文书写作记录。")] );
+        }) : [emptyState("还没有文书写作记录。")] ;
+        if (page.corruptCount > 0) rows.unshift(statusBox(`检测到 ${page.corruptCount} 个损坏文书记录，未显示。`, "warning"));
+        if (page.nextCursor) rows.push(button("加载更多文书历史", () => refreshHistory({ append: true }), "button subtle"));
+        replaceChildren(historyList, rows);
       } catch (error) {
         replaceChildren(historyList, [statusBox(apiErrorMessage(error), "danger")]);
       }
@@ -3202,10 +4496,50 @@ export class WebApp {
       modelInput.value = preferred;
       modelInput.disabled = !provider || !models.length;
       modelInput.title = models.length ? "可选择该 Provider 已启用的模型" : "该 Provider 尚未启用模型";
-      if (syncMaterialTrust) this.applyMaterialTrust(materialPicker, provider);
+      if (syncMaterialTrust) this.applyMaterialTrust(materialPicker, provider, { notify: writingDraftReady });
       return provider;
     };
-    providerSelect.addEventListener("change", () => providerModel());
+    const draftSnapshot = () => writingDraftContent({
+      document_type: documentType.value,
+      prompt: caseDescription.value,
+      requirements: requirements.value,
+      case_date: legalDateValue(caseDate.value),
+      provider_id: providerSelect.value,
+      model: modelInput.value,
+      materials: materialPicker?.values?.() || [],
+      attachment_ids: attachmentPicker.attachmentIds?.() || [],
+      run_id: textValue(contentEditor.dataset.runId, this.pageRun("writing")?.id || ""),
+      run_revision: Number(contentEditor.dataset.expectedRevision) || aiRunRevision(this.pageRun("writing")),
+      content: contentEditor.value,
+      dirty: !contentEditor.hidden
+    });
+    queueDraft = () => {
+      if (this.state.writingDraft.loaded) this.queueWritingDraft(draftSnapshot(), draftStatus);
+    };
+    documentType.addEventListener("change", noteDraftInput);
+    caseDescription.addEventListener("input", noteDraftInput);
+    requirements.addEventListener("input", noteDraftInput);
+    caseDate.addEventListener("change", () => {
+      writingDateChanged = Boolean(this.pageRun("writing")?.id);
+      if (writingDateChanged) {
+        writingCitationPending = true;
+        renderWritingCitation(this.pageRun("writing"));
+        setStatus(runStatus, "文书适用日期已修改；旧版本未改变，请保存正文与日期修改以创建新版本。", "warning");
+      }
+      noteDraftInput();
+    });
+    contentEditor.addEventListener("input", () => {
+      noteDraftInput();
+      if (!contentEditor.hidden && contentEditor.dataset.runId) {
+        writingCitationPending = true;
+        renderWritingCitation(this.state.runsById.get(contentEditor.dataset.runId));
+      }
+    });
+    providerSelect.addEventListener("change", () => {
+      providerModel();
+      noteDraftInput();
+    });
+    modelInput.addEventListener("change", noteDraftInput);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const provider = providerModel({ preserveModel: true, syncMaterialTrust: false });
@@ -3226,18 +4560,26 @@ export class WebApp {
           setStatus(status, "所选模型未启用，请前往设置勾选后重试。", "warning");
           return;
         }
-        await this.createAiRun({ kind: AI_RUN_KINDS.writing, prompt, provider_id: providerSelect.value, model, document_type: documentType.value, requirements: requirements.value.trim(), materials: materialPicker?.values?.() || [], attachment_ids: attachmentPicker.attachmentIds?.() || [] }, {
+        const writingDate = legalDateValue(caseDate.value);
+        const payload = { kind: AI_RUN_KINDS.writing, prompt, provider_id: providerSelect.value, model, document_type: documentType.value, requirements: requirements.value.trim(), ...(writingDate ? { case_date: writingDate } : {}), materials: materialPicker?.values?.() || [], attachment_ids: attachmentPicker.attachmentIds?.() || [] };
+        const contextEstimate = await this.preflightAiContext(payload, writingContextEstimate, status);
+        if (!contextEstimate) return;
+        payload.context_plan_hash = contextEstimate.planHash;
+        await this.createAiRun(payload, {
+          page: "writing",
           status,
           onUpdate: (run) => {
-            this.state.selectedAiRun = run;
+            if (this.state.pageRunIds.writing !== run.id) return;
             if (run.content || run.html) { renderRenderedContent(preview, run.html, run.content, "该任务尚无正文结果。"); contentEditor.value = run.content; }
             this.renderRunCitations(citations, run.citations);
+            renderWritingCitation(run);
             replaceChildren(toolSteps, [node("summary", { text: "查看检索过程" }), ...(run.tool_steps || []).map((step) => node("p", { className: "tool-step", text: textValue(field(step, ["summary", "query", "action"]), aiToolLabel(field(step, ["tool", "name"]))) }))]);
           },
           onDone: (run) => {
-            this.state.selectedAiRun = run;
+            if (this.state.pageRunIds.writing !== run.id) return;
             if (run.content || run.html) { renderRenderedContent(preview, run.html, run.content, "该任务尚无正文结果。"); contentEditor.value = run.content; }
             this.renderRunCitations(citations, run.citations);
+            renderWritingCitation(run);
             setStatus(status, run.status === "completed" ? "文书已生成并保存历史记录。" : `任务状态：${aiRunStatusLabel(run.status)}`, run.status === "completed" ? "success" : "warning");
             refreshHistory();
           }
@@ -3248,12 +4590,75 @@ export class WebApp {
         generateButton.disabled = false;
       }
     });
+    let restoredDraft = writingDraftContent();
+    try {
+      restoredDraft = await draftLoad;
+      if (hasLocalDraftInput) {
+        setStatus(draftStatus, "已保留本次输入，正在加密保存。", "info");
+        queueDraft();
+      } else {
+        setStatus(draftStatus, restoredDraft.prompt || restoredDraft.requirements || restoredDraft.materials.length || restoredDraft.attachment_ids.length ? "已恢复本机加密草稿。" : "暂无已保存草稿。", "success");
+      }
+    } catch (error) {
+      this.state.writingDraft.loaded = true;
+      setStatus(draftStatus, `草稿未恢复：${apiErrorMessage(error)}`, "danger");
+      if (hasLocalDraftInput) queueDraft();
+    }
+    if (!hasLocalDraftInput) {
+      documentType.value = [...documentType.options].some((option) => option.value === restoredDraft.document_type) ? restoredDraft.document_type : documentType.value;
+      caseDescription.value = restoredDraft.prompt;
+      requirements.value = restoredDraft.requirements;
+      caseDate.value = legalDateValue(restoredDraft.case_date);
+      attachmentPicker.setAttachments(restoredDraft.attachment_ids.map((id) => ({ id })));
+    }
     await this.loadProvidersInto(providerSelect, "writing");
-    const materials = await this.loadAiMaterials();
-    materialPicker = this.renderAiMaterialPicker(materials, { title: "选择材料（默认脱敏版）" });
-    replaceChildren(materialHost, [materialPicker]);
+    if (!hasLocalDraftInput && restoredDraft.provider_id && [...providerSelect.options].some((option) => option.value === restoredDraft.provider_id)) providerSelect.value = restoredDraft.provider_id;
+    await this.loadAiMaterials();
+    const renderWritingMaterialPicker = (selectedValues) => {
+      const page = this.state.aiMaterialsPage;
+      materialPicker = this.renderAiMaterialPicker(this.state.aiMaterials, {
+        title: "选择材料（默认脱敏版）",
+        selectedValues,
+        hasMore: Boolean(page.nextCursor),
+        total: page.total,
+        corruptCount: page.corruptCount,
+        errorMessage: page.error,
+        onLoadMore: async (preservedValues) => {
+          await this.loadAiMaterials({ append: true });
+          renderWritingMaterialPicker(preservedValues);
+        },
+        onChange: noteDraftInput
+      });
+      replaceChildren(materialHost, [materialPicker]);
+    };
+    renderWritingMaterialPicker(hasLocalDraftInput ? [] : restoredDraft.materials);
     providerModel({ preserveModel: true });
+    if (!hasLocalDraftInput && restoredDraft.model && [...modelInput.options].some((option) => option.value === restoredDraft.model)) modelInput.value = restoredDraft.model;
     await refreshHistory();
+    const restorePlan = writingDraftRestorePlan(
+      restoredDraft,
+      this.state.runsById.get(restoredDraft.run_id),
+      { hasLocalInput: hasLocalDraftInput }
+    );
+    if (restorePlan) {
+      try {
+        // The page list intentionally contains summary records without a
+        // document body. Always fetch the specific run before binding the
+        // editor, while taking the unsaved body only from the encrypted draft.
+        const response = await this.api.getAiRun(restorePlan.runId);
+        const restoredRun = showWritingRun(response?.run || response, { resume: false });
+        contentEditor.value = restorePlan.content;
+        contentEditor.dataset.runId = restoredRun.id || restorePlan.runId;
+        contentEditor.dataset.expectedRevision = String(restorePlan.expectedRevision ?? aiRunRevision(restoredRun));
+        contentEditor.hidden = false;
+        saveContent.hidden = false;
+        setStatus(draftStatus, "已恢复未提交的文书正文修改。", "success");
+      } catch (error) {
+        setStatus(draftStatus, `文书正文草稿待恢复：${apiErrorMessage(error)}`, "warning");
+      }
+    }
+    writingDraftReady = true;
+    if (hasLocalDraftInput) queueDraft();
   }
 
   async renderAiChat(main) {
@@ -3285,7 +4690,11 @@ export class WebApp {
     appendOption(modelInput, "", "选择 Provider 后载入模型");
     const materialHost = node("div", { className: "ai-material-host" }, [emptyState("正在加载可用材料…")]);
     let materialPicker = null;
-    const attachmentPicker = this.renderAiAttachmentPicker();
+    let queueConversationContext = () => {};
+    const attachmentPicker = this.renderAiAttachmentPicker({ onChange: () => queueConversationContext() });
+    const contextStatus = statusBox("会话材料由本机服务保存。", "muted");
+    const contextManifest = node("div", { className: "conversation-context-manifest" }, [emptyState("选择会话后显示本次发送清单。")]);
+    const chatContextEstimate = node("div", { className: "context-estimate" }, [emptyState("发送前会显示本次采用的会话材料、历史范围及上下文预算。")]);
     const messages = node("div", { className: "message-list", ariaLive: "polite" }, [emptyState("选择或新建会话。")]);
     const composer = node("form", { className: "composer" });
     const messageInput = node("textarea", { rows: 5, placeholder: "输入问题；助手可调用本地法律检索工具查找相关法条。", required: true });
@@ -3304,7 +4713,7 @@ export class WebApp {
     cancelButton.disabled = true;
     const chatStatus = statusBox();
     composer.append(labelFor("消息", messageInput), node("div", { className: "button-row" }, [providerSelect, modelInput, sendButton, cancelButton]), chatStatus);
-    chatPanel.append(selectedTitle, renameForm, labelFor("材料上下文", materialHost), attachmentPicker, messages, composer);
+    chatPanel.append(selectedTitle, renameForm, labelFor("材料上下文", materialHost), attachmentPicker, contextStatus, contextManifest, chatContextEstimate, messages, composer);
     chatColumn.append(chatPanel);
 
     const renderChatMessages = (items) => {
@@ -3323,9 +4732,131 @@ export class WebApp {
       messages.lastElementChild?.scrollIntoView?.({ block: "nearest" });
     };
 
+    let contextWrite = Promise.resolve();
+    let contextSaveError = null;
+    let contextPrepareGeneration = 0;
+    let preparedContext = null;
+    const currentConversationId = () => textValue(field(this.state.selectedConversation, ["id", "conversationId"]));
+    const renderContextManifest = (manifest, message = "") => {
+      const source = manifest?.context || manifest || {};
+      const materialItems = Array.isArray(source.materials) ? source.materials : [];
+      const attachmentItems = Array.isArray(source.attachments)
+        ? source.attachments
+        : Array.isArray(source.attachment_ids) ? source.attachment_ids.map((id) => ({ id })) : [];
+      const rows = [];
+      for (const item of materialItems) {
+        const name = textValue(field(item, ["name", "material_name", "materialName"]), textValue(field(item, ["id", "material_id", "materialId"]), "未命名材料"));
+        const sourceLabel = textValue(field(item, ["source"]), "待核验") === "original" ? "原文" : "脱敏版";
+        rows.push(node("li", { text: `${name} · ${sourceLabel}` }));
+      }
+      for (const item of attachmentItems) {
+        const name = textValue(field(item, ["name", "filename"]), textValue(field(item, ["id", "attachment_id", "attachmentId"]), "已保存附件"));
+        rows.push(node("li", { text: `${name} · 附件` }));
+      }
+      replaceChildren(contextManifest, [
+        heading(3, "发送前服务器最终清单"),
+        message ? node("p", { className: "muted small", text: message }) : null,
+        rows.length ? node("ul", { className: "context-manifest-list" }, rows) : node("p", { className: "muted small", text: "本轮不发送材料或附件。" })
+      ]);
+    };
+    const renderConversationContext = (conversation) => {
+      const context = conversation || {};
+      const selectedValues = Array.isArray(context.materials) ? context.materials : [];
+      const page = this.state.aiMaterialsPage;
+      materialPicker = this.renderAiMaterialPicker(this.state.aiMaterials, {
+        title: "会话材料（取消勾选会立即从后续轮次移除）",
+        selectedValues,
+        hasMore: Boolean(page.nextCursor),
+        total: page.total,
+        corruptCount: page.corruptCount,
+        errorMessage: page.error,
+        onLoadMore: async (preservedValues) => {
+          const attachmentIds = attachmentPicker.attachmentIds?.() || [];
+          const current = { ...(this.state.selectedConversation || context), materials: preservedValues, attachment_ids: attachmentIds };
+          await this.loadAiMaterials({ append: true });
+          renderConversationContext(current);
+          const selectedProvider = this.state.providers.find((item) => textValue(field(item, ["id"])) === providerSelect.value);
+          this.applyMaterialTrust(materialPicker, selectedProvider);
+        },
+        onChange: () => queueConversationContext()
+      });
+      replaceChildren(materialHost, [materialPicker]);
+      attachmentPicker.setAttachments((Array.isArray(context.attachment_ids) ? context.attachment_ids : []).map((id) => {
+        const existing = this.state.aiAttachments.find((attachment) => attachment.id === id);
+        return existing || { id };
+      }));
+      renderContextManifest(context, "正在等待本机服务按当前模型核验。");
+    };
+    const prepareConversationContext = async ({ announce = false, waitForContext = true } = {}) => {
+      if (waitForContext) await contextWrite;
+      if (contextSaveError) return null;
+      const conversationId = currentConversationId();
+      const providerId = providerSelect.value;
+      const model = modelInput.value;
+      if (!conversationId || !providerId || !model) return null;
+      const expectedRevision = conversationContextRevision(this.state.selectedConversation);
+      const generation = ++contextPrepareGeneration;
+      if (announce) setStatus(contextStatus, "正在核验发送材料清单…", "info");
+      try {
+        const response = await this.api.prepareAiConversationContext(conversationId, {
+          provider_id: providerId,
+          model,
+          expected_revision: expectedRevision
+        });
+        if (generation !== contextPrepareGeneration || conversationId !== currentConversationId()) return null;
+        const manifest = response?.manifest || response?.context_manifest || response;
+        const revision = conversationContextRevision(response, conversationContextRevision(manifest, expectedRevision));
+        const preparationHash = textValue(field(response, ["preparation_hash", "preparationHash"]));
+        if (!Number.isSafeInteger(revision) || revision < 0 || !preparationHash) throw new ApiError("invalid_response", false, 200);
+        preparedContext = { conversationId, providerId, model, revision, preparationHash, manifest };
+        renderContextManifest(manifest, "此清单由本机服务核验；发送时会再次校验版本和材料状态。");
+        setStatus(contextStatus, "发送材料清单已由本机服务核验。", "success");
+        return preparedContext;
+      } catch (error) {
+        if (generation === contextPrepareGeneration) {
+          preparedContext = null;
+          setStatus(contextStatus, `无法核验发送清单：${apiErrorMessage(error)}`, "danger");
+        }
+        return null;
+      }
+    };
+    queueConversationContext = () => {
+      const conversationId = currentConversationId();
+      if (!conversationId || !materialPicker) return Promise.resolve();
+      preparedContext = null;
+      contextSaveError = null;
+      contextWrite = contextWrite.catch(() => {}).then(async () => {
+        const activeId = currentConversationId();
+        if (!activeId || activeId !== conversationId) return;
+        const expectedRevision = conversationContextRevision(this.state.selectedConversation);
+        setStatus(contextStatus, "正在保存会话材料清单…", "info");
+        const response = await this.api.updateAiConversationContext(activeId, {
+          expected_revision: expectedRevision,
+          materials: materialPicker.values(),
+          attachment_ids: attachmentPicker.attachmentIds()
+        });
+        const conversation = response?.conversation || response;
+        if (activeId !== currentConversationId()) return;
+        this.state.selectedConversation = conversation;
+        const cancelled = Array.isArray(response?.cancelled_run_ids) ? response.cancelled_run_ids.length : 0;
+        setStatus(contextStatus, cancelled ? `会话材料清单已保存；已停止 ${cancelled} 个未完成任务。已发送的内容无法撤回。` : "会话材料清单已保存。", "success");
+        void prepareConversationContext({ waitForContext: false });
+      }).catch((error) => {
+        contextSaveError = error;
+        preparedContext = null;
+        setStatus(contextStatus, `会话材料未保存：${apiErrorMessage(error)}`, "danger");
+      });
+      return contextWrite;
+    };
+
     const openConversation = async (id) => {
       if (!id) return;
       try {
+        // A failed write or prepared manifest belongs only to the conversation
+        // it was made for.  It must not block a newly selected conversation.
+        contextSaveError = null;
+        preparedContext = null;
+        contextPrepareGeneration += 1;
         const response = await this.api.getAiConversation(id);
         const conversation = response?.conversation || response;
         this.state.selectedConversation = conversation;
@@ -3333,31 +4864,45 @@ export class WebApp {
         selectedTitle.firstElementChild.textContent = conversationTitle;
         renameInput.value = conversationTitle;
         renderChatMessages(parseJsonList(conversation?.messages));
+        renderConversationContext(conversation);
+        const selectedProvider = this.state.providers.find((item) => textValue(field(item, ["id"])) === providerSelect.value);
+        this.applyMaterialTrust(materialPicker, selectedProvider);
+        this.state.currentChatRunId = "";
         for (const item of conversationList.querySelectorAll(".conversation-item")) item.classList.toggle("active", item.dataset.conversationId === id);
+        void prepareConversationContext();
       } catch (error) {
         setStatus(chatStatus, apiErrorMessage(error), "danger");
       }
     };
-    const loadConversationList = async (preferredId = "") => {
+    const loadConversationList = async (preferredId = "", { append = false } = {}) => {
       try {
-        const response = await this.api.listAiConversations();
-        const conversations = Array.isArray(response) ? response : response?.conversations || response?.items || [];
-        this.state.conversations = Array.isArray(conversations) ? conversations : [];
+        const previous = this.state.conversationPage;
+        const cursor = append ? textValue(previous.nextCursor) : "";
+        if (append && !cursor) return;
+        const response = await this.api.listAiConversations({ limit: 20, cursor });
+        const page = normalizeCursorPage(response, ["conversations"]);
+        const conversations = append ? appendUniqueById(this.state.conversations, page.items) : page.items;
+        this.state.conversations = conversations;
+        this.state.conversationPage = { nextCursor: page.nextCursor, total: page.total, corruptCount: page.corruptCount, loaded: true };
         if (!this.state.conversations.length) {
           replaceChildren(conversationList, [emptyState("还没有会话，点击“新建会话”。")]);
           this.state.selectedConversation = null;
           selectedTitle.firstElementChild.textContent = "请选择或新建会话";
-          replaceChildren(messages, [emptyState("选择或新建会话。")]);
+          replaceChildren(messages, [emptyState("选择或新建会话。")] );
           return;
         }
-        const selectedId = preferredId || textValue(field(this.state.selectedConversation, ["id", "conversationId"]), textValue(field(this.state.conversations[0], ["id", "conversationId"])));
-        replaceChildren(conversationList, this.state.conversations.map((conversation) => {
+        const activeId = textValue(field(this.state.selectedConversation, ["id", "conversationId"]));
+        const selectedId = preferredId || activeId || textValue(field(this.state.conversations[0], ["id", "conversationId"]));
+        const rows = this.state.conversations.map((conversation) => {
           const id = textValue(field(conversation, ["id", "conversationId"]));
           const item = button(textValue(field(conversation, ["title", "name"]), "未命名会话"), () => openConversation(id), `conversation-item${id === selectedId ? " active" : ""}`);
           item.dataset.conversationId = id;
           return item;
-        }));
-        await openConversation(selectedId);
+        });
+        if (this.state.conversationPage.corruptCount > 0) rows.unshift(statusBox(`检测到 ${this.state.conversationPage.corruptCount} 个损坏会话记录，未显示。`, "warning"));
+        if (this.state.conversationPage.nextCursor) rows.push(button("加载更多会话", () => loadConversationList(selectedId, { append: true }), "button subtle"));
+        replaceChildren(conversationList, rows);
+        if (!append || !activeId) await openConversation(selectedId);
       } catch (error) {
         replaceChildren(conversationList, [statusBox(apiErrorMessage(error), "danger")]);
       }
@@ -3412,13 +4957,19 @@ export class WebApp {
       modelInput.title = models.length ? "可选择该 Provider 已启用的模型" : "该 Provider 尚未启用模型";
       this.applyMaterialTrust(materialPicker, provider);
     };
-    providerSelect.addEventListener("change", () => syncChatModel());
+    providerSelect.addEventListener("change", () => {
+      syncChatModel();
+      void prepareConversationContext();
+    });
+    modelInput.addEventListener("change", () => void prepareConversationContext());
     const finishChatRun = async (next, conversationId) => {
-      setStatus(chatStatus, next.status === "completed" ? "回答已生成并保存。" : `任务状态：${aiRunStatusLabel(next.status)}`, next.status === "completed" ? "success" : "warning");
-      cancelButton.disabled = true;
-      this.state.currentChatRunId = "";
-      await openConversation(conversationId);
-      await loadConversationList(conversationId);
+      if (currentConversationId() === conversationId) {
+        setStatus(chatStatus, next.status === "completed" ? "回答已生成并保存。" : `任务状态：${aiRunStatusLabel(next.status)}`, next.status === "completed" ? "success" : "warning");
+        cancelButton.disabled = true;
+        this.state.currentChatRunId = "";
+        await openConversation(conversationId);
+      }
+      await loadConversationList(currentConversationId());
     };
     composer.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -3444,15 +4995,25 @@ export class WebApp {
         return;
       }
       sendButton.disabled = true;
-      cancelButton.disabled = false;
-      messageInput.value = "";
-      const current = parseJsonList(this.state.selectedConversation?.messages);
-      const pendingMessages = [...current, { role: "user", content: prompt }, { role: "assistant", content: "正在检索法律依据并生成回答…" }];
-      renderChatMessages(pendingMessages);
       try {
-        const run = await this.createAiRun({ kind: AI_RUN_KINDS.chat, prompt, provider_id: providerSelect.value, model, conversation_id: conversationId, materials: materialPicker?.values?.() || [], attachment_ids: attachmentPicker.attachmentIds?.() || [] }, {
+        const prepared = await prepareConversationContext({ announce: true });
+        if (!prepared || prepared.conversationId !== conversationId || prepared.providerId !== providerSelect.value || prepared.model !== model) {
+          setStatus(chatStatus, "发送前材料清单尚未通过本机服务核验。", "warning");
+          return;
+        }
+        const payload = { kind: AI_RUN_KINDS.chat, prompt, provider_id: providerSelect.value, model, conversation_id: conversationId, context_revision: prepared.revision, context_preparation_hash: prepared.preparationHash };
+        const contextEstimate = await this.preflightAiContext(payload, chatContextEstimate, chatStatus);
+        if (!contextEstimate) return;
+        payload.context_plan_hash = contextEstimate.planHash;
+        const current = parseJsonList(this.state.selectedConversation?.messages);
+        messageInput.value = "";
+        renderChatMessages([...current, { role: "user", content: prompt }, { role: "assistant", content: "正在检索法律依据并生成回答…" }]);
+        cancelButton.disabled = false;
+        const run = await this.createAiRun(payload, {
+          page: "chat",
           status: chatStatus,
           onUpdate: (next) => {
+            if (currentConversationId() !== conversationId || this.state.pageRunIds.chat !== next.id) return;
             const answer = next.content || "正在检索法律依据并生成回答…";
             renderChatMessages([...current, { role: "user", content: prompt }, { role: "assistant", content: answer, run_id: next.id }]);
           },
@@ -3468,20 +5029,24 @@ export class WebApp {
     });
     await this.loadProvidersInto(providerSelect, "chat");
     syncChatModel({ preserveModel: true });
-    const materials = await this.loadAiMaterials();
-    materialPicker = this.renderAiMaterialPicker(materials, { title: "选择材料（默认脱敏版）" });
-    replaceChildren(materialHost, [materialPicker]);
-    const selectedProvider = this.state.providers.find((item) => textValue(field(item, ["id"])) === providerSelect.value);
-    this.applyMaterialTrust(materialPicker, selectedProvider);
+    await this.loadAiMaterials();
     await loadConversationList();
     try {
-      const activeRuns = normalizeAiRunList(await this.api.listAiRuns("chat"));
+      const activeRuns = normalizeAiRunList(await this.api.listAiRuns("chat", { limit: 50 }));
       const selectedId = textValue(field(this.state.selectedConversation, ["id", "conversationId"]));
       const active = activeRuns.find((run) => !aiRunIsTerminal(run) && textValue(field(run, ["conversation_id", "conversationId"])) === selectedId);
       if (active) {
+        this.selectPageRun("chat", active);
         this.state.currentChatRunId = active.id;
         setStatus(chatStatus, `${aiRunKindLabel(active.kind)}：${aiRunStatusLabel(active.status)}${active.stage ? ` · ${pipelineStageLabel(active.stage)}` : ""} · ${aiRunProgressText(active)}`, "info");
-        this.pollAiRun(active.id, { status: chatStatus, onUpdate: (next) => setStatus(chatStatus, `${aiRunKindLabel(next.kind)}：${aiRunStatusLabel(next.status)}${next.stage ? ` · ${pipelineStageLabel(next.stage)}` : ""} · ${aiRunProgressText(next)}`, "info"), onDone: (next) => finishChatRun(next, selectedId) });
+        this.pollAiRun(active.id, {
+          status: chatStatus,
+          onUpdate: (next) => {
+            if (currentConversationId() !== selectedId || this.state.pageRunIds.chat !== next.id) return;
+            setStatus(chatStatus, `${aiRunKindLabel(next.kind)}：${aiRunStatusLabel(next.status)}${next.stage ? ` · ${pipelineStageLabel(next.stage)}` : ""} · ${aiRunProgressText(next)}`, "info");
+          },
+          onDone: (next) => finishChatRun(next, selectedId)
+        });
       }
     } catch {
       // History remains usable when the optional recovery check is unavailable.
@@ -3531,6 +5096,22 @@ export class WebApp {
     const modelHost = node("div", { className: "model-selection" }, [emptyState("输入 API Key 后点击联网获取模型列表。")]);
     let modelItems = [];
     let enabledModels = new Set();
+    let modelCapabilities = new Map();
+    const capabilityInputPresent = (value) => {
+      const source = value && typeof value === "object" ? value : {};
+      return Boolean(textValue(source.contextWindowTokens ?? source.context_window_tokens) || textValue(source.maxOutputTokens ?? source.max_output_tokens) || source.supportsTools === true || source.supports_tools === true || source.supportsStructuredOutput === true || source.supports_structured_output === true || source.supportsVision === true || source.supports_vision === true);
+    };
+    const editableCapabilities = (value) => ({
+      contextWindowTokens: textValue(field(value, ["context_window_tokens", "contextWindowTokens"])),
+      maxOutputTokens: textValue(field(value, ["max_output_tokens", "maxOutputTokens"])),
+      supportsTools: field(value, ["supports_tools", "supportsTools"]) === true,
+      supportsStructuredOutput: field(value, ["supports_structured_output", "supportsStructuredOutput"]) === true,
+      supportsVision: field(value, ["supports_vision", "supportsVision"]) === true
+    });
+    const restoreModelCapabilities = (value) => {
+      const entries = value && typeof value === "object" && !Array.isArray(value) ? Object.entries(value) : [];
+      modelCapabilities = new Map(entries.map(([modelId, capability]) => [textValue(modelId), editableCapabilities(capability)]).filter(([modelId]) => modelId));
+    };
     const renderModels = () => {
       const filter = modelSearch.value.trim().toLowerCase();
       const visible = modelItems.filter((model) => {
@@ -3543,10 +5124,34 @@ export class WebApp {
       }
       replaceChildren(modelHost, visible.map((model) => {
         const modelId = textValue(field(model, ["id", "name"]));
+        const capability = editableCapabilities(modelCapabilities.get(modelId) || {});
         const checked = node("input", { type: "checkbox", checked: enabledModels.has(modelId), ariaLabel: `启用${modelId}` });
         checked.dataset.modelId = modelId;
         checked.addEventListener("change", () => { if (checked.checked) enabledModels.add(modelId); else enabledModels.delete(modelId); });
-        return node("label", { className: "model-option" }, [checked, node("span", { text: modelId }), node("span", { className: "muted small", text: textValue(field(model, ["owned_by", "description"])) })]);
+        const contextWindow = node("input", { type: "number", min: "1", step: "1", value: capability.contextWindowTokens, placeholder: "上下文窗口 tokens" });
+        const maxOutput = node("input", { type: "number", min: "1", step: "1", value: capability.maxOutputTokens, placeholder: "最大输出 tokens" });
+        const tools = node("input", { type: "checkbox", checked: capability.supportsTools, ariaLabel: `${modelId}支持工具` });
+        const structured = node("input", { type: "checkbox", checked: capability.supportsStructuredOutput, ariaLabel: `${modelId}支持结构化输出` });
+        const vision = node("input", { type: "checkbox", checked: capability.supportsVision, ariaLabel: `${modelId}支持视觉` });
+        const persistCapabilities = () => {
+          const next = { contextWindowTokens: contextWindow.value, maxOutputTokens: maxOutput.value, supportsTools: tools.checked, supportsStructuredOutput: structured.checked, supportsVision: vision.checked };
+          if (capabilityInputPresent(next)) modelCapabilities.set(modelId, next); else modelCapabilities.delete(modelId);
+        };
+        contextWindow.addEventListener("input", persistCapabilities);
+        maxOutput.addEventListener("input", persistCapabilities);
+        tools.addEventListener("change", persistCapabilities);
+        structured.addEventListener("change", persistCapabilities);
+        vision.addEventListener("change", persistCapabilities);
+        const option = node("div", { className: "model-option" }, [
+          node("label", { className: "checkbox-label" }, [checked, node("span", { text: modelId }), node("span", { className: "muted small", text: textValue(field(model, ["owned_by", "description"])) })]),
+          node("details", { className: "model-capability-config", open: capabilityInputPresent(capability) }, [
+            node("summary", { text: "配置上下文能力（可选）" }),
+            node("p", { className: "muted small", text: "未配置时按输入 16k、输出 4k 保守预检；填写时需同时提供上下文窗口和最大输出。" }),
+            node("div", { className: "model-capability-fields" }, [fieldInput("上下文窗口", contextWindow), fieldInput("最大输出", maxOutput)]),
+            node("div", { className: "model-capability-flags" }, [labelFor("支持工具调用", tools), labelFor("支持结构化输出", structured), labelFor("支持视觉", vision)])
+          ])
+        ]);
+        return option;
       }));
     };
     modelSearch.addEventListener("input", renderModels);
@@ -3589,9 +5194,23 @@ export class WebApp {
         setStatus(status, "请先联网获取并启用至少一个模型，或填写默认模型 ID。", "warning");
         return;
       }
+      const configuredModels = selectedModels.length ? selectedModels : [defaultModel.value.trim()];
+      const serializedCapabilities = {};
+      const invalidCapabilityModels = [];
+      for (const modelId of configuredModels) {
+        const capability = modelCapabilities.get(modelId);
+        if (!capabilityInputPresent(capability)) continue;
+        const payload = modelCapabilitiesPayload(capability);
+        if (!payload) invalidCapabilityModels.push(modelId);
+        else serializedCapabilities[modelId] = payload;
+      }
+      if (invalidCapabilityModels.length) {
+        setStatus(status, `模型能力配置不完整：${invalidCapabilityModels.join("、")}。请同时填写上下文窗口和最大输出，且前者必须更大。`, "warning");
+        return;
+      }
       save.disabled = true;
       try {
-        const body = { id: id.value.trim() || undefined, name: name.value.trim(), preset: preset.value, base_url: baseUrl.value.trim(), enabled_models: selectedModels.length ? selectedModels : [defaultModel.value.trim()], model: defaultModel.value.trim(), trust_raw: trustRaw.checked, allow_private_network: privateNetwork.checked };
+        const body = { id: id.value.trim() || undefined, name: name.value.trim(), preset: preset.value, base_url: baseUrl.value.trim(), enabled_models: configuredModels, model: defaultModel.value.trim(), trust_raw: trustRaw.checked, allow_private_network: privateNetwork.checked, model_capabilities: serializedCapabilities };
         if (apiKey.value) body.api_key = apiKey.value;
         const response = await this.api.saveAiProvider(body);
         apiKey.value = "";
@@ -3662,12 +5281,14 @@ export class WebApp {
         replaceChildren(list, providers.length ? providers.map((provider) => {
           const pid = textValue(provider.id);
           const edit = button("编辑", () => {
-            id.value = pid; name.value = textValue(provider.name); baseUrl.value = textValue(field(provider, ["base_url", "baseUrl"])); preset.value = textValue(provider.preset, "custom"); apiKey.value = ""; privateNetwork.checked = provider.allow_private_network === true; trustRaw.checked = provider.trust_raw === true; enabledModels = new Set(providerModelIds(provider)); defaultModel.value = textValue(provider.model) || [...enabledModels][0] || ""; modelItems = [...enabledModels].map((value) => ({ id: value })); renderModels(); }, "button subtle");
+            id.value = pid; name.value = textValue(provider.name); baseUrl.value = textValue(field(provider, ["base_url", "baseUrl"])); preset.value = textValue(provider.preset, "custom"); apiKey.value = ""; privateNetwork.checked = provider.allow_private_network === true; trustRaw.checked = provider.trust_raw === true; enabledModels = new Set(providerModelIds(provider)); defaultModel.value = textValue(provider.model) || [...enabledModels][0] || ""; modelItems = [...enabledModels].map((value) => ({ id: value })); restoreModelCapabilities(field(provider, ["model_capabilities", "modelCapabilities"])); renderModels(); }, "button subtle");
           const test = button("连接测试", async () => {
             test.disabled = true;
             try { await this.api.testAiProvider({ provider_id: pid, model: textValue(provider.model) }); setStatus(status, `${textValue(provider.name, "模型服务")} 连接测试成功。`, "success"); } catch (error) { setStatus(status, apiErrorMessage(error), "danger"); } finally { test.disabled = false; }
           }, "button subtle");
-          return node("div", { className: "provider-row" }, [node("strong", { text: textValue(provider.name, "未命名服务") }), node("span", { className: "muted small", text: `${textValue(provider.model, "未设置模型")} · ${provider.key_configured ? "API Key 已配置" : "未配置 API Key"} · ${providerTrustLabel(provider)}` }), edit, test]);
+          const capabilityMap = field(provider, ["model_capabilities", "modelCapabilities"]);
+          const capabilityCount = capabilityMap && typeof capabilityMap === "object" && !Array.isArray(capabilityMap) ? Object.keys(capabilityMap).length : 0;
+          return node("div", { className: "provider-row" }, [node("strong", { text: textValue(provider.name, "未命名服务") }), node("span", { className: "muted small", text: `${textValue(provider.model, "未设置模型")} · ${provider.key_configured ? "API Key 已配置" : "未配置 API Key"} · ${capabilityCount ? `已配置 ${capabilityCount} 个模型能力` : "模型能力待核实"} · ${providerTrustLabel(provider)}` }), edit, test]);
         }) : [emptyState("尚未配置模型服务。")]);
         if (selectId) {
           const found = providers.find((provider) => textValue(provider.id) === selectId);
@@ -3690,12 +5311,32 @@ export class WebApp {
     const create = formButton("创建客户端", "button secondary");
     const status = statusBox();
     form.append(name, group, create);
-    target.append(list, form, status);
-    try {
-      const groups = await this.api.request("/groups");
-      this.state.groups = parseJsonList(groups?.groups);
+    const loadMoreGroups = button("加载更多分组", async () => {
+      loadMoreGroups.disabled = true;
+      try {
+        await loadGroups({ append: true });
+      } catch (error) {
+        setStatus(status, apiErrorMessage(error), "danger");
+      } finally {
+        loadMoreGroups.disabled = false;
+      }
+    }, "button subtle");
+    loadMoreGroups.hidden = true;
+    target.append(list, form, loadMoreGroups, status);
+    const renderGroups = () => {
+      const selectedGroupId = group.value;
       replaceChildren(group);
-      for (const item of this.state.groups) appendOption(group, groupId(item), textValue(field(item, ["name"]), "未命名分组"));
+      for (const item of this.state.groups) appendOption(group, groupId(item), textValue(field(item, ["name"]), "未命名分组"), groupId(item) === selectedGroupId);
+      if (selectedGroupId && [...group.options].some((option) => option.value === selectedGroupId)) group.value = selectedGroupId;
+      loadMoreGroups.hidden = !this.state.groupsPage.nextCursor;
+      if (this.state.groupsPage.corruptCount > 0) setStatus(status, `检测到 ${this.state.groupsPage.corruptCount} 个损坏分组记录，未显示。`, "warning");
+    };
+    const loadGroups = async ({ append = false } = {}) => {
+      await this.loadGroupsPage({ append });
+      renderGroups();
+    };
+    try {
+      await loadGroups();
     } catch (error) {
       setStatus(status, apiErrorMessage(error), "danger");
     }

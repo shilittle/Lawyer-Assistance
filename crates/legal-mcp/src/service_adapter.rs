@@ -7,7 +7,8 @@ use rmcp::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     privacy_gate, public_output,
@@ -15,6 +16,109 @@ use crate::{
 };
 
 const MAX_TOOL_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Transport teardown may drop the call future before its cancellation branch
+/// is polled. The database worker still owns its admission until it exits.
+struct CancelSqliteOnDrop(legal_services::SearchCancellation);
+impl Drop for CancelSqliteOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// A host-supplied admission boundary for public legal queries.  The trait is
+/// intentionally independent of workspace-service so the standalone MCP
+/// binary keeps a local bounded implementation while an embedded router can
+/// share the workspace's Search budget.
+#[async_trait]
+pub trait PublicQueryAdmission: Send + Sync {
+    async fn acquire(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<dyn Send>, PublicQueryAdmissionError>;
+}
+
+/// Only stable, non-diagnostic codes cross the adapter boundary.  They are
+/// later rendered through the existing public error envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicQueryAdmissionError {
+    code: String,
+    retryable: bool,
+}
+
+impl PublicQueryAdmissionError {
+    pub fn new(code: impl AsRef<str>, retryable: bool) -> Self {
+        let code = match code.as_ref() {
+            "capacity_exceeded" | "cancelled" | "workspace_unavailable" => code.as_ref(),
+            _ => "query_admission_failed",
+        };
+        Self {
+            code: code.to_owned(),
+            retryable,
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+/// Default standalone admission: at most two active public queries and at
+/// most sixteen waiting callers.  The owned permit is moved into the blocking
+/// worker and therefore lasts until the synchronous SQLite call actually
+/// returns, even when the HTTP caller has timed out or disconnected.
+#[derive(Debug)]
+pub struct BoundedPublicQueryAdmission {
+    active: Arc<Semaphore>,
+    waiting: Arc<Semaphore>,
+}
+
+impl Default for BoundedPublicQueryAdmission {
+    fn default() -> Self {
+        Self::new(2, 16)
+    }
+}
+
+impl BoundedPublicQueryAdmission {
+    pub fn new(active: usize, waiting: usize) -> Self {
+        Self {
+            active: Arc::new(Semaphore::new(active)),
+            waiting: Arc::new(Semaphore::new(waiting)),
+        }
+    }
+}
+
+#[async_trait]
+impl PublicQueryAdmission for BoundedPublicQueryAdmission {
+    async fn acquire(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<dyn Send>, PublicQueryAdmissionError> {
+        if cancellation.is_cancelled() {
+            return Err(PublicQueryAdmissionError::new("cancelled", false));
+        }
+        if let Ok(active) = Arc::clone(&self.active).try_acquire_owned() {
+            return Ok(Box::new(active));
+        }
+        let waiting = Arc::clone(&self.waiting)
+            .try_acquire_owned()
+            .map_err(|_| PublicQueryAdmissionError::new("capacity_exceeded", true))?;
+        let active = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(PublicQueryAdmissionError::new("cancelled", false)),
+            acquired = Arc::clone(&self.active).acquire_owned() => acquired.map_err(|_| PublicQueryAdmissionError::new("workspace_unavailable", true))?,
+        };
+        drop(waiting);
+        if cancellation.is_cancelled() {
+            return Err(PublicQueryAdmissionError::new("cancelled", false));
+        }
+        Ok(Box::new(active))
+    }
+}
 
 /// The only private-workspace boundary exposed to MCP. Implementations receive
 /// no LegalServices handle and therefore cannot open the application's private
@@ -176,6 +280,7 @@ impl Drop for InFlightGuard {
 pub struct ServiceAdapter {
     services: Arc<LegalServices>,
     profile: PrivacyProfile,
+    public_query_admission: Arc<dyn PublicQueryAdmission>,
     static_privacy_backend: Option<Arc<dyn PrivacyWorkspaceBackend>>,
     request_backend_factory: Option<Arc<dyn PrivacyWorkspaceBackendFactory>>,
     in_flight: InFlightOperations,
@@ -186,6 +291,7 @@ impl std::fmt::Debug for ServiceAdapter {
         formatter
             .debug_struct("ServiceAdapter")
             .field("profile", &self.profile)
+            .field("public_query_admission", &"configured")
             .field(
                 "static_privacy_backend",
                 &self.static_privacy_backend.is_some(),
@@ -207,6 +313,7 @@ impl ServiceAdapter {
         Self {
             services: Arc::new(services),
             profile,
+            public_query_admission: Arc::new(BoundedPublicQueryAdmission::default()),
             static_privacy_backend: None,
             request_backend_factory: None,
             in_flight: InFlightOperations::default(),
@@ -220,6 +327,7 @@ impl ServiceAdapter {
         Self {
             services: Arc::new(services),
             profile: PrivacyProfile::PrivacyWorkspace,
+            public_query_admission: Arc::new(BoundedPublicQueryAdmission::default()),
             static_privacy_backend: Some(backend),
             request_backend_factory: None,
             in_flight: InFlightOperations::default(),
@@ -233,10 +341,18 @@ impl ServiceAdapter {
         Self {
             services: Arc::new(services),
             profile: PrivacyProfile::PrivacyWorkspace,
+            public_query_admission: Arc::new(BoundedPublicQueryAdmission::default()),
             static_privacy_backend: None,
             request_backend_factory: Some(backend_factory),
             in_flight: InFlightOperations::default(),
         }
+    }
+
+    /// Use the embedding host's public-query budget.  The adapter never
+    /// receives a workspace handle, preserving the one-way MCP boundary.
+    pub fn with_public_query_admission(mut self, admission: Arc<dyn PublicQueryAdmission>) -> Self {
+        self.public_query_admission = admission;
+        self
     }
 
     pub(crate) fn in_flight_operations(&self) -> InFlightOperations {
@@ -248,7 +364,8 @@ impl ServiceAdapter {
         tool_name: &str,
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.call_with_request_id(tool_name, arguments, None).await
+        self.call_with_request_id(tool_name, arguments, None, CancellationToken::new())
+            .await
     }
 
     pub(crate) async fn call_with_request_id(
@@ -256,6 +373,7 @@ impl ServiceAdapter {
         tool_name: &str,
         arguments: Option<JsonObject>,
         authorization: Option<&str>,
+        cancellation: CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         if !self.profile.allows_tool(tool_name) {
             return Err(ErrorData::new(
@@ -266,41 +384,61 @@ impl ServiceAdapter {
         }
         let arguments = arguments.unwrap_or_default();
         match tool_name {
-            "system_status" => self.system_status(arguments).await,
-            "legal_search" => {
-                self.invoke("legal_search", arguments, |services, request| {
-                    services.legal_search(request)
-                })
-                .await
-            }
+            "system_status" => self.system_status(arguments, cancellation).await,
+            "legal_search" => self.invoke_legal_search(arguments, cancellation).await,
             "legal_get_article" => {
-                self.invoke("legal_get_article", arguments, |services, request| {
-                    services.legal_get_article(request)
-                })
+                self.invoke(
+                    "legal_get_article",
+                    arguments,
+                    cancellation,
+                    |services, request, cancel| {
+                        services.legal_get_article_cancellable(request, cancel)
+                    },
+                )
                 .await
             }
             "legal_get_versions" => {
-                self.invoke("legal_get_versions", arguments, |services, request| {
-                    services.legal_get_versions(request)
-                })
+                self.invoke(
+                    "legal_get_versions",
+                    arguments,
+                    cancellation,
+                    |services, request, cancel| {
+                        services.legal_get_versions_cancellable(request, cancel)
+                    },
+                )
                 .await
             }
             "legal_get_relations" => {
-                self.invoke("legal_get_relations", arguments, |services, request| {
-                    services.legal_get_relations(request)
-                })
+                self.invoke(
+                    "legal_get_relations",
+                    arguments,
+                    cancellation,
+                    |services, request, cancel| {
+                        services.legal_get_relations_cancellable(request, cancel)
+                    },
+                )
                 .await
             }
             "legal_search_cases" => {
-                self.invoke("legal_search_cases", arguments, |services, request| {
-                    services.judicial_case_search(request)
-                })
+                self.invoke(
+                    "legal_search_cases",
+                    arguments,
+                    cancellation,
+                    |services, request, cancel| {
+                        services.judicial_case_search_cancellable(request, cancel)
+                    },
+                )
                 .await
             }
             "legal_get_case" => {
-                self.invoke("legal_get_case", arguments, |services, request| {
-                    services.judicial_case_get(request)
-                })
+                self.invoke(
+                    "legal_get_case",
+                    arguments,
+                    cancellation,
+                    |services, request, cancel| {
+                        services.judicial_case_get_cancellable(request, cancel)
+                    },
+                )
                 .await
             }
             name if PRIVACY_WORKSPACE_TOOL_NAMES.contains(&name) => {
@@ -314,28 +452,79 @@ impl ServiceAdapter {
         }
     }
 
-    async fn system_status(&self, arguments: JsonObject) -> Result<CallToolResult, ErrorData> {
-        let input: StatusInput = match decode(arguments) {
-            Ok(input) => input,
-            Err(error) => return Ok(public_error("system_status", error)),
+    async fn system_status(
+        &self,
+        arguments: JsonObject,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.invoke(
+            "system_status",
+            arguments,
+            cancellation,
+            |services, input: StatusInput, cancel| {
+                if input.schema_version != SERVICE_SCHEMA_VERSION {
+                    return Err(ServiceError::new(
+                        "unsupported_schema_version",
+                        "unsupported schema",
+                        false,
+                    ));
+                }
+                services.system_status_cancellable(cancel)
+            },
+        )
+        .await
+    }
+
+    /// `legal_search` has a cancellable SQLite implementation.  Keep the
+    /// caller token and the SQLite interrupt token separate: a request may
+    /// cancel its subscription without the worker releasing its admission
+    /// permit before the database returns.
+    async fn invoke_legal_search(
+        &self,
+        arguments: JsonObject,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResult, ErrorData> {
+        let request: legal_services::LegalSearchRequest = match decode(arguments) {
+            Ok(request) => request,
+            Err(error) => return Ok(public_error("legal_search", error)),
         };
-        if input.schema_version != SERVICE_SCHEMA_VERSION {
-            return Ok(public_error(
-                "system_status",
-                ServiceError::new("unsupported_schema_version", "unsupported schema", false),
-            ));
-        }
+        let permit = match self.public_query_admission.acquire(&cancellation).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Ok(public_error(
+                    "legal_search",
+                    ServiceError::new(
+                        error.code(),
+                        "public query admission rejected the request",
+                        error.retryable(),
+                    ),
+                ));
+            }
+        };
         let services = Arc::clone(&self.services);
         let operation = self.begin_blocking_operation()?;
-        let result = tokio::task::spawn_blocking(move || {
+        let sqlite_cancellation = legal_services::SearchCancellation::new();
+        let _cancel_on_drop = CancelSqliteOnDrop(sqlite_cancellation.clone());
+        let worker_cancellation = sqlite_cancellation.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let _operation = operation;
-            services.system_status()
-        })
-        .await
-        .map_err(|_| internal_error())?;
+            services.legal_search_cancellable(request, &worker_cancellation)
+        });
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                sqlite_cancellation.cancel();
+                return Ok(public_error(
+                    "legal_search",
+                    ServiceError::new("cancelled", "public query cancelled", false),
+                ));
+            }
+            result = task => result.map_err(|_| internal_error())?,
+        };
         match result {
-            Ok(response) => public_success("system_status", response),
-            Err(error) => Ok(public_error("system_status", error)),
+            Ok(response) => public_success("legal_search", response),
+            Err(error) => Ok(public_error("legal_search", error)),
         }
     }
 
@@ -343,25 +532,61 @@ impl ServiceAdapter {
         &self,
         tool_name: &str,
         arguments: JsonObject,
+        cancellation: CancellationToken,
         invoke: Invoke,
     ) -> Result<CallToolResult, ErrorData>
     where
         Request: DeserializeOwned + Send + 'static,
         Response: Serialize + Send + 'static,
-        Invoke: FnOnce(&LegalServices, Request) -> Result<Response, ServiceError> + Send + 'static,
+        Invoke: FnOnce(
+                &LegalServices,
+                Request,
+                &legal_services::SearchCancellation,
+            ) -> Result<Response, ServiceError>
+            + Send
+            + 'static,
     {
         let request: Request = match decode(arguments) {
             Ok(request) => request,
             Err(error) => return Ok(public_error(tool_name, error)),
         };
+        let permit = match self.public_query_admission.acquire(&cancellation).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Ok(public_error(
+                    tool_name,
+                    ServiceError::new(
+                        error.code(),
+                        "public query admission rejected the request",
+                        error.retryable(),
+                    ),
+                ));
+            }
+        };
         let services = Arc::clone(&self.services);
         let operation = self.begin_blocking_operation()?;
-        let result = tokio::task::spawn_blocking(move || {
+        let sqlite_cancellation = legal_services::SearchCancellation::new();
+        let _cancel_on_drop = CancelSqliteOnDrop(sqlite_cancellation.clone());
+        let worker_cancellation = sqlite_cancellation.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            // Both permits live in the worker, not the HTTP future.  A client
+            // cancellation can return a public cancellation response while
+            // the resource remains accounted for until SQLite actually exits.
+            let _permit = permit;
             let _operation = operation;
-            invoke(&services, request)
-        })
-        .await
-        .map_err(|_| internal_error())?;
+            invoke(&services, request, &worker_cancellation)
+        });
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                sqlite_cancellation.cancel();
+                return Ok(public_error(
+                    tool_name,
+                    ServiceError::new("cancelled", "public query cancelled", false),
+                ));
+            },
+            result = task => result.map_err(|_| internal_error())?,
+        };
         match result {
             Ok(response) => public_success(tool_name, response),
             Err(error) => Ok(public_error(tool_name, error)),
@@ -720,6 +945,53 @@ mod tests {
     use legal_services::LegalServices;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn bounded_public_query_admission_rejects_overflow_and_releases_cancelled_waiters() {
+        let admission = Arc::new(BoundedPublicQueryAdmission::new(1, 1));
+        let active_cancel = CancellationToken::new();
+        let active = admission
+            .acquire(&active_cancel)
+            .await
+            .expect("first public query is active");
+
+        let waiting_cancel = CancellationToken::new();
+        let waiting_admission = Arc::clone(&admission);
+        let waiting_token = waiting_cancel.clone();
+        let waiting =
+            tokio::spawn(
+                async move { waiting_admission.acquire(&waiting_token).await.map(|_| ()) },
+            );
+        tokio::task::yield_now().await;
+        let overflow = match admission.acquire(&active_cancel).await {
+            Ok(_) => panic!("second waiting public query is rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(overflow.code(), "capacity_exceeded");
+
+        waiting_cancel.cancel();
+        assert_eq!(
+            match waiting.await.expect("waiting admission task joins") {
+                Ok(_) => panic!("cancelled request does not remain queued"),
+                Err(error) => error.code().to_owned(),
+            },
+            "cancelled"
+        );
+
+        let replacement_cancel = CancellationToken::new();
+        let replacement_admission = Arc::clone(&admission);
+        let replacement_token = replacement_cancel.clone();
+        let replacement =
+            tokio::spawn(async move { replacement_admission.acquire(&replacement_token).await });
+        tokio::task::yield_now().await;
+        drop(active);
+        drop(
+            replacement
+                .await
+                .expect("replacement joins")
+                .expect("cancelled queue place was released"),
+        );
+    }
 
     #[derive(Debug)]
     struct MockPrivacyBackend;

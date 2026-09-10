@@ -13,6 +13,7 @@ use rmcp::{
     service::RequestContext,
     ErrorData, RoleServer, ServerHandler,
 };
+use tokio_util::sync::CancellationToken;
 
 pub const STABLE_PROTOCOL_VERSION: &str = "2025-11-25";
 
@@ -126,8 +127,14 @@ impl ServerHandler for LegalMcpServer {
             .get::<Parts>()
             .and_then(|parts| parts.headers.get(AUTHORIZATION))
             .and_then(|value| value.to_str().ok());
+        let cancellation = context
+            .extensions
+            .get::<Parts>()
+            .and_then(|parts| parts.extensions.get::<CancellationToken>())
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
         self.adapter
-            .call_with_request_id(&name, request.arguments, authorization)
+            .call_with_request_id(&name, request.arguments, authorization, cancellation)
             .await
     }
 }

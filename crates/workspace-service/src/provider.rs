@@ -175,6 +175,10 @@ impl Workspace {
         if request.result_ids.len() > 20 || request.article_ids.len() > 20 {
             return Err(Error::new("context_too_large"));
         }
+        // Reserve before resolving a conversation, provider credential, or
+        // selected result context.  A queued legacy chat holds one of the six
+        // bounded wait places and only opens its context after activation.
+        let admission = self.admission.reserve(AdmissionClass::Ai)?;
         let gate = self.lock()?;
         let conversation = self.conversation(&request.conversation_id)?;
         let config: ProviderConfig = self.store.get("provider", &request.provider_id)?;
@@ -191,19 +195,57 @@ impl Workspace {
         drop(active);
         let (tx, rx) = mpsc::channel(64);
         let workspace = Arc::clone(self);
+        let operation_id = format!("legacy_chat_{}", request.conversation_id);
+        let failure_workspace = Arc::clone(self);
+        let failure_chat_id = request.conversation_id.clone();
+        let failure_tx = tx.clone();
+        let supervisor = self.supervisor.clone();
         drop(gate);
-        tokio::spawn(async move {
-            let chat_id = request.conversation_id.clone();
-            let result = workspace
-                .run_chat(request, conversation, config, cancel, tx.clone())
+        supervisor.spawn(
+            "ai_run",
+            operation_id.clone(),
+            async move {
+                let chat_id = request.conversation_id.clone();
+                let result = async {
+                    let _permit = admission.activate(&cancel).await?;
+                    workspace
+                        .run_chat(request, conversation, config, cancel.clone(), tx.clone())
+                        .await
+                }
                 .await;
-            if let Err(e) = result {
-                let _ = tx.send(json!({"type":"error","code":e.code})).await;
-            }
-            if let Ok(mut active) = workspace.chat_cancellations.lock() {
-                active.remove(&chat_id);
-            }
-        });
+                if let Err(e) = result {
+                    if e.code == "cancelled" || e.code == "client_disconnected" {
+                        workspace.supervisor.operation_failed(
+                            "ai_run",
+                            &operation_id,
+                            "legacy_chat_cancelled",
+                            &e,
+                        );
+                    } else {
+                        workspace.supervisor.failed(
+                            "ai_run",
+                            &operation_id,
+                            "legacy_chat_failed",
+                            &e,
+                        );
+                    }
+                    let _ = tx.send(json!({"type":"error","code":e.code})).await;
+                }
+                if let Ok(mut active) = workspace.chat_cancellations.lock() {
+                    active.remove(&chat_id);
+                }
+            },
+            move |error| {
+                // A panic has no durable legacy-chat row.  Send only a
+                // stable code to the receiver and remove its cancellation
+                // registration so a stale handle cannot remain active.
+                let _ = failure_tx.try_send(json!({"type":"error","code":error.code}));
+                if let Ok(mut active) = failure_workspace.chat_cancellations.lock() {
+                    active.remove(&failure_chat_id);
+                }
+                Ok(())
+            },
+        );
         Ok(rx)
     }
     async fn run_chat(
@@ -343,7 +385,7 @@ impl Workspace {
                         }
                     }
                     StreamEvent::Error { .. } => {
-                        return Err(Error::new("provider_response_invalid"))
+                        return Err(Error::new("provider_response_invalid"));
                     }
                     StreamEvent::Done => done = true,
                     _ => {}
@@ -395,5 +437,44 @@ impl Workspace {
             .await
             .map_err(|_| Error::new("client_disconnected"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod legacy_chat_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_chat_rejects_before_conversation_or_provider_lookup_when_ai_queue_is_full() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = Workspace::open(
+            temporary.path().join("workspace"),
+            temporary.path().join("missing-legal.sqlite"),
+        )
+        .expect("workspace opens");
+        let mut reservations = Vec::new();
+        for _ in 0..8 {
+            reservations.push(
+                workspace
+                    .admission
+                    .reserve(AdmissionClass::Ai)
+                    .expect("two active plus six waiting reservations fill"),
+            );
+        }
+
+        // Neither identifier exists.  The capacity error proves start_chat
+        // does not open a conversation/provider row while the AI queue is
+        // already full.
+        let error = workspace
+            .start_chat(ChatRequest {
+                conversation_id: "missing-conversation".into(),
+                provider_id: "missing-provider".into(),
+                message: "synthetic bounded chat".into(),
+                result_ids: Vec::new(),
+                article_ids: Vec::new(),
+            })
+            .expect_err("ninth legacy chat is rejected before context work");
+        assert_eq!(error.code, "capacity_exceeded");
+        drop(reservations);
     }
 }

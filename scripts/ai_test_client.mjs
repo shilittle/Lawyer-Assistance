@@ -25,8 +25,11 @@ export class Client {
 export async function startServer(dataDir,executable=path.join(root,'target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe'),legalDb=path.join(root,'data/runtime/legal_core.sqlite'),options={}) {
   if(!options.portable){const info=fs.statSync(executable);const copied=path.join(root,'output/ai-test-bin',`${info.size}-${Math.trunc(info.mtimeMs)}-${process.pid}`,'lawyer-assistance.exe');fs.mkdirSync(path.dirname(copied),{recursive:true});if(!fs.existsSync(copied))fs.copyFileSync(executable,copied);executable=copied;}
   fs.mkdirSync(dataDir,{recursive:true});const log=fs.openSync(path.join(dataDir,'server-test.log'),'a');
-  const env={...process.env};if(options.portable)delete env.LAWYER_RUNTIME_TOOLS;else env.LAWYER_RUNTIME_TOOLS=path.join(root,'output/runtime-tools');
-  const server=spawn(executable,['serve','--port','0','--data-dir',dataDir,'--legal-db',legalDb],{windowsHide:true,stdio:['ignore',log,log],env,cwd:options.portable?path.dirname(executable):root});
+  const env={...process.env};if(options.portable){delete env.LAWYER_RUNTIME_TOOLS;delete env.LAWYER_ASSISTANCE_PDFIUM;}else env.LAWYER_RUNTIME_TOOLS=path.join(root,'output/runtime-tools');
+  if(options.discoverLegalDb)delete env.LEGAL_DB;
+  const args=['serve','--port','0','--data-dir',dataDir];
+  if(!options.discoverLegalDb)args.push('--legal-db',legalDb);
+  const server=spawn(executable,args,{windowsHide:true,stdio:['ignore',log,log],env,cwd:options.portable?path.dirname(executable):root});
   let descriptor;for(let i=0;i<100;i++){if(server.exitCode!==null)throw new Error('server_exited');try{descriptor=connection(dataDir);if(descriptor.pid===server.pid)break;}catch{}await sleep(200);}
   check(descriptor?.pid===server.pid,'server_start_timeout');const client=new Client(descriptor.origin);await client.login(descriptor.bootstrap);
   return {client,server,stop:async()=>{server.kill();await new Promise(r=>server.exitCode===null?server.once('exit',r):r());fs.closeSync(log);}};

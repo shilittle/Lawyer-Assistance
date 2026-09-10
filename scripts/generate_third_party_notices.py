@@ -506,6 +506,7 @@ def complete_missing_license_texts(components: list[Component]) -> list[Componen
             "Apache-2.0 OR MIT",
             "MIT OR Apache-2.0",
             "MIT/Apache-2.0",
+            "MIT OR Apache-2.0 OR Zlib",
         }:
             # Some crates (including rmcp-macros and sse-stream) declare an
             # Apache-2.0 option in their published manifest but omit the

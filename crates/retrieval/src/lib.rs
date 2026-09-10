@@ -16,9 +16,11 @@ use rusqlite::{named_params, types::Value, OptionalExtension, ToSql};
 mod paged;
 
 pub use paged::{
-    search_page, version_articles, LawSearchGroup, PagedSearchRequest, PagedSearchResponse,
-    SearchIndex, SearchSort, SearchView, VersionArticlesRequest, VersionArticlesResponse,
-    DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, SEARCH_INDEX_FILE_NAME,
+    search_page, search_page_cancellable, version_articles, version_is_visible,
+    CancellationRegistration, LawNameAmbiguity, LawSearchGroup, PagedSearchRequest,
+    PagedSearchResponse, SearchAppliedQuery, SearchCancellation, SearchIndex, SearchMatchMode,
+    SearchMetrics, SearchSort, SearchView, VersionArticlesRequest, VersionArticlesResponse,
+    VersionScope, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, SEARCH_INDEX_FILE_NAME,
 };
 
 const DEFAULT_SEARCH_LIMIT: u32 = 20;
@@ -48,6 +50,7 @@ struct StructuredArticleQuery {
 #[derive(Debug)]
 pub enum RetrievalError {
     InvalidRequest(String),
+    Cancelled,
     Sqlite(rusqlite::Error),
 }
 
@@ -57,6 +60,7 @@ impl Display for RetrievalError {
             Self::InvalidRequest(message) => {
                 write!(formatter, "invalid retrieval request: {message}")
             }
+            Self::Cancelled => write!(formatter, "retrieval request was cancelled"),
             Self::Sqlite(error) => write!(formatter, "sqlite retrieval error: {error}"),
         }
     }
@@ -65,7 +69,7 @@ impl Display for RetrievalError {
 impl Error for RetrievalError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidRequest(_) => None,
+            Self::InvalidRequest(_) | Self::Cancelled => None,
             Self::Sqlite(error) => Some(error),
         }
     }
@@ -315,7 +319,9 @@ pub fn search_articles(
     let fts_results = match search_articles_fts(connection, &effective_request, &query, fts_limit) {
         Ok(results) => results,
         Err(RetrievalError::Sqlite(_)) => Vec::new(),
-        Err(error @ RetrievalError::InvalidRequest(_)) => return Err(error),
+        Err(error @ (RetrievalError::InvalidRequest(_) | RetrievalError::Cancelled)) => {
+            return Err(error)
+        }
     };
     let expand_like =
         should_expand_bounded_like(&search_terms, may_expand_like, fts_results.len(), limit);

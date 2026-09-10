@@ -8,6 +8,7 @@ version.workspace = true
 database.workspace = true
 domain.workspace = true
 rusqlite.workspace = true
+unicode-normalization = "0.1.25"
 
 [dev-dependencies]
 serde.workspace = true

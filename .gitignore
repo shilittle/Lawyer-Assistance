@@ -8,6 +8,7 @@
 /.tmp-test-runtime/
 /tmp/
 /output/
+/work/
 
 *.patch
 *.patch.stderr

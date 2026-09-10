@@ -10,6 +10,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/ai/providers/models", post(models))
         .route("/api/v1/ai/providers/test", post(test_model))
         .route("/api/v1/ai/defaults", put(defaults))
+        .route("/api/v1/ai/context/estimate", post(estimate_context))
         .route("/api/v1/ai/materials", get(materials))
         .route(
             "/api/v1/ai/attachments",
@@ -20,7 +21,15 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/ai/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/ai/runs/{id}/continue", post(continue_run))
         .route("/api/v1/ai/runs/{id}/content", put(edit_document))
+        .route(
+            "/api/v1/ai/runs/{id}/citations/recheck",
+            post(recheck_citations),
+        )
         .route("/api/v1/ai/runs/{id}/export", get(export_document))
+        .route(
+            "/api/v1/ai/drafts/{id}",
+            get(draft).put(save_draft).delete(delete_draft),
+        )
         .route(
             "/api/v1/ai/conversations",
             get(conversations).post(create_conversation),
@@ -28,6 +37,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/ai/conversations/{id}",
             get(conversation).merge(patch(rename_conversation)),
+        )
+        .route(
+            "/api/v1/ai/conversations/{id}/context",
+            put(replace_conversation_context),
+        )
+        .route(
+            "/api/v1/ai/conversations/{id}/context/prepare",
+            post(prepare_conversation_context),
         )
         .route("/api/v1/legal/search/page", get(search_page))
         .route("/api/v1/legal/filters", get(search_filters))
@@ -43,9 +60,19 @@ async fn save_provider(State(s): State<AppState>, Input(r): Input<AiProviderRequ
     val(s.workspace.save_ai_provider(r)?)
 }
 async fn models(State(s): State<AppState>, Input(r): Input<AiProviderRequest>) -> ApiResult {
+    let cancel = CancellationToken::new();
+    let _permit = s
+        .workspace
+        .acquire_admission(workspace_service::AdmissionClass::Ai, &cancel)
+        .await?;
     val(s.workspace.discover_ai_models(r).await?)
 }
 async fn test_model(State(s): State<AppState>, Input(r): Input<AiModelSelection>) -> ApiResult {
+    let cancel = CancellationToken::new();
+    let _permit = s
+        .workspace
+        .acquire_admission(workspace_service::AdmissionClass::Ai, &cancel)
+        .await?;
     val(s.workspace.test_ai_model(r).await?)
 }
 async fn defaults(
@@ -54,8 +81,15 @@ async fn defaults(
 ) -> ApiResult {
     val(s.workspace.save_ai_defaults(r)?)
 }
-async fn materials(State(s): State<AppState>) -> ApiResult {
-    val(s.workspace.ai_materials()?)
+async fn estimate_context(State(s): State<AppState>, Input(r): Input<AiRunRequest>) -> ApiResult {
+    val(s.workspace.estimate_ai_context(&r)?)
+}
+async fn materials(
+    State(s): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let (limit, cursor) = list_page(&q)?;
+    val(s.workspace.ai_materials_page(cursor, limit)?)
 }
 async fn attachment(State(s): State<AppState>, mut multipart: Multipart) -> ApiResult {
     let mut file = None;
@@ -80,7 +114,10 @@ async fn attachment(State(s): State<AppState>, mut multipart: Multipart) -> ApiR
     val(s.workspace.save_ai_attachment(name, bytes)?)
 }
 async fn runs(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
-    val(s.workspace.ai_runs(q.get("kind").map(String::as_str))?)
+    let (limit, cursor) = list_page(&q)?;
+    val(s
+        .workspace
+        .ai_runs_page(q.get("kind").map(String::as_str), cursor, limit)?)
 }
 async fn start_run(State(s): State<AppState>, Input(r): Input<AiRunRequest>) -> ApiResult {
     val(s.workspace.start_ai_run(r)?)
@@ -97,17 +134,41 @@ async fn cancel_run(State(s): State<AppState>, Path(id): Path<String>) -> ApiRes
 async fn continue_run(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
     val(s.workspace.continue_ai_run(&id)?)
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ContentEdit {
-    content: String,
+fn versioned<T: DeserializeOwned>(value: Value) -> workspace_service::Result<T> {
+    if value
+        .get("expected_revision")
+        .and_then(Value::as_u64)
+        .is_none()
+    {
+        return Err(Error::new("revision_required"));
+    }
+    serde_json::from_value(value).map_err(|_| Error::new("invalid_request"))
 }
 async fn edit_document(
     State(s): State<AppState>,
     Path(id): Path<String>,
-    Input(r): Input<ContentEdit>,
+    Input(value): Input<Value>,
 ) -> ApiResult {
-    val(s.workspace.edit_ai_document(&id, r.content)?)
+    let request = versioned::<workspace_service::AiDocumentEdit>(value)?;
+    val(s.workspace.edit_ai_document(&id, request)?)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedRevision {
+    expected_revision: u64,
+}
+async fn recheck_citations(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Input(value): Input<Value>,
+) -> ApiResult {
+    let request = versioned::<ExpectedRevision>(value)?;
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    val(s
+        .workspace
+        .recheck_ai_citations(&id, request.expected_revision, &cancel)
+        .await?)
 }
 async fn export_document(
     State(s): State<AppState>,
@@ -115,15 +176,67 @@ async fn export_document(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     let format = q.get("format").cloned().unwrap_or_else(|| "pdf".into());
+    let expected_revision = q
+        .get("expected_revision")
+        .ok_or_else(|| Error::new("revision_required"))?
+        .parse::<u64>()
+        .map_err(|_| Error::new("revision_required"))?;
     let f = format.clone();
     let workspace = s.workspace.clone();
-    let bytes = tokio::task::spawn_blocking(move || workspace.export_ai_document(&id, &f))
-        .await
-        .map_err(|_| Error::new("export_failed"))??;
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let permit = workspace
+        .acquire_admission(workspace_service::AdmissionClass::Parse, &cancel)
+        .await?;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        workspace.export_ai_document_cancellable(&id, expected_revision, &f, &cancel)
+    })
+    .await
+    .map_err(|_| Error::new("export_failed"))??;
     download(bytes, &format, "document")
 }
-async fn conversations(State(s): State<AppState>) -> ApiResult {
-    val(s.workspace.ai_conversations()?)
+
+async fn draft(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    val(s.workspace.ai_draft(&id)?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftEdit {
+    expected_revision: u64,
+    content: Value,
+}
+
+async fn save_draft(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Input(value): Input<Value>,
+) -> ApiResult {
+    let r = versioned::<DraftEdit>(value)?;
+    val(s
+        .workspace
+        .save_ai_draft(&id, r.expected_revision, r.content)?)
+}
+
+async fn delete_draft(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let expected_revision = q
+        .get("expected_revision")
+        .ok_or_else(|| Error::new("revision_required"))?
+        .parse::<u64>()
+        .map_err(|_| Error::new("revision_required"))?;
+    val(s.workspace.delete_ai_draft(&id, expected_revision)?)
+}
+async fn conversations(
+    State(s): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let (limit, cursor) = list_page(&q)?;
+    val(s.workspace.ai_conversations_page(cursor, limit)?)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +258,52 @@ async fn rename_conversation(
         .workspace
         .rename_ai_conversation(&id, r.title.as_deref().unwrap_or_default())?)
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextReplace {
+    expected_revision: u64,
+    #[serde(default)]
+    materials: Vec<workspace_service::AiMaterialReference>,
+    #[serde(default)]
+    attachment_ids: Vec<String>,
+}
+
+async fn replace_conversation_context(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Input(value): Input<Value>,
+) -> ApiResult {
+    let r = versioned::<ContextReplace>(value)?;
+    val(s.workspace.replace_ai_conversation_context(
+        &id,
+        r.expected_revision,
+        r.materials,
+        r.attachment_ids,
+    )?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextPrepare {
+    expected_revision: u64,
+    provider_id: Option<String>,
+    model: Option<String>,
+}
+
+async fn prepare_conversation_context(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Input(value): Input<Value>,
+) -> ApiResult {
+    let r = versioned::<ContextPrepare>(value)?;
+    val(s.workspace.prepare_ai_conversation_context(
+        &id,
+        r.expected_revision,
+        r.provider_id,
+        r.model,
+    )?)
+}
 async fn search_page(
     State(s): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
@@ -159,6 +318,9 @@ async fn search_page(
             "case_date" => "caseDate",
             "document_type" => "documentType",
             "effectiveness_level" => "effectivenessLevel",
+            "match_mode" => "matchMode",
+            "version_scope" => "versionScope",
+            "version_status" => "versionStatus",
             other => other,
         };
         if ["limit", "offset"].contains(&name) {
@@ -171,22 +333,22 @@ async fn search_page(
     }
     let request = serde_json::from_value::<legal_services::LegalPagedSearchRequest>(request)
         .map_err(|_| Error::new("invalid_search_request"))?;
-    let legal = s.workspace.legal().clone();
-    val(
-        tokio::task::spawn_blocking(move || legal.legal_search_page(request))
-            .await
-            .map_err(|_| Error::new("legal_query_failed"))?
-            .map_err(legal_error)?,
-    )
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.legal_search_page_cancellable(request, &cancel)
+    })
+    .await?)
 }
 async fn version_articles(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let request = legal_services::LegalVersionArticlesRequest {
+    let (version_scope, case_date) = legal_read_scope(&q)?;
+    let request = legal_services::LegalVersionArticlesScopedRequest {
         schema_version: 1,
         version_id: id,
+        version_scope,
+        case_date,
         limit: q
             .get("limit")
             .map(|v| v.parse::<u32>())
@@ -198,20 +360,14 @@ async fn version_articles(
             .transpose()
             .map_err(|_| Error::new("invalid_pagination"))?,
     };
-    let legal = s.workspace.legal().clone();
-    val(
-        tokio::task::spawn_blocking(move || legal.legal_version_articles(request))
-            .await
-            .map_err(|_| Error::new("legal_query_failed"))?
-            .map_err(legal_error)?,
-    )
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.legal_version_articles_scoped_cancellable(request, &cancel)
+    })
+    .await?)
 }
 async fn search_filters(State(s): State<AppState>) -> ApiResult {
-    let legal = s.workspace.legal().clone();
-    val(
-        tokio::task::spawn_blocking(move || legal.legal_search_facets())
-            .await
-            .map_err(|_| Error::new("legal_query_failed"))?
-            .map_err(legal_error)?,
-    )
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.legal_search_facets_cancellable(&cancel)
+    })
+    .await?)
 }

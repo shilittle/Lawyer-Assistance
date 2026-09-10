@@ -103,6 +103,11 @@ impl From<retrieval::RetrievalError> for ServiceError {
             retrieval::RetrievalError::InvalidRequest(_) => {
                 Self::new("invalid_request", "legal search request is invalid", false)
             }
+            retrieval::RetrievalError::Cancelled => Self::new(
+                "request_cancelled",
+                "legal search request was cancelled",
+                false,
+            ),
             retrieval::RetrievalError::Sqlite(error) => error.into(),
         }
     }

@@ -1,7 +1,8 @@
 use crate::{
     filesystem::PathIdentityGuard, require_schema_version, validate_identifier, validate_text,
-    LegalServices, ServiceError, SERVICE_SCHEMA_VERSION,
+    LegalServices, SearchCancellation, ServiceError, SERVICE_SCHEMA_VERSION,
 };
+use retrieval::CancellationRegistration;
 use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -146,6 +147,14 @@ impl LegalServices {
         &self,
         request: JudicialCaseSearchRequest,
     ) -> Result<JudicialCaseSearchResponse, ServiceError> {
+        self.judicial_case_search_cancellable(request, &SearchCancellation::new())
+    }
+
+    pub fn judicial_case_search_cancellable(
+        &self,
+        request: JudicialCaseSearchRequest,
+        cancellation: &SearchCancellation,
+    ) -> Result<JudicialCaseSearchResponse, ServiceError> {
         require_schema_version(request.schema_version)?;
         validate_text("query", &request.query, MAX_SEARCH_QUERY_BYTES, false)?;
         let case_type = validate_case_type(request.case_type.as_deref())?;
@@ -163,8 +172,11 @@ impl LegalServices {
                 "offset must not exceed 10000",
             ));
         }
-        let (connection, identity) =
-            open_validated_judicial_cases_database(self.legal_core_path())?;
+        let (connection, identity, _registration) =
+            open_validated_judicial_cases_database_cancellable(
+                self.legal_core_path(),
+                cancellation,
+            )?;
         let normalized = normalize_query(&request.query);
         let exact_guiding_number = guiding_number_from_query(&normalized);
         let terms = search_terms(&normalized);
@@ -224,10 +236,21 @@ impl LegalServices {
         &self,
         request: JudicialCaseGetRequest,
     ) -> Result<JudicialCaseGetResponse, ServiceError> {
+        self.judicial_case_get_cancellable(request, &SearchCancellation::new())
+    }
+
+    pub fn judicial_case_get_cancellable(
+        &self,
+        request: JudicialCaseGetRequest,
+        cancellation: &SearchCancellation,
+    ) -> Result<JudicialCaseGetResponse, ServiceError> {
         require_schema_version(request.schema_version)?;
         validate_identifier("caseId", &request.case_id)?;
-        let (connection, identity) =
-            open_validated_judicial_cases_database(self.legal_core_path())?;
+        let (connection, identity, _registration) =
+            open_validated_judicial_cases_database_cancellable(
+                self.legal_core_path(),
+                cancellation,
+            )?;
         let row = connection
             .query_row(
                 "SELECT case_id, title, case_type, guiding_number, reference_number, keywords_json, \
@@ -250,8 +273,18 @@ impl LegalServices {
     }
 
     pub fn judicial_case_status(&self) -> Result<JudicialCaseStatusResponse, ServiceError> {
-        match open_validated_judicial_cases_database(self.legal_core_path()) {
-            Ok((connection, identity)) => {
+        self.judicial_case_status_cancellable(&SearchCancellation::new())
+    }
+
+    pub fn judicial_case_status_cancellable(
+        &self,
+        cancellation: &SearchCancellation,
+    ) -> Result<JudicialCaseStatusResponse, ServiceError> {
+        match open_validated_judicial_cases_database_cancellable(
+            self.legal_core_path(),
+            cancellation,
+        ) {
+            Ok((connection, identity, _registration)) => {
                 let (total, guiding_count, reference_count, typical_count, last_fetched_at) =
                     connection.query_row(
                         "SELECT COUNT(*), \
@@ -313,19 +346,31 @@ fn judicial_case_database_path(legal_core_path: &Path) -> Result<PathBuf, Servic
         })
 }
 
-fn open_validated_judicial_cases_database(
+fn open_validated_judicial_cases_database_cancellable(
     legal_core_path: &Path,
-) -> Result<(Connection, JudicialCaseDatabaseIdentity), ServiceError> {
+    cancellation: &SearchCancellation,
+) -> Result<
+    (
+        Connection,
+        JudicialCaseDatabaseIdentity,
+        CancellationRegistration,
+    ),
+    ServiceError,
+> {
+    if cancellation.is_cancelled() {
+        return Err(retrieval::RetrievalError::Cancelled.into());
+    }
     let path = judicial_case_database_path(legal_core_path)?;
     require_regular_judicial_database_file(&path)?;
     let guard = PathIdentityGuard::regular_file(&path, true)?;
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.pragma_update(None, "query_only", "ON")?;
     connection.pragma_update(None, "trusted_schema", "OFF")?;
+    let registration = cancellation.register_connection(&connection)?;
     guard.verify()?;
     let identity = inspect_judicial_cases_database(&connection)?;
     guard.verify()?;
-    Ok((connection, identity))
+    Ok((connection, identity, registration))
 }
 
 fn require_regular_judicial_database_file(path: &Path) -> Result<(), ServiceError> {
@@ -963,6 +1008,51 @@ mod tests {
         assert!(!absent.available);
         assert_eq!(absent.total, 0);
         assert_eq!(absent.warnings, ["judicial_case_database_missing"]);
+    }
+
+    #[test]
+    fn cancelled_case_reads_fail_before_any_sidecar_sql() {
+        let (_directory, services) = fixture();
+        let cancellation = SearchCancellation::new();
+        cancellation.cancel();
+        let assert_cancelled = |result: Result<(), ServiceError>| {
+            assert!(matches!(
+                result,
+                Err(ServiceError { ref code, .. }) if code == "request_cancelled"
+            ));
+        };
+
+        assert_cancelled(
+            services
+                .judicial_case_search_cancellable(
+                    JudicialCaseSearchRequest {
+                        schema_version: 1,
+                        query: "劳动关系".into(),
+                        case_type: None,
+                        limit: None,
+                        offset: None,
+                        include_withdrawn: None,
+                    },
+                    &cancellation,
+                )
+                .map(|_| ()),
+        );
+        assert_cancelled(
+            services
+                .judicial_case_get_cancellable(
+                    JudicialCaseGetRequest {
+                        schema_version: 1,
+                        case_id: "spc-guiding-1".into(),
+                    },
+                    &cancellation,
+                )
+                .map(|_| ()),
+        );
+        assert_cancelled(
+            services
+                .judicial_case_status_cancellable(&cancellation)
+                .map(|_| ()),
+        );
     }
 
     #[test]

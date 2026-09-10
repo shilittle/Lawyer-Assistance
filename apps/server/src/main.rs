@@ -27,6 +27,8 @@ enum Command {
     Serve,
     Login,
     Stop,
+    #[command(name = "document-worker", hide = true)]
+    DocumentWorker,
 }
 #[derive(Serialize, Deserialize)]
 struct Connection {
@@ -37,10 +39,32 @@ struct Connection {
 
 #[tokio::main]
 async fn main() {
+    // Panic payloads may contain formatted user input or provider bodies. Keep
+    // stderr useful for native diagnostics without emitting that payload.
+    std::panic::set_hook(Box::new(|info| {
+        if let Some(location) = info.location() {
+            let file = location
+                .file()
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("unknown");
+            eprintln!(
+                "task_panicked module={file} line={} column={}",
+                location.line(),
+                location.column()
+            );
+        } else {
+            eprintln!("task_panicked");
+        }
+    }));
     let cli = Cli::parse();
     // The portable VBS launcher intentionally hides the console.  Keep its
     // error path visible without changing the normal CLI behavior.
-    let should_show_launch_error = cli.open && !matches!(cli.command.as_ref(), Some(Command::Stop));
+    let should_show_launch_error = cli.open
+        && !matches!(
+            cli.command.as_ref(),
+            Some(Command::Stop | Command::DocumentWorker)
+        );
     if let Err(e) = run(cli).await {
         eprintln!("{}", e.code);
         if should_show_launch_error {
@@ -181,6 +205,9 @@ fn legal_path(cli: &Cli) -> Result<PathBuf> {
     Ok(folder.join("data/runtime/legal_core.sqlite"))
 }
 async fn run(cli: Cli) -> Result<()> {
+    if matches!(cli.command, Some(Command::DocumentWorker)) {
+        return workspace_service::run_internal_document_worker();
+    }
     let root = root(&cli)?;
     if matches!(cli.command, Some(Command::Login)) {
         return open_saved(&root);
@@ -226,11 +253,14 @@ async fn run(cli: Cli) -> Result<()> {
             max_daemon_response_bytes: 2 * 1024 * 1024,
         },
     );
-    let mcp = legal_mcp::http::build_proxy_router(
+    let mcp = legal_mcp::http::build_proxy_router_with_query_admission(
         workspace.legal().clone(),
         address,
         proxy,
         shutdown.clone(),
+        std::sync::Arc::new(lawyer_assistance_server::WorkspaceQueryAdmission(
+            workspace.clone(),
+        )),
     )
     .map_err(|_| Error::new("mcp_configuration_invalid"))?;
     let app = lawyer_assistance_server::router(lawyer_assistance_server::AppState::with_shutdown(

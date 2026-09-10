@@ -154,6 +154,60 @@ fn make_pdf(page_texts: &[Option<&str>]) -> Vec<u8> {
     save_pdf(document)
 }
 
+fn make_mixed_pdf() -> Vec<u8> {
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let font_id = document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let image_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 1,
+            "Height" => 1,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8,
+        },
+        vec![0],
+    ));
+    let resources_id = document.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+    });
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        b"BT\n/F1 12 Tf\n72 720 Td\n(local text) Tj\nET\nq\n/Im0 Do\nQ\n".to_vec(),
+    ));
+    let page_id = document.new_object_id();
+    document.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => Object::Reference(resources_id),
+            "Contents" => Object::Reference(content_id),
+        }),
+    );
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    document.trailer.set("Root", Object::Reference(catalog_id));
+    save_pdf(document)
+}
+
 fn save_pdf(mut document: Document) -> Vec<u8> {
     let mut bytes = Vec::new();
     document.save_to(&mut bytes).unwrap();
@@ -914,11 +968,40 @@ fn ai_ocr_docx_rejects_nonempty_custom_xml_instead_of_omitting_it() {
 
 #[test]
 fn pdf_ocr_fails_closed_when_the_bundled_renderer_is_missing() {
-    let pdf = make_pdf(&[Some("synthetic OCR page")]);
+    let pdf = make_pdf(&[None]);
     assert!(matches!(
-        render_pdf_pages(&pdf, Path::new("C:\\missing\\pdfium.dll")),
+        stream_pdf_pages(&pdf, Some(Path::new("C:\\missing\\pdfium.dll")), |_| Ok(())),
         Err(IngestError::PdfiumUnavailable)
     ));
+}
+
+#[test]
+fn text_only_pdf_streams_without_binding_pdfium_or_requesting_ocr() {
+    let pdf = make_pdf(&[Some("page one local text"), Some("page two local text")]);
+    let pages = inspect_pdf_pages(&pdf).expect("inspect text PDF");
+    assert!(pages.iter().all(|page| !page.needs_ocr));
+    let mut emitted = Vec::new();
+    stream_pdf_pages(&pdf, None, |output| {
+        assert!(output.ocr_asset.is_none());
+        emitted.push((output.page.locator, output.page.text));
+        Ok(())
+    })
+    .expect("text-only stream does not require Pdfium");
+    assert_eq!(
+        emitted,
+        vec![
+            ("page:1".to_owned(), "page one local text".to_owned()),
+            ("page:2".to_owned(), "page two local text".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn mixed_pdf_marks_its_text_page_for_visual_ocr() {
+    let pages = inspect_pdf_pages(&make_mixed_pdf()).expect("inspect mixed PDF");
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].text, "local text");
+    assert!(pages[0].needs_ocr);
 }
 
 #[test]
@@ -927,16 +1010,28 @@ fn pdf_ocr_renders_each_synthetic_page_with_bounded_png_output() {
     let library = std::env::var_os("LAWYER_ASSISTANCE_PDFIUM")
         .map(std::path::PathBuf::from)
         .expect("LAWYER_ASSISTANCE_PDFIUM must point to the bundled DLL");
-    let pdf = make_pdf(&[Some("synthetic OCR page one"), Some("page two")]);
-    let assets = render_pdf_pages(&pdf, &library).expect("Pdfium renders synthetic PDF");
-    assert_eq!(assets.len(), 2);
-    assert_eq!(assets[0].locator, "page:1");
-    assert_eq!(assets[1].locator, "page:2");
-    assert!(assets.iter().all(|asset| asset.mime_type == "image/png"));
-    assert!(assets.iter().all(|asset| !asset.bytes.is_empty()));
-    let second_assets = render_pdf_pages(&make_pdf(&[Some("second PDF")]), &library)
-        .expect("reuses the pinned Pdfium binding");
-    assert_eq!(second_assets.len(), 1);
+    let pdf = make_pdf(&[None, None]);
+    let mut pages = Vec::new();
+    stream_pdf_pages(&pdf, Some(&library), |output| {
+        let asset = output.ocr_asset.expect("scan page renders");
+        pages.push((output.page.locator, asset));
+        Ok(())
+    })
+    .expect("Pdfium streams synthetic scan pages");
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].0, "page:1");
+    assert_eq!(pages[1].0, "page:2");
+    assert!(pages
+        .iter()
+        .all(|(_, asset)| asset.mime_type == "image/png"));
+    assert!(pages.iter().all(|(_, asset)| !asset.bytes.is_empty()));
+    let mut second_count = 0;
+    stream_pdf_pages(&make_pdf(&[None]), Some(&library), |_| {
+        second_count += 1;
+        Ok(())
+    })
+    .expect("reuses the pinned Pdfium binding");
+    assert_eq!(second_count, 1);
 }
 
 #[test]

@@ -31,6 +31,28 @@ struct Session {
     csrf: String,
     expires: u64,
 }
+
+/// Embedded MCP requests share the same search budget as Web and AI callers.
+pub struct WorkspaceQueryAdmission(pub Arc<Workspace>);
+
+#[async_trait::async_trait]
+impl legal_mcp::service_adapter::PublicQueryAdmission for WorkspaceQueryAdmission {
+    async fn acquire(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<dyn Send>, legal_mcp::service_adapter::PublicQueryAdmissionError> {
+        self.0
+            .acquire_admission(workspace_service::AdmissionClass::Search, cancellation)
+            .await
+            .map(|permit| Box::new(permit) as Box<dyn Send>)
+            .map_err(|error| {
+                legal_mcp::service_adapter::PublicQueryAdmissionError::new(
+                    error.code,
+                    error.retryable,
+                )
+            })
+    }
+}
 pub struct ApiError(pub Error);
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
@@ -46,9 +68,33 @@ impl IntoResponse for ApiError {
             "revision_conflict" | "idempotency_conflict" | "task_busy" | "conversation_busy" => {
                 StatusCode::CONFLICT
             }
+            "capacity_exceeded" => StatusCode::TOO_MANY_REQUESTS,
+            "context_budget_exceeded" => StatusCode::PAYLOAD_TOO_LARGE,
+            "storage_busy" | "storage_unavailable" | "workspace_unavailable" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            "storage_full" => StatusCode::INSUFFICIENT_STORAGE,
+            "storage_failed"
+            | "file_operation_failed"
+            | "invalid_data"
+            | "encrypted_object_invalid"
+            | "storage_object_corrupt"
+            | "local_encryption_failed"
+            | "worker_failed"
+            | "task_panicked"
+            | "legal_query_failed"
+            | "export_failed" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         };
         let mut response = (status, Json(json!({"error":self.0}))).into_response();
+        if matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+        }
         response
             .headers_mut()
             .insert("cache-control", HeaderValue::from_static("no-store"));
@@ -81,6 +127,79 @@ fn val<T: serde::Serialize>(v: T) -> ApiResult {
 }
 fn ok() -> ApiResult {
     Ok(Json(json!({"ok":true})))
+}
+
+fn list_page(query: &HashMap<String, String>) -> Result<(usize, Option<&str>), ApiError> {
+    let limit = query
+        .get("limit")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| Error::new("invalid_pagination"))?
+        .unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(Error::new("invalid_pagination").into());
+    }
+    Ok((
+        limit,
+        query
+            .get("cursor")
+            .map(String::as_str)
+            .filter(|v| !v.is_empty()),
+    ))
+}
+
+fn legal_read_scope(
+    query: &HashMap<String, String>,
+) -> Result<(Option<legal_services::LegalVersionScope>, Option<String>), ApiError> {
+    let scope = query
+        .get("version_scope")
+        .or_else(|| query.get("versionScope"))
+        .filter(|v| !v.is_empty())
+        .map(|v| serde_json::from_value::<legal_services::LegalVersionScope>(json!(v)))
+        .transpose()
+        .map_err(|_| Error::new("invalid_search_request"))?;
+    let date = query
+        .get("case_date")
+        .or_else(|| query.get("caseDate"))
+        .filter(|v| !v.is_empty())
+        .cloned();
+    Ok((scope, date))
+}
+
+struct CancelLegalOnDrop(legal_services::SearchCancellation);
+impl Drop for CancelLegalOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+async fn legal_job<T, F>(workspace: &Arc<Workspace>, operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            legal_services::LegalServices,
+            legal_services::SearchCancellation,
+        ) -> Result<T, legal_services::ServiceError>
+        + Send
+        + 'static,
+{
+    let cancel = CancellationToken::new();
+    let _cancel_wait = cancel.clone().drop_guard();
+    let permit = workspace
+        .acquire_admission(workspace_service::AdmissionClass::Search, &cancel)
+        .await?;
+    let query_cancel = legal_services::SearchCancellation::new();
+    let _cancel_query = CancelLegalOnDrop(query_cancel.clone());
+    let legal = workspace.legal().clone();
+    tokio::task::spawn_blocking(move || {
+        // A dropped HTTP future interrupts SQLite, but the capacity permit is
+        // retained until the blocking worker has really returned.
+        let _permit = permit;
+        operation(legal, query_cancel)
+    })
+    .await
+    .map_err(|_| Error::new("legal_query_failed"))?
+    .map_err(legal_error)
 }
 
 impl AppState {
@@ -331,8 +450,9 @@ async fn styles() -> impl IntoResponse {
 async fn health(State(s): State<AppState>) -> ApiResult {
     val(s.workspace.health())
 }
-async fn groups(State(s): State<AppState>) -> ApiResult {
-    val(s.workspace.groups()?)
+async fn groups(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let (limit, cursor) = list_page(&q)?;
+    val(s.workspace.groups_page(cursor, limit)?)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -360,9 +480,15 @@ async fn set_dictionary(
 #[derive(Deserialize)]
 struct MaterialQuery {
     group_id: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<String>,
 }
 async fn materials(State(s): State<AppState>, Query(q): Query<MaterialQuery>) -> ApiResult {
-    val(s.workspace.materials(q.group_id.as_deref())?)
+    val(s.workspace.materials_page(
+        q.group_id.as_deref(),
+        q.cursor.as_deref(),
+        q.limit.unwrap_or(50),
+    )?)
 }
 async fn material(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
     val(s.workspace.material_view(&id)?)
@@ -568,8 +694,22 @@ struct Search {
     query: String,
     case_date: Option<String>,
 }
-fn legal_error(_: legal_services::ServiceError) -> ApiError {
-    Error::new("legal_query_failed").into()
+fn legal_error(error: legal_services::ServiceError) -> ApiError {
+    let code = match error.code.as_str() {
+        "invalid_request" => "invalid_search_request",
+        "not_found" => "not_found",
+        "cancelled" | "request_cancelled" => "cancelled",
+        "capacity_exceeded" => "capacity_exceeded",
+        "database_unavailable" => "storage_unavailable",
+        "database_operation_failed" if error.retryable => "storage_busy",
+        "judicial_case_database_missing" => "judicial_case_database_missing",
+        "judicial_case_database_incompatible" => "judicial_case_database_incompatible",
+        "filesystem_hardlink_rejected"
+        | "filesystem_identity_changed"
+        | "filesystem_path_rejected" => error.code.as_str(),
+        _ => "legal_query_failed",
+    };
+    Error::new(code).into()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -580,90 +720,109 @@ struct CaseSearch {
     offset: Option<u32>,
     include_withdrawn: Option<bool>,
 }
-fn case_error(error: legal_services::ServiceError) -> ApiError {
-    // Keep errors actionable without returning database paths or diagnostics.
-    Error::new(&error.code).into()
-}
 async fn judicial_case_search(State(s): State<AppState>, Query(q): Query<CaseSearch>) -> ApiResult {
-    val(s
-        .workspace
-        .legal()
-        .judicial_case_search(legal_services::JudicialCaseSearchRequest {
-            schema_version: 1,
-            query: q.query,
-            case_type: q.case_type.filter(|v| !v.is_empty()),
-            limit: q.limit,
-            offset: q.offset,
-            include_withdrawn: q.include_withdrawn,
-        })
-        .map_err(case_error)?)
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.judicial_case_search_cancellable(
+            legal_services::JudicialCaseSearchRequest {
+                schema_version: 1,
+                query: q.query,
+                case_type: q.case_type.filter(|v| !v.is_empty()),
+                limit: q.limit,
+                offset: q.offset,
+                include_withdrawn: q.include_withdrawn,
+            },
+            &cancel,
+        )
+    })
+    .await?)
 }
 async fn judicial_case_get(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    val(s
-        .workspace
-        .legal()
-        .judicial_case_get(legal_services::JudicialCaseGetRequest {
-            schema_version: 1,
-            case_id: id,
-        })
-        .map_err(case_error)?)
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.judicial_case_get_cancellable(
+            legal_services::JudicialCaseGetRequest {
+                schema_version: 1,
+                case_id: id,
+            },
+            &cancel,
+        )
+    })
+    .await?)
 }
 async fn judicial_case_status(State(s): State<AppState>) -> ApiResult {
-    val(s
-        .workspace
-        .legal()
-        .judicial_case_status()
-        .map_err(case_error)?)
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.judicial_case_status_cancellable(&cancel)
+    })
+    .await?)
 }
 async fn judicial_case_understand(
     State(s): State<AppState>,
     Input(request): Input<workspace_service::CaseUnderstandingRequest>,
 ) -> ApiResult {
+    let cancel = CancellationToken::new();
+    let _permit = s
+        .workspace
+        .acquire_admission(workspace_service::AdmissionClass::Ai, &cancel)
+        .await?;
     val(s.workspace.understand_cases(request).await?)
 }
 async fn legal_search(State(s): State<AppState>, Query(q): Query<Search>) -> ApiResult {
-    val(s
-        .workspace
-        .legal()
-        .legal_search(legal_services::LegalSearchRequest {
-            schema_version: 1,
-            query: q.query,
-            document_id: None,
-            case_date: q.case_date.filter(|v| !v.is_empty()),
-            limit: Some(20),
-        })
-        .map_err(legal_error)?)
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.legal_search_cancellable(
+            legal_services::LegalSearchRequest {
+                schema_version: 1,
+                query: q.query,
+                document_id: None,
+                case_date: q.case_date.filter(|v| !v.is_empty()),
+                limit: Some(20),
+            },
+            &cancel,
+        )
+    })
+    .await?)
 }
-async fn legal_article(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    val(s
-        .workspace
-        .legal()
-        .legal_get_article(legal_services::LegalGetArticleRequest {
-            schema_version: 1,
-            article_id: id,
-        })
-        .map_err(legal_error)?)
+async fn legal_article(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let (version_scope, case_date) = legal_read_scope(&q)?;
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.legal_get_article_scoped_cancellable(
+            legal_services::LegalGetArticleScopedRequest {
+                schema_version: 1,
+                article_id: id,
+                version_scope,
+                case_date,
+            },
+            &cancel,
+        )
+    })
+    .await?)
 }
 async fn legal_versions(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    val(s
-        .workspace
-        .legal()
-        .legal_get_versions(legal_services::LegalGetVersionsRequest {
-            schema_version: 1,
-            document_id: id,
-        })
-        .map_err(legal_error)?)
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.legal_get_versions_cancellable(
+            legal_services::LegalGetVersionsRequest {
+                schema_version: 1,
+                document_id: id,
+            },
+            &cancel,
+        )
+    })
+    .await?)
 }
 async fn legal_relations(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    val(s
-        .workspace
-        .legal()
-        .legal_get_relations(legal_services::LegalGetRelationsRequest {
-            schema_version: 1,
-            document_id: id,
-            direction: None,
-        })
-        .map_err(legal_error)?)
+    val(legal_job(&s.workspace, move |legal, cancel| {
+        legal.legal_get_relations_cancellable(
+            legal_services::LegalGetRelationsRequest {
+                schema_version: 1,
+                document_id: id,
+                direction: None,
+            },
+            &cancel,
+        )
+    })
+    .await?)
 }
 async fn bookmarks(State(s): State<AppState>) -> ApiResult {
     val(s.workspace.bookmarks()?)

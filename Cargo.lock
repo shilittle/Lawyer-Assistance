@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "assistant"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "quick-xml",
  "serde",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "citations"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "database",
  "domain",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "database"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "file-ingest"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "encoding_rs",
  "image",
@@ -1204,8 +1204,9 @@ dependencies = [
 
 [[package]]
 name = "lawyer-assistance-server"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
+ "async-trait",
  "axum",
  "clap",
  "dirs",
@@ -1237,7 +1238,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "legal-mcp"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1265,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "legal-services"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "assistant",
  "citations",
@@ -1587,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "privacy"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "base64",
  "regex",
@@ -1604,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "privacy-text"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "file-ingest",
  "privacy",
@@ -1625,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "providers"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "privacy",
  "reqwest",
@@ -1882,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "retrieval"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "database",
  "domain",
@@ -1890,6 +1891,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -2994,7 +2996,7 @@ checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 
 [[package]]
 name = "workspace-service"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "base64",
  "domain",

@@ -3,7 +3,10 @@ use crate::{
     handler::{LegalMcpServer, STABLE_PROTOCOL_VERSION},
     privacy_backend::DaemonPrivacyBackendFactory,
     registry::{PrivacyProfile, ToolRegistry},
-    service_adapter::{InFlightOperations, PrivacyWorkspaceError, ServiceAdapter},
+    service_adapter::{
+        BoundedPublicQueryAdmission, InFlightOperations, PrivacyWorkspaceError,
+        PublicQueryAdmission, ServiceAdapter,
+    },
 };
 use axum::{
     body::{to_bytes, Body},
@@ -79,6 +82,25 @@ pub fn build_proxy_router(
     proxy: ProxyRouterConfig,
     cancellation: CancellationToken,
 ) -> Result<Router, PrivacyWorkspaceError> {
+    build_proxy_router_with_query_admission(
+        legal_services,
+        bind,
+        proxy,
+        cancellation,
+        Arc::new(BoundedPublicQueryAdmission::default()),
+    )
+}
+
+/// Build an embedded MCP router with the host's public-query admission.  The
+/// host can use this to share Search capacity with its HTTP and AI routes
+/// without introducing a workspace dependency into legal-mcp.
+pub fn build_proxy_router_with_query_admission(
+    legal_services: LegalServices,
+    bind: SocketAddr,
+    proxy: ProxyRouterConfig,
+    cancellation: CancellationToken,
+    public_query_admission: Arc<dyn PublicQueryAdmission>,
+) -> Result<Router, PrivacyWorkspaceError> {
     if !bind.ip().is_loopback() {
         return Err(PrivacyWorkspaceError::new(
             "invalid_daemon_configuration",
@@ -88,7 +110,8 @@ pub fn build_proxy_router(
     let factory = DaemonPrivacyBackendFactory::new(proxy.daemon_url, proxy.limits.clone())?;
     let server = LegalMcpServer::new(
         ToolRegistry::for_profile(PrivacyProfile::PrivacyWorkspace),
-        ServiceAdapter::for_privacy_workspace_proxy(legal_services, Arc::new(factory)),
+        ServiceAdapter::for_privacy_workspace_proxy(legal_services, Arc::new(factory))
+            .with_public_query_admission(public_query_admission),
     );
     Ok(build_router_with_security(
         server,
@@ -191,6 +214,12 @@ async fn enforce_http_boundary(
     request: Request,
     next: Next,
 ) -> Response {
+    // This guard cancels the request token on a timeout, normal completion, or
+    // an HTTP disconnect that drops this middleware future.  The adapter moves
+    // its admission permit into spawn_blocking, so cancellation never reports
+    // a free slot until the synchronous query has actually returned.
+    let request_cancellation = CancellationToken::new();
+    let _cancel_when_response_ends = request_cancellation.clone().drop_guard();
     let started = Instant::now();
     if request.uri().path() != MCP_PATH {
         return rejection(StatusCode::NOT_FOUND, "not_found", false);
@@ -253,6 +282,7 @@ async fn enforce_http_boundary(
         );
     }
     parts.extensions.insert(scope);
+    parts.extensions.insert(request_cancellation);
     let request = Request::from_parts(parts, Body::from(body));
     let mut task = tokio::spawn(async move {
         // Keep the admission permit with the detached task. A timeout only

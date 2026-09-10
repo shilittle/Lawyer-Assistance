@@ -23,6 +23,7 @@ pub use error::*;
 pub use judicial::*;
 pub use legal::*;
 pub use paged::*;
+pub use retrieval::{CancellationRegistration, SearchCancellation};
 pub use status::*;
 
 use std::path::Path;

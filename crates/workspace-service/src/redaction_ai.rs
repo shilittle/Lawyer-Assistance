@@ -1420,6 +1420,7 @@ mod tests {
                     enabled_models: vec![selection.model.clone()],
                     trust_raw: true,
                     base_url: config.base_url.clone(),
+                    model_capabilities: std::collections::BTreeMap::new(),
                 },
             )
             .expect("metadata");
