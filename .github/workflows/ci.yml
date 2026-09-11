@@ -54,7 +54,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Prepare locked packages for offline cross-platform license checks
-        run: python -c "import subprocess; from scripts.generate_third_party_notices import CARGO_RELEASE_TARGET_PRODUCTS; [subprocess.run(['cargo','fetch','--locked','--target',target],check=True) for target,_ in CARGO_RELEASE_TARGET_PRODUCTS]"
+        run: python -c "import subprocess; from scripts.generate_third_party_notices import CARGO_RELEASE_TARGET_PRODUCTS; [subprocess.run(['cargo','metadata','--locked','--filter-platform',target,'--format-version','1'],stdout=subprocess.DEVNULL,check=True) for target,_ in CARGO_RELEASE_TARGET_PRODUCTS]"
 
       - name: Run every Python regression module without network access
         run: python -c "import subprocess,sys; from scripts.audit_validate import discover_python_tests,DEFAULT_ROOT; sys.exit(subprocess.call([sys.executable,'-m','unittest',*discover_python_tests(DEFAULT_ROOT),'-v']))"
