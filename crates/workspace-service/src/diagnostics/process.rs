@@ -1166,6 +1166,7 @@ fn with_directory_budget_lock<T>(
     }
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
@@ -1360,10 +1361,8 @@ fn log_is_active(path: &Path) -> bool {
 fn launch_id_from_log_name(name: &str) -> Option<&str> {
     let stem = if let Some(stem) = name.strip_prefix("process-") {
         stem.strip_suffix(".jsonl")?
-    } else if let Some(stem) = name.strip_prefix("panic-") {
-        stem.strip_suffix(".jsonl")?
     } else {
-        return None;
+        name.strip_prefix("panic-")?.strip_suffix(".jsonl")?
     };
     let launch_id = stem.split('.').next()?;
     safe_operation_id(launch_id).then_some(launch_id)

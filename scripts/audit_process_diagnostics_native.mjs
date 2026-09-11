@@ -258,17 +258,19 @@ async function workerScenario(label, mode, action) {
     }
     assert.equal(exit.memory_limit_exceeded, undefined, "nonzero exit alone never establishes OOM");
     row.observed = { task_status: completed.status, error_code: completed.error_code, child_identity: childIdentity, exit, termination_intents: intents };
-    row.logs = await saveSafeLogs(label, logs, workspace);
     // An identical failed source must be usable next on the same daemon, with the one-shot
     // injection disarmed. This is a recovery gate, not an old/new incident comparison.
     {
       holdOcr = false;
       for (const response of connections) response.destroy();
       const recovery = await beginRun(service, selection);
-      assert.equal((await terminal(service, recovery.id)).status, "completed");
+      const recovered = await terminal(service, recovery.id);
+      assert.equal(recovered.status, "completed");
       await until(() => ownedWorkers(service).length === 0, "recovery_reaped");
       row.recovery_same_input = "passed";
+      row.recovery = { operation_id: recovery.id, status: recovered.status };
     }
+    row.logs = await saveSafeLogs(label, await readProcessLogs(workspace), workspace);
     row.status = "passed";
     passedGate(label);
   } finally {

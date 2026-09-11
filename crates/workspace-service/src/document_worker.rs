@@ -1107,32 +1107,29 @@ impl Drop for PdfDocumentWorker {
         if self.exit_recorded {
             return;
         }
-        match self.child.try_wait() {
-            Ok(Some(status)) => {
-                // The child had already exited naturally. Do not turn that observed status into
-                // cleanup merely because the owner future was dropped before it recorded exit.
-                // `Drop` cannot await stderr; retain only its current structural counters.
-                let stderr = self
-                    .stderr
-                    .as_ref()
-                    .map(WorkerStderrDrain::snapshot)
-                    .unwrap_or_default();
-                if let Some(diagnostics) = self.diagnostics.as_ref() {
-                    diagnostics.record_child_exit(
-                        self.worker_pid,
-                        &self.operation_id,
-                        "document_worker_drop_natural_exit",
-                        Some(&status),
-                        crate::process_diagnostics::ExitSource::Natural,
-                        stderr.bytes_read,
-                        stderr.read_errors,
-                        true,
-                    );
-                }
-                self.exit_recorded = true;
-                return;
+        if let Ok(Some(status)) = self.child.try_wait() {
+            // The child had already exited naturally. Do not turn that observed status into
+            // cleanup merely because the owner future was dropped before it recorded exit.
+            // `Drop` cannot await stderr; retain only its current structural counters.
+            let stderr = self
+                .stderr
+                .as_ref()
+                .map(WorkerStderrDrain::snapshot)
+                .unwrap_or_default();
+            if let Some(diagnostics) = self.diagnostics.as_ref() {
+                diagnostics.record_child_exit(
+                    self.worker_pid,
+                    &self.operation_id,
+                    "document_worker_drop_natural_exit",
+                    Some(&status),
+                    crate::process_diagnostics::ExitSource::Natural,
+                    stderr.bytes_read,
+                    stderr.read_errors,
+                    true,
+                );
             }
-            Ok(None) | Err(_) => {}
+            self.exit_recorded = true;
+            return;
         }
         // A dropped future cannot await reaping. Normal call paths use `abort`/`finish`; this
         // fallback nevertheless records intent before best-effort termination and never logs a

@@ -69,6 +69,8 @@ python scripts/build_diagnostic.py `
 
 主 EXE 的安全日志保存其 SHA-256 和 CodeView 标识。panic 栈保留模块名、基址、偏移及绑定状态；其他 DLL 的帧标为 `unbound_module`，不能单凭模块名或偏移声称已匹配某个 DLL 版本。运行时资源哈希应与同次采集一并保留，旧程序不能套用新建 PDB。
 
+`exit_source: natural` 表示父进程在主动清理前已观察到退出码，并不表示正常退出或已排除外部终止。取消、超时等由父进程发起的终止会先记录意图，再把随后观察到的退出标为 `after_cleanup`。外部终止须结合采集窗口、系统事件或明确的测试控制记录判断，不能只用一个退出码确定原因。
+
 ## 合成环境回归
 
 `scripts/audit_process_diagnostics_native.mjs` 使用独立临时工作区、固定合成 PDF 和本地 mock，验证 14 个诊断门禁。它需要用 `build_document_fault_test.py` 单独构建的测试 EXE、普通生产 EXE，以及通过既有原生预检的本地 Pdfium/公开库副本。`--scope process` 只运行不依赖 PDF 渲染的前 7 项，供 Windows CI 使用。测试程序的故障入口不会进入普通或 diagnostic 构建；不得把测试 EXE 放入交付程序目录。完整既有 43 项门禁仍由 `scripts/audit_validate.py --phase all` 单独记录。
