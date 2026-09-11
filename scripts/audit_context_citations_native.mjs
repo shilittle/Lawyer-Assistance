@@ -38,7 +38,8 @@ const selection = () => ({ provider_id: providerId, model: "audit-context" });
 const hash = text => createHash("sha256").update(text).digest("hex");
 const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
 function verifyActualPlan(plan) {
-  const value = { schema_version: 1, preflight_plan_hash: plan.plan_hash, stage: plan.stage, capabilities: plan.capabilities, estimate: plan.estimate, selected_scope: plan.selected_scope, omitted_scope: plan.omitted_scope };
+  const schemaVersion = plan.schema_version ?? 1;
+  const value = { schema_version: schemaVersion, preflight_plan_hash: plan.plan_hash, stage: plan.stage, capabilities: plan.capabilities, estimate: plan.estimate, ...(schemaVersion >= 2 ? { requested_scope: plan.requested_scope } : {}), selected_scope: plan.selected_scope, omitted_scope: plan.omitted_scope };
   assert.equal(plan.actual_plan_hash, hash(JSON.stringify(canonical(value))), "actual ranges and budget ledger must match the actual plan hash");
 }
 async function until(predicate, label, timeout = 15000) {
@@ -101,7 +102,9 @@ try {
   await client.request("/api/v1/ai/providers", "POST", { ...providerRequest(), model_capabilities: { "audit-context": { context_window_tokens: 20480, max_output_tokens: 4096, supports_tools: false } } });
   await assert.rejects(() => writeRun("Explicit unsupported tool model"), /model_tools_unsupported/u);
   assert.equal(requests.length, beforeUnsupported);
-  await client.request("/api/v1/ai/providers", "POST", providerRequest());
+  // An unrelated provider save preserves capability declarations. Explicit null
+  // is the user's deliberate correction of this test's earlier false value.
+  await client.request("/api/v1/ai/providers", "POST", { ...providerRequest(), model_capabilities: { "audit-context": { supports_tools: null } } });
   checks.push("explicit_model_capability_rejected_before_dispatch");
 
   const created = await writeRun("NATIVE_CITATION read the source then cite it", { case_date: "2026-09-10" });

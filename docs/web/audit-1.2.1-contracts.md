@@ -45,7 +45,31 @@ MCP v1 的字段、数量上限和公开输出格式保留，内部使用同一�
 
 Provider 的 `model_capabilities` 按模型名配置 `context_window_tokens`、`max_output_tokens`、`supports_tools`、`supports_structured_output`、`supports_vision`。未配置容量时采用 16,384 输入和 4,096 输出 token 的保守预算并显示未核实。配置值不等于已经实测服务能力。容量不足返回 `context_budget_exceeded`（HTTP 413）；明确不支持的功能在外发前拒绝。模型响应因长度上限截断时，任务不能标为完成。
 
-预检的 `plan_hash` 保持不变；实际处理后新增 `actual_plan_hash`，绑定采用范围、遗漏和实际预算账目，历史轮次计入 `history_tokens`。大视觉材料的完整估算超过剩余容量时，预检返回 `stage: scope_required` 并说明原因，创建任务返回 HTTP 413，不能继续解密正文、启动 PDF worker 或外发 OCR。当前界面没有页范围选择器，需先拆分文件、减少材料或配置有足够容量的模型后重试。
+能力字段使用 `null`（未知）、`true`（声明支持）、`false`（声明不支持）。保存 Provider 时，省略能力映射或其中某个字段表示保留；显式 `null` 才将该字段改为未知。只修改容量不能清除已有 `false`，旧记录的 `false` 在用户明确更正前仍阻断相应功能。声明来源、时间、配置绑定和待复核状态由服务器记录；改变容量不代表已经实测模型。
+
+兼容字段 `capabilities.verified` 表示输入预算所需的容量配置是否完整，不能作为真实模型测试通过的证据。Provider 的 `capability_metadata` 提供声明来源与 `verification_state`；本轮只使用本地 mock，不将用户声明升级为实测支持。
+
+Provider 配置、能力声明和默认模型选择在同一工作区锁和 SQLite 事务内保存；发送前在锁内读取配置与凭据的一致快照，网络等待不持锁。凭据管理器属于独立存储，写入前持久化发送阻断状态；失败时恢复并核对旧凭据。无法确认恢复时保留阻断，即使重启也不能继续发送，须重新填写并成功保存凭据。
+
+`POST /api/v1/ai/context/inspect` 接受单个来源的 `source_kind`、`source_id` 和材料所需的 `source: original | redacted`。响应只包含格式、`unit_kind`、`unit_count`、`unit_version`、`estimated_input_tokens`、`estimate_basis` 和 `inspection_hash` 等结构信息。PDF 页树在隔离进程中检查；检查不调用 OCR 或模型，不返回正文。
+
+任务请求和会话材料替换接口接受 `context_ranges`。每个已选来源对应一个条目，例如：
+
+```json
+{
+  "source_kind": "attachment",
+  "source_id": "attachment_...",
+  "mode": "pages",
+  "ranges": [{"start": 2, "end": 4}, {"start": 7, "end": 7}],
+  "inspection_hash": "服务器返回的来源绑定标识"
+}
+```
+
+`mode` 为 `all`、`pages` 或 `paragraphs`。页码和段落编号从 1 开始、包含两端；服务器排序并合并重叠或相邻区间。局部范围为空、倒序、从 0 开始、越界或与来源格式不匹配时拒绝。局部范围须携带当前来源的检查标识；来源版本、内容或范围改变后，旧准备计划失效。未提供范围的旧请求按全部处理，仍受预算限制；最终材料和附件清单都为空时范围也为空。
+
+预检的 `plan_hash` 保持不变；实际处理后新增 `actual_plan_hash`，绑定原始请求范围 `requested_scope`、实际采用范围 `selected_scope`、遗漏和预算账目，历史轮次计入 `history_tokens`。完整估算超过剩余容量时，预检返回 `stage: scope_required` 并说明原因，创建任务返回 HTTP 413。用户可缩小页码或段落范围后重新准备。处理过程中仍有增量预算检查，不能将预算导致的截断结果标为完整完成。
+
+新计划返回 `schema_version: 2`，其实际哈希包含 `requested_scope`。旧 schema 1 记录继续按原投影核验，不因兼容读取补出的空字段改变原哈希。同一材料的原稿和脱敏稿分别按来源版本归集范围。
 
 ## PDF 工作进程
 

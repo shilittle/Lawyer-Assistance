@@ -86,13 +86,13 @@ impl Workspace {
 
         let cancellation = CancellationToken::new();
         let registration_id = id("case_search");
-        let (config, secret) = {
+        let provider = {
             let _gate = self.lock()?;
             let config: ProviderConfig = self.store.get("provider", &request.provider_id)?;
             if request.model != config.model {
                 return Err(Error::new("provider_changed"));
             }
-            let secret = self.api_key(&config.id)?;
+            let provider = self.provider_dispatch_snapshot_locked(&config)?;
             let mut active = self
                 .chat_cancellations
                 .lock()
@@ -106,13 +106,13 @@ impl Workspace {
                 return Err(Error::retry("case_search_busy"));
             }
             active.insert(registration_id.clone(), cancellation.clone());
-            (config, secret)
+            provider
         };
         let _registration = ActiveUnderstanding {
             workspace: self,
             id: registration_id,
         };
-        let binding = hash(&serde_json::to_vec(&(&request.query, &config))?);
+        let binding = hash(&serde_json::to_vec(&(&request.query, &provider.config))?);
         let messages = vec![
             ChatMessage {
                 role: ChatMessageRole::System,
@@ -126,17 +126,17 @@ impl Workspace {
         let output = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(Error::new("provider_changed")),
-            response = self.complete_authorized(&config, messages, "case_search_understanding", &binding, now() + 180) => response?,
+            response = self.complete_authorized(&provider, messages, "case_search_understanding", &binding, now() + 180) => response?,
         };
-        if output.contains(secret.expose_secret()) {
+        if output.contains(provider.secret.expose_secret()) {
             return Err(Error::new("provider_secret_echo_blocked"));
         }
         let understanding = parse_understanding(&output)?;
         // A changed provider cancels delivery as well as any pending dispatch.
         let _gate = self.lock()?;
-        let active: ProviderConfig = self.store.get("provider", &config.id)?;
+        let active: ProviderConfig = self.store.get("provider", &provider.config.id)?;
         if cancellation.is_cancelled()
-            || hash(&serde_json::to_vec(&active)?) != hash(&serde_json::to_vec(&config)?)
+            || hash(&serde_json::to_vec(&active)?) != hash(&serde_json::to_vec(&provider.config)?)
         {
             return Err(Error::new("provider_changed"));
         }

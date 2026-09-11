@@ -968,7 +968,9 @@ fn encrypted_writing_draft_is_revision_bound_and_survives_workspace_reopen() {
         .save_ai_draft("writing-current", 0, content.clone())
         .unwrap();
     assert_eq!(saved["revision"], 1);
-    assert_eq!(saved["content"], content);
+    let mut normalized_content = content.clone();
+    normalized_content["context_ranges"] = json!([]);
+    assert_eq!(saved["content"], normalized_content);
     assert_eq!(
         workspace
             .save_ai_draft("writing-current", 0, content.clone())
@@ -981,6 +983,7 @@ fn encrypted_writing_draft_is_revision_bound_and_survives_workspace_reopen() {
     let reopened = Workspace::open(root, legal).unwrap();
     let restored = reopened.ai_draft("writing-current").unwrap();
     assert_eq!(restored["revision"], 1);
+    assert_eq!(restored["content"]["context_ranges"], json!([]));
     assert_eq!(
         restored["content"]["content"],
         "# 未提交修改\n\nSYNTHETIC DRAFT ONLY"
@@ -1019,9 +1022,11 @@ async fn replacing_chat_context_cancels_affected_run_and_requires_current_revisi
                 source: "original".into(),
             }],
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
     assert_eq!(replacement["manifest"]["revision"], 2);
+    assert_eq!(replacement["manifest"]["context_ranges"][0]["mode"], "all");
     let prepared = f
         .workspace
         .prepare_ai_conversation_context(
@@ -1032,6 +1037,7 @@ async fn replacing_chat_context_cancels_affected_run_and_requires_current_revisi
         )
         .unwrap();
     assert_eq!(prepared["manifest"]["materials"][0]["id"], material_id);
+    assert_eq!(prepared["manifest"]["context_ranges"][0]["mode"], "all");
 
     let run = f
         .workspace
@@ -1054,7 +1060,7 @@ async fn replacing_chat_context_cancels_affected_run_and_requires_current_revisi
     }
     let removed = f
         .workspace
-        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new())
+        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new(), Vec::new())
         .unwrap();
     assert_eq!(removed["manifest"]["revision"], 3);
     assert!(removed["cancelled_run_ids"]
@@ -1102,6 +1108,7 @@ async fn removed_context_excludes_the_entire_prior_turn_from_followup_history() 
                 source: "original".into(),
             }],
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
     let prepared = f
@@ -1141,7 +1148,7 @@ async fn removed_context_excludes_the_entire_prior_turn_from_followup_history() 
 
     let removed = f
         .workspace
-        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new())
+        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new(), Vec::new())
         .unwrap();
     let prepared = f
         .workspace
@@ -1200,6 +1207,7 @@ async fn context_removal_before_model_slot_prevents_a_queued_dispatch() {
                 source: "original".into(),
             }],
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
     let prepared = f
@@ -1243,7 +1251,7 @@ async fn context_removal_before_model_slot_prevents_a_queued_dispatch() {
         .unwrap();
     let removed = f
         .workspace
-        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new())
+        .replace_ai_conversation_context(conversation_id, 2, Vec::new(), Vec::new(), Vec::new())
         .unwrap();
     assert!(removed["cancelled_run_ids"]
         .as_array()
@@ -1732,6 +1740,8 @@ fn estimate_returns_safe_scope_and_stale_plan_hash_is_not_advisory() {
         .workspace
         .estimate_ai_context(&request)
         .expect("summary-only estimate");
+    assert_eq!(estimate["schema_version"], 2);
+    assert_eq!(estimate["plan"]["schema_version"], 2);
     assert_eq!(estimate["capabilities"]["verified"], false);
     assert_eq!(estimate["capabilities"]["max_input_tokens"], 16_384);
     assert_eq!(estimate["capabilities"]["max_output_tokens"], 4_096);

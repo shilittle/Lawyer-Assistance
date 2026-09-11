@@ -65,6 +65,8 @@ NATIVE_SCRIPTS = (
     "audit_index_equivalence",
     "audit_document_worker_native",
     "audit_context_citations_native",
+    "audit_context_ranges_native",
+    "audit_model_capabilities_native",
 )
 NATIVE_SCRIPT_CHECK_IDS = tuple(f"native-{name.removeprefix('audit_')}" for name in NATIVE_SCRIPTS)
 SOURCE_MANIFEST_NAME = "source-manifest.json"
@@ -1128,6 +1130,7 @@ def build_command_specs(ctx: AuditContext, python_modules: Sequence[str]) -> tup
         CheckSpec("web-tests", "web", ("node", "--test", "apps/web/app.test.js"), "web.log", ("preflight:node",)),
         CheckSpec("editor-retest", "web", ("node", "scripts/audit_editor_retest.mjs", "--postfix", "--output", str(ctx.output / "editor-retest")), "web.log", ("preflight:node", "preflight:browser")),
         CheckSpec("contract-retest", "web", ("node", "scripts/audit_contract_retest.mjs", "--source", str(ctx.root), "--output", str(ctx.output / "contract-retest")), "web.log", ("preflight:node", "preflight:browser")),
+        CheckSpec("context-ranges-web", "web", ("node", "scripts/audit_context_ranges_web.mjs", "--root", str(ctx.root), "--output", str(ctx.output / "context-ranges-web")), "web.log", ("preflight:node", "preflight:browser")),
         CheckSpec("python-tests", "python", python_command, "python.log", ("preflight:python",)),
         CheckSpec("native-pdfium", "native", ("cargo", "+1.98.0", "test", "--locked", "--offline", "-p", "file-ingest", "--lib", "--", "--ignored"), "native-pdfium.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk", "preflight:manifests", "preflight:runtime-resources")),
         CheckSpec("formal-tests", "native", ("cargo", "+1.98.0", "test", "--locked", "--offline", "-p", "citations", "-p", "retrieval", "--test", "formal_legal_core", "--", "--ignored"), "formal-tests.log", ("preflight:rustc", "preflight:cargo", "preflight:manifests", "preflight:runtime-resources")),

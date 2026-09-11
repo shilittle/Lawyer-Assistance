@@ -15,8 +15,9 @@ pub(crate) use ai_context::{
     estimate_image_tokens, estimate_text_tokens, ContextExtractionPlan, DEFAULT_TOOL_RESERVE_TOKENS,
 };
 pub use ai_context::{
-    AiContextCapabilities, AiContextEstimate, AiContextOmission, AiContextPlan, AiContextRange,
-    AiContextScope,
+    AiContextCapabilities, AiContextEstimate, AiContextInspectRequest, AiContextInspectResponse,
+    AiContextOmission, AiContextPlan, AiContextRange, AiContextRangeSelection, AiContextScope,
+    AiContextUnitRange,
 };
 pub use ai_provider::*;
 pub use ai_runs::*;

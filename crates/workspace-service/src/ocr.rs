@@ -59,10 +59,8 @@ struct OcrPageRecord {
 /// only when both the redaction model and the OCR model are marked trusted by the workspace
 /// provider policy. The method never persists or logs the OCR prompt or response.
 impl Workspace {
-    /// Extract an attachment using the fixed public attachment API. Explicit text encodings are
-    /// supplied by the material worker through `extract_ai_attachment_with_encoding`; callers
-    /// that do not carry an encoding retain the strict UTF-8 default for TXT.
-    pub(crate) async fn extract_ai_attachment(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn extract_ai_attachment_scoped(
         &self,
         name: &str,
         bytes: &[u8],
@@ -70,8 +68,11 @@ impl Workspace {
         cancel: &CancellationToken,
         context: Option<&ContextExtractionPlan>,
         context_source_id: Option<&str>,
+        context_source_kind: Option<&str>,
+        context_source: Option<&str>,
+        pdf_ranges: Option<&[(u32, u32)]>,
     ) -> Result<String> {
-        self.extract_ai_attachment_with_encoding(
+        self.extract_ai_attachment_with_encoding_scoped(
             name,
             bytes,
             None,
@@ -79,6 +80,9 @@ impl Workspace {
             cancel,
             context,
             context_source_id,
+            context_source_kind,
+            context_source,
+            pdf_ranges,
         )
         .await
     }
@@ -93,6 +97,35 @@ impl Workspace {
         cancel: &CancellationToken,
         context: Option<&ContextExtractionPlan>,
         context_source_id: Option<&str>,
+    ) -> Result<String> {
+        self.extract_ai_attachment_with_encoding_scoped(
+            name,
+            bytes,
+            encoding,
+            selection,
+            cancel,
+            context,
+            context_source_id,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn extract_ai_attachment_with_encoding_scoped(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        encoding: Option<&str>,
+        selection: &AiModelSelection,
+        cancel: &CancellationToken,
+        context: Option<&ContextExtractionPlan>,
+        context_source_id: Option<&str>,
+        context_source_kind: Option<&str>,
+        context_source: Option<&str>,
+        pdf_ranges: Option<&[(u32, u32)]>,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Err(Error::new("cancelled"));
@@ -119,6 +152,8 @@ impl Workspace {
                     cancel,
                     context,
                     context_source_id,
+                    context_source_kind,
+                    context_source,
                 )
                 .await
             }
@@ -133,6 +168,8 @@ impl Workspace {
                     cancel,
                     context,
                     context_source_id,
+                    context_source_kind,
+                    context_source,
                 )
                 .await
             }
@@ -143,6 +180,9 @@ impl Workspace {
                     cancel,
                     context,
                     context_source_id,
+                    context_source_kind,
+                    context_source,
+                    pdf_ranges,
                 )
                 .await
             }
@@ -157,10 +197,11 @@ impl Workspace {
         bytes: &[u8],
         cancel: &CancellationToken,
     ) -> Result<String> {
-        self.extract_pdf_attachment(bytes, None, cancel, None, None)
+        self.extract_pdf_attachment(bytes, None, cancel, None, None, None, None, None)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn extract_pdf_attachment(
         &self,
         bytes: &[u8],
@@ -168,8 +209,21 @@ impl Workspace {
         cancel: &CancellationToken,
         context: Option<&ContextExtractionPlan>,
         context_source_id: Option<&str>,
+        context_source_kind: Option<&str>,
+        context_source: Option<&str>,
+        pdf_ranges: Option<&[(u32, u32)]>,
     ) -> Result<String> {
-        let mut worker = PdfDocumentWorker::start(bytes, cancel).await?;
+        let mut worker = match pdf_ranges {
+            Some(ranges) => PdfDocumentWorker::start_selected(bytes, ranges, cancel).await,
+            None => PdfDocumentWorker::start(bytes, cancel).await,
+        }
+        .map_err(|error| {
+            if error.code == "invalid_pdf_page_range" {
+                Error::new("context_scope_invalid")
+            } else {
+                error
+            }
+        })?;
         let result = async {
             let source_hash = hash(bytes);
             let ocr = redaction_selection
@@ -180,10 +234,13 @@ impl Workspace {
                 let Some(page) = worker.next_page(cancel).await? else {
                     break Ok(body);
                 };
-                if let (Some(context), Some(source_id)) = (context, context_source_id) {
+                if let (Some(context), Some(source_id), Some(source_kind)) =
+                    (context, context_source_id, context_source_kind)
+                {
                     let reservation = context.reserve_text_segment(
-                        "attachment",
+                        source_kind,
                         source_id,
+                        context_source,
                         &page.page.locator,
                         &page.page.text,
                     )?;
@@ -205,6 +262,8 @@ impl Workspace {
                         cancel,
                         context,
                         context_source_id,
+                        context_source_kind,
+                        context_source,
                     );
                     tokio::pin!(request);
                     let text = tokio::select! {
@@ -238,6 +297,8 @@ impl Workspace {
         cancel: &CancellationToken,
         context: Option<&ContextExtractionPlan>,
         context_source_id: Option<&str>,
+        context_source_kind: Option<&str>,
+        context_source: Option<&str>,
     ) -> Result<String> {
         if assets.len() > MAX_OCR_ASSETS {
             return Err(Error::new("ocr_asset_limit_exceeded"));
@@ -258,6 +319,8 @@ impl Workspace {
                     cancel,
                     context,
                     context_source_id,
+                    context_source_kind,
+                    context_source,
                 )
                 .await?;
             insert_ocr_asset_text(&mut body, &asset, &text)?;
@@ -290,6 +353,8 @@ impl Workspace {
         cancel: &CancellationToken,
         context: Option<&ContextExtractionPlan>,
         context_source_id: Option<&str>,
+        context_source_kind: Option<&str>,
+        context_source: Option<&str>,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Err(Error::new("cancelled"));
@@ -314,6 +379,19 @@ impl Workspace {
                     && cached.model == ocr_selection.model
                     && cached.provider_revision == ocr_revision =>
             {
+                if let (Some(context), Some(source_id), Some(source_kind)) =
+                    (context, context_source_id, context_source_kind)
+                {
+                    let reservation = context.reserve_ocr_page(
+                        source_kind,
+                        source_id,
+                        context_source,
+                        &asset.locator,
+                        0,
+                        asset.bytes.len(),
+                    )?;
+                    reservation.record_ocr_result(estimate_text_tokens(&cached.text))?;
+                }
                 Ok(cached.text)
             }
             _ => {
@@ -329,13 +407,17 @@ impl Workspace {
                     )
                     .as_bytes(),
                 );
-                let reservation = match (context, context_source_id) {
-                    (Some(context), Some(source_id)) => Some(context.reserve_ocr_page(
-                        source_id,
-                        &asset.locator,
-                        0,
-                        asset.bytes.len(),
-                    )?),
+                let reservation = match (context, context_source_id, context_source_kind) {
+                    (Some(context), Some(source_id), Some(source_kind)) => {
+                        Some(context.reserve_ocr_page(
+                            source_kind,
+                            source_id,
+                            context_source,
+                            &asset.locator,
+                            0,
+                            asset.bytes.len(),
+                        )?)
+                    }
                     _ => None,
                 };
                 let text = self

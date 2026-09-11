@@ -10,7 +10,9 @@ import { execFileSync } from "node:child_process";
 import { chromium } from "@playwright/test";
 
 const root = path.resolve(import.meta.dirname, "..");
-const { values } = parseArgs({ options: { source: { type: "string", default: root }, output: { type: "string", default: "work/retest-121/contracts" } } });
+const { values } = parseArgs({ options: { source: { type: "string", default: root }, output: { type: "string", default: "work/retest-121/contracts" }, only: { type: "string" } } });
+const selectedGroups = values.only ? values.only.split(",") : null;
+if (selectedGroups?.some(group => !["R07", "R08", "R10"].includes(group))) throw new Error("only_must_be_R07_R08_or_R10");
 const source = path.resolve(values.source);
 const output = path.resolve(values.output);
 await fs.mkdir(output, { recursive: true });
@@ -33,6 +35,7 @@ const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
 const checks = [];
 async function check(id, operation) {
+  if (selectedGroups && !selectedGroups.some(group => id.startsWith(`${group}_`))) { checks.push({ id, status: "not_run", reason: "phase_filter" }); return; }
   const start = performance.now();
   try { await operation(); checks.push({ id, status: "passed", assertions: true, elapsed_ms: performance.now() - start }); }
   catch (error) { checks.push({ id, status: "failed", assertions: false, error: String(error), elapsed_ms: performance.now() - start }); }
@@ -74,8 +77,8 @@ try {
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));
-  const result = { schema_version: 1, reconstructed_from_report: true, independent_original_json_available: false, source_root: source, source_commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(), source_hashes: hashes, node: process.version, generated_at: new Date().toISOString(), production_csp_test: false, status: checks.every(c => c.status === "passed") ? "passed" : "failed", checks };
+  const result = { schema_version: 1, reconstructed_from_report: true, independent_original_json_available: false, source_root: source, source_commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(), source_hashes: hashes, node: process.version, generated_at: new Date().toISOString(), production_csp_test: false, selected_groups: selectedGroups, status: checks.every(c => ["passed", "not_run"].includes(c.status)) ? "passed" : "failed", checks };
   await fs.writeFile(path.join(output, "report.json"), JSON.stringify(result, null, 2) + "\n");
-  console.log(JSON.stringify({ status: result.status, passed: checks.filter(c => c.status === "passed").length, failed: checks.filter(c => c.status === "failed").length, output }));
+  console.log(JSON.stringify({ status: result.status, passed: checks.filter(c => c.status === "passed").length, failed: checks.filter(c => c.status === "failed").length, not_run: checks.filter(c => c.status === "not_run").length, output }));
   process.exitCode = result.status === "passed" ? 0 : 1;
 }

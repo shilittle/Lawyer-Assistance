@@ -53,6 +53,59 @@ pub struct AiContextRange {
     pub estimated_tokens: u32,
 }
 
+/// A user-visible, structural selection made before the protected source body is opened.
+/// Unit numbering is one-based and inclusive.  The server canonicalizes `ranges` before it is
+/// persisted or hashed, so callers may submit overlapping or unordered intervals.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiContextUnitRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The requested source extent.  `source` distinguishes a material's original and redacted
+/// variants; attachments leave it absent.  `inspection_hash` is required for explicit page or
+/// paragraph ranges and binds their bounds to an inspected local source revision.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiContextRangeSelection {
+    pub source_kind: String,
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<AiContextUnitRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection_hash: Option<String>,
+}
+
+/// Request for local structural inspection.  It never carries a path, text, range, or model
+/// configuration; the workspace resolves the opaque source reference itself.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AiContextInspectRequest {
+    pub source_kind: String,
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Safe result of local structural inspection.  `estimated_input_tokens` is deliberately a
+/// budget estimate, not extracted source text.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiContextInspectResponse {
+    pub source_kind: String,
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub format: String,
+    pub unit_kind: String,
+    pub unit_count: u32,
+    pub unit_version: String,
+    pub inspection_hash: String,
+    pub estimated_input_tokens: u32,
+    pub estimate_basis: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AiContextScope {
     #[serde(default)]
@@ -88,6 +141,10 @@ pub struct AiContextPlan {
     pub stage: String,
     pub capabilities: AiContextCapabilities,
     pub estimate: AiContextEstimate,
+    /// The normalized user request remains immutable after preflight.  Actual prompt locators
+    /// belong in `selected_scope`, so a later budget cut is auditable without rewriting intent.
+    #[serde(default)]
+    pub requested_scope: Vec<AiContextRangeSelection>,
     pub selected_scope: AiContextScope,
     #[serde(default)]
     pub omitted_scope: Vec<AiContextOmission>,
@@ -98,26 +155,29 @@ impl AiContextPlan {
         stage: &str,
         capabilities: AiContextCapabilities,
         estimate: AiContextEstimate,
+        requested_scope: Vec<AiContextRangeSelection>,
         selected_scope: AiContextScope,
         omitted_scope: Vec<AiContextOmission>,
         binding: &Value,
     ) -> Result<Self> {
         let plan_hash = hash(&serde_json::to_vec(&json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "stage": stage,
             "capabilities": capabilities,
             "estimate": estimate,
+            "requested_scope": requested_scope,
             "selected_scope": selected_scope,
             "omitted_scope": omitted_scope,
             "binding": binding,
         }))?);
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             plan_hash,
             actual_plan_hash: None,
             stage: stage.to_owned(),
             capabilities,
             estimate,
+            requested_scope,
             selected_scope,
             omitted_scope,
         })
@@ -125,11 +185,13 @@ impl AiContextPlan {
 
     pub fn public_view(&self) -> Value {
         json!({
+            "schema_version": self.schema_version,
             "plan_hash": self.plan_hash,
             "actual_plan_hash": self.actual_plan_hash,
             "stage": self.stage,
             "capabilities": self.capabilities,
             "estimate": self.estimate,
+            "requested_scope": self.requested_scope,
             "selected_scope": self.selected_scope,
             "omitted_scope": self.omitted_scope,
         })
@@ -143,15 +205,32 @@ impl AiContextPlan {
     /// hash stays immutable; this second hash makes the adopted locators, omissions and budget
     /// ledger independently auditable without exposing prompt text.
     pub(crate) fn refresh_actual_plan_hash(&mut self) -> Result<()> {
-        self.actual_plan_hash = Some(hash(&serde_json::to_vec(&json!({
-            "schema_version": self.schema_version,
-            "preflight_plan_hash": self.plan_hash,
-            "stage": self.stage,
-            "capabilities": self.capabilities,
-            "estimate": self.estimate,
-            "selected_scope": self.selected_scope,
-            "omitted_scope": self.omitted_scope,
-        }))?));
+        // Schema 1 pre-dates requested_scope. Deserializing it supplies an empty default for
+        // display only; including that field in its hash would make authentic legacy evidence
+        // unverifiable. Every newly created plan is schema 2 and binds requested_scope.
+        let actual = if self.schema_version >= 2 {
+            json!({
+                "schema_version": self.schema_version,
+                "preflight_plan_hash": self.plan_hash,
+                "stage": self.stage,
+                "capabilities": self.capabilities,
+                "estimate": self.estimate,
+                "requested_scope": self.requested_scope,
+                "selected_scope": self.selected_scope,
+                "omitted_scope": self.omitted_scope,
+            })
+        } else {
+            json!({
+                "schema_version": self.schema_version,
+                "preflight_plan_hash": self.plan_hash,
+                "stage": self.stage,
+                "capabilities": self.capabilities,
+                "estimate": self.estimate,
+                "selected_scope": self.selected_scope,
+                "omitted_scope": self.omitted_scope,
+            })
+        };
+        self.actual_plan_hash = Some(hash(&serde_json::to_vec(&actual)?));
         Ok(())
     }
 }
@@ -181,7 +260,9 @@ struct BudgetState {
     input_limit: usize,
     used: usize,
     pending: BTreeMap<String, usize>,
-    ranges: BTreeMap<(String, String, String), usize>,
+    // The optional material variant is part of the ledger identity: the same material may
+    // legally contribute both its original and its redacted representation.
+    ranges: BTreeMap<(String, String, Option<String>, String), usize>,
 }
 
 pub(crate) struct ContextBudgetReservation {
@@ -189,6 +270,7 @@ pub(crate) struct ContextBudgetReservation {
     key: Option<String>,
     source_kind: String,
     source_id: String,
+    source: Option<String>,
     locator: String,
 }
 
@@ -206,6 +288,7 @@ impl ContextExtractionPlan {
         &self,
         source_kind: &str,
         source_id: &str,
+        source: Option<&str>,
         locator: &str,
         tokens: usize,
     ) -> Result<ContextBudgetReservation> {
@@ -218,9 +301,10 @@ impl ContextExtractionPlan {
             return Err(Error::new("context_budget_exceeded"));
         }
         let key = format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{:?}:{}:{}",
             source_kind,
             source_id,
+            source,
             locator,
             state.pending.len()
         );
@@ -230,6 +314,7 @@ impl ContextExtractionPlan {
             key: Some(key),
             source_kind: source_kind.to_owned(),
             source_id: source_id.to_owned(),
+            source: source.map(str::to_owned),
             locator: locator.to_owned(),
         })
     }
@@ -238,14 +323,17 @@ impl ContextExtractionPlan {
     /// page-text estimate when available; image bytes enforce the explicit visual fallback.
     pub(crate) fn reserve_ocr_page(
         &self,
+        source_kind: &str,
         source_id: &str,
+        source: Option<&str>,
         locator: &str,
         estimated_tokens: usize,
         image_bytes: usize,
     ) -> Result<ContextBudgetReservation> {
         self.reserve(
-            "attachment",
+            source_kind,
             source_id,
+            source,
             locator,
             estimated_tokens.max(estimate_image_tokens(image_bytes)),
         )
@@ -255,10 +343,17 @@ impl ContextExtractionPlan {
         &self,
         source_kind: &str,
         source_id: &str,
+        source: Option<&str>,
         locator: &str,
         text: &str,
     ) -> Result<ContextBudgetReservation> {
-        self.reserve(source_kind, source_id, locator, estimate_text_tokens(text))
+        self.reserve(
+            source_kind,
+            source_id,
+            source,
+            locator,
+            estimate_text_tokens(text),
+        )
     }
 
     pub(crate) fn charge_fixed(&self, tokens: usize) -> Result<()> {
@@ -296,10 +391,10 @@ impl ContextExtractionPlan {
             .ranges
             .iter()
             .map(
-                |((source_kind, source_id, locator), tokens)| AiContextRange {
+                |((source_kind, source_id, source, locator), tokens)| AiContextRange {
                     source_kind: source_kind.clone(),
                     source_id: source_id.clone(),
-                    source: None,
+                    source: source.clone(),
                     format: None,
                     locators: vec![locator.clone()],
                     estimated_tokens: u32::try_from(*tokens).unwrap_or(u32::MAX),
@@ -307,11 +402,18 @@ impl ContextExtractionPlan {
             )
             .collect::<Vec<_>>();
         values.sort_by(|left, right| {
-            (&left.source_kind, &left.source_id, &left.locators).cmp(&(
-                &right.source_kind,
-                &right.source_id,
-                &right.locators,
-            ))
+            (
+                &left.source_kind,
+                &left.source_id,
+                &left.source,
+                &left.locators,
+            )
+                .cmp(&(
+                    &right.source_kind,
+                    &right.source_id,
+                    &right.source,
+                    &right.locators,
+                ))
         });
         values
     }
@@ -346,14 +448,16 @@ impl ContextBudgetReservation {
             return Err(Error::new("context_budget_exceeded"));
         }
         state.used = state.used.saturating_add(actual_tokens);
-        state.ranges.insert(
-            (
+        state
+            .ranges
+            .entry((
                 self.source_kind.clone(),
                 self.source_id.clone(),
+                self.source.clone(),
                 self.locator.clone(),
-            ),
-            actual_tokens,
-        );
+            ))
+            .and_modify(|total| *total = total.saturating_add(actual_tokens))
+            .or_insert(actual_tokens);
         Ok(())
     }
 }
@@ -396,6 +500,7 @@ mod tests {
             "conservative",
             capabilities,
             AiContextEstimate::default(),
+            Vec::new(),
             AiContextScope::default(),
             Vec::new(),
             &json!({"provider_revision": 1}),
@@ -414,15 +519,67 @@ mod tests {
     }
 
     #[test]
+    fn legacy_schema_one_actual_hash_excludes_defaulted_requested_scope() {
+        let legacy = json!({
+            "schema_version": 1,
+            "plan_hash": "legacy-preflight-hash",
+            "actual_plan_hash": null,
+            "stage": "conservative",
+            "capabilities": {
+                "verified": false,
+                "context_window_tokens": 20480,
+                "max_input_tokens": 16384,
+                "max_output_tokens": 4096,
+                "supports_tools": null,
+                "supports_structured_output": null,
+                "supports_vision": null
+            },
+            "estimate": {
+                "input_tokens": 42,
+                "reserved_output_tokens": 4096,
+                "system_tokens": 10,
+                "request_tokens": 12,
+                "history_tokens": 0,
+                "material_tokens": 20,
+                "attachment_tokens": 0,
+                "tool_reserve_tokens": 0
+            },
+            "selected_scope": {"materials":[],"attachments":[],"history_run_ids":[]},
+            "omitted_scope": []
+        });
+        let mut plan: AiContextPlan = serde_json::from_value(legacy).expect("legacy plan reads");
+        assert_eq!(plan.schema_version, 1);
+        assert!(plan.requested_scope.is_empty());
+        assert_eq!(plan.public_view()["schema_version"], 1);
+        assert_eq!(plan.public_view()["requested_scope"], json!([]));
+
+        let expected = hash(
+            &serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "preflight_plan_hash": "legacy-preflight-hash",
+                "stage": "conservative",
+                "capabilities": plan.capabilities,
+                "estimate": plan.estimate,
+                "selected_scope": plan.selected_scope,
+                "omitted_scope": plan.omitted_scope,
+            }))
+            .expect("legacy hash serialization"),
+        );
+        plan.refresh_actual_plan_hash()
+            .expect("legacy actual hash refreshes");
+        assert_eq!(plan.actual_plan_hash.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
     fn cancelled_or_failed_ocr_reservation_releases_pending_budget() {
         let plan = ContextExtractionPlan::new(2_000);
         let reservation = plan
-            .reserve_ocr_page("attachment_a", "page:1", 1_024, 1)
+            .reserve_ocr_page("attachment", "attachment_a", None, "page:1", 1_024, 1)
             .expect("page reserves before OCR");
         drop(reservation);
         assert_eq!(plan.remaining_tokens(), 2_000);
         let reservation = plan
-            .reserve_ocr_page("attachment_a", "page:1", 1_024, 1)
+            .reserve_ocr_page("attachment", "attachment_a", None, "page:1", 1_024, 1)
             .expect("released reservation can be reacquired");
         reservation
             .record_ocr_result(1_100)

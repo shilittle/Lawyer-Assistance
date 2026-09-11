@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { materialReviewDecision } from "./app.js";
 import { ApiClient, ApiError, ERROR_MESSAGES, pathId, queryString, splitIds } from "./api.js";
-import { AI_RUN_KINDS, AI_RUN_POLL_MAX_CONSECUTIVE_FAILURES, AiRunPoller, CASE_TYPES, ENTITY_KINDS, adaptiveLegalPageSize, aiRunPollBackoffDelay, aiDefaultSelection, aiRunProgress, aiRunProgressText, aiRunRevision, aiRunStatusLabel, caseUnderstandPayload, caseSourceLabel, caseStatusLabel, caseTypeLabel, caseWarningLabel, conversationContextRevision, field, isRetryableAiPollError, legalArticleDisplayTitle, legalArticleDocumentId, legalCaseSearchParams, legalDateValue, legalFacetLabel, legalMatchMode, legalRelationTarget, legalQueryScopeSummary, legalScopedReadParams, legalSearchPageParams, legalVersionScope, markdownPlainText, markdownToHtml, materialStatusTone, mcpClientDetails, normalizeAiRun, normalizeCaseSearchResponse, normalizeCursorPage, normalizeLegalPageResponse, optionalAlias, pipelineStageLabel, providerModelIds, providerPresetForBaseUrl, reasonLabel, safeExternalUrl, statusLabel, textValue, writingDocumentId, writingDraftCandidateId, writingDraftContent, writingDraftIdForRun, writingDraftRestorePlan, citationCheckLabel, citationErrorCategoryLabel, citationVerificationReasonLabel, citationVerificationStateLabel, contextBudgetStageLabel, contextEstimateCanProceed, contextOmissionReasonLabel, modelCapabilitiesPayload, normalizeAiContextEstimate, normalizeCitationVerification } from "./app.js";
+import { AI_RUN_KINDS, AI_RUN_POLL_MAX_CONSECUTIVE_FAILURES, AiRunPoller, CASE_TYPES, ENTITY_KINDS, adaptiveLegalPageSize, aiRunPollBackoffDelay, aiDefaultSelection, aiRunProgress, aiRunProgressText, aiRunRevision, aiRunStatusLabel, caseUnderstandPayload, caseSourceLabel, caseStatusLabel, caseTypeLabel, caseWarningLabel, conversationContextRevision, field, isRetryableAiPollError, legalArticleDisplayTitle, legalArticleDocumentId, legalCaseSearchParams, legalDateValue, legalFacetLabel, legalMatchMode, legalRelationTarget, legalQueryScopeSummary, legalScopedReadParams, legalSearchPageParams, legalVersionScope, markdownPlainText, markdownToHtml, materialStatusTone, mcpClientDetails, normalizeAiRun, normalizeCaseSearchResponse, normalizeCursorPage, normalizeLegalPageResponse, optionalAlias, parseContextUnitRanges, pipelineStageLabel, providerModelIds, providerPresetForBaseUrl, reasonLabel, safeExternalUrl, statusLabel, textValue, writingDocumentId, writingDraftCandidateId, writingDraftContent, writingDraftIdForRun, writingDraftRestorePlan, citationCheckLabel, citationErrorCategoryLabel, citationVerificationReasonLabel, citationVerificationStateLabel, contextBudgetStageLabel, contextEstimateCanProceed, contextOmissionReasonLabel, modelCapabilitiesPayload, normalizeAiContextEstimate, normalizeCitationVerification } from "./app.js";
 
 test("status presentation has safe Chinese labels and tones", () => {
   assert.equal(statusLabel("needs_review"), "待复核");
@@ -407,6 +407,7 @@ test("revision-bound draft, context, edit, recheck, estimate, and export wrapper
   await client.updateAiRunContent("run/1", "修改日期", 8, { caseDate: null });
   await client.recheckAiRunCitations("run/1", 8);
   await client.estimateAiContext({ kind: "writing", prompt: "案情", provider_id: "p-1", model: "m-1" });
+  await client.inspectAiContextSource({ source_kind: "material", source_id: "m-1", source: "redacted" });
   await client.exportAiRun("run/1", "pdf", 8);
   await client.updateAiConversationContext("conversation/1", { expected_revision: 3, materials: [], attachment_ids: ["a-1"] });
   await client.prepareAiConversationContext("conversation/1", { expected_revision: 3, provider_id: "p-1", model: "m-1" });
@@ -422,15 +423,17 @@ test("revision-bound draft, context, edit, recheck, estimate, and export wrapper
   assert.deepEqual(JSON.parse(calls[2].options.body), { expected_revision: 8 });
   assert.equal(calls[3].url, "/api/v1/ai/context/estimate");
   assert.deepEqual(JSON.parse(calls[3].options.body), { kind: "writing", prompt: "案情", provider_id: "p-1", model: "m-1" });
-  assert.equal(calls[4].url, "/api/v1/ai/runs/run%2F1/export?format=pdf&expected_revision=8");
-  assert.equal(calls[5].url, "/api/v1/ai/conversations/conversation%2F1/context");
-  assert.deepEqual(JSON.parse(calls[5].options.body), { expected_revision: 3, materials: [], attachment_ids: ["a-1"] });
-  assert.equal(calls[6].url, "/api/v1/ai/conversations/conversation%2F1/context/prepare");
-  assert.equal(calls[7].url, "/api/v1/ai/drafts/writing%2Fcurrent");
+  assert.equal(calls[4].url, "/api/v1/ai/context/inspect");
+  assert.deepEqual(JSON.parse(calls[4].options.body), { source_kind: "material", source_id: "m-1", source: "redacted" });
+  assert.equal(calls[5].url, "/api/v1/ai/runs/run%2F1/export?format=pdf&expected_revision=8");
+  assert.equal(calls[6].url, "/api/v1/ai/conversations/conversation%2F1/context");
+  assert.deepEqual(JSON.parse(calls[6].options.body), { expected_revision: 3, materials: [], attachment_ids: ["a-1"] });
+  assert.equal(calls[7].url, "/api/v1/ai/conversations/conversation%2F1/context/prepare");
   assert.equal(calls[8].url, "/api/v1/ai/drafts/writing%2Fcurrent");
-  assert.deepEqual(JSON.parse(calls[8].options.body), { expected_revision: 4, content: { dirty: true } });
-  assert.equal(calls[9].url, "/api/v1/ai/drafts/writing%2Fcurrent?expected_revision=5");
-  assert.equal(calls[10].url, "/api/v1/ai/drafts/writing%2Fcurrent/conflicts?limit=20&cursor=candidate-next");
+  assert.equal(calls[9].url, "/api/v1/ai/drafts/writing%2Fcurrent");
+  assert.deepEqual(JSON.parse(calls[9].options.body), { expected_revision: 4, content: { dirty: true } });
+  assert.equal(calls[10].url, "/api/v1/ai/drafts/writing%2Fcurrent?expected_revision=5");
+  assert.equal(calls[11].url, "/api/v1/ai/drafts/writing%2Fcurrent/conflicts?limit=20&cursor=candidate-next");
 });
 
 test("citation verification exposes only mechanical checks and safe bindings", () => {
@@ -511,11 +514,34 @@ test("context estimate keeps bounded safe scope and distinguishes configured fro
   assert.deepEqual(modelCapabilitiesPayload({ contextWindowTokens: "20000", maxOutputTokens: "4000", supportsTools: true }), {
     context_window_tokens: 20000,
     max_output_tokens: 4000,
-    supports_tools: true,
-    supports_structured_output: false,
-    supports_vision: false
+    supports_tools: true
   });
+  assert.deepEqual(modelCapabilitiesPayload({ contextWindowTokens: "20000", maxOutputTokens: "4000" }), {
+    context_window_tokens: 20000,
+    max_output_tokens: 4000
+  });
+  assert.deepEqual(modelCapabilitiesPayload({ contextWindowTokens: "20000", maxOutputTokens: "4000", supportsTools: false, supportsToolsPresent: false }), {
+    context_window_tokens: 20000,
+    max_output_tokens: 4000
+  });
+  assert.deepEqual(modelCapabilitiesPayload({ supportsTools: false }), { supports_tools: false });
+  assert.deepEqual(modelCapabilitiesPayload({ supportsTools: null, supportsToolsPresent: true }), { supports_tools: null });
   assert.equal(modelCapabilitiesPayload({ contextWindowTokens: "4000", maxOutputTokens: "4000" }), null);
+});
+
+test("context range input requires bounded one-based inclusive intervals", () => {
+  assert.deepEqual(parseContextUnitRanges("1-3, 5，8", { max: 8 }), [{ start: 1, end: 3 }, { start: 5, end: 5 }, { start: 8, end: 8 }]);
+  assert.deepEqual(parseContextUnitRanges("", { max: 8 }), []);
+  assert.equal(parseContextUnitRanges("0-2", { max: 8 }), null);
+  assert.equal(parseContextUnitRanges("4-3", { max: 8 }), null);
+  assert.equal(parseContextUnitRanges("1-9", { max: 8 }), null);
+});
+
+test("R08 model and context errors have safe actionable messages", () => {
+  for (const code of ["capacity_exceeded", "context_budget_exceeded", "document_worker_timeout", "document_worker_exited", "invalid_model_capabilities", "model_tools_unsupported", "model_structured_output_unsupported", "model_vision_unsupported", "context_source_removed", "context_revision_required", "context_prepare_required", "search_scope_conflict"]) {
+    assert.equal(typeof ERROR_MESSAGES[code], "string", code);
+    assert(ERROR_MESSAGES[code].length > 8, code);
+  }
 });
 
 test("writing drafts retain only the strict encrypted-record fields and current run revision", () => {
@@ -528,6 +554,11 @@ test("writing drafts retain only the strict encrypted-record fields and current 
     model: "model-1",
     materials: [{ materialId: "m-original", source: "original" }, { id: "m-invalid", source: "temporary" }],
     attachmentIds: ["a-1", "", null],
+    contextRanges: [
+      { sourceKind: "material", sourceId: "m-original", source: "original", mode: "pages", ranges: [{ start: 1, end: 3 }], inspectionHash: "inspect-1" },
+      { source_kind: "attachment", source_id: "a-1", mode: "all" },
+      { source_kind: "material", source_id: "m-invalid", source: "temporary", mode: "all" }
+    ],
     runId: "run-1",
     runRevision: 6,
     content: "未提交正文",
@@ -542,6 +573,10 @@ test("writing drafts retain only the strict encrypted-record fields and current 
     model: "model-1",
     materials: [{ id: "m-original", source: "original" }],
     attachment_ids: ["a-1"],
+    context_ranges: [
+      { source_kind: "material", source_id: "m-original", source: "original", mode: "pages", ranges: [{ start: 1, end: 3 }], inspection_hash: "inspect-1" },
+      { source_kind: "attachment", source_id: "a-1", mode: "all" }
+    ],
     run_id: "run-1",
     run_revision: 6,
     content: "未提交正文",

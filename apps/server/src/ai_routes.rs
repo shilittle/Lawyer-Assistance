@@ -1,7 +1,9 @@
 use super::*;
 use axum::routing::{patch, put};
 use std::collections::BTreeMap;
-use workspace_service::{AiModelSelection, AiProviderRequest, AiRunRequest};
+use workspace_service::{
+    AiContextInspectRequest, AiModelSelection, AiProviderRequest, AiRunRequest,
+};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -10,6 +12,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/ai/providers/models", post(models))
         .route("/api/v1/ai/providers/test", post(test_model))
         .route("/api/v1/ai/defaults", put(defaults))
+        .route("/api/v1/ai/context/inspect", post(inspect_context))
         .route("/api/v1/ai/context/estimate", post(estimate_context))
         .route("/api/v1/ai/materials", get(materials))
         .route(
@@ -84,6 +87,12 @@ async fn defaults(
 }
 async fn estimate_context(State(s): State<AppState>, Input(r): Input<AiRunRequest>) -> ApiResult {
     val(s.workspace.estimate_ai_context(&r)?)
+}
+async fn inspect_context(
+    State(s): State<AppState>,
+    Input(r): Input<AiContextInspectRequest>,
+) -> ApiResult {
+    val(s.workspace.inspect_ai_context_source(r).await?)
 }
 async fn materials(
     State(s): State<AppState>,
@@ -277,6 +286,8 @@ struct ContextReplace {
     materials: Vec<workspace_service::AiMaterialReference>,
     #[serde(default)]
     attachment_ids: Vec<String>,
+    #[serde(default)]
+    context_ranges: Vec<workspace_service::AiContextRangeSelection>,
 }
 
 async fn replace_conversation_context(
@@ -290,6 +301,7 @@ async fn replace_conversation_context(
         r.expected_revision,
         r.materials,
         r.attachment_ids,
+        r.context_ranges,
     )?)
 }
 

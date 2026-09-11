@@ -136,7 +136,7 @@ export const ERROR_MESSAGES = Object.freeze({
   invalid_api_key: "API Key 格式无效。",
   api_key_required: "该模型服务尚未配置 API Key。",
   api_key_required_for_new_endpoint: "更换模型服务地址后必须重新输入 API Key。",
-  credential_write_failed: "API Key 保存失败。",
+  credential_write_failed: "API Key 保存或恢复失败，请在模型设置中重新填写并保存。",
   credential_read_failed: "API Key 读取失败。",
   provider_changed: "所选模型服务配置已变化，请重新选择 Provider 或刷新设置后重试。",
   provider_unavailable: "模型服务暂时不可用，请稍后重试。",
@@ -162,6 +162,19 @@ export const ERROR_MESSAGES = Object.freeze({
   conversation_busy: "该会话正在生成，请等待或取消当前生成。",
   invalid_title: "会话标题不能为空或过长。",
   context_too_large: "选择的上下文过大，请减少材料或法条。",
+  capacity_exceeded: "当前任务已达到处理上限，请等待任务结束后重试。",
+  context_budget_exceeded: "所选材料、附件或历史超过当前模型的上下文预算，请缩小页/段落范围后重新预检。",
+  context_scope_invalid: "页或段落范围无效、已过期或不属于当前来源；请重新检查范围后再预检。",
+  document_worker_timeout: "本机文档处理超时，请缩小页范围或检查文件后重试。",
+  document_worker_exited: "本机文档处理意外结束，请检查文件和便携包依赖后重试。",
+  invalid_model_capabilities: "模型容量超出允许范围，或输出预留不小于上下文窗口；请更正设置后保存。",
+  model_tools_unsupported: "当前模型被明确声明为不支持工具调用；请更换模型，或在确认后更正能力声明。",
+  model_structured_output_unsupported: "当前模型被明确声明为不支持结构化输出；请更换模型，或在确认后更正能力声明。",
+  model_vision_unsupported: "当前模型被明确声明为不支持视觉附件；请移除视觉附件、更换模型，或在确认后更正能力声明。",
+  context_source_removed: "准备后的材料或附件已被移除，发送前核验已停止；请重新选择范围并准备。",
+  context_revision_required: "会话材料或范围已变化，原准备结果不能继续使用；请重新准备后发送。",
+  context_prepare_required: "发送前范围尚未由本机服务准备并绑定；请先完成准备。",
+  search_scope_conflict: "法律检索范围与本次任务已记录的范围冲突；请统一日期、版本范围和筛选条件后重试。",
   chat_authorization_failed: "对话授权失败，未发送上下文。",
   article_not_found: "所选法条不存在。",
   invalid_purpose: "云辅助用途无效。",
@@ -428,6 +441,10 @@ export class ApiClient {
 
   async estimateAiContext(payload, options = {}) {
     return this.request("/ai/context/estimate", { ...options, method: "POST", body: payload });
+  }
+
+  async inspectAiContextSource(payload, options = {}) {
+    return this.request("/ai/context/inspect", { ...options, method: "POST", body: payload });
   }
 
   async listAiRuns(kind = "", { limit, cursor, ...options } = {}) {

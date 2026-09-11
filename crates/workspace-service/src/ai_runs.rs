@@ -1,3 +1,4 @@
+use crate::document_worker::PdfDocumentWorker;
 use crate::*;
 #[path = "ai_citations.rs"]
 mod ai_citations;
@@ -69,109 +70,46 @@ fn context_text_segments(text: &str) -> Vec<String> {
     segments
 }
 
-fn context_terms(request: &AiRunRequest) -> Vec<String> {
-    let text = format!(
-        "{} {}",
-        request.prompt,
-        request.requirements.as_deref().unwrap_or_default()
-    );
-    let mut terms = BTreeSet::new();
-    for word in text.split(|character: char| !character.is_alphanumeric()) {
-        if word.chars().count() >= 3 {
-            terms.insert(word.to_ascii_lowercase());
-        }
-    }
-    let chinese = text
-        .chars()
-        .filter(|character| !character.is_ascii() && !character.is_whitespace())
-        .collect::<Vec<_>>();
-    for window in chinese.windows(2) {
-        terms.insert(window.iter().collect());
-    }
-    terms.into_iter().collect()
-}
-
-fn context_score(text: &str, terms: &[String]) -> usize {
-    let folded = text.to_ascii_lowercase();
-    terms
-        .iter()
-        .filter(|term| folded.contains(term.as_str()))
-        .count()
-}
-
 fn select_context_text(
     tracker: &ContextExtractionPlan,
     source_kind: &str,
     source_id: &str,
+    source: Option<&str>,
     text: &str,
-    request: &AiRunRequest,
-    omissions: &mut Vec<AiContextOmission>,
+    requested_scope: &[AiContextRangeSelection],
 ) -> Result<String> {
-    const PER_SOURCE_TARGET_TOKENS: usize = 4 * 1024;
-    let terms = context_terms(request);
-    let mut candidates = context_text_segments(text)
+    let requested = requested_scope
+        .iter()
+        .find(|selection| {
+            selection.source_kind == source_kind
+                && selection.source_id == source_id
+                && selection.source.as_deref() == source
+        })
+        .ok_or_else(|| Error::new("context_prepare_required"))?;
+    if !["all", "paragraphs"].contains(&requested.mode.as_str()) {
+        return Err(Error::new("context_scope_invalid"));
+    }
+    let candidates = context_text_segments(text)
         .into_iter()
         .enumerate()
-        .map(|(index, text)| (index, context_score(&text, &terms), text))
+        .filter(|(index, _)| {
+            requested.mode == "all"
+                || requested.ranges.iter().any(|range| {
+                    range.start <= u32::try_from(index + 1).unwrap_or(u32::MAX)
+                        && u32::try_from(index + 1).unwrap_or(u32::MAX) <= range.end
+                })
+        })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
     let mut selected = Vec::new();
-    let mut selected_tokens = 0usize;
-    let any_relevant = candidates.iter().any(|candidate| candidate.1 > 0);
-    for (index, score, candidate) in candidates {
+    for (index, candidate) in candidates {
         let tokens = estimate_text_tokens(&candidate);
-        if selected_tokens.saturating_add(tokens) > PER_SOURCE_TARGET_TOKENS {
-            omissions.push(AiContextOmission {
-                source_kind: source_kind.into(),
-                source_id: source_id.into(),
-                reason: "budget_cut".into(),
-                estimated_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
-                locators: vec![format!("paragraph:{}", index + 1)],
-            });
-            continue;
-        }
-        if any_relevant && score == 0 {
-            omissions.push(AiContextOmission {
-                source_kind: source_kind.into(),
-                source_id: source_id.into(),
-                reason: "no_relevant_segment".into(),
-                estimated_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
-                locators: vec![format!("paragraph:{}", index + 1)],
-            });
-            continue;
-        }
         let locator = format!("paragraph:{}", index + 1);
-        match tracker.reserve_text_segment(source_kind, source_id, &locator, &candidate) {
-            Ok(reservation) => match reservation.record_text_result(tokens) {
-                Ok(()) => {
-                    selected_tokens = selected_tokens.saturating_add(tokens);
-                    selected.push((index, candidate));
-                }
-                Err(error) if error.code == "context_budget_exceeded" => {
-                    omissions.push(AiContextOmission {
-                        source_kind: source_kind.into(),
-                        source_id: source_id.into(),
-                        reason: "budget_cut".into(),
-                        estimated_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
-                        locators: vec![locator],
-                    });
-                }
-                Err(error) => return Err(error),
-            },
-            Err(error) if error.code == "context_budget_exceeded" => {
-                omissions.push(AiContextOmission {
-                    source_kind: source_kind.into(),
-                    source_id: source_id.into(),
-                    reason: "budget_cut".into(),
-                    estimated_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
-                    locators: vec![locator],
-                });
-            }
-            Err(error) => return Err(error),
-        }
+        let reservation =
+            tracker.reserve_text_segment(source_kind, source_id, source, &locator, &candidate)?;
+        reservation.record_text_result(tokens)?;
+        selected.push((index, candidate));
     }
-    selected.sort_by_key(|(index, _)| *index);
     Ok(selected
         .into_iter()
         .map(|(_, text)| text)
@@ -190,6 +128,10 @@ pub struct AiRunRequest {
     pub materials: Vec<AiMaterialReference>,
     #[serde(default)]
     pub attachment_ids: Vec<String>,
+    /// Empty in a legacy request means every supplied source (`all`).  Once a caller supplies
+    /// any selector, the server normalizes it to exactly one selector per source.
+    #[serde(default)]
+    pub context_ranges: Vec<AiContextRangeSelection>,
     pub case_date: Option<String>,
     #[serde(default)]
     pub match_mode: Option<String>,
@@ -221,6 +163,8 @@ pub struct AiContextManifest {
     pub revision: u64,
     pub materials: Vec<AiMaterialReference>,
     pub attachment_ids: Vec<String>,
+    #[serde(default)]
+    pub context_ranges: Vec<AiContextRangeSelection>,
     pub updated_at: u64,
 }
 
@@ -243,6 +187,8 @@ struct WritingDraftContent {
     materials: Vec<AiMaterialReference>,
     #[serde(default)]
     attachment_ids: Vec<String>,
+    #[serde(default)]
+    context_ranges: Vec<AiContextRangeSelection>,
     /// A locally edited completed writing run can be restored after a browser
     /// restart without pretending that it was exported or revalidated.
     #[serde(default)]
@@ -333,6 +279,8 @@ pub struct AiConversation {
     pub messages: Vec<Value>,
     pub materials: Vec<AiMaterialReference>,
     pub attachment_ids: Vec<String>,
+    #[serde(default)]
+    pub context_ranges: Vec<AiContextRangeSelection>,
     /// Zero/false marks an old conversation whose inherited context cannot be
     /// proven to be the set that the user most recently reviewed.
     #[serde(default)]
@@ -350,6 +298,25 @@ struct AiAttachment {
     source_byte_len: u64,
     #[serde(default)]
     format: String,
+    created_at: u64,
+}
+
+/// Persisted structural metadata from `/context/inspect`.  It is intentionally summary-only:
+/// neither source bytes nor extracted text are retained here.
+#[derive(Clone, Serialize, Deserialize)]
+struct AiContextInspection {
+    id: String,
+    source_kind: String,
+    source_id: String,
+    #[serde(default)]
+    source: Option<String>,
+    format: String,
+    unit_kind: String,
+    unit_count: u32,
+    unit_version: String,
+    estimated_input_tokens: u32,
+    estimate_basis: String,
+    source_binding: Value,
     created_at: u64,
 }
 
@@ -429,7 +396,7 @@ impl Workspace {
                 // cannot prove which inherited materials were approved by the
                 // user in a previous version.  A new explicit replacement is
                 // required before it can be sent to any provider.
-                self.store.save("ai_conversation",&c.id,&AiConversation{id:c.id.clone(),title:c.title,title_manual:true,messages:c.messages.into_iter().map(|m|json!({"role":m.role,"content":m.content,"html":crate::document_render::rendered_html(&m.content)})).collect(),materials,attachment_ids:Vec::new(),context_revision:0,context_known:false,updated_at:now()})?;
+                self.store.save("ai_conversation",&c.id,&AiConversation{id:c.id.clone(),title:c.title,title_manual:true,messages:c.messages.into_iter().map(|m|json!({"role":m.role,"content":m.content,"html":crate::document_render::rendered_html(&m.content)})).collect(),materials,attachment_ids:Vec::new(),context_ranges:Vec::new(),context_revision:0,context_known:false,updated_at:now()})?;
             }
         }
         Ok(())
@@ -461,6 +428,7 @@ impl Workspace {
             messages: Vec::new(),
             materials: Vec::new(),
             attachment_ids: Vec::new(),
+            context_ranges: Vec::new(),
             context_revision: 1,
             context_known: true,
             updated_at: now(),
@@ -479,6 +447,7 @@ impl Workspace {
             revision: conversation.context_revision,
             materials: conversation.materials.clone(),
             attachment_ids: conversation.attachment_ids.clone(),
+            context_ranges: conversation.context_ranges.clone(),
             updated_at: conversation.updated_at,
         }
     }
@@ -498,16 +467,98 @@ impl Workspace {
                 .unwrap_or_else(|| json!([])),
         )
         .map_err(|_| Error::new("context_metadata_unknown"))?;
+        let context_ranges = serde_json::from_value(
+            summary
+                .get("context_ranges")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|_| Error::new("context_metadata_unknown"))?;
         Ok(AiContextManifest {
             revision: summary["context_revision"]
                 .as_u64()
                 .ok_or_else(|| Error::new("context_metadata_unknown"))?,
             materials,
             attachment_ids,
+            context_ranges,
             updated_at: summary["updated_at"]
                 .as_u64()
                 .ok_or_else(|| Error::new("context_metadata_unknown"))?,
         })
+    }
+
+    fn implicit_context_ranges(
+        materials: &[AiMaterialReference],
+        attachment_ids: &[String],
+    ) -> Vec<AiContextRangeSelection> {
+        let mut ranges = materials
+            .iter()
+            .map(|material| AiContextRangeSelection {
+                source_kind: "material".into(),
+                source_id: material.id.clone(),
+                source: Some(material.source.clone()),
+                mode: "all".into(),
+                ranges: Vec::new(),
+                inspection_hash: None,
+            })
+            .collect::<Vec<_>>();
+        ranges.extend(
+            attachment_ids
+                .iter()
+                .map(|attachment_id| AiContextRangeSelection {
+                    source_kind: "attachment".into(),
+                    source_id: attachment_id.clone(),
+                    source: None,
+                    mode: "all".into(),
+                    ranges: Vec::new(),
+                    inspection_hash: None,
+                }),
+        );
+        ranges.sort_by(|left, right| {
+            (&left.source_kind, &left.source_id, &left.source).cmp(&(
+                &right.source_kind,
+                &right.source_id,
+                &right.source,
+            ))
+        });
+        ranges
+    }
+
+    fn manifest_context_ranges(manifest: &AiContextManifest) -> Vec<AiContextRangeSelection> {
+        if manifest.context_ranges.is_empty() {
+            Self::implicit_context_ranges(&manifest.materials, &manifest.attachment_ids)
+        } else {
+            manifest.context_ranges.clone()
+        }
+    }
+
+    fn interval_set_contains(
+        current: &[AiContextUnitRange],
+        required: &[AiContextUnitRange],
+    ) -> bool {
+        required.iter().all(|needed| {
+            current
+                .iter()
+                .any(|available| available.start <= needed.start && available.end >= needed.end)
+        })
+    }
+
+    fn range_selection_contains(
+        current: &AiContextRangeSelection,
+        required: &AiContextRangeSelection,
+    ) -> bool {
+        if current.source_kind != required.source_kind
+            || current.source_id != required.source_id
+            || current.source != required.source
+        {
+            return false;
+        }
+        if current.mode == "all" {
+            return true;
+        }
+        current.mode == required.mode
+            && required.mode != "all"
+            && Self::interval_set_contains(&current.ranges, &required.ranges)
     }
 
     fn context_contains_manifest(
@@ -524,14 +575,25 @@ impl Workspace {
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        required
+        let sources_contained = required
             .materials
             .iter()
             .all(|item| current_materials.contains(&(item.id.as_str(), item.source.as_str())))
             && required
                 .attachment_ids
                 .iter()
-                .all(|item| current_attachments.contains(item.as_str()))
+                .all(|item| current_attachments.contains(item.as_str()));
+        if !sources_contained {
+            return false;
+        }
+        let current_ranges = Self::manifest_context_ranges(current);
+        Self::manifest_context_ranges(required)
+            .iter()
+            .all(|required| {
+                current_ranges
+                    .iter()
+                    .any(|current| Self::range_selection_contains(current, required))
+            })
     }
 
     fn public_context_manifest(conversation: &AiConversation) -> Value {
@@ -541,6 +603,7 @@ impl Workspace {
             "revision": manifest.revision,
             "materials": manifest.materials,
             "attachment_ids": manifest.attachment_ids,
+            "context_ranges": manifest.context_ranges,
             "updated_at": manifest.updated_at,
             "state": if conversation.context_known { "current" } else { "legacy_unknown" },
         })
@@ -649,6 +712,257 @@ impl Workspace {
         Ok(())
     }
 
+    fn context_source_binding_metadata(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+        source: Option<&str>,
+    ) -> Result<(Value, String, u64)> {
+        match (source_kind, source) {
+            ("material", Some("original")) => {
+                let material = self.store.summary("material", source_id)?;
+                Ok((
+                    json!({
+                        "kind":"material", "id":source_id, "source":"original",
+                        "source_sha256":material["source_sha256"], "revision":material["revision"],
+                    }),
+                    material["source_format"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    material["source_byte_len"].as_u64().unwrap_or(0),
+                ))
+            }
+            ("material", Some("redacted")) => {
+                let material = self.store.summary("material", source_id)?;
+                let result_id = material["result_id"]
+                    .as_str()
+                    .ok_or_else(|| Error::new("redacted_material_not_ready"))?;
+                let result = self.store.summary("result", result_id)?;
+                Ok((
+                    json!({
+                        "kind":"material", "id":source_id, "source":"redacted",
+                        "result_id":result_id, "output_sha256":result["output_sha256"],
+                        "revision":material["revision"],
+                    }),
+                    "text".into(),
+                    result["text_byte_len"].as_u64().unwrap_or(0),
+                ))
+            }
+            ("attachment", None) => {
+                let attachment = self.store.summary("ai_attachment", source_id)?;
+                Ok((
+                    json!({
+                        "kind":"attachment", "id":source_id,
+                        "source_sha256":attachment["sha256"],
+                    }),
+                    attachment["format"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    attachment["source_byte_len"].as_u64().unwrap_or(0),
+                ))
+            }
+            _ => Err(Error::new("context_scope_invalid")),
+        }
+    }
+
+    fn normalize_context_intervals(
+        mut ranges: Vec<AiContextUnitRange>,
+    ) -> Result<Vec<AiContextUnitRange>> {
+        if ranges
+            .iter()
+            .any(|range| range.start == 0 || range.end < range.start)
+        {
+            return Err(Error::new("context_scope_invalid"));
+        }
+        ranges.sort_by_key(|range| (range.start, range.end));
+        let mut canonical = Vec::<AiContextUnitRange>::new();
+        for range in ranges {
+            match canonical.last_mut() {
+                Some(previous) if range.start <= previous.end.saturating_add(1) => {
+                    previous.end = previous.end.max(range.end);
+                }
+                _ => canonical.push(range),
+            }
+        }
+        Ok(canonical)
+    }
+
+    /// Normalize legacy absence to `all`; otherwise require one selection for every selected
+    /// source and bind explicit unit ranges to a current structural inspection record.
+    fn canonical_context_ranges_metadata(
+        &self,
+        materials: &[AiMaterialReference],
+        attachment_ids: &[String],
+        supplied: &[AiContextRangeSelection],
+    ) -> Result<Vec<AiContextRangeSelection>> {
+        self.check_context_shape_metadata(materials, attachment_ids)?;
+        if supplied.is_empty() {
+            return Ok(Self::implicit_context_ranges(materials, attachment_ids));
+        }
+        let expected = Self::implicit_context_ranges(materials, attachment_ids)
+            .into_iter()
+            .map(|range| (range.source_kind, range.source_id, range.source))
+            .collect::<BTreeSet<_>>();
+        let mut grouped =
+            BTreeMap::<(String, String, Option<String>), AiContextRangeSelection>::new();
+        for range in supplied {
+            let key = (
+                range.source_kind.clone(),
+                range.source_id.clone(),
+                range.source.clone(),
+            );
+            if !expected.contains(&key)
+                || range.source_id.is_empty()
+                || range.source_id.len() > 200
+                || !["all", "pages", "paragraphs"].contains(&range.mode.as_str())
+            {
+                return Err(Error::new("context_scope_invalid"));
+            }
+            match grouped.get_mut(&key) {
+                Some(existing) => {
+                    if existing.mode != range.mode
+                        || existing.inspection_hash != range.inspection_hash
+                    {
+                        return Err(Error::new("context_scope_invalid"));
+                    }
+                    existing.ranges.extend(range.ranges.clone());
+                }
+                None => {
+                    grouped.insert(key, range.clone());
+                }
+            }
+        }
+        if grouped.len() != expected.len() || grouped.keys().any(|key| !expected.contains(key)) {
+            return Err(Error::new("context_scope_invalid"));
+        }
+
+        let mut canonical = Vec::with_capacity(grouped.len());
+        for (_, mut range) in grouped {
+            if range.mode == "all" {
+                if !range.ranges.is_empty() {
+                    return Err(Error::new("context_scope_invalid"));
+                }
+                range.inspection_hash = None;
+            } else {
+                if range.ranges.is_empty()
+                    || range.inspection_hash.as_deref().is_none_or(str::is_empty)
+                {
+                    return Err(Error::new("context_scope_invalid"));
+                }
+                range.ranges = Self::normalize_context_intervals(range.ranges)?;
+                let inspection: AiContextInspection = match self.store.get(
+                    "ai_context_inspection",
+                    range.inspection_hash.as_deref().unwrap_or_default(),
+                ) {
+                    Ok(value) => value,
+                    Err(error) if error.code == "not_found" => {
+                        return Err(Error::new("context_prepare_required"));
+                    }
+                    Err(error) => return Err(error),
+                };
+                let (binding, _, _) = self.context_source_binding_metadata(
+                    &range.source_kind,
+                    &range.source_id,
+                    range.source.as_deref(),
+                )?;
+                if inspection.id != range.inspection_hash.clone().unwrap_or_default()
+                    || inspection.source_kind != range.source_kind
+                    || inspection.source_id != range.source_id
+                    || inspection.source != range.source
+                    || inspection.source_binding != binding
+                {
+                    return Err(Error::new("context_prepare_required"));
+                }
+                let expected_unit = if range.mode == "pages" {
+                    "page"
+                } else {
+                    "paragraph"
+                };
+                if inspection.unit_kind != expected_unit
+                    || range
+                        .ranges
+                        .iter()
+                        .any(|item| item.end > inspection.unit_count)
+                {
+                    return Err(Error::new("context_scope_invalid"));
+                }
+            }
+            canonical.push(range);
+        }
+        canonical.sort_by(|left, right| {
+            (&left.source_kind, &left.source_id, &left.source).cmp(&(
+                &right.source_kind,
+                &right.source_id,
+                &right.source,
+            ))
+        });
+        Ok(canonical)
+    }
+
+    fn requested_range<'a>(
+        requested_scope: &'a [AiContextRangeSelection],
+        source_kind: &str,
+        source_id: &str,
+        source: Option<&str>,
+    ) -> Result<&'a AiContextRangeSelection> {
+        requested_scope
+            .iter()
+            .find(|range| {
+                range.source_kind == source_kind
+                    && range.source_id == source_id
+                    && range.source.as_deref() == source
+            })
+            .ok_or_else(|| Error::new("context_prepare_required"))
+    }
+
+    fn requested_range_estimate(
+        &self,
+        requested: &AiContextRangeSelection,
+        all_source_tokens: usize,
+    ) -> Result<usize> {
+        if requested.mode == "all" {
+            return Ok(all_source_tokens);
+        }
+        let inspection = self
+            .requested_context_inspection(requested)?
+            .ok_or_else(|| Error::new("context_prepare_required"))?;
+        if inspection.unit_count == 0 {
+            return Err(Error::new("context_prepare_required"));
+        }
+        let units = requested.ranges.iter().fold(0_u64, |total, range| {
+            total.saturating_add(u64::from(
+                range.end.saturating_sub(range.start).saturating_add(1),
+            ))
+        });
+        let per_unit = u64::from(inspection.estimated_input_tokens)
+            .saturating_add(u64::from(inspection.unit_count).saturating_sub(1))
+            / u64::from(inspection.unit_count);
+        Ok(usize::try_from(units.saturating_mul(per_unit)).unwrap_or(usize::MAX))
+    }
+
+    fn requested_context_inspection(
+        &self,
+        requested: &AiContextRangeSelection,
+    ) -> Result<Option<AiContextInspection>> {
+        if requested.mode == "all" {
+            return Ok(None);
+        }
+        let hash = requested
+            .inspection_hash
+            .as_deref()
+            .ok_or_else(|| Error::new("context_prepare_required"))?;
+        let inspection: AiContextInspection = match self.store.get("ai_context_inspection", hash) {
+            Ok(value) => value,
+            Err(error) if error.code == "not_found" => {
+                return Err(Error::new("context_prepare_required"));
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some(inspection))
+    }
+
     fn check_material_policy_metadata(
         &self,
         refs: &[AiMaterialReference],
@@ -685,13 +999,184 @@ impl Workspace {
         Ok(())
     }
 
+    /// Inspect only local structure after taking Parse admission.  This endpoint never invokes a
+    /// model or OCR; PDFs delegate their page-count-only operation to the isolated worker.
+    pub async fn inspect_ai_context_source(
+        &self,
+        request: AiContextInspectRequest,
+    ) -> Result<Value> {
+        if request.source_id.is_empty() || request.source_id.len() > 200 {
+            return Err(Error::new("context_scope_invalid"));
+        }
+        let cancel = CancellationToken::new();
+        let _parse = self
+            .acquire_admission(AdmissionClass::Parse, &cancel)
+            .await?;
+        let (binding, _, _) = self.context_source_binding_metadata(
+            &request.source_kind,
+            &request.source_id,
+            request.source.as_deref(),
+        )?;
+        let format: String;
+        let (unit_kind, unit_count, unit_version, estimated_input_tokens, estimate_basis): (
+            String,
+            u32,
+            String,
+            u32,
+            String,
+        ) = match (request.source_kind.as_str(), request.source.as_deref()) {
+            ("material", Some("redacted")) => {
+                let material = self.material(&request.source_id)?;
+                let result = self.read_result(
+                    material
+                        .result_id
+                        .as_deref()
+                        .ok_or_else(|| Error::new("redacted_material_not_ready"))?,
+                )?;
+                format = "text".into();
+                let units = context_text_segments(&result.text).len();
+                (
+                    "paragraph".into(),
+                    u32::try_from(units).unwrap_or(u32::MAX),
+                    "paragraph-v1".into(),
+                    u32::try_from(units.saturating_mul(1024)).unwrap_or(u32::MAX),
+                    "paragraph_v1_upper_bound".into(),
+                )
+            }
+            ("material", Some("original")) => {
+                let material = self.material(&request.source_id)?;
+                if material.original_text.is_empty() {
+                    let bytes = self.store.raw("source", &material.id)?;
+                    if hash(&bytes) != material.source_sha256 {
+                        return Err(Error::new("source_integrity_failed"));
+                    }
+                    format = context_format(&material.name);
+                    if format == "pdf" {
+                        let metadata = PdfDocumentWorker::metadata(&bytes, &cancel).await?;
+                        (
+                            "page".into(),
+                            metadata.page_count,
+                            "pdf-page-v1".into(),
+                            metadata.estimated_input_tokens,
+                            metadata.estimate_basis,
+                        )
+                    } else if ["txt", "md", "markdown"].contains(&format.as_str()) {
+                        let text = std::str::from_utf8(&bytes)
+                            .map_err(|_| Error::new("invalid_text_encoding"))?;
+                        let units = context_text_segments(text).len();
+                        (
+                            "paragraph".into(),
+                            u32::try_from(units).unwrap_or(u32::MAX),
+                            "paragraph-v1".into(),
+                            u32::try_from(units.saturating_mul(1024)).unwrap_or(u32::MAX),
+                            "paragraph_v1_upper_bound".into(),
+                        )
+                    } else {
+                        ("none".into(), 0, "none-v1".into(), 0, "all_only".into())
+                    }
+                } else {
+                    format = context_format(&material.name);
+                    let units = context_text_segments(&material.original_text).len();
+                    (
+                        "paragraph".into(),
+                        u32::try_from(units).unwrap_or(u32::MAX),
+                        "paragraph-v1".into(),
+                        u32::try_from(units.saturating_mul(1024)).unwrap_or(u32::MAX),
+                        "paragraph_v1_upper_bound".into(),
+                    )
+                }
+            }
+            ("attachment", None) => {
+                let attachment: AiAttachment =
+                    self.store.get("ai_attachment", &request.source_id)?;
+                let bytes = self.store.raw("ai_attachment_source", &attachment.id)?;
+                if hash(&bytes) != attachment.sha256 {
+                    return Err(Error::new("source_integrity_failed"));
+                }
+                format = context_format(&attachment.name);
+                if format == "pdf" {
+                    let metadata = PdfDocumentWorker::metadata(&bytes, &cancel).await?;
+                    (
+                        "page".into(),
+                        metadata.page_count,
+                        "pdf-page-v1".into(),
+                        metadata.estimated_input_tokens,
+                        metadata.estimate_basis,
+                    )
+                } else if ["txt", "md", "markdown"].contains(&format.as_str()) {
+                    let text = std::str::from_utf8(&bytes)
+                        .map_err(|_| Error::new("invalid_text_encoding"))?;
+                    let units = context_text_segments(text).len();
+                    (
+                        "paragraph".into(),
+                        u32::try_from(units).unwrap_or(u32::MAX),
+                        "paragraph-v1".into(),
+                        u32::try_from(units.saturating_mul(1024)).unwrap_or(u32::MAX),
+                        "paragraph_v1_upper_bound".into(),
+                    )
+                } else {
+                    ("none".into(), 0, "none-v1".into(), 0, "all_only".into())
+                }
+            }
+            _ => return Err(Error::new("context_scope_invalid")),
+        };
+        let (current_binding, _, _) = self.context_source_binding_metadata(
+            &request.source_kind,
+            &request.source_id,
+            request.source.as_deref(),
+        )?;
+        if current_binding != binding {
+            return Err(Error::new("context_prepare_required"));
+        }
+        let inspection_hash = hash(&serde_json::to_vec(&json!({
+            "source_kind":request.source_kind.clone(),
+            "source_id":request.source_id.clone(),
+            "source":request.source.clone(),
+            "format":format.clone(),
+            "unit_kind":unit_kind.clone(),
+            "unit_count":unit_count,
+            "unit_version":unit_version.clone(),
+            "estimated_input_tokens":estimated_input_tokens,
+            "estimate_basis":estimate_basis.clone(),
+            "source_binding":binding.clone(),
+        }))?);
+        let record = AiContextInspection {
+            id: inspection_hash.clone(),
+            source_kind: request.source_kind.clone(),
+            source_id: request.source_id.clone(),
+            source: request.source.clone(),
+            format: format.clone(),
+            unit_kind: unit_kind.clone(),
+            unit_count,
+            unit_version: unit_version.clone(),
+            estimated_input_tokens,
+            estimate_basis: estimate_basis.clone(),
+            source_binding: binding,
+            created_at: now(),
+        };
+        let _gate = self.lock()?;
+        self.store
+            .save("ai_context_inspection", &inspection_hash, &record)?;
+        Ok(serde_json::to_value(AiContextInspectResponse {
+            source_kind: request.source_kind,
+            source_id: request.source_id,
+            source: request.source,
+            format,
+            unit_kind,
+            unit_count,
+            unit_version,
+            inspection_hash,
+            estimated_input_tokens,
+            estimate_basis,
+        })?)
+    }
+
     fn context_plan_from_metadata(
         &self,
         request: &AiRunRequest,
         selection: &AiModelSelection,
         manifest: Option<&AiContextManifest>,
     ) -> Result<AiContextPlan> {
-        const PER_SOURCE_TARGET_TOKENS: usize = 4 * 1024;
         let capabilities = self.ai_model_capabilities(selection)?;
         let references = manifest
             .map(|value| value.materials.as_slice())
@@ -699,8 +1184,13 @@ impl Workspace {
         let attachment_ids = manifest
             .map(|value| value.attachment_ids.as_slice())
             .unwrap_or(request.attachment_ids.as_slice());
+        let supplied_ranges = manifest
+            .map(|value| value.context_ranges.as_slice())
+            .unwrap_or(request.context_ranges.as_slice());
         self.check_context_shape_metadata(references, attachment_ids)?;
         self.check_material_policy_metadata(references, attachment_ids, selection)?;
+        let requested_scope =
+            self.canonical_context_ranges_metadata(references, attachment_ids, supplied_ranges)?;
 
         let request_text = context_request_text(request);
         let system_tokens = estimate_text_tokens(AI_SYSTEM);
@@ -747,8 +1237,27 @@ impl Workspace {
                         .to_owned(),
                 )
             };
-            let format = material["source_format"].as_str().unwrap_or_default();
-            let visual = reference.source == "original" && is_visual_context_format(format);
+            let requested = Self::requested_range(
+                &requested_scope,
+                "material",
+                &reference.id,
+                Some(&reference.source),
+            )?;
+            let inspection = self.requested_context_inspection(requested)?;
+            let format = if reference.source == "redacted" {
+                "text".to_owned()
+            } else {
+                inspection
+                    .as_ref()
+                    .map(|value| value.format.clone())
+                    .unwrap_or_else(|| {
+                        material["source_format"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+            };
+            let visual = reference.source == "original" && is_visual_context_format(&format);
             source_bindings.push(json!({
                 "kind":"material",
                 "id":reference.id,
@@ -757,7 +1266,9 @@ impl Workspace {
                 "revision":material["revision"],
                 "result_id":material["result_id"],
             }));
-            if source_bytes == 0 || source_hash.is_empty() || (visual && format.is_empty()) {
+            if source_hash.is_empty()
+                || (inspection.is_none() && (source_bytes == 0 || (visual && format.is_empty())))
+            {
                 conservative = true;
                 omitted_scope.push(AiContextOmission {
                     source_kind: "material".into(),
@@ -768,12 +1279,13 @@ impl Workspace {
                 });
                 continue;
             }
-            let source_tokens = if visual {
+            let all_source_tokens = if visual {
                 conservative = true;
                 estimate_image_tokens(usize::try_from(source_bytes).unwrap_or(usize::MAX))
             } else {
                 usize::try_from(source_bytes).unwrap_or(usize::MAX)
             };
+            let source_tokens = self.requested_range_estimate(requested, all_source_tokens)?;
             let selected = if visual {
                 if source_tokens > remaining {
                     requires_visual_scope = true;
@@ -788,7 +1300,18 @@ impl Workspace {
                 }
                 source_tokens
             } else {
-                source_tokens.min(PER_SOURCE_TARGET_TOKENS).min(remaining)
+                if source_tokens > remaining {
+                    requires_visual_scope = true;
+                    omitted_scope.push(AiContextOmission {
+                        source_kind: "material".into(),
+                        source_id: reference.id.clone(),
+                        reason: "budget_cut".into(),
+                        estimated_tokens: u32::try_from(source_tokens).unwrap_or(u32::MAX),
+                        locators: Vec::new(),
+                    });
+                    continue;
+                }
+                source_tokens
             };
             if selected == 0 {
                 omitted_scope.push(AiContextOmission {
@@ -806,7 +1329,7 @@ impl Workspace {
                 source_kind: "material".into(),
                 source_id: reference.id.clone(),
                 source: Some(reference.source.clone()),
-                format: (!format.is_empty()).then(|| format.to_owned()),
+                format: (!format.is_empty()).then(|| format.clone()),
                 locators: Vec::new(),
                 estimated_tokens: u32::try_from(selected).unwrap_or(u32::MAX),
             });
@@ -825,13 +1348,19 @@ impl Workspace {
         for attachment_id in attachment_ids {
             let attachment = self.store.summary("ai_attachment", attachment_id)?;
             let source_bytes = attachment["source_byte_len"].as_u64().unwrap_or(0);
-            let format = attachment["format"].as_str().unwrap_or_default();
+            let requested =
+                Self::requested_range(&requested_scope, "attachment", attachment_id, None)?;
+            let inspection = self.requested_context_inspection(requested)?;
+            let format = inspection
+                .as_ref()
+                .map(|value| value.format.clone())
+                .unwrap_or_else(|| attachment["format"].as_str().unwrap_or_default().to_owned());
             source_bindings.push(json!({
                 "kind":"attachment",
                 "id":attachment_id,
                 "source_sha256":attachment["sha256"],
             }));
-            if source_bytes == 0 || format.is_empty() {
+            if inspection.is_none() && (source_bytes == 0 || format.is_empty()) {
                 conservative = true;
                 omitted_scope.push(AiContextOmission {
                     source_kind: "attachment".into(),
@@ -843,13 +1372,14 @@ impl Workspace {
                 continue;
             }
             let source_bytes = usize::try_from(source_bytes).unwrap_or(usize::MAX);
-            let visual = is_visual_context_format(format);
-            let source_tokens = if visual {
+            let visual = is_visual_context_format(&format);
+            let all_source_tokens = if visual {
                 conservative = true;
                 estimate_image_tokens(source_bytes)
             } else {
                 source_bytes
             };
+            let source_tokens = self.requested_range_estimate(requested, all_source_tokens)?;
             let selected = if visual {
                 // A visual input is indivisible at preflight. Do not apply the text paragraph
                 // target: reserve its complete conservative estimate or reject before raw bytes,
@@ -867,7 +1397,18 @@ impl Workspace {
                 }
                 source_tokens
             } else {
-                source_tokens.min(PER_SOURCE_TARGET_TOKENS).min(remaining)
+                if source_tokens > remaining {
+                    requires_visual_scope = true;
+                    omitted_scope.push(AiContextOmission {
+                        source_kind: "attachment".into(),
+                        source_id: attachment_id.clone(),
+                        reason: "budget_cut".into(),
+                        estimated_tokens: u32::try_from(source_tokens).unwrap_or(u32::MAX),
+                        locators: Vec::new(),
+                    });
+                    continue;
+                }
+                source_tokens
             };
             if selected == 0 {
                 omitted_scope.push(AiContextOmission {
@@ -885,7 +1426,7 @@ impl Workspace {
                 source_kind: "attachment".into(),
                 source_id: attachment_id.clone(),
                 source: None,
-                format: Some(format.to_owned()),
+                format: Some(format),
                 locators: Vec::new(),
                 estimated_tokens: u32::try_from(selected).unwrap_or(u32::MAX),
             });
@@ -918,6 +1459,7 @@ impl Workspace {
             },
             capabilities,
             estimate,
+            requested_scope,
             selected_scope,
             omitted_scope,
             &json!({
@@ -972,6 +1514,7 @@ impl Workspace {
             if request.context_revision != Some(manifest.revision)
                 || !request.materials.is_empty()
                 || !request.attachment_ids.is_empty()
+                || !request.context_ranges.is_empty()
             {
                 return Err(Error::new("context_prepare_required"));
             }
@@ -984,6 +1527,7 @@ impl Workspace {
             "provider_id": selection.provider_id,
             "model": selection.model,
             "plan": plan.public_view(),
+            "schema_version": plan.schema_version,
             "plan_hash": plan.plan_hash,
             "stage": plan.stage,
             "capabilities": plan.capabilities,
@@ -994,7 +1538,7 @@ impl Workspace {
     }
 
     fn writing_draft_content(&self, value: Value) -> Result<WritingDraftContent> {
-        let content: WritingDraftContent =
+        let mut content: WritingDraftContent =
             serde_json::from_value(value).map_err(|_| Error::new("invalid_ai_request"))?;
         if content.document_type.len() > 200
             || content.prompt.len() > 128 * 1024
@@ -1025,6 +1569,11 @@ impl Workspace {
             return Err(Error::new("invalid_ai_request"));
         }
         self.check_context_shape(&content.materials, &content.attachment_ids)?;
+        content.context_ranges = self.canonical_context_ranges_metadata(
+            &content.materials,
+            &content.attachment_ids,
+            &content.context_ranges,
+        )?;
         Ok(content)
     }
 
@@ -1116,28 +1665,28 @@ impl Workspace {
         Ok(json!({"deleted":true,"id":id,"revision":expected_revision}))
     }
 
-    fn run_uses_removed_context(
+    fn run_uses_deselected_context(
         run: &AiRun,
         conversation_id: &str,
-        removed_materials: &BTreeSet<(String, String)>,
-        removed_attachments: &BTreeSet<String>,
+        current: &AiContextManifest,
     ) -> bool {
         if run.request.conversation_id.as_deref() != Some(conversation_id)
             || !["queued", "running"].contains(&run.status.as_str())
         {
             return false;
         }
-        let (materials, attachments) = run
-            .context_manifest
-            .as_ref()
-            .map(|manifest| (&manifest.materials, &manifest.attachment_ids))
-            .unwrap_or((&run.request.materials, &run.request.attachment_ids));
-        materials
-            .iter()
-            .any(|item| removed_materials.contains(&(item.id.clone(), item.source.clone())))
-            || attachments
-                .iter()
-                .any(|item| removed_attachments.contains(item))
+        let required =
+            run.context_manifest
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| AiContextManifest {
+                    revision: run.request.context_revision.unwrap_or_default(),
+                    materials: run.request.materials.clone(),
+                    attachment_ids: run.request.attachment_ids.clone(),
+                    context_ranges: run.request.context_ranges.clone(),
+                    updated_at: 0,
+                });
+        !Self::context_contains_manifest(current, &required)
     }
 
     /// Replaces, rather than merges, the material set.  Removing a selected
@@ -1149,8 +1698,11 @@ impl Workspace {
         expected_revision: u64,
         materials: Vec<AiMaterialReference>,
         attachment_ids: Vec<String>,
+        context_ranges: Vec<AiContextRangeSelection>,
     ) -> Result<Value> {
         self.check_context_shape(&materials, &attachment_ids)?;
+        let context_ranges =
+            self.canonical_context_ranges_metadata(&materials, &attachment_ids, &context_ranges)?;
         let _gate = self.lock()?;
         let mut conversation: AiConversation = self.store.get("ai_conversation", id)?;
         if conversation.context_revision != expected_revision {
@@ -1180,8 +1732,50 @@ impl Workspace {
             .cloned()
             .collect::<BTreeSet<_>>();
 
+        let previous_manifest = Self::context_manifest(&conversation);
+        let mut current_manifest = previous_manifest.clone();
+        current_manifest.materials = materials.clone();
+        current_manifest.attachment_ids = attachment_ids.clone();
+        current_manifest.context_ranges = context_ranges.clone();
+        let previous_ranges = Self::manifest_context_ranges(&previous_manifest);
+        let current_ranges = Self::manifest_context_ranges(&current_manifest);
+        let mut changed_sources = BTreeSet::<(String, String, Option<String>)>::new();
+        for range in previous_ranges.iter().chain(current_ranges.iter()) {
+            let key = (
+                range.source_kind.clone(),
+                range.source_id.clone(),
+                range.source.clone(),
+            );
+            let previous = previous_ranges.iter().find(|item| {
+                (
+                    item.source_kind.as_str(),
+                    item.source_id.as_str(),
+                    item.source.as_deref(),
+                ) == (
+                    range.source_kind.as_str(),
+                    range.source_id.as_str(),
+                    range.source.as_deref(),
+                )
+            });
+            let current = current_ranges.iter().find(|item| {
+                (
+                    item.source_kind.as_str(),
+                    item.source_id.as_str(),
+                    item.source.as_deref(),
+                ) == (
+                    range.source_kind.as_str(),
+                    range.source_id.as_str(),
+                    range.source.as_deref(),
+                )
+            });
+            if previous != current {
+                changed_sources.insert(key);
+            }
+        }
+
         conversation.materials = materials;
         conversation.attachment_ids = attachment_ids;
+        conversation.context_ranges = context_ranges;
         conversation.context_known = true;
         conversation.context_revision = conversation
             .context_revision
@@ -1191,7 +1785,10 @@ impl Workspace {
 
         let mut cancelled_run_ids = Vec::new();
         let mut rows = vec![Store::encoded("ai_conversation", id, &conversation)?];
-        if !removed_materials.is_empty() || !removed_attachments.is_empty() {
+        if !removed_materials.is_empty()
+            || !removed_attachments.is_empty()
+            || !changed_sources.is_empty()
+        {
             let mut relations = removed_materials
                 .iter()
                 .map(|(material_id, source)| (format!("material_{source}"), material_id.clone()))
@@ -1201,16 +1798,25 @@ impl Workspace {
                     .iter()
                     .map(|attachment_id| ("attachment".into(), attachment_id.clone())),
             );
+            relations.extend(changed_sources.iter().map(|(kind, source_id, source)| {
+                let relation = if kind == "material" {
+                    format!("material_{}", source.as_deref().unwrap_or_default())
+                } else {
+                    "attachment".into()
+                };
+                (relation, source_id.clone())
+            }));
+            relations.sort();
+            relations.dedup();
             let affected =
                 self.store
                     .related_ids_with_status("ai_run", &relations, &["queued", "running"])?;
             for run_id in affected {
                 let mut run: AiRun = self.store.get("ai_run", &run_id)?;
-                if !Self::run_uses_removed_context(
+                if !Self::run_uses_deselected_context(
                     &run,
                     id,
-                    &removed_materials,
-                    &removed_attachments,
+                    &Self::context_manifest(&conversation),
                 ) {
                     continue;
                 }
@@ -1279,7 +1885,7 @@ impl Workspace {
         let preparation_hash =
             self.context_preparation_hash_from_metadata(&manifest, &selection, &plan)?;
         Ok(json!({
-            "manifest": {"conversation_id":id,"revision":manifest.revision,"materials":manifest.materials,"attachment_ids":manifest.attachment_ids,"updated_at":manifest.updated_at,"state":"current"},
+            "manifest": {"conversation_id":id,"revision":manifest.revision,"materials":manifest.materials,"attachment_ids":manifest.attachment_ids,"context_ranges":manifest.context_ranges,"updated_at":manifest.updated_at,"state":"current"},
             "provider_id": selection.provider_id,
             "model": selection.model,
             "preparation_hash": preparation_hash,
@@ -1319,7 +1925,7 @@ impl Workspace {
             .map(|verification| verification.public_view(run))
             .unwrap_or_else(|| AiCitationVerification::legacy_pending().public_view(run));
         let context_plan = run.context_plan.as_ref().map(AiContextPlan::public_view);
-        json!({"id":run.id,"document_id":run.writing_document_id(),"kind":run.kind,"status":run.status,"stage":run.stage,"prompt":run.prompt,"title":run.title,"content":run.content,"html":run.html,"citations":run.citations,"citation_verification":citation_verification,"tool_steps":run.tool_steps,"error_code":run.error_code,"usage":run.usage,"created_at":run.created_at,"updated_at":run.updated_at,"provider_id":run.provider_id,"model":run.model,"materials":run.request.materials,"attachment_ids":run.request.attachment_ids,"conversation_id":run.request.conversation_id,"context_revision":run.request.context_revision,"context_manifest":run.context_manifest,"context_plan":context_plan,"parent_id":run.request.parent_id,"revision":run.revision,"case_date":run.request.case_date,"match_mode":run.request.match_mode.as_deref().unwrap_or("all"),"version_scope":run.request.search_version_scope(),"version_status":run.request.version_status})
+        json!({"id":run.id,"document_id":run.writing_document_id(),"kind":run.kind,"status":run.status,"stage":run.stage,"prompt":run.prompt,"title":run.title,"content":run.content,"html":run.html,"citations":run.citations,"citation_verification":citation_verification,"tool_steps":run.tool_steps,"error_code":run.error_code,"usage":run.usage,"created_at":run.created_at,"updated_at":run.updated_at,"provider_id":run.provider_id,"model":run.model,"materials":run.request.materials,"attachment_ids":run.request.attachment_ids,"context_ranges":run.request.context_ranges,"conversation_id":run.request.conversation_id,"context_revision":run.request.context_revision,"context_manifest":run.context_manifest,"context_plan":context_plan,"parent_id":run.request.parent_id,"revision":run.revision,"case_date":run.request.case_date,"match_mode":run.request.match_mode.as_deref().unwrap_or("all"),"version_scope":run.request.search_version_scope(),"version_status":run.request.version_status})
     }
     pub fn ai_run(&self, id: &str) -> Result<Value> {
         Ok(Self::public_run(&self.store.get("ai_run", id)?))
@@ -1490,7 +2096,10 @@ impl Workspace {
             }
             // Chat context is never reconstructed by unioning the current form with old
             // conversation data. The client submits only its reviewed revision/hash.
-            if !request.materials.is_empty() || !request.attachment_ids.is_empty() {
+            if !request.materials.is_empty()
+                || !request.attachment_ids.is_empty()
+                || !request.context_ranges.is_empty()
+            {
                 return Err(Error::new("context_prepare_required"));
             }
             let base = AiRunRequest {
@@ -1508,6 +2117,7 @@ impl Workspace {
             }
             request.materials = manifest.materials.clone();
             request.attachment_ids = manifest.attachment_ids.clone();
+            request.context_ranges = Self::manifest_context_ranges(&manifest);
             let plan = self.context_plan_from_metadata(&request, &selection, Some(&manifest))?;
             if request
                 .context_plan_hash
@@ -1518,6 +2128,11 @@ impl Workspace {
             }
             (Some(manifest), plan)
         } else {
+            request.context_ranges = self.canonical_context_ranges_metadata(
+                &request.materials,
+                &request.attachment_ids,
+                &request.context_ranges,
+            )?;
             let plan = self.context_plan_from_metadata(&request, &selection, None)?;
             if request
                 .context_plan_hash
@@ -2001,8 +2616,10 @@ impl Workspace {
     ) -> Result<()> {
         let planned_materials = plan.selected_scope.materials.clone();
         let planned_attachments = plan.selected_scope.attachments.clone();
-        let mut material_ranges = BTreeMap::<String, AiContextRange>::new();
-        let mut attachment_ranges = BTreeMap::<String, AiContextRange>::new();
+        // Range ledger identity includes a material variant.  Original and redacted output can
+        // share a material ID but bind distinct protected bytes, locators and token charges.
+        let mut material_ranges = BTreeMap::<(String, Option<String>), AiContextRange>::new();
+        let mut attachment_ranges = BTreeMap::<(String, Option<String>), AiContextRange>::new();
         let mut history_tokens = 0_u32;
         for actual in tracker.selected_ranges() {
             if actual.source_kind == "history" {
@@ -2010,38 +2627,34 @@ impl Workspace {
                 continue;
             }
             let template = match actual.source_kind.as_str() {
-                "material" => planned_materials
-                    .iter()
-                    .find(|item| item.source_id == actual.source_id),
-                "attachment" => planned_attachments
-                    .iter()
-                    .find(|item| item.source_id == actual.source_id),
+                "material" => planned_materials.iter().find(|item| {
+                    item.source_id == actual.source_id && item.source == actual.source
+                }),
+                "attachment" => planned_attachments.iter().find(|item| {
+                    item.source_id == actual.source_id && item.source == actual.source
+                }),
                 _ => None,
-            };
-            let mut range = actual.clone();
-            if let Some(template) = template {
-                range.source = template.source.clone();
-                range.format = template.format.clone();
             }
+            .ok_or_else(|| Error::new("context_scope_invalid"))?;
             let target = match actual.source_kind.as_str() {
                 "material" => &mut material_ranges,
                 "attachment" => &mut attachment_ranges,
                 _ => continue,
             };
             let entry = target
-                .entry(actual.source_id.clone())
+                .entry((actual.source_id.clone(), actual.source.clone()))
                 .or_insert_with(|| AiContextRange {
                     source_kind: actual.source_kind.clone(),
                     source_id: actual.source_id.clone(),
-                    source: range.source.clone(),
-                    format: range.format.clone(),
+                    source: actual.source.clone(),
+                    format: template.format.clone(),
                     locators: Vec::new(),
                     estimated_tokens: 0,
                 });
-            entry.locators.extend(range.locators);
+            entry.locators.extend(actual.locators);
             entry.estimated_tokens = entry
                 .estimated_tokens
-                .saturating_add(range.estimated_tokens);
+                .saturating_add(actual.estimated_tokens);
         }
         for omitted in &mut omissions {
             omitted.locators.sort();
@@ -2136,9 +2749,9 @@ impl Workspace {
                     &tracker,
                     "material",
                     &material.id,
+                    Some("redacted"),
                     &result.text,
-                    &r.request,
-                    &mut omissions,
+                    &plan.requested_scope,
                 )?
             } else {
                 let expected_revision = r
@@ -2171,9 +2784,9 @@ impl Workspace {
                         &tracker,
                         "material",
                         &material.id,
+                        Some("original"),
                         &material.original_text,
-                        &r.request,
-                        &mut omissions,
+                        &plan.requested_scope,
                     )?
                 } else {
                     let bytes = self.store.raw("source", &material.id)?;
@@ -2189,27 +2802,46 @@ impl Workspace {
                         let _gate = self.lock()?;
                         self.store.save("material", &material.id, &material)?;
                     }
+                    let requested = Self::requested_range(
+                        &plan.requested_scope,
+                        "material",
+                        &material.id,
+                        Some("original"),
+                    )?;
+                    let pdf_ranges = (context_format(&material.name) == "pdf"
+                        && requested.mode == "pages")
+                        .then(|| {
+                            requested
+                                .ranges
+                                .iter()
+                                .map(|range| (range.start, range.end))
+                                .collect::<Vec<_>>()
+                        });
                     let extracted = self
-                        .extract_ai_attachment(
+                        .extract_ai_attachment_scoped(
                             &material.name,
                             &bytes,
                             selection,
                             cancel,
                             Some(&tracker),
                             Some(&material.id),
+                            Some("material"),
+                            Some("original"),
+                            pdf_ranges.as_deref(),
                         )
                         .await?;
-                    // The worker reserves each rendered/OCR page before expensive work. Select
-                    // structural paragraphs from the returned text as the actual prompt scope;
-                    // any existing page reservation makes this deliberately conservative.
-                    select_context_text(
-                        &tracker,
-                        "material",
-                        &material.id,
-                        &extracted,
-                        &r.request,
-                        &mut omissions,
-                    )?
+                    if context_format(&material.name) == "pdf" {
+                        extracted
+                    } else {
+                        select_context_text(
+                            &tracker,
+                            "material",
+                            &material.id,
+                            Some("original"),
+                            &extracted,
+                            &plan.requested_scope,
+                        )?
+                    }
                 }
             };
             if !text.is_empty() {
@@ -2232,24 +2864,42 @@ impl Workspace {
                 self.store
                     .save("ai_attachment", &attachment.id, &attachment)?;
             }
+            let requested =
+                Self::requested_range(&plan.requested_scope, "attachment", &attachment.id, None)?;
+            let pdf_ranges = (context_format(&attachment.name) == "pdf"
+                && requested.mode == "pages")
+                .then(|| {
+                    requested
+                        .ranges
+                        .iter()
+                        .map(|range| (range.start, range.end))
+                        .collect::<Vec<_>>()
+                });
             let extracted = self
-                .extract_ai_attachment(
+                .extract_ai_attachment_scoped(
                     &attachment.name,
                     &bytes,
                     selection,
                     cancel,
                     Some(&tracker),
                     Some(&attachment.id),
+                    Some("attachment"),
+                    None,
+                    pdf_ranges.as_deref(),
                 )
                 .await?;
-            let selected = select_context_text(
-                &tracker,
-                "attachment",
-                &attachment.id,
-                &extracted,
-                &r.request,
-                &mut omissions,
-            )?;
+            let selected = if context_format(&attachment.name) == "pdf" {
+                extracted
+            } else {
+                select_context_text(
+                    &tracker,
+                    "attachment",
+                    &attachment.id,
+                    None,
+                    &extracted,
+                    &plan.requested_scope,
+                )?
+            };
             r.bindings
                 .push(("attachment".into(), attachment.id, attachment.sha256));
             if !selected.is_empty() {
@@ -2307,6 +2957,7 @@ impl Workspace {
                     let reservation = tracker.reserve_text_segment(
                         "history",
                         &run_id,
+                        None,
                         &format!("turn:{}", message_index + 1),
                         content,
                     )?;
@@ -3081,32 +3732,130 @@ mod supervisor_tests {
     }
 
     #[test]
-    fn paragraph_selection_keeps_relevant_segments_and_reports_omission_without_raw_plan_text() {
+    fn paragraph_selection_uses_all_when_requested_without_raw_plan_text() {
         let tracker = ContextExtractionPlan::new(8_000);
-        let request = AiRunRequest {
-            kind: "writing".into(),
-            prompt: "合同解除通知与违约责任".into(),
-            ..AiRunRequest::default()
-        };
-        let mut omissions = Vec::new();
         let selected = select_context_text(
             &tracker,
             "material",
             "material_opaque",
+            Some("redacted"),
             "普通背景。\n\n合同解除条件以及违约责任已经载明。\n\n无关的会议记录。",
-            &request,
-            &mut omissions,
+            &[AiContextRangeSelection {
+                source_kind: "material".into(),
+                source_id: "material_opaque".into(),
+                source: Some("redacted".into()),
+                mode: "all".into(),
+                ranges: Vec::new(),
+                inspection_hash: None,
+            }],
         )
         .expect("selection remains within budget");
         assert!(selected.contains("合同解除条件"));
-        assert!(!selected.contains("普通背景"));
-        assert!(omissions
-            .iter()
-            .any(|item| item.reason == "no_relevant_segment"));
+        assert!(selected.contains("普通背景"));
         assert!(tracker
             .selected_ranges()
             .iter()
-            .all(|item| item.source.is_none()));
+            .all(|item| item.source.as_deref() == Some("redacted")));
+    }
+
+    #[test]
+    fn actual_scope_keeps_original_and_redacted_ranges_of_one_material_separate() {
+        let capabilities = AiContextCapabilities {
+            verified: false,
+            context_window_tokens: 20_480,
+            max_input_tokens: 16_384,
+            max_output_tokens: 4_096,
+            supports_tools: None,
+            supports_structured_output: None,
+            supports_vision: None,
+        };
+        let requested_scope = vec![
+            AiContextRangeSelection {
+                source_kind: "material".into(),
+                source_id: "material_opaque".into(),
+                source: Some("original".into()),
+                mode: "paragraphs".into(),
+                ranges: vec![AiContextUnitRange { start: 1, end: 1 }],
+                inspection_hash: Some("inspect-original".into()),
+            },
+            AiContextRangeSelection {
+                source_kind: "material".into(),
+                source_id: "material_opaque".into(),
+                source: Some("redacted".into()),
+                mode: "paragraphs".into(),
+                ranges: vec![AiContextUnitRange { start: 2, end: 2 }],
+                inspection_hash: Some("inspect-redacted".into()),
+            },
+        ];
+        let mut plan = AiContextPlan::new(
+            "ready",
+            capabilities,
+            AiContextEstimate::default(),
+            requested_scope,
+            AiContextScope {
+                materials: vec![
+                    AiContextRange {
+                        source_kind: "material".into(),
+                        source_id: "material_opaque".into(),
+                        source: Some("original".into()),
+                        format: Some("text".into()),
+                        locators: Vec::new(),
+                        estimated_tokens: 32,
+                    },
+                    AiContextRange {
+                        source_kind: "material".into(),
+                        source_id: "material_opaque".into(),
+                        source: Some("redacted".into()),
+                        format: Some("text".into()),
+                        locators: Vec::new(),
+                        estimated_tokens: 32,
+                    },
+                ],
+                ..AiContextScope::default()
+            },
+            Vec::new(),
+            &json!({"source_bindings":[]}),
+        )
+        .expect("preflight plan");
+        let tracker = ContextExtractionPlan::new(1_000);
+        tracker
+            .reserve_text_segment(
+                "material",
+                "material_opaque",
+                Some("original"),
+                "paragraph:1",
+                "原稿第一段",
+            )
+            .expect("original reservation")
+            .record_text_result(15)
+            .expect("original range records");
+        tracker
+            .reserve_text_segment(
+                "material",
+                "material_opaque",
+                Some("redacted"),
+                "paragraph:2",
+                "脱敏第二段",
+            )
+            .expect("redacted reservation")
+            .record_text_result(15)
+            .expect("redacted range records");
+
+        Workspace::apply_actual_context_scope(&mut plan, &tracker, Vec::new(), Vec::new())
+            .expect("actual scope remains variant-bound");
+
+        assert_eq!(plan.selected_scope.materials.len(), 2);
+        assert!(plan.selected_scope.materials.iter().any(|range| {
+            range.source.as_deref() == Some("original")
+                && range.locators == vec!["paragraph:1".to_owned()]
+                && range.estimated_tokens == 15
+        }));
+        assert!(plan.selected_scope.materials.iter().any(|range| {
+            range.source.as_deref() == Some("redacted")
+                && range.locators == vec!["paragraph:2".to_owned()]
+                && range.estimated_tokens == 15
+        }));
+        assert_eq!(plan.estimate.material_tokens, 30);
     }
 
     #[tokio::test]

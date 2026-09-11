@@ -390,6 +390,36 @@ export function conversationContextRevision(conversation, fallback = 0) {
   return Number.isSafeInteger(revision) && revision >= 0 ? revision : fallback;
 }
 
+function normalizedDraftContextRanges(value) {
+  const rows = Array.isArray(value?.context_ranges ?? value?.contextRanges)
+    ? (value.context_ranges ?? value.contextRanges) : [];
+  return rows.map((item) => {
+    const sourceKind = textValue(field(item, ["source_kind", "sourceKind"]));
+    const sourceId = textValue(field(item, ["source_id", "sourceId"]));
+    const source = textValue(field(item, ["source"]));
+    const mode = textValue(field(item, ["mode"]));
+    const ranges = (Array.isArray(item?.ranges) ? item.ranges : []).map((range) => {
+      const start = Number(field(range, ["start"]));
+      const end = Number(field(range, ["end"]));
+      return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 1 && end >= start ? { start, end } : null;
+    }).filter(Boolean);
+    const inspectionHash = textValue(field(item, ["inspection_hash", "inspectionHash"]));
+    if (!sourceId || !["material", "attachment"].includes(sourceKind)) return null;
+    if (sourceKind === "material" && !["original", "redacted"].includes(source)) return null;
+    if (!["all", "pages", "paragraphs"].includes(mode)) return null;
+    if (mode === "all") return { source_kind: sourceKind, source_id: sourceId, ...(sourceKind === "material" ? { source } : {}), mode };
+    if (!ranges.length || !inspectionHash) return null;
+    return {
+      source_kind: sourceKind,
+      source_id: sourceId,
+      ...(sourceKind === "material" ? { source } : {}),
+      mode,
+      ranges,
+      inspection_hash: inspectionHash
+    };
+  }).filter(Boolean);
+}
+
 export function writingDraftContent(value = {}) {
   const materials = Array.isArray(value.materials) ? value.materials
     .map((reference) => ({
@@ -410,6 +440,7 @@ export function writingDraftContent(value = {}) {
     model: textValue(value.model),
     materials,
     attachment_ids: attachmentIds,
+    context_ranges: normalizedDraftContextRanges(value),
     // These are optional as a pair.  JSON null maps to the service's
     // Option fields; an empty string would be an invalid run identifier.
     run_id: runId || null,
@@ -724,7 +755,9 @@ function safeContextLocator(value) {
 function normalizeContextScopeItems(value, kind) {
   const rows = Array.isArray(value) ? value : [];
   return rows.map((item) => ({
-    id: textValue(field(item, ["id", "material_id", "materialId", "attachment_id", "attachmentId", "run_id", "runId"])),
+    // Context plans use source_id/source_kind, while older estimate payloads
+    // used their type-specific ids. Accept both without inventing a source.
+    id: textValue(field(item, ["id", "source_id", "sourceId", "material_id", "materialId", "attachment_id", "attachmentId", "run_id", "runId"])),
     source: textValue(field(item, ["source"])),
     format: textValue(field(item, ["format", "content_type", "contentType"])),
     locators: (Array.isArray(item?.locators) ? item.locators : []).map(safeContextLocator).filter(Boolean),
@@ -790,14 +823,79 @@ export function modelCapabilitiesPayload(value = {}) {
   const source = value && typeof value === "object" ? value : {};
   const contextWindow = boundedTokenCount(source.context_window_tokens ?? source.contextWindowTokens);
   const maxOutput = boundedTokenCount(source.max_output_tokens ?? source.maxOutputTokens);
-  if (!contextWindow || !maxOutput || maxOutput >= contextWindow) return null;
-  return {
-    context_window_tokens: contextWindow,
-    max_output_tokens: maxOutput,
-    supports_tools: source.supports_tools === true || source.supportsTools === true,
-    supports_structured_output: source.supports_structured_output === true || source.supportsStructuredOutput === true,
-    supports_vision: source.supports_vision === true || source.supportsVision === true
+  const triState = (names, presenceName) => {
+    const selected = field(source, names);
+    // Editing state carries an explicit touched bit.  Existing declarations
+    // are shown in the picker but must not be re-submitted just because a
+    // user changed capacity; that would falsely mark a legacy field reviewed.
+    const present = Object.hasOwn(source, presenceName)
+      ? source[presenceName] === true
+      : names.some((name) => Object.hasOwn(source, name));
+    return { present, value: selected === true ? true : selected === false ? false : null };
   };
+  const supportsTools = triState(["supports_tools", "supportsTools"], "supportsToolsPresent");
+  const supportsStructuredOutput = triState(["supports_structured_output", "supportsStructuredOutput"], "supportsStructuredOutputPresent");
+  const supportsVision = triState(["supports_vision", "supportsVision"], "supportsVisionPresent");
+  const hasCapacity = Boolean(contextWindow || maxOutput);
+  const hasFeatureDeclaration = [supportsTools, supportsStructuredOutput, supportsVision].some((item) => item.present);
+  if (!hasCapacity && !hasFeatureDeclaration) return null;
+  // Capacity is declared as one bound pair. Feature declarations are
+  // independent tri-state facts: unknown must not be serialized as false.
+  if (hasCapacity && (!contextWindow || !maxOutput || maxOutput >= contextWindow)) return null;
+  return {
+    ...(hasCapacity ? { context_window_tokens: contextWindow, max_output_tokens: maxOutput } : {}),
+    ...(supportsTools.present ? { supports_tools: supportsTools.value } : {}),
+    ...(supportsStructuredOutput.present ? { supports_structured_output: supportsStructuredOutput.value } : {}),
+    ...(supportsVision.present ? { supports_vision: supportsVision.value } : {})
+  };
+}
+
+function contextRangeSourceKey(source) {
+  const kind = textValue(source?.source_kind ?? source?.sourceKind);
+  const id = textValue(source?.source_id ?? source?.sourceId);
+  const variant = kind === "material" ? textValue(source?.source) : "";
+  return kind && id ? `${kind}:${id}:${variant}` : "";
+}
+
+function contextRangeSources(materials, attachmentIds) {
+  const sourceRows = [];
+  const seen = new Set();
+  for (const material of Array.isArray(materials) ? materials : []) {
+    const source = {
+      source_kind: "material",
+      source_id: textValue(field(material, ["id", "material_id", "materialId"])),
+      source: textValue(field(material, ["source"]))
+    };
+    const key = contextRangeSourceKey(source);
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      sourceRows.push(source);
+    }
+  }
+  for (const attachment of Array.isArray(attachmentIds) ? attachmentIds : []) {
+    const source = { source_kind: "attachment", source_id: textValue(attachment) };
+    const key = contextRangeSourceKey(source);
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      sourceRows.push(source);
+    }
+  }
+  return sourceRows;
+}
+
+export function parseContextUnitRanges(value, { max = 0 } = {}) {
+  const raw = textValue(value).trim();
+  if (!raw) return [];
+  const ranges = [];
+  for (const part of raw.split(/[,，\s]+/u).filter(Boolean)) {
+    const match = /^(\d+)(?:\s*[-–]\s*(\d+))?$/u.exec(part);
+    if (!match) return null;
+    const start = Number(match[1]);
+    const end = Number(match[2] || match[1]);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || (max && end > max)) return null;
+    ranges.push({ start, end });
+  }
+  return ranges;
 }
 
 export function legalSearchPageParams({ query = "", documentId = "", caseDate = "", matchMode = "all", versionScope = "current", versionStatus = "", type = "", level = "", region = "", status = "", sort = "relevance", view = "grouped", pageSize = 20, offset = 0, includeHistory = true, includeRelations = true } = {}) {
@@ -2735,6 +2833,180 @@ export class WebApp {
     return wrapper;
   }
 
+  renderContextRangePicker({ title = "材料范围", getMaterials = () => [], getAttachmentIds = () => [], onChanged = () => {} } = {}) {
+    const picker = node("div", { className: "context-range-picker" });
+    const selections = new Map();
+    const sources = () => contextRangeSources(getMaterials(), getAttachmentIds());
+    const selectionFor = (source) => {
+      const key = contextRangeSourceKey(source);
+      let selection = selections.get(key);
+      if (!selection) {
+        selection = { mode: "all", rangesText: "", ranges: [], inspection: null };
+        selections.set(key, selection);
+      }
+      return selection;
+    };
+    const clearRemoved = () => {
+      const live = new Set(sources().map(contextRangeSourceKey));
+      for (const key of selections.keys()) if (!live.has(key)) selections.delete(key);
+    };
+    const sourceLabelFor = (source) => {
+      if (source.source_kind === "material") {
+        const material = this.state.aiMaterials.find((item) => textValue(field(item, ["id"])) === source.source_id);
+        const name = textValue(field(material, ["name", "title"]), source.source_id);
+        return `材料 ${name}${source.source === "original" ? " · 原文" : " · 脱敏版"}`;
+      }
+      const attachment = this.state.aiAttachments.find((item) => textValue(field(item, ["id"])) === source.source_id);
+      return `附件 ${textValue(field(attachment, ["name", "filename"]), source.source_id)}`;
+    };
+    const currentRanges = () => {
+      const entries = sources();
+      if (!entries.length) return { ranges: [], error: "" };
+      const ranges = [];
+      for (const source of entries) {
+        const selection = selectionFor(source);
+        if (selection.mode === "all") {
+          ranges.push({ ...source, mode: "all" });
+          continue;
+        }
+        const inspection = selection.inspection;
+        const restored = selection.restoredRange;
+        if (!inspection && restored?.inspection_hash && Array.isArray(restored.ranges) && restored.ranges.length) {
+          ranges.push(restored);
+          continue;
+        }
+        const parsed = parseContextUnitRanges(selection.rangesText, { max: inspection?.unitCount || 0 });
+        if (!inspection || !inspection.inspectionHash || !["pages", "paragraphs"].includes(selection.mode) || !parsed?.length) {
+          return { ranges: [], error: `${source.source_kind === "material" ? "材料" : "附件"} ${source.source_id} 的页/段落范围尚未检查或格式无效。` };
+        }
+        ranges.push({ ...source, mode: selection.mode, ranges: parsed, inspection_hash: inspection.inspectionHash });
+      }
+      return { ranges, error: "" };
+    };
+    const render = () => {
+      clearRemoved();
+      const entries = sources();
+      if (!entries.length) {
+        replaceChildren(picker, [heading(3, title), node("p", { className: "muted small", text: "未选择材料或附件；提交时将显式发送空范围。" })]);
+        return;
+      }
+      const rows = entries.map((source) => {
+        const selection = selectionFor(source);
+        const inspection = selection.inspection;
+        const sourceLabel = sourceLabelFor(source);
+        const inspect = button("检查页/段落", async () => {
+          inspect.disabled = true;
+          try {
+            const response = await this.api.inspectAiContextSource(source);
+            const result = response?.inspection || response;
+            const sameSource = textValue(field(result, ["source_kind", "sourceKind"])) === source.source_kind
+              && textValue(field(result, ["source_id", "sourceId"])) === source.source_id
+              && (source.source_kind !== "material" || textValue(field(result, ["source"])) === source.source);
+            const unitKind = textValue(field(result, ["unit_kind", "unitKind"]));
+            const scopeMode = unitKind === "page" ? "pages" : unitKind === "paragraph" ? "paragraphs" : "";
+            const unitCount = Number(field(result, ["unit_count", "unitCount"]));
+            const inspectionHash = textValue(field(result, ["inspection_hash", "inspectionHash"]));
+            if (!sameSource || !scopeMode || !Number.isSafeInteger(unitCount) || unitCount < 1 || !inspectionHash) throw new ApiError("invalid_response", false, 200);
+            selection.inspection = {
+              unitKind,
+              scopeMode,
+              unitCount,
+              inspectionHash,
+              unitVersion: textValue(field(result, ["unit_version", "unitVersion"])),
+              estimateBasis: textValue(field(result, ["estimate_basis", "estimateBasis"])),
+              estimatedInputTokens: boundedTokenCount(field(result, ["estimated_input_tokens", "estimatedInputTokens"]))
+            };
+            if (selection.mode !== scopeMode) {
+              selection.mode = "all";
+              selection.rangesText = "";
+              selection.ranges = [];
+            }
+            selection.restoredRange = null;
+            render();
+          } catch (error) {
+            rowStatus.textContent = `无法检查范围：${apiErrorMessage(error)}`;
+            rowStatus.className = "status-message danger";
+          } finally {
+            inspect.disabled = false;
+          }
+        }, "button subtle");
+        const mode = node("select", { ariaLabel: `${sourceLabel}范围模式` });
+        appendOption(mode, "all", "全部");
+        const scopedMode = inspection?.scopeMode || (["pages", "paragraphs"].includes(selection.mode) ? selection.mode : "");
+        if (scopedMode) appendOption(mode, scopedMode, scopedMode === "pages" ? "指定页" : "指定段落");
+        mode.value = scopedMode && selection.mode === scopedMode ? selection.mode : "all";
+        const rangeInput = node("input", { type: "text", placeholder: inspection?.scopeMode === "pages" ? "例如 1-3, 5" : "例如 1-4, 8", value: selection.rangesText, ariaLabel: `${sourceLabel}范围` });
+        rangeInput.hidden = mode.value === "all";
+        const apply = button("应用范围", () => {
+          if (!inspection) {
+            rowStatus.textContent = "请先检查页/段落范围，再修改指定范围。";
+            rowStatus.className = "status-message danger";
+            return;
+          }
+          const parsed = parseContextUnitRanges(rangeInput.value, { max: inspection?.unitCount || 0 });
+          if (!parsed?.length) {
+            rowStatus.textContent = `范围须为 1–${inspection?.unitCount || "?"} 的页/段落编号，例如 1-3, 5。`;
+            rowStatus.className = "status-message danger";
+            return;
+          }
+          selection.mode = mode.value;
+          selection.rangesText = rangeInput.value;
+          selection.ranges = parsed;
+          selection.restoredRange = null;
+          rowStatus.textContent = "范围已应用；需重新预检或准备后才能发送。";
+          rowStatus.className = "status-message warning";
+          onChanged();
+        }, "button subtle");
+        apply.hidden = rangeInput.hidden;
+        const rowStatus = statusBox(inspection
+          ? `已检查 ${inspection.scopeMode === "pages" ? "页" : "段落"}：共 ${inspection.unitCount} 个单位${inspection.estimatedInputTokens ? ` · 约 ${inspection.estimatedInputTokens} tokens` : ""}${inspection.estimateBasis ? ` · ${inspection.estimateBasis}` : ""}`
+          : selection.restoredRange ? "已恢复指定范围；重新检查后才能修改范围。"
+            : "未检查时将发送全部范围。", inspection ? "success" : selection.restoredRange ? "warning" : "muted");
+        mode.addEventListener("change", () => {
+          selection.mode = mode.value;
+          if (selection.mode === "all") {
+            selection.rangesText = "";
+            selection.ranges = [];
+            selection.restoredRange = null;
+            onChanged();
+          }
+          render();
+        });
+        return node("div", { className: "context-range-row" }, [
+          node("strong", { text: sourceLabel }),
+          node("div", { className: "button-row" }, [mode, inspect]),
+          rangeInput,
+          apply,
+          rowStatus
+        ]);
+      });
+      replaceChildren(picker, [heading(3, title), node("p", { className: "muted small", text: "选择全部时按预算处理整份材料；指定页码或段落前，先在本机检查范围。检查不会调用模型。范围、来源或版本变化后，先重新预检或准备。" }), ...rows]);
+    };
+    picker.contextRanges = currentRanges;
+    picker.setContextRanges = (value) => {
+      selections.clear();
+      const supplied = normalizedDraftContextRanges({ context_ranges: value });
+      const byKey = new Map(supplied.map((item) => [contextRangeSourceKey(item), item]));
+      for (const source of sources()) {
+        const restored = byKey.get(contextRangeSourceKey(source));
+        if (!restored) continue;
+        const selection = selectionFor(source);
+        selection.mode = restored.mode;
+        selection.ranges = restored.ranges || [];
+        selection.rangesText = selection.ranges.map((range) => range.start === range.end ? String(range.start) : `${range.start}-${range.end}`).join(", ");
+        selection.restoredRange = restored.mode === "all" ? null : restored;
+      }
+      render();
+    };
+    picker.syncSources = ({ notify = false } = {}) => {
+      clearRemoved();
+      render();
+      if (notify) onChanged();
+    };
+    render();
+    return picker;
+  }
+
   async createAiRun(payload, { page, status, onUpdate, onDone } = {}) {
     const response = await this.api.createAiRun(payload);
     const run = this.rememberAiRun(response?.run || response);
@@ -3381,7 +3653,21 @@ export class WebApp {
     syncAiSearchVersionControls();
     const aiSearchMaterialHost = node("div", { className: "ai-material-host" }, [emptyState("正在加载可用材料…")]);
     let aiSearchPicker = null;
-    const aiSearchAttachment = this.renderAiAttachmentPicker();
+    let aiSearchRangePicker = null;
+    let aiSearchScopeGeneration = 0;
+    const aiSearchAttachment = this.renderAiAttachmentPicker({ onChange: () => {
+      aiSearchRangePicker?.syncSources();
+      aiSearchScopeGeneration += 1;
+    } });
+    aiSearchRangePicker = this.renderContextRangePicker({
+      title: "材料与附件范围",
+      getMaterials: () => aiSearchPicker?.values?.() || [],
+      getAttachmentIds: () => aiSearchAttachment.attachmentIds?.() || [],
+      onChanged: () => {
+        aiSearchScopeGeneration += 1;
+        setStatus(aiSearchStatus, "范围已修改；此前预检结果已失效，提交前将重新预检。", "warning");
+      }
+    });
     const aiSearchContextEstimate = node("div", { className: "context-estimate" }, [emptyState("提交前会显示本次采用的材料、页码或段落范围及上下文预算。")]);
     const aiSearchButton = formButton("开始 AI 法律搜索", "button primary");
     const aiSearchStatus = statusBox();
@@ -3390,7 +3676,7 @@ export class WebApp {
     const aiSearchCitations = node("div", { className: "citation-list" });
     const aiSearchVerification = node("div", { className: "citation-verification" });
     const aiSearchHistory = node("div", { className: "ai-history-list" });
-    aiSearchForm.append(labelFor("Provider", aiSearchProvider), labelFor("模型", aiSearchModel), labelFor("案情或事件", aiSearchPrompt), labelFor("关键词匹配", aiSearchMatchMode), labelFor("版本范围", aiSearchVersionScope), labelFor("适用日期（选择“按日期范围”后使用）", aiSearchCaseDate), aiSearchVersionStatusRow, aiSearchMaterialHost, aiSearchAttachment, aiSearchContextEstimate, aiSearchButton, aiSearchStatus, aiSearchRunScope, aiSearchOutput, aiSearchCitations, aiSearchVerification, heading(3, "AI 搜索历史"), aiSearchHistory);
+    aiSearchForm.append(labelFor("Provider", aiSearchProvider), labelFor("模型", aiSearchModel), labelFor("案情或事件", aiSearchPrompt), labelFor("关键词匹配", aiSearchMatchMode), labelFor("版本范围", aiSearchVersionScope), labelFor("适用日期（选择“按日期范围”后使用）", aiSearchCaseDate), aiSearchVersionStatusRow, aiSearchMaterialHost, aiSearchAttachment, aiSearchRangePicker, aiSearchContextEstimate, aiSearchButton, aiSearchStatus, aiSearchRunScope, aiSearchOutput, aiSearchCitations, aiSearchVerification, heading(3, "AI 搜索历史"), aiSearchHistory);
     aiSearchPanel.append(aiSearchForm);
 
     const resultsPanel = panel("搜索结果", [], "panel results-panel");
@@ -3855,11 +4141,21 @@ export class WebApp {
       }
       const retrievalPayload = aiSearchRetrievalPayload();
       if (!retrievalPayload) return;
+      const scope = aiSearchRangePicker.contextRanges();
+      if (scope.error) {
+        setStatus(aiSearchStatus, scope.error, "warning");
+        return;
+      }
       aiSearchButton.disabled = true;
       try {
-        const payload = { kind: AI_RUN_KINDS.search, prompt, provider_id: aiSearchProvider.value, model, materials: aiSearchPicker?.values?.() || [], attachment_ids: aiSearchAttachment.attachmentIds?.() || [], ...retrievalPayload };
+        const scopeGeneration = aiSearchScopeGeneration;
+        const payload = { kind: AI_RUN_KINDS.search, prompt, provider_id: aiSearchProvider.value, model, materials: aiSearchPicker?.values?.() || [], attachment_ids: aiSearchAttachment.attachmentIds?.() || [], context_ranges: scope.ranges, ...retrievalPayload };
         const contextEstimate = await this.preflightAiContext(payload, aiSearchContextEstimate, aiSearchStatus);
         if (!contextEstimate) return;
+        if (scopeGeneration !== aiSearchScopeGeneration) {
+          setStatus(aiSearchStatus, "材料、附件或范围在预检期间已修改；旧预检结果未被提交。", "warning");
+          return;
+        }
         payload.context_plan_hash = contextEstimate.planHash;
         await this.createAiRun(payload, {
           page: "search",
@@ -3900,9 +4196,14 @@ export class WebApp {
           await this.loadAiMaterials({ append: true });
           renderAiSearchMaterialPicker(preservedValues);
           syncAiSearchModel({ preserveModel: true });
+        },
+        onChange: () => {
+          aiSearchRangePicker?.syncSources();
+          aiSearchScopeGeneration += 1;
         }
       });
       replaceChildren(aiSearchMaterialHost, [aiSearchPicker]);
+      aiSearchRangePicker?.syncSources();
     };
 
     let aiSurfaceLoad = null;
@@ -4562,6 +4863,12 @@ export class WebApp {
     appendOption(modelInput, "", "选择 Provider 后载入模型");
     const materialHost = node("div", { className: "ai-material-host" }, [emptyState("正在加载可用材料…")]);
     let materialPicker = null;
+    let writingRangePicker = null;
+    let writingScopeGeneration = 0;
+    // The run and source-selection generation that dispatched the currently
+    // visible context plan. A terminal poll may clear the picker warning only
+    // while that exact selection is still on screen.
+    let latestWritingContextSubmission = null;
     let hasLocalDraftInput = false;
     // Programmatic source selection during initial recovery must not be
     // treated as a user edit: it would overwrite a dirty body before it can
@@ -4575,7 +4882,21 @@ export class WebApp {
       writingFormDirty = true;
       if (writingDraftReady) queueDraft();
     };
-    const attachmentPicker = this.renderAiAttachmentPicker({ onChange: noteDraftInput });
+    const attachmentPicker = this.renderAiAttachmentPicker({ onChange: () => {
+      writingRangePicker?.syncSources();
+      writingScopeGeneration += 1;
+      noteDraftInput();
+    } });
+    writingRangePicker = this.renderContextRangePicker({
+      title: "文书材料与附件范围",
+      getMaterials: () => materialPicker?.values?.() || [],
+      getAttachmentIds: () => attachmentPicker.attachmentIds?.() || [],
+      onChanged: () => {
+        writingScopeGeneration += 1;
+        noteDraftInput();
+        setStatus(status, "材料范围已修改；此前预检结果已失效。", "warning");
+      }
+    });
     const writingContextEstimate = node("div", { className: "context-estimate" }, [emptyState("提交前会显示本次采用的材料、页码或段落范围及上下文预算。")]);
     const generateButton = formButton("生成文书", "button primary");
     const status = statusBox();
@@ -4587,7 +4908,7 @@ export class WebApp {
     retryDraft.hidden = true;
     draftStatus.retryControl = retryDraft;
     const conflictPanel = node("div", { className: "draft-conflict-panel", hidden: true });
-    form.append(labelFor("文书类型", documentType), labelFor("案情描述", caseDescription), labelFor("写作要求", requirements), labelFor("文书适用日期（可选；修改已有文书后须保存为新版本）", caseDate), labelFor("Provider", providerSelect), labelFor("模型", modelInput), materialHost, attachmentPicker, writingContextEstimate, generateButton, status, draftStatus, retryDraft, conflictPanel);
+    form.append(labelFor("文书类型", documentType), labelFor("案情描述", caseDescription), labelFor("写作要求", requirements), labelFor("文书适用日期（可选；修改已有文书后须保存为新版本）", caseDate), labelFor("Provider", providerSelect), labelFor("模型", modelInput), materialHost, attachmentPicker, writingRangePicker, writingContextEstimate, generateButton, status, draftStatus, retryDraft, conflictPanel);
     editor.append(form);
     editorColumn.append(editor);
 
@@ -4607,6 +4928,7 @@ export class WebApp {
       caseDate.value = legalDateValue(snapshot.case_date);
       attachmentPicker.setAttachments(snapshot.attachment_ids.map((id) => ({ id })));
       if (materialPicker) renderWritingMaterialPicker(snapshot.materials);
+      writingRangePicker.setContextRanges(snapshot.context_ranges);
       if (snapshot.provider_id && [...providerSelect.options].some((option) => option.value === snapshot.provider_id)) providerSelect.value = snapshot.provider_id;
       providerModel({ preserveModel: true });
       if (snapshot.model && [...modelInput.options].some((option) => option.value === snapshot.model)) modelInput.value = snapshot.model;
@@ -5010,6 +5332,12 @@ export class WebApp {
       }
       return snapshot;
     };
+    const renderWritingRunContextPlan = (run) => {
+      const plan = field(run, ["context_plan", "contextPlan"]);
+      if (!plan || typeof plan !== "object") return false;
+      this.renderContextEstimate(writingContextEstimate, plan);
+      return true;
+    };
     const showWritingRun = (run, { resume = true, selectionIntent = null } = {}) => {
       const loaded = this.rememberAiRun(run);
       if (!isCurrentWritingRender()) return loaded;
@@ -5046,6 +5374,7 @@ export class WebApp {
       renderWritingCitation(loaded);
       replaceChildren(toolSteps, [node("summary", { text: "查看检索过程" }), ...(loaded.tool_steps || []).map((step) => node("p", { className: "tool-step", text: textValue(field(step, ["summary", "query", "action"]), aiToolLabel(field(step, ["tool", "name"]))) }))]);
       setStatus(runStatus, `${aiRunKindLabel(loaded.kind)}：${aiRunStatusLabel(loaded.status)}${loaded.stage ? ` · ${pipelineStageLabel(loaded.stage)}` : ""} · ${aiRunProgressText(loaded)}`, loaded.status === "completed" ? "success" : aiRunIsTerminal(loaded) ? "warning" : "info");
+      renderWritingRunContextPlan(loaded);
       if (switchingDocument || activeWritingDraft.id !== writingDraftIdForRun(loaded)) {
         void activateDraftForRun(loaded, { previousSnapshot }).catch((error) => {
           if (error?.name !== "AbortError" && isCurrentWritingRender()) setStatus(draftStatus, `草稿未恢复：${apiErrorMessage(error)}`, "danger");
@@ -5058,6 +5387,26 @@ export class WebApp {
         }
       });
       return loaded;
+    };
+    const applyPolledWritingRun = (run, { terminal = false, submission = null } = {}) => {
+      const loaded = normalizeAiRun(run);
+      // A result for a history row that is no longer selected must remain in
+      // the cache only. In particular it may not replace a dirty editor, its
+      // title/status, or its current range readiness message.
+      if (!isCurrentWritingRender() || this.state.pageRunIds.writing !== loaded.id) return false;
+      showWritingRun(loaded, { resume: false });
+      const submissionMatches = terminal
+        && loaded.status === "completed"
+        && submission === latestWritingContextSubmission
+        && submission?.runId === loaded.id
+        && submission.scopeGeneration === writingScopeGeneration
+        && submission.sessionEpoch === renderSessionEpoch
+        && submission.renderScope === renderScope;
+      // Applying a range deliberately warns that a new plan is needed. Once
+      // the matching run completes, a plain re-render removes only that stale
+      // warning; it does not change the selected sources or ranges.
+      if (submissionMatches && renderWritingRunContextPlan(loaded)) writingRangePicker.syncSources();
+      return true;
     };
     renderWritingCitation = (run) => {
       const activeRun = normalizeAiRun(run || this.pageRun("writing"));
@@ -5159,6 +5508,7 @@ export class WebApp {
       model: modelInput.value,
       materials: materialPicker?.values?.() || [],
       attachment_ids: attachmentPicker.attachmentIds?.() || [],
+      context_ranges: writingRangePicker.contextRanges().ranges,
       run_id: textValue(contentEditor.dataset.runId, this.pageRun("writing")?.id || ""),
       run_revision: Number(contentEditor.dataset.expectedRevision) || aiRunRevision(this.pageRun("writing")),
       content: contentEditor.value,
@@ -5223,30 +5573,48 @@ export class WebApp {
           return;
         }
         const writingDate = legalDateValue(caseDate.value);
-        const payload = { kind: AI_RUN_KINDS.writing, prompt, provider_id: providerSelect.value, model, document_type: documentType.value, requirements: requirements.value.trim(), ...(writingDate ? { case_date: writingDate } : {}), materials: materialPicker?.values?.() || [], attachment_ids: attachmentPicker.attachmentIds?.() || [] };
+        const scope = writingRangePicker.contextRanges();
+        if (scope.error) {
+          setStatus(status, scope.error, "warning");
+          return;
+        }
+        const scopeGeneration = writingScopeGeneration;
+        const payload = { kind: AI_RUN_KINDS.writing, prompt, provider_id: providerSelect.value, model, document_type: documentType.value, requirements: requirements.value.trim(), ...(writingDate ? { case_date: writingDate } : {}), materials: materialPicker?.values?.() || [], attachment_ids: attachmentPicker.attachmentIds?.() || [], context_ranges: scope.ranges };
         const contextEstimate = await this.preflightAiContext(payload, writingContextEstimate, status);
         if (!contextEstimate) return;
+        if (scopeGeneration !== writingScopeGeneration) {
+          setStatus(status, "材料、附件或范围在预检期间已修改；旧预检结果未被提交。", "warning");
+          return;
+        }
         payload.context_plan_hash = contextEstimate.planHash;
         const preCreationDraft = draftSnapshot();
+        const contextSubmission = {
+          runId: "",
+          scopeGeneration,
+          sessionEpoch: renderSessionEpoch,
+          renderScope
+        };
+        latestWritingContextSubmission = contextSubmission;
         const created = await this.createAiRun(payload, {
           page: "writing",
           status,
           onUpdate: (run) => {
-            if (this.state.pageRunIds.writing !== run.id) return;
-            if (run.content || run.html) { renderRenderedContent(preview, run.html, run.content, "该任务尚无正文结果。"); contentEditor.value = run.content; }
-            this.renderRunCitations(citations, run.citations);
-            renderWritingCitation(run);
-            replaceChildren(toolSteps, [node("summary", { text: "查看检索过程" }), ...(run.tool_steps || []).map((step) => node("p", { className: "tool-step", text: textValue(field(step, ["summary", "query", "action"]), aiToolLabel(field(step, ["tool", "name"]))) }))]);
+            if (!contextSubmission.runId) contextSubmission.runId = textValue(run?.id);
+            applyPolledWritingRun(run, { submission: contextSubmission });
           },
           onDone: (run) => {
-            if (this.state.pageRunIds.writing !== run.id) return;
-            if (run.content || run.html) { renderRenderedContent(preview, run.html, run.content, "该任务尚无正文结果。"); contentEditor.value = run.content; }
-            this.renderRunCitations(citations, run.citations);
-            renderWritingCitation(run);
-            setStatus(status, run.status === "completed" ? "文书已生成并保存历史记录。" : `任务状态：${aiRunStatusLabel(run.status)}`, run.status === "completed" ? "success" : "warning");
-            refreshHistory();
+            if (!contextSubmission.runId) contextSubmission.runId = textValue(run?.id);
+            if (!applyPolledWritingRun(run, { terminal: true, submission: contextSubmission })) return;
+            const scopeStillCurrent = contextSubmission === latestWritingContextSubmission
+              && contextSubmission.scopeGeneration === writingScopeGeneration;
+            setStatus(status, run.status === "completed"
+              ? scopeStillCurrent ? "文书已生成并保存历史记录。" : "文书已生成；当前材料或范围已修改，需重新预检后再生成。"
+              : `任务状态：${aiRunStatusLabel(run.status)}`,
+            run.status === "completed" && scopeStillCurrent ? "success" : "warning");
+            void refreshHistory();
           }
         });
+        contextSubmission.runId = created.id;
         if (!isCurrentWritingRender()) return;
         this.rememberWritingRunPointer(created);
         await activateDraftForRun(created, { previousSnapshot: preCreationDraft });
@@ -5295,11 +5663,17 @@ export class WebApp {
           await this.loadAiMaterials({ append: true });
           renderWritingMaterialPicker(preservedValues);
         },
-        onChange: noteDraftInput
+        onChange: () => {
+          writingRangePicker?.syncSources();
+          writingScopeGeneration += 1;
+          noteDraftInput();
+        }
       });
       replaceChildren(materialHost, [materialPicker]);
+      writingRangePicker?.syncSources();
     };
     renderWritingMaterialPicker(hasLocalDraftInput ? [] : restoredDraft.materials);
+    if (!hasLocalDraftInput) writingRangePicker.setContextRanges(restoredDraft.context_ranges);
     providerModel({ preserveModel: true });
     if (!hasLocalDraftInput && restoredDraft.model && [...modelInput.options].some((option) => option.value === restoredDraft.model)) modelInput.value = restoredDraft.model;
     await refreshHistory();
@@ -5361,7 +5735,19 @@ export class WebApp {
     const materialHost = node("div", { className: "ai-material-host" }, [emptyState("正在加载可用材料…")]);
     let materialPicker = null;
     let queueConversationContext = () => {};
-    const attachmentPicker = this.renderAiAttachmentPicker({ onChange: () => queueConversationContext() });
+    let chatRangePicker = null;
+    const attachmentPicker = this.renderAiAttachmentPicker({ onChange: () => {
+      chatRangePicker?.syncSources();
+      void queueConversationContext();
+    } });
+    chatRangePicker = this.renderContextRangePicker({
+      title: "会话材料与附件范围",
+      getMaterials: () => materialPicker?.values?.() || [],
+      getAttachmentIds: () => attachmentPicker.attachmentIds?.() || [],
+      onChanged: () => {
+        void queueConversationContext();
+      }
+    });
     const contextStatus = statusBox("会话材料由本机服务保存。", "muted");
     const contextManifest = node("div", { className: "conversation-context-manifest" }, [emptyState("选择会话后显示本次发送清单。")]);
     const chatContextEstimate = node("div", { className: "context-estimate" }, [emptyState("发送前会显示本次采用的会话材料、历史范围及上下文预算。")]);
@@ -5383,7 +5769,7 @@ export class WebApp {
     cancelButton.disabled = true;
     const chatStatus = statusBox();
     composer.append(labelFor("消息", messageInput), node("div", { className: "button-row" }, [providerSelect, modelInput, sendButton, cancelButton]), chatStatus);
-    chatPanel.append(selectedTitle, renameForm, labelFor("材料上下文", materialHost), attachmentPicker, contextStatus, contextManifest, chatContextEstimate, messages, composer);
+    chatPanel.append(selectedTitle, renameForm, labelFor("材料上下文", materialHost), attachmentPicker, chatRangePicker, contextStatus, contextManifest, chatContextEstimate, messages, composer);
     chatColumn.append(chatPanel);
 
     const renderChatMessages = (items) => {
@@ -5423,6 +5809,14 @@ export class WebApp {
         const name = textValue(field(item, ["name", "filename"]), textValue(field(item, ["id", "attachment_id", "attachmentId"]), "已保存附件"));
         rows.push(node("li", { text: `${name} · 附件` }));
       }
+      const ranges = normalizedDraftContextRanges({ context_ranges: source.context_ranges ?? source.contextRanges });
+      for (const range of ranges) {
+        const label = range.source_kind === "material"
+          ? `材料 ${textValue(field(materialItems.find((item) => textValue(field(item, ["id", "material_id", "materialId"])) === range.source_id), ["name", "material_name", "materialName"]), range.source_id)}`
+          : `附件 ${textValue(field(attachmentItems.find((item) => textValue(field(item, ["id", "attachment_id", "attachmentId"])) === range.source_id), ["name", "filename"]), range.source_id)}`;
+        const detail = range.mode === "all" ? "全部" : `${range.mode === "pages" ? "页" : "段落"} ${range.ranges.map((item) => item.start === item.end ? item.start : `${item.start}-${item.end}`).join("、")}`;
+        rows.push(node("li", { text: `${label} · ${detail}` }));
+      }
       replaceChildren(contextManifest, [
         heading(3, "发送前服务器最终清单"),
         message ? node("p", { className: "muted small", text: message }) : null,
@@ -5442,19 +5836,23 @@ export class WebApp {
         errorMessage: page.error,
         onLoadMore: async (preservedValues) => {
           const attachmentIds = attachmentPicker.attachmentIds?.() || [];
-          const current = { ...(this.state.selectedConversation || context), materials: preservedValues, attachment_ids: attachmentIds };
+          const current = { ...(this.state.selectedConversation || context), materials: preservedValues, attachment_ids: attachmentIds, context_ranges: chatRangePicker?.contextRanges().ranges || [] };
           await this.loadAiMaterials({ append: true });
           renderConversationContext(current);
           const selectedProvider = this.state.providers.find((item) => textValue(field(item, ["id"])) === providerSelect.value);
           this.applyMaterialTrust(materialPicker, selectedProvider);
         },
-        onChange: () => queueConversationContext()
+        onChange: () => {
+          chatRangePicker?.syncSources();
+          void queueConversationContext();
+        }
       });
       replaceChildren(materialHost, [materialPicker]);
       attachmentPicker.setAttachments((Array.isArray(context.attachment_ids) ? context.attachment_ids : []).map((id) => {
         const existing = this.state.aiAttachments.find((attachment) => attachment.id === id);
         return existing || { id };
       }));
+      chatRangePicker.setContextRanges(context.context_ranges ?? context.contextRanges);
       renderContextManifest(context, "正在等待本机服务按当前模型核验。");
     };
     const prepareConversationContext = async ({ announce = false, waitForContext = true } = {}) => {
@@ -5494,16 +5892,28 @@ export class WebApp {
       const conversationId = currentConversationId();
       if (!conversationId || !materialPicker) return Promise.resolve();
       preparedContext = null;
+      contextPrepareGeneration += 1;
       contextSaveError = null;
+      setStatus(contextStatus, "会话材料或范围已变更；原准备结果已失效，正在保存清单…", "warning");
+      const initialScope = chatRangePicker.contextRanges();
+      if (initialScope.error) {
+        const error = new ApiError("context_scope_invalid", false, 400);
+        contextSaveError = error;
+        setStatus(contextStatus, `会话材料未保存：${initialScope.error}`, "danger");
+        return Promise.resolve();
+      }
       contextWrite = contextWrite.catch(() => {}).then(async () => {
         const activeId = currentConversationId();
         if (!activeId || activeId !== conversationId) return;
+        const scope = chatRangePicker.contextRanges();
+        if (scope.error) throw new ApiError("context_scope_invalid", false, 400);
         const expectedRevision = conversationContextRevision(this.state.selectedConversation);
         setStatus(contextStatus, "正在保存会话材料清单…", "info");
         const response = await this.api.updateAiConversationContext(activeId, {
           expected_revision: expectedRevision,
           materials: materialPicker.values(),
-          attachment_ids: attachmentPicker.attachmentIds()
+          attachment_ids: attachmentPicker.attachmentIds(),
+          context_ranges: scope.ranges
         });
         const conversation = response?.conversation || response;
         if (activeId !== currentConversationId()) return;
@@ -5769,19 +6179,51 @@ export class WebApp {
     let modelCapabilities = new Map();
     const capabilityInputPresent = (value) => {
       const source = value && typeof value === "object" ? value : {};
-      return Boolean(textValue(source.contextWindowTokens ?? source.context_window_tokens) || textValue(source.maxOutputTokens ?? source.max_output_tokens) || source.supportsTools === true || source.supports_tools === true || source.supportsStructuredOutput === true || source.supports_structured_output === true || source.supportsVision === true || source.supports_vision === true);
+      return Boolean(textValue(source.contextWindowTokens ?? source.context_window_tokens)
+        || textValue(source.maxOutputTokens ?? source.max_output_tokens)
+        || source.supportsToolsPresent === true
+        || source.supportsStructuredOutputPresent === true
+        || source.supportsVisionPresent === true
+        || Object.hasOwn(source, "supports_tools")
+        || Object.hasOwn(source, "supportsTools")
+        || Object.hasOwn(source, "supports_structured_output")
+        || Object.hasOwn(source, "supportsStructuredOutput")
+        || Object.hasOwn(source, "supports_vision")
+        || Object.hasOwn(source, "supportsVision"));
     };
-    const editableCapabilities = (value) => ({
-      contextWindowTokens: textValue(field(value, ["context_window_tokens", "contextWindowTokens"])),
-      maxOutputTokens: textValue(field(value, ["max_output_tokens", "maxOutputTokens"])),
-      supportsTools: field(value, ["supports_tools", "supportsTools"]) === true,
-      supportsStructuredOutput: field(value, ["supports_structured_output", "supportsStructuredOutput"]) === true,
-      supportsVision: field(value, ["supports_vision", "supportsVision"]) === true
-    });
+    const editableCapabilities = (value) => {
+      const source = value && typeof value === "object" ? value : {};
+      const declared = (names, presenceName) => ({
+        value: field(source, names) === true ? true : field(source, names) === false ? false : null,
+        present: source[presenceName] === true
+      });
+      const tools = declared(["supports_tools", "supportsTools"], "supportsToolsPresent");
+      const structured = declared(["supports_structured_output", "supportsStructuredOutput"], "supportsStructuredOutputPresent");
+      const vision = declared(["supports_vision", "supportsVision"], "supportsVisionPresent");
+      return {
+        contextWindowTokens: textValue(field(source, ["context_window_tokens", "contextWindowTokens"])),
+        maxOutputTokens: textValue(field(source, ["max_output_tokens", "maxOutputTokens"])),
+        supportsTools: tools.value,
+        supportsToolsPresent: tools.present,
+        supportsStructuredOutput: structured.value,
+        supportsStructuredOutputPresent: structured.present,
+        supportsVision: vision.value,
+        supportsVisionPresent: vision.present
+      };
+    };
     const restoreModelCapabilities = (value) => {
       const entries = value && typeof value === "object" && !Array.isArray(value) ? Object.entries(value) : [];
       modelCapabilities = new Map(entries.map(([modelId, capability]) => [textValue(modelId), editableCapabilities(capability)]).filter(([modelId]) => modelId));
     };
+    const capabilityDeclarationSelect = (modelId, label, value) => {
+      const select = node("select", { ariaLabel: `${modelId}${label}能力声明` });
+      appendOption(select, "unknown", "未知（未声明）", value === null);
+      appendOption(select, "supported", "支持（配置声明）", value === true);
+      appendOption(select, "unsupported", "不支持（明确阻断）", value === false);
+      select.value = value === true ? "supported" : value === false ? "unsupported" : "unknown";
+      return select;
+    };
+    const declarationValue = (select) => select.value === "supported" ? true : select.value === "unsupported" ? false : null;
     const renderModels = () => {
       const filter = modelSearch.value.trim().toLowerCase();
       const visible = modelItems.filter((model) => {
@@ -5794,31 +6236,49 @@ export class WebApp {
       }
       replaceChildren(modelHost, visible.map((model) => {
         const modelId = textValue(field(model, ["id", "name"]));
-        const capability = editableCapabilities(modelCapabilities.get(modelId) || {});
+        let capability = editableCapabilities(modelCapabilities.get(modelId) || {});
         const checked = node("input", { type: "checkbox", checked: enabledModels.has(modelId), ariaLabel: `启用${modelId}` });
         checked.dataset.modelId = modelId;
         checked.addEventListener("change", () => { if (checked.checked) enabledModels.add(modelId); else enabledModels.delete(modelId); });
         const contextWindow = node("input", { type: "number", min: "1", step: "1", value: capability.contextWindowTokens, placeholder: "上下文窗口 tokens" });
         const maxOutput = node("input", { type: "number", min: "1", step: "1", value: capability.maxOutputTokens, placeholder: "最大输出 tokens" });
-        const tools = node("input", { type: "checkbox", checked: capability.supportsTools, ariaLabel: `${modelId}支持工具` });
-        const structured = node("input", { type: "checkbox", checked: capability.supportsStructuredOutput, ariaLabel: `${modelId}支持结构化输出` });
-        const vision = node("input", { type: "checkbox", checked: capability.supportsVision, ariaLabel: `${modelId}支持视觉` });
-        const persistCapabilities = () => {
-          const next = { contextWindowTokens: contextWindow.value, maxOutputTokens: maxOutput.value, supportsTools: tools.checked, supportsStructuredOutput: structured.checked, supportsVision: vision.checked };
+        const tools = capabilityDeclarationSelect(modelId, "工具调用", capability.supportsTools);
+        const structured = capabilityDeclarationSelect(modelId, "结构化输出", capability.supportsStructuredOutput);
+        const vision = capabilityDeclarationSelect(modelId, "视觉", capability.supportsVision);
+        const persistCapabilities = (changedDeclaration = "") => {
+          const next = {
+            contextWindowTokens: contextWindow.value,
+            maxOutputTokens: maxOutput.value,
+            supportsTools: declarationValue(tools),
+            supportsToolsPresent: changedDeclaration === "tools" ? true : capability.supportsToolsPresent,
+            supportsStructuredOutput: declarationValue(structured),
+            supportsStructuredOutputPresent: changedDeclaration === "structured" ? true : capability.supportsStructuredOutputPresent,
+            supportsVision: declarationValue(vision),
+            supportsVisionPresent: changedDeclaration === "vision" ? true : capability.supportsVisionPresent
+          };
+          capability = next;
           if (capabilityInputPresent(next)) modelCapabilities.set(modelId, next); else modelCapabilities.delete(modelId);
         };
         contextWindow.addEventListener("input", persistCapabilities);
         maxOutput.addEventListener("input", persistCapabilities);
-        tools.addEventListener("change", persistCapabilities);
-        structured.addEventListener("change", persistCapabilities);
-        vision.addEventListener("change", persistCapabilities);
+        tools.addEventListener("change", () => persistCapabilities("tools"));
+        structured.addEventListener("change", () => persistCapabilities("structured"));
+        vision.addEventListener("change", () => persistCapabilities("vision"));
+        const hasKnownCapability = Boolean(capability.contextWindowTokens || capability.maxOutputTokens
+          || capability.supportsTools !== null || capability.supportsStructuredOutput !== null || capability.supportsVision !== null);
+        const explicitBlocks = [
+          capability.supportsTools === false ? "工具调用" : "",
+          capability.supportsStructuredOutput === false ? "结构化输出" : "",
+          capability.supportsVision === false ? "视觉附件" : ""
+        ].filter(Boolean);
         const option = node("div", { className: "model-option" }, [
           node("label", { className: "checkbox-label" }, [checked, node("span", { text: modelId }), node("span", { className: "muted small", text: textValue(field(model, ["owned_by", "description"])) })]),
-          node("details", { className: "model-capability-config", open: capabilityInputPresent(capability) }, [
+          node("details", { className: "model-capability-config", open: hasKnownCapability }, [
             node("summary", { text: "配置上下文能力（可选）" }),
-            node("p", { className: "muted small", text: "未配置时按输入 16k、输出 4k 保守预检；填写时需同时提供上下文窗口和最大输出。" }),
+            node("p", { className: "muted small", text: "未配置容量时按输入 16k、输出 4k 保守预检；容量需成对填写。能力状态可分别保留未知、支持声明或明确不支持。支持只是配置声明，不等于已对服务实测；明确不支持会在提交前阻断对应功能，需人工确认后才能更正。" }),
+            explicitBlocks.length ? statusBox(`已明确阻断：${explicitBlocks.join("、")}。保持阻断，直到你在上方作出明确更正并保存。`, "warning") : null,
             node("div", { className: "model-capability-fields" }, [fieldInput("上下文窗口", contextWindow), fieldInput("最大输出", maxOutput)]),
-            node("div", { className: "model-capability-flags" }, [labelFor("支持工具调用", tools), labelFor("支持结构化输出", structured), labelFor("支持视觉", vision)])
+            node("div", { className: "model-capability-flags" }, [labelFor("工具调用", tools), labelFor("结构化输出", structured), labelFor("视觉", vision)])
           ])
         ]);
         return option;
@@ -5948,6 +6408,20 @@ export class WebApp {
         this.state.providers = providers;
         this.state.aiDefaults = response?.defaults || this.state.aiDefaults || {};
         const presets = Array.isArray(response?.presets) && response.presets.length ? response.presets : presetOptions;
+        const declarationSummary = (provider) => {
+          const model = textValue(provider.model);
+          const metadata = field(provider, ["capability_metadata", "capabilityMetadata"]);
+          const declaration = metadata && typeof metadata === "object" ? metadata[model] : null;
+          if (!declaration || typeof declaration !== "object") return "模型能力未知（未声明）";
+          const state = textValue(field(declaration, ["verification_state", "verificationState"]), "unknown");
+          const declaredAt = Number(field(declaration, ["declared_at", "declaredAt"]));
+          const when = Number.isSafeInteger(declaredAt) && declaredAt > 0
+            ? new Date(declaredAt * 1000).toLocaleString("zh-CN", { hour12: false }) : "时间未记录";
+          const bindingChanged = Boolean(field(declaration, ["current_config_binding", "currentConfigBinding"])) || declaration.needs_review === true;
+          if (state === "declared") return `能力为配置声明（${when}，${bindingChanged ? "配置绑定待复核" : "绑定当前配置"}；未实测）`;
+          if (state === "legacy") return "能力来自旧配置，待人工复核";
+          return "模型能力未知（未声明）";
+        };
         replaceChildren(list, providers.length ? providers.map((provider) => {
           const pid = textValue(provider.id);
           const edit = button("编辑", () => {
@@ -5958,7 +6432,7 @@ export class WebApp {
           }, "button subtle");
           const capabilityMap = field(provider, ["model_capabilities", "modelCapabilities"]);
           const capabilityCount = capabilityMap && typeof capabilityMap === "object" && !Array.isArray(capabilityMap) ? Object.keys(capabilityMap).length : 0;
-          return node("div", { className: "provider-row" }, [node("strong", { text: textValue(provider.name, "未命名服务") }), node("span", { className: "muted small", text: `${textValue(provider.model, "未设置模型")} · ${provider.key_configured ? "API Key 已配置" : "未配置 API Key"} · ${capabilityCount ? `已配置 ${capabilityCount} 个模型能力` : "模型能力待核实"} · ${providerTrustLabel(provider)}` }), edit, test]);
+          return node("div", { className: "provider-row" }, [node("strong", { text: textValue(provider.name, "未命名服务") }), node("span", { className: "muted small", text: `${textValue(provider.model, "未设置模型")} · ${provider.key_configured ? "API Key 已配置" : "未配置 API Key"} · ${capabilityCount ? `已配置 ${capabilityCount} 个模型能力` : "模型能力待核实"} · ${declarationSummary(provider)} · ${providerTrustLabel(provider)}` }), edit, test]);
         }) : [emptyState("尚未配置模型服务。")]);
         if (selectId) {
           const found = providers.find((provider) => textValue(provider.id) === selectId);

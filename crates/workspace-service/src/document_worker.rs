@@ -28,16 +28,55 @@ const PAGE: u8 = 2;
 const DONE: u8 = 3;
 const FAILURE: u8 = 4;
 const ACK: u8 = 5;
+const REQUEST_ALL: u8 = 6;
+const REQUEST_SELECTED: u8 = 7;
+const REQUEST_METADATA: u8 = 8;
+const METADATA: u8 = 9;
 const PAGE_HEADER_BYTES: usize = 1 + 4 + 1 + 4 + 4 + 4 + 4;
-const MAX_REQUEST_FRAME_BYTES: usize = MAX_FILE_BYTES + 1;
+const REQUEST_HEADER_BYTES: usize = 2;
+const SELECTED_REQUEST_HEADER_BYTES: usize = REQUEST_HEADER_BYTES + 2;
+const SELECTED_PAGE_RANGE_BYTES: usize = 8;
+const MAX_SELECTED_PAGE_RANGES: usize = file_ingest::MAX_PDF_PAGES;
+const MAX_REQUEST_FRAME_BYTES: usize = MAX_FILE_BYTES
+    + SELECTED_REQUEST_HEADER_BYTES
+    + SELECTED_PAGE_RANGE_BYTES * MAX_SELECTED_PAGE_RANGES;
 const MAX_RESPONSE_FRAME_BYTES: usize = PAGE_HEADER_BYTES + MAX_TEXT_BYTES + MAX_OCR_IMAGE_BYTES;
 const MAX_ERROR_CODE_BYTES: usize = 128;
+const METADATA_RESPONSE_BYTES: usize = 1 + 4;
+/// A preflight has no source-text tokenizer available. Reserve a documented, conservative page
+/// envelope; actual text and visual work still charge the execution budget incrementally.
+pub(crate) const PDF_METADATA_TOKENS_PER_PAGE: u32 = 1_024;
+pub(crate) const PDF_METADATA_ESTIMATE_BASIS: &str = "conservative_per_page_metadata";
 
 /// A single page received from the worker. Its image is dropped by the caller before it asks the
 /// worker to render the following page.
 pub(crate) struct WorkerPage {
     pub page: PdfPage,
     pub ocr_asset: Option<OcrAsset>,
+}
+
+/// Payload-free local structural facts returned by the isolated PDF worker. The estimate is a
+/// conservative page envelope, never a claim that the PDF's body was extracted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PdfDocumentMetadata {
+    pub page_count: u32,
+    pub estimated_input_tokens: u32,
+    pub estimate_basis: String,
+}
+
+enum WorkerRequestMode<'a> {
+    All,
+    Selected(&'a [(u32, u32)]),
+    Metadata,
+}
+
+enum DecodedWorkerRequest<'a> {
+    All(&'a [u8]),
+    Selected {
+        bytes: &'a [u8],
+        ranges: Vec<(u32, u32)>,
+    },
+    Metadata(&'a [u8]),
 }
 
 pub(crate) struct PdfDocumentWorker {
@@ -50,12 +89,54 @@ pub(crate) struct PdfDocumentWorker {
 
 impl PdfDocumentWorker {
     pub(crate) async fn start(bytes: &[u8], cancel: &CancellationToken) -> Result<Self> {
+        Self::start_with_request(bytes, WorkerRequestMode::All, cancel).await
+    }
+
+    /// Start the existing streaming worker for only selected one-based, inclusive page ranges.
+    /// An empty selection is never interpreted as all pages.
+    pub(crate) async fn start_selected(
+        bytes: &[u8],
+        ranges: &[(u32, u32)],
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
+        // Reject malformed local input before a child process or Job is created. The child repeats
+        // this check because its stdin is still an isolation boundary.
+        let canonical = canonicalize_worker_ranges(ranges)?;
+        Self::start_with_request(bytes, WorkerRequestMode::Selected(&canonical), cancel).await
+    }
+
+    /// Count the PDF page tree in the isolated executable without extracting text, inspecting
+    /// image resources, rendering a page, or loading Pdfium.
+    pub(crate) async fn metadata(
+        bytes: &[u8],
+        cancel: &CancellationToken,
+    ) -> Result<PdfDocumentMetadata> {
+        let mut worker =
+            Self::start_with_request(bytes, WorkerRequestMode::Metadata, cancel).await?;
+        let result = worker.read_metadata(cancel).await;
+        match result {
+            Ok(metadata) => worker.finish().await.map(|()| metadata),
+            Err(error) => {
+                worker.abort().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn start_with_request(
+        bytes: &[u8],
+        request: WorkerRequestMode<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
         if bytes.len() > MAX_FILE_BYTES {
             return Err(Error::new("file_too_large"));
         }
         if cancel.is_cancelled() {
             return Err(Error::new("cancelled"));
         }
+        // Encode before spawning so a malformed request cannot leave a short-lived unreaped
+        // worker behind. All post-spawn failures use `abort`, which waits for the child.
+        let payload = encode_worker_request(bytes, request)?;
         let executable =
             std::env::current_exe().map_err(|_| Error::new("document_worker_unavailable"))?;
         let mut command = Command::new(executable);
@@ -96,9 +177,6 @@ impl PdfDocumentWorker {
             renderer_elapsed: Duration::ZERO,
             _job: job,
         };
-        let mut payload = Vec::with_capacity(bytes.len() + 1);
-        payload.push(INPUT_PDF);
-        payload.extend_from_slice(bytes);
         if let Err(error) = worker.write_renderer_frame(&payload, cancel).await {
             worker.abort().await;
             return Err(error);
@@ -110,6 +188,15 @@ impl PdfDocumentWorker {
         &mut self,
         cancel: &CancellationToken,
     ) -> Result<Option<WorkerPage>> {
+        parse_worker_response(&self.read_renderer_response(cancel).await?)
+    }
+
+    async fn read_metadata(&mut self, cancel: &CancellationToken) -> Result<PdfDocumentMetadata> {
+        let payload = self.read_renderer_response(cancel).await?;
+        decode_metadata(&payload)
+    }
+
+    async fn read_renderer_response(&mut self, cancel: &CancellationToken) -> Result<Vec<u8>> {
         let remaining = self.renderer_remaining()?;
         let started = std::time::Instant::now();
         let payload = tokio::select! {
@@ -125,7 +212,7 @@ impl PdfDocumentWorker {
             },
         };
         self.charge_renderer_elapsed(started);
-        parse_worker_response(&payload)
+        Ok(payload)
     }
 
     pub(crate) async fn acknowledge_page(&mut self, cancel: &CancellationToken) -> Result<()> {
@@ -202,6 +289,135 @@ fn renderer_budget_remaining(elapsed: Duration) -> Result<Duration> {
         .ok_or_else(|| Error::new("document_worker_timeout"))
 }
 
+fn encode_worker_request(bytes: &[u8], request: WorkerRequestMode<'_>) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(bytes.len() + SELECTED_REQUEST_HEADER_BYTES);
+    payload.push(INPUT_PDF);
+    match request {
+        WorkerRequestMode::All => payload.push(REQUEST_ALL),
+        WorkerRequestMode::Metadata => payload.push(REQUEST_METADATA),
+        WorkerRequestMode::Selected(ranges) => {
+            let ranges = canonicalize_worker_ranges(ranges)?;
+            if ranges.is_empty() {
+                return Err(Error::new("invalid_pdf_page_range"));
+            }
+            let range_count =
+                u16::try_from(ranges.len()).map_err(|_| Error::new("invalid_pdf_page_range"))?;
+            payload.push(REQUEST_SELECTED);
+            payload.extend_from_slice(&range_count.to_le_bytes());
+            for (start, end) in ranges {
+                payload.extend_from_slice(&start.to_le_bytes());
+                payload.extend_from_slice(&end.to_le_bytes());
+            }
+        }
+    }
+    payload.extend_from_slice(bytes);
+    if payload.len() > MAX_REQUEST_FRAME_BYTES {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    Ok(payload)
+}
+
+fn decode_worker_request(payload: &[u8]) -> Result<DecodedWorkerRequest<'_>> {
+    let Some((&INPUT_PDF, payload)) = payload.split_first() else {
+        return Err(Error::new("document_worker_protocol_error"));
+    };
+    // Accept the pre-1.2.1 all-page request layout for an already running paired executable.
+    // New parents always use an explicit mode, avoiding any interpretation of PDF bytes as a
+    // page selection command.
+    let Some((&mode, remaining)) = payload.split_first() else {
+        return Err(Error::new("document_worker_protocol_error"));
+    };
+    match mode {
+        REQUEST_ALL => validate_worker_pdf_bytes(remaining).map(DecodedWorkerRequest::All),
+        REQUEST_METADATA => {
+            validate_worker_pdf_bytes(remaining).map(DecodedWorkerRequest::Metadata)
+        }
+        REQUEST_SELECTED => {
+            if remaining.len() < 2 {
+                return Err(Error::new("document_worker_protocol_error"));
+            }
+            let count = usize::from(u16::from_le_bytes([remaining[0], remaining[1]]));
+            if count == 0 || count > MAX_SELECTED_PAGE_RANGES {
+                return Err(Error::new("invalid_pdf_page_range"));
+            }
+            let ranges_len = count
+                .checked_mul(SELECTED_PAGE_RANGE_BYTES)
+                .ok_or_else(|| Error::new("document_worker_protocol_error"))?;
+            let bytes_start = 2usize
+                .checked_add(ranges_len)
+                .ok_or_else(|| Error::new("document_worker_protocol_error"))?;
+            if bytes_start >= remaining.len() {
+                return Err(Error::new("document_worker_protocol_error"));
+            }
+            let mut ranges = Vec::with_capacity(count);
+            for range in remaining[2..bytes_start]
+                .as_chunks::<SELECTED_PAGE_RANGE_BYTES>()
+                .0
+            {
+                ranges.push((read_u32(&range[..4])?, read_u32(&range[4..])?));
+            }
+            let ranges = canonicalize_worker_ranges(&ranges)?;
+            let bytes = validate_worker_pdf_bytes(&remaining[bytes_start..])?;
+            Ok(DecodedWorkerRequest::Selected { bytes, ranges })
+        }
+        // The former request was `[INPUT_PDF, %PDF…]`; only an actual PDF signature earns
+        // compatibility, so malformed inputs never turn into a hidden all-page request.
+        b'%' if payload.starts_with(b"%PDF-") => {
+            validate_worker_pdf_bytes(payload).map(DecodedWorkerRequest::All)
+        }
+        _ => Err(Error::new("document_worker_protocol_error")),
+    }
+}
+
+fn validate_worker_pdf_bytes(bytes: &[u8]) -> Result<&[u8]> {
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(Error::new("file_too_large"));
+    }
+    if !bytes.starts_with(b"%PDF-") {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    Ok(bytes)
+}
+
+fn canonicalize_worker_ranges(ranges: &[(u32, u32)]) -> Result<Vec<(u32, u32)>> {
+    if ranges.is_empty() || ranges.len() > MAX_SELECTED_PAGE_RANGES {
+        return Err(Error::new("invalid_pdf_page_range"));
+    }
+    let mut result = ranges.to_vec();
+    result.sort_unstable();
+    let mut canonical: Vec<(u32, u32)> = Vec::with_capacity(result.len());
+    for (start, end) in result {
+        if start == 0 || end < start {
+            return Err(Error::new("invalid_pdf_page_range"));
+        }
+        match canonical.last_mut() {
+            Some((_, prior_end)) if start <= prior_end.saturating_add(1) => {
+                *prior_end = (*prior_end).max(end);
+            }
+            _ => canonical.push((start, end)),
+        }
+    }
+    Ok(canonical)
+}
+
+fn decode_metadata(payload: &[u8]) -> Result<PdfDocumentMetadata> {
+    if payload.first() == Some(&FAILURE) {
+        return Err(decode_worker_failure(payload));
+    }
+    if payload.len() != METADATA_RESPONSE_BYTES || payload.first() != Some(&METADATA) {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    let page_count = read_u32(&payload[1..])?;
+    if page_count == 0 || usize::try_from(page_count).ok() > Some(file_ingest::MAX_PDF_PAGES) {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    Ok(PdfDocumentMetadata {
+        page_count,
+        estimated_input_tokens: page_count.saturating_mul(PDF_METADATA_TOKENS_PER_PAGE),
+        estimate_basis: PDF_METADATA_ESTIMATE_BASIS.to_owned(),
+    })
+}
+
 impl Drop for PdfDocumentWorker {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
@@ -214,33 +430,65 @@ pub fn run_internal_document_worker() -> Result<()> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let payload = read_frame_blocking(&mut input, MAX_REQUEST_FRAME_BYTES)?;
-    let Some(bytes) = payload.strip_prefix(&[INPUT_PDF]) else {
-        return Err(Error::new("document_worker_protocol_error"));
-    };
-    if bytes.len() > MAX_FILE_BYTES {
-        return Err(Error::new("file_too_large"));
-    }
-    let pdfium = worker_pdfium_library();
-    let result = file_ingest::stream_pdf_pages(bytes, pdfium.as_deref(), |page| {
-        write_page_blocking(&mut output, &page)
-            .map_err(|_| file_ingest::IngestError::PdfRenderFailed)?;
-        // The renderer keeps no image after its page bytes have entered the bounded pipe. The
-        // parent must ACK before this callback returns and Pdfium can render another page.
-        drop(page);
-        let acknowledgement = read_frame_blocking(&mut input, 1)
-            .map_err(|_| file_ingest::IngestError::PdfRenderFailed)?;
-        if acknowledgement.as_slice() != [ACK] {
-            return Err(file_ingest::IngestError::PdfRenderFailed);
+    let request = decode_worker_request(&payload)?;
+    let metadata_request = matches!(&request, DecodedWorkerRequest::Metadata(_));
+    let result: std::result::Result<(), file_ingest::IngestError> = match request {
+        DecodedWorkerRequest::Metadata(bytes) => {
+            file_ingest::inspect_pdf_metadata(bytes).and_then(|metadata| {
+                write_metadata_blocking(&mut output, metadata.page_count)
+                    .map_err(|_| file_ingest::IngestError::PdfRenderFailed)
+            })
         }
-        Ok(())
-    });
+        DecodedWorkerRequest::All(bytes) => stream_worker_pages(
+            &mut input,
+            &mut output,
+            bytes,
+            None,
+            worker_pdfium_library().as_deref(),
+        ),
+        DecodedWorkerRequest::Selected { bytes, ranges } => stream_worker_pages(
+            &mut input,
+            &mut output,
+            bytes,
+            Some(&ranges),
+            worker_pdfium_library().as_deref(),
+        ),
+    };
     match result {
-        Ok(()) => write_frame_blocking(&mut output, &[DONE]),
+        Ok(()) => {
+            if metadata_request {
+                Ok(())
+            } else {
+                write_frame_blocking(&mut output, &[DONE])
+            }
+        }
         Err(error) => {
             let _ = write_failure(&mut output, error.code());
             Err(Error::new(error.code()))
         }
     }
+}
+
+fn stream_worker_pages(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    bytes: &[u8],
+    ranges: Option<&[(u32, u32)]>,
+    pdfium_library: Option<&std::path::Path>,
+) -> std::result::Result<(), file_ingest::IngestError> {
+    file_ingest::stream_pdf_selected_pages(bytes, ranges, pdfium_library, |page| {
+        write_page_blocking(output, &page)
+            .map_err(|_| file_ingest::IngestError::PdfRenderFailed)?;
+        // The renderer keeps no image after its page bytes have entered the bounded pipe. The
+        // parent must ACK before this callback returns and Pdfium can render another page.
+        drop(page);
+        let acknowledgement =
+            read_frame_blocking(input, 1).map_err(|_| file_ingest::IngestError::PdfRenderFailed)?;
+        if acknowledgement.as_slice() != [ACK] {
+            return Err(file_ingest::IngestError::PdfRenderFailed);
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn health_status() -> serde_json::Value {
@@ -283,16 +531,18 @@ fn worker_pdfium_library() -> Option<PathBuf> {
 fn parse_worker_response(payload: &[u8]) -> Result<Option<WorkerPage>> {
     match payload.first().copied() {
         Some(DONE) if payload.len() == 1 => Ok(None),
-        Some(FAILURE) => {
-            let code = std::str::from_utf8(&payload[1..])
-                .ok()
-                .filter(|code| valid_error_code(code))
-                .unwrap_or("document_worker_exited");
-            Err(Error::new(code))
-        }
+        Some(FAILURE) => Err(decode_worker_failure(payload)),
         Some(PAGE) => decode_page(payload).map(Some),
         _ => Err(Error::new("document_worker_protocol_error")),
     }
+}
+
+fn decode_worker_failure(payload: &[u8]) -> Error {
+    let code = std::str::from_utf8(&payload[1..])
+        .ok()
+        .filter(|code| valid_error_code(code))
+        .unwrap_or("document_worker_exited");
+    Error::new(code)
 }
 
 fn page_parts(output: &PdfPageOutput) -> Result<(u8, &[u8], u32, u32)> {
@@ -362,6 +612,16 @@ fn write_page_blocking(output: &mut impl Write, page: &PdfPageOutput) -> Result<
         .and_then(|()| output.write_all(image))
         .and_then(|()| output.flush())
         .map_err(|_| Error::new("document_worker_protocol_error"))
+}
+
+fn write_metadata_blocking(output: &mut impl Write, page_count: u32) -> Result<()> {
+    if page_count == 0 || usize::try_from(page_count).ok() > Some(file_ingest::MAX_PDF_PAGES) {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    let mut payload = [0u8; METADATA_RESPONSE_BYTES];
+    payload[0] = METADATA;
+    payload[1..].copy_from_slice(&page_count.to_le_bytes());
+    write_frame_blocking(output, &payload)
 }
 
 fn decode_page(frame: &[u8]) -> Result<WorkerPage> {
@@ -680,6 +940,62 @@ mod tests {
                 .code,
             "document_worker_timeout"
         );
+    }
+
+    #[test]
+    fn selected_request_canonicalizes_before_the_child_can_open_a_page() {
+        let request = encode_worker_request(
+            b"%PDF-1.5\nfixture",
+            WorkerRequestMode::Selected(&[(4, 4), (2, 3), (3, 4)]),
+        )
+        .expect("selected request");
+        match decode_worker_request(&request).expect("decode selected request") {
+            DecodedWorkerRequest::Selected { bytes, ranges } => {
+                assert_eq!(bytes, b"%PDF-1.5\nfixture");
+                assert_eq!(ranges, vec![(2, 4)]);
+            }
+            _ => panic!("selected request lost its mode"),
+        }
+    }
+
+    #[test]
+    fn selected_request_rejects_empty_zero_and_reversed_ranges() {
+        for ranges in [&[][..], &[(0, 1)][..], &[(2, 1)][..]] {
+            assert_eq!(
+                encode_worker_request(b"%PDF-1.5\nfixture", WorkerRequestMode::Selected(ranges))
+                    .unwrap_err()
+                    .code,
+                "invalid_pdf_page_range"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_response_is_bounded_and_uses_the_documented_conservative_estimate() {
+        let mut frame = vec![METADATA];
+        frame.extend_from_slice(&3u32.to_le_bytes());
+        let metadata = decode_metadata(&frame).expect("metadata frame");
+        assert_eq!(metadata.page_count, 3);
+        assert_eq!(metadata.estimated_input_tokens, 3_072);
+        assert_eq!(metadata.estimate_basis, PDF_METADATA_ESTIMATE_BASIS);
+        assert_eq!(
+            decode_metadata(&[METADATA, 0, 0, 0, 0]).unwrap_err().code,
+            "document_worker_protocol_error"
+        );
+    }
+
+    #[test]
+    fn legacy_all_page_request_requires_an_actual_pdf_signature() {
+        let mut legacy = vec![INPUT_PDF];
+        legacy.extend_from_slice(b"%PDF-1.5\nfixture");
+        assert!(matches!(
+            decode_worker_request(&legacy),
+            Ok(DecodedWorkerRequest::All(_))
+        ));
+        match decode_worker_request(&[INPUT_PDF, b'x']) {
+            Err(error) => assert_eq!(error.code, "document_worker_protocol_error"),
+            Ok(_) => panic!("invalid legacy request was accepted"),
+        }
     }
 
     #[cfg(windows)]

@@ -208,6 +208,81 @@ fn make_mixed_pdf() -> Vec<u8> {
     save_pdf(document)
 }
 
+fn make_three_page_pdf_with_scan_and_mixed_page() -> Vec<u8> {
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let font_id = document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    // A complete two-by-two RGB image uses twelve raw bytes. It is intentionally shared by the
+    // scan and mixed pages, which makes the fixture exercise real image rendering rather than
+    // the empty-content OCR fallback.
+    let image_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 2,
+            "Height" => 2,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+        },
+        vec![255, 255, 255, 0, 0, 0, 0, 0, 0, 255, 255, 255],
+    ));
+    let text_resources_id = document.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+    });
+    let visual_resources_id = document.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+    });
+    let mut page_ids = Vec::new();
+    for (content, resources) in [
+        (
+            b"BT\n/F1 12 Tf\n72 720 Td\n(page one text only) Tj\nET\n".as_slice(),
+            text_resources_id,
+        ),
+        (
+            b"q\n400 0 0 600 36 60 cm\n/Im0 Do\nQ\n".as_slice(),
+            visual_resources_id,
+        ),
+        (
+            b"BT\n/F1 12 Tf\n72 720 Td\n(page three mixed text) Tj\nET\nq\n400 0 0 600 36 60 cm\n/Im0 Do\nQ\n"
+                .as_slice(),
+            visual_resources_id,
+        ),
+    ] {
+        let content_id = document.add_object(Stream::new(dictionary! {}, content.to_vec()));
+        let page_id = document.new_object_id();
+        document.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => Object::Reference(resources),
+                "Contents" => Object::Reference(content_id),
+            }),
+        );
+        page_ids.push(page_id);
+    }
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>(),
+            "Count" => 3,
+        }),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    document.trailer.set("Root", Object::Reference(catalog_id));
+    save_pdf(document)
+}
+
 fn save_pdf(mut document: Document) -> Vec<u8> {
     let mut bytes = Vec::new();
     document.save_to(&mut bytes).unwrap();
@@ -997,6 +1072,68 @@ fn text_only_pdf_streams_without_binding_pdfium_or_requesting_ocr() {
 }
 
 #[test]
+fn pdf_metadata_counts_page_tree_without_opening_page_content() {
+    let pdf = make_pdf(&[Some("first local text"), Some("second local text")]);
+    let _ = crate::pdf::take_page_accesses();
+
+    let metadata = inspect_pdf_metadata(&pdf).expect("page-tree metadata");
+
+    assert_eq!(metadata.page_count, 2);
+    assert_eq!(crate::pdf::take_page_accesses(), Vec::<u32>::new());
+}
+
+#[test]
+fn selected_pdf_pages_skip_unselected_scan_before_pdfium_or_content_access() {
+    // Page 1 is a scanned page. Selecting only text page 2 with no Pdfium proves the selection
+    // happens before either scan rendering or image-resource traversal: the historical all-page
+    // inspection would have required the renderer and returned PdfiumUnavailable here.
+    let pdf = make_pdf(&[None, Some("selected page local text")]);
+    let _ = crate::pdf::take_page_accesses();
+    let mut emitted = Vec::new();
+
+    stream_pdf_selected_pages(&pdf, Some(&[(2, 2)]), None, |output| {
+        emitted.push((
+            output.page.number,
+            output.page.text,
+            output.ocr_asset.is_some(),
+        ));
+        Ok(())
+    })
+    .expect("selected text page does not bind Pdfium for an unselected scan");
+
+    assert_eq!(
+        emitted,
+        vec![(2, "selected page local text".to_owned(), false)]
+    );
+    assert_eq!(crate::pdf::take_page_accesses(), vec![2]);
+}
+
+#[test]
+fn selected_pdf_ranges_are_one_based_inclusive_and_canonicalized_before_access() {
+    let pdf = make_pdf(&[Some("one"), Some("two"), Some("three")]);
+    let _ = crate::pdf::take_page_accesses();
+    let pages = inspect_pdf_pages_selected(&pdf, Some(&[(3, 3), (2, 2), (2, 3)]))
+        .expect("unordered overlapping ranges normalize");
+
+    assert_eq!(
+        pages.iter().map(|page| page.number).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert_eq!(crate::pdf::take_page_accesses(), vec![2, 3]);
+}
+
+#[test]
+fn selected_pdf_ranges_reject_empty_zero_reversed_and_out_of_bounds() {
+    let pdf = make_pdf(&[Some("one"), Some("two")]);
+    for ranges in [&[][..], &[(0, 1)][..], &[(2, 1)][..], &[(1, 3)][..]] {
+        match inspect_pdf_pages_selected(&pdf, Some(ranges)) {
+            Err(error) => assert_eq!(error, IngestError::InvalidPdfPageRange),
+            Ok(_) => panic!("invalid selected range was accepted"),
+        }
+    }
+}
+
+#[test]
 fn mixed_pdf_marks_its_text_page_for_visual_ocr() {
     let pages = inspect_pdf_pages(&make_mixed_pdf()).expect("inspect mixed PDF");
     assert_eq!(pages.len(), 1);
@@ -1032,6 +1169,41 @@ fn pdf_ocr_renders_each_synthetic_page_with_bounded_png_output() {
     })
     .expect("reuses the pinned Pdfium binding");
     assert_eq!(second_count, 1);
+}
+
+#[test]
+#[ignore = "requires the pinned Pdfium DLL from scripts/fetch_pdfium.py"]
+fn pdfium_renders_only_the_selected_scan_or_mixed_page() {
+    let library = std::env::var_os("LAWYER_ASSISTANCE_PDFIUM")
+        .map(std::path::PathBuf::from)
+        .expect("LAWYER_ASSISTANCE_PDFIUM must point to the bundled DLL");
+    let pdf = make_three_page_pdf_with_scan_and_mixed_page();
+
+    for (selected, expected_text) in [(2, ""), (3, "page three mixed text")] {
+        let _ = take_pdfium_render_page_numbers();
+        let mut emitted = Vec::new();
+        stream_pdf_selected_pages(
+            &pdf,
+            Some(&[(selected, selected)]),
+            Some(&library),
+            |output| {
+                let asset = output.ocr_asset.expect("selected visual page renders");
+                emitted.push((output.page.number, output.page.text, asset.bytes.len()));
+                Ok(())
+            },
+        )
+        .expect("selected visual page renders from a three-page PDF");
+
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|(number, text, _)| (*number, text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(selected, expected_text)]
+        );
+        assert!(emitted[0].2 > 0);
+        assert_eq!(take_pdfium_render_page_numbers(), vec![selected]);
+    }
 }
 
 #[test]

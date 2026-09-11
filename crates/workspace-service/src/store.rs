@@ -215,6 +215,39 @@ impl Store {
     pub fn save<T: Serialize>(&self, kind: &str, id: &str, value: &T) -> Result<()> {
         self.put_many(vec![Self::encoded(kind, id, value)?])
     }
+
+    #[cfg(test)]
+    pub(crate) fn fail_object_writes_for_kind_for_tests(&self, kind: &str) -> Result<()> {
+        // This is deliberately test-only. It provides a deterministic SQLite
+        // failure after earlier rows in `put_many` have been staged, proving
+        // callers rely on the transaction rather than on write ordering.
+        if kind.is_empty()
+            || !kind
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(Error::new("invalid_request"));
+        }
+        let connection = self.connection()?;
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER fail_object_write_insert BEFORE INSERT ON objects \
+             WHEN NEW.kind='{kind}' BEGIN SELECT RAISE(ABORT,'forced object write'); END; \
+             CREATE TRIGGER fail_object_write_update BEFORE UPDATE ON objects \
+             WHEN NEW.kind='{kind}' BEGIN SELECT RAISE(ABORT,'forced object write'); END;"
+        ))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_object_write_failure_for_tests(&self) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute_batch(
+            "DROP TRIGGER IF EXISTS fail_object_write_insert; \
+             DROP TRIGGER IF EXISTS fail_object_write_update;",
+        )?;
+        Ok(())
+    }
+
     pub fn encoded_raw(kind: &str, id: &str, value: &[u8]) -> Result<StoredRow> {
         Ok(StoredRow {
             kind: kind.into(),
@@ -922,6 +955,7 @@ fn summary_for_value(kind: &str, id: &str, value: &Value, index: &ObjectIndex) -
             "id":id,"title":value["title"],"updated_at":index.updated_at,
             "context_revision":value["context_revision"],"context_known":value["context_known"],
             "materials":value["materials"],"attachment_ids":value["attachment_ids"],
+            "context_ranges":value["context_ranges"],
         }),
         "ai_attachment" => json!({
             "id":id,"sha256":value["sha256"],"source_byte_len":value["source_byte_len"],

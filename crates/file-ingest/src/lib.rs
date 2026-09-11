@@ -56,6 +56,23 @@ const PNG_MIME: &str = "image/png";
 const JPEG_MIME: &str = "image/jpeg";
 const WEBP_MIME: &str = "image/webp";
 
+#[cfg(test)]
+thread_local! {
+    // The test-only trace sits immediately before Pdfium receives a page handle. It proves a
+    // selected-range regression cannot be hidden by merely filtering emitted output afterwards.
+    static PDFIUM_RENDER_PAGE_NUMBERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_pdfium_render_page(page: u32) {
+    PDFIUM_RENDER_PAGE_NUMBERS.with(|pages| pages.borrow_mut().push(page));
+}
+
+#[cfg(test)]
+pub(crate) fn take_pdfium_render_page_numbers() -> Vec<u32> {
+    PDFIUM_RENDER_PAGE_NUMBERS.with(|pages| std::mem::take(&mut *pages.borrow_mut()))
+}
+
 /// A format accepted by the Stage 8 attachment importer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileFormat {
@@ -161,6 +178,15 @@ pub struct PdfPageOutput {
     pub ocr_asset: Option<OcrAsset>,
 }
 
+/// Structural PDF facts obtained without opening a page content stream or loading Pdfium.
+///
+/// `page_count` is deliberately the only document-derived value. Callers which need a budget
+/// estimate must apply their own documented policy rather than treating this as extracted text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PdfDocumentMetadata {
+    pub page_count: u32,
+}
+
 /// Internal marker inserted into DOCX body text at the position of a validated embedded image.
 ///
 /// The marker is never derived from a document relationship ID or source path.  The OCR pipeline
@@ -197,6 +223,7 @@ pub enum IngestError {
     CorruptPdf,
     EncryptedPdf,
     PdfPageLimitExceeded,
+    InvalidPdfPageRange,
     PdfContentLimitExceeded,
     NonTextPdf,
     CorruptDocx,
@@ -234,6 +261,7 @@ impl IngestError {
             Self::CorruptPdf => "corrupt_pdf",
             Self::EncryptedPdf => "encrypted_pdf",
             Self::PdfPageLimitExceeded => "pdf_page_limit_exceeded",
+            Self::InvalidPdfPageRange => "invalid_pdf_page_range",
             Self::PdfContentLimitExceeded => "pdf_content_limit_exceeded",
             Self::NonTextPdf => "non_text_pdf",
             Self::CorruptDocx => "corrupt_docx",
@@ -273,6 +301,7 @@ impl IngestError {
             Self::CorruptPdf => "The PDF is malformed or unsupported.",
             Self::EncryptedPdf => "Encrypted PDF files are not supported.",
             Self::PdfPageLimitExceeded => "The PDF exceeds the page limit.",
+            Self::InvalidPdfPageRange => "The selected PDF page range is invalid.",
             Self::PdfContentLimitExceeded => "The PDF exceeds a safe content limit.",
             Self::NonTextPdf => "The PDF has no extractable text layer.",
             Self::CorruptDocx => "The DOCX container is malformed or incomplete.",
@@ -467,12 +496,35 @@ fn decode_webp_for_ocr(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), IngestError>
 pub fn stream_pdf_pages<F>(
     bytes: &[u8],
     pdfium_library: Option<&Path>,
+    emit: F,
+) -> Result<(), IngestError>
+where
+    F: FnMut(PdfPageOutput) -> Result<(), IngestError>,
+{
+    stream_pdf_selected_pages(bytes, None, pdfium_library, emit)
+}
+
+/// Stream an explicitly selected set of one-based, inclusive PDF page ranges. Ranges are sorted
+/// and merged before page-local extraction begins. This is intentionally separate from filtering
+/// a complete result: unselected pages never have their text stream inspected, their resources
+/// traversed, or their visual OCR image rendered.
+///
+/// `None` selects every page and backs [`stream_pdf_pages`]. `Some(&[])` is rejected so an
+/// explicit local range can never silently acquire all-page semantics.
+pub fn stream_pdf_selected_pages<F>(
+    bytes: &[u8],
+    ranges: Option<&[(u32, u32)]>,
+    pdfium_library: Option<&Path>,
     mut emit: F,
 ) -> Result<(), IngestError>
 where
     F: FnMut(PdfPageOutput) -> Result<(), IngestError>,
 {
-    let pages = inspect_pdf_pages(bytes)?;
+    // Keep the renderer's document-wide page count check even when only a subset will be
+    // inspected. `inspect_pdf_metadata` reads only the page tree, so this does not open text or
+    // image resources for omitted pages.
+    let metadata = inspect_pdf_metadata(bytes)?;
+    let pages = inspect_pdf_pages_selected(bytes, ranges)?;
     let needs_renderer = pages.iter().any(|page| page.needs_ocr);
 
     if !needs_renderer {
@@ -494,7 +546,9 @@ where
         .map_err(|_| IngestError::PdfRenderFailed)?;
     let rendered_page_count =
         usize::try_from(document.pages().len()).map_err(|_| IngestError::PdfPageLimitExceeded)?;
-    if rendered_page_count != pages.len() || rendered_page_count > MAX_PDF_PAGES {
+    if rendered_page_count != usize::try_from(metadata.page_count).unwrap_or(usize::MAX)
+        || rendered_page_count > MAX_PDF_PAGES
+    {
         return Err(IngestError::PdfRenderFailed);
     }
 
@@ -503,6 +557,8 @@ where
         let ocr_asset = if page.needs_ocr {
             let index = i32::try_from(page.number.saturating_sub(1))
                 .map_err(|_| IngestError::PdfRenderFailed)?;
+            #[cfg(test)]
+            record_pdfium_render_page(page.number);
             let rendered = document
                 .pages()
                 .get(index)
@@ -552,11 +608,33 @@ where
 /// Inspect page-local text and visual content without binding Pdfium. This supports text-only
 /// local processing and lets the isolated renderer decide exactly which pages it must render.
 pub fn inspect_pdf_pages(bytes: &[u8]) -> Result<Vec<PdfPage>, IngestError> {
+    inspect_pdf_pages_selected(bytes, None)
+}
+
+/// Inspect only explicitly selected PDF pages without binding Pdfium. See
+/// [`stream_pdf_selected_pages`] for range semantics and the guarantee that unselected page
+/// content is not opened.
+pub fn inspect_pdf_pages_selected(
+    bytes: &[u8],
+    ranges: Option<&[(u32, u32)]>,
+) -> Result<Vec<PdfPage>, IngestError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(IngestError::FileTooLarge);
     }
     verify_magic(FileFormat::Pdf, bytes)?;
-    pdf::inspect_pages(bytes, Limits::default())
+    pdf::inspect_pages_selected(bytes, ranges, Limits::default())
+}
+
+/// Read only the PDF catalog/page tree. This does not inspect page content streams, image
+/// resources or text, and does not load Pdfium.
+pub fn inspect_pdf_metadata(bytes: &[u8]) -> Result<PdfDocumentMetadata, IngestError> {
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(IngestError::FileTooLarge);
+    }
+    verify_magic(FileFormat::Pdf, bytes)?;
+    Ok(PdfDocumentMetadata {
+        page_count: pdf::page_count(bytes, Limits::default())?,
+    })
 }
 
 fn bind_pdfium(pdfium_library: &Path) -> Result<pdfium_render::prelude::Pdfium, IngestError> {
