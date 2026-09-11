@@ -94,6 +94,17 @@ jobs:
       - name: Install Chromium for browser smoke
         run: pnpm exec playwright install chromium
 
+      - name: Verify local process diagnostics with isolated test faults
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP ("lawyer-process-diagnostics-" + [guid]::NewGuid().ToString("N"))
+          $faults = Join-Path $evidence "fault-bin"
+          python scripts/build_document_fault_test.py --output $faults
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:LAWYER_AUDIT_LEGAL_DB = Join-Path $env:RUNNER_TEMP "legal_core_web_smoke.synthetic.sqlite"
+          node scripts/audit_process_diagnostics_native.mjs --scope process --fault-exe (Join-Path $faults "lawyer-assistance-fault-test.exe") --production-exe "target/x86_64-pc-windows-msvc/release/lawyer-assistance.exe" --output (Join-Path $evidence "process-gates")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run deterministic editor, capability, sanitizer and context regressions
         shell: pwsh
         run: |

@@ -281,7 +281,7 @@ impl Workspace {
         match result {
             Ok(text) => worker.finish().await.map(|()| text),
             Err(error) => {
-                worker.abort().await;
+                worker.abort_with_error(&error).await;
                 Err(error)
             }
         }

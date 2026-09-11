@@ -65,6 +65,72 @@ class AuditValidateTests(unittest.TestCase):
         self.assertNotIn("rust-tests", selected)
         self.assertNotIn("preflight:rustc", selected)
 
+    def test_python_and_notice_checks_require_cargo_preflight(self) -> None:
+        context = audit_validate.AuditContext(
+            root=ROOT,
+            resources=ROOT / "output" / "runtime-tools",
+            output=ROOT / "work" / "test-audit-validate",
+            server_exe=ROOT / "server.exe",
+            mcp_exe=ROOT / "mcp.exe",
+        )
+        specs = {spec.check_id: spec for spec in audit_validate.build_command_specs(context, ())}
+        self.assertIn("preflight:cargo", specs["python-tests"].requires)
+        self.assertIn("preflight:cargo", specs["notices"].requires)
+        selected = audit_validate.selection_for(
+            "all", ("python-tests,notices",), audit_validate.PREFLIGHT_IDS, tuple(specs.values())
+        )
+        self.assertIn("preflight:cargo", selected)
+
+    def test_cargo_block_does_not_block_unrelated_web_check(self) -> None:
+        context = audit_validate.AuditContext(
+            root=ROOT,
+            resources=ROOT / "output" / "runtime-tools",
+            output=ROOT / "work" / "test-audit-validate",
+            server_exe=ROOT / "server.exe",
+            mcp_exe=ROOT / "mcp.exe",
+        )
+        specs = audit_validate.build_command_specs(context, ())
+        records = {
+            "preflight:cargo": audit_validate.make_record(
+                "preflight:cargo", "preflight", "tool", ("cargo version == 1.98.0",)
+            )
+        }
+        records["preflight:cargo"]["status"] = "blocked"
+        records["preflight:python"] = audit_validate.make_record(
+            "preflight:python", "preflight", "tool", ("Python major version >= 3",)
+        )
+        records["preflight:python"]["status"] = "passed"
+        python_spec = next(spec for spec in specs if spec.check_id == "python-tests")
+        python_record = audit_validate.blocked_record(python_spec, records)
+        self.assertEqual("blocked", python_record["status"])
+        self.assertEqual(["preflight:cargo"], python_record["blocked_by"])
+        web_spec = next(spec for spec in specs if spec.check_id == "web-tests")
+        self.assertNotIn("preflight:cargo", web_spec.requires)
+
+    def test_report_exposes_legacy_43_gate_comparison(self) -> None:
+        records = [
+            audit_validate.make_record("preflight:python", "preflight", "tool", ()),
+            audit_validate.make_record("python-tests", "python", "command", ()),
+        ]
+        records[0]["status"] = "passed"
+        records[1]["status"] = "blocked"
+        report = audit_validate.make_report(
+            audit_validate.AuditContext(ROOT, ROOT, ROOT, ROOT / "server.exe", ROOT / "mcp.exe"),
+            "python",
+            (),
+            records,
+            {"preflight:python", "python-tests"},
+            {"commit": None, "tools": [], "executables": [], "resources": [], "manifests": {}},
+            (),
+            "2026-09-11T00:00:00+00:00",
+            0.0,
+        )
+        comparison = report["top_level_count_comparison"]
+        self.assertEqual({"preflight": 12, "command_checks": 31, "total": 43}, comparison["legacy_baseline"])
+        self.assertEqual({"preflight": 1, "command_checks": 1, "total": 2}, comparison["current"])
+        self.assertEqual({"preflight": -11, "command_checks": -30, "total": -41}, comparison["delta"])
+        self.assertEqual({"passed": 1, "failed": 0, "blocked": 1, "not_run": 0}, report["summary"]["counts"])
+
     def test_runtime_resource_selection_includes_manifest_authority(self) -> None:
         context = audit_validate.AuditContext(
             root=ROOT,
@@ -240,6 +306,32 @@ class AuditValidateTests(unittest.TestCase):
             self.assertEqual("node", record["missing"])
             self.assertIn("PATH", record["how_to_obtain"])
             self.assertEqual("blocked", evidence["tools"][0]["status"])
+
+    def test_blocked_command_receives_an_immutable_evidence_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = audit_validate.AuditContext(
+                root=root,
+                resources=root,
+                output=root / "evidence",
+                server_exe=root / "server.exe",
+                mcp_exe=root / "mcp.exe",
+            )
+            preflight = audit_validate.make_record(
+                "preflight:cargo", "preflight", "tool", ("cargo version == 1.98.0",)
+            )
+            preflight["status"] = "blocked"
+            spec = audit_validate.CheckSpec(
+                "notices", "packaging", (sys.executable, "-c", "pass"), "notices.log", ("preflight:cargo",)
+            )
+            record = audit_validate.blocked_record(spec, {"preflight:cargo": preflight})
+            payload = dict(record)
+            payload.pop("log", None)
+            record["log"] = audit_validate.write_evidence_log(context, spec.check_id, payload)
+            record["log_sha256"] = audit_validate.sha256_file(context.output / record["log"])
+            self.assertEqual("blocked", record["status"])
+            self.assertIsNotNone(record["log"])
+            self.assertTrue((context.output / record["log"]).is_file())
 
     def test_pnpm_cmd_shim_is_resolved_before_launch(self) -> None:
         with patch.object(audit_validate.shutil, "which", return_value=r"C:\tools\pnpm.cmd"):

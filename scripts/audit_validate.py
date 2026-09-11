@@ -71,6 +71,14 @@ NATIVE_SCRIPTS = (
 )
 NATIVE_SCRIPT_CHECK_IDS = tuple(f"native-{name.removeprefix('audit_')}" for name in NATIVE_SCRIPTS)
 SOURCE_MANIFEST_NAME = "source-manifest.json"
+# Keep the historical top-level gate count visible in every report.  The
+# dependency correction below deliberately reuses the existing Cargo
+# preflight, so the current and historical totals remain comparable.
+LEGACY_TOP_LEVEL_CHECK_COUNTS = {
+    "preflight": 12,
+    "command_checks": 31,
+    "total": 43,
+}
 SOURCE_EXCLUDED_DIRECTORIES = {
     ".git",
     ".release-secrets",
@@ -1160,10 +1168,15 @@ def build_command_specs(ctx: AuditContext, python_modules: Sequence[str]) -> tup
         CheckSpec("editor-retest", "web", ("node", "scripts/audit_editor_retest.mjs", "--postfix", "--output", str(ctx.output / "editor-retest")), "web.log", ("preflight:node", "preflight:browser")),
         CheckSpec("contract-retest", "web", ("node", "scripts/audit_contract_retest.mjs", "--source", str(ctx.root), "--output", str(ctx.output / "contract-retest")), "web.log", ("preflight:node", "preflight:browser")),
         CheckSpec("context-ranges-web", "web", ("node", "scripts/audit_context_ranges_web.mjs", "--root", str(ctx.root), "--output", str(ctx.output / "context-ranges-web")), "web.log", ("preflight:node", "preflight:browser")),
-        CheckSpec("python-tests", "python", python_command, "python.log", ("preflight:python",)),
+        # The full discovered suite includes scripts.test_generate_third_party_notices,
+        # whose tests invoke Cargo through cargo_metadata_for_target().  Keep
+        # this explicit so a missing Cargo installation is a blocked test
+        # prerequisite rather than a Python ERROR reported as a product
+        # failure.  Other command checks continue independently.
+        CheckSpec("python-tests", "python", python_command, "python.log", ("preflight:python", "preflight:cargo")),
         CheckSpec("native-pdfium", "native", ("cargo", "+1.98.0", "test", "--locked", "--offline", "-p", "file-ingest", "--lib", "--", "--ignored"), "native-pdfium.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk", "preflight:manifests", "preflight:runtime-resources")),
         CheckSpec("formal-tests", "native", ("cargo", "+1.98.0", "test", "--locked", "--offline", "-p", "citations", "-p", "retrieval", "--test", "formal_legal_core", "--", "--ignored"), "formal-tests.log", ("preflight:rustc", "preflight:cargo", "preflight:manifests", "preflight:runtime-resources")),
-        CheckSpec("notices", "packaging", (sys.executable, "scripts/generate_third_party_notices.py", "--check"), "notices.log", ("preflight:python",)),
+        CheckSpec("notices", "packaging", (sys.executable, "scripts/generate_third_party_notices.py", "--check"), "notices.log", ("preflight:python", "preflight:cargo")),
         CheckSpec("server-build", "native", ("cargo", "+1.98.0", "build", "--locked", "--offline", "--release", "-j", "1", "-p", "lawyer-assistance-server", "--bin", "lawyer-assistance"), "build.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk")),
         CheckSpec("mcp-build", "native", ("cargo", "+1.98.0", "build", "--locked", "--offline", "--release", "-j", "1", "-p", "legal-mcp", "--bin", "lawyer-assistance-mcp"), "build.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk")),
         CheckSpec("document-fault-build", "native", (sys.executable, "scripts/build_document_fault_test.py", "--output", str(ctx.output / "fault-bin")), "fault-build.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk", "preflight:python")),
@@ -1345,6 +1358,11 @@ def make_report(
     started: float,
 ) -> dict[str, Any]:
     counts = {status: sum(record.get("status") == status for record in records) for status in ("passed", "failed", "blocked", "not_run")}
+    current_top_level_counts = {
+        "preflight": sum(record.get("kind") != "command" for record in records),
+        "command_checks": sum(record.get("kind") == "command" for record in records),
+        "total": len(records),
+    }
     selected_records = [record for record in records if record.get("id") in selected]
     if any(record.get("status") == "failed" for record in selected_records):
         status = "failed"
@@ -1386,6 +1404,15 @@ def make_report(
         "target": ctx.target,
         "python_tests": {"modules": list(python_modules), "count": len(python_modules)},
         "summary": {"counts": counts, "selected_count": len(selected_records), "total_checks": len(records)},
+        "top_level_count_comparison": {
+            "legacy_baseline": dict(LEGACY_TOP_LEVEL_CHECK_COUNTS),
+            "current": current_top_level_counts,
+            "delta": {
+                key: current_top_level_counts[key] - LEGACY_TOP_LEVEL_CHECK_COUNTS[key]
+                for key in LEGACY_TOP_LEVEL_CHECK_COUNTS
+            },
+            "note": "Cargo dependency correction reuses the existing preflight; 43 remains the comparable top-level count.",
+        },
         "scope": scope,
         "evidence": evidence,
         "commit": evidence.get("commit"),
@@ -1485,6 +1512,15 @@ def run_audit(ctx: AuditContext, phase: str = "all", only: Sequence[str] = ()) -
             record = blocked_record(spec, record_map)
         else:
             record = run_command_check(spec, ctx, evidence)
+        # A filtered or prerequisite-blocked command has no subprocess log,
+        # but it still needs an immutable evidence record.  Without this
+        # small record, an absent log can be mistaken for an unobserved
+        # success by downstream collectors.
+        if record.get("log") is None:
+            payload = dict(record)
+            payload.pop("log", None)
+            record["log"] = write_evidence_log(ctx, spec.check_id, payload)
+            record["log_sha256"] = sha256_file(ctx.output / record["log"])
         records.append(record)
         record_map[spec.check_id] = record
     report = make_report(ctx, phase, only, records, selected, evidence, python_modules, started_at, started)

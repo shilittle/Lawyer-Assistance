@@ -6,7 +6,12 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use workspace_service::{Error, Result, Workspace};
+use workspace_service::{
+    process_diagnostics::{
+        current_process_diagnostics, install_process_diagnostics, ProcessDiagnostics, ProcessRole,
+    },
+    Error, Result, Workspace,
+};
 
 #[derive(Parser)]
 #[command(version, about = "本地脱敏与法律检索 WebUI")]
@@ -27,11 +32,21 @@ enum Command {
     Serve,
     Login,
     Stop,
+    /// Prints only the local process diagnostic identity and health.  It does
+    /// not open a workspace, decrypt a record, or inspect source material.
+    Diagnostics,
     #[command(name = "document-worker", hide = true)]
     DocumentWorker,
     #[cfg(feature = "document-worker-fault-injection")]
     #[command(name = "document-worker-fault", hide = true)]
     DocumentWorkerFault {
+        mode: String,
+    },
+    /// Test-build-only fault harness for the process diagnostic gate.  It is
+    /// intentionally absent from ordinary release binaries.
+    #[cfg(feature = "document-worker-fault-injection")]
+    #[command(name = "process-diagnostic-fault", hide = true)]
+    ProcessDiagnosticFault {
         mode: String,
     },
 }
@@ -44,8 +59,21 @@ struct Connection {
 
 #[tokio::main]
 async fn main() {
-    // Panic payloads may contain formatted user input or provider bodies. Keep
-    // stderr useful for native diagnostics without emitting that payload.
+    let cli = Cli::parse();
+    #[cfg(feature = "document-worker-fault-injection")]
+    if diagnostic_fault_requires_explicit_data_dir(&cli) {
+        // The harness must never create a process ledger in the user's default
+        // workspace.  Check this before diagnostic initialization itself.
+        eprintln!("diagnostic_data_dir_required");
+        std::process::exit(2);
+    }
+    let diagnostics = initialize_process_diagnostics(&cli);
+    install_process_diagnostics(diagnostics.clone());
+    // Panic payloads may contain formatted user input or provider bodies. The
+    // hook therefore persists only a source basename and raw addresses that
+    // can later be symbolized against the matching diagnostic-build PDB. It
+    // does not write stderr: a closed/contended stderr stream must not turn an
+    // ordinary panic into a second panic or deadlock.
     std::panic::set_hook(Box::new(|info| {
         if let Some(location) = info.location() {
             let file = location
@@ -53,16 +81,35 @@ async fn main() {
                 .rsplit(['/', '\\'])
                 .next()
                 .unwrap_or("unknown");
-            eprintln!(
-                "task_panicked module={file} line={} column={}",
-                location.line(),
-                location.column()
-            );
+            if let Some(diagnostics) = current_process_diagnostics() {
+                diagnostics.record_panic_location(file, location.line(), location.column());
+            }
         } else {
-            eprintln!("task_panicked");
+            if let Some(diagnostics) = current_process_diagnostics() {
+                diagnostics.record_panic_location("unknown", 0, 0);
+            }
         }
     }));
-    let cli = Cli::parse();
+    if matches!(cli.command.as_ref(), Some(Command::Diagnostics)) {
+        diagnostics.record_phase("diagnostic_inspect");
+        // Persist the terminal event before taking the status snapshot: a
+        // failed final write must be visible to both the JSON consumer and the
+        // process exit status.
+        diagnostics.record_normal_stop();
+        let final_status = diagnostics.status();
+        match serde_json::to_string(&final_status) {
+            Ok(status) if final_status.ready => println!("{status}"),
+            Ok(status) => {
+                println!("{status}");
+                std::process::exit(1);
+            }
+            Err(_) => {
+                println!(r#"{{"status":"degraded","error_code":"diagnostic_serialize_failed"}}"#);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     // The portable VBS launcher intentionally hides the console.  Keep its
     // error path visible without changing the normal CLI behavior.
     let should_show_launch_error = cli.open
@@ -70,13 +117,60 @@ async fn main() {
             cli.command.as_ref(),
             Some(Command::Stop | Command::DocumentWorker)
         );
-    if let Err(e) = run(cli).await {
-        eprintln!("{}", e.code);
-        if should_show_launch_error {
-            show_launch_error(&e.code);
+    match run(cli).await {
+        Ok(()) => diagnostics.record_normal_stop(),
+        Err(e) => {
+            if matches!(diagnostics.identity().role, ProcessRole::DocumentWorker) {
+                // The hidden worker has already begun its framed operation;
+                // its errors are execution failures, never daemon startup.
+                diagnostics.record_unexpected_stop(&e.code);
+            } else if diagnostics.status().current_phase == "serving" {
+                diagnostics.record_unexpected_stop(&e.code);
+            } else {
+                diagnostics.record_start_failure(&e.code);
+            }
+            eprintln!("{}", e.code);
+            if should_show_launch_error {
+                show_launch_error(&e.code);
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
     }
+}
+
+fn build_revision() -> &'static str {
+    env!("LAWYER_ASSISTANCE_REVISION")
+}
+
+fn process_role(cli: &Cli) -> ProcessRole {
+    match cli.command.as_ref() {
+        Some(Command::DocumentWorker) => ProcessRole::DocumentWorker,
+        #[cfg(feature = "document-worker-fault-injection")]
+        Some(Command::DocumentWorkerFault { .. }) => ProcessRole::DocumentWorker,
+        Some(Command::Diagnostics) => ProcessRole::Diagnostics,
+        #[cfg(feature = "document-worker-fault-injection")]
+        Some(Command::ProcessDiagnosticFault { .. }) => ProcessRole::DiagnosticFault,
+        _ => ProcessRole::Daemon,
+    }
+}
+
+fn initialize_process_diagnostics(cli: &Cli) -> ProcessDiagnostics {
+    let role = process_role(cli);
+    if matches!(role, ProcessRole::DocumentWorker) {
+        return ProcessDiagnostics::from_child_environment(role, build_revision());
+    }
+    match root(cli) {
+        Ok(root) => ProcessDiagnostics::initialize(&root, role, build_revision()),
+        Err(_) => ProcessDiagnostics::disabled(role, build_revision()),
+    }
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn diagnostic_fault_requires_explicit_data_dir(cli: &Cli) -> bool {
+    matches!(
+        cli.command.as_ref(),
+        Some(Command::ProcessDiagnosticFault { .. })
+    ) && cli.data_dir.is_none()
 }
 
 fn launch_error_message(code: &str) -> String {
@@ -211,11 +305,21 @@ fn legal_path(cli: &Cli) -> Result<PathBuf> {
 }
 async fn run(cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Command::DocumentWorker)) {
+        if let Some(diagnostics) = current_process_diagnostics() {
+            diagnostics.record_phase("document_worker");
+        }
         return workspace_service::run_internal_document_worker();
     }
     #[cfg(feature = "document-worker-fault-injection")]
     if let Some(Command::DocumentWorkerFault { mode }) = cli.command.as_ref() {
+        if let Some(diagnostics) = current_process_diagnostics() {
+            diagnostics.record_phase("document_worker_fault");
+        }
         return workspace_service::run_internal_document_worker_fault(mode);
+    }
+    #[cfg(feature = "document-worker-fault-injection")]
+    if let Some(Command::ProcessDiagnosticFault { mode }) = cli.command.as_ref() {
+        return run_process_diagnostic_fault(mode);
     }
     let root = root(&cli)?;
     if matches!(cli.command, Some(Command::Login)) {
@@ -229,6 +333,9 @@ async fn run(cli: Cli) -> Result<()> {
         Err(e) if e.code == "workspace_in_use" && cli.open => return open_saved(&root),
         Err(e) => return Err(e),
     };
+    if let Some(diagnostics) = current_process_diagnostics() {
+        diagnostics.record_phase("workspace_open");
+    }
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, cli.port)))
         .await
         .map_err(|_| Error::new("port_in_use"))?;
@@ -280,6 +387,9 @@ async fn run(cli: Cli) -> Result<()> {
     ))
     .merge(mcp);
     let worker = workspace.start_worker();
+    if let Some(diagnostics) = current_process_diagnostics() {
+        diagnostics.record_phase("serving");
+    }
     eprintln!("Lawyer Assistance listening at {origin}");
     if cli.open {
         let url = format!("{}#token={}", connection.origin, connection.bootstrap);
@@ -304,6 +414,45 @@ async fn run(cli: Cli) -> Result<()> {
     let _ = worker.await;
     shutdown.cancel();
     result.map_err(|_| Error::new("server_failed"))
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn run_process_diagnostic_fault(mode: &str) -> Result<()> {
+    let diagnostics =
+        current_process_diagnostics().ok_or_else(|| Error::new("diagnostic_unavailable"))?;
+    diagnostics.record_phase("diagnostic_fault");
+    let operation_id = workspace_service::process_diagnostics::new_operation_id("diagnostic_fault");
+    diagnostics.record_operation_started(&operation_id, "diagnostic_fault");
+    match mode {
+        "panic" => panic!("controlled process diagnostic panic"),
+        "exit-code" => {
+            diagnostics.record_operation_failed(
+                &operation_id,
+                "diagnostic_fault",
+                "controlled_exit",
+            );
+            // Deliberately bypasses normal shutdown after its safe record. This
+            // establishes an exact, nonzero process exit for the gate.
+            std::process::exit(23);
+        }
+        "stderr-flood" => {
+            use std::io::Write;
+            let mut stderr = std::io::stderr().lock();
+            let chunk = [b'X'; 4096];
+            for _ in 0..64 {
+                let _ = stderr.write_all(&chunk);
+            }
+            let _ = stderr.flush();
+            diagnostics.record_operation_finished(&operation_id, "diagnostic_fault");
+            Ok(())
+        }
+        "hold" => {
+            std::thread::sleep(Duration::from_secs(30));
+            diagnostics.record_operation_finished(&operation_id, "diagnostic_fault");
+            Ok(())
+        }
+        _ => Err(Error::new("invalid_request")),
+    }
 }
 fn open_saved(root: &Path) -> Result<()> {
     let (connection, _lock) = saved_connection(root)?;
@@ -548,5 +697,28 @@ mod tests {
 
         assert!(same_executable_path(&current, &current).expect("compare same file"));
         assert!(!same_executable_path(&other, &current).expect("compare distinct files"));
+    }
+
+    #[cfg(feature = "document-worker-fault-injection")]
+    #[test]
+    fn process_diagnostic_fault_never_falls_back_to_the_default_workspace() {
+        let without_data_dir = Cli {
+            data_dir: None,
+            legal_db: None,
+            port: 8877,
+            open: false,
+            command: Some(Command::ProcessDiagnosticFault {
+                mode: "panic".to_owned(),
+            }),
+        };
+        assert!(diagnostic_fault_requires_explicit_data_dir(
+            &without_data_dir
+        ));
+
+        let with_data_dir = Cli {
+            data_dir: Some(PathBuf::from(r"C:\\synthetic-diagnostics")),
+            ..without_data_dir
+        };
+        assert!(!diagnostic_fault_requires_explicit_data_dir(&with_data_dir));
     }
 }

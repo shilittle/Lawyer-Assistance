@@ -232,7 +232,10 @@ impl Supervisor {
         self.start(kind, &id, "started");
         let supervisor = Arc::clone(self);
         tokio::spawn(async move {
-            let task = tokio::spawn(future);
+            // Keep the operation identity task-local for the work itself and
+            // its panic hook.  A process-wide mutable value would let a
+            // concurrent A/B run incorrectly claim another run's worker.
+            let task = tokio::spawn(super::process::with_operation_id(id.clone(), future));
             let guard = AbortChildOnDrop(task.abort_handle());
             let result = task.await;
             match result {

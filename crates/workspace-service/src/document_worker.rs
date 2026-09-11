@@ -9,18 +9,21 @@ use file_ingest::{
     self, OcrAsset, PdfPage, PdfPageOutput, MAX_FILE_BYTES, MAX_OCR_IMAGE_BYTES, MAX_TEXT_BYTES,
 };
 #[cfg(feature = "document-worker-fault-injection")]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex, OnceLock,
-};
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "document-worker-fault-injection")]
+use std::sync::{Mutex, OnceLock};
 use std::{
     io::{Read, Write},
     path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +43,12 @@ const DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES: usize =
 const DOCUMENT_WORKER_FAULT_MEMORY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "document-worker-fault-injection")]
 const DOCUMENT_WORKER_FAULT_PAGE_BYTES: usize = 4 * 1024;
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_TEST_STDERR_FLOOD_BYTES: usize = 256 * 1024;
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_TEST_NATIVE_EXIT_STATUS: i32 = -1_073_741_819; // 0xC0000005
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_TEST_PRIVATE_SENTINEL: &[u8] = b"DIAGNOSTIC_PRIVATE_SENTINEL";
 
 const INPUT_PDF: u8 = 1;
 const PAGE: u8 = 2;
@@ -63,6 +72,10 @@ const MAX_REQUEST_FRAME_BYTES: usize = MAX_FILE_BYTES
 const MAX_RESPONSE_FRAME_BYTES: usize = PAGE_HEADER_BYTES + MAX_TEXT_BYTES + MAX_OCR_IMAGE_BYTES;
 const MAX_ERROR_CODE_BYTES: usize = 128;
 const METADATA_RESPONSE_BYTES: usize = 1 + 4;
+/// Stderr never carries worker protocol data or source material. Drain it in fixed chunks so an
+/// unexpected native diagnostic cannot block the child, but retain only structural counters for
+/// the local process diagnostic record. No stderr bytes are persisted by this module.
+const DOCUMENT_WORKER_STDERR_DRAIN_CHUNK_BYTES: usize = 4 * 1024;
 #[cfg(feature = "document-worker-fault-injection")]
 const FAULT_REPORT_BYTES: usize = 1 + 1 + 1 + 8 + 8 + 8 + 8 + 4;
 /// A preflight has no source-text tokenizer available. Reserve a documented, conservative page
@@ -106,6 +119,10 @@ enum DecodedWorkerRequest<'a> {
 enum DocumentWorkerFault {
     Memory,
     Stall,
+    Panic,
+    Nonzero,
+    StderrFlood,
+    NativeExit,
 }
 
 #[cfg(feature = "document-worker-fault-injection")]
@@ -114,6 +131,10 @@ impl DocumentWorkerFault {
         match std::env::var(DOCUMENT_WORKER_FAULT_ENV).ok()?.as_str() {
             "memory" => Some(Self::Memory),
             "stall" => Some(Self::Stall),
+            "panic" => Some(Self::Panic),
+            "nonzero" => Some(Self::Nonzero),
+            "stderr-flood" => Some(Self::StderrFlood),
+            "native-exit" => Some(Self::NativeExit),
             _ => None,
         }
     }
@@ -122,6 +143,10 @@ impl DocumentWorkerFault {
         match value {
             "memory" => Ok(Self::Memory),
             "stall" => Ok(Self::Stall),
+            "panic" => Ok(Self::Panic),
+            "nonzero" => Ok(Self::Nonzero),
+            "stderr-flood" => Ok(Self::StderrFlood),
+            "native-exit" => Ok(Self::NativeExit),
             _ => Err(Error::new("document_worker_fault_invalid")),
         }
     }
@@ -130,6 +155,10 @@ impl DocumentWorkerFault {
         match self {
             Self::Memory => "memory",
             Self::Stall => "stall",
+            Self::Panic => "panic",
+            Self::Nonzero => "nonzero",
+            Self::StderrFlood => "stderr-flood",
+            Self::NativeExit => "native-exit",
         }
     }
 
@@ -137,6 +166,10 @@ impl DocumentWorkerFault {
         match self {
             Self::Memory => 1,
             Self::Stall => 2,
+            Self::Panic => 3,
+            Self::Nonzero => 4,
+            Self::StderrFlood => 5,
+            Self::NativeExit => 6,
         }
     }
 
@@ -144,6 +177,10 @@ impl DocumentWorkerFault {
         match self {
             Self::Memory => "memory",
             Self::Stall => "stall",
+            Self::Panic => "panic",
+            Self::Nonzero => "nonzero",
+            Self::StderrFlood => "stderr_flood",
+            Self::NativeExit => "native_exit",
         }
     }
 
@@ -151,6 +188,10 @@ impl DocumentWorkerFault {
         match value {
             1 => Ok(Self::Memory),
             2 => Ok(Self::Stall),
+            3 => Ok(Self::Panic),
+            4 => Ok(Self::Nonzero),
+            5 => Ok(Self::StderrFlood),
+            6 => Ok(Self::NativeExit),
             _ => Err(Error::new("document_worker_protocol_error")),
         }
     }
@@ -221,9 +262,128 @@ pub(crate) struct PdfDocumentWorker {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
+    stderr: Option<WorkerStderrDrain>,
+    diagnostics: Option<crate::process_diagnostics::ProcessDiagnostics>,
+    operation_id: String,
+    worker_pid: u32,
+    exit_recorded: bool,
     renderer_elapsed: Duration,
     renderer_timeout: Duration,
     _job: WorkerJob,
+}
+
+/// A bounded, concurrent stderr drain.  Raw stderr is deliberately discarded after it has been
+/// read: native libraries can write arbitrary text, paths, or document-derived content there.
+/// The counters are safe, schema-whitelisted facts that diagnostics may persist alongside a
+/// worker exit record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WorkerStderrSummary {
+    bytes_read: u64,
+    read_errors: u64,
+}
+
+struct WorkerStderrDrain {
+    bytes_read: Arc<AtomicU64>,
+    read_errors: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WorkerStderrDrain {
+    fn start(mut stderr: ChildStderr) -> Self {
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let read_errors = Arc::new(AtomicU64::new(0));
+        let task_bytes = Arc::clone(&bytes_read);
+        let task_errors = Arc::clone(&read_errors);
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; DOCUMENT_WORKER_STDERR_DRAIN_CHUNK_BYTES];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        task_bytes
+                            .fetch_add(u64::try_from(read).unwrap_or(u64::MAX), Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        task_errors.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            bytes_read,
+            read_errors,
+            task,
+        }
+    }
+
+    async fn finish(self) -> WorkerStderrSummary {
+        // The child is reaped before this is awaited, so its inherited stderr is closed. A panic
+        // in the drain, or an inherited handle held beyond the child, is still represented as an
+        // incomplete drain rather than process success. Never make cleanup wait indefinitely.
+        let Self {
+            bytes_read,
+            read_errors,
+            mut task,
+        } = self;
+        match tokio::time::timeout(Duration::from_millis(250), &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                // A drain panic is a local diagnostic failure, never evidence that the worker
+                // completed successfully.
+                read_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                read_errors.fetch_add(1, Ordering::Relaxed);
+                task.abort();
+            }
+        }
+        WorkerStderrSummary {
+            bytes_read: bytes_read.load(Ordering::Relaxed),
+            read_errors: read_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `Drop` cannot await the draining task. This only exposes bounded structural counters; it
+    /// never retains a stderr byte or claims that the drain has completed.
+    fn snapshot(&self) -> WorkerStderrSummary {
+        WorkerStderrSummary {
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            read_errors: self.read_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Launch failures still own a live child and its stderr pipe.  Record that the parent is about
+/// to terminate it before issuing the kill, then reap it and retain the original exit status only
+/// as an `AfterCleanup` observation.  It must not be treated as the cause of the launch failure.
+async fn cleanup_unmanaged_worker(
+    child: &mut Child,
+    stderr: WorkerStderrDrain,
+    diagnostics: Option<&crate::process_diagnostics::ProcessDiagnostics>,
+    worker_pid: u32,
+    operation_id: &str,
+    phase: &str,
+    intent: crate::process_diagnostics::TerminationIntent,
+) {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_termination_intent(worker_pid, operation_id, phase, intent);
+    }
+    let _ = child.start_kill();
+    let status = child.wait().await.ok();
+    let stderr = stderr.finish().await;
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_child_exit(
+            worker_pid,
+            operation_id,
+            phase,
+            status.as_ref(),
+            crate::process_diagnostics::ExitSource::AfterCleanup,
+            stderr.bytes_read,
+            stderr.read_errors,
+            status.is_some(),
+        );
+    }
 }
 
 impl PdfDocumentWorker {
@@ -256,7 +416,7 @@ impl PdfDocumentWorker {
         match result {
             Ok(metadata) => worker.finish().await.map(|()| metadata),
             Err(error) => {
-                worker.abort().await;
+                worker.abort_with_error(&error).await;
                 Err(error)
             }
         }
@@ -282,8 +442,27 @@ impl PdfDocumentWorker {
         let fault = render_request
             .then(take_document_worker_fault_for_render)
             .flatten();
-        let executable =
-            std::env::current_exe().map_err(|_| Error::new("document_worker_unavailable"))?;
+        // Assign the operation before even resolving the executable. A failed launch has no child
+        // PID or exit status, but it must still remain distinguishable from a silent worker exit.
+        let diagnostics = crate::process_diagnostics::current_process_diagnostics();
+        let operation_id = crate::process_diagnostics::current_operation_id()
+            .unwrap_or_else(|| crate::process_diagnostics::new_operation_id("document_worker"));
+        if let Some(diagnostics) = diagnostics.as_ref() {
+            diagnostics.record_operation_started(&operation_id, "document_worker_spawn");
+        }
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(_) => {
+                if let Some(diagnostics) = diagnostics.as_ref() {
+                    diagnostics.record_operation_failed(
+                        &operation_id,
+                        "document_worker_spawn_failed",
+                        "document_worker_unavailable",
+                    );
+                }
+                return Err(Error::new("document_worker_unavailable"));
+            }
+        };
         let mut command = Command::new(executable);
         #[cfg(feature = "document-worker-fault-injection")]
         if let Some(fault) = fault {
@@ -293,39 +472,145 @@ impl PdfDocumentWorker {
         }
         #[cfg(not(feature = "document-worker-fault-injection"))]
         command.arg("document-worker");
+        let child_environment = diagnostics
+            .as_ref()
+            .and_then(crate::process_diagnostics::ProcessDiagnostics::child_environment);
+        if let Some(child_environment) = child_environment.as_ref() {
+            child_environment.apply_to_tokio_command(&mut command);
+        }
         command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
+            .stderr(std::process::Stdio::piped())
+            // Cleanup must record its intent before a kill. `Drop` only provides a best-effort
+            // fallback for an abandoned future, so normal paths always call `abort` or `finish`.
+            .kill_on_drop(false);
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|_| Error::new("document_worker_unavailable"))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                if let Some(diagnostics) = diagnostics.as_ref() {
+                    diagnostics.record_operation_failed(
+                        &operation_id,
+                        "document_worker_spawn_failed",
+                        "document_worker_unavailable",
+                    );
+                }
+                return Err(Error::new("document_worker_unavailable"));
+            }
+        };
+        let worker_pid = child.id().unwrap_or(0);
+        if let (Some(diagnostics), Some(child_environment)) =
+            (diagnostics.as_ref(), child_environment.as_ref())
+        {
+            diagnostics.record_child_started(
+                worker_pid,
+                &operation_id,
+                "document_worker_launch",
+                child_environment.launch_id(),
+            );
+        }
+        let stderr = match child.stderr.take() {
+            Some(stderr) => WorkerStderrDrain::start(stderr),
+            None => {
+                if let Some(diagnostics) = diagnostics.as_ref() {
+                    diagnostics.record_operation_failed(
+                        &operation_id,
+                        "document_worker_stderr_unavailable",
+                        "document_worker_unavailable",
+                    );
+                    diagnostics.record_termination_intent(
+                        worker_pid,
+                        &operation_id,
+                        "document_worker_launch_cleanup",
+                        crate::process_diagnostics::TerminationIntent::ParentCleanup,
+                    );
+                }
+                let _ = child.start_kill();
+                let status = child.wait().await.ok();
+                if let Some(diagnostics) = diagnostics.as_ref() {
+                    diagnostics.record_child_exit(
+                        worker_pid,
+                        &operation_id,
+                        "document_worker_launch_cleanup",
+                        status.as_ref(),
+                        crate::process_diagnostics::ExitSource::AfterCleanup,
+                        0,
+                        0,
+                        status.is_some(),
+                    );
+                }
+                return Err(Error::new("document_worker_unavailable"));
+            }
+        };
         let job = match WorkerJob::assign(&child) {
             Ok(job) => job,
             Err(error) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                if let Some(diagnostics) = diagnostics.as_ref() {
+                    diagnostics.record_operation_failed(
+                        &operation_id,
+                        "document_worker_job_assignment_failed",
+                        error.code.as_str(),
+                    );
+                }
+                cleanup_unmanaged_worker(
+                    &mut child,
+                    stderr,
+                    diagnostics.as_ref(),
+                    worker_pid,
+                    &operation_id,
+                    "document_worker_job_cleanup",
+                    crate::process_diagnostics::TerminationIntent::JobCleanup,
+                )
+                .await;
                 return Err(error);
             }
         };
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::new("document_worker_unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::new("document_worker_unavailable"))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                cleanup_unmanaged_worker(
+                    &mut child,
+                    stderr,
+                    diagnostics.as_ref(),
+                    worker_pid,
+                    &operation_id,
+                    "document_worker_launch_cleanup",
+                    crate::process_diagnostics::TerminationIntent::ParentCleanup,
+                )
+                .await;
+                return Err(Error::new("document_worker_unavailable"));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                cleanup_unmanaged_worker(
+                    &mut child,
+                    stderr,
+                    diagnostics.as_ref(),
+                    worker_pid,
+                    &operation_id,
+                    "document_worker_launch_cleanup",
+                    crate::process_diagnostics::TerminationIntent::ParentCleanup,
+                )
+                .await;
+                return Err(Error::new("document_worker_unavailable"));
+            }
+        };
         let mut worker = Self {
             child,
             stdin,
             stdout,
+            stderr: Some(stderr),
+            diagnostics,
+            operation_id,
+            worker_pid,
+            exit_recorded: false,
             renderer_elapsed: Duration::ZERO,
             #[cfg(feature = "document-worker-fault-injection")]
             renderer_timeout: if matches!(fault, Some(DocumentWorkerFault::Stall)) {
@@ -338,7 +623,7 @@ impl PdfDocumentWorker {
             _job: job,
         };
         if let Err(error) = worker.write_renderer_frame(&payload, cancel).await {
-            worker.abort().await;
+            worker.abort_with_error(&error).await;
             return Err(error);
         }
         Ok(worker)
@@ -379,12 +664,19 @@ impl PdfDocumentWorker {
             biased;
             _ = cancel.cancelled() => {
                 self.charge_renderer_elapsed(started);
+                self.record_operation_failed("document_worker_read_cancelled", "cancelled");
                 return Err(Error::new("cancelled"));
             },
             result = tokio::time::timeout(remaining, read_frame_async(&mut self.stdout, MAX_RESPONSE_FRAME_BYTES)) => match result {
                 Ok(Ok(value)) => value,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => return Err(Error::new("document_worker_timeout")),
+                Ok(Err(error)) => {
+                    self.record_operation_failed("document_worker_stdout_read_failed", "document_worker_pipe_read_failed");
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.record_operation_failed("document_worker_read_timeout", "document_worker_timeout");
+                    return Err(Error::new("document_worker_timeout"));
+                },
             },
         };
         self.charge_renderer_elapsed(started);
@@ -400,12 +692,27 @@ impl PdfDocumentWorker {
     /// must not consume the 90 second render budget.
     pub(crate) async fn wait_for_exit(&mut self) -> Result<()> {
         loop {
-            match self
-                .child
-                .try_wait()
-                .map_err(|_| Error::new("document_worker_exited"))?
-            {
-                Some(_) => return Err(Error::new("document_worker_exited")),
+            match self.child.try_wait().map_err(|_| {
+                self.record_operation_failed(
+                    "document_worker_wait_failed",
+                    "document_worker_wait_failed",
+                );
+                Error::new("document_worker_exited")
+            })? {
+                Some(status) => {
+                    self.record_child_exit(
+                        Some(&status),
+                        crate::process_diagnostics::ExitSource::Natural,
+                        "document_worker_exit_observed",
+                        true,
+                    )
+                    .await;
+                    self.record_operation_failed(
+                        "document_worker_exit_observed",
+                        "document_worker_exited",
+                    );
+                    return Err(Error::new("document_worker_exited"));
+                }
                 None => tokio::time::sleep(Duration::from_millis(20)).await,
             }
         }
@@ -413,18 +720,194 @@ impl PdfDocumentWorker {
 
     pub(crate) async fn finish(mut self) -> Result<()> {
         match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
-            Ok(Ok(status)) if status.success() => Ok(()),
-            Ok(_) => Err(Error::new("document_worker_exited")),
+            Ok(Ok(status)) => {
+                self.record_child_exit(
+                    Some(&status),
+                    crate::process_diagnostics::ExitSource::Natural,
+                    "document_worker_finish",
+                    true,
+                )
+                .await;
+                if status.success() {
+                    self.record_operation_finished("document_worker_finish");
+                    Ok(())
+                } else {
+                    self.record_operation_failed(
+                        "document_worker_finish",
+                        "document_worker_exited",
+                    );
+                    Err(Error::new("document_worker_exited"))
+                }
+            }
+            Ok(Err(_)) => {
+                self.record_operation_failed(
+                    "document_worker_wait_failed",
+                    "document_worker_wait_failed",
+                );
+                Err(Error::new("document_worker_exited"))
+            }
             Err(_) => {
-                self.abort().await;
+                self.abort_with_intent(
+                    crate::process_diagnostics::TerminationIntent::Timeout,
+                    "document_worker_finish_timeout",
+                )
+                .await;
+                self.record_operation_failed(
+                    "document_worker_finish_timeout",
+                    "document_worker_timeout",
+                );
                 Err(Error::new("document_worker_exited"))
             }
         }
     }
 
-    pub(crate) async fn abort(&mut self) {
+    /// Reap an abandoned child, retaining cancellation and timeout as a pre-kill intent. A pipe
+    /// EOF receives a brief natural-exit grace period so a panic/nonzero exit is not overwritten
+    /// by the cleanup status. Public callers still see the existing safe error code.
+    pub(crate) async fn abort_with_error(&mut self, error: &Error) {
+        match error.code.as_str() {
+            "cancelled" => {
+                self.abort_with_intent(
+                    crate::process_diagnostics::TerminationIntent::Cancelled,
+                    "document_worker_cancelled",
+                )
+                .await;
+            }
+            "document_worker_timeout" => {
+                self.abort_with_intent(
+                    crate::process_diagnostics::TerminationIntent::Timeout,
+                    "document_worker_timeout",
+                )
+                .await;
+            }
+            "document_worker_exited" => {
+                if !self
+                    .wait_for_natural_exit(Duration::from_millis(250), "document_worker_pipe_eof")
+                    .await
+                {
+                    self.abort_with_intent(
+                        crate::process_diagnostics::TerminationIntent::ParentCleanup,
+                        "document_worker_pipe_cleanup",
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                self.abort_with_intent(
+                    crate::process_diagnostics::TerminationIntent::ParentCleanup,
+                    "document_worker_parent_cleanup",
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn wait_for_natural_exit(&mut self, grace: Duration, phase: &str) -> bool {
+        let status = match tokio::time::timeout(grace, self.child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) => {
+                self.record_operation_failed(
+                    "document_worker_wait_failed",
+                    "document_worker_wait_failed",
+                );
+                return false;
+            }
+            Err(_) => return false,
+        };
+        self.record_child_exit(
+            Some(&status),
+            crate::process_diagnostics::ExitSource::Natural,
+            phase,
+            true,
+        )
+        .await;
+        self.record_operation_failed(phase, "document_worker_exited");
+        true
+    }
+
+    async fn abort_with_intent(
+        &mut self,
+        intent: crate::process_diagnostics::TerminationIntent,
+        phase: &str,
+    ) {
+        if self.exit_recorded {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.record_child_exit(
+                    Some(&status),
+                    crate::process_diagnostics::ExitSource::Natural,
+                    phase,
+                    true,
+                )
+                .await;
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => self.record_operation_failed(
+                "document_worker_wait_failed",
+                "document_worker_wait_failed",
+            ),
+        }
+        if let Some(diagnostics) = self.diagnostics.as_ref() {
+            diagnostics.record_termination_intent(
+                self.worker_pid,
+                &self.operation_id,
+                phase,
+                intent,
+            );
+        }
         let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        let status = self.child.wait().await.ok();
+        self.record_child_exit(
+            status.as_ref(),
+            crate::process_diagnostics::ExitSource::AfterCleanup,
+            phase,
+            status.is_some(),
+        )
+        .await;
+    }
+
+    async fn record_child_exit(
+        &mut self,
+        status: Option<&std::process::ExitStatus>,
+        source: crate::process_diagnostics::ExitSource,
+        phase: &str,
+        reaped: bool,
+    ) {
+        if self.exit_recorded {
+            return;
+        }
+        let stderr = match self.stderr.take() {
+            Some(stderr) => stderr.finish().await,
+            None => WorkerStderrSummary::default(),
+        };
+        if let Some(diagnostics) = self.diagnostics.as_ref() {
+            diagnostics.record_child_exit(
+                self.worker_pid,
+                &self.operation_id,
+                phase,
+                status,
+                source,
+                stderr.bytes_read,
+                stderr.read_errors,
+                reaped,
+            );
+        }
+        self.exit_recorded = true;
+    }
+
+    fn record_operation_failed(&self, phase: &str, error_code: &str) {
+        if let Some(diagnostics) = self.diagnostics.as_ref() {
+            diagnostics.record_operation_failed(&self.operation_id, phase, error_code);
+        }
+    }
+
+    fn record_operation_finished(&self, phase: &str) {
+        if let Some(diagnostics) = self.diagnostics.as_ref() {
+            diagnostics.record_operation_finished(&self.operation_id, phase);
+        }
     }
 
     async fn write_renderer_frame(
@@ -446,6 +929,19 @@ impl PdfDocumentWorker {
             },
         };
         self.charge_renderer_elapsed(started);
+        if let Err(error) = &result {
+            let (phase, diagnostic_code) = match error.code.as_str() {
+                "cancelled" => ("document_worker_write_cancelled", "cancelled"),
+                "document_worker_timeout" => {
+                    ("document_worker_write_timeout", "document_worker_timeout")
+                }
+                _ => (
+                    "document_worker_stdin_write_failed",
+                    "document_worker_pipe_write_failed",
+                ),
+            };
+            self.record_operation_failed(phase, diagnostic_code);
+        }
         result
     }
 
@@ -608,6 +1104,47 @@ fn decode_metadata(payload: &[u8]) -> Result<PdfDocumentMetadata> {
 
 impl Drop for PdfDocumentWorker {
     fn drop(&mut self) {
+        if self.exit_recorded {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                // The child had already exited naturally. Do not turn that observed status into
+                // cleanup merely because the owner future was dropped before it recorded exit.
+                // `Drop` cannot await stderr; retain only its current structural counters.
+                let stderr = self
+                    .stderr
+                    .as_ref()
+                    .map(WorkerStderrDrain::snapshot)
+                    .unwrap_or_default();
+                if let Some(diagnostics) = self.diagnostics.as_ref() {
+                    diagnostics.record_child_exit(
+                        self.worker_pid,
+                        &self.operation_id,
+                        "document_worker_drop_natural_exit",
+                        Some(&status),
+                        crate::process_diagnostics::ExitSource::Natural,
+                        stderr.bytes_read,
+                        stderr.read_errors,
+                        true,
+                    );
+                }
+                self.exit_recorded = true;
+                return;
+            }
+            Ok(None) | Err(_) => {}
+        }
+        // A dropped future cannot await reaping. Normal call paths use `abort`/`finish`; this
+        // fallback nevertheless records intent before best-effort termination and never logs a
+        // fabricated exit or success result.
+        if let Some(diagnostics) = self.diagnostics.as_ref() {
+            diagnostics.record_termination_intent(
+                self.worker_pid,
+                &self.operation_id,
+                "document_worker_drop_cleanup",
+                crate::process_diagnostics::TerminationIntent::ParentCleanup,
+            );
+        }
         let _ = self.child.start_kill();
     }
 }
@@ -615,11 +1152,23 @@ impl Drop for PdfDocumentWorker {
 /// Entrypoint for the hidden same-executable command. It does not construct a [`crate::Workspace`]
 /// or open a store, database, socket, or source path.
 pub fn run_internal_document_worker() -> Result<()> {
+    if let Some(diagnostics) = crate::process_diagnostics::current_process_diagnostics() {
+        // This is structural worker state only. The worker never writes source bytes, page text,
+        // paths, or native stderr to the shared diagnostic ledger.
+        diagnostics.record_phase("document_worker");
+    }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let payload = read_frame_blocking(&mut input, MAX_REQUEST_FRAME_BYTES)?;
     let request = decode_worker_request(&payload)?;
     let metadata_request = matches!(&request, DecodedWorkerRequest::Metadata(_));
+    if let Some(diagnostics) = crate::process_diagnostics::current_process_diagnostics() {
+        diagnostics.record_phase(if metadata_request {
+            "pdf_metadata"
+        } else {
+            "pdf_stream"
+        });
+    }
     let result: std::result::Result<(), file_ingest::IngestError> = match request {
         DecodedWorkerRequest::Metadata(bytes) => {
             file_ingest::inspect_pdf_metadata(bytes).and_then(|metadata| {
@@ -664,6 +1213,18 @@ pub fn run_internal_document_worker() -> Result<()> {
 #[cfg(feature = "document-worker-fault-injection")]
 pub fn run_internal_document_worker_fault(mode: &str) -> Result<()> {
     let fault = DocumentWorkerFault::from_cli(mode)?;
+    if let Some(diagnostics) = crate::process_diagnostics::current_process_diagnostics() {
+        diagnostics.record_phase(match fault {
+            DocumentWorkerFault::Memory => "document_worker_fault_memory",
+            DocumentWorkerFault::Stall => "document_worker_fault_stall",
+            DocumentWorkerFault::Panic => "document_worker_fault_panic",
+            DocumentWorkerFault::Nonzero => "document_worker_fault_nonzero",
+            DocumentWorkerFault::StderrFlood => "document_worker_fault_stderr_flood",
+            // This carries a Windows-shaped status via `process::exit`; it is intentionally not
+            // an SEH exception and must not be reported as Pdfium evidence.
+            DocumentWorkerFault::NativeExit => "document_worker_fault_native_exit_simulated",
+        });
+    }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let payload = read_frame_blocking(&mut input, MAX_REQUEST_FRAME_BYTES)?;
@@ -695,6 +1256,29 @@ pub fn run_internal_document_worker_fault(mode: &str) -> Result<()> {
             // deadline proves timeout/kill/reap without weakening the production 90 s deadline.
             std::thread::sleep(DOCUMENT_WORKER_TEST_STALL_DURATION);
             Err(Error::new("document_worker_fault_stalled"))
+        }
+        // These modes model distinct termination evidence without accessing a document body. They
+        // are compiled only into the isolated test binary; an ordinary release executable has no
+        // matching hidden subcommand at all.
+        DocumentWorkerFault::Panic => panic!(
+            "document_worker_test_panic_{}",
+            std::str::from_utf8(DOCUMENT_WORKER_TEST_PRIVATE_SENTINEL).unwrap_or("invalid")
+        ),
+        DocumentWorkerFault::Nonzero => std::process::exit(23),
+        DocumentWorkerFault::StderrFlood => {
+            let mut stderr = std::io::stderr().lock();
+            let chunk = [b'x'; DOCUMENT_WORKER_STDERR_DRAIN_CHUNK_BYTES];
+            let _ = stderr.write_all(DOCUMENT_WORKER_TEST_PRIVATE_SENTINEL);
+            for _ in 0..(DOCUMENT_WORKER_TEST_STDERR_FLOOD_BYTES / chunk.len()) {
+                let _ = stderr.write_all(&chunk);
+            }
+            let _ = stderr.flush();
+            std::process::exit(74);
+        }
+        // This is a safe process exit carrying the Windows access-violation status value. It is
+        // not an actual native exception and must never be reported as proof of a Pdfium fault.
+        DocumentWorkerFault::NativeExit => {
+            std::process::exit(DOCUMENT_WORKER_TEST_NATIVE_EXIT_STATUS)
         }
     }
 }
@@ -786,15 +1370,27 @@ fn stream_worker_pages(
     pdfium_library: Option<&std::path::Path>,
 ) -> std::result::Result<(), file_ingest::IngestError> {
     file_ingest::stream_pdf_selected_pages(bytes, ranges, pdfium_library, |page| {
+        let number = page.page.number;
+        let diagnostics = crate::process_diagnostics::current_process_diagnostics();
+        if let Some(diagnostics) = diagnostics.as_ref() {
+            let kind = if page.page.needs_ocr { "ocr" } else { "text" };
+            diagnostics.record_phase(&format!("pdf_page_{number}_ready_{kind}"));
+        }
         write_page_blocking(output, &page)
             .map_err(|_| file_ingest::IngestError::PdfRenderFailed)?;
         // The renderer keeps no image after its page bytes have entered the bounded pipe. The
         // parent must ACK before this callback returns and Pdfium can render another page.
         drop(page);
+        if let Some(diagnostics) = diagnostics.as_ref() {
+            diagnostics.record_phase(&format!("pdf_page_{number}_waiting_ack"));
+        }
         let acknowledgement =
             read_frame_blocking(input, 1).map_err(|_| file_ingest::IngestError::PdfRenderFailed)?;
         if acknowledgement.as_slice() != [ACK] {
             return Err(file_ingest::IngestError::PdfRenderFailed);
+        }
+        if let Some(diagnostics) = diagnostics.as_ref() {
+            diagnostics.record_phase(&format!("pdf_page_{number}_acknowledged"));
         }
         Ok(())
     })
@@ -1401,6 +1997,169 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn async_pipe_eof_keeps_the_public_worker_error_code() {
+        let (mut reader, writer) = tokio::io::duplex(8);
+        drop(writer);
+        let error = read_frame_async(&mut reader, 8)
+            .await
+            .expect_err("closed stdout is not a protocol frame");
+        assert_eq!(error.code, "document_worker_exited");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stderr_is_drained_in_fixed_memory_without_retaining_bytes() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "for /L %i in (1,1,4096) do @echo x 1>&2"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("stderr fixture starts");
+        let stderr = child.stderr.take().expect("stderr pipe");
+        let drain = WorkerStderrDrain::start(stderr);
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("drained stderr cannot block the fixture")
+            .expect("fixture reaped");
+        assert!(status.success());
+        let summary = drain.finish().await;
+        assert!(summary.bytes_read >= 8 * 1024);
+        assert_eq!(summary.read_errors, 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_reaps_the_worker_after_recording_the_cancel_path() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "ping -n 6 127.0.0.1 > nul"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("cancellation fixture starts");
+        let job = WorkerJob::assign(&child).expect("job configured and read back");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+        let mut worker = PdfDocumentWorker {
+            child,
+            stdin,
+            stdout,
+            stderr: Some(WorkerStderrDrain::start(stderr)),
+            diagnostics: None,
+            operation_id: "document_worker_cancel_test".to_owned(),
+            worker_pid: 0,
+            exit_recorded: false,
+            renderer_elapsed: Duration::ZERO,
+            renderer_timeout: DOCUMENT_WORKER_RENDER_TIMEOUT,
+            _job: job,
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = worker
+            .read_renderer_response(&cancel)
+            .await
+            .expect_err("cancelled read must not wait for child output");
+        assert_eq!(error.code, "cancelled");
+        worker.abort_with_error(&error).await;
+        assert!(worker.exit_recorded, "cancelled child is reaped");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn drop_records_a_previously_observed_natural_exit_without_cleanup_intent() {
+        let directory = tempfile::tempdir().expect("temporary diagnostic root");
+        let diagnostics = crate::process_diagnostics::ProcessDiagnostics::initialize(
+            directory.path(),
+            crate::process_diagnostics::ProcessRole::Daemon,
+            "test_revision",
+        );
+        let operation_id = "document_worker_drop_natural_test";
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "set /p fixture_signal= & exit 23"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("nonzero fixture starts");
+        let worker_pid = child.id().expect("fixture pid");
+        let job = WorkerJob::assign(&child).expect("job configured and read back");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+        let mut worker = PdfDocumentWorker {
+            child,
+            stdin,
+            stdout,
+            stderr: Some(WorkerStderrDrain::start(stderr)),
+            diagnostics: Some(diagnostics),
+            operation_id: operation_id.to_owned(),
+            worker_pid,
+            exit_recorded: false,
+            renderer_elapsed: Duration::ZERO,
+            renderer_timeout: DOCUMENT_WORKER_RENDER_TIMEOUT,
+            _job: job,
+        };
+        // Release the fixture only after its job and pipes exist; process startup speed must
+        // not turn this exit-observation regression into an assignment race.
+        worker
+            .stdin
+            .write_all(b"go\r\n")
+            .await
+            .expect("release fixture");
+        let status = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(status) = worker.child.try_wait().expect("child status query") {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture naturally exits");
+        assert_eq!(status.code(), Some(23));
+        // This is the regression condition: the owner observes a natural exit but does not call
+        // `wait_for_exit`, `finish`, or either abort path before it is dropped.
+        drop(worker);
+
+        let events = std::fs::read_dir(directory.path().join("diagnostics/process"))
+            .expect("diagnostic directory")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .flat_map(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .expect("diagnostic JSONL")
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .map(|line| serde_json::from_str::<serde_json::Value>(&line).expect("diagnostic JSON"))
+            .collect::<Vec<_>>();
+        let exit = events
+            .iter()
+            .find(|event| {
+                event["event"] == "child_exit"
+                    && event["operation_id"] == operation_id
+                    && event["phase"] == "document_worker_drop_natural_exit"
+            })
+            .expect("Drop records the observed natural exit");
+        assert_eq!(exit["native_exit_code"], 23);
+        assert_eq!(exit["exit_code_hex"], "0x00000017");
+        assert_eq!(exit["exit_source"], "natural");
+        assert_eq!(exit["child_reaped"], true);
+        assert!(
+            !events.iter().any(|event| {
+                event["event"] == "termination_intent" && event["operation_id"] == operation_id
+            }),
+            "a natural exit observed before Drop must not be reclassified as cleanup"
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn worker_exit_is_observed_promptly_after_job_assignment() {
@@ -1417,6 +2176,11 @@ mod tests {
             child,
             stdin,
             stdout,
+            stderr: None,
+            diagnostics: None,
+            operation_id: "document_worker_test".to_owned(),
+            worker_pid: 0,
+            exit_recorded: false,
             renderer_elapsed: Duration::ZERO,
             renderer_timeout: DOCUMENT_WORKER_RENDER_TIMEOUT,
             _job: job,
@@ -1425,6 +2189,35 @@ mod tests {
             .await
             .expect("child exit is prompt");
         assert_eq!(result.unwrap_err().code, "document_worker_exited");
+    }
+
+    #[cfg(feature = "document-worker-fault-injection")]
+    #[test]
+    fn test_fault_modes_are_explicit_and_do_not_alias_native_exit() {
+        let expected = [
+            ("memory", DocumentWorkerFault::Memory),
+            ("stall", DocumentWorkerFault::Stall),
+            ("panic", DocumentWorkerFault::Panic),
+            ("nonzero", DocumentWorkerFault::Nonzero),
+            ("stderr-flood", DocumentWorkerFault::StderrFlood),
+            ("native-exit", DocumentWorkerFault::NativeExit),
+        ];
+        for (value, fault) in expected {
+            assert_eq!(
+                DocumentWorkerFault::from_cli(value).expect("valid mode"),
+                fault
+            );
+            assert_eq!(fault.as_cli(), value);
+        }
+        assert_eq!(
+            DocumentWorkerFault::NativeExit.as_str(),
+            "native_exit",
+            "the synthetic Windows-shaped status is named separately from a real exception"
+        );
+        assert_eq!(
+            DocumentWorkerFault::from_cli("unknown").unwrap_err().code,
+            "document_worker_fault_invalid"
+        );
     }
 
     #[cfg(feature = "document-worker-fault-injection")]

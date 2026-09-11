@@ -32,7 +32,7 @@ export async function startServer(dataDir,executable=path.join(root,'target/x86_
   const server=spawn(executable,args,{windowsHide:true,stdio:['ignore',log,log],env,cwd:options.portable?path.dirname(executable):root});
   let descriptor;for(let i=0;i<100;i++){if(server.exitCode!==null)throw new Error('server_exited');try{descriptor=connection(dataDir);if(descriptor.pid===server.pid)break;}catch{}await sleep(200);}
   check(descriptor?.pid===server.pid,'server_start_timeout');const client=new Client(descriptor.origin);await client.login(descriptor.bootstrap);
-  return {client,server,stop:async()=>{server.kill();await new Promise(r=>server.exitCode===null?server.once('exit',r):r());fs.closeSync(log);}};
+  return {client,server,stop:async()=>{server.kill();await new Promise(r=>server.exitCode===null&&server.signalCode===null?server.once('exit',r):r());fs.closeSync(log);}};
 }
 export async function configureGlm(client){
   const lines=fs.readFileSync(path.join(root,'apikey.txt'),'utf8').split(/\r?\n/).filter(s=>s.trim());const marker=lines.findIndex(s=>/^GLM\s+api/i.test(s));check(marker>=0&&lines[marker+1],'glm_key_missing');

@@ -8,6 +8,7 @@ mod case_search;
 mod diagnostics;
 mod document_render;
 mod document_worker;
+pub use diagnostics::process as process_diagnostics;
 pub(crate) use diagnostics::supervisor::Supervisor;
 mod ocr;
 mod redaction_ai;
