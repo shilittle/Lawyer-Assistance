@@ -4,7 +4,7 @@
 
 Lawyer Assistance 是一个 Windows 本机单用户法律工具。它由一个 Rust 后台服务、一个普通 HTML WebUI 和一个可独立运行的 MCP 程序组成，核心工作是材料脱敏和本地法律检索。
 
-当前版本为 `1.2.1`，保留 AI 脱敏、法律检索、文书写作和会话，修复审查报告中的任务绑定、草稿恢复、检索一致性、资源限制、PDF 隔离、引用与上下文问题。独立复测后的续修状态见[1.2.1 续修记录](docs/web/retest-1.2.1.md)，发布构建与便携包验证摘要见 Release 附件；[上一轮报告](docs/web/audit-1.2.1.md)保留为历史记录。下载见 [v1.2.1 发布页](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1)。
+当前版本为 `1.2.1`，保留 AI 脱敏、法律检索、文书写作和会话，修复审查报告中的任务绑定、草稿恢复、检索一致性、资源限制、PDF 隔离、引用与上下文问题。独立复测后的续修状态见[1.2.1 续修记录](docs/web/retest-1.2.1.md)，发布构建与便携包验证摘要见 Release 附件；[上一轮报告](docs/web/audit-1.2.1.md)保留为历史记录。下载见 [v1.2.1 发布页](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1-r1)。
 
 ## 功能
 

@@ -1,6 +1,6 @@
 # 快速开始
 
-本页对应 v1.2.1，提供材料脱敏、本地法律检索、文书写作和 AI 会话。完整便携包与源码见 [GitHub Release](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1)，下载后核对 SHA-256 校验文件；资产名附日期与提交。升级和兼容边界见[升级说明](web/ai-upgrade.md)及[独立复测续修记录](web/retest-1.2.1.md)。
+本页对应 v1.2.1，提供材料脱敏、本地法律检索、文书写作和 AI 会话。完整便携包与源码见 [GitHub Release](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1-r1)，下载后核对 SHA-256 校验文件；资产名附日期与提交。升级和兼容边界见[升级说明](web/ai-upgrade.md)及[独立复测续修记录](web/retest-1.2.1.md)。
 
 ## 运行便携包
 

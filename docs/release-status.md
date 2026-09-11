@@ -1,6 +1,6 @@
 # 当前发布状态
 
-本页对应 v1.2.1。Windows 完整便携包、源码和 SHA-256 校验文件见 [发布页](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1)，资产文件名附日期与提交。功能续修与验证边界见[独立复测记录](web/retest-1.2.1.md)，发布构建身份和便携包验证见 Release 附件 `release-validation.json`。
+本页对应 v1.2.1。Windows 完整便携包、源码和 SHA-256 校验文件见 [发布页](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1-r1)，资产文件名附日期与提交。功能续修与验证边界见[独立复测记录](web/retest-1.2.1.md)，发布构建身份和便携包验证见 Release 附件 `release-validation.json`。
 
 ## 版本与交付
 

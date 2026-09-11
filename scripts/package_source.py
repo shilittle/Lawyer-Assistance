@@ -75,16 +75,41 @@ def sha256_file(path: Path) -> str:
         raise SourcePackageError(f"unable to read {path}") from error
 
 
-def git(*args: str) -> bytes:
+def git(root: Path, *args: str) -> bytes:
     try:
-        return subprocess.check_output(["git", *args], cwd=ROOT, stderr=subprocess.STDOUT)
+        return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.STDOUT)
     except (OSError, subprocess.CalledProcessError) as error:
         detail = error.output.decode("utf-8", "replace").strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
         raise SourcePackageError(f"git {' '.join(args)} failed: {detail}") from error
 
 
-def git_revision(revision: str) -> str:
-    value = git("rev-parse", "--verify", f"{revision}^{{commit}}").decode("ascii", "replace").strip()
+def repository_root(root: Path) -> Path:
+    """Resolve and require the Git toplevel supplied to the source packager.
+
+    A caller may supply a lexical Windows path alias (for example ``nested/..``
+    or a short path). The Git toplevel is the authority instead of comparing a
+    normalized path with this module's or another unnormalized alias.
+    """
+
+    try:
+        root = root.resolve(strict=True)
+    except OSError as error:
+        raise SourcePackageError("source packaging must run from the repository root") from error
+    if not root.is_dir():
+        raise SourcePackageError("source packaging must run from the repository root")
+    try:
+        top_level = Path(
+            git(root, "rev-parse", "--show-toplevel").decode("utf-8", "strict").strip()
+        ).resolve(strict=True)
+    except (OSError, UnicodeError, ValueError, SourcePackageError) as error:
+        raise SourcePackageError("source packaging must run from the repository root") from error
+    if top_level != root:
+        raise SourcePackageError("source packaging must run from the repository root")
+    return root
+
+
+def git_revision(root: Path, revision: str) -> str:
+    value = git(root, "rev-parse", "--verify", f"{revision}^{{commit}}").decode("ascii", "replace").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", value):
         raise SourcePackageError(f"git revision is not a commit: {revision}")
     return value
@@ -106,8 +131,8 @@ def validate_label(label: str) -> str:
     return label
 
 
-def default_label() -> str:
-    revision = git("rev-parse", "--short=12", "HEAD").decode("ascii", "replace").strip()
+def default_label(root: Path) -> str:
+    revision = git(root, "rev-parse", "--short=12", "HEAD").decode("ascii", "replace").strip()
     return f"{datetime.now().strftime('%Y%m%d')}-{revision}"
 
 
@@ -160,17 +185,17 @@ def is_workspace_path(relative: str) -> bool:
     return any(part.startswith(prefix) for part in parts[:-1] for prefix in WORKSPACE_PREFIXES)
 
 
-def _diff_paths(base_revision: str) -> tuple[str, ...]:
+def _diff_paths(root: Path, base_revision: str) -> tuple[str, ...]:
     """Return both sides of changed/renamed paths, including deleted files."""
 
-    raw = git("diff", "--name-only", "--no-renames", "-z", base_revision)
+    raw = git(root, "diff", "--name-only", "--no-renames", "-z", base_revision)
     return tuple(item for item in raw.decode("utf-8", "strict").split("\0") if item)
 
 
-def validate_diff_paths(base_revision: str) -> None:
+def validate_diff_paths(root: Path, base_revision: str) -> None:
     """Reject protected paths before a binary Git patch can copy old blobs."""
 
-    for relative in _diff_paths(base_revision):
+    for relative in _diff_paths(root, base_revision):
         normalized = relative.replace("\\", "/")
         parts = tuple(part.lower() for part in normalized.split("/"))
         if not parts or any(part in EXCLUDED_PARTS for part in parts):
@@ -255,19 +280,17 @@ def package_source(
     base: str | None = None,
     label: str | None = None,
 ) -> dict[str, object]:
-    root = root.resolve()
-    if root != ROOT:
-        raise SourcePackageError("source packaging must run from the repository root")
+    root = repository_root(root)
     output_dir = (output_dir or root / "dist").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     version = workspace_version(root)
-    selected_label = validate_label(label) if label else default_label()
-    base_revision = git_revision(base) if base else git_revision("HEAD")
-    source_revision = git_revision("HEAD")
+    selected_label = validate_label(label) if label else default_label(root)
+    base_revision = git_revision(root, base) if base else git_revision(root, "HEAD")
+    source_revision = git_revision(root, "HEAD")
     credentials = known_credentials(root)
-    validate_diff_paths(base_revision)
+    validate_diff_paths(root, base_revision)
     payload = build_payload(root, credentials, (output_dir,))
-    patch = git("diff", "--binary", "--full-index", base_revision)
+    patch = git(root, "diff", "--binary", "--full-index", base_revision)
     if any(secret in patch for secret in credentials):
         raise SourcePackageError("credential matched source increment")
     payload["SOURCE_INCREMENT.patch"] = patch

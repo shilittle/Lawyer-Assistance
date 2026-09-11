@@ -53,6 +53,12 @@ jobs:
       - name: Install WebUI dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare locked packages for offline cross-platform license checks
+        run: python -c "import subprocess; from scripts.generate_third_party_notices import CARGO_RELEASE_TARGET_PRODUCTS; [subprocess.run(['cargo','fetch','--locked','--target',target],check=True) for target,_ in CARGO_RELEASE_TARGET_PRODUCTS]"
+
+      - name: Run every Python regression module without network access
+        run: python -c "import subprocess,sys; from scripts.audit_validate import discover_python_tests,DEFAULT_ROOT; sys.exit(subprocess.call([sys.executable,'-m','unittest',*discover_python_tests(DEFAULT_ROOT),'-v']))"
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
@@ -77,9 +83,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Run every Python regression module without network access
-        run: python -c "import subprocess,sys; from scripts.audit_validate import discover_python_tests,DEFAULT_ROOT; sys.exit(subprocess.call([sys.executable,'-m','unittest',*discover_python_tests(DEFAULT_ROOT),'-v']))"
 
       - name: Prepare synthetic non-distribution legal fixture for Web smoke
         shell: pwsh

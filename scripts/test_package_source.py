@@ -33,6 +33,61 @@ class SourcePackageTests(unittest.TestCase):
         source = self.git(root, "rev-parse", "HEAD")
         return root, base, source
 
+    def test_explicit_repository_uses_its_own_git_root(self) -> None:
+        """Git commands follow the supplied repository rather than module location."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, base, source = self.repository(directory)
+            output = root / "artifacts"
+            with patch.object(
+                package_source,
+                "ROOT",
+                Path("D:/ci-checkout/Lawyer-Assistance"),
+            ):
+                result = package_source.package_source(
+                    root,
+                    output,
+                    base=base,
+                    label="20260912-cross-volume",
+                )
+
+            self.assertEqual(result["source_revision"], source)
+            self.assertTrue(Path(result["archive"]).is_file())
+
+    def test_repository_path_alias_is_resolved_against_git_toplevel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, base, source = self.repository(directory)
+            nested = root / "nested"
+            nested.mkdir()
+            alias = nested / ".."
+            with patch.object(package_source, "ROOT", alias):
+                # This is the exact pre-fix comparison after package_source
+                # called root.resolve(): the equivalent Git root was rejected
+                # only because ROOT remained a lexical, unnormalized alias.
+                self.assertNotEqual(alias.resolve(), package_source.ROOT)
+                result = package_source.package_source(
+                    alias,
+                    root / "artifacts",
+                    base=base,
+                    label="20260912-path-alias",
+                )
+
+            self.assertEqual(result["source_revision"], source)
+            self.assertTrue(Path(result["archive"]).is_file())
+
+    def test_rejects_a_nested_directory_instead_of_git_toplevel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, base, _source = self.repository(directory)
+            nested = root / "nested"
+            nested.mkdir()
+            with self.assertRaisesRegex(package_source.SourcePackageError, "repository root"):
+                package_source.package_source(
+                    nested,
+                    root / "artifacts",
+                    base=base,
+                    label="20260912-nested-root",
+                )
+
     def test_explicit_base_records_committed_increment_without_exact_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, base, source = self.repository(directory)

@@ -1,6 +1,6 @@
 # Getting started
 
-This page describes v1.2.1: material redaction, local legal research, document writing and AI conversations. Download the complete portable package or source from [GitHub Releases](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1) and verify its SHA-256 sidecar. Asset names include the date and commit. See the [upgrade guide](web/ai-upgrade.md) and [retest record](web/retest-1.2.1.md) for compatibility and validation limits.
+This page describes v1.2.1: material redaction, local legal research, document writing and AI conversations. Download the complete portable package or source from [GitHub Releases](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1-r1) and verify its SHA-256 sidecar. Asset names include the date and commit. See the [upgrade guide](web/ai-upgrade.md) and [retest record](web/retest-1.2.1.md) for compatibility and validation limits.
 
 ## Run the portable package
 

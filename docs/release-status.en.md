@@ -1,6 +1,6 @@
 # Current release status
 
-This page describes v1.2.1. The [release page](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1) provides the complete Windows portable package, source and SHA-256 checksums; asset names include the date and commit. See the [retest record](web/retest-1.2.1.md) for changes and validation limits, and the release attachment `release-validation.json` for build identity and packaged verification.
+This page describes v1.2.1. The [release page](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1-r1) provides the complete Windows portable package, source and SHA-256 checksums; asset names include the date and commit. See the [retest record](web/retest-1.2.1.md) for changes and validation limits, and the release attachment `release-validation.json` for build identity and packaged verification.
 
 ## Version and delivery
 
