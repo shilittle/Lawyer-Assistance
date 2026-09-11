@@ -1,6 +1,7 @@
 const API_PREFIX = "/api/v1";
 
 const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const READ_METHODS = new Set(["GET", "HEAD"]);
 
 export const ERROR_MESSAGES = Object.freeze({
   unauthenticated: "会话已失效，请重新打开本地访问链接。",
@@ -247,20 +248,62 @@ function joinApiPath(path) {
   return `${API_PREFIX}${normalized}`;
 }
 
+function staleSessionAbortError() {
+  const error = new Error("stale_session_response");
+  error.name = "AbortError";
+  return error;
+}
+
+function joinedAbortSignal(...signals) {
+  const active = signals.filter((signal) => signal && typeof signal.addEventListener === "function");
+  if (!active.length) return undefined;
+  if (active.length === 1) return active[0];
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") return AbortSignal.any(active);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of active) {
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  return controller.signal;
+}
+
 export class ApiClient {
-  constructor({ fetchImpl, csrfToken = "", onUnauthenticated = () => {} } = {}) {
+  constructor({ fetchImpl, csrfToken = "", onUnauthenticated = () => {}, sessionEpoch = 0 } = {}) {
     const defaultFetch = globalThis.fetch;
     this.fetchImpl = fetchImpl || (typeof defaultFetch === "function" ? defaultFetch.bind(globalThis) : defaultFetch);
     this.csrfToken = csrfToken;
     this.onUnauthenticated = onUnauthenticated;
+    // A response belongs to the browser session that started its fetch.  It
+    // must never log out a newer session after the user has re-authenticated.
+    this.sessionEpoch = Number.isSafeInteger(sessionEpoch) && sessionEpoch >= 0 ? sessionEpoch : 0;
+    this.sessionReadController = new AbortController();
   }
 
   setCsrfToken(token) {
     this.csrfToken = typeof token === "string" ? token : "";
   }
 
+  setSessionEpoch(epoch) {
+    if (!Number.isSafeInteger(epoch) || epoch < 0 || epoch === this.sessionEpoch) return;
+    this.sessionEpoch = epoch;
+    // Only requests that read data are attached to this signal. A write may
+    // already have been accepted by the local service and must not imply that
+    // its durable background task is cancelled when the browser re-auths.
+    this.sessionReadController.abort();
+    this.sessionReadController = new AbortController();
+  }
+
+  isSessionEpochCurrent(epoch) {
+    return epoch === this.sessionEpoch;
+  }
+
   async request(path, { method = "GET", body, headers = {}, signal } = {}) {
+    const requestSessionEpoch = this.sessionEpoch;
     const upperMethod = method.toUpperCase();
+    const requestSignal = READ_METHODS.has(upperMethod)
+      ? joinedAbortSignal(signal, this.sessionReadController.signal)
+      : signal;
     const requestHeaders = new Headers(headers);
     const hasBody = body !== undefined && body !== null;
     let requestBody = body;
@@ -279,22 +322,34 @@ export class ApiClient {
         body: requestBody,
         credentials: "include",
         cache: "no-store",
-        signal
+        signal: requestSignal
       });
     } catch (error) {
       if (error && error.name === "AbortError") throw error;
       throw new ApiError("network_error", true, 0);
     }
 
-    if (response.status === 401) this.onUnauthenticated();
-    if (!response.ok) throw errorFromBody(await readJsonOrNull(response), response.status);
-    if (response.status === 204) return null;
-    if (isJsonResponse(response)) return response.json();
-    return response.text();
+    if (response.status === 401 && this.isSessionEpochCurrent(requestSessionEpoch)) this.onUnauthenticated();
+    if (!response.ok) {
+      const details = await readJsonOrNull(response);
+      if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
+      throw errorFromBody(details, response.status);
+    }
+    if (response.status === 204) {
+      if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
+      return null;
+    }
+    const result = isJsonResponse(response) ? await response.json() : await response.text();
+    if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
+    return result;
   }
 
   async download(path, options = {}) {
+    const requestSessionEpoch = this.sessionEpoch;
     const upperMethod = (options.method || "GET").toUpperCase();
+    const requestSignal = READ_METHODS.has(upperMethod)
+      ? joinedAbortSignal(options.signal, this.sessionReadController.signal)
+      : options.signal;
     const requestHeaders = new Headers(options.headers || {});
     const body = options.body;
     let requestBody = body;
@@ -311,15 +366,21 @@ export class ApiClient {
         body: requestBody,
         credentials: "include",
         cache: "no-store",
-        signal: options.signal
+        signal: requestSignal
       });
     } catch (error) {
       if (error && error.name === "AbortError") throw error;
       throw new ApiError("network_error", true, 0);
     }
-    if (response.status === 401) this.onUnauthenticated();
-    if (!response.ok) throw errorFromBody(await readJsonOrNull(response), response.status);
-    return response.blob();
+    if (response.status === 401 && this.isSessionEpochCurrent(requestSessionEpoch)) this.onUnauthenticated();
+    if (!response.ok) {
+      const details = await readJsonOrNull(response);
+      if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
+      throw errorFromBody(details, response.status);
+    }
+    const blob = await response.blob();
+    if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
+    return blob;
   }
 
   // The AI surface deliberately lives behind one small set of helpers.  Keeping
@@ -440,7 +501,12 @@ export class ApiClient {
     return this.request(`/ai/drafts/${pathId(id)}${queryString({ expected_revision: expectedRevision })}`, { ...options, method: "DELETE" });
   }
 
+  async listAiDraftConflicts(id, { limit, cursor, ...options } = {}) {
+    return this.request(`/ai/drafts/${pathId(id)}/conflicts${queryString({ limit, cursor })}`, options);
+  }
+
   async streamChat(path, payload, { onDelta, onDone, onError, signal } = {}) {
+    const requestSessionEpoch = this.sessionEpoch;
     const requestHeaders = new Headers({
       "Accept": "text/event-stream",
       "Content-Type": "application/json",
@@ -461,14 +527,19 @@ export class ApiClient {
       if (error && error.name === "AbortError") throw error;
       throw new ApiError("network_error", true, 0);
     }
-    if (response.status === 401) this.onUnauthenticated();
-    if (!response.ok) throw errorFromBody(await readJsonOrNull(response), response.status);
+    if (response.status === 401 && this.isSessionEpochCurrent(requestSessionEpoch)) this.onUnauthenticated();
+    if (!response.ok) {
+      const details = await readJsonOrNull(response);
+      if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
+      throw errorFromBody(details, response.status);
+    }
     if (!response.body || typeof response.body.getReader !== "function") throw new ApiError("server_error", true, response.status);
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     const consumeLine = (line) => {
+      if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith(":")) return;
       const data = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : "";
@@ -487,13 +558,20 @@ export class ApiClient {
 
     while (true) {
       const { value, done } = await reader.read();
+      if (!this.isSessionEpochCurrent(requestSessionEpoch)) {
+        await reader.cancel().catch(() => {});
+        throw staleSessionAbortError();
+      }
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
       const lines = buffer.split(/\r?\n/u);
       buffer = lines.pop() || "";
       for (const line of lines) consumeLine(line);
       if (done) break;
     }
-    if (buffer) consumeLine(buffer);
+    if (buffer) {
+      if (!this.isSessionEpochCurrent(requestSessionEpoch)) throw staleSessionAbortError();
+      consumeLine(buffer);
+    }
   }
 }
 

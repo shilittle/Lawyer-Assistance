@@ -5,7 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import { root, startServer, sleep } from "./ai_test_client.mjs";
 
-const output = path.join(root, "work/audit-repair/ai-capacity-native");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "ai-capacity-native");
 await fs.mkdir(output, { recursive: true });
 const directory = await fs.mkdtemp(path.join(output, "workspace-"));
 const live = new Set();

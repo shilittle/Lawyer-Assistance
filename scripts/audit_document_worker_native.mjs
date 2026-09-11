@@ -6,7 +6,7 @@ import http from "node:http";
 import { execFileSync } from "node:child_process";
 import { root, startServer, sleep } from "./ai_test_client.mjs";
 
-const output = path.join(root, "work/audit-repair/document-worker-native");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "document-worker-native");
 await fs.mkdir(output, { recursive: true });
 const dataDir = await fs.mkdtemp(path.join(output, "workspace-"));
 const executable = path.resolve(process.argv[2] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe"));

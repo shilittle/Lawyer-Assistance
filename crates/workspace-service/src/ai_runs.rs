@@ -265,6 +265,10 @@ struct AiDraft {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AiRun {
     pub id: String,
+    /// Stable server-owned identity shared by all revisions of a writing document.
+    /// Legacy writing rows use their original run ID until the next save.
+    #[serde(default)]
+    pub document_id: Option<String>,
     pub kind: String,
     pub status: String,
     pub stage: String,
@@ -310,6 +314,17 @@ pub struct AiRun {
     pub context_plan: Option<AiContextPlan>,
     pub revision: u64,
 }
+impl AiRun {
+    fn writing_document_id(&self) -> Option<&str> {
+        (self.kind == "writing").then(|| {
+            self.document_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .unwrap_or(&self.id)
+        })
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AiConversation {
     pub id: String,
@@ -1037,6 +1052,26 @@ impl Workspace {
         }))
     }
 
+    pub fn ai_draft_conflicts_page(
+        &self,
+        base_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Value> {
+        if !Self::valid_draft_id(base_id)
+            || !base_id.starts_with("writing-")
+            || base_id.len() > 44
+            || base_id.len() == "writing-".len()
+        {
+            return Err(Error::new("invalid_ai_request"));
+        }
+        let page = self.store.draft_conflicts_page(base_id, cursor, limit)?;
+        Ok(json!({
+            "drafts": page.items, "next_cursor": page.next_cursor,
+            "total": page.total, "corrupt_count": page.corrupt_count,
+        }))
+    }
+
     pub fn save_ai_draft(&self, id: &str, expected_revision: u64, content: Value) -> Result<Value> {
         if !Self::valid_draft_id(id) {
             return Err(Error::new("invalid_ai_request"));
@@ -1284,7 +1319,7 @@ impl Workspace {
             .map(|verification| verification.public_view(run))
             .unwrap_or_else(|| AiCitationVerification::legacy_pending().public_view(run));
         let context_plan = run.context_plan.as_ref().map(AiContextPlan::public_view);
-        json!({"id":run.id,"kind":run.kind,"status":run.status,"stage":run.stage,"prompt":run.prompt,"title":run.title,"content":run.content,"html":run.html,"citations":run.citations,"citation_verification":citation_verification,"tool_steps":run.tool_steps,"error_code":run.error_code,"usage":run.usage,"created_at":run.created_at,"updated_at":run.updated_at,"provider_id":run.provider_id,"model":run.model,"materials":run.request.materials,"attachment_ids":run.request.attachment_ids,"conversation_id":run.request.conversation_id,"context_revision":run.request.context_revision,"context_manifest":run.context_manifest,"context_plan":context_plan,"parent_id":run.request.parent_id,"revision":run.revision,"case_date":run.request.case_date,"match_mode":run.request.match_mode.as_deref().unwrap_or("all"),"version_scope":run.request.search_version_scope(),"version_status":run.request.version_status})
+        json!({"id":run.id,"document_id":run.writing_document_id(),"kind":run.kind,"status":run.status,"stage":run.stage,"prompt":run.prompt,"title":run.title,"content":run.content,"html":run.html,"citations":run.citations,"citation_verification":citation_verification,"tool_steps":run.tool_steps,"error_code":run.error_code,"usage":run.usage,"created_at":run.created_at,"updated_at":run.updated_at,"provider_id":run.provider_id,"model":run.model,"materials":run.request.materials,"attachment_ids":run.request.attachment_ids,"conversation_id":run.request.conversation_id,"context_revision":run.request.context_revision,"context_manifest":run.context_manifest,"context_plan":context_plan,"parent_id":run.request.parent_id,"revision":run.revision,"case_date":run.request.case_date,"match_mode":run.request.match_mode.as_deref().unwrap_or("all"),"version_scope":run.request.search_version_scope(),"version_status":run.request.version_status})
     }
     pub fn ai_run(&self, id: &str) -> Result<Value> {
         Ok(Self::public_run(&self.store.get("ai_run", id)?))
@@ -1536,8 +1571,28 @@ impl Workspace {
             self.provider_profile_binding(&selection)?;
         let original_material_revisions =
             self.original_material_revisions_from_metadata(&request.materials)?;
+        let run_id = id("run");
+        let document_id = if request.kind == "writing" {
+            Some(match request.parent_id.as_deref() {
+                Some(parent_id) => {
+                    let parent = self.store.summary("ai_run", parent_id)?;
+                    if parent["kind"] != "writing" {
+                        return Err(Error::new("document_not_ready"));
+                    }
+                    parent["document_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or(parent_id)
+                        .to_owned()
+                }
+                None => run_id.clone(),
+            })
+        } else {
+            None
+        };
         let r = AiRun {
-            id: id("run"),
+            id: run_id,
+            document_id,
             kind: request.kind.clone(),
             status: "queued".into(),
             stage: "已加入处理队列".into(),
@@ -1705,6 +1760,7 @@ impl Workspace {
             }
         }
         let mut resumed = r.clone();
+        resumed.document_id = r.writing_document_id().map(str::to_owned);
         resumed.id = crate::id("run");
         resumed.request = request;
         resumed.status = "queued".into();
@@ -1757,6 +1813,7 @@ impl Workspace {
         let content_changed = r.content != edit.content;
         let date_changed = r.request.case_date != case_date;
         let scope_changed = r.request.version_scope != version_scope;
+        r.document_id = r.writing_document_id().map(str::to_owned);
         r.request.parent_id = Some(r.id.clone());
         r.id = crate::id("run");
         r.content = edit.content;
@@ -2854,6 +2911,7 @@ mod supervisor_tests {
     fn queued_run(id: &str, status: &str, revision: u64) -> AiRun {
         AiRun {
             id: id.into(),
+            document_id: None,
             kind: "writing".into(),
             status: status.into(),
             stage: "queued stage".into(),
@@ -2885,6 +2943,106 @@ mod supervisor_tests {
             context_plan: None,
             revision,
         }
+    }
+
+    #[test]
+    fn writing_identity_survives_legacy_read_two_edits_and_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        let legal = temporary.path().join("absent.sqlite");
+        let workspace = Workspace::open(root.clone(), legal.clone()).unwrap();
+        let legacy = queued_run("run_legacy", "completed", 3);
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        value.as_object_mut().unwrap().remove("document_id");
+        workspace.store.save("ai_run", &legacy.id, &value).unwrap();
+        assert_eq!(
+            workspace.ai_run(&legacy.id).unwrap()["document_id"],
+            legacy.id
+        );
+        let first = workspace
+            .edit_ai_document(
+                &legacy.id,
+                AiDocumentEdit {
+                    expected_revision: 3,
+                    content: "第一份固定快照".into(),
+                    case_date: AiCaseDateUpdate::Inherit,
+                },
+            )
+            .unwrap();
+        let first_id = first["id"].as_str().unwrap();
+        let second = workspace
+            .edit_ai_document(
+                first_id,
+                AiDocumentEdit {
+                    expected_revision: 4,
+                    content: "第二份固定快照".into(),
+                    case_date: AiCaseDateUpdate::Inherit,
+                },
+            )
+            .unwrap();
+        assert_eq!(first["document_id"], legacy.id);
+        assert_eq!(second["document_id"], legacy.id);
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(
+            workspace.store.summary("ai_run", first_id).unwrap()["document_id"],
+            legacy.id
+        );
+        assert_eq!(
+            workspace.ai_run(first_id).unwrap()["content"],
+            "第一份固定快照"
+        );
+        drop(workspace);
+        let reopened = Workspace::open(root, legal).unwrap();
+        assert_eq!(
+            reopened.ai_run(second["id"].as_str().unwrap()).unwrap()["document_id"],
+            legacy.id
+        );
+        assert_eq!(reopened.ai_run(first_id).unwrap()["revision"], 4);
+    }
+
+    #[test]
+    fn draft_conflict_candidate_remains_encrypted_and_recoverable_after_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        let legal = temporary.path().join("absent.sqlite");
+        let workspace = Workspace::open(root.clone(), legal.clone()).unwrap();
+        let base = "writing-run_legacy";
+        let candidate = format!("{base}-c-{}", "a".repeat(32));
+        let remote = workspace
+            .save_ai_draft(base, 0, json!({"content":"remote", "dirty":true}))
+            .unwrap();
+        assert_eq!(remote["revision"], 1);
+        assert_eq!(
+            workspace
+                .save_ai_draft(base, 0, json!({"content":"local"}))
+                .unwrap_err()
+                .code,
+            "revision_conflict"
+        );
+        workspace.save_ai_draft(&candidate, 0, json!({"content":"preserved local", "run_id":"run_legacy", "run_revision":3, "dirty":true})).unwrap();
+        assert_eq!(
+            workspace.ai_draft(base).unwrap()["content"]["content"],
+            "remote"
+        );
+        drop(workspace);
+        let workspace = Workspace::open(root, legal).unwrap();
+        let page = workspace.ai_draft_conflicts_page(base, None, 20).unwrap();
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["drafts"][0]["id"], candidate);
+        assert!(page["drafts"][0].get("content").is_none());
+        assert_eq!(
+            workspace.ai_draft(&candidate).unwrap()["content"]["content"],
+            "preserved local"
+        );
+        assert_eq!(
+            workspace.delete_ai_draft(&candidate, 0).unwrap_err().code,
+            "revision_conflict"
+        );
+        workspace.delete_ai_draft(&candidate, 1).unwrap();
+        assert_eq!(
+            workspace.ai_draft_conflicts_page(base, None, 20).unwrap()["total"],
+            0
+        );
     }
 
     #[test]

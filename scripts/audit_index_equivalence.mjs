@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { root, startServer } from "./ai_test_client.mjs";
 
-const output = path.join(root, "work/audit-repair/index-equivalence");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "index-equivalence");
 await fs.mkdir(output, { recursive: true });
 const run = await fs.mkdtemp(path.join(output, "run-"));
 const executable = path.resolve(process.argv[2] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe"));

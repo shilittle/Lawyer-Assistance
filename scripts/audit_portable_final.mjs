@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { root, startServer } from "./ai_test_client.mjs";
 
-const output = path.join(root, "work/audit-repair/portable-final");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "portable-final");
 await fs.mkdir(output, { recursive: true });
 const directory = await fs.mkdtemp(path.join(output, "unpacked-"));
 const archive = path.resolve(process.argv[2]);

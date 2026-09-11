@@ -13,6 +13,8 @@ PUBLIC_TOOLS = (
     "legal_get_article",
     "legal_get_versions",
     "legal_get_relations",
+    "legal_search_cases",
+    "legal_get_case",
 )
 PRIVACY_TOOLS = PUBLIC_TOOLS + (
     "privacy_workspace.submit",
@@ -109,14 +111,28 @@ def validate_no_literal_secret(integrations_root: Path) -> None:
 def validate_rust_registry() -> None:
     path = ROOT / "crates" / "legal-mcp" / "src" / "registry.rs"
     text = path.read_text(encoding="utf-8")
-    public = re.search(r"pub const TOOL_NAMES:\s*\[&str;\s*5\]\s*=\s*\[(.*?)\];", text, re.DOTALL)
-    privacy = re.search(r"pub const PRIVACY_WORKSPACE_TOOL_NAMES:\s*\[&str;\s*8\]\s*=\s*\[(.*?)\];", text, re.DOTALL)
-    check(public is not None, "registry: public five declaration missing")
-    check(privacy is not None, "registry: privacy eight declaration missing")
+    public = re.search(
+        r"pub const TOOL_NAMES:\s*\[&str;\s*(\d+)\]\s*=\s*\[(.*?)\];",
+        text,
+        re.DOTALL,
+    )
+    privacy = re.search(
+        r"pub const PRIVACY_WORKSPACE_TOOL_NAMES:\s*\[&str;\s*(\d+)\]\s*=\s*\[(.*?)\];",
+        text,
+        re.DOTALL,
+    )
+    check(public is not None, "registry: public tool declaration missing")
+    check(privacy is not None, "registry: privacy tool declaration missing")
     if public:
-        check(tuple(re.findall(r'"([^\"]+)"', public.group(1))) == PUBLIC_TOOLS, "registry: public tools drift")
+        declared_count = int(public.group(1))
+        names = tuple(re.findall(r'"([^\"]+)"', public.group(2)))
+        check(declared_count == len(PUBLIC_TOOLS), "registry: public tool count drift")
+        check(names == PUBLIC_TOOLS, "registry: public tools drift")
     if privacy:
-        check(tuple(re.findall(r'"([^\"]+)"', privacy.group(1))) == PRIVACY_TOOLS, "registry: privacy tools drift")
+        declared_count = int(privacy.group(1))
+        names = tuple(re.findall(r'"([^\"]+)"', privacy.group(2)))
+        check(declared_count == len(PRIVACY_TOOLS), "registry: privacy tool count drift")
+        check(names == PRIVACY_TOOLS, "registry: privacy tools drift")
 
 
 def validate_integrations_root(integrations_root: Path = INTEGRATIONS) -> None:
@@ -139,7 +155,7 @@ def main() -> int:
     if ERRORS:
         print("\n".join(f"ERROR: {error}" for error in ERRORS), file=sys.stderr)
         return 1
-    print("validated public five-tool and privacy eight-tool MCP examples")
+    print("validated public seven-tool and privacy ten-tool MCP examples")
     return 0
 
 

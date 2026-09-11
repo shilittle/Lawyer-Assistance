@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { materialReviewDecision } from "./app.js";
 import { ApiClient, ApiError, ERROR_MESSAGES, pathId, queryString, splitIds } from "./api.js";
-import { AI_RUN_KINDS, AI_RUN_POLL_MAX_CONSECUTIVE_FAILURES, AiRunPoller, CASE_TYPES, ENTITY_KINDS, adaptiveLegalPageSize, aiRunPollBackoffDelay, aiDefaultSelection, aiRunProgress, aiRunProgressText, aiRunRevision, aiRunStatusLabel, caseUnderstandPayload, caseSourceLabel, caseStatusLabel, caseTypeLabel, caseWarningLabel, conversationContextRevision, field, isRetryableAiPollError, legalArticleDisplayTitle, legalArticleDocumentId, legalCaseSearchParams, legalDateValue, legalFacetLabel, legalMatchMode, legalRelationTarget, legalQueryScopeSummary, legalScopedReadParams, legalSearchPageParams, legalVersionScope, markdownPlainText, markdownToHtml, materialStatusTone, mcpClientDetails, normalizeAiRun, normalizeCaseSearchResponse, normalizeCursorPage, normalizeLegalPageResponse, optionalAlias, pipelineStageLabel, providerModelIds, providerPresetForBaseUrl, reasonLabel, safeExternalUrl, statusLabel, textValue, writingDraftContent, writingDraftRestorePlan, citationCheckLabel, citationErrorCategoryLabel, citationVerificationReasonLabel, citationVerificationStateLabel, contextBudgetStageLabel, contextEstimateCanProceed, contextOmissionReasonLabel, modelCapabilitiesPayload, normalizeAiContextEstimate, normalizeCitationVerification } from "./app.js";
+import { AI_RUN_KINDS, AI_RUN_POLL_MAX_CONSECUTIVE_FAILURES, AiRunPoller, CASE_TYPES, ENTITY_KINDS, adaptiveLegalPageSize, aiRunPollBackoffDelay, aiDefaultSelection, aiRunProgress, aiRunProgressText, aiRunRevision, aiRunStatusLabel, caseUnderstandPayload, caseSourceLabel, caseStatusLabel, caseTypeLabel, caseWarningLabel, conversationContextRevision, field, isRetryableAiPollError, legalArticleDisplayTitle, legalArticleDocumentId, legalCaseSearchParams, legalDateValue, legalFacetLabel, legalMatchMode, legalRelationTarget, legalQueryScopeSummary, legalScopedReadParams, legalSearchPageParams, legalVersionScope, markdownPlainText, markdownToHtml, materialStatusTone, mcpClientDetails, normalizeAiRun, normalizeCaseSearchResponse, normalizeCursorPage, normalizeLegalPageResponse, optionalAlias, pipelineStageLabel, providerModelIds, providerPresetForBaseUrl, reasonLabel, safeExternalUrl, statusLabel, textValue, writingDocumentId, writingDraftCandidateId, writingDraftContent, writingDraftIdForRun, writingDraftRestorePlan, citationCheckLabel, citationErrorCategoryLabel, citationVerificationReasonLabel, citationVerificationStateLabel, contextBudgetStageLabel, contextEstimateCanProceed, contextOmissionReasonLabel, modelCapabilitiesPayload, normalizeAiContextEstimate, normalizeCitationVerification } from "./app.js";
 
 test("status presentation has safe Chinese labels and tones", () => {
   assert.equal(statusLabel("needs_review"), "待复核");
@@ -186,6 +186,35 @@ test("ApiClient keeps structured backend error code and retryability", async () 
     assert.match(error.message, /云辅助/);
     return true;
   });
+});
+
+test("ApiClient discards a delayed JSON response after the browser session epoch changes", async () => {
+  let releaseBody;
+  let readSignal;
+  let unauthenticated = 0;
+  const client = new ApiClient({
+    sessionEpoch: 4,
+    onUnauthenticated: () => { unauthenticated += 1; },
+    fetchImpl: async (_url, options) => {
+      readSignal = options.signal;
+      return {
+      status: 200,
+      ok: true,
+      headers: new Headers({ "content-type": "application/json" }),
+      json: async () => {
+        await new Promise((resolve) => { releaseBody = resolve; });
+        return { stale: true };
+      }
+      };
+    }
+  });
+  const pending = client.request("/delayed-json");
+  await new Promise((resolve) => setImmediate(resolve));
+  client.setSessionEpoch(5);
+  assert.equal(readSignal.aborted, true, "the old GET uses the session read controller");
+  releaseBody();
+  await assert.rejects(pending, (error) => error?.name === "AbortError");
+  assert.equal(unauthenticated, 0);
 });
 
 test("streamChat parses split SSE frames and exposes deltas without HTML rendering", async () => {
@@ -384,6 +413,7 @@ test("revision-bound draft, context, edit, recheck, estimate, and export wrapper
   await client.getAiDraft("writing/current");
   await client.saveAiDraft("writing/current", { expected_revision: 4, content: { dirty: true } });
   await client.deleteAiDraft("writing/current", 5);
+  await client.listAiDraftConflicts("writing/current", { limit: 20, cursor: "candidate-next" });
 
   assert.equal(calls[0].url, "/api/v1/ai/runs/run%2F1/content");
   assert.deepEqual(JSON.parse(calls[0].options.body), { content: "修订正文", expected_revision: 7 });
@@ -400,6 +430,7 @@ test("revision-bound draft, context, edit, recheck, estimate, and export wrapper
   assert.equal(calls[8].url, "/api/v1/ai/drafts/writing%2Fcurrent");
   assert.deepEqual(JSON.parse(calls[8].options.body), { expected_revision: 4, content: { dirty: true } });
   assert.equal(calls[9].url, "/api/v1/ai/drafts/writing%2Fcurrent?expected_revision=5");
+  assert.equal(calls[10].url, "/api/v1/ai/drafts/writing%2Fcurrent/conflicts?limit=20&cursor=candidate-next");
 });
 
 test("citation verification exposes only mechanical checks and safe bindings", () => {
@@ -522,6 +553,15 @@ test("writing drafts retain only the strict encrypted-record fields and current 
   assert.equal(writingDraftContent({ run_id: "", run_revision: 0 }).run_revision, null);
   assert.equal(isRetryableAiPollError(new ApiError("server_error", true, 500)), true);
   assert.equal(isRetryableAiPollError(new ApiError("not_found", true, 404)), false);
+});
+
+test("writing draft names follow stable logical-document ids and bounded candidate suffixes", () => {
+  assert.equal(writingDocumentId({ id: "writing-old" }), "writing-old");
+  assert.equal(writingDocumentId({ id: "writing-v2", document_id: "run_0123456789abcdef0123456789abcdef" }), "run_0123456789abcdef0123456789abcdef");
+  assert.equal(writingDraftIdForRun({ id: "writing-v2", document_id: "run_0123456789abcdef0123456789abcdef" }), "writing-run_0123456789abcdef0123456789abcdef");
+  assert.equal(writingDraftIdForRun({ id: "writing-old" }), "writing-writing-old");
+  assert.equal(writingDraftCandidateId("writing-run_0123456789abcdef0123456789abcdef", "a".repeat(32)), "writing-run_0123456789abcdef0123456789abcdef-c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  assert.equal(writingDraftCandidateId("bad/key", "a".repeat(32)), "");
 });
 
 test("summary-only writing history cannot replace an encrypted unsaved document draft", () => {

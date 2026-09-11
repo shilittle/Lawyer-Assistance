@@ -322,6 +322,69 @@ export function aiRunRevision(run, fallback = 0) {
   return Number.isSafeInteger(revision) && revision >= 0 ? revision : fallback;
 }
 
+// A document keeps this stable identity as immutable writing versions receive
+// new run ids. Older records did not have it, so their own run id remains the
+// compatible logical-document identity.
+export function writingDocumentId(run) {
+  return textValue(field(run, ["document_id", "documentId"])) || aiRunId(run);
+}
+
+export function writingDraftIdForRun(run) {
+  const documentId = writingDocumentId(run);
+  return documentId ? `writing-${documentId}` : "writing-current";
+}
+
+export function writingDraftCandidateId(baseId, randomHex = "") {
+  const base = textValue(baseId);
+  const supplied = String(randomHex || "").toLowerCase();
+  let nonce = supplied;
+  if (!/^[a-f0-9]{32}$/u.test(nonce)) {
+    if (typeof globalThis.crypto?.getRandomValues !== "function") return "";
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    nonce = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  }
+  // ai_draft names are bounded at 80 characters. The canonical writing bases
+  // are 44 characters, leaving room for "-c-" and a 128-bit hex nonce.
+  return /^[A-Za-z0-9_-]{1,45}$/u.test(base) && /^[a-f0-9]{32}$/u.test(nonce)
+    ? `${base}-c-${nonce}`
+    : "";
+}
+
+function newWritingDraftState(id = "writing-current") {
+  return {
+    id,
+    revision: 0,
+    loaded: false,
+    timer: null,
+    saving: false,
+    savingPromise: null,
+    clearing: false,
+    pending: null,
+    sequence: 0,
+    retryAttempts: 0,
+    retryStopped: false,
+    conflicts: [],
+    conflictLoadPromise: null,
+    conflictNextCursor: "",
+    conflictTotal: 0,
+    conflictCorruptCount: 0
+  };
+}
+
+const WRITING_LAST_RUN_STORAGE_KEY = "lawyer-assistance.writing.last-run.v1";
+
+function safeWritingRunPointer(value) {
+  const id = textValue(value);
+  return /^[A-Za-z0-9_-]{1,64}$/u.test(id) ? id : "";
+}
+
+function staleAsyncError() {
+  const error = new Error("stale_async_response");
+  error.name = "AbortError";
+  return error;
+}
+
 export function conversationContextRevision(conversation, fallback = 0) {
   const revision = Number(field(conversation, ["context_revision", "contextRevision", "revision"]));
   return Number.isSafeInteger(revision) && revision >= 0 ? revision : fallback;
@@ -1566,6 +1629,7 @@ export class WebApp {
     this.state = {
       authenticated: false,
       csrfToken: "",
+      sessionEpoch: 0,
       view: "privacy",
       health: null,
       groups: [],
@@ -1616,20 +1680,27 @@ export class WebApp {
        activeRenderScope: "",
        renderGeneration: 0,
        providerLoadPromise: null,
-       writingDraft: { id: "writing-current", revision: 0, loaded: false, timer: null, saving: false, savingPromise: null, clearing: false, pending: null, sequence: 0, retryAttempts: 0, retryStopped: false },
+       writingDrafts: new Map(),
+       writingDraft: newWritingDraftState(),
        pendingMcpToken: null,
        pendingCitation: null
      };
+     this.state.writingDrafts.set(this.state.writingDraft.id, this.state.writingDraft);
+     this.api.setSessionEpoch?.(this.state.sessionEpoch);
      this.api.onUnauthenticated = () => this.requireLogin();
      this.aiRunPoller = new AiRunPoller({
        getRun: async (id, options) => {
+         const sessionEpoch = this.state.sessionEpoch;
          const response = await this.api.getAiRun(id, options);
+         if (!this.isSessionCurrent(sessionEpoch)) throw staleAsyncError();
          return normalizeAiRun(response?.run || response);
        },
-       onRun: (run) => this.rememberAiRun(run)
+       onRun: (run) => {
+         if (this.state.authenticated) this.rememberAiRun(run);
+       }
      });
      globalThis.addEventListener?.("pagehide", () => {
-       void this.flushWritingDraft();
+       void this.flushAllWritingDrafts();
      });
   }
 
@@ -1665,20 +1736,127 @@ export class WebApp {
     this.state.authenticated = Boolean(session && session.authenticated);
     this.state.csrfToken = textValue(session && session.csrf_token);
     this.api.setCsrfToken(this.state.csrfToken);
+    if (this.state.authenticated) {
+      this.state.sessionEpoch += 1;
+      this.api.setSessionEpoch?.(this.state.sessionEpoch);
+    }
   }
 
   requireLogin() {
+    this.state.sessionEpoch += 1;
     this.state.authenticated = false;
     this.state.csrfToken = "";
     this.api.setCsrfToken("");
+    this.api.setSessionEpoch?.(this.state.sessionEpoch);
+    for (const id of [...this.aiRunPoller.entries.keys()]) this.aiRunPoller.stop(id);
+    this.cancelLegalRequests();
+    this.teardownLegalViewport();
+    this.state.chatAbort?.abort();
+    this.state.chatAbort = null;
+    if (this.state.taskTimer) clearTimeout(this.state.taskTimer);
+    this.state.taskTimer = null;
+    for (const draft of this.state.writingDrafts.values()) {
+      if (draft.timer) clearTimeout(draft.timer);
+      draft.timer = null;
+      draft.pending = null;
+      draft.savingPromise = null;
+      draft.saving = false;
+      draft.lastContent = undefined;
+      draft.conflicts = [];
+      draft.onConflictsChanged = null;
+      draft.conflictLoadPromise = null;
+    }
+    this.state.writingDrafts.clear();
+    this.state.writingDraft = newWritingDraftState();
+    this.state.writingDrafts.set(this.state.writingDraft.id, this.state.writingDraft);
+    this.state.health = null;
+    this.state.groups = [];
+    this.state.groupsPage = { items: [], nextCursor: "", total: 0, corruptCount: 0 };
+    this.state.selectedGroupId = "";
+    this.state.materials = [];
+    this.state.privacyMaterialPages.clear();
+    this.state.privacySelectedMaterialIds.clear();
+    this.state.selectedMaterial = null;
+    this.state.legalResults = [];
+    this.state.legalCases = [];
+    this.state.legalMode = LEGAL_SEARCH_MODES.statute;
+    this.state.legalCaseType = CASE_TYPES.all;
+    this.state.legalCaseQuery = "";
+    this.state.legalCaseOffset = 0;
+    this.state.legalIncludeWithdrawn = false;
+    this.state.legalCaseResponse = null;
+    this.state.legalCaseStatus = null;
+    this.state.legalBookmarks = [];
+    this.state.selectedArticle = null;
+    this.state.selectedCase = null;
+    this.state.legalArticleOffset = 0;
+    this.state.legalArticleQuery = "";
+    this.state.legalQueryFilters = { caseDate: "", matchMode: "all", versionScope: "current", versionStatus: "", documentId: "", documentTitle: "", type: "", level: "", region: "", status: "", sort: "relevance", view: "grouped", includeHistory: true, includeRelations: true };
+    this.state.aiSearchFilters = { caseDate: "", matchMode: "all", versionScope: "current", versionStatus: "" };
+    this.state.legalArticlePage = null;
+    this.state.legalDetailOptions = { includeHistory: true, includeRelations: true };
+    this.state.providers = [];
+    this.state.aiDefaults = {};
+    this.state.aiMaterials = [];
+    this.state.aiMaterialsPage = { nextCursor: "", total: 0, corruptCount: 0, error: "", loaded: false };
+    this.state.aiAttachments = [];
+    this.state.aiRuns = [];
+    this.state.aiRunPages.clear();
+    this.state.runsById.clear();
+    this.state.pageRunIds = { writing: "", search: "", chat: "" };
+    this.state.conversations = [];
+    this.state.conversationPage = { nextCursor: "", total: 0, corruptCount: 0, loaded: false };
+    this.state.selectedConversation = null;
+    this.state.mcpClients = [];
+    this.state.providerLoadPromise = null;
+    this.state.pendingMcpToken = null;
+    this.state.pendingCitation = null;
+    this.state.activeRenderScope = `session-cleared-${++this.state.renderGeneration}`;
     this.renderLogin("会话已失效，请使用新的本地访问链接。", true);
   }
 
+  isSessionCurrent(epoch) {
+    return this.state.authenticated && this.state.sessionEpoch === epoch;
+  }
+
+  writingDraftState(id = "writing-current") {
+    const key = textValue(id, "writing-current") || "writing-current";
+    let draft = this.state.writingDrafts.get(key);
+    if (!draft) {
+      draft = newWritingDraftState(key);
+      this.state.writingDrafts.set(key, draft);
+    }
+    return draft;
+  }
+
+  activateWritingDraft(id) {
+    const draft = this.writingDraftState(id);
+    this.state.writingDraft = draft;
+    return draft;
+  }
+
+  async flushAllWritingDrafts() {
+    await Promise.allSettled([...this.state.writingDrafts.values()].map((draft) => this.flushWritingDraft(draft)));
+  }
+
+  rememberWritingRunPointer(run) {
+    const id = safeWritingRunPointer(aiRunId(run));
+    if (!id) return;
+    try { globalThis.localStorage?.setItem(WRITING_LAST_RUN_STORAGE_KEY, id); } catch {}
+  }
+
+  restoredWritingRunPointer() {
+    try { return safeWritingRunPointer(globalThis.localStorage?.getItem(WRITING_LAST_RUN_STORAGE_KEY)); } catch { return ""; }
+  }
+
   async loadHealth() {
+    const sessionEpoch = this.state.sessionEpoch;
     try {
-      this.state.health = await this.api.request("/health");
+      const health = await this.api.request("/health");
+      if (!this.isSessionCurrent(sessionEpoch)) return;
+      this.state.health = health;
     } catch {
-      this.state.health = null;
+      if (this.isSessionCurrent(sessionEpoch)) this.state.health = null;
     }
   }
 
@@ -2307,22 +2485,25 @@ export class WebApp {
 
   pollTask(taskId, status, groupSelect, materialsList, detail) {
     if (this.state.taskTimer) clearTimeout(this.state.taskTimer);
+    const sessionEpoch = this.state.sessionEpoch;
     const poll = async () => {
+      if (!this.isSessionCurrent(sessionEpoch)) return;
       try {
         const task = await this.api.request(`/tasks/${pathId(taskId)}`);
+        if (!this.isSessionCurrent(sessionEpoch)) return;
         const taskStatus = textValue(field(task, ["status"]));
         setStatus(status, `任务：${statusLabel(taskStatus)}`, materialStatusTone(taskStatus));
         const done = ["completed", "failed", "cancelled", "ready", "partial", "needs_review", "awaiting_consent"].includes(taskStatus.toLowerCase());
         if (!done) {
-          this.state.taskTimer = setTimeout(poll, 1500);
+          if (this.isSessionCurrent(sessionEpoch)) this.state.taskTimer = setTimeout(poll, 1500);
         } else if (groupSelect && materialsList && detail) {
           await this.loadPrivacyData(groupSelect, materialsList, detail);
-        } else if (detail && this.state.selectedMaterial) {
+        } else if (this.isSessionCurrent(sessionEpoch) && detail && this.state.selectedMaterial) {
           const selectedId = textValue(field(this.state.selectedMaterial, ["id", "materialId"]));
           if (selectedId) await this.loadMaterialDetail(selectedId, detail);
         }
       } catch (error) {
-        setStatus(status, apiErrorMessage(error), "danger");
+        if (error?.name !== "AbortError" && this.isSessionCurrent(sessionEpoch)) setStatus(status, apiErrorMessage(error), "danger");
       }
     };
     poll();
@@ -2621,28 +2802,35 @@ export class WebApp {
     };
   }
 
-  async loadWritingDraft() {
-    const draft = this.state.writingDraft;
+  async loadWritingDraft(draft = this.state.writingDraft, { sessionEpoch = this.state.sessionEpoch } = {}) {
+    const id = draft.id;
     try {
-      const response = await this.api.getAiDraft(draft.id);
+      const response = await this.api.getAiDraft(id);
+      if (!this.isSessionCurrent(sessionEpoch)) throw staleAsyncError();
       const record = response?.draft || response || {};
       draft.revision = aiRunRevision(record, 0);
       draft.loaded = true;
-      return writingDraftContent(record.content || record);
+      draft.exists = true;
+      draft.lastContent = writingDraftContent(record.content || record);
+      return draft.lastContent;
     } catch (error) {
+      if (!this.isSessionCurrent(sessionEpoch)) throw staleAsyncError();
+      if (error?.name === "AbortError") throw error;
       if (error instanceof ApiError && (error.status === 404 || error.code === "not_found")) {
         draft.revision = 0;
         draft.loaded = true;
-        return writingDraftContent();
+        draft.exists = false;
+        draft.lastContent = writingDraftContent();
+        return draft.lastContent;
       }
       throw error;
     }
   }
 
-  queueWritingDraft(content, status) {
-    const draft = this.state.writingDraft;
+  queueWritingDraft(content, status, draft = this.state.writingDraft) {
     if (draft.clearing) return;
     draft.pending = { content: writingDraftContent(content), status, sequence: ++draft.sequence };
+    draft.lastContent = draft.pending.content;
     draft.retryAttempts = 0;
     draft.retryStopped = false;
     status?.retryControl && (status.retryControl.hidden = true);
@@ -2650,14 +2838,71 @@ export class WebApp {
     setStatus(status, "草稿待保存…", "info");
     draft.timer = setTimeout(() => {
       draft.timer = null;
-      void this.flushWritingDraft();
+      void this.flushWritingDraft(draft);
     }, 500);
   }
 
-  async flushWritingDraft() {
-    const draft = this.state.writingDraft;
+  async saveWritingConflictCandidate(draft, pending, sessionEpoch) {
+    const candidateId = writingDraftCandidateId(draft.id);
+    if (!candidateId) throw new ApiError("draft_conflict_candidate_invalid", false, 409);
+    const response = await this.api.saveAiDraft(candidateId, {
+      expected_revision: 0,
+      content: pending.content
+    });
+    if (!this.isSessionCurrent(sessionEpoch)) throw staleAsyncError();
+    const record = response?.draft || response || {};
+    const candidate = {
+      id: candidateId,
+      revision: aiRunRevision(record, 1),
+      updated_at: textValue(field(record, ["updated_at", "updatedAt"]))
+    };
+    draft.conflicts = [candidate, ...draft.conflicts.filter((item) => item.id !== candidate.id)];
+    draft.onConflictsChanged?.(draft.conflicts);
+    return candidate;
+  }
+
+  async loadWritingDraftConflicts(draft = this.state.writingDraft, { sessionEpoch = this.state.sessionEpoch, append = false } = {}) {
+    if (typeof this.api.listAiDraftConflicts !== "function") return [];
+    const cursor = append ? textValue(draft.conflictNextCursor) : "";
+    // The service returns metadata only. Keep each page until the user asks
+    // for more; candidates after the first page must remain discoverable.
+    const load = this.api.listAiDraftConflicts(draft.id, { limit: 20, ...(cursor ? { cursor } : {}) });
+    draft.conflictLoadPromise = load;
+    try {
+      const response = await load;
+      if (!this.isSessionCurrent(sessionEpoch)) throw staleAsyncError();
+      const source = response?.drafts || response?.items || [];
+      const next = Array.isArray(source) ? source
+        .map((item) => ({
+          id: textValue(field(item, ["id"])),
+          revision: aiRunRevision(item, 0),
+          updated_at: textValue(field(item, ["updated_at", "updatedAt"]))
+        }))
+        .filter((item) => /^[-A-Za-z0-9_]+-c-[a-f0-9]{32}$/u.test(item.id)) : [];
+      draft.conflicts = append
+        ? appendUniqueById(draft.conflicts, next)
+        : next;
+      draft.conflictNextCursor = textValue(response?.next_cursor ?? response?.nextCursor);
+      const total = Number(response?.total);
+      const corruptCount = Number(response?.corrupt_count ?? response?.corruptCount);
+      draft.conflictTotal = Number.isSafeInteger(total) && total >= 0 ? total : draft.conflicts.length;
+      draft.conflictCorruptCount = Number.isSafeInteger(corruptCount) && corruptCount >= 0 ? corruptCount : 0;
+      draft.onConflictsChanged?.(draft.conflicts);
+      return draft.conflicts;
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      // Candidate discovery is additive: an unavailable list must never
+      // prevent loading the canonical encrypted draft.
+      return draft.conflicts;
+    } finally {
+      if (draft.conflictLoadPromise === load) draft.conflictLoadPromise = null;
+    }
+  }
+
+  async flushWritingDraft(draft = this.state.writingDraft) {
     if (draft.clearing || draft.saving || !draft.pending) return draft.savingPromise;
     const pending = draft.pending;
+    const sessionEpoch = this.state.sessionEpoch;
     draft.pending = null;
     draft.saving = true;
     setStatus(pending.status, "草稿保存中…", "info");
@@ -2668,13 +2913,32 @@ export class WebApp {
     draft.savingPromise = save;
     try {
       const response = await save;
+      if (!this.isSessionCurrent(sessionEpoch)) throw staleAsyncError();
       const record = response?.draft || response || {};
       draft.revision = aiRunRevision(record, draft.revision + 1);
       draft.loaded = true;
+      draft.exists = true;
+      draft.lastContent = pending.content;
       draft.retryAttempts = 0;
       pending.status?.retryControl && (pending.status.retryControl.hidden = true);
       setStatus(pending.status, "草稿已加密保存到本机。", "success");
     } catch (error) {
+      if (error?.name === "AbortError") return;
+      if (error instanceof ApiError && (error.status === 409 || error.code === "revision_conflict")) {
+        try {
+          const candidate = await this.saveWritingConflictCandidate(draft, pending, sessionEpoch);
+          draft.retryStopped = true;
+          pending.status?.retryControl && (pending.status.retryControl.hidden = true);
+          setStatus(pending.status, `草稿发生冲突，已加密保留独立副本（${candidate.id.slice(-8)}）。请选择恢复、采用远端或合并。`, "warning");
+        } catch (candidateError) {
+          if (candidateError?.name === "AbortError") return;
+          draft.pending = pending;
+          draft.retryStopped = true;
+          if (pending.status?.retryControl) pending.status.retryControl.hidden = false;
+          setStatus(pending.status, `草稿未保存：冲突副本也未保存（${apiErrorMessage(candidateError)}）。`, "danger");
+        }
+        return;
+      }
       // A newer edit wins over the failed write; never revive an older body.
       if (!draft.clearing && (!draft.pending || draft.pending.sequence <= pending.sequence)) draft.pending = pending;
       const retryable = isRetryableAiPollError(error);
@@ -2689,14 +2953,14 @@ export class WebApp {
         const delay = 1000 * (3 ** Math.max(0, draft.retryAttempts - 1));
         draft.timer = setTimeout(() => {
           draft.timer = null;
-          void this.flushWritingDraft();
+          void this.flushWritingDraft(draft);
         }, delay);
       }
     }
   }
 
-  async clearWritingDraft(status) {
-    const draft = this.state.writingDraft;
+  async clearWritingDraft(status, draft = this.state.writingDraft) {
+    const sessionEpoch = this.state.sessionEpoch;
     draft.clearing = true;
     if (draft.timer) clearTimeout(draft.timer);
     draft.timer = null;
@@ -2710,10 +2974,13 @@ export class WebApp {
         await Promise.resolve();
       }
       await this.api.deleteAiDraft(draft.id, draft.revision);
+      if (!this.isSessionCurrent(sessionEpoch)) throw staleAsyncError();
       draft.revision = 0;
       draft.loaded = true;
+      draft.exists = false;
       setStatus(status, "本机草稿已清除。", "success");
     } catch (error) {
+      if (error?.name === "AbortError") return;
       if (error instanceof ApiError && (error.status === 404 || error.code === "not_found")) {
         draft.revision = 0;
         return;
@@ -4265,13 +4532,22 @@ export class WebApp {
   }
 
   async renderWriting(main) {
+    const renderScope = this.state.activeRenderScope;
+    const renderSessionEpoch = this.state.sessionEpoch;
+    const isCurrentWritingRender = () => this.isSessionCurrent(renderSessionEpoch) && this.state.activeRenderScope === renderScope;
+    let activeWritingDraft = this.activateWritingDraft("writing-current");
+    let writingSelectionGeneration = 0;
+    let writingInputGeneration = 0;
+    let writingFormGeneration = 0;
+    let writingFormDirty = false;
+    let writingDraftLoadGeneration = 0;
     const title = node("div", { className: "page-title" }, [heading(1, "文书写作"), node("p", { text: "描述案件和写作要求，由模型先检索依据再生成文书；预览为渲染后的正文，默认导出 PDF。" })]);
     const layout = node("div", { className: "workspace-grid template-grid" });
     const editorColumn = node("div", { className: "workspace-column" });
     const previewColumn = node("div", { className: "workspace-column" });
     layout.append(editorColumn, previewColumn);
     main.append(title, layout);
-    const draftLoad = this.loadWritingDraft();
+    const draftLoad = this.loadWritingDraft(activeWritingDraft, { sessionEpoch: renderSessionEpoch });
 
     const editor = panel("案件与写作要求");
     const form = node("form", { className: "stack-form" });
@@ -4295,6 +4571,8 @@ export class WebApp {
     let queueDraft = () => {};
     const noteDraftInput = () => {
       hasLocalDraftInput = true;
+      writingFormGeneration += 1;
+      writingFormDirty = true;
       if (writingDraftReady) queueDraft();
     };
     const attachmentPicker = this.renderAiAttachmentPicker({ onChange: noteDraftInput });
@@ -4303,12 +4581,13 @@ export class WebApp {
     const status = statusBox();
     const draftStatus = statusBox("正在恢复本机加密草稿…", "muted");
     const retryDraft = button("重试保存草稿", () => {
-      this.queueWritingDraft(draftSnapshot(), draftStatus);
-      void this.flushWritingDraft();
+      this.queueWritingDraft(draftSnapshot(), draftStatus, activeWritingDraft);
+      void this.flushWritingDraft(activeWritingDraft);
     }, "button subtle");
     retryDraft.hidden = true;
     draftStatus.retryControl = retryDraft;
-    form.append(labelFor("文书类型", documentType), labelFor("案情描述", caseDescription), labelFor("写作要求", requirements), labelFor("文书适用日期（可选；修改已有文书后须保存为新版本）", caseDate), labelFor("Provider", providerSelect), labelFor("模型", modelInput), materialHost, attachmentPicker, writingContextEstimate, generateButton, status, draftStatus, retryDraft);
+    const conflictPanel = node("div", { className: "draft-conflict-panel", hidden: true });
+    form.append(labelFor("文书类型", documentType), labelFor("案情描述", caseDescription), labelFor("写作要求", requirements), labelFor("文书适用日期（可选；修改已有文书后须保存为新版本）", caseDate), labelFor("Provider", providerSelect), labelFor("模型", modelInput), materialHost, attachmentPicker, writingContextEstimate, generateButton, status, draftStatus, retryDraft, conflictPanel);
     editor.append(form);
     editorColumn.append(editor);
 
@@ -4316,34 +4595,262 @@ export class WebApp {
     const runStatus = statusBox("尚未生成文书。", "muted");
     const preview = node("article", { className: "document-preview document-rendered" }, [emptyState("填写案件并生成文书。")]);
     const contentEditor = node("textarea", { className: "document-content-editor", rows: 22, hidden: true, placeholder: "在此修改 Markdown 正文后保存" });
+    let pendingExportSnapshot = null;
     let writingCitationPending = false;
     let writingDateChanged = false;
     let renderWritingCitation = () => {};
-    const saveContent = button("保存正文修改", async () => {
+    const applyDraftSnapshot = (value, { keepEditor = true } = {}) => {
+      const snapshot = writingDraftContent(value);
+      documentType.value = [...documentType.options].some((option) => option.value === snapshot.document_type) ? snapshot.document_type : documentType.value;
+      caseDescription.value = snapshot.prompt;
+      requirements.value = snapshot.requirements;
+      caseDate.value = legalDateValue(snapshot.case_date);
+      attachmentPicker.setAttachments(snapshot.attachment_ids.map((id) => ({ id })));
+      if (materialPicker) renderWritingMaterialPicker(snapshot.materials);
+      if (snapshot.provider_id && [...providerSelect.options].some((option) => option.value === snapshot.provider_id)) providerSelect.value = snapshot.provider_id;
+      providerModel({ preserveModel: true });
+      if (snapshot.model && [...modelInput.options].some((option) => option.value === snapshot.model)) modelInput.value = snapshot.model;
+      if (keepEditor && snapshot.run_id && snapshot.content) {
+        contentEditor.value = snapshot.content;
+        contentEditor.dataset.runId = snapshot.run_id;
+        contentEditor.dataset.expectedRevision = String(snapshot.run_revision ?? aiRunRevision(this.state.runsById.get(snapshot.run_id)));
+        contentEditor.dataset.documentId = writingDocumentId(this.state.runsById.get(snapshot.run_id) || { id: snapshot.run_id });
+        contentEditor.hidden = false;
+        saveContent.hidden = false;
+        writingCitationPending = true;
+      }
+      writingInputGeneration += 1;
+      writingFormDirty = false;
+      return snapshot;
+    };
+    const conflictBody = (remote, candidate) => {
+      const remoteText = textValue(remote);
+      const candidateText = textValue(candidate);
+      if (!candidateText || candidateText === remoteText) return remoteText;
+      if (!remoteText) return candidateText;
+      return `${remoteText}\n\n--- 本窗口冲突副本 ---\n\n${candidateText}`;
+    };
+    const renderDraftConflicts = (items = activeWritingDraft.conflicts) => {
+      if (!isCurrentWritingRender() || activeWritingDraft !== this.state.writingDraft) return;
+      const rows = Array.isArray(items) ? items.filter((item) => item?.id) : [];
+      const hasMore = Boolean(activeWritingDraft.conflictNextCursor);
+      conflictPanel.hidden = rows.length === 0 && !hasMore;
+      if (!rows.length && !hasMore) {
+        replaceChildren(conflictPanel);
+        return;
+      }
+      const actionsFor = (candidate) => {
+        // All conflict actions belong to the candidate and document displayed
+        // when the control was created.  An async read that returns after the
+        // user selected another history row must neither change nor save that
+        // other document.
+        const actionDraft = activeWritingDraft;
+        const actionDraftId = actionDraft.id;
+        const actionSelectionGeneration = writingSelectionGeneration;
+        const actionInputGeneration = writingInputGeneration;
+        const actionFormGeneration = writingFormGeneration;
+        const actionPageRunId = textValue(this.state.pageRunIds.writing);
+        const actionDocumentId = writingDocumentId(this.pageRun("writing"))
+          || (actionDraftId.startsWith("writing-") && actionDraftId !== "writing-current" ? actionDraftId.slice("writing-".length) : "");
+        const canApplyAction = () => {
+          const currentPageRun = this.pageRun("writing");
+          return isCurrentWritingRender()
+          && activeWritingDraft === actionDraft
+          && this.state.writingDraft === actionDraft
+          && actionDraft.id === actionDraftId
+          && writingSelectionGeneration === actionSelectionGeneration
+          && writingInputGeneration === actionInputGeneration
+          && writingFormGeneration === actionFormGeneration
+          && textValue(this.state.pageRunIds.writing) === actionPageRunId
+          && (!actionDocumentId || !currentPageRun || writingDocumentId(currentPageRun) === actionDocumentId);
+        };
+        const readRecord = async (id) => {
+          const response = await this.api.getAiDraft(id);
+          if (!canApplyAction()) throw staleAsyncError();
+          return response?.draft || response || {};
+        };
+        const bindSnapshotRun = async (value) => {
+          const snapshot = writingDraftContent(value);
+          if (!snapshot.run_id) return snapshot;
+          let bound = this.state.runsById.get(snapshot.run_id);
+          if (!bound) {
+            const response = await this.api.getAiRun(snapshot.run_id);
+            if (!canApplyAction()) throw staleAsyncError();
+            bound = normalizeAiRun(response?.run || response);
+          } else bound = normalizeAiRun(bound);
+          const snapshotRevision = snapshot.run_revision;
+          const expectedDocument = actionDocumentId;
+          if (bound.kind !== AI_RUN_KINDS.writing
+            || (expectedDocument && writingDocumentId(bound) !== expectedDocument)
+            || (Number.isSafeInteger(snapshotRevision) && snapshotRevision >= 0 && aiRunRevision(bound) !== snapshotRevision)) {
+            throw new ApiError("draft_run_binding_invalid", false, 409);
+          }
+          if (!canApplyAction()) throw staleAsyncError();
+          const remembered = this.rememberAiRun(bound);
+          return writingDraftContent({ ...snapshot, run_id: remembered.id, run_revision: aiRunRevision(remembered) });
+        };
+        const restore = button("恢复冲突草稿", async () => {
+          try {
+            const record = await readRecord(candidate.id);
+            if (!canApplyAction()) throw staleAsyncError();
+            const snapshot = await bindSnapshotRun(record.content || record);
+            if (!canApplyAction()) throw staleAsyncError();
+            applyDraftSnapshot(snapshot);
+            setStatus(draftStatus, "已恢复冲突副本；请确认后生成文书或保存新的文书版本。", "warning");
+          } catch (error) {
+            if (error?.name !== "AbortError" && canApplyAction()) setStatus(draftStatus, `冲突副本未恢复：${apiErrorMessage(error)}`, "danger");
+          }
+        }, "button subtle");
+        const adopt = button("采用远端草稿", async () => {
+          try {
+            const record = await readRecord(actionDraftId);
+            if (!canApplyAction()) throw staleAsyncError();
+            const snapshot = await bindSnapshotRun(record.content || record);
+            if (!canApplyAction()) throw staleAsyncError();
+            actionDraft.revision = aiRunRevision(record, actionDraft.revision);
+            applyDraftSnapshot(snapshot);
+            setStatus(draftStatus, "已采用远端草稿；独立冲突副本仍被保留。", "success");
+          } catch (error) {
+            if (error?.name !== "AbortError" && canApplyAction()) setStatus(draftStatus, `远端草稿未恢复：${apiErrorMessage(error)}`, "danger");
+          }
+        }, "button subtle");
+        const merge = button("合并冲突草稿", async () => {
+          try {
+            const [remoteRecord, candidateRecord] = await Promise.all([readRecord(actionDraftId), readRecord(candidate.id)]);
+            if (!canApplyAction()) throw staleAsyncError();
+            const [remote, local] = await Promise.all([
+              bindSnapshotRun(remoteRecord.content || remoteRecord),
+              bindSnapshotRun(candidateRecord.content || candidateRecord)
+            ]);
+            if (!canApplyAction()) throw staleAsyncError();
+            actionDraft.revision = aiRunRevision(remoteRecord, actionDraft.revision);
+            const merged = writingDraftContent({
+              ...remote,
+              prompt: conflictBody(remote.prompt, local.prompt),
+              requirements: conflictBody(remote.requirements, local.requirements),
+              content: conflictBody(remote.content, local.content),
+              dirty: Boolean(remote.dirty || local.dirty)
+            });
+            applyDraftSnapshot(merged);
+            this.queueWritingDraft(merged, draftStatus, actionDraft);
+            void this.flushWritingDraft(actionDraft);
+            setStatus(draftStatus, "已将远端草稿和冲突副本并列合并，正在保存为新的加密草稿。", "info");
+          } catch (error) {
+            if (error?.name !== "AbortError" && canApplyAction()) setStatus(draftStatus, `草稿未合并：${apiErrorMessage(error)}`, "danger");
+          }
+        }, "button subtle");
+        const retain = button("保留独立草稿", () => {
+          if (canApplyAction()) setStatus(draftStatus, "独立冲突副本已加密保留，可稍后恢复、采用或合并。", "success");
+        }, "button subtle");
+        return node("div", { className: "button-row draft-conflict-actions" }, [restore, adopt, merge, retain]);
+      };
+      const body = [
+        heading(3, "发现加密冲突草稿"),
+        node("p", { className: "muted small", text: "冲突副本未覆盖远端草稿；请明确选择恢复、采用、合并或保留。" }),
+        ...rows.map((candidate) => node("div", { className: "draft-conflict-row" }, [
+          node("p", { className: "result-meta", text: `副本 ${candidate.id.slice(-8)} · 修订 ${candidate.revision}` }),
+          actionsFor(candidate)
+        ]))
+      ];
+      if (activeWritingDraft.conflictCorruptCount > 0) body.push(statusBox(`检测到 ${activeWritingDraft.conflictCorruptCount} 个损坏冲突草稿，未显示。`, "warning"));
+      if (hasMore) body.push(button(`加载更多冲突草稿${activeWritingDraft.conflictTotal ? `（共 ${activeWritingDraft.conflictTotal} 条）` : ""}`, async (event) => {
+        const control = event.currentTarget;
+        control.disabled = true;
+        try {
+          await this.loadWritingDraftConflicts(activeWritingDraft, { sessionEpoch: renderSessionEpoch, append: true });
+        } catch (error) {
+          if (error?.name !== "AbortError" && isCurrentWritingRender() && activeWritingDraft === this.state.writingDraft) setStatus(draftStatus, `更多冲突草稿未载入：${apiErrorMessage(error)}`, "danger");
+        } finally {
+          if (isCurrentWritingRender() && activeWritingDraft === this.state.writingDraft) control.disabled = false;
+        }
+      }, "button subtle"));
+      replaceChildren(conflictPanel, body);
+    };
+    activeWritingDraft.onConflictsChanged = renderDraftConflicts;
+    // Serialized by logical document rather than by the save button. A
+    // save-and-export request therefore owns its captured body and cannot
+    // consume another document's in-flight button promise.
+    const contentSaveChains = new Map();
+    const captureContentSaveRequest = ({ expectedDocumentId = "" } = {}) => {
       const editingRunId = textValue(contentEditor.dataset.runId);
       const run = editingRunId ? this.state.runsById.get(editingRunId) : null;
-      if (!run?.id) return;
-      saveContent.disabled = true;
-      try {
-        const expectedRevision = Number(contentEditor.dataset.expectedRevision);
-        const changedDate = writingDateChanged ? (legalDateValue(caseDate.value) || null) : undefined;
-        const response = await this.api.updateAiRunContent(run.id, contentEditor.value, Number.isSafeInteger(expectedRevision) ? expectedRevision : aiRunRevision(run), { caseDate: changedDate });
-        const saved = this.selectPageRun("writing", response?.run || response);
+      const documentId = textValue(contentEditor.dataset.documentId) || writingDocumentId(run);
+      if (!run?.id || !documentId || (expectedDocumentId && documentId !== expectedDocumentId)) return null;
+      const expectedRevision = Number(contentEditor.dataset.expectedRevision);
+      return {
+        run: normalizeAiRun(run),
+        documentId,
+        expectedRevision: Number.isSafeInteger(expectedRevision) ? expectedRevision : aiRunRevision(run),
+        content: contentEditor.value,
+        changedDate: writingDateChanged ? (legalDateValue(caseDate.value) || null) : undefined,
+        sessionEpoch: this.state.sessionEpoch,
+        inputGeneration: writingInputGeneration,
+        formGeneration: writingFormGeneration,
+        renderScope: this.state.activeRenderScope
+      };
+    };
+    const performContentSave = (request) => {
+      if (!request) return Promise.resolve(null);
+      const predecessor = contentSaveChains.get(request.documentId);
+      const chained = (async () => {
+        const previous = predecessor ? await predecessor : null;
+        const source = previous?.id ? previous : request.run;
+        const expectedRevision = previous?.id ? aiRunRevision(previous) : request.expectedRevision;
+        const response = await this.api.updateAiRunContent(source.id, request.content, expectedRevision, { caseDate: request.changedDate });
+        if (!this.isSessionCurrent(request.sessionEpoch)) throw staleAsyncError();
+        const saved = this.rememberAiRun(response?.run || response);
+        // Delivery of a saved version is intentionally independent from UI
+        // selection. Export can consume it after a history switch, while UI
+        // mutations still require the exact render/document/input identity.
+        const canApply = this.state.activeRenderScope === request.renderScope
+          && this.state.pageRunIds.writing
+          && writingDocumentId(this.pageRun("writing")) === request.documentId
+          && textValue(contentEditor.dataset.documentId) === request.documentId
+          && writingInputGeneration === request.inputGeneration;
+        if (!canApply) return saved;
+        this.selectPageRun("writing", saved);
+        this.rememberWritingRunPointer(saved);
         contentEditor.dataset.runId = saved.id;
         contentEditor.dataset.expectedRevision = String(aiRunRevision(saved));
-        if (changedDate !== undefined) caseDate.value = legalDateValue(field(saved, ["case_date", "caseDate"])) || changedDate || "";
-        writingCitationPending = false;
-        writingDateChanged = false;
+        contentEditor.dataset.documentId = writingDocumentId(saved);
+        const formChangedDuringSave = writingFormGeneration !== request.formGeneration;
+        if (request.changedDate !== undefined && !formChangedDuringSave) caseDate.value = legalDateValue(field(saved, ["case_date", "caseDate"])) || request.changedDate || "";
+        if (!formChangedDuringSave) {
+          writingCitationPending = false;
+          writingDateChanged = false;
+        }
         renderRenderedContent(preview, saved.html, saved.content);
         renderWritingCitation(saved);
         await refreshHistory();
-        setStatus(runStatus, changedDate === undefined ? "正文修改已保存。" : "正文与文书适用日期已保存为新版本。", "success");
-        contentEditor.hidden = true;
-        saveContent.hidden = true;
-        this.queueWritingDraft(draftSnapshot(), draftStatus);
-        void this.flushWritingDraft();
+        if (!isCurrentWritingRender() || writingInputGeneration !== request.inputGeneration || writingDocumentId(this.pageRun("writing")) !== request.documentId) return saved;
+        setStatus(runStatus, request.changedDate === undefined ? "正文修改已保存。" : "正文与文书适用日期已保存为新版本。", "success");
+        if (!formChangedDuringSave) {
+          contentEditor.hidden = true;
+          saveContent.hidden = true;
+          writingFormDirty = false;
+        }
+        // Form edits made while the request was in flight remain in the
+        // encrypted draft, including a later case date and requirements.
+        this.queueWritingDraft(draftSnapshot(), draftStatus, activeWritingDraft);
+        void this.flushWritingDraft(activeWritingDraft);
+        return saved;
+      })();
+      contentSaveChains.set(request.documentId, chained);
+      const clearChain = () => {
+        if (contentSaveChains.get(request.documentId) === chained) contentSaveChains.delete(request.documentId);
+      };
+      void chained.then(clearChain, clearChain);
+      return chained;
+    };
+    const saveContent = button("保存正文修改", async () => {
+      const request = captureContentSaveRequest();
+      if (!request) return;
+      saveContent.disabled = true;
+      try {
+        saveContent.savePromise = performContentSave(request);
+        await saveContent.savePromise;
       } catch (error) {
-        setStatus(runStatus, apiErrorMessage(error), "danger");
+        if (error?.name !== "AbortError" && isCurrentWritingRender()) setStatus(runStatus, apiErrorMessage(error), "danger");
       } finally {
         saveContent.disabled = false;
       }
@@ -4355,6 +4862,7 @@ export class WebApp {
       contentEditor.value = run.content;
       contentEditor.dataset.runId = run.id;
       contentEditor.dataset.expectedRevision = String(aiRunRevision(run));
+      contentEditor.dataset.documentId = writingDocumentId(run);
       contentEditor.hidden = false;
       saveContent.hidden = false;
       contentEditor.focus();
@@ -4365,22 +4873,73 @@ export class WebApp {
     appendOption(format, "docx", "DOCX");
     appendOption(format, "txt", "TXT");
     appendOption(format, "md", "Markdown");
+    const exportChoices = node("div", { className: "draft-export-choices", hidden: true });
+    const exportRunSnapshot = async (sourceRun, formatValue = format.value) => {
+      const exportSessionEpoch = this.state.sessionEpoch;
+      const snapshot = normalizeAiRun(sourceRun);
+      const selectedFormat = ["pdf", "docx", "txt", "md"].includes(String(formatValue)) ? String(formatValue) : "pdf";
+      if (!snapshot.id) throw new ApiError("run_id_missing", false, 200);
+      const verification = normalizeCitationVerification(snapshot.citationVerification);
+      const verificationPending = verification.state !== "passed";
+      if (verificationPending) setStatus(runStatus, "引用机械核验待复核，仍可导出；当前导出在界面中标记为待复核。", "warning");
+      const blob = await this.api.exportAiRun(snapshot.id, selectedFormat, aiRunRevision(snapshot));
+      if (!this.isSessionCurrent(exportSessionEpoch)) throw staleAsyncError();
+      await downloadBlob(blob, safeFilename(snapshot.title || "文书", selectedFormat));
+      if (isCurrentWritingRender() && writingDocumentId(this.pageRun("writing")) === writingDocumentId(snapshot)) setStatus(runStatus, verificationPending ? `已导出 ${selectedFormat.toUpperCase()}；引用机械核验仍待复核。` : `已导出 ${selectedFormat.toUpperCase()}。`, verificationPending ? "warning" : "success");
+    };
+    const exportSavedVersion = button("导出已保存版本", async () => {
+      const choice = pendingExportSnapshot;
+      if (!choice?.run?.id) return;
+      pendingExportSnapshot = null;
+      exportChoices.hidden = true;
+      exportButton.disabled = true;
+      try {
+        await exportRunSnapshot(choice.run, choice.format);
+      } catch (error) {
+        if (error?.name !== "AbortError") setStatus(runStatus, apiErrorMessage(error), "danger");
+      } finally {
+        exportButton.disabled = false;
+      }
+    }, "button secondary");
+    const saveThenExport = button("保存并导出", async () => {
+      const choice = pendingExportSnapshot;
+      if (!choice?.run?.id || contentEditor.hidden) return;
+      pendingExportSnapshot = null;
+      exportChoices.hidden = true;
+      exportButton.disabled = true;
+      try {
+        // Do not delegate to the shared button promise: it may belong to an
+        // older A save, or to a different document after a history switch.
+        const request = captureContentSaveRequest({ expectedDocumentId: choice.documentId });
+        const saved = await performContentSave(request);
+        if (!saved?.id) return;
+        await exportRunSnapshot(saved, choice.format);
+      } catch (error) {
+        if (error?.name !== "AbortError") setStatus(runStatus, apiErrorMessage(error), "danger");
+      } finally {
+        exportButton.disabled = false;
+      }
+    }, "button secondary");
+    exportChoices.append(node("p", { className: "muted small", text: "正文有未保存修改。请选择固定导出快照。" }), exportSavedVersion, saveThenExport);
     const exportButton = button("导出", async () => {
       const run = this.pageRun("writing");
       if (!run?.id) {
         setStatus(runStatus, "请先生成文书。", "warning");
         return;
       }
-      const verification = normalizeCitationVerification(run.citationVerification);
-      const verificationPending = verification.state !== "passed" || (run.id === this.pageRun("writing")?.id && (writingCitationPending || writingDateChanged));
+      const dirtyCurrentDocument = !contentEditor.hidden
+        && textValue(contentEditor.dataset.documentId) === writingDocumentId(run);
+      if (dirtyCurrentDocument) {
+        pendingExportSnapshot = { run: normalizeAiRun(run), format: format.value, documentId: writingDocumentId(run) };
+        exportChoices.hidden = false;
+        setStatus(runStatus, "正文有未保存修改。请明确选择导出已保存版本，或保存并导出。", "warning");
+        return;
+      }
       exportButton.disabled = true;
       try {
-        if (verificationPending) setStatus(runStatus, "引用机械核验待复核，仍可导出；当前导出在界面中标记为待复核。", "warning");
-        const blob = await this.api.exportAiRun(run.id, format.value, aiRunRevision(run));
-        await downloadBlob(blob, safeFilename(run.title || documentType.value || "文书", format.value));
-        setStatus(runStatus, verificationPending ? `已导出 ${format.value.toUpperCase()}；引用机械核验仍待复核。` : `已导出 ${format.value.toUpperCase()}。`, verificationPending ? "warning" : "success");
+        await exportRunSnapshot(run, format.value);
       } catch (error) {
-        setStatus(runStatus, apiErrorMessage(error), "danger");
+        if (error?.name !== "AbortError") setStatus(runStatus, apiErrorMessage(error), "danger");
       } finally {
         exportButton.disabled = false;
       }
@@ -4389,33 +4948,109 @@ export class WebApp {
     const citations = node("div", { className: "citation-list" });
     const citationVerification = node("div", { className: "citation-verification" });
     const toolSteps = node("details", { className: "tool-steps" }, [node("summary", { text: "查看检索过程" })]);
-    previewPanel.append(runStatus, preview, contentEditor, saveContent, citations, citationVerification, toolSteps, exportRow);
+    previewPanel.append(runStatus, preview, contentEditor, saveContent, citations, citationVerification, toolSteps, exportRow, exportChoices);
     previewColumn.append(previewPanel);
 
     const historyPanel = panel("写作历史", [], "panel ai-history-panel");
     const historyList = node("div", { className: "ai-history-list" }, [emptyState("正在加载历史记录…")]);
     historyPanel.append(historyList);
     editorColumn.append(historyPanel);
-    const showWritingRun = (run, { resume = true } = {}) => {
-      const previousRunId = this.state.pageRunIds.writing;
-      const loaded = this.selectPageRun("writing", run);
-      if (previousRunId && previousRunId !== loaded.id) {
+    const persistActiveDraft = (snapshot = null) => {
+      if (!writingDraftReady) return;
+      const value = snapshot || draftSnapshot();
+      this.queueWritingDraft(value, draftStatus, activeWritingDraft);
+      void this.flushWritingDraft(activeWritingDraft);
+    };
+    const activateDraftForRun = async (run, { previousSnapshot = null } = {}) => {
+      const draftId = writingDraftIdForRun(run);
+      if (activeWritingDraft.id !== draftId) {
+        if (previousSnapshot) persistActiveDraft(previousSnapshot);
+        activeWritingDraft = this.activateWritingDraft(draftId);
+        activeWritingDraft.onConflictsChanged = renderDraftConflicts;
+      }
+      const target = activeWritingDraft;
+      const loadGeneration = ++writingDraftLoadGeneration;
+      let snapshot = await this.loadWritingDraft(target, { sessionEpoch: renderSessionEpoch });
+      if (!isCurrentWritingRender() || activeWritingDraft !== target || loadGeneration !== writingDraftLoadGeneration) return snapshot;
+
+      // v1.2.1 stored every draft in writing-current. If its run belongs to
+      // this document, copy it once to the canonical per-document key while
+      // deliberately retaining the legacy source for recovery and audit.
+      if (target.id !== "writing-current" && !target.exists) {
+        const legacy = this.writingDraftState("writing-current");
+        const legacySnapshot = legacy.loaded
+          ? await Promise.resolve(writingDraftContent(legacy.lastContent || {}))
+          : await this.loadWritingDraft(legacy, { sessionEpoch: renderSessionEpoch });
+        const legacyRun = this.state.runsById.get(legacySnapshot.run_id);
+        const legacyMatches = legacySnapshot.run_id && (
+          legacySnapshot.run_id === run.id
+          || (legacyRun && writingDocumentId(legacyRun) === writingDocumentId(run))
+        );
+        if (legacyMatches) {
+          try {
+            const response = await this.api.saveAiDraft(target.id, { expected_revision: 0, content: legacySnapshot });
+            if (!isCurrentWritingRender() || activeWritingDraft !== target || loadGeneration !== writingDraftLoadGeneration) return snapshot;
+            const record = response?.draft || response || {};
+            target.revision = aiRunRevision(record, 1);
+            target.loaded = true;
+            target.exists = true;
+            target.lastContent = legacySnapshot;
+            snapshot = legacySnapshot;
+          } catch (error) {
+            if (error?.name !== "AbortError") setStatus(draftStatus, `旧版文书草稿未迁移：${apiErrorMessage(error)}`, "warning");
+          }
+        }
+      }
+      target.lastContent = snapshot;
+      void this.loadWritingDraftConflicts(target, { sessionEpoch: renderSessionEpoch });
+      if (!isCurrentWritingRender() || activeWritingDraft !== target || loadGeneration !== writingDraftLoadGeneration) return snapshot;
+      if (snapshot.dirty && (snapshot.prompt || snapshot.requirements || snapshot.content || snapshot.materials.length || snapshot.attachment_ids.length)) {
+        applyDraftSnapshot(snapshot);
+        setStatus(draftStatus, "已恢复该文书的本机加密草稿。", "success");
+      }
+      return snapshot;
+    };
+    const showWritingRun = (run, { resume = true, selectionIntent = null } = {}) => {
+      const loaded = this.rememberAiRun(run);
+      if (!isCurrentWritingRender()) return loaded;
+      if (selectionIntent !== null && selectionIntent !== writingSelectionGeneration) return loaded;
+      const previous = this.pageRun("writing");
+      const previousDocumentId = writingDocumentId(previous);
+      const nextDocumentId = writingDocumentId(loaded);
+      const switchingDocument = previousDocumentId !== nextDocumentId;
+      const previousSnapshot = switchingDocument && writingDraftReady ? draftSnapshot() : null;
+      const dirtySameDocument = !contentEditor.hidden && textValue(contentEditor.dataset.documentId) === nextDocumentId;
+      this.selectPageRun("writing", loaded);
+      this.rememberWritingRunPointer(loaded);
+      if (previous?.id && previous.id !== loaded.id) {
         writingCitationPending = false;
         writingDateChanged = false;
       }
-      if (contentEditor.dataset.runId && contentEditor.dataset.runId !== loaded.id) {
+      if (switchingDocument) {
+        // A dirty-export decision is for the document visible when the choice
+        // opened. Do not leave its controls actionable after a history switch.
+        pendingExportSnapshot = null;
+        exportChoices.hidden = true;
+      }
+      if (switchingDocument && contentEditor.dataset.runId) {
         contentEditor.hidden = true;
         saveContent.hidden = true;
         delete contentEditor.dataset.runId;
         delete contentEditor.dataset.expectedRevision;
+        delete contentEditor.dataset.documentId;
       }
       renderRenderedContent(preview, loaded.html, loaded.content, "该任务尚无正文结果。");
       if (!writingDateChanged) caseDate.value = legalDateValue(field(loaded, ["case_date", "caseDate"]));
-      contentEditor.value = loaded.content;
+      if (!dirtySameDocument) contentEditor.value = loaded.content;
       this.renderRunCitations(citations, loaded.citations);
       renderWritingCitation(loaded);
       replaceChildren(toolSteps, [node("summary", { text: "查看检索过程" }), ...(loaded.tool_steps || []).map((step) => node("p", { className: "tool-step", text: textValue(field(step, ["summary", "query", "action"]), aiToolLabel(field(step, ["tool", "name"]))) }))]);
       setStatus(runStatus, `${aiRunKindLabel(loaded.kind)}：${aiRunStatusLabel(loaded.status)}${loaded.stage ? ` · ${pipelineStageLabel(loaded.stage)}` : ""} · ${aiRunProgressText(loaded)}`, loaded.status === "completed" ? "success" : aiRunIsTerminal(loaded) ? "warning" : "info");
+      if (switchingDocument || activeWritingDraft.id !== writingDraftIdForRun(loaded)) {
+        void activateDraftForRun(loaded, { previousSnapshot }).catch((error) => {
+          if (error?.name !== "AbortError" && isCurrentWritingRender()) setStatus(draftStatus, `草稿未恢复：${apiErrorMessage(error)}`, "danger");
+        });
+      }
       if (resume && !aiRunIsTerminal(loaded)) this.pollAiRun(loaded.id, {
         status: runStatus,
         onUpdate: (next) => {
@@ -4452,16 +5087,24 @@ export class WebApp {
       }
     };
     const openRun = async (run) => {
+      const selectionIntent = ++writingSelectionGeneration;
+      const requestSessionEpoch = this.state.sessionEpoch;
       try {
         const response = await this.api.getAiRun(run.id);
-        showWritingRun(response?.run || response);
+        if (!this.isSessionCurrent(requestSessionEpoch) || !isCurrentWritingRender()) return;
+        const loaded = this.rememberAiRun(response?.run || response);
+        if (selectionIntent !== writingSelectionGeneration) return;
+        showWritingRun(loaded, { selectionIntent });
       } catch (error) {
-        setStatus(runStatus, apiErrorMessage(error), "danger");
+        if (error?.name !== "AbortError" && this.isSessionCurrent(requestSessionEpoch) && isCurrentWritingRender() && selectionIntent === writingSelectionGeneration) setStatus(runStatus, apiErrorMessage(error), "danger");
       }
     };
+    let restoredWritingPointerAttempted = false;
     const refreshHistory = async ({ append = false } = {}) => {
+      const historySessionEpoch = this.state.sessionEpoch;
       try {
         const page = await this.loadAiRunPage("writing", { append, limit: 20 });
+        if (!this.isSessionCurrent(historySessionEpoch) || !isCurrentWritingRender()) return;
         const runs = page.items;
         const rows = runs.length ? runs.map((run) => {
           const open = button(`${run.title || documentType.value} · ${aiRunStatusLabel(run.status)}`, () => openRun(run), "conversation-item");
@@ -4476,8 +5119,16 @@ export class WebApp {
         if (page.corruptCount > 0) rows.unshift(statusBox(`检测到 ${page.corruptCount} 个损坏文书记录，未显示。`, "warning"));
         if (page.nextCursor) rows.push(button("加载更多文书历史", () => refreshHistory({ append: true }), "button subtle"));
         replaceChildren(historyList, rows);
+        const pointer = this.restoredWritingRunPointer();
+        if (!restoredWritingPointerAttempted && !this.pageRun("writing")?.id && pointer) {
+          restoredWritingPointerAttempted = true;
+          const summary = runs.find((item) => item.id === pointer);
+          // The safe pointer names one document, while history is paged.  A
+          // restart must not depend on the document fitting in the first page.
+          void openRun(summary || { id: pointer, kind: AI_RUN_KINDS.writing, title: "恢复的文书", status: "completed" });
+        }
       } catch (error) {
-        replaceChildren(historyList, [statusBox(apiErrorMessage(error), "danger")]);
+        if (this.isSessionCurrent(historySessionEpoch) && isCurrentWritingRender() && error?.name !== "AbortError") replaceChildren(historyList, [statusBox(apiErrorMessage(error), "danger")]);
       }
     };
     const providerModel = ({ preserveModel = false, syncMaterialTrust = true } = {}) => {
@@ -4511,10 +5162,10 @@ export class WebApp {
       run_id: textValue(contentEditor.dataset.runId, this.pageRun("writing")?.id || ""),
       run_revision: Number(contentEditor.dataset.expectedRevision) || aiRunRevision(this.pageRun("writing")),
       content: contentEditor.value,
-      dirty: !contentEditor.hidden
+      dirty: !contentEditor.hidden || writingFormDirty
     });
     queueDraft = () => {
-      if (this.state.writingDraft.loaded) this.queueWritingDraft(draftSnapshot(), draftStatus);
+      if (activeWritingDraft.loaded) this.queueWritingDraft(draftSnapshot(), draftStatus, activeWritingDraft);
     };
     documentType.addEventListener("change", noteDraftInput);
     caseDescription.addEventListener("input", noteDraftInput);
@@ -4522,6 +5173,15 @@ export class WebApp {
     caseDate.addEventListener("change", () => {
       writingDateChanged = Boolean(this.pageRun("writing")?.id);
       if (writingDateChanged) {
+        if (contentEditor.hidden) {
+          const run = this.pageRun("writing");
+          contentEditor.value = run.content;
+          contentEditor.dataset.runId = run.id;
+          contentEditor.dataset.expectedRevision = String(aiRunRevision(run));
+          contentEditor.dataset.documentId = writingDocumentId(run);
+          contentEditor.hidden = false;
+          saveContent.hidden = false;
+        }
         writingCitationPending = true;
         renderWritingCitation(this.pageRun("writing"));
         setStatus(runStatus, "文书适用日期已修改；旧版本未改变，请保存正文与日期修改以创建新版本。", "warning");
@@ -4529,7 +5189,9 @@ export class WebApp {
       noteDraftInput();
     });
     contentEditor.addEventListener("input", () => {
-      noteDraftInput();
+      writingInputGeneration += 1;
+      hasLocalDraftInput = true;
+      if (writingDraftReady) queueDraft();
       if (!contentEditor.hidden && contentEditor.dataset.runId) {
         writingCitationPending = true;
         renderWritingCitation(this.state.runsById.get(contentEditor.dataset.runId));
@@ -4565,7 +5227,8 @@ export class WebApp {
         const contextEstimate = await this.preflightAiContext(payload, writingContextEstimate, status);
         if (!contextEstimate) return;
         payload.context_plan_hash = contextEstimate.planHash;
-        await this.createAiRun(payload, {
+        const preCreationDraft = draftSnapshot();
+        const created = await this.createAiRun(payload, {
           page: "writing",
           status,
           onUpdate: (run) => {
@@ -4584,8 +5247,12 @@ export class WebApp {
             refreshHistory();
           }
         });
+        if (!isCurrentWritingRender()) return;
+        this.rememberWritingRunPointer(created);
+        await activateDraftForRun(created, { previousSnapshot: preCreationDraft });
+        if (isCurrentWritingRender() && activeWritingDraft.id === writingDraftIdForRun(created)) queueDraft();
       } catch (error) {
-        setStatus(status, apiErrorMessage(error), "danger");
+        if (error?.name !== "AbortError") setStatus(status, apiErrorMessage(error), "danger");
       } finally {
         generateButton.disabled = false;
       }
@@ -4593,6 +5260,7 @@ export class WebApp {
     let restoredDraft = writingDraftContent();
     try {
       restoredDraft = await draftLoad;
+      if (!isCurrentWritingRender()) return;
       if (hasLocalDraftInput) {
         setStatus(draftStatus, "已保留本次输入，正在加密保存。", "info");
         queueDraft();
@@ -4600,8 +5268,8 @@ export class WebApp {
         setStatus(draftStatus, restoredDraft.prompt || restoredDraft.requirements || restoredDraft.materials.length || restoredDraft.attachment_ids.length ? "已恢复本机加密草稿。" : "暂无已保存草稿。", "success");
       }
     } catch (error) {
-      this.state.writingDraft.loaded = true;
-      setStatus(draftStatus, `草稿未恢复：${apiErrorMessage(error)}`, "danger");
+      activeWritingDraft.loaded = true;
+      if (error?.name !== "AbortError") setStatus(draftStatus, `草稿未恢复：${apiErrorMessage(error)}`, "danger");
       if (hasLocalDraftInput) queueDraft();
     }
     if (!hasLocalDraftInput) {
@@ -4658,6 +5326,8 @@ export class WebApp {
       }
     }
     writingDraftReady = true;
+    activeWritingDraft.onConflictsChanged = renderDraftConflicts;
+    void this.loadWritingDraftConflicts(activeWritingDraft, { sessionEpoch: renderSessionEpoch });
     if (hasLocalDraftInput) queueDraft();
   }
 

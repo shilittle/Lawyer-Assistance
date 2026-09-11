@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { root, startServer, sleep } from "./ai_test_client.mjs";
 
-const output = path.join(root, "work/audit-repair/capacity-native");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "capacity-native");
 await fs.mkdir(output, { recursive:true });
 const data = await fs.mkdtemp(path.join(output, "workspace-"));
 let service;

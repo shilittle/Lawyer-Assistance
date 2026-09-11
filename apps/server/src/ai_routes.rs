@@ -30,6 +30,7 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/ai/drafts/{id}",
             get(draft).put(save_draft).delete(delete_draft),
         )
+        .route("/api/v1/ai/drafts/{id}/conflicts", get(draft_conflicts))
         .route(
             "/api/v1/ai/conversations",
             get(conversations).post(create_conversation),
@@ -199,6 +200,15 @@ async fn export_document(
 
 async fn draft(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
     val(s.workspace.ai_draft(&id)?)
+}
+
+async fn draft_conflicts(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let (limit, cursor) = list_page(&q)?;
+    val(s.workspace.ai_draft_conflicts_page(&id, cursor, limit)?)
 }
 
 #[derive(Deserialize)]

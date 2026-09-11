@@ -1533,9 +1533,12 @@ async fn cancellation_continuation_creates_an_isolated_successor_attempt() {
     let successor_id = successor["id"].as_str().unwrap().to_owned();
     assert_ne!(successor_id, original_id);
     assert_eq!(successor["parent_id"], original_id);
+    assert_eq!(original["document_id"], original_id);
+    assert_eq!(successor["document_id"], original["document_id"]);
 
     let successor_done = wait_done(&f.workspace, &successor_id).await;
     assert_eq!(successor_done["status"], "completed");
+    assert_eq!(successor_done["document_id"], original["document_id"]);
     assert_eq!(
         f.workspace.ai_run(&original_id).unwrap()["status"],
         "cancelled"
@@ -1584,11 +1587,13 @@ async fn paused_continue_clones_verified_tool_context_without_repeating_complete
     let resumed_id = resumed["id"].as_str().unwrap();
     assert_ne!(resumed_id, original_id);
     assert_eq!(resumed["parent_id"], original_id);
+    assert_eq!(resumed["document_id"], original["document_id"]);
     assert_eq!(resumed["tool_steps"].as_array().unwrap().len(), 8);
     assert_eq!(resumed["usage"]["total_tokens"], 160);
 
     let completed = wait_done(&f.workspace, resumed_id).await;
     assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["document_id"], original["document_id"]);
     assert_eq!(completed["tool_steps"].as_array().unwrap().len(), 8);
     assert_eq!(
         completed["citations"][0]["article_id"],

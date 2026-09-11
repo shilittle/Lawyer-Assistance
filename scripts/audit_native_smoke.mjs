@@ -7,9 +7,10 @@ import { execFileSync } from "node:child_process";
 import { chromium } from "@playwright/test";
 import { startServer, connection, sleep, root } from "./ai_test_client.mjs";
 
-const output = path.join(root, "work/audit-repair/native-smoke");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "native-smoke");
 await fs.mkdir(output, { recursive: true });
 const dataDir = await fs.mkdtemp(path.join(output, "workspace-"));
+const browserProfile = await fs.mkdtemp(path.join(output, "browser-profile-"));
 const executable = path.resolve(process.argv[2] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe"));
 let modelCalls = 0;
 const mock = http.createServer(async (req, res) => {
@@ -41,7 +42,7 @@ function observe(current) {
   });
 }
 try {
-  service = await startServer(dataDir, executable, path.join(root, "data/runtime/legal_core.sqlite"), { portable: process.argv.includes("--portable") });
+  service = await startServer(dataDir, executable, path.resolve(process.env.LAWYER_AUDIT_LEGAL_DB || path.join(root, "work/retest-121/public-corpus/legal_core.sqlite")), { portable: process.argv.includes("--portable") });
   const client = service.client;
   const provider = await client.request("/api/v1/ai/providers", "POST", { preset: "custom", name: "审查本机合成模型", base_url: `http://127.0.0.1:${mock.address().port}/v1`, enabled_models: ["audit-mock"], api_key: "audit-synthetic-key-only", trust_raw: false, allow_private_network: true });
   providerId = provider.id;
@@ -58,8 +59,8 @@ try {
   checks.push("real_daemon_mock_writing_completed");
 
   const descriptor = connection(dataDir);
-  browser = await chromium.launch({ headless: true });
-  page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  browser = await chromium.launchPersistentContext(browserProfile, { headless: true, viewport: { width: 1440, height: 1000 } });
+  page = await browser.newPage();
   observe(page);
   await page.goto(`${descriptor.origin}#token=${descriptor.bootstrap}`);
   await page.getByRole("navigation").getByRole("button", { name: "文书写作", exact: true }).click();
@@ -68,8 +69,8 @@ try {
   const draft = await client.request("/api/v1/ai/drafts/writing-current");
   assert.equal(draft.content.prompt, "原生验收的加密草稿，重启浏览器应恢复。");
   await browser.close();
-  browser = await chromium.launch({ headless: true });
-  page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  browser = await chromium.launchPersistentContext(browserProfile, { headless: true, viewport: { width: 1440, height: 1000 } });
+  page = await browser.newPage();
   observe(page);
   await page.goto(`${descriptor.origin}#token=${descriptor.bootstrap}`);
   await page.getByRole("navigation").getByRole("button", { name: "文书写作", exact: true }).click();
@@ -79,25 +80,31 @@ try {
   await page.getByRole("button", { name: "原生验收文书 A · 已完成", exact: true }).click();
   await page.getByRole("button", { name: "编辑正文", exact: true }).click();
   const edited = "# 合成材料说明\n\n126800 元。用户尚未保存的正文修改。";
+  const draftId = `writing-${completed.document_id}`;
+  assert.equal(completed.document_id, run.document_id);
   await page.locator(".document-content-editor").fill(edited);
   await page.waitForFunction(() => document.body.textContent.includes("草稿已加密保存到本机"));
   // Confirm the storage snapshot, not an older success badge, before reloading.
   let persisted;
   for (let n = 0; n < 60; n++) {
-    persisted = await client.request("/api/v1/ai/drafts/writing-current");
+    persisted = await client.request(`/api/v1/ai/drafts/${draftId}`);
     if (persisted.content.content === edited) break;
     await sleep(100);
   }
   assert.equal(persisted.content.content, edited);
-  await page.reload();
+  await browser.close();
+  browser = await chromium.launchPersistentContext(browserProfile, { headless: true, viewport: { width: 1440, height: 1000 } });
+  page = await browser.newPage();
+  observe(page);
+  await page.goto(`${descriptor.origin}#token=${descriptor.bootstrap}`);
   await page.getByRole("navigation").getByRole("button", { name: "文书写作", exact: true }).click();
   await page.waitForFunction(text => document.querySelector(".document-content-editor")?.value === text, edited);
-  checks.push("unsaved_document_edit_restored_after_reload");
+  checks.push("unsaved_document_edit_restored_after_browser_process_restart");
   await page.getByRole("button", { name: "保存正文修改", exact: true }).click();
   await page.waitForFunction(() => document.querySelector(".document-preview")?.textContent.includes("用户尚未保存的正文修改"));
   let savedDraft;
   for (let n = 0; n < 60; n++) {
-    savedDraft = await client.request("/api/v1/ai/drafts/writing-current");
+    savedDraft = await client.request(`/api/v1/ai/drafts/${draftId}`);
     if (savedDraft.content.dirty === false && savedDraft.content.run_id !== run.id) break;
     await sleep(100);
   }

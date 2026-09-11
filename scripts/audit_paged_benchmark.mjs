@@ -8,7 +8,7 @@ import { root, startServer } from "./ai_test_client.mjs";
 
 const label = process.argv[2] || "candidate";
 assert.match(label, /^[a-z0-9_-]+$/u);
-const output = path.join(root, "work/audit-repair/paged-benchmark", label);
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "paged-benchmark", label);
 await fs.mkdir(output, { recursive: true });
 const dataDir = await fs.mkdtemp(path.join(output, "workspace-"));
 const executable = path.resolve(process.argv[3] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe"));

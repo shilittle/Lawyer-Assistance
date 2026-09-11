@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import { chromium } from "@playwright/test";
 import { connection, root, startServer, sleep } from "./ai_test_client.mjs";
 
-const output = path.join(root, "work/audit-repair/context-citations-native");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "context-citations-native");
 await fs.mkdir(output, { recursive: true });
 const directory = await fs.mkdtemp(path.join(output, "fixture-"));
 const legalPath = path.join(directory, "legal.sqlite");

@@ -1,6 +1,6 @@
 # 1.2.1 本地接口变更
 
-本文记录审查修复中的兼容约定。实际验收状态见[逐项报告](audit-1.2.1.md)。HTTP 路由仍受现有登录、CSRF 与本机访问限制约束。
+本文记录审查修复中的兼容约定。本轮实际验收状态见[续修记录](retest-1.2.1.md)，上一轮[逐项报告](audit-1.2.1.md)保留为历史证据。HTTP 路由仍受现有登录、CSRF 与本机访问限制约束。
 
 ## 法规检索
 
@@ -30,6 +30,12 @@ MCP v1 的字段、数量上限和公开输出格式保留，内部使用同一�
 `POST /api/v1/ai/runs/{id}/citations/recheck` 接受 `expected_revision`，只进行来源和引文的机械核对，不调用模型。响应的 `citation_verification` 记录来源及版本 ID、全文哈希、引文定位、查询日期、文书正文哈希和 revision，分别提供来源存在、全文读取、引文匹配和时间核验结果。论证相关性始终需要人工判断。待复核和旧记录文书仍可导出，导出记录保存当时的核验状态，不借用其他版本的通过状态。
 
 写作草稿保存在加密工作区，包含表单和未提交正文的任务版本绑定，采用期望 revision 更新。成功生成不删除草稿，清除需要显式操作。
+
+写作任务响应增加服务器维护的 `document_id`，保存新版本和继续生成均继承该标识；旧记录缺字段时以原任务 ID 兼容读取。`id` 和 `revision` 仍定位固定正文版本，不能用 `document_id` 代替导出版本校验。
+
+新建表单使用 `writing-current` 草稿；文书正文使用 `writing-{document_id}`，草稿 CAS revision 与正文 revision 分别管理。发生 CAS 冲突后，客户端停止旧版本重试，通过现有草稿 PUT 接口保存独立的 `{base_id}-c-{32位小写十六进制随机ID}` 候选（`expected_revision: 0`）。候选写入未获成功确认时，正文仍应显示未保存。
+
+`GET /api/v1/ai/drafts/{base_id}/conflicts?limit=20&cursor=...` 分页返回 `drafts: [{id, revision, updated_at}]`、`next_cursor`、`total`、`corrupt_count`。`limit` 为 1–100，游标只适用于同一基底；列表仅读取索引元数据，正文须通过单份草稿 GET 读取。候选采用远端、合并保存或保留独立草稿均由用户选择；合并时仍携带读取到的 CAS revision，再次冲突不能覆盖任何输入。
 
 会话材料清单在服务器持久化并带 revision。`inherit` 表示沿用服务器清单，`replace` 表示完整替换；替换为空数组表示清空。发送使用 `context/prepare` 返回的清单版本与准备哈希。移除材料会停止依赖该材料的未完成任务，后续上下文排除相应历史轮次；无法可靠归因的旧历史仅保留本地查看。
 

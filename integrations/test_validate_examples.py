@@ -21,10 +21,10 @@ class IntegrationExamplesTests(unittest.TestCase):
         validator.validate_rust_registry()
         self.assertEqual([], validator.ERRORS)
 
-    def test_public_catalog_rejects_a_sixth_tool(self) -> None:
+    def test_public_catalog_rejects_an_unexpected_extra_tool(self) -> None:
         path = validator.INTEGRATIONS / "tool-catalog.json"
         catalog = json.loads(path.read_text(encoding="utf-8"))
-        catalog["tools"].append({"name": "legacy"})
+        catalog["tools"].append({"name": "unexpected_extra_tool"})
         with tempfile.TemporaryDirectory() as directory:
             copied = Path(directory) / "catalog.json"
             copied.write_text(json.dumps(catalog), encoding="utf-8")

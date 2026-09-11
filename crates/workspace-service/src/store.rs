@@ -387,6 +387,132 @@ impl Store {
         })
     }
 
+    /// Lists conflict candidates for one logical writing document using only
+    /// the cleartext index.  Candidate bodies (and their protected summaries)
+    /// stay unopened until the caller explicitly selects a candidate.
+    pub fn draft_conflicts_page(
+        &self,
+        base_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SummaryPage> {
+        if !valid_writing_draft_base(base_id) {
+            return Err(Error::new("invalid_ai_request"));
+        }
+        if !(1..=100).contains(&limit) {
+            return Err(Error::new("invalid_pagination"));
+        }
+
+        let prefix = format!("{base_id}-c-");
+        let upper = format!("{base_id}-c.");
+        let candidate_len = prefix
+            .len()
+            .checked_add(32)
+            .ok_or_else(|| Error::new("invalid_pagination"))?;
+        let suffix_start = prefix
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| Error::new("invalid_pagination"))?;
+        let cursor = cursor.map(decode_cursor).transpose()?;
+        if let Some((updated_at, id)) = &cursor {
+            // A cursor from another document must never be usable to walk a
+            // different candidate namespace.  Keeping this check independent
+            // from the database query also avoids turning an arbitrary cursor
+            // into an index probe.
+            if !valid_draft_conflict_id(&prefix, id) || i64::try_from(*updated_at).is_err() {
+                return Err(Error::new("invalid_pagination"));
+            }
+        }
+
+        let (selected, total, corrupt_count) = {
+            let connection = self.connection()?;
+            let total: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM object_index
+                 WHERE kind='ai_draft' AND id>=?1 AND id<?2
+                   AND length(id)=?3
+                   AND substr(id,?4) NOT GLOB '*[^0-9a-f]*'",
+                rusqlite::params![&prefix, &upper, candidate_len as i64, suffix_start as i64],
+                |row| row.get(0),
+            )?;
+            let corrupt_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM corrupt_objects
+                 WHERE kind='ai_draft' AND id>=?1 AND id<?2
+                   AND length(id)=?3
+                   AND substr(id,?4) NOT GLOB '*[^0-9a-f]*'",
+                rusqlite::params![&prefix, &upper, candidate_len as i64, suffix_start as i64],
+                |row| row.get(0),
+            )?;
+
+            let mut values = vec![
+                SqlValue::Text(prefix.clone()),
+                SqlValue::Text(upper.clone()),
+                SqlValue::Integer(candidate_len as i64),
+                SqlValue::Integer(suffix_start as i64),
+            ];
+            let mut cursor_sql = String::new();
+            if let Some((updated_at, id)) = &cursor {
+                cursor_sql = " AND (i.updated_at < ? OR (i.updated_at = ? AND i.id < ?))".into();
+                let updated_at =
+                    i64::try_from(*updated_at).map_err(|_| Error::new("invalid_pagination"))?;
+                values.push(SqlValue::Integer(updated_at));
+                values.push(SqlValue::Integer(updated_at));
+                values.push(SqlValue::Text(id.clone()));
+            }
+            values.push(SqlValue::Integer((limit + 1) as i64));
+            let sql = format!(
+                "SELECT i.id,i.revision,i.updated_at FROM object_index i
+                 WHERE i.kind='ai_draft' AND i.id>=? AND i.id<?
+                   AND length(i.id)=? AND substr(i.id,?) NOT GLOB '*[^0-9a-f]*'
+                   {cursor_sql}
+                 ORDER BY i.updated_at DESC,i.id DESC LIMIT ?"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut selected = Vec::new();
+            for row in rows {
+                selected.push(row?);
+            }
+            (
+                selected,
+                u64::try_from(total).map_err(|_| Error::new("storage_metadata_invalid"))?,
+                u64::try_from(corrupt_count).map_err(|_| Error::new("storage_metadata_invalid"))?,
+            )
+        };
+
+        let has_more = selected.len() > limit;
+        let mut items = Vec::new();
+        let mut last = None;
+        for (id, revision, updated_at) in selected.into_iter().take(limit) {
+            let updated_at =
+                u64::try_from(updated_at).map_err(|_| Error::new("storage_metadata_invalid"))?;
+            let revision = revision
+                .map(|revision| {
+                    u64::try_from(revision).map_err(|_| Error::new("storage_metadata_invalid"))
+                })
+                .transpose()?;
+            last = Some((updated_at, id.clone()));
+            items.push(json!({
+                "id": id,
+                "revision": revision,
+                "updated_at": updated_at,
+            }));
+        }
+        Ok(SummaryPage {
+            items,
+            next_cursor: has_more
+                .then(|| last.map(|(updated_at, id)| encode_cursor(updated_at, &id)))
+                .flatten(),
+            total,
+            corrupt_count,
+        })
+    }
+
     pub fn summary(&self, kind: &str, id: &str) -> Result<Value> {
         if self.is_quarantined(kind, id)? {
             return Err(Error::new("storage_object_corrupt"));
@@ -664,6 +790,28 @@ fn field_u64(value: &Value, field: &str) -> Option<u64> {
     value.get(field).and_then(Value::as_u64)
 }
 
+fn valid_writing_draft_base(base_id: &str) -> bool {
+    if base_id == "writing-current" {
+        return true;
+    }
+    let Some(document_id) = base_id.strip_prefix("writing-") else {
+        return false;
+    };
+    !document_id.is_empty()
+        && base_id.len() <= 44
+        && document_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn valid_draft_conflict_id(prefix: &str, id: &str) -> bool {
+    id.len() == prefix.len() + 32
+        && id.starts_with(prefix)
+        && id[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 fn index_for_value(_kind: &str, value: &Value) -> ObjectIndex {
     let request = value.get("request").unwrap_or(&Value::Null);
     ObjectIndex {
@@ -760,6 +908,15 @@ fn summary_for_value(kind: &str, id: &str, value: &Value, index: &ObjectIndex) -
             "updated_at":index.updated_at,"provider_id":value["provider_id"],"model":value["model"],
             "conversation_id":index.conversation_id,"parent_id":index.parent_id,
             "context_revision":value["request"]["context_revision"],"revision":index.revision,
+            "document_id": if value["kind"].as_str() == Some("writing") {
+                value["document_id"]
+                    .as_str()
+                    .filter(|document_id| !document_id.is_empty())
+                    .map(|document_id| Value::String(document_id.to_owned()))
+                    .unwrap_or_else(|| Value::String(id.to_owned()))
+            } else {
+                Value::Null
+            },
         }),
         "ai_conversation" | "conversation" => json!({
             "id":id,"title":value["title"],"updated_at":index.updated_at,
@@ -1427,6 +1584,165 @@ mod tests {
         assert_eq!(second.items.len(), 1);
         assert_ne!(first.items[0]["id"], second.items[0]["id"]);
         assert_eq!(first.total, 3);
+    }
+
+    #[test]
+    fn draft_conflict_page_is_scoped_index_only_and_paginated() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let base = "writing-run_alpha";
+        let other_base = "writing-runXalpha";
+        let candidate =
+            |base: &str, digit: char| format!("{base}-c-{}", digit.to_string().repeat(32));
+        let first_id = candidate(base, 'a');
+        let second_id = candidate(base, 'b');
+        let third_id = candidate(base, 'c');
+        for (id, revision, updated_at, content) in [
+            (&first_id, 1_u64, 10_u64, "short body".to_owned()),
+            (&second_id, 2_u64, 10_u64, "second body".to_owned()),
+            (&third_id, 3_u64, 11_u64, "third body".to_owned()),
+        ] {
+            store
+                .save(
+                    "ai_draft",
+                    id,
+                    &json!({
+                        "revision":revision,"updated_at":updated_at,"content":content,
+                    }),
+                )
+                .unwrap();
+        }
+        // A large protected body must not be opened just to build this page.
+        let large_id = candidate(other_base, 'd');
+        store
+            .save(
+                "ai_draft",
+                &large_id,
+                &json!({
+                    "revision": 4,
+                    "updated_at": 12,
+                    "content": "x".repeat(4 * 1024 * 1024),
+                }),
+            )
+            .unwrap();
+        // Rows in the index range with a malformed suffix are not candidates.
+        let malformed_short = format!("{base}-c-{}", "e".repeat(31));
+        let malformed_upper = format!("{base}-c-{}", "F".repeat(32));
+        for id in [&malformed_short, &malformed_upper] {
+            store
+                .save(
+                    "ai_draft",
+                    id,
+                    &json!({"revision":99,"updated_at":99,"content":"ignore"}),
+                )
+                .unwrap();
+        }
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO corrupt_objects(kind,id,code,detected_at) VALUES(?1,?2,?3,?4)",
+                    rusqlite::params!["ai_draft", &third_id, "test_corrupt", crate::now() as i64],
+                )
+                .unwrap();
+            // This malformed and other-document entry must not inflate the
+            // scoped corruption count.
+            connection
+                .execute(
+                    "INSERT INTO corrupt_objects(kind,id,code,detected_at) VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![
+                        "ai_draft",
+                        &malformed_short,
+                        "test_corrupt",
+                        crate::now() as i64
+                    ],
+                )
+                .unwrap();
+        }
+
+        reset_plaintext_decryptions();
+        let first = store.draft_conflicts_page(base, None, 2).unwrap();
+        assert_eq!(plaintext_decryptions(), 0);
+        assert_eq!(first.total, 3);
+        assert_eq!(first.corrupt_count, 1);
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(first.items[0]["id"], third_id);
+        assert_eq!(first.items[0]["revision"], 3);
+        assert_eq!(first.items[0]["updated_at"], 11);
+        assert_eq!(first.items[1]["id"], second_id);
+        assert!(first.items[0].get("content").is_none());
+        assert_eq!(first.items[0].as_object().unwrap().len(), 3);
+
+        let second = store
+            .draft_conflicts_page(base, first.next_cursor.as_deref(), 2)
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0]["id"], first_id);
+        assert!(second.next_cursor.is_none());
+
+        let foreign_cursor = encode_cursor(12, &large_id);
+        assert_eq!(
+            store
+                .draft_conflicts_page(base, Some(&foreign_cursor), 2)
+                .err()
+                .expect("foreign cursor must be rejected")
+                .code,
+            "invalid_pagination"
+        );
+        assert_eq!(
+            store
+                .draft_conflicts_page(base, Some("not-a-cursor"), 2)
+                .err()
+                .expect("malformed cursor must be rejected")
+                .code,
+            "invalid_pagination"
+        );
+        assert_eq!(
+            store
+                .draft_conflicts_page("writing-", None, 2)
+                .err()
+                .expect("invalid base must be rejected")
+                .code,
+            "invalid_ai_request"
+        );
+        assert_eq!(
+            store
+                .draft_conflicts_page(base, None, 0)
+                .err()
+                .expect("invalid page size must be rejected")
+                .code,
+            "invalid_pagination"
+        );
+    }
+
+    #[test]
+    fn ai_run_summary_binds_writing_document_identity_and_hides_it_for_other_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let base = json!({
+            "kind":"writing","status":"completed","stage":"done","title":"draft",
+            "request":{"context_revision":1},"revision":1,
+        });
+        store.save("ai_run", "legacy-run", &base).unwrap();
+        assert_eq!(
+            store.summary("ai_run", "legacy-run").unwrap()["document_id"],
+            "legacy-run"
+        );
+
+        let mut current = base;
+        current["document_id"] = json!("document-stable");
+        store.save("ai_run", "new-run", &current).unwrap();
+        assert_eq!(
+            store.summary("ai_run", "new-run").unwrap()["document_id"],
+            "document-stable"
+        );
+
+        let other = json!({
+            "kind":"search","status":"completed","stage":"done","title":"search",
+            "document_id":"must-not-be-exposed","request":{"context_revision":1},"revision":1,
+        });
+        store.save("ai_run", "search-run", &other).unwrap();
+        assert!(store.summary("ai_run", "search-run").unwrap()["document_id"].is_null());
     }
 
     #[test]

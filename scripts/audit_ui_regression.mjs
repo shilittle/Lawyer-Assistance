@@ -8,7 +8,7 @@ import { chromium } from "@playwright/test";
 
 const root = path.resolve(import.meta.dirname, "..");
 const web = path.join(root, "apps/web");
-const output = path.join(root, "work/audit-repair/ui-regression");
+const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "ui-regression");
 await fs.mkdir(output, { recursive: true });
 let pollReply = { id: "browser-poll", kind: "writing", status: "completed", revision: 1 };
 const server = http.createServer(async (req, res) => {
@@ -92,6 +92,8 @@ try {
   await page.getByRole("button", { name: "编辑正文", exact: true }).click();
   assert.equal(await page.locator(".document-content-editor").inputValue(), "文书 A 的正式正文");
   await page.getByRole("button", { name: "导出", exact: true }).click();
+  assert.equal(await page.evaluate(() => calls.some(c => c[0] === "exportAiRun")), false, "dirty document must choose an export snapshot");
+  await page.getByRole("button", { name: "导出已保存版本", exact: true }).click();
   await page.waitForFunction(() => calls.some(c => c[0] === "exportAiRun"));
   assert.equal(await page.evaluate(() => calls.find(c => c[0] === "exportAiRun")[1]), "writing_A");
   checks.push("background_search_cannot_change_document_edit_or_export");
