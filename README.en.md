@@ -4,7 +4,7 @@
 
 Lawyer Assistance is a Windows single-user legal tool built around one Rust backend, a plain HTML WebUI, and an independently callable MCP program. This release focuses on material redaction and local legal research.
 
-The current local repair candidate is `1.2.1`. It retains model-assisted redaction, legal retrieval, document writing, and conversations while repairing task/version binding, encrypted drafts, search consistency, resource limits, PDF isolation, citation evidence, and context budgets. See the [independent-retest follow-up record](docs/web/retest-1.2.1.md) and the accompanying final acceptance report. The [previous report](docs/web/audit-1.2.1.md) remains historical evidence. The portable package has not been published as a GitHub Release.
+The current release is `1.2.1`. It retains model-assisted redaction, legal retrieval, document writing, and conversations while repairing task/version binding, encrypted drafts, search consistency, resource limits, PDF isolation, citation evidence, and context budgets. See the [independent-retest follow-up record](docs/web/retest-1.2.1.md) and the release validation summary. The [previous report](docs/web/audit-1.2.1.md) remains historical evidence. Download it from the [v1.2.1 release page](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1).
 
 TXT, DOCX, PDF, PNG, JPEG and WebP inputs produce plain UTF-8 redacted TXT. Document writing renders one shared Markdown structure to safe preview HTML, plain TXT, structured DOCX and default A4 PDF. Provider presets discover available models using the supplied key and support separate chat, redaction, writing and OCR defaults. Trusted domestic official endpoints may receive explicitly selected originals; other providers require valid redacted references. User data remains protected by the local Windows service.
 
@@ -12,7 +12,7 @@ The existing seven public MCP tools and ten privacy-workspace tools remain compa
 
 ## Portable Windows package
 
-The local builder `scripts/package_portable.py` produces `Lawyer-Assistance_1.2.1_windows-x86_64-portable.zip`. Follow-up candidate filenames also carry the date and source commit. Delivery consists of the ZIP, its adjacent `.zip.sha256`, and the JSON manifests, delivered together locally. The Windows x86_64 portable ZIP contains two release executables, `legal_core.sqlite`, the sibling `judicial_cases.sqlite` sidecar, its source note and distribution manifest, the derived retrieval index, licenses/notices, current documentation and MCP examples, `Lawyer-Assistance.vbs`, and `Stop-Lawyer-Assistance.vbs`. Extract it and double-click a launcher; it invokes `wscript.exe` with a hidden window:
+The local builder `scripts/package_portable.py` produces `Lawyer-Assistance_1.2.1_windows-x86_64-portable.zip`. Release filenames also carry the date and source commit. Assets include the ZIP, its adjacent `.zip.sha256`, and the JSON manifests. The Windows x86_64 portable ZIP contains two release executables, `legal_core.sqlite`, the sibling `judicial_cases.sqlite` sidecar, its source note and distribution manifest, the derived retrieval index, licenses/notices, current documentation and MCP examples, `Lawyer-Assistance.vbs`, and `Stop-Lawyer-Assistance.vbs`. Extract it and double-click a launcher; it invokes `wscript.exe` with a hidden window:
 
 ```powershell
 lawyer-assistance.exe serve --open --port 8877 --data-dir "$env:LOCALAPPDATA\LawyerAssistanceWeb" --legal-db "<package>\data\runtime\legal_core.sqlite"
@@ -22,7 +22,7 @@ User data is stored under `%LOCALAPPDATA%\LawyerAssistanceWeb`; the package does
 
 To stop the service, double-click `Stop-Lawyer-Assistance.vbs` or run `lawyer-assistance.exe stop`. The command reads the current user's encrypted connection descriptor and sends an authenticated loopback session/CSRF shutdown request to the matching server process; it never kills an arbitrary process.
 
-After receiving the ZIP, verify the adjacent `.zip.sha256`, then inspect `MANIFEST.sha256` and `portable.manifest.json` inside the archive. The portable manifest must include size, SHA-256, schema, count, and official-source identity for both databases. The v1.2.1 candidate artifact is an unsigned local portable package; it has no installer, signature file, or updater file.
+After receiving the ZIP, verify the adjacent `.zip.sha256`, then inspect `MANIFEST.sha256` and `portable.manifest.json` inside the archive. The portable manifest must include size, SHA-256, schema, count, and official-source identity for both databases. The v1.2.1 artifact is an unsigned Windows portable package; it has no installer, signature file, or updater file.
 
 ## Development
 
@@ -86,7 +86,7 @@ See the [MCP documentation](docs/mcp/README.md) for the protocol and tool contra
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
-- [v1.2.1 candidate notes](RELEASE_NOTES.md)
+- [v1.2.1 release notes](RELEASE_NOTES.md)
 
 Legal data supports research and lawyer review; it does not replace checking current official text, facts, or professional advice.
 

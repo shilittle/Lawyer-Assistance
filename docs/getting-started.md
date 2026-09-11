@@ -1,10 +1,10 @@
 # 快速开始
 
-本页对应 v1.2.0。它在 V1.0.0 Web 工作区上增加了模型驱动的材料脱敏、完整分页法律检索、AI 法律搜索、文书写作和带法律工具的 AI 会话。详细升级步骤见[升级说明](web/ai-upgrade.md)，已执行的命令、真实模型调用、案例检索和限制见[AI 增量验收报告](web/ai-validation.md)。当前交付方式是本地 Windows 便携 ZIP、SHA-256 sidecar 和 JSON 清单；本文不表示 GitHub Release 已发布。
+本页对应 v1.2.1，提供材料脱敏、本地法律检索、文书写作和 AI 会话。完整便携包与源码见 [GitHub Release](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1)，下载后核对 SHA-256 校验文件；资产名附日期与提交。升级和兼容边界见[升级说明](web/ai-upgrade.md)及[独立复测续修记录](web/retest-1.2.1.md)。
 
 ## 运行便携包
 
-1. 使用 `scripts/package_portable.py` 生成或取得 `Lawyer-Assistance_1.2.0_windows-x86_64-portable.zip`，在 Windows x86_64 上解压。
+1. 使用 `scripts/package_portable.py` 生成或取得 `Lawyer-Assistance_1.2.1_windows-x86_64-portable_<date>-<commit>.zip`，在 Windows x86_64 上解压。
 2. 核对同名 `.zip.sha256`，再查看包内 `MANIFEST.sha256` 和 `portable.manifest.json`。
 3. 双击 `Lawyer-Assistance.vbs`。它通过 `wscript.exe` 隐藏窗口运行 `lawyer-assistance.exe serve --open --port 8877`。
 4. 浏览器访问 `http://127.0.0.1:8877`。数据目录默认是 `%LOCALAPPDATA%\LawyerAssistanceWeb`。便携包为未签名产物，不含安装器或自动更新器。

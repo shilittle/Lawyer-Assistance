@@ -1,10 +1,10 @@
 # Getting started
 
-This page describes v1.2.0. It builds on the V1.0.0 Web workspace with model-led material redaction, complete paged legal research, AI legal research, document writing, and AI conversations with legal tools. See the [upgrade guide](web/ai-upgrade.md) for migration details and the [AI incremental validation report](web/ai-validation.md) for executed commands, model calls, case retrieval checks, and limits. Delivery is a local Windows portable ZIP with a SHA-256 sidecar and JSON manifests; this page does not claim that a GitHub Release has been published.
+This page describes v1.2.1: material redaction, local legal research, document writing and AI conversations. Download the complete portable package or source from [GitHub Releases](https://github.com/shilittle/Lawyer-Assistance/releases/tag/v1.2.1) and verify its SHA-256 sidecar. Asset names include the date and commit. See the [upgrade guide](web/ai-upgrade.md) and [retest record](web/retest-1.2.1.md) for compatibility and validation limits.
 
 ## Run the portable package
 
-1. Build or obtain `Lawyer-Assistance_1.2.0_windows-x86_64-portable.zip` with `scripts/package_portable.py`, then extract it on Windows x86_64.
+1. Build or obtain `Lawyer-Assistance_1.2.1_windows-x86_64-portable_<date>-<commit>.zip` with `scripts/package_portable.py`, then extract it on Windows x86_64.
 2. Verify the adjacent `.zip.sha256`, then inspect `MANIFEST.sha256` and `portable.manifest.json` inside the ZIP.
 3. Double-click `Lawyer-Assistance.vbs`. It invokes `wscript.exe` with a hidden window and runs `lawyer-assistance.exe serve --open --port 8877`.
 4. Open `http://127.0.0.1:8877`. User data defaults to `%LOCALAPPDATA%\LawyerAssistanceWeb`. The portable package is unsigned and includes no installer or automatic updater.
