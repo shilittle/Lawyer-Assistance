@@ -98,6 +98,7 @@ LEGAL_DISTRIBUTION_MANIFEST = Path("data/generated/legal_core_distribution_manif
 CASE_DISTRIBUTION_MANIFEST = Path("data/generated/judicial_cases_manifest.json")
 CASE_MANIFEST_DESTINATION = Path("judicial_cases_manifest.json")
 MAX_MANIFEST_FILE_BYTES = 8 * 1024 * 1024
+MAX_AI_BINARY_FILE_BYTES = 128 * 1024 * 1024
 AI_TOOL_FILES = (
     "typst.exe", "pdfium.dll", "fonts/SourceHanSerifSC-Regular.otf",
     "fonts/SourceHanSerifSC-Bold.otf", "Typst-LICENSE.txt",
@@ -112,6 +113,10 @@ def verify_ai_runtime(root: Path, corpus: Path | None = None) -> tuple[Path, ...
         raise PackageError(f"AI runtime resource directory is missing or is a symlink: {tools}")
     paths = tuple(tools / name for name in AI_TOOL_FILES)
     for item in paths:
+        _ensure_regular_file(
+            item, "AI runtime resource", tools,
+            max_bytes=MAX_AI_BINARY_FILE_BYTES if item.suffix.lower() in {".exe", ".dll", ".otf"} else MAX_MANIFEST_FILE_BYTES,
+        )
         if (
             _has_symlink_component(item, tools)
             or not item.is_file()
@@ -127,7 +132,7 @@ def verify_ai_runtime(root: Path, corpus: Path | None = None) -> tuple[Path, ...
         for entry in document:
             relative = _safe_relative_path(entry["path"], "document runtime manifest")
             runtime_file = tools / Path(*relative.parts)
-            _ensure_regular_file(runtime_file, "document runtime resource", tools)
+            _ensure_regular_file(runtime_file, "document runtime resource", tools, max_bytes=MAX_AI_BINARY_FILE_BYTES)
             if sha256_file(runtime_file) != entry["sha256"]:
                 raise PackageError("document runtime checksum mismatch")
         pdfium = json.loads((tools / "pdfium.version.json").read_text(encoding="utf-8"))
@@ -656,14 +661,14 @@ def _case_portable_identity(expected_case: dict[str, object]) -> dict[str, objec
     }
 
 
-def _ensure_regular_file(path: Path, label: str, boundary: Path | None = None) -> None:
+def _ensure_regular_file(path: Path, label: str, boundary: Path | None = None, *, max_bytes: int = MAX_MANIFEST_FILE_BYTES) -> None:
     if (
         not path.is_file()
         or path.is_symlink()
         or (boundary is not None and _has_symlink_component(path, boundary))
     ):
         raise PackageError(f"{label} is missing or is a symlink: {path}")
-    if path.stat().st_size > MAX_MANIFEST_FILE_BYTES and path.suffix.lower() != ".sqlite":
+    if path.stat().st_size > max_bytes and path.suffix.lower() != ".sqlite":
         raise PackageError(f"{label} is unexpectedly large: {path}")
 
 

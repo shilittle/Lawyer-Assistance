@@ -21,6 +21,7 @@ from scripts.package_portable import (
     launcher_text,
     stop_launcher_text,
     verify_default_server_binary,
+    verify_ai_runtime,
     verify_case_runtime,
     verify_legal_runtime,
 )
@@ -199,6 +200,38 @@ class PortablePackageTests(unittest.TestCase):
             connection.close()
         (root / "data/generated/legal_search_index_manifest.json").write_text("{}", encoding="utf-8")
         return root
+
+    def test_large_document_binary_uses_its_own_limit_and_keeps_hash_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory)
+            tools = root / "output/runtime-tools"
+            binary = tools / "typst.exe"
+            binary.write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+            manifest = tools / "document-runtime.json"
+            entries = json.loads(manifest.read_text(encoding="utf-8"))
+            next(entry for entry in entries if entry["path"] == "typst.exe")["sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+            manifest.write_text(json.dumps(entries), encoding="utf-8")
+            self.assertIn(binary, verify_ai_runtime(root))
+            with binary.open("r+b") as stream:
+                stream.write(b"y")
+            with self.assertRaisesRegex(PackageError, "checksum mismatch"):
+                verify_ai_runtime(root)
+
+    def test_runtime_manifest_remains_bounded_before_json_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory)
+            with (root / "output/runtime-tools/document-runtime.json").open("wb") as stream:
+                stream.truncate(8 * 1024 * 1024 + 1)
+            with self.assertRaisesRegex(PackageError, "unexpectedly large"):
+                verify_ai_runtime(root)
+
+    def test_document_binary_budget_remains_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory)
+            with (root / "output/runtime-tools/typst.exe").open("wb") as stream:
+                stream.truncate(128 * 1024 * 1024 + 1)
+            with self.assertRaisesRegex(PackageError, "unexpectedly large"):
+                verify_ai_runtime(root)
 
     def test_skip_build_creates_verified_zip_and_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
