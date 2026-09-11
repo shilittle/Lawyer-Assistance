@@ -311,8 +311,8 @@ class AuditValidateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             private = ["workspace/draft.txt", "workspace-ABCD/draft.txt", "workspace_abcd/draft.txt", "user-workspace_abcd/case.txt", "browser-profile_abcd/state.json", "user-workspace/case.txt", "browser-profile-1/state.json", "connection.dpapi", "private.key", "apikey.txt"]
-            safe = "crates/workspace-service/src/lib.rs"
-            for relative in [*private, safe]:
+            safe = ["crates/workspace-service/src/lib.rs", "crates/providers/src/adapter/workspace_json.rs", "crates/workspace-service/tests/workspace_security.rs"]
+            for relative in [*private, *safe]:
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"synthetic fixture")
@@ -327,7 +327,7 @@ class AuditValidateTests(unittest.TestCase):
             with patch.object(audit_validate, "hash_source_entry", side_effect=checked_read):
                 result = audit_validate.source_manifest_record(context)
             self.assertEqual("passed", result["status"])
-            self.assertEqual([safe], read_paths)
+            self.assertEqual(sorted(safe), read_paths)
 
     def test_source_manifest_reports_read_failure_without_claiming_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

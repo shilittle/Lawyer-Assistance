@@ -595,7 +595,7 @@ def source_exclusion_reason(relative: PurePosixPath, ctx: AuditContext) -> str |
     parts = tuple(part.lower() for part in relative.parts)
     if any(part in SOURCE_EXCLUDED_DIRECTORIES for part in parts):
         return "generated_or_build_directory"
-    for index, part in enumerate(parts):
+    for index, part in enumerate(parts[:-1]):
         if index == 1 and parts[0] == "crates" and part == "workspace-service":
             continue
         if part in {"workspace", "workspaces", "user-workspace", "profile", "profiles", "browser-profile", "user data"} or part.startswith(("workspace-", "workspace_", "user-workspace-", "user-workspace_", "browser-profile-", "browser-profile_", "profile-", "profile_")):
