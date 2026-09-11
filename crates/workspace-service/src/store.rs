@@ -1486,6 +1486,73 @@ mod tests {
     }
 
     #[test]
+    fn v2_verified_backup_restores_into_independent_workspace_and_remigrates() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let source = Store::open(source_directory.path()).unwrap();
+        source
+            .save(
+                "material",
+                "mat_backup_restore",
+                &queued_material("mat_backup_restore", "queued"),
+            )
+            .unwrap();
+        drop(source);
+        force_v2(source_directory.path());
+
+        // Opening this v2 copy first creates and verifies the pre-index
+        // backup, then migrates the active source workspace to v3.
+        let migrated = Store::open(source_directory.path()).unwrap();
+        assert_eq!(
+            migrated.summary("material", "mat_backup_restore").unwrap()["status"],
+            "queued"
+        );
+        let backup = source_directory
+            .path()
+            .join("workspace.pre-index-v2.sqlite");
+        assert!(backup.is_file());
+
+        // A recovery is an independent workspace, not a second connection to
+        // the active source.  The local test encryption context is unchanged,
+        // so opening the copied backup proves the original object can still be
+        // decrypted and rebuilt into fresh protected summaries.
+        let recovery_directory = tempfile::tempdir().unwrap();
+        std::fs::copy(&backup, recovery_directory.path().join("workspace.sqlite")).unwrap();
+        let recovered = Store::open(recovery_directory.path()).unwrap();
+        let material: crate::Material = recovered.get("material", "mat_backup_restore").unwrap();
+        assert_eq!(material.status, "queued");
+        assert_eq!(material.original_text, "sensitive original body");
+        assert_eq!(
+            recovered.summary("material", "mat_backup_restore").unwrap()["name"],
+            "confidential-source.txt"
+        );
+        assert!(recovery_directory
+            .path()
+            .join("workspace.pre-index-v2.sqlite")
+            .is_file());
+
+        let database =
+            Connection::open(recovery_directory.path().join("workspace.sqlite")).unwrap();
+        let schema: String = database
+            .query_row(
+                "SELECT value FROM web_metadata WHERE key='schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema, SCHEMA_V3);
+        let summary: Vec<u8> = database
+            .query_row(
+                "SELECT body FROM object_summaries WHERE kind='material' AND id='mat_backup_restore'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!summary
+            .windows("confidential-source.txt".len())
+            .any(|window| { window == b"confidential-source.txt" }));
+    }
+
+    #[test]
     fn v2_migration_failure_rolls_back_before_recovery_without_touching_backup() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();

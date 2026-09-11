@@ -28,6 +28,8 @@ mod store;
 mod tasks;
 mod types;
 pub use document_worker::run_internal_document_worker;
+#[cfg(feature = "document-worker-fault-injection")]
+pub use document_worker::run_internal_document_worker_fault;
 pub use error::{Error, Result};
 use privacy_text::DictionaryEntry;
 use serde_json::{json, Value};

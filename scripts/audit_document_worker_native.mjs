@@ -7,6 +7,9 @@ import { execFileSync } from "node:child_process";
 import { root, startServer, sleep } from "./ai_test_client.mjs";
 
 const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "document-worker-native");
+if (await fs.stat(path.join(output, "report.json")).then(() => true).catch(() => false)) {
+  throw new Error("document_worker_native_output_exists");
+}
 await fs.mkdir(output, { recursive: true });
 const dataDir = await fs.mkdtemp(path.join(output, "workspace-"));
 const executable = path.resolve(process.argv[2] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe"));
@@ -35,7 +38,9 @@ function pdf(kinds, seed) {
     objects[pageId - 1] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> ${xobjects} >> /Contents ${streamId} 0 R >>`;
   }
   objects[1] = `<< /Type /Pages /Count ${pages.length} /Kids [${pages.join(" ")}] >>`;
-  let data = "%PDF-1.4\n", offsets = [0];
+  // The source hash scopes cached OCR. Keep the visual pixels identical but bind every synthetic
+  // fixture to its label so a recovery assertion really exercises a new OCR dispatch.
+  let data = `%PDF-1.4\n% ${seed}\n`, offsets = [0];
   objects.forEach((object, i) => { offsets.push(Buffer.byteLength(data)); data += `${i + 1} 0 obj\n${object}\nendobj\n`; });
   const xref = Buffer.byteLength(data);
   data += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
@@ -136,6 +141,14 @@ try {
     assert.equal(requests.slice(before).filter(request => !request.ocr).length, 0);
     checks.push(`worker_${action}_reaped_model_closed_parent_ready`);
     holdOcr = false;
+    const recoveryBefore = requests.length;
+    const recovery = await runPdf(["scan"], `${action}-recovery`);
+    const recovered = await terminal(recovery.id);
+    assert.equal(recovered.status, "completed", recovered.error_code);
+    assert.equal(requests.slice(recoveryBefore).filter(request => request.ocr).length, 1);
+    assert.equal(requests.slice(recoveryBefore).filter(request => !request.ocr).length, 1);
+    await assertHealthyAndReaped();
+    checks.push(`worker_${action}_same_daemon_next_pdf_completed`);
   }
   const malformed = await upload(Buffer.from("%PDF-1.4\ninvalid synthetic PDF\n"), "broken.pdf");
   const started = await service.client.request("/api/v1/ai/runs", "POST", { kind: "writing", prompt: "Synthetic invalid PDF", ...selection, attachment_ids: [malformed.id] });

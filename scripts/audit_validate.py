@@ -38,6 +38,7 @@ MANIFEST_FILES = (
     Path("data/generated/legal_core_distribution_manifest.json"),
     Path("data/generated/legal_core_runtime_report.json"),
     Path("data/generated/judicial_cases_manifest.json"),
+    Path("data/generated/legal_search_index_manifest.json"),
 )
 RUNTIME_FILES = (
     Path("data/runtime/legal_core.sqlite"),
@@ -72,6 +73,10 @@ NATIVE_SCRIPT_CHECK_IDS = tuple(f"native-{name.removeprefix('audit_')}" for name
 SOURCE_MANIFEST_NAME = "source-manifest.json"
 SOURCE_EXCLUDED_DIRECTORIES = {
     ".git",
+    ".release-secrets",
+    ".credentials",
+    "credentials",
+    "secrets",
     ".mypy_cache",
     ".pytest_cache",
     ".venv",
@@ -89,11 +94,13 @@ SOURCE_BINARY_SUFFIXES = {
     ".bin",
     ".cab",
     ".db",
+    ".dpapi",
     ".dylib",
     ".dll",
     ".exe",
     ".gz",
     ".lib",
+    ".key",
     ".msi",
     ".o",
     ".obj",
@@ -112,6 +119,7 @@ SOURCE_BINARY_SUFFIXES = {
     ".zip",
 }
 SOURCE_PRIVATE_BASENAMES = {
+    "apikey.txt",
     ".env",
     "credentials",
     "id_ed25519",
@@ -140,6 +148,11 @@ class AuditContext:
     server_exe: Path
     mcp_exe: Path
     target: str = DEFAULT_TARGET
+    corpus: Path | None = None
+
+    @property
+    def corpus_root(self) -> Path:
+        return self.corpus if self.corpus is not None else self.root / "data/runtime"
 
 
 def utc_now() -> str:
@@ -582,6 +595,11 @@ def source_exclusion_reason(relative: PurePosixPath, ctx: AuditContext) -> str |
     parts = tuple(part.lower() for part in relative.parts)
     if any(part in SOURCE_EXCLUDED_DIRECTORIES for part in parts):
         return "generated_or_build_directory"
+    for index, part in enumerate(parts):
+        if index == 1 and parts[0] == "crates" and part == "workspace-service":
+            continue
+        if part in {"workspace", "workspaces", "user-workspace", "profile", "profiles", "browser-profile", "user data"} or part.startswith(("workspace-", "workspace_", "user-workspace-", "user-workspace_", "browser-profile-", "browser-profile_", "profile-", "profile_")):
+            return "private_workspace_or_profile"
     try:
         output_relative = PurePosixPath(ctx.output.resolve().relative_to(ctx.root.resolve()).as_posix())
     except ValueError:
@@ -971,6 +989,7 @@ def check_manifests(ctx: AuditContext, evidence: dict[str, Any]) -> dict[str, An
     distribution = payloads.get(distribution_key)
     report = payloads.get(report_key)
     case_manifest = payloads.get(case_key)
+    index_manifest = payloads.get("data/generated/legal_search_index_manifest.json")
     if full_hash and isinstance(distribution, dict):
         if distribution.get("archival_manifest_sha256") != full_hash:
             failures.append("distribution_archival_manifest_sha256_mismatch")
@@ -980,6 +999,15 @@ def check_manifests(ctx: AuditContext, evidence: dict[str, Any]) -> dict[str, An
         archival = report.get("archival_manifest")
         if not isinstance(archival, dict) or archival.get("sha256") != full_hash:
             failures.append("runtime_report_archival_manifest_sha256_mismatch")
+    if isinstance(index_manifest, dict):
+        projection = {key: value for key, value in index_manifest.items() if key != "manifest_sha256"}
+        expected = hashlib.sha256(json.dumps(projection, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        if expected != index_manifest.get("manifest_sha256"):
+            failures.append("index_manifest_payload_hash_mismatch")
+        if isinstance(distribution, dict):
+            for key in ("source_manifest_sha256", "dataset_version"):
+                if index_manifest.get(key) != distribution.get(key):
+                    failures.append(f"index_manifest_{key}_mismatch")
     record.update({"status": "passed" if not failures else "failed", "observed": {"entries": entries}})
     if failures:
         record["failures"] = failures
@@ -1008,17 +1036,18 @@ def check_runtime_resources(ctx: AuditContext, evidence: dict[str, Any]) -> dict
     payloads = evidence.get("manifest_payloads", {})
     distribution = payloads.get("data/generated/legal_core_distribution_manifest.json", {})
     case_manifest = payloads.get("data/generated/judicial_cases_manifest.json", {})
+    index_manifest = payloads.get("data/generated/legal_search_index_manifest.json", {})
     entries: list[dict[str, Any]] = []
     failures: list[str] = []
     runtime_expectations = {
         Path("data/runtime/legal_core.sqlite"): (distribution.get("sha256"), distribution.get("size_bytes")),
         Path("data/runtime/judicial_cases.sqlite"): (case_manifest.get("sha256"), case_manifest.get("size_bytes")),
-        Path("data/runtime/legal_search_index.sqlite"): (None, None),
+        Path("data/runtime/legal_search_index.sqlite"): (None, index_manifest.get("index_size_bytes")),
     }
     for relative, (expected_hash, expected_size) in runtime_expectations.items():
         entries.append(
             hash_entry(
-                ctx.root / relative,
+                ctx.corpus_root / relative.name,
                 ctx.root,
                 str(expected_hash) if isinstance(expected_hash, str) else None,
                 int(expected_size) if isinstance(expected_size, int) else None,
@@ -1137,6 +1166,9 @@ def build_command_specs(ctx: AuditContext, python_modules: Sequence[str]) -> tup
         CheckSpec("notices", "packaging", (sys.executable, "scripts/generate_third_party_notices.py", "--check"), "notices.log", ("preflight:python",)),
         CheckSpec("server-build", "native", ("cargo", "+1.98.0", "build", "--locked", "--offline", "--release", "-j", "1", "-p", "lawyer-assistance-server", "--bin", "lawyer-assistance"), "build.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk")),
         CheckSpec("mcp-build", "native", ("cargo", "+1.98.0", "build", "--locked", "--offline", "--release", "-j", "1", "-p", "legal-mcp", "--bin", "lawyer-assistance-mcp"), "build.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk")),
+        CheckSpec("document-fault-build", "native", (sys.executable, "scripts/build_document_fault_test.py", "--output", str(ctx.output / "fault-bin")), "fault-build.log", ("preflight:rustc", "preflight:cargo", "preflight:msvc", "preflight:sdk", "preflight:python")),
+        CheckSpec("native-document-faults", "native", ("node", "scripts/audit_document_fault_native.mjs", "--fault-exe", str(ctx.output / "fault-bin/lawyer-assistance-fault-test.exe"), "--production-exe", str(ctx.server_exe), "--output", str(ctx.output / "document-fault-native")), "fault-native.log", ("preflight:node", "preflight:runtime-resources", "server-build", "document-fault-build")),
+        CheckSpec("native-sanitizer", "native", ("node", "scripts/audit_sanitizer_native.mjs", "--exe", str(ctx.server_exe), "--output", str(ctx.output / "sanitizer-native")), "sanitizer-native.log", ("preflight:node", "preflight:browser", "preflight:runtime-resources", "server-build")),
         CheckSpec("ui-regression", "native", ("node", "scripts/audit_ui_regression.mjs"), "native-suite.log", ("preflight:node", "preflight:browser")),
     ]
     for name in NATIVE_SCRIPTS:
@@ -1149,6 +1181,7 @@ def build_command_specs(ctx: AuditContext, python_modules: Sequence[str]) -> tup
                 ("preflight:node", "preflight:browser", "preflight:release-executables", "preflight:manifests", "preflight:runtime-resources", "server-build"),
             )
         )
+    specs.append(CheckSpec("native-paged-benchmark", "native", ("node", "scripts/audit_paged_benchmark.mjs", "final_candidate", str(ctx.server_exe), str(ctx.corpus_root / "legal_core.sqlite"), "10"), "paged-benchmark.log", ("preflight:node", "preflight:runtime-resources", "server-build", "native-index_equivalence")))
     return tuple(specs)
 
 
@@ -1228,8 +1261,12 @@ def execution_executable_entries(spec: CheckSpec, ctx: AuditContext) -> list[dic
     """
 
     paths: list[Path] = []
-    if spec.check_id == "server-build" or spec.check_id in NATIVE_SCRIPT_CHECK_IDS:
+    if spec.check_id in {
+        "server-build", "native-document-faults", "native-sanitizer", "native-paged-benchmark"
+    } or spec.check_id in NATIVE_SCRIPT_CHECK_IDS:
         paths.append(ctx.server_exe)
+    if spec.check_id in {"document-fault-build", "native-document-faults"}:
+        paths.append(ctx.output / "fault-bin" / "lawyer-assistance-fault-test.exe")
     if spec.check_id == "mcp-build":
         paths.append(ctx.mcp_exe)
     return [hash_entry(path, ctx.root) for path in paths]
@@ -1252,7 +1289,9 @@ def run_command_check(
     environment = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     environment["LAWYER_AUDIT_OUTPUT"] = str(ctx.output)
     environment["LAWYER_ASSISTANCE_PDFIUM"] = str(ctx.resources / "pdfium.dll")
-    environment["LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE"] = str(ctx.root / "data/runtime/legal_core.sqlite")
+    environment["LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE"] = str(ctx.corpus_root / "legal_core.sqlite")
+    environment["LAWYER_AUDIT_CORPUS"] = str(ctx.corpus_root)
+    environment["LAWYER_AUDIT_LEGAL_DB"] = str(ctx.corpus_root / "legal_core.sqlite")
     try:
         with log_path.open("wb") as log:
             log.write(("$ " + subprocess.list2cmdline(list(resolved_command)) + "\n").encode("utf-8"))
@@ -1266,7 +1305,7 @@ def run_command_check(
                 check=False,
             )
     except OSError as error:
-        record.update({"status": "failed", "exit_code": None, "launch_exception": {"type": type(error).__name__, "message": str(error)}})
+        record.update({"status": "blocked" if isinstance(error, FileNotFoundError) else "failed", "exit_code": None, "launch_exception": {"type": type(error).__name__, "message": str(error)}})
     else:
         record.update({"status": "passed" if completed.returncode == 0 else "failed", "exit_code": completed.returncode})
     executable_entries = execution_executable_entries(spec, ctx)
@@ -1275,6 +1314,7 @@ def run_command_check(
         if evidence is not None:
             evidence.setdefault("execution_executables", {})[spec.check_id] = executable_entries
     set_timing(record, started_at, started)
+    record["log_sha256"] = sha256_file(log_path)
     return record
 
 
@@ -1341,6 +1381,7 @@ def make_report(
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "root": str(ctx.root),
         "resources_root": str(ctx.resources),
+        "corpus_root": str(ctx.corpus_root),
         "output": str(ctx.output),
         "target": ctx.target,
         "python_tests": {"modules": list(python_modules), "count": len(python_modules)},
@@ -1379,6 +1420,12 @@ def affected_command_checks(check_id: str, command_specs: Sequence[CheckSpec]) -
 
 def run_audit(ctx: AuditContext, phase: str = "all", only: Sequence[str] = ()) -> dict[str, Any]:
     ctx.output.mkdir(parents=True, exist_ok=True)
+    if any((ctx.output / name).exists() for name in ("final-command-results.json", "preflight-evidence.json", SOURCE_MANIFEST_NAME, "logs")):
+        raise FileExistsError(f"Evidence already exists at {ctx.output}; choose a new --output")
+    # Claim one directory before creating any evidence. A failed or interrupted
+    # attempt remains immutable; a retry must choose a fresh output directory.
+    with (ctx.output / "audit-attempt.json").open("x", encoding="utf-8") as claim:
+        json.dump({"started_at": utc_now(), "phase": phase, "only": list(only)}, claim)
     started_at = utc_now()
     started = time.monotonic()
     python_modules = discover_python_tests(ctx.root)
@@ -1411,6 +1458,7 @@ def run_audit(ctx: AuditContext, phase: str = "all", only: Sequence[str] = ()) -
                 payload.pop("log", None)
                 record["log"] = write_evidence_log(ctx, check_id, payload)
             evidence["preflight_logs"][check_id] = record["log"]
+            record["log_sha256"] = sha256_file(ctx.output / record["log"])
             for tool in evidence.get("tools", []):
                 if tool.get("id") == check_id:
                     tool["log"] = record["log"]
@@ -1473,6 +1521,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="repository root; relative paths resolve here")
     parser.add_argument("--resources", type=Path, default=None, help="native runtime resource directory; defaults to <root>/output/runtime-tools")
+    parser.add_argument("--corpus", type=Path, default=None, help="independent public database copy; defaults to <root>/work/retest-121/public-corpus")
     parser.add_argument("--output", type=Path, default=None, help="evidence directory; defaults to <root>/work/retest-121")
     parser.add_argument("--exe-dir", type=Path, default=None, help="release executable directory; defaults to <root>/target/x86_64-pc-windows-msvc/release")
     parser.add_argument("--phase", default="all", help="all, preflight, rust, web, python, native, packaging, or stage0 (preflight) alias")
@@ -1485,6 +1534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
     root = arguments.root.resolve()
     resources = resolve_path(arguments.resources, root) if arguments.resources else (root / "output" / "runtime-tools").resolve()
+    corpus = resolve_path(arguments.corpus, root) if arguments.corpus else (root / "work/retest-121/public-corpus").resolve()
     output = resolve_path(arguments.output, root) if arguments.output else (root / "work" / "retest-121").resolve()
     exe_dir = resolve_path(arguments.exe_dir, root) if arguments.exe_dir else (root / "target" / DEFAULT_TARGET / "release").resolve()
     phase = "preflight" if arguments.preflight_only else arguments.phase
@@ -1494,6 +1544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output=output,
         server_exe=exe_dir / SERVER_BINARY,
         mcp_exe=exe_dir / MCP_BINARY,
+        corpus=corpus,
     )
     try:
         report = run_audit(ctx, phase=phase, only=arguments.only)

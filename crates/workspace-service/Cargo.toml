@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# A default-off, test-only subprocess fault path. Release packages are built without it.
+document-worker-fault-injection = []
+
 [dependencies]
 base64.workspace = true
 domain.workspace = true

@@ -14,6 +14,7 @@ Rust build.  The script does not publish artifacts or sign them.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -71,6 +72,7 @@ PORTABLE_FILES = (
     (Path("docs/mcp/security-and-privacy.md"), Path("docs/mcp/security-and-privacy.md")),
     (Path("docs/mcp/tools.md"), Path("docs/mcp/tools.md")),
     (Path("docs/web/README.md"), Path("docs/web/README.md")),
+    (Path("docs/web/retest-1.2.1.md"), Path("docs/web/retest-1.2.1.md")),
     (Path("docs/web/ai-upgrade.md"), Path("docs/web/ai-upgrade.md")),
     (Path("docs/web/ai-validation.md"), Path("docs/web/ai-validation.md")),
     (Path("docs/web/audit-1.2.1.md"), Path("docs/web/audit-1.2.1.md")),
@@ -104,11 +106,18 @@ AI_TOOL_FILES = (
 )
 
 
-def verify_ai_runtime(root: Path) -> tuple[Path, ...]:
+def verify_ai_runtime(root: Path, corpus: Path | None = None) -> tuple[Path, ...]:
     tools = root / "output/runtime-tools"
+    if _has_symlink_component(tools, root) or not tools.is_dir():
+        raise PackageError(f"AI runtime resource directory is missing or is a symlink: {tools}")
     paths = tuple(tools / name for name in AI_TOOL_FILES)
     for item in paths:
-        if not item.is_file() or item.is_symlink() or item.stat().st_size == 0:
+        if (
+            _has_symlink_component(item, tools)
+            or not item.is_file()
+            or item.is_symlink()
+            or item.stat().st_size == 0
+        ):
             raise PackageError(f"required AI runtime resource missing: {item}")
     try:
         document = json.loads((tools / "document-runtime.json").read_text(encoding="utf-8"))
@@ -116,16 +125,27 @@ def verify_ai_runtime(root: Path) -> tuple[Path, ...]:
         if {entry["path"] for entry in document} != expected_paths:
             raise PackageError("document runtime manifest file set invalid")
         for entry in document:
-            if sha256_file(tools / entry["path"]) != entry["sha256"]:
+            relative = _safe_relative_path(entry["path"], "document runtime manifest")
+            runtime_file = tools / Path(*relative.parts)
+            _ensure_regular_file(runtime_file, "document runtime resource", tools)
+            if sha256_file(runtime_file) != entry["sha256"]:
                 raise PackageError("document runtime checksum mismatch")
         pdfium = json.loads((tools / "pdfium.version.json").read_text(encoding="utf-8"))
         if sha256_file(tools / "pdfium.dll") != pdfium["dll_sha256"]:
             raise PackageError("Pdfium runtime checksum mismatch")
     except (KeyError, TypeError, ValueError, OSError) as error:
         raise PackageError("AI runtime manifest invalid") from error
-    index = root / "data/runtime/legal_search_index.sqlite"
-    index_manifest = root / "data/generated/legal_search_index_manifest.json"
-    if not index.is_file() or index.is_symlink() or not index_manifest.is_file():
+    layout = resolve_corpus(root, corpus)
+    index = layout.runtime / "legal_search_index.sqlite"
+    index_manifest = layout.generated / "legal_search_index_manifest.json"
+    if (
+        _has_symlink_component(index, layout.runtime)
+        or _has_symlink_component(index_manifest, layout.generated)
+        or not index.is_file()
+        or index.is_symlink()
+        or not index_manifest.is_file()
+        or index_manifest.is_symlink()
+    ):
         raise PackageError("derived legal search index missing; run scripts/build_search_index.py")
     connection = sqlite3.connect(f"file:{index.resolve().as_posix()}?mode=ro", uri=True)
     try:
@@ -134,7 +154,9 @@ def verify_ai_runtime(root: Path) -> tuple[Path, ...]:
         metadata = dict(connection.execute("SELECT key,value FROM search_index_metadata"))
     finally:
         connection.close()
-    expected = json.loads((root / "data/generated/legal_core_distribution_manifest.json").read_text(encoding="utf-8"))
+    distribution_manifest = layout.generated / "legal_core_distribution_manifest.json"
+    _ensure_regular_file(distribution_manifest, "legal distribution manifest", layout.generated)
+    expected = json.loads(distribution_manifest.read_text(encoding="utf-8"))
     if metadata.get("source_manifest_sha256") != expected["source_manifest_sha256"]:
         raise PackageError("derived legal search index belongs to a different legal database")
     return paths
@@ -158,6 +180,93 @@ class PackageResult:
     manifest: Path
     package_root: str
     files: tuple[PackagedFile, ...]
+    source_commit: str = "unknown"
+    label: str | None = None
+
+
+@dataclass(frozen=True)
+class CorpusLayout:
+    runtime: Path
+    generated: Path
+
+
+def _has_symlink_component(path: Path, root: Path) -> bool:
+    """Return whether ``path`` or a child component is a symlink."""
+
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _safe_relative_path(value: object, description: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise PackageError(f"{description} contains an invalid path")
+    normalized = value.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(":" in part for part in path.parts)
+    ):
+        raise PackageError(f"{description} contains a dangerous path")
+    return path
+
+
+def resolve_corpus(root: Path, corpus: Path | None = None) -> CorpusLayout:
+    """Resolve an independent corpus copy without changing the source tree."""
+
+    root = root.resolve()
+    selected_input = corpus or root / "data"
+    if selected_input.is_symlink():
+        raise PackageError("--corpus must name an existing independent directory")
+    selected = selected_input.resolve()
+    if selected == root or not selected.is_dir() or selected.is_symlink():
+        raise PackageError("--corpus must name an existing independent directory")
+    nested_runtime = selected / "runtime"
+    nested_generated = selected / "generated"
+    if nested_runtime.is_dir():
+        runtime = nested_runtime
+        generated = nested_generated
+    elif (selected / "data" / "runtime").is_dir():
+        runtime = selected / "data" / "runtime"
+        generated = selected / "data" / "generated"
+    else:
+        runtime = selected
+        generated = selected
+    for path in (runtime, generated):
+        if path.is_symlink() or _has_symlink_component(path, selected):
+            raise PackageError(f"corpus path is a symlink: {path}")
+    return CorpusLayout(runtime, generated)
+
+
+def source_commit(root: Path) -> str:
+    try:
+        value = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, stderr=subprocess.STDOUT
+        ).decode("ascii", "replace").strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else "unknown"
+
+
+def validate_label(label: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", label):
+        raise PackageError("label must contain only letters, digits, '.', '_' or '-'")
+    return label
+
+
+def default_label(root: Path) -> str:
+    revision = source_commit(root)
+    suffix = revision[:12] if revision != "unknown" else "unknown"
+    return f"{datetime.now().strftime('%Y%m%d')}-{suffix}"
 
 
 def sha256_file(path: Path) -> str:
@@ -233,8 +342,41 @@ def release_binary_path(root: Path, target: str, filename: str) -> Path:
     raise PackageError(f"release binary is missing: {candidates[0]}")
 
 
-def _read_distribution_manifest(root: Path) -> dict[str, object]:
-    path = root / LEGAL_DISTRIBUTION_MANIFEST
+def verify_default_server_binary(server: Path) -> None:
+    """Ensure the package server was built without the QA-only fault feature.
+
+    The hidden ``document-worker-fault`` subcommand exists only in the
+    test-feature binary.  Asking the production binary to parse that unknown
+    command stops in Clap before the server or a worker can start.  This also
+    catches a ``--skip-build`` invocation that accidentally points at the
+    fault-feature executable.
+    """
+
+    try:
+        result = subprocess.run(
+            [str(server), "document-worker-fault"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise PackageError("release server fault-feature probe timed out") from error
+    except OSError as error:
+        raise PackageError("release server fault-feature probe could not run") from error
+    output = result.stdout or ""
+    lowered = output.lower()
+    if result.returncode != 2 or "unrecognized subcommand" not in lowered or "document-worker-fault" not in lowered:
+        raise PackageError("release server binary exposes the document-worker-fault test feature")
+
+
+def _read_distribution_manifest(root: Path, corpus: Path | None = None) -> dict[str, object]:
+    path = resolve_corpus(root, corpus).generated / LEGAL_DISTRIBUTION_MANIFEST.name
+    if path.is_symlink() or not path.is_file():
+        raise PackageError(f"legal distribution manifest is missing or is a symlink: {path}")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -244,12 +386,13 @@ def _read_distribution_manifest(root: Path) -> dict[str, object]:
     return value
 
 
-def verify_legal_runtime(root: Path) -> tuple[Path, dict[str, object]]:
-    runtime = root / "data" / "runtime"
+def verify_legal_runtime(root: Path, corpus: Path | None = None) -> tuple[Path, dict[str, object]]:
+    layout = resolve_corpus(root, corpus)
+    runtime = layout.runtime
     database = runtime / "legal_core.sqlite"
     if not database.is_file() or database.is_symlink():
         raise PackageError(f"runtime legal database is missing: {database}")
-    expected = _read_distribution_manifest(root)
+    expected = _read_distribution_manifest(root, corpus)
     if expected.get("filename") != "legal_core.sqlite":
         raise PackageError("legal distribution manifest names an unexpected file")
     try:
@@ -307,8 +450,8 @@ _CASE_SCHEMA_VERSION = "1"
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 
 
-def _case_manifest_path(root: Path) -> Path:
-    path = root / CASE_DISTRIBUTION_MANIFEST
+def _case_manifest_path(root: Path, corpus: Path | None = None) -> Path:
+    path = resolve_corpus(root, corpus).generated / CASE_DISTRIBUTION_MANIFEST.name
     if not path.is_file() or path.is_symlink():
         raise PackageError(f"judicial case distribution manifest is missing: {path}")
     return path
@@ -395,13 +538,14 @@ def _case_schema_tables(manifest: dict[str, object]) -> tuple[str, ...]:
     return tuple(tables)
 
 
-def verify_case_runtime(root: Path) -> tuple[Path, dict[str, object]]:
+def verify_case_runtime(root: Path, corpus: Path | None = None) -> tuple[Path, dict[str, object]]:
     """Validate the official Supreme People's Court case sidecar before packaging."""
-    runtime = root / "data" / "runtime"
+    layout = resolve_corpus(root, corpus)
+    runtime = layout.runtime
     database = runtime / "judicial_cases.sqlite"
     if not database.is_file() or database.is_symlink():
         raise PackageError(f"runtime judicial case database is missing: {database}")
-    manifest_path = _case_manifest_path(root)
+    manifest_path = _case_manifest_path(root, corpus)
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -512,8 +656,12 @@ def _case_portable_identity(expected_case: dict[str, object]) -> dict[str, objec
     }
 
 
-def _ensure_regular_file(path: Path, label: str) -> None:
-    if not path.is_file() or path.is_symlink():
+def _ensure_regular_file(path: Path, label: str, boundary: Path | None = None) -> None:
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or (boundary is not None and _has_symlink_component(path, boundary))
+    ):
         raise PackageError(f"{label} is missing or is a symlink: {path}")
     if path.stat().st_size > MAX_MANIFEST_FILE_BYTES and path.suffix.lower() != ".sqlite":
         raise PackageError(f"{label} is unexpectedly large: {path}")
@@ -603,6 +751,8 @@ def _write_embedded_manifest(stage: Path, entries: tuple[PackagedFile, ...]) -> 
 def _write_json_manifest(
     stage: Path,
     version: str,
+    source_revision: str,
+    label: str | None,
     expected_legal: dict[str, object],
     expected_case: dict[str, object],
     entries: tuple[PackagedFile, ...],
@@ -612,6 +762,9 @@ def _write_json_manifest(
         "format_version": 1,
         "product": "Lawyer Assistance",
         "version": version,
+        "candidate": "1.2.1",
+        "source_commit": source_revision,
+        "label": label,
         "artifact": "unsigned-windows-portable",
         "target": DEFAULT_TARGET,
         "signed": False,
@@ -650,35 +803,53 @@ def build_package(
     *,
     target: str = DEFAULT_TARGET,
     skip_build: bool = False,
+    label: str | None = None,
+    corpus: Path | None = None,
 ) -> PackageResult:
     root = root.resolve()
     output_dir = (output_dir or root / "dist").resolve()
     if target != DEFAULT_TARGET:
         raise PackageError(f"portable packaging only supports {DEFAULT_TARGET}")
     version = workspace_version(root)
-    if not skip_build:
-        build_release_binaries(root, target)
-    server = release_binary_path(root, target, SERVER_BINARY)
-    mcp = release_binary_path(root, target, MCP_BINARY)
-    legal, expected_legal = verify_legal_runtime(root)
-    _case_database, expected_case = verify_case_runtime(root)
-    ai_tools = verify_ai_runtime(root)
-    for relative in RUNTIME_FILES[1:]:
-        _ensure_regular_file(root / "data" / "runtime" / relative, f"runtime resource {relative}")
-    for relative in CASE_RUNTIME_FILES[1:]:
-        _ensure_regular_file(root / "data" / "runtime" / relative, f"runtime case resource {relative}")
-    _ensure_regular_file(root / CASE_DISTRIBUTION_MANIFEST, "judicial case distribution manifest")
-    for source, _destination in PORTABLE_FILES:
-        _ensure_regular_file(root / source, f"portable document or example {source}")
-
-    package_root = f"Lawyer-Assistance_{version}_windows-x86_64-portable"
+    selected_label = validate_label(label) if label else None
+    revision = source_commit(root)
+    corpus_layout = resolve_corpus(root, corpus)
+    package_suffix = f"_{selected_label}" if selected_label else ""
+    package_root = f"Lawyer-Assistance_{version}_windows-x86_64-portable{package_suffix}"
     archive = output_dir / f"{package_root}.zip"
     checksum = output_dir / f"{package_root}.zip.sha256"
     manifest = output_dir / f"{package_root}.manifest.json"
     output_dir.mkdir(parents=True, exist_ok=True)
     for path in (archive, checksum, manifest):
-        if path.exists():
-            path.unlink()
+        if path.exists() or path.is_symlink():
+            raise PackageError(f"refusing to overwrite existing artifact: {path}")
+    if not skip_build:
+        build_release_binaries(root, target)
+    server = release_binary_path(root, target, SERVER_BINARY)
+    verify_default_server_binary(server)
+    mcp = release_binary_path(root, target, MCP_BINARY)
+    legal, expected_legal = verify_legal_runtime(root, corpus)
+    _case_database, expected_case = verify_case_runtime(root, corpus)
+    ai_tools = verify_ai_runtime(root, corpus)
+    for relative in RUNTIME_FILES[1:]:
+        _ensure_regular_file(
+            corpus_layout.runtime / relative,
+            f"runtime resource {relative}",
+            corpus_layout.runtime,
+        )
+    for relative in CASE_RUNTIME_FILES[1:]:
+        _ensure_regular_file(
+            corpus_layout.runtime / relative,
+            f"runtime case resource {relative}",
+            corpus_layout.runtime,
+        )
+    _ensure_regular_file(
+        corpus_layout.generated / CASE_DISTRIBUTION_MANIFEST.name,
+        "judicial case distribution manifest",
+        corpus_layout.generated,
+    )
+    for source, _destination in PORTABLE_FILES:
+        _ensure_regular_file(root / source, f"portable document or example {source}", root)
     with tempfile.TemporaryDirectory(prefix="lawyer-assistance-portable-", dir=output_dir) as temporary:
         stage = Path(temporary) / package_root
         stage.mkdir()
@@ -686,16 +857,16 @@ def build_package(
         _copy_payload(mcp, stage / MCP_BINARY)
         for resource in ai_tools:
             _copy_payload(resource, stage / "tools" / resource.relative_to(root / "output/runtime-tools"))
-        _copy_payload(root / "data/runtime/legal_search_index.sqlite", stage / "data/runtime/legal_search_index.sqlite")
-        _copy_payload(root / "data/generated/legal_search_index_manifest.json", stage / "data/runtime/legal_search_index_manifest.json")
+        _copy_payload(corpus_layout.runtime / "legal_search_index.sqlite", stage / "data/runtime/legal_search_index.sqlite")
+        _copy_payload(corpus_layout.generated / "legal_search_index_manifest.json", stage / "data/runtime/legal_search_index_manifest.json")
         for source, destination in PORTABLE_FILES:
             _copy_payload(root / source, stage / destination)
         for relative in RUNTIME_FILES:
-            _copy_payload(root / "data" / "runtime" / relative, stage / "data" / "runtime" / relative)
+            _copy_payload(corpus_layout.runtime / relative, stage / "data" / "runtime" / relative)
         for relative in CASE_RUNTIME_FILES:
-            _copy_payload(root / "data" / "runtime" / relative, stage / "data" / "runtime" / relative)
+            _copy_payload(corpus_layout.runtime / relative, stage / "data" / "runtime" / relative)
         _copy_payload(
-            root / CASE_DISTRIBUTION_MANIFEST,
+            corpus_layout.generated / CASE_DISTRIBUTION_MANIFEST.name,
             stage / "data" / "runtime" / CASE_MANIFEST_DESTINATION,
         )
         (stage / "Lawyer-Assistance.vbs").write_text(launcher_text(), encoding="utf-8", newline="\r\n")
@@ -704,7 +875,15 @@ def build_package(
         )
         entries = _manifest_entries(stage)
         _write_embedded_manifest(stage, entries)
-        _write_json_manifest(stage, version, expected_legal, expected_case, entries)
+        _write_json_manifest(
+            stage,
+            version,
+            revision,
+            selected_label,
+            expected_legal,
+            expected_case,
+            entries,
+        )
         # The JSON manifest itself is part of the hash manifest.  Rebuild the
         # hash list after writing it; the JSON's own files list intentionally
         # excludes its self-referential hash, while MANIFEST.sha256 covers it.
@@ -720,6 +899,9 @@ def build_package(
         "format_version": 1,
         "product": "Lawyer Assistance",
         "version": version,
+        "candidate": "1.2.1",
+        "source_commit": revision,
+        "label": selected_label,
         "artifact": "unsigned-windows-portable",
         "target": target,
         "signed": False,
@@ -740,7 +922,7 @@ def build_package(
         ],
     }
     manifest.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
-    return PackageResult(archive, checksum, manifest, package_root, entries)
+    return PackageResult(archive, checksum, manifest, package_root, entries, revision, selected_label)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -748,6 +930,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--target", default=DEFAULT_TARGET)
+    parser.add_argument("--label", default=None, help="safe artifact label, e.g. 20260911-01cf195")
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=None,
+        help="independent corpus directory (data/runtime plus data/generated, or a flat corpus root)",
+    )
     parser.add_argument("--skip-build", action="store_true", help="use existing release binaries")
     return parser.parse_args(argv)
 
@@ -760,6 +949,8 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             target=args.target,
             skip_build=args.skip_build,
+            label=args.label,
+            corpus=args.corpus,
         )
     except PackageError as error:
         print(f"portable packaging failed: {error}", file=sys.stderr)
@@ -772,6 +963,8 @@ def main(argv: list[str] | None = None) -> int:
                 "manifest": str(result.manifest),
                 "files": len(result.files),
                 "package_root": result.package_root,
+                "source_commit": result.source_commit,
+                "label": result.label,
                 "signed": False,
             },
             ensure_ascii=False,

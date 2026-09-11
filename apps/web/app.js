@@ -1328,7 +1328,10 @@ function sanitizeRenderedHtml(html) {
           continue;
         }
         // Flatten unknown wrappers so a harmless text response still remains
-        // readable while scripts, style blocks and embeds are discarded.
+        // readable while scripts, style blocks and embeds are discarded.  Visit
+        // before lifting children: the parent snapshot would otherwise skip
+        // newly promoted nested wrappers and their dangerous descendants.
+        visit(child);
         while (child.firstChild) child.parentNode.insertBefore(child.firstChild, child);
         child.remove();
         continue;

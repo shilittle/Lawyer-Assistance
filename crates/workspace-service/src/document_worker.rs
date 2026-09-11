@@ -8,6 +8,11 @@ use crate::{Error, Result};
 use file_ingest::{
     self, OcrAsset, PdfPage, PdfPageOutput, MAX_FILE_BYTES, MAX_OCR_IMAGE_BYTES, MAX_TEXT_BYTES,
 };
+#[cfg(feature = "document-worker-fault-injection")]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, OnceLock,
+};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -22,6 +27,19 @@ use tokio_util::sync::CancellationToken;
 pub const DOCUMENT_WORKER_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 pub const DOCUMENT_WORKER_RENDER_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DOCUMENT_WORKER_MAX_BUFFERED_PAGES: usize = 2;
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_TEST_RENDER_TIMEOUT: Duration = Duration::from_millis(750);
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_TEST_STALL_DURATION: Duration = Duration::from_secs(3);
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_FAULT_ENV: &str = "LAWYER_ASSISTANCE_DOCUMENT_WORKER_FAULT";
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES: usize =
+    DOCUMENT_WORKER_MEMORY_LIMIT_BYTES + 8 * 1024 * 1024;
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_FAULT_MEMORY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(feature = "document-worker-fault-injection")]
+const DOCUMENT_WORKER_FAULT_PAGE_BYTES: usize = 4 * 1024;
 
 const INPUT_PDF: u8 = 1;
 const PAGE: u8 = 2;
@@ -32,6 +50,8 @@ const REQUEST_ALL: u8 = 6;
 const REQUEST_SELECTED: u8 = 7;
 const REQUEST_METADATA: u8 = 8;
 const METADATA: u8 = 9;
+#[cfg(feature = "document-worker-fault-injection")]
+const FAULT_REPORT: u8 = 10;
 const PAGE_HEADER_BYTES: usize = 1 + 4 + 1 + 4 + 4 + 4 + 4;
 const REQUEST_HEADER_BYTES: usize = 2;
 const SELECTED_REQUEST_HEADER_BYTES: usize = REQUEST_HEADER_BYTES + 2;
@@ -43,6 +63,8 @@ const MAX_REQUEST_FRAME_BYTES: usize = MAX_FILE_BYTES
 const MAX_RESPONSE_FRAME_BYTES: usize = PAGE_HEADER_BYTES + MAX_TEXT_BYTES + MAX_OCR_IMAGE_BYTES;
 const MAX_ERROR_CODE_BYTES: usize = 128;
 const METADATA_RESPONSE_BYTES: usize = 1 + 4;
+#[cfg(feature = "document-worker-fault-injection")]
+const FAULT_REPORT_BYTES: usize = 1 + 1 + 1 + 8 + 8 + 8 + 8 + 4;
 /// A preflight has no source-text tokenizer available. Reserve a documented, conservative page
 /// envelope; actual text and visual work still charge the execution budget incrementally.
 pub(crate) const PDF_METADATA_TOKENS_PER_PAGE: u32 = 1_024;
@@ -79,11 +101,128 @@ enum DecodedWorkerRequest<'a> {
     Metadata(&'a [u8]),
 }
 
+#[cfg(feature = "document-worker-fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentWorkerFault {
+    Memory,
+    Stall,
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+impl DocumentWorkerFault {
+    fn from_env() -> Option<Self> {
+        match std::env::var(DOCUMENT_WORKER_FAULT_ENV).ok()?.as_str() {
+            "memory" => Some(Self::Memory),
+            "stall" => Some(Self::Stall),
+            _ => None,
+        }
+    }
+
+    fn from_cli(value: &str) -> Result<Self> {
+        match value {
+            "memory" => Ok(Self::Memory),
+            "stall" => Ok(Self::Stall),
+            _ => Err(Error::new("document_worker_fault_invalid")),
+        }
+    }
+
+    const fn as_cli(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Stall => "stall",
+        }
+    }
+
+    const fn as_code(self) -> u8 {
+        match self {
+            Self::Memory => 1,
+            Self::Stall => 2,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Stall => "stall",
+        }
+    }
+
+    fn from_code(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Memory),
+            2 => Ok(Self::Stall),
+            _ => Err(Error::new("document_worker_protocol_error")),
+        }
+    }
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocumentWorkerFaultReport {
+    fault: DocumentWorkerFault,
+    outcome: u8,
+    attempted_bytes: u64,
+    touched_bytes: u64,
+    target_bytes: u64,
+    first_rejection_bytes: u64,
+    win32_error: u32,
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+impl DocumentWorkerFaultReport {
+    const OUTCOME_MEMORY_LIMIT_REJECTED: u8 = 1;
+    const OUTCOME_MEMORY_LIMIT_NOT_ENFORCED: u8 = 2;
+    const OUTCOME_UNAVAILABLE: u8 = 3;
+
+    fn public_view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "fault": self.fault.as_str(),
+            "outcome": match self.outcome {
+                Self::OUTCOME_MEMORY_LIMIT_REJECTED => "memory_limit_rejected",
+                Self::OUTCOME_MEMORY_LIMIT_NOT_ENFORCED => "memory_limit_not_enforced",
+                Self::OUTCOME_UNAVAILABLE => "unavailable",
+                _ => "unknown",
+            },
+            "attempted_bytes": self.attempted_bytes,
+            "touched_bytes": self.touched_bytes,
+            "target_bytes": self.target_bytes,
+            "first_rejection_bytes": self.first_rejection_bytes,
+            "win32_error": self.win32_error,
+        })
+    }
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+static DOCUMENT_WORKER_FAULT_CONSUMED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "document-worker-fault-injection")]
+static DOCUMENT_WORKER_LAST_FAULT_REPORT: OnceLock<Mutex<Option<DocumentWorkerFaultReport>>> =
+    OnceLock::new();
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn take_document_worker_fault_for_render() -> Option<DocumentWorkerFault> {
+    let fault = DocumentWorkerFault::from_env()?;
+    DOCUMENT_WORKER_FAULT_CONSUMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| fault)
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn record_document_worker_fault_report(report: DocumentWorkerFaultReport) {
+    if let Ok(mut slot) = DOCUMENT_WORKER_LAST_FAULT_REPORT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = Some(report);
+    }
+}
+
 pub(crate) struct PdfDocumentWorker {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
     renderer_elapsed: Duration,
+    renderer_timeout: Duration,
     _job: WorkerJob,
 }
 
@@ -136,12 +275,25 @@ impl PdfDocumentWorker {
         }
         // Encode before spawning so a malformed request cannot leave a short-lived unreaped
         // worker behind. All post-spawn failures use `abort`, which waits for the child.
+        #[cfg(feature = "document-worker-fault-injection")]
+        let render_request = request.is_render();
         let payload = encode_worker_request(bytes, request)?;
+        #[cfg(feature = "document-worker-fault-injection")]
+        let fault = render_request
+            .then(take_document_worker_fault_for_render)
+            .flatten();
         let executable =
             std::env::current_exe().map_err(|_| Error::new("document_worker_unavailable"))?;
         let mut command = Command::new(executable);
+        #[cfg(feature = "document-worker-fault-injection")]
+        if let Some(fault) = fault {
+            command.arg("document-worker-fault").arg(fault.as_cli());
+        } else {
+            command.arg("document-worker");
+        }
+        #[cfg(not(feature = "document-worker-fault-injection"))]
+        command.arg("document-worker");
         command
-            .arg("document-worker")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -175,6 +327,14 @@ impl PdfDocumentWorker {
             stdin,
             stdout,
             renderer_elapsed: Duration::ZERO,
+            #[cfg(feature = "document-worker-fault-injection")]
+            renderer_timeout: if matches!(fault, Some(DocumentWorkerFault::Stall)) {
+                DOCUMENT_WORKER_TEST_RENDER_TIMEOUT
+            } else {
+                DOCUMENT_WORKER_RENDER_TIMEOUT
+            },
+            #[cfg(not(feature = "document-worker-fault-injection"))]
+            renderer_timeout: DOCUMENT_WORKER_RENDER_TIMEOUT,
             _job: job,
         };
         if let Err(error) = worker.write_renderer_frame(&payload, cancel).await {
@@ -184,6 +344,22 @@ impl PdfDocumentWorker {
         Ok(worker)
     }
 
+    #[cfg(feature = "document-worker-fault-injection")]
+    pub(crate) async fn next_page(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<WorkerPage>> {
+        loop {
+            let payload = self.read_renderer_response(cancel).await?;
+            if payload.first() == Some(&FAULT_REPORT) {
+                record_document_worker_fault_report(decode_fault_report(&payload)?);
+                continue;
+            }
+            return parse_worker_response(&payload);
+        }
+    }
+
+    #[cfg(not(feature = "document-worker-fault-injection"))]
     pub(crate) async fn next_page(
         &mut self,
         cancel: &CancellationToken,
@@ -274,7 +450,7 @@ impl PdfDocumentWorker {
     }
 
     fn renderer_remaining(&self) -> Result<Duration> {
-        renderer_budget_remaining(self.renderer_elapsed)
+        renderer_budget_remaining_for(self.renderer_timeout, self.renderer_elapsed)
     }
 
     fn charge_renderer_elapsed(&mut self, started: std::time::Instant) {
@@ -282,11 +458,23 @@ impl PdfDocumentWorker {
     }
 }
 
+#[cfg(test)]
 fn renderer_budget_remaining(elapsed: Duration) -> Result<Duration> {
-    DOCUMENT_WORKER_RENDER_TIMEOUT
+    renderer_budget_remaining_for(DOCUMENT_WORKER_RENDER_TIMEOUT, elapsed)
+}
+
+fn renderer_budget_remaining_for(timeout: Duration, elapsed: Duration) -> Result<Duration> {
+    timeout
         .checked_sub(elapsed)
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| Error::new("document_worker_timeout"))
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+impl WorkerRequestMode<'_> {
+    const fn is_render(&self) -> bool {
+        matches!(self, Self::All | Self::Selected(_))
+    }
 }
 
 fn encode_worker_request(bytes: &[u8], request: WorkerRequestMode<'_>) -> Result<Vec<u8>> {
@@ -469,6 +657,127 @@ pub fn run_internal_document_worker() -> Result<()> {
     }
 }
 
+/// Test-only counterpart of [`run_internal_document_worker`]. The parent picks this hidden
+/// command only for one actual render request after the default-off feature is enabled. It is
+/// deliberately unavailable in ordinary builds, and a metadata request is rejected here rather
+/// than consuming the one-shot parent fault setting.
+#[cfg(feature = "document-worker-fault-injection")]
+pub fn run_internal_document_worker_fault(mode: &str) -> Result<()> {
+    let fault = DocumentWorkerFault::from_cli(mode)?;
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    let payload = read_frame_blocking(&mut input, MAX_REQUEST_FRAME_BYTES)?;
+    let request = decode_worker_request(&payload)?;
+    if !matches!(
+        request,
+        DecodedWorkerRequest::All(_) | DecodedWorkerRequest::Selected { .. }
+    ) {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    match fault {
+        DocumentWorkerFault::Memory => {
+            let report = run_document_worker_memory_fault();
+            write_fault_report(&mut output, &report)?;
+            let code = if report.outcome == DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_REJECTED
+            {
+                "document_worker_memory_limit_rejected"
+            } else if report.outcome == DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_NOT_ENFORCED
+            {
+                "document_worker_memory_limit_not_enforced"
+            } else {
+                "document_worker_fault_unavailable"
+            };
+            let _ = write_failure(&mut output, code);
+            Err(Error::new(code))
+        }
+        DocumentWorkerFault::Stall => {
+            // This child has already received a render request. A feature-only short parent
+            // deadline proves timeout/kill/reap without weakening the production 90 s deadline.
+            std::thread::sleep(DOCUMENT_WORKER_TEST_STALL_DURATION);
+            Err(Error::new("document_worker_fault_stalled"))
+        }
+    }
+}
+
+#[cfg(all(feature = "document-worker-fault-injection", windows))]
+fn run_document_worker_memory_fault() -> DocumentWorkerFaultReport {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::{
+        Foundation::GetLastError,
+        System::Memory::{
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        },
+    };
+
+    let mut allocations: Vec<*mut c_void> = Vec::new();
+    let mut attempted_bytes = 0usize;
+    let mut touched_bytes = 0usize;
+    let mut rejected = false;
+    let mut first_rejection_bytes = 0usize;
+    let mut win32_error = 0u32;
+    while attempted_bytes < DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES {
+        let requested = DOCUMENT_WORKER_FAULT_MEMORY_CHUNK_BYTES
+            .min(DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES.saturating_sub(attempted_bytes));
+        attempted_bytes = attempted_bytes.saturating_add(requested);
+        let allocation = unsafe {
+            VirtualAlloc(
+                ptr::null_mut(),
+                requested,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if allocation.is_null() {
+            // Keep issuing bounded requests through the declared target: Windows has rejected a
+            // real allocation, but the report still records the intended over-limit attempt.
+            rejected = true;
+            if first_rejection_bytes == 0 {
+                first_rejection_bytes = attempted_bytes;
+                win32_error = unsafe { GetLastError() };
+            }
+            continue;
+        }
+        for offset in (0..requested).step_by(DOCUMENT_WORKER_FAULT_PAGE_BYTES) {
+            unsafe {
+                ptr::write_volatile((allocation as *mut u8).add(offset), 0xA5);
+            }
+            touched_bytes = touched_bytes.saturating_add(DOCUMENT_WORKER_FAULT_PAGE_BYTES);
+        }
+        allocations.push(allocation);
+    }
+    for allocation in allocations {
+        unsafe {
+            let _ = VirtualFree(allocation, 0, MEM_RELEASE);
+        }
+    }
+    DocumentWorkerFaultReport {
+        fault: DocumentWorkerFault::Memory,
+        outcome: if rejected {
+            DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_REJECTED
+        } else {
+            DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_NOT_ENFORCED
+        },
+        attempted_bytes: attempted_bytes as u64,
+        touched_bytes: touched_bytes as u64,
+        target_bytes: DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES as u64,
+        first_rejection_bytes: first_rejection_bytes as u64,
+        win32_error,
+    }
+}
+
+#[cfg(all(feature = "document-worker-fault-injection", not(windows)))]
+fn run_document_worker_memory_fault() -> DocumentWorkerFaultReport {
+    DocumentWorkerFaultReport {
+        fault: DocumentWorkerFault::Memory,
+        outcome: DocumentWorkerFaultReport::OUTCOME_UNAVAILABLE,
+        attempted_bytes: 0,
+        touched_bytes: 0,
+        target_bytes: DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES as u64,
+        first_rejection_bytes: 0,
+        win32_error: 0,
+    }
+}
+
 fn stream_worker_pages(
     input: &mut impl Read,
     output: &mut impl Write,
@@ -494,13 +803,41 @@ fn stream_worker_pages(
 pub(crate) fn health_status() -> serde_json::Value {
     let executable_available = std::env::current_exe().is_ok_and(|path| path.is_file());
     let renderer_available = worker_pdfium_library().is_some();
-    serde_json::json!({
+    let status = serde_json::json!({
         "enabled": executable_available && renderer_available,
         "executable_available": executable_available,
         "renderer_available": renderer_available,
         "memory_limit_bytes": DOCUMENT_WORKER_MEMORY_LIMIT_BYTES,
         "render_timeout_seconds": DOCUMENT_WORKER_RENDER_TIMEOUT.as_secs(),
         "max_buffered_pages": DOCUMENT_WORKER_MAX_BUFFERED_PAGES,
+    });
+    #[cfg(feature = "document-worker-fault-injection")]
+    {
+        let mut status = status;
+        if let Some(object) = status.as_object_mut() {
+            object.insert("fault_injection".to_owned(), fault_injection_status());
+        }
+        status
+    }
+    #[cfg(not(feature = "document-worker-fault-injection"))]
+    {
+        status
+    }
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn fault_injection_status() -> serde_json::Value {
+    let configured = DocumentWorkerFault::from_env();
+    let last_report = DOCUMENT_WORKER_LAST_FAULT_REPORT
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|report| report.clone()))
+        .map(|report| report.public_view());
+    serde_json::json!({
+        "enabled": true,
+        "configured_fault": configured.map(DocumentWorkerFault::as_str),
+        "armed": configured.is_some() && !DOCUMENT_WORKER_FAULT_CONSUMED.load(Ordering::Acquire),
+        "last_report": last_report,
+        "test_render_timeout_millis": DOCUMENT_WORKER_TEST_RENDER_TIMEOUT.as_millis(),
     })
 }
 
@@ -543,6 +880,64 @@ fn decode_worker_failure(payload: &[u8]) -> Error {
         .filter(|code| valid_error_code(code))
         .unwrap_or("document_worker_exited");
     Error::new(code)
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn write_fault_report(output: &mut impl Write, report: &DocumentWorkerFaultReport) -> Result<()> {
+    let mut frame = [0u8; FAULT_REPORT_BYTES];
+    frame[0] = FAULT_REPORT;
+    frame[1] = report.fault.as_code();
+    frame[2] = report.outcome;
+    frame[3..11].copy_from_slice(&report.attempted_bytes.to_le_bytes());
+    frame[11..19].copy_from_slice(&report.touched_bytes.to_le_bytes());
+    frame[19..27].copy_from_slice(&report.target_bytes.to_le_bytes());
+    frame[27..35].copy_from_slice(&report.first_rejection_bytes.to_le_bytes());
+    frame[35..39].copy_from_slice(&report.win32_error.to_le_bytes());
+    write_frame_blocking(output, &frame)
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn decode_fault_report(payload: &[u8]) -> Result<DocumentWorkerFaultReport> {
+    if payload.len() != FAULT_REPORT_BYTES || payload.first() != Some(&FAULT_REPORT) {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    let fault = DocumentWorkerFault::from_code(payload[1])?;
+    let outcome = payload[2];
+    if !matches!(
+        outcome,
+        DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_REJECTED
+            | DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_NOT_ENFORCED
+            | DocumentWorkerFaultReport::OUTCOME_UNAVAILABLE
+    ) {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    let attempted_bytes = read_u64(&payload[3..11])?;
+    let touched_bytes = read_u64(&payload[11..19])?;
+    let target_bytes = read_u64(&payload[19..27])?;
+    let first_rejection_bytes = read_u64(&payload[27..35])?;
+    let win32_error = read_u32(&payload[35..39])?;
+    if fault != DocumentWorkerFault::Memory
+        || target_bytes != DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES as u64
+        || attempted_bytes < touched_bytes
+        || attempted_bytes < target_bytes
+        || (outcome == DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_REJECTED
+            && (first_rejection_bytes == 0
+                || first_rejection_bytes > attempted_bytes
+                || win32_error == 0))
+        || (outcome != DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_REJECTED
+            && (first_rejection_bytes != 0 || win32_error != 0))
+    {
+        return Err(Error::new("document_worker_protocol_error"));
+    }
+    Ok(DocumentWorkerFaultReport {
+        fault,
+        outcome,
+        attempted_bytes,
+        touched_bytes,
+        target_bytes,
+        first_rejection_bytes,
+        win32_error,
+    })
 }
 
 fn page_parts(output: &PdfPageOutput) -> Result<(u8, &[u8], u32, u32)> {
@@ -685,6 +1080,14 @@ fn read_u32(bytes: &[u8]) -> Result<u32> {
         .try_into()
         .map_err(|_| Error::new("document_worker_protocol_error"))?;
     Ok(u32::from_le_bytes(value))
+}
+
+#[cfg(feature = "document-worker-fault-injection")]
+fn read_u64(bytes: &[u8]) -> Result<u64> {
+    let value: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::new("document_worker_protocol_error"))?;
+    Ok(u64::from_le_bytes(value))
 }
 
 fn valid_error_code(code: &str) -> bool {
@@ -1015,11 +1418,73 @@ mod tests {
             stdin,
             stdout,
             renderer_elapsed: Duration::ZERO,
+            renderer_timeout: DOCUMENT_WORKER_RENDER_TIMEOUT,
             _job: job,
         };
         let result = tokio::time::timeout(Duration::from_secs(1), worker.wait_for_exit())
             .await
             .expect("child exit is prompt");
         assert_eq!(result.unwrap_err().code, "document_worker_exited");
+    }
+
+    #[cfg(feature = "document-worker-fault-injection")]
+    #[test]
+    fn fault_report_round_trips_only_a_valid_over_limit_memory_attempt() {
+        let report = DocumentWorkerFaultReport {
+            fault: DocumentWorkerFault::Memory,
+            outcome: DocumentWorkerFaultReport::OUTCOME_MEMORY_LIMIT_REJECTED,
+            attempted_bytes: DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES as u64,
+            touched_bytes: 8 * 1024 * 1024,
+            target_bytes: DOCUMENT_WORKER_FAULT_MEMORY_TARGET_BYTES as u64,
+            first_rejection_bytes: 512 * 1024 * 1024,
+            win32_error: 8,
+        };
+        let mut bytes = Vec::new();
+        write_fault_report(&mut bytes, &report).expect("report frame");
+        let mut input = bytes.as_slice();
+        let frame = read_frame_blocking(&mut input, FAULT_REPORT_BYTES).expect("frame");
+        assert_eq!(decode_fault_report(&frame).expect("report"), report);
+
+        let mut malformed = frame;
+        malformed[2] = 99;
+        assert_eq!(
+            decode_fault_report(&malformed).unwrap_err().code,
+            "document_worker_protocol_error"
+        );
+    }
+
+    #[cfg(feature = "document-worker-fault-injection")]
+    #[test]
+    fn fault_stall_uses_only_the_feature_deadline() {
+        assert_eq!(
+            renderer_budget_remaining_for(
+                DOCUMENT_WORKER_TEST_RENDER_TIMEOUT,
+                Duration::from_millis(749),
+            )
+            .expect("one millisecond remains"),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            renderer_budget_remaining_for(
+                DOCUMENT_WORKER_TEST_RENDER_TIMEOUT,
+                DOCUMENT_WORKER_TEST_RENDER_TIMEOUT,
+            )
+            .unwrap_err()
+            .code,
+            "document_worker_timeout"
+        );
+        assert_eq!(DOCUMENT_WORKER_RENDER_TIMEOUT, Duration::from_secs(90));
+    }
+
+    #[cfg(feature = "document-worker-fault-injection")]
+    #[test]
+    fn feature_health_is_explicit_and_production_limits_remain_visible() {
+        let health = health_status();
+        assert_eq!(health["render_timeout_seconds"], 90);
+        assert_eq!(health["fault_injection"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            health["fault_injection"]["test_render_timeout_millis"].as_u64(),
+            u64::try_from(DOCUMENT_WORKER_TEST_RENDER_TIMEOUT.as_millis()).ok()
+        );
     }
 }

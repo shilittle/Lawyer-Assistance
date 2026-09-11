@@ -2,6 +2,58 @@ use crate::{redaction_ai::AiStageRecord, *};
 use privacy_text::{AiFinding, Analysis, CloudFinding};
 use serde::Deserialize;
 
+#[cfg(test)]
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+#[cfg(test)]
+use tokio::sync::Notify;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct MaterialPanicHook {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+struct MaterialPanicHookGuard {
+    key: (String, String),
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+static MATERIAL_PANIC_HOOKS: OnceLock<Mutex<HashMap<(String, String), MaterialPanicHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn material_panic_hooks() -> &'static Mutex<HashMap<(String, String), MaterialPanicHook>> {
+    MATERIAL_PANIC_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+impl Drop for MaterialPanicHookGuard {
+    fn drop(&mut self) {
+        material_panic_hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+/// An outer worker shutdown must also stop the per-material join task.  The
+/// handle is otherwise only used to turn a panic into a durable material
+/// failure while letting the long-lived queue worker continue.
+struct AbortMaterialTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortMaterialTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn source_format(name: &str) -> String {
     match name
         .rsplit('.')
@@ -20,6 +72,55 @@ fn source_format(name: &str) -> String {
 }
 
 impl Workspace {
+    #[cfg(test)]
+    fn install_material_panic_after_parse_for_tests(
+        &self,
+        material_id: &str,
+    ) -> MaterialPanicHookGuard {
+        let key = (
+            self.root.to_string_lossy().into_owned(),
+            material_id.to_owned(),
+        );
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let previous = material_panic_hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key.clone(),
+                MaterialPanicHook {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        assert!(
+            previous.is_none(),
+            "a material panic hook is already installed for this workspace/material"
+        );
+        MaterialPanicHookGuard {
+            key,
+            entered,
+            release,
+        }
+    }
+
+    #[cfg(test)]
+    async fn panic_after_parse_permit_for_tests(&self, material_id: &str) {
+        let key = (
+            self.root.to_string_lossy().into_owned(),
+            material_id.to_owned(),
+        );
+        let hook = material_panic_hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+        if let Some(hook) = hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+            panic!("controlled material worker panic after parse admission");
+        }
+    }
+
     pub fn replace_material(
         &self,
         material_id: &str,
@@ -450,44 +551,51 @@ impl Workspace {
                             .supervisor
                             .heartbeat("material_worker", "worker", "processing");
                         service.supervisor.start("material", &task_id, "processing");
-                        if let Err(error) = service
-                            .process_material_with_heartbeat(m, g, cancel)
-                            .await
-                        {
-                            service.supervisor.operation_failed(
-                                "material",
-                                &task_id,
-                                "processing",
-                                &error,
-                            );
-                            match service.fail_material(&id, revision, &error.code) {
-                                Ok(true) => {
-                                    // The material failure is durable and the worker can continue.
-                                    service.supervisor.completed("material", &task_id, "failed_persisted");
-                                }
-                                Ok(false) => {
-                                    // A cancel/retry/replacement won the race.  The stale worker
-                                    // must not rewrite that terminal or newer state.
-                                    service.supervisor.completed("material", &task_id, "superseded");
-                                }
-                                Err(persist_error) => {
-                                    service.supervisor.operation_failed(
-                                        "material",
-                                        &task_id,
-                                        "persist_failure",
-                                        &persist_error,
-                                    );
-                                    service.supervisor.failed(
-                                        "material_worker",
-                                        "worker",
-                                        "persist_failure",
-                                        &persist_error,
-                                    );
-                                }
+                        // A material is an independent fault boundary.  A panic must not kill
+                        // the durable queue loop and strand the material in `running`; the join
+                        // error below still has its id and revision for the CAS failure write.
+                        let material_service = Arc::clone(&service);
+                        let work = tokio::spawn(async move {
+                            material_service
+                                .process_material_with_heartbeat(m, g, cancel)
+                                .await
+                        });
+                        let work_guard = AbortMaterialTaskOnDrop(work.abort_handle());
+                        match work.await {
+                            Ok(Ok(())) => {
+                                service.supervisor.completed("material", &task_id, "completed");
                             }
-                        } else {
-                            service.supervisor.completed("material", &task_id, "completed");
+                            Ok(Err(error)) => {
+                                service
+                                    .settle_material_failure(
+                                        &id,
+                                        revision,
+                                        &task_id,
+                                        "processing",
+                                        &error,
+                                    )
+                                    .await;
+                            }
+                            Err(join_error) => {
+                                let (phase, error) = if join_error.is_panic() {
+                                    ("panicked", Error::new("task_panicked"))
+                                } else {
+                                    ("cancelled", Error::new("task_cancelled"))
+                                };
+                                service
+                                    .supervisor
+                                    .failed("material_worker", "worker", phase, &error);
+                                service
+                                    .settle_material_failure(
+                                        &id, revision, &task_id, phase, &error,
+                                    )
+                                    .await;
+                            }
                         }
+                        // The join already completed; this is a no-op.  If the outer worker was
+                        // aborted while awaiting instead, Drop aborts the child rather than
+                        // leaving a detached material task behind.
+                        drop(work_guard);
                     }
                     Ok(None) => {
                         service
@@ -510,6 +618,77 @@ impl Workspace {
                 }
             }
         }, |_| Ok(()))
+    }
+
+    /// Keep a claimed material in the supervisor's failed state until its
+    /// terminal CAS write is durable or a cancellation/replacement makes that
+    /// write stale.  In particular, an empty queue must not turn a failed
+    /// storage write into a healthy idle worker while the material remains
+    /// `running`.
+    async fn settle_material_failure(
+        &self,
+        id: &str,
+        revision: u64,
+        task_id: &str,
+        phase: &'static str,
+        error: &Error,
+    ) {
+        let mut retry_delay = std::time::Duration::from_millis(100);
+        while !self.record_material_failure(id, revision, task_id, phase, error) {
+            // A storage repair is not necessarily accompanied by a queued
+            // submission, so retain a bounded exponential retry interval as
+            // well as the normal worker wake signal. No source is open while
+            // waiting, and the cap avoids repeatedly logging a permanent
+            // storage outage at a high rate.
+            tokio::select! {
+                _ = self.wake.notified() => {},
+                _ = tokio::time::sleep(retry_delay) => {},
+            }
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_secs(5));
+        }
+    }
+
+    fn record_material_failure(
+        &self,
+        id: &str,
+        revision: u64,
+        task_id: &str,
+        phase: &'static str,
+        error: &Error,
+    ) -> bool {
+        self.supervisor
+            .operation_failed("material", task_id, phase, error);
+        match self.fail_material(id, revision, &error.code) {
+            Ok(true) => {
+                // The material failure is durable and the worker can continue.
+                self.supervisor
+                    .completed("material", task_id, "failed_persisted");
+                true
+            }
+            Ok(false) => {
+                // A cancel/retry/replacement won the race.  The stale worker
+                // must not rewrite that terminal or newer state.
+                self.supervisor.completed("material", task_id, "superseded");
+                true
+            }
+            Err(persist_error) => {
+                self.supervisor.operation_failed(
+                    "material",
+                    task_id,
+                    "persist_failure",
+                    &persist_error,
+                );
+                self.supervisor.failed(
+                    "material_worker",
+                    "worker",
+                    "persist_failure",
+                    &persist_error,
+                );
+                false
+            }
+        }
     }
     fn claim_next(&self) -> Result<Option<(Material, Group, CancellationToken)>> {
         let _gate = self.lock()?;
@@ -568,6 +747,11 @@ impl Workspace {
         let parse = self
             .acquire_admission(AdmissionClass::Parse, &cancel)
             .await?;
+        // Test-only, one-shot fault injection after every required admission
+        // has been acquired.  Production builds contain neither the hook nor
+        // the panic path.
+        #[cfg(test)]
+        self.panic_after_parse_permit_for_tests(&m.id).await;
         let bytes = self.store.raw("source", &m.id)?;
         if hash(&bytes) != m.source_sha256 {
             return Err(Error::new("source_integrity_failed"));
@@ -1005,6 +1189,68 @@ mod worker_supervision_tests {
         (temporary, workspace)
     }
 
+    async fn wait_for_material_status(
+        workspace: &Workspace,
+        material_id: &str,
+        expected: &str,
+    ) -> Material {
+        for _ in 0..100 {
+            let material = workspace
+                .material(material_id)
+                .expect("material remains readable while worker runs");
+            if material.status == expected {
+                return material;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("material {material_id} did not reach {expected}");
+    }
+
+    async fn wait_for_material_worker_panic_log(workspace: &Workspace) {
+        let path = workspace.root.join("diagnostics/supervisor.jsonl");
+        for _ in 0..100 {
+            if std::fs::read_to_string(&path)
+                .is_ok_and(|log| log.contains("material_worker") && log.contains("task_panicked"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("material worker panic was not recorded in supervisor diagnostics");
+    }
+
+    async fn wait_for_material_worker_storage_failure(workspace: &Workspace) {
+        for _ in 0..100 {
+            let health = workspace.health();
+            if health["supervision"]["material_worker"]["status"] == "failed" {
+                assert_eq!(health["status"], "degraded");
+                assert_eq!(
+                    health["supervision"]["material_worker"]["last_error_code"],
+                    "storage_failed"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("material worker did not retain its storage failure in health");
+    }
+
+    fn material_persist_failure_log_count(workspace: &Workspace) -> usize {
+        std::fs::read_to_string(workspace.root.join("diagnostics/supervisor.jsonl"))
+            .map(|log| log.matches("\"phase\":\"persist_failure\"").count())
+            .unwrap_or(0)
+    }
+
+    async fn wait_for_material_persist_failure_log_count(workspace: &Workspace, minimum: usize) {
+        for _ in 0..100 {
+            if material_persist_failure_log_count(workspace) >= minimum {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("material worker did not record the requested retry failure");
+    }
+
     #[tokio::test]
     async fn storage_failure_is_not_reported_as_an_empty_queue() {
         let (_temporary, workspace) = open_workspace();
@@ -1282,6 +1528,230 @@ mod worker_supervision_tests {
             .expect("material remains readable");
         assert_eq!(material.status, "cancelled");
         assert_eq!(material.reason_code.as_deref(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn material_worker_panic_fails_active_material_releases_parse_and_recovers() {
+        let (_temporary, workspace) = open_workspace();
+        let group_id = workspace
+            .create_group("material panic recovery")
+            .expect("group creates")["id"]
+            .as_str()
+            .expect("group identifier")
+            .to_owned();
+        let panicking_task = workspace
+            .submit(
+                &group_id,
+                "material_panic_active",
+                vec![ImportFile {
+                    name: "panic.txt".to_owned(),
+                    bytes: b"ordinary local material for panic boundary".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("panic material submits");
+        let panicking_id = panicking_task["materials"][0]["id"]
+            .as_str()
+            .expect("panic material identifier")
+            .to_owned();
+        let hook = workspace.install_material_panic_after_parse_for_tests(&panicking_id);
+        let worker = workspace.start_worker();
+
+        tokio::time::timeout(Duration::from_secs(1), hook.entered.notified())
+            .await
+            .expect("test hook fires after the parse permit is acquired");
+        let admitted = workspace.admission.snapshot();
+        assert_eq!(admitted["parse"]["active"].as_u64(), Some(1));
+        assert_eq!(admitted["parse"]["waiting"].as_u64(), Some(0));
+
+        hook.release.notify_one();
+        let failed = wait_for_material_status(&workspace, &panicking_id, "failed").await;
+        assert_eq!(failed.reason_code.as_deref(), Some("task_panicked"));
+        wait_for_material_worker_panic_log(&workspace).await;
+
+        let released = workspace.admission.snapshot();
+        assert_eq!(released["parse"]["active"].as_u64(), Some(0));
+        assert_eq!(released["parse"]["waiting"].as_u64(), Some(0));
+
+        let next_task = workspace
+            .submit(
+                &group_id,
+                "material_panic_next",
+                vec![ImportFile {
+                    name: "next.txt".to_owned(),
+                    bytes: b"ordinary local material after a worker panic".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("next material submits");
+        let next_id = next_task["materials"][0]["id"]
+            .as_str()
+            .expect("next material identifier");
+        let ready = wait_for_material_status(&workspace, next_id, "ready").await;
+        assert!(ready.reason_code.is_none());
+        let health = workspace.health();
+        assert_eq!(health["status"], "ready");
+        assert_eq!(
+            health["supervision"]["material_worker"]["status"],
+            "running"
+        );
+
+        drop(hook);
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    async fn material_worker_panic_does_not_overwrite_cancelled_material() {
+        let (_temporary, workspace) = open_workspace();
+        let group_id = workspace
+            .create_group("material panic cancellation")
+            .expect("group creates")["id"]
+            .as_str()
+            .expect("group identifier")
+            .to_owned();
+        let submitted = workspace
+            .submit(
+                &group_id,
+                "material_panic_cancelled",
+                vec![ImportFile {
+                    name: "cancelled.txt".to_owned(),
+                    bytes: b"ordinary local material cancelled before panic recovery".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("cancellable material submits");
+        let task_id = submitted["id"]
+            .as_str()
+            .expect("task identifier")
+            .to_owned();
+        let material_id = submitted["materials"][0]["id"]
+            .as_str()
+            .expect("material identifier")
+            .to_owned();
+        let hook = workspace.install_material_panic_after_parse_for_tests(&material_id);
+        let worker = workspace.start_worker();
+
+        tokio::time::timeout(Duration::from_secs(1), hook.entered.notified())
+            .await
+            .expect("test hook fires after the parse permit is acquired");
+        let cancelled = workspace
+            .cancel_task(&task_id)
+            .expect("running material cancels before panic recovery");
+        assert_eq!(cancelled["status"], "cancelled");
+        let before_panic = workspace
+            .material(&material_id)
+            .expect("cancelled material reads");
+        assert_eq!(before_panic.status, "cancelled");
+        assert_eq!(before_panic.reason_code.as_deref(), Some("cancelled"));
+
+        hook.release.notify_one();
+        wait_for_material_worker_panic_log(&workspace).await;
+        let after_panic = workspace
+            .material(&material_id)
+            .expect("cancelled material remains readable");
+        assert_eq!(after_panic.status, "cancelled");
+        assert_eq!(after_panic.reason_code.as_deref(), Some("cancelled"));
+        assert_eq!(after_panic.revision, before_panic.revision);
+        let released = workspace.admission.snapshot();
+        assert_eq!(released["parse"]["active"].as_u64(), Some(0));
+        assert_eq!(released["parse"]["waiting"].as_u64(), Some(0));
+
+        drop(hook);
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    async fn material_worker_retries_panic_terminal_after_object_write_failure() {
+        let (_temporary, workspace) = open_workspace();
+        let group_id = workspace
+            .create_group("material panic storage retry")
+            .expect("group creates")["id"]
+            .as_str()
+            .expect("group identifier")
+            .to_owned();
+        let panicking_task = workspace
+            .submit(
+                &group_id,
+                "material_panic_storage_failure",
+                vec![ImportFile {
+                    name: "panic-storage.txt".to_owned(),
+                    bytes: b"ordinary local material with a failed terminal write".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("panic material submits");
+        let panicking_id = panicking_task["materials"][0]["id"]
+            .as_str()
+            .expect("panic material identifier")
+            .to_owned();
+        let hook = workspace.install_material_panic_after_parse_for_tests(&panicking_id);
+        let worker = workspace.start_worker();
+
+        tokio::time::timeout(Duration::from_secs(1), hook.entered.notified())
+            .await
+            .expect("test hook fires after the parse permit is acquired");
+        workspace
+            .store
+            .fail_object_writes_for_kind_for_tests("material")
+            .expect("terminal material writes fail deterministically");
+        hook.release.notify_one();
+
+        wait_for_material_worker_storage_failure(&workspace).await;
+        let stranded = workspace
+            .material(&panicking_id)
+            .expect("failed terminal write leaves readable running material");
+        assert_eq!(stranded.status, "running");
+        let released = workspace.admission.snapshot();
+        assert_eq!(released["parse"]["active"].as_u64(), Some(0));
+        assert_eq!(released["parse"]["waiting"].as_u64(), Some(0));
+        // Drive a second attempt through the normal worker wake signal. The
+        // retry must remain failed rather than reach an idle heartbeat while
+        // its material is still non-terminal.
+        let failures_before = material_persist_failure_log_count(&workspace);
+        workspace.wake.notify_one();
+        wait_for_material_persist_failure_log_count(&workspace, failures_before + 1).await;
+        wait_for_material_worker_storage_failure(&workspace).await;
+
+        workspace
+            .store
+            .clear_object_write_failure_for_tests()
+            .expect("terminal material writes recover");
+        workspace.wake.notify_one();
+        let failed = wait_for_material_status(&workspace, &panicking_id, "failed").await;
+        assert_eq!(failed.reason_code.as_deref(), Some("task_panicked"));
+
+        let next_task = workspace
+            .submit(
+                &group_id,
+                "material_panic_storage_next",
+                vec![ImportFile {
+                    name: "next-after-storage.txt".to_owned(),
+                    bytes: b"ordinary local material after a recovered terminal write".to_vec(),
+                    encoding: Some("utf-8".to_owned()),
+                }],
+                None,
+            )
+            .expect("next material submits");
+        let next_id = next_task["materials"][0]["id"]
+            .as_str()
+            .expect("next material identifier");
+        wait_for_material_status(&workspace, next_id, "ready").await;
+        let health = workspace.health();
+        assert_eq!(health["status"], "ready");
+        assert_eq!(
+            health["supervision"]["material_worker"]["status"],
+            "running"
+        );
+
+        drop(hook);
+        worker.abort();
+        let _ = worker.await;
     }
 }
 

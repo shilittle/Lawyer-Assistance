@@ -14,6 +14,7 @@ import path from "node:path";
 
 const HOST_ORIGIN = /^https?:\/\/127\.0\.0\.1(?::\d+)?$/u;
 const TERMINAL_TASK_STATES = new Set(["ready", "needs_review", "awaiting_consent", "partial", "failed", "cancelled"]);
+const EXPECTED_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 const REDACTION_SOURCE = "请在联系时使用号码 13800138000。";
 const REPLACEMENT_SOURCE = "请改用号码 13900139000。";
 const BROWSER_SOURCE = "请在浏览器 smoke 中使用号码 13700137000。";
@@ -221,6 +222,10 @@ async function pollTask(client, taskId) {
 
 async function runHttpSmoke(connection) {
   const client = new LocalClient(connection.baseUrl);
+  const [index, app] = await Promise.all([fetch(`${connection.baseUrl}/`), fetch(`${connection.baseUrl}/app.js`)]);
+  check(index.status === 200 && app.status === 200, "Web 入口或 app.js 不可用");
+  check(index.headers.get("content-security-policy") === EXPECTED_CSP, "Web 入口 CSP 不符合发布策略");
+  check(app.headers.get("content-security-policy") === EXPECTED_CSP, "app.js CSP 不符合发布策略");
   const wrongOrigin = await client.request("/api/v1/session", {
     method: "POST",
     body: { token: connection.token },

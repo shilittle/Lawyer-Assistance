@@ -15,7 +15,7 @@ await fs.mkdir(output, { recursive: true });
 try { await fs.access(path.join(output, "report.json")); throw new Error("evidence_directory_already_used"); } catch (error) { if (error.code !== "ENOENT") throw error; }
 const dataDir = await fs.mkdtemp(path.join(output, "workspace-"));
 const executable = path.resolve(process.argv[3] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe"));
-const legal = path.resolve(process.argv[4] || path.join(root, "data/runtime/legal_core.sqlite"));
+const legal = path.resolve(process.argv[4] || process.env.LAWYER_AUDIT_LEGAL_DB || path.join(process.env.LAWYER_AUDIT_CORPUS || path.join(root, "work/retest-121/public-corpus"), "legal_core.sqlite"));
 const count = Number(process.argv[5] || 10);
 assert(Number.isInteger(count) && count >= 3 && count <= 100);
 const samples = [];

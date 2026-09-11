@@ -61,18 +61,38 @@ try {
     assert(text.trim().length > 8);
     assert.notEqual(text, "请求未完成，请稍后重试。");
   });
-  for (const [name, markup] of [
-    ["nested_unknown", '<div><img src=x onerror="window.injected=1"><a href="javascript:window.injected=1" onclick="window.injected=1">合成链接</a></div>'],
-    ["deep_unknown", '<custom-a><custom-b><p onmouseover="window.injected=1">合成文本</p><script>window.injected=1</script></custom-b></custom-a>']
+  for (const [name, markup, expectedText, assertSafeContent] of [
+    ["nested_unknown", '<div><img src=x onerror="window.injected=1"><a href="javascript:window.injected=1" onclick="window.injected=1">合成链接</a></div>', "合成链接", null],
+    ["deep_unknown", '<custom-a><custom-b><p id="unsafe-id" class="unsafe-class" style="color:red" onmouseover="window.injected=1">合成文本</p><a href="data:text/html,unsafe">数据链接</a><script>window.injected=1</script><style>body{outline:1px solid red}</style><iframe></iframe><object></object><svg></svg></custom-b></custom-a>', "合成文本数据链接", null],
+    ["safe_content", '<custom-a><p id="unsafe-id" class="unsafe-class" style="color:red">安全段落 <strong>保留强调</strong></p><a href="https://example.com/ok">安全链接</a><ol start="3"><li>第三项</li></ol></custom-a>', "安全段落 保留强调安全链接第三项", { href: "https://example.com/ok", target: "_blank", rel: "noopener noreferrer", start: "3" }]
   ]) await check(`R10_${name}`, async () => {
     const actual = await page.evaluate(markup => {
       const target = document.getElementById("target");
       target.replaceChildren(...subject.sanitizeRenderedHtml(markup));
-      return { unsafe: [...target.querySelectorAll("*")].flatMap(element => [...element.attributes].filter(a => a.name.startsWith("on") || (a.name === "href" && !/^https?:\/\//i.test(a.value))).map(a => a.name)), dangerous: target.querySelectorAll("script,img,iframe,svg").length, text: target.textContent };
+      const descendants = [...target.querySelectorAll("*")];
+      const unsafeAttributes = descendants.flatMap(element => [...element.attributes]
+        .filter(attribute => attribute.name.startsWith("on")
+          || ["style", "class", "id"].includes(attribute.name)
+          || (attribute.name === "href" && !/^https?:\/\//i.test(attribute.value)))
+        .map(attribute => `${element.tagName.toLowerCase()}.${attribute.name}`));
+      return {
+        unsafe: unsafeAttributes,
+        dangerous: descendants.filter(element => ["base", "embed", "iframe", "link", "meta", "object", "script", "style", "svg", "img"].includes(element.tagName.toLowerCase())).map(element => element.tagName.toLowerCase()),
+        wrappers: descendants.filter(element => ["custom-a", "custom-b"].includes(element.tagName.toLowerCase())).map(element => element.tagName.toLowerCase()),
+        safe: {
+          href: target.querySelector("a")?.getAttribute("href") || "",
+          target: target.querySelector("a")?.getAttribute("target") || "",
+          rel: target.querySelector("a")?.getAttribute("rel") || "",
+          start: target.querySelector("ol")?.getAttribute("start") || ""
+        },
+        text: target.textContent
+      };
     }, markup);
     assert.deepEqual(actual.unsafe, []);
-    assert.equal(actual.dangerous, 0);
-    assert.match(actual.text, /合成/);
+    assert.deepEqual(actual.dangerous, []);
+    assert.deepEqual(actual.wrappers, []);
+    assert.equal(actual.text, expectedText);
+    if (assertSafeContent) assert.deepEqual(actual.safe, assertSafeContent);
   });
 } finally {
   await browser.close();

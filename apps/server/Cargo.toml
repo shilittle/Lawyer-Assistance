@@ -8,6 +8,10 @@ license.workspace = true
 name = "lawyer-assistance"
 path = "src/main.rs"
 
+[features]
+# Propagate the default-off test worker fault path only when an isolated test binary is built.
+document-worker-fault-injection = ["workspace-service/document-worker-fault-injection"]
+
 [dependencies]
 async-trait = "0.1"
 workspace-service.workspace = true

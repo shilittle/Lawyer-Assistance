@@ -4,7 +4,7 @@
 
 Lawyer Assistance 是一个 Windows 本机单用户法律工具。它由一个 Rust 后台服务、一个普通 HTML WebUI 和一个可独立运行的 MCP 程序组成，核心工作是材料脱敏和本地法律检索。
 
-当前本地修复候选版为 `1.2.1`，保留 AI 脱敏、法律检索、文书写作和会话，修复审查报告中的任务绑定、草稿恢复、检索一致性、资源限制、PDF 隔离、引用与上下文问题。逐项状态和验收证据见[1.2.1 审查修复报告](docs/web/audit-1.2.1.md)。便携包尚未作为 GitHub Release 发布。
+当前本地修复候选版为 `1.2.1`，保留 AI 脱敏、法律检索、文书写作和会话，修复审查报告中的任务绑定、草稿恢复、检索一致性、资源限制、PDF 隔离、引用与上下文问题。独立复测后的续修状态见[1.2.1 续修记录](docs/web/retest-1.2.1.md)，最终证据见随包验收报告；[上一轮报告](docs/web/audit-1.2.1.md)保留为历史记录。便携包尚未作为 GitHub Release 发布。
 
 ## 功能
 
@@ -22,7 +22,7 @@ Lawyer Assistance 是一个 Windows 本机单用户法律工具。它由一个 R
 
 ## 便携运行
 
-便携包由 `scripts/package_portable.py` 在本地生成，文件名为 `Lawyer-Assistance_1.2.1_windows-x86_64-portable.zip`。当前交付方式是 ZIP、同名 `.zip.sha256` 和包内 JSON 清单一起交付；不表示 GitHub Release 已发布。Windows x86_64 便携包包含两个 release 程序、`legal_core.sqlite` 法律库、`judicial_cases.sqlite` 案例库、案例来源说明和发行清单、许可证/第三方 notices、派生检索索引、Pdfium、Typst、中文字体、当前文档和 MCP 示例、`Lawyer-Assistance.vbs` 以及 `Stop-Lawyer-Assistance.vbs`。解压后双击启动脚本；脚本通过 `wscript.exe` 隐藏窗口执行：
+便携包由 `scripts/package_portable.py` 在本地生成，文件名为 `Lawyer-Assistance_1.2.1_windows-x86_64-portable.zip`。本轮续修交付的文件名另附日期和提交。当前交付方式是 ZIP、同名 `.zip.sha256` 和包内 JSON 清单一起交付；不表示 GitHub Release 已发布。Windows x86_64 便携包包含两个 release 程序、`legal_core.sqlite` 法律库、`judicial_cases.sqlite` 案例库、案例来源说明和发行清单、许可证/第三方 notices、派生检索索引、Pdfium、Typst、中文字体、当前文档和 MCP 示例、`Lawyer-Assistance.vbs` 以及 `Stop-Lawyer-Assistance.vbs`。解压后双击启动脚本；脚本通过 `wscript.exe` 隐藏窗口执行：
 
 ```powershell
 lawyer-assistance.exe serve --open --port 8877 --data-dir "$env:LOCALAPPDATA\LawyerAssistanceWeb" --legal-db "<package>\data\runtime\legal_core.sqlite"

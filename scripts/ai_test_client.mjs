@@ -22,7 +22,7 @@ export class Client {
   async login(token){const r=await this.request('/api/v1/session','POST',{token});this.csrf=r.csrf_token;}
   async waitRun(id,timeout=1800000){const start=Date.now();let previous='';while(Date.now()-start<timeout){const r=await this.request(`/api/v1/ai/runs/${id}`);if(r.stage!==previous){console.log(JSON.stringify({run:id,status:r.status,stage:r.stage}));previous=r.stage;}if(!['queued','running'].includes(r.status))return r;await sleep(1500);}throw new Error('run_timeout');}
 }
-export async function startServer(dataDir,executable=path.join(root,'target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe'),legalDb=path.join(root,'data/runtime/legal_core.sqlite'),options={}) {
+export async function startServer(dataDir,executable=path.join(root,'target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe'),legalDb=process.env.LAWYER_AUDIT_LEGAL_DB || path.join(process.env.LAWYER_AUDIT_CORPUS || path.join(root,'data/runtime'),'legal_core.sqlite'),options={}) {
   if(!options.portable){const info=fs.statSync(executable);const copied=path.join(root,'output/ai-test-bin',`${info.size}-${Math.trunc(info.mtimeMs)}-${process.pid}`,'lawyer-assistance.exe');fs.mkdirSync(path.dirname(copied),{recursive:true});if(!fs.existsSync(copied))fs.copyFileSync(executable,copied);executable=copied;}
   fs.mkdirSync(dataDir,{recursive:true});const log=fs.openSync(path.join(dataDir,'server-test.log'),'a');
   const env={...process.env};if(options.portable){delete env.LAWYER_RUNTIME_TOOLS;delete env.LAWYER_ASSISTANCE_PDFIUM;}else env.LAWYER_RUNTIME_TOOLS=path.join(root,'output/runtime-tools');

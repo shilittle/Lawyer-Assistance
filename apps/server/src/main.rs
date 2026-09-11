@@ -29,6 +29,11 @@ enum Command {
     Stop,
     #[command(name = "document-worker", hide = true)]
     DocumentWorker,
+    #[cfg(feature = "document-worker-fault-injection")]
+    #[command(name = "document-worker-fault", hide = true)]
+    DocumentWorkerFault {
+        mode: String,
+    },
 }
 #[derive(Serialize, Deserialize)]
 struct Connection {
@@ -207,6 +212,10 @@ fn legal_path(cli: &Cli) -> Result<PathBuf> {
 async fn run(cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Command::DocumentWorker)) {
         return workspace_service::run_internal_document_worker();
+    }
+    #[cfg(feature = "document-worker-fault-injection")]
+    if let Some(Command::DocumentWorkerFault { mode }) = cli.command.as_ref() {
+        return workspace_service::run_internal_document_worker_fault(mode);
     }
     let root = root(&cli)?;
     if matches!(cli.command, Some(Command::Login)) {

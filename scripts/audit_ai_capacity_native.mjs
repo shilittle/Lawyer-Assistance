@@ -22,7 +22,7 @@ let providerId;
 const runs = [];
 const checks = [];
 try {
-  service = await startServer(directory, path.resolve(process.argv[2] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe")), path.join(root, "data/runtime/legal_core.sqlite"), { portable: true });
+  service = await startServer(directory, path.resolve(process.argv[2] || path.join(root, "target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe")), path.resolve(process.env.LAWYER_AUDIT_LEGAL_DB || path.join(process.env.LAWYER_AUDIT_CORPUS || path.join(root, "work/retest-121/public-corpus"), "legal_core.sqlite")), { portable: true });
   const client = service.client;
   const provider = await client.request("/api/v1/ai/providers", "POST", { preset: "custom", name: "容量验收本机 mock", base_url: `http://127.0.0.1:${mock.address().port}/v1`, enabled_models: ["audit-mock"], api_key: "audit-synthetic-only", allow_private_network: true, trust_raw: false });
   providerId = provider.id;

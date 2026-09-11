@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,10 +131,78 @@ class AuditValidateTests(unittest.TestCase):
                 "missing-probe", "test", ("audit-command-that-does-not-exist",), "probe.log"
             )
             record = audit_validate.run_command_check(spec, context)
-            self.assertEqual("failed", record["status"])
+            self.assertEqual("blocked", record["status"])
             self.assertIsNone(record["exit_code"])
             self.assertEqual("FileNotFoundError", record["launch_exception"]["type"])
             self.assertTrue((output / "logs" / "missing-probe.log").is_file())
+            self.assertEqual(audit_validate.sha256_file(output / "logs" / "missing-probe.log"), record["log_sha256"])
+
+    def test_corpus_override_binds_resources_and_native_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, resources = root / "independent-copy", root / "tools"
+            corpus.mkdir()
+            resources.mkdir()
+            for name in ("legal_core.sqlite", "judicial_cases.sqlite", "legal_search_index.sqlite"):
+                (corpus / name).write_bytes(("synthetic " + name).encode())
+            for relative in audit_validate.AI_RUNTIME_FILES:
+                target = resources / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"synthetic resource")
+            document = [{"path": name, "sha256": audit_validate.sha256_file(resources / name)} for name in ("typst.exe", "fonts/SourceHanSerifSC-Regular.otf", "fonts/SourceHanSerifSC-Bold.otf")]
+            (resources / "document-runtime.json").write_text(json.dumps(document), encoding="utf-8")
+            (resources / "pdfium.version.json").write_text(json.dumps({"dll_sha256": audit_validate.sha256_file(resources / "pdfium.dll")}), encoding="utf-8")
+            context = audit_validate.AuditContext(root, resources, root / "evidence", root / "server.exe", root / "mcp.exe", corpus=corpus)
+            evidence = {"manifest_payloads": {}}
+            result = audit_validate.check_runtime_resources(context, evidence)
+            self.assertEqual("passed", result["status"])
+            self.assertEqual({str(corpus / name) for name in ("legal_core.sqlite", "judicial_cases.sqlite", "legal_search_index.sqlite")}, {entry["absolute_path"] for entry in evidence["resources"][:3]})
+            probe = "import os,json; print(json.dumps({k:os.environ[k] for k in ['LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE','LAWYER_AUDIT_CORPUS','LAWYER_AUDIT_LEGAL_DB']}))"
+            spec = audit_validate.CheckSpec("corpus-probe", "native", (sys.executable, "-c", probe), "probe.log")
+            record = audit_validate.run_command_check(spec, context)
+            self.assertEqual("passed", record["status"])
+            values = json.loads((context.output / "logs/corpus-probe.log").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(str(corpus), values["LAWYER_AUDIT_CORPUS"])
+            self.assertEqual(str(corpus / "legal_core.sqlite"), values["LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE"])
+            self.assertEqual(values["LAWYER_ASSISTANCE_FORMAL_LEGAL_CORE"], values["LAWYER_AUDIT_LEGAL_DB"])
+
+    def test_native_checks_bind_the_actual_default_and_fault_programs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = audit_validate.AuditContext(root, root, root / "evidence", root / "server.exe", root / "mcp.exe")
+            fault = context.output / "fault-bin" / "lawyer-assistance-fault-test.exe"
+            fault.parent.mkdir(parents=True)
+            context.server_exe.write_bytes(b"default release without fault feature")
+            fault.write_bytes(b"independent fault feature build")
+            expected = {
+                "document-fault-build": [fault],
+                "native-document-faults": [context.server_exe, fault],
+                "native-sanitizer": [context.server_exe],
+                "native-paged-benchmark": [context.server_exe],
+            }
+            for check_id, paths in expected.items():
+                with self.subTest(check_id=check_id):
+                    spec = audit_validate.CheckSpec(check_id, "native", (), "probe.log")
+                    entries = audit_validate.execution_executable_entries(spec, context)
+                    self.assertEqual([str(path) for path in paths], [entry["absolute_path"] for entry in entries])
+                    self.assertEqual([hashlib.sha256(path.read_bytes()).hexdigest() for path in paths], [entry["sha256"] for entry in entries])
+
+    def test_existing_attempt_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = audit_validate.AuditContext(root, root, root / "evidence", root / "server.exe", root / "mcp.exe")
+            report = audit_validate.run_audit(context, only=("preflight:python",))
+            self.assertTrue(report["passed"])
+            report_path = context.output / "final-command-results.json"
+            previous = report_path.read_bytes()
+            with self.assertRaises(FileExistsError):
+                audit_validate.run_audit(context, only=("preflight:python",))
+            self.assertEqual(previous, report_path.read_bytes())
+            # Also preserve attempts produced before audit-attempt.json existed.
+            (context.output / "audit-attempt.json").unlink()
+            with self.assertRaises(FileExistsError):
+                audit_validate.run_audit(context, only=("preflight:python",))
+            self.assertEqual(previous, report_path.read_bytes())
 
     def test_missing_preflight_tool_is_blocked_with_recovery_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -237,6 +306,28 @@ class AuditValidateTests(unittest.TestCase):
                 third["artifact"]["sha256"],
                 hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
             )
+
+    def test_source_manifest_excludes_workspace_and_key_bytes_before_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = ["workspace/draft.txt", "workspace-ABCD/draft.txt", "workspace_abcd/draft.txt", "user-workspace_abcd/case.txt", "browser-profile_abcd/state.json", "user-workspace/case.txt", "browser-profile-1/state.json", "connection.dpapi", "private.key", "apikey.txt"]
+            safe = "crates/workspace-service/src/lib.rs"
+            for relative in [*private, safe]:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"synthetic fixture")
+            init_git_fixture(root)
+            context = audit_validate.AuditContext(root, root, root / "evidence", root / "server.exe", root / "mcp.exe")
+            original = audit_validate.hash_source_entry
+            read_paths = []
+            def checked_read(path, relative, tracked):
+                read_paths.append(relative.as_posix())
+                self.assertNotIn(relative.as_posix(), private)
+                return original(path, relative, tracked)
+            with patch.object(audit_validate, "hash_source_entry", side_effect=checked_read):
+                result = audit_validate.source_manifest_record(context)
+            self.assertEqual("passed", result["status"])
+            self.assertEqual([safe], read_paths)
 
     def test_source_manifest_reports_read_failure_without_claiming_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

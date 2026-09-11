@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.package_portable import (
     CASE_DISTRIBUTION_MANIFEST,
@@ -17,12 +20,23 @@ from scripts.package_portable import (
     build_package,
     launcher_text,
     stop_launcher_text,
+    verify_default_server_binary,
     verify_case_runtime,
     verify_legal_runtime,
 )
 
 
 class PortablePackageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The fixture binaries are deliberately byte stubs.  The probe itself
+        # is covered below with deterministic Clap-shaped subprocess results.
+        self.server_probe = patch(
+            "scripts.package_portable.verify_default_server_binary",
+            autospec=True,
+        )
+        self.server_probe.start()
+        self.addCleanup(self.server_probe.stop)
+
     def fixture(self, directory: str) -> Path:
         root = Path(directory)
         (root / "data/runtime").mkdir(parents=True)
@@ -237,6 +251,99 @@ class PortablePackageTests(unittest.TestCase):
                 stop_launcher = package.read(prefix + "Stop-Lawyer-Assistance.vbs").decode("utf-8")
                 self.assertIn('""" & exe & """ stop', stop_launcher)
                 self.assertIn("shell.Run command, 0, False", stop_launcher)
+
+    def test_label_records_source_commit_and_refuses_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory)
+            label = "20260911-01cf195"
+            result = build_package(root, root / "artifacts", skip_build=True, label=label)
+            self.assertEqual(result.label, label)
+            self.assertEqual(result.source_commit, "unknown")
+            with zipfile.ZipFile(result.archive) as package:
+                prefix = result.package_root + "/"
+                manifest = json.loads(package.read(prefix + "portable.manifest.json"))
+                self.assertEqual(manifest["candidate"], "1.2.1")
+                self.assertEqual(manifest["label"], label)
+                self.assertEqual(manifest["source_commit"], "unknown")
+                self.assertIn(prefix + "docs/web/retest-1.2.1.md", package.namelist())
+            with self.assertRaisesRegex(PackageError, "overwrite"):
+                build_package(root, root / "artifacts", skip_build=True, label=label)
+
+    def test_default_server_probe_accepts_unknown_fault_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = Path(directory) / "lawyer-assistance.exe"
+            server.write_bytes(b"test-binary")
+            result = subprocess.CompletedProcess(
+                [str(server), "document-worker-fault"],
+                2,
+                stdout="error: unrecognized subcommand 'document-worker-fault'",
+            )
+            with patch("scripts.package_portable.subprocess.run", return_value=result):
+                verify_default_server_binary(server)
+
+    def test_default_server_probe_rejects_fault_feature_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = Path(directory) / "lawyer-assistance.exe"
+            server.write_bytes(b"test-binary")
+            result = subprocess.CompletedProcess(
+                [str(server), "document-worker-fault"],
+                2,
+                stdout="error: the following required arguments were not provided: <MODE>",
+            )
+            with patch("scripts.package_portable.subprocess.run", return_value=result):
+                with self.assertRaisesRegex(PackageError, "fault test feature"):
+                    verify_default_server_binary(server)
+
+    def test_independent_corpus_override_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory)
+            corpus = Path(directory) / "independent-corpus"
+            shutil.copytree(root / "data", corpus / "data")
+            expected_database = corpus / "data/runtime/legal_core.sqlite"
+            expected_bytes = expected_database.read_bytes()
+            (root / "data/runtime/legal_core.sqlite").write_bytes(b"root corpus must not be used")
+            result = build_package(
+                root,
+                root / "artifacts",
+                skip_build=True,
+                label="20260911-corpus",
+                corpus=corpus,
+            )
+            with zipfile.ZipFile(result.archive) as package:
+                packaged = package.read(result.package_root + "/data/runtime/legal_core.sqlite")
+            self.assertEqual(packaged, expected_bytes)
+
+    def test_flat_independent_corpus_override_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory)
+            corpus = Path(directory) / "public-corpus"
+            shutil.copytree(root / "data/runtime", corpus)
+            for manifest in (root / "data/generated").iterdir():
+                shutil.copyfile(manifest, corpus / manifest.name)
+            expected_database = corpus / "legal_core.sqlite"
+            expected_bytes = expected_database.read_bytes()
+            (root / "data/runtime/legal_core.sqlite").write_bytes(b"root corpus must not be used")
+            result = build_package(
+                root,
+                root / "artifacts",
+                skip_build=True,
+                label="20260911-flat-corpus",
+                corpus=corpus,
+            )
+            with zipfile.ZipFile(result.archive) as package:
+                packaged = package.read(result.package_root + "/data/runtime/legal_core.sqlite")
+            self.assertEqual(packaged, expected_bytes)
+
+    def test_corpus_symlink_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory)
+            corpus = Path(directory) / "corpus-link"
+            try:
+                corpus.symlink_to(root / "data", target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("directory symlinks are unavailable on this Windows test host")
+            with self.assertRaisesRegex(PackageError, "independent directory"):
+                build_package(root, root / "artifacts", skip_build=True, corpus=corpus)
 
     def test_legal_hash_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

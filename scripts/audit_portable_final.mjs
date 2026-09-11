@@ -6,7 +6,9 @@ import { spawn } from "node:child_process";
 import { root, startServer } from "./ai_test_client.mjs";
 
 const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "portable-final");
-await fs.mkdir(output, { recursive: true });
+await fs.mkdir(path.dirname(output), { recursive: true });
+// One attempt owns its complete logs, unpacked payload and report.
+await fs.mkdir(output);
 const directory = await fs.mkdtemp(path.join(output, "unpacked-"));
 const archive = path.resolve(process.argv[2]);
 const checks = [];
