@@ -8,6 +8,7 @@ import { root, startServer, sleep } from "./ai_test_client.mjs";
 
 const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "search-native");
 await fs.mkdir(output, { recursive: true });
+try { await fs.access(path.join(output, "report.json")); throw new Error("evidence_directory_already_used"); } catch (error) { if (error.code !== "ENOENT") throw error; }
 const directory = await fs.mkdtemp(path.join(output, "fixture-"));
 const legalPath = path.join(directory, "legal.sqlite");
 execFileSync("python", ["-c", String.raw`
@@ -24,6 +25,9 @@ for vid,status,start,end in versions:
 for aid,no,content in [('audit-now-2','第二条','合同成立。'),('audit-now-3','第三条','解除条件。')]:
     c.execute("INSERT INTO law_articles(id,document_id,version_id,article_number,article_order,title,content,updated_on) VALUES(?,?,?,?,?,?,?,?)",(aid,'audit-law','audit-now',no,2 if aid.endswith('2') else 3,'一般规定',content,'2026-09-10'))
 c.execute("INSERT INTO law_aliases(id,document_id,alias,normalized_alias) VALUES('audit-alias','audit-law','合成法','合成法')")
+c.execute("INSERT INTO law_articles(id,document_id,version_id,article_number,article_order,title,content,updated_on) VALUES('audit-now-1-extra','audit-law','audit-now','第一条之一',4,'增设条款','增设合成条款。','2026-09-11')")
+for n,did in enumerate(['audit-law','old-contract-law']):
+    c.execute("INSERT INTO law_aliases(id,document_id,alias,normalized_alias) VALUES(?,?,?,?)",('audit-ambiguous-'+str(n),did,'歧义合成法','歧义合成法'))
 c.commit(); c.close()
 `, root, legalPath], { windowsHide: true, encoding: "utf8" });
 
@@ -55,6 +59,19 @@ try {
     assert.equal(result.totalArticles, 1);
   }
   checks.push("exact_law_and_article_intersection_chinese_arabic_fullwidth");
+  for (const query of ["合成法第一条之一", "合成法第1条之1", "合成法第１条之１"]) {
+    const result = await page({ query });
+    assert.deepEqual(ids(result), ["audit-now-1-extra"]);
+    assert.equal(result.totalArticles, 1);
+  }
+  checks.push("exact_added_article_and_unique_alias");
+  const ambiguous = await page({ query: "歧义合成法第一条" });
+  assert.equal(ambiguous.totalArticles, 0);
+  assert.equal(ambiguous.ambiguities[0].candidates.length, 2);
+  assert(ambiguous.warnings.includes("ambiguous_law_name"));
+  const chosen = await page({ query: "歧义合成法第一条", document_id: "audit-law" });
+  assert.deepEqual(ids(chosen), ["audit-now-1"]);
+  checks.push("ambiguous_alias_requires_and_respects_explicit_choice");
   const all = await page({ query: "合同 解除", document_id: "audit-law", match_mode: "all" });
   const any = await page({ query: "合同 解除", document_id: "audit-law", match_mode: "any" });
   const phrase = await page({ query: "合同解除", document_id: "audit-law", match_mode: "phrase" });
@@ -72,6 +89,7 @@ try {
   assert.deepEqual(ids(broad), ["audit-future-1", "audit-now-1", "audit-old-1", "audit-unknown-1"]);
   const boundary = await page({ query: "合成标记", case_date: "2020-12-31", version_scope: "as_of" });
   assert.deepEqual(ids(boundary), ["audit-old-1"]);
+  assert.deepEqual(ids(await page({ query: "合成标记", case_date: "2021-01-01", version_scope: "as_of" })), ["audit-now-1"]);
   checks.push("current_historical_grouped_unknown_and_date_boundary");
   const oldDetail = await client.request("/api/v1/legal/articles/audit-old-1?version_scope=as_of&case_date=2019-12-31");
   assert.equal(oldDetail.article.versionId, "audit-old");

@@ -154,10 +154,16 @@ pub struct LegalLawNameCandidate {
 pub struct LegalSearchMetrics {
     pub candidate_count: u64,
     pub index_fallback: bool,
+    pub index_fallback_reason: Option<String>,
     pub cache_hit: bool,
     pub count_cache_hit: bool,
     pub cache_retained_bytes: u64,
     pub lock_wait_ms: u64,
+    pub plan_ms: u64,
+    pub index_ms: u64,
+    pub count_ms: u64,
+    pub page_ms: u64,
+    pub total_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,10 +566,16 @@ fn into_legal_metrics(value: SearchMetrics) -> LegalSearchMetrics {
     LegalSearchMetrics {
         candidate_count: value.candidate_count,
         index_fallback: value.index_fallback,
+        index_fallback_reason: value.index_fallback_reason,
         cache_hit: value.cache_hit,
         count_cache_hit: value.count_cache_hit,
         cache_retained_bytes: value.cache_retained_bytes,
         lock_wait_ms: value.lock_wait_ms,
+        plan_ms: value.plan_ms,
+        index_ms: value.index_ms,
+        count_ms: value.count_ms,
+        page_ms: value.page_ms,
+        total_ms: value.total_ms,
     }
 }
 
@@ -664,15 +676,27 @@ mod tests {
             metrics: LegalSearchMetrics {
                 candidate_count: 0,
                 index_fallback: false,
+                index_fallback_reason: None,
                 cache_hit: false,
                 count_cache_hit: false,
                 cache_retained_bytes: 0,
                 lock_wait_ms: 0,
+                plan_ms: 0,
+                index_ms: 0,
+                count_ms: 0,
+                page_ms: 0,
+                total_ms: 0,
             },
         })
         .expect("response fields serialize");
         assert_eq!(encoded["totalLaws"], 2);
         assert_eq!(encoded["totalArticles"], 3);
+        assert!(encoded["metrics"].get("indexFallbackReason").is_some());
+        assert_eq!(encoded["metrics"]["planMs"], 0);
+        assert_eq!(encoded["metrics"]["indexMs"], 0);
+        assert_eq!(encoded["metrics"]["countMs"], 0);
+        assert_eq!(encoded["metrics"]["pageMs"], 0);
+        assert_eq!(encoded["metrics"]["totalMs"], 0);
     }
 
     #[test]

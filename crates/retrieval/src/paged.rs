@@ -33,9 +33,23 @@ pub const SEARCH_INDEX_FILE_NAME: &str = "legal_search_index.sqlite";
 // literal SQL path instead of expanding an unbounded IN list.  This is a
 // performance fallback, never a result cap.
 const MAX_INDEX_BOUND_CANDIDATES: usize = 900;
-// A complete result set is cached only when it is small enough to retain its
-// full payload safely.  Larger searches continue to use the exact paged SQL
-// path; they are never truncated just to make them cacheable.
+// Keep the derived-index probe below the smallest variable limit supported by
+// the SQLite builds we ship.  This is separate from the candidate-row bound:
+// too many distinct required bigrams must take the complete source-SQL path,
+// never truncate the query to fit the IN list.
+const MAX_INDEX_QUERY_PARAMETERS: usize = 900;
+// The source query must remain valid on SQLite builds using the historical
+// 999-variable limit.  Index candidates consume this same budget alongside
+// score, filter, match, and pagination parameters, so a safe probe can still
+// require a complete source-SQL fallback.
+const MAX_SQLITE_PARAMETERS: usize = 999;
+const FALLBACK_REASON_INDEX_UNAVAILABLE: &str = "index_unavailable";
+const FALLBACK_REASON_UNSUPPORTED_TERM: &str = "unsupported_term";
+const FALLBACK_REASON_CANDIDATE_LIMIT: &str = "candidate_limit";
+const FALLBACK_REASON_PARAMETER_LIMIT: &str = "parameter_limit";
+// Only bounded page payloads and exact count results are cached. Larger
+// searches continue to use the exact paged SQL path; they are never
+// truncated just to make them cacheable.
 /// The cache retains rendered *pages*, never complete result sets.  The
 /// values below are deliberately byte budgets rather than result-count
 /// budgets: legal article bodies and snippets have highly variable sizes.
@@ -152,10 +166,21 @@ pub struct PagedSearchResponse {
 pub struct SearchMetrics {
     pub candidate_count: u64,
     pub index_fallback: bool,
+    pub index_fallback_reason: Option<String>,
     pub cache_hit: bool,
     pub count_cache_hit: bool,
     pub cache_retained_bytes: u64,
     pub lock_wait_ms: u64,
+    /// Milliseconds spent compiling the normalized query plan.
+    pub plan_ms: u64,
+    /// Milliseconds spent probing the optional derived index.
+    pub index_ms: u64,
+    /// Milliseconds spent obtaining the exact total counts.
+    pub count_ms: u64,
+    /// Milliseconds spent rendering the requested page.
+    pub page_ms: u64,
+    /// End-to-end retrieval time, including planning and cache coordination.
+    pub total_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -449,92 +474,183 @@ impl SearchIndex {
     }
 
     /// Return a bounded candidate set.  `All` and `Phrase` intersect the
-    /// bigrams belonging to every term; `Any` unions per-term intersections.
-    /// Literal SQL predicates still verify every selected source row.
+    /// *complete* set of required bigrams in one SQLite query; `Any` unions
+    /// per-term intersections.  Literal SQL predicates still verify every
+    /// selected source row.
     ///
-    /// The bound is only a probe: once the index proves that a term has more
-    /// than `MAX_INDEX_BOUND_CANDIDATES` candidates, `indexed_candidates`
-    /// returns `None` and the authoritative query scans all source rows.  It
-    /// therefore cannot truncate a legal result set.  Keeping the probe
-    /// bounded avoids reading millions of rowids merely to decide to fall
-    /// back for common terms.
+    /// The bound is only a probe: once the index proves that the final
+    /// candidate set has more than `MAX_INDEX_BOUND_CANDIDATES` rows, the
+    /// caller receives `None` and the authoritative query scans all source
+    /// rows.  It therefore cannot truncate a legal result set.  Keeping the
+    /// probe bounded avoids reading millions of rowids merely to decide to
+    /// fall back for common terms.
+    #[cfg(test)]
     fn article_rowids_for_terms(
         &self,
         terms: &[String],
         match_mode: SearchMatchMode,
     ) -> Result<Option<Vec<i64>>, RetrievalError> {
+        Ok(self
+            .article_rowids_for_terms_with_reason(terms, match_mode, None)?
+            .rowids)
+    }
+
+    fn article_rowids_for_terms_with_reason(
+        &self,
+        terms: &[String],
+        match_mode: SearchMatchMode,
+        cancellation: Option<&SearchCancellation>,
+    ) -> Result<IndexCandidateProbe, RetrievalError> {
+        ensure_index_probe_not_cancelled(cancellation)?;
         let mut term_bigrams = Vec::new();
         for term in terms {
             let chars = term.chars().collect::<Vec<_>>();
             if chars.len() < 2 || !chars.iter().copied().all(is_cjk_ideograph) {
-                return Ok(None);
+                return Ok(IndexCandidateProbe::fallback(
+                    FALLBACK_REASON_UNSUPPORTED_TERM,
+                ));
             }
             let mut bigrams = HashSet::new();
             for pair in chars.windows(2) {
                 bigrams.insert(pair.iter().collect::<String>());
             }
-            term_bigrams.push(bigrams.into_iter().collect::<Vec<_>>());
+            let mut bigrams = bigrams.into_iter().collect::<Vec<_>>();
+            bigrams.sort_unstable();
+            term_bigrams.push(bigrams);
         }
         if term_bigrams.is_empty() {
-            return Ok(None);
+            return Ok(IndexCandidateProbe::default());
         }
-        let mut per_term = Vec::with_capacity(term_bigrams.len());
-        for bigrams in term_bigrams {
-            let Some(rows) = self.article_rowids_for_bigrams(&bigrams)? else {
-                // A bounded posting list cannot prove a complete
-                // intersection/union.  Fall back to literal source SQL;
-                // never intersect an arbitrary first 901 rows.
-                return Ok(None);
-            };
-            per_term.push(rows);
-        }
-        let rows = match match_mode {
-            SearchMatchMode::Any => per_term.into_iter().flatten().collect::<HashSet<_>>(),
+
+        match match_mode {
             SearchMatchMode::All | SearchMatchMode::Phrase => {
-                let mut iter = per_term.into_iter();
-                let Some(first) = iter.next() else {
-                    return Ok(None);
-                };
-                iter.fold(
-                    first.into_iter().collect::<HashSet<_>>(),
-                    |matched, rows| {
-                        matched
-                            .intersection(&rows.into_iter().collect())
-                            .copied()
-                            .collect()
-                    },
-                )
+                // A row must contain every unique bigram from every term.
+                // Doing this as one GROUP BY is essential: probing each term
+                // separately would reject a small intersection merely because
+                // one individual posting list is common (>900 rows).
+                let mut required_bigrams = HashSet::new();
+                for bigrams in term_bigrams {
+                    required_bigrams.extend(bigrams);
+                }
+                let mut required_bigrams = required_bigrams.into_iter().collect::<Vec<_>>();
+                required_bigrams.sort_unstable();
+                self.article_rowids_for_bigrams_with_reason(&required_bigrams, cancellation)
             }
-        };
-        let mut rows = rows.into_iter().collect::<Vec<_>>();
-        rows.sort_unstable();
-        Ok(Some(rows))
+            SearchMatchMode::Any => {
+                let mut rows = HashSet::new();
+                for bigrams in term_bigrams {
+                    let probe =
+                        self.article_rowids_for_bigrams_with_reason(&bigrams, cancellation)?;
+                    let Some(term_rows) = probe.rowids else {
+                        // A bounded posting list cannot prove a complete
+                        // union.  Fall back to literal source SQL; never
+                        // union an arbitrary first 901 rows.
+                        return Ok(probe);
+                    };
+                    rows.extend(term_rows);
+                    // The union is itself the candidate set for ANY.  Keep
+                    // the same bounded probe contract after each term; a
+                    // union of individually small postings can still exceed
+                    // the safe rowid bind budget.
+                    if rows.len() > MAX_INDEX_BOUND_CANDIDATES {
+                        return Ok(IndexCandidateProbe::fallback(
+                            FALLBACK_REASON_CANDIDATE_LIMIT,
+                        ));
+                    }
+                }
+                ensure_index_probe_not_cancelled(cancellation)?;
+                let mut rows = rows.into_iter().collect::<Vec<_>>();
+                rows.sort_unstable();
+                Ok(IndexCandidateProbe::candidates(rows))
+            }
+        }
     }
 
-    fn article_rowids_for_bigrams(
+    fn article_rowids_for_bigrams_with_reason(
         &self,
         bigrams: &[String],
-    ) -> Result<Option<Vec<i64>>, RetrievalError> {
+        cancellation: Option<&SearchCancellation>,
+    ) -> Result<IndexCandidateProbe, RetrievalError> {
+        ensure_index_probe_not_cancelled(cancellation)?;
         if bigrams.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(IndexCandidateProbe::candidates(Vec::new()));
+        }
+        if bigrams.len() > MAX_INDEX_QUERY_PARAMETERS {
+            return Ok(IndexCandidateProbe::fallback(
+                FALLBACK_REASON_PARAMETER_LIMIT,
+            ));
         }
         let placeholders = (0..bigrams.len())
             .map(|index| format!("?{}", index + 1))
             .collect::<Vec<_>>()
             .join(", ");
         let values = bigrams.iter().cloned().map(Value::Text).collect::<Vec<_>>();
-        let mut statement = self.connection.prepare(&format!(
-            "SELECT article_rowid FROM article_bigrams WHERE bigram IN ({placeholders}) GROUP BY article_rowid HAVING COUNT(DISTINCT bigram) = {} LIMIT {}",
-            bigrams.len(), MAX_INDEX_BOUND_CANDIDATES + 1
-        ))?;
-        let rows = statement
-            .query_map(params_from_iter(values.iter()), |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT article_rowid FROM article_bigrams WHERE bigram IN ({placeholders}) GROUP BY article_rowid HAVING COUNT(DISTINCT bigram) = {} LIMIT {}",
+                bigrams.len(), MAX_INDEX_BOUND_CANDIDATES + 1
+            ))
+            .map_err(|error| index_probe_sqlite_error(error, cancellation))?;
+        let mapped = statement
+            .query_map(params_from_iter(values.iter()), |row| row.get::<_, i64>(0))
+            .map_err(|error| index_probe_sqlite_error(error, cancellation))?;
+        let rows = mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| index_probe_sqlite_error(error, cancellation))?;
+        ensure_index_probe_not_cancelled(cancellation)?;
         if rows.len() > MAX_INDEX_BOUND_CANDIDATES {
-            Ok(None)
+            Ok(IndexCandidateProbe::fallback(
+                FALLBACK_REASON_CANDIDATE_LIMIT,
+            ))
         } else {
-            Ok(Some(rows))
+            let mut rows = rows;
+            rows.sort_unstable();
+            Ok(IndexCandidateProbe::candidates(rows))
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct IndexCandidateProbe {
+    rowids: Option<Vec<i64>>,
+    fallback_reason: Option<&'static str>,
+}
+
+impl IndexCandidateProbe {
+    fn candidates(rowids: Vec<i64>) -> Self {
+        Self {
+            rowids: Some(rowids),
+            fallback_reason: None,
+        }
+    }
+
+    fn fallback(reason: &'static str) -> Self {
+        Self {
+            rowids: None,
+            fallback_reason: Some(reason),
+        }
+    }
+}
+
+fn ensure_index_probe_not_cancelled(
+    cancellation: Option<&SearchCancellation>,
+) -> Result<(), RetrievalError> {
+    if cancellation.is_some_and(SearchCancellation::is_cancelled) {
+        Err(RetrievalError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn index_probe_sqlite_error(
+    error: rusqlite::Error,
+    cancellation: Option<&SearchCancellation>,
+) -> RetrievalError {
+    if cancellation.is_some_and(SearchCancellation::is_cancelled) {
+        RetrievalError::Cancelled
+    } else {
+        RetrievalError::Sqlite(error)
     }
 }
 
@@ -965,6 +1081,7 @@ fn search_page_inner(
     request: PagedSearchRequest,
     cancellation: &SearchCancellation,
 ) -> Result<PagedSearchResponse, RetrievalError> {
+    let total_started = Instant::now();
     if cancellation.is_cancelled() {
         return Err(RetrievalError::Cancelled);
     }
@@ -973,8 +1090,10 @@ fn search_page_inner(
     // caller token installed until it has either left at a cache hit or been
     // attached to a shared flight; it must not leak into that flight's work.
     let caller_registration = cancellation.register_connection(connection)?;
+    let plan_started = Instant::now();
     install_unicode_fold(connection)?;
     let plan = compile_query_plan(connection, &request)?;
+    let plan_ms = elapsed_millis(plan_started);
     if !plan.ambiguities.is_empty() {
         return Ok(PagedSearchResponse {
             view: request.view,
@@ -988,7 +1107,11 @@ fn search_page_inner(
             warnings: vec!["ambiguous_law_name".to_owned()],
             applied_query: plan.applied,
             ambiguities: plan.ambiguities,
-            metrics: SearchMetrics::default(),
+            metrics: SearchMetrics {
+                plan_ms,
+                total_ms: elapsed_millis(total_started),
+                ..SearchMetrics::default()
+            },
         });
     }
 
@@ -1006,6 +1129,18 @@ fn search_page_inner(
                 cached.applied_query = plan.applied;
                 cached.ambiguities = plan.ambiguities;
                 cached.metrics.cache_hit = true;
+                // A cache hit did not perform the owner's index/count/page
+                // work.  Do not attribute those measurements or candidate
+                // rows to this request.
+                cached.metrics.candidate_count = 0;
+                cached.metrics.index_fallback = false;
+                cached.metrics.index_fallback_reason = None;
+                cached.metrics.count_cache_hit = false;
+                cached.metrics.plan_ms = plan_ms;
+                cached.metrics.index_ms = 0;
+                cached.metrics.count_ms = 0;
+                cached.metrics.page_ms = 0;
+                cached.metrics.total_ms = elapsed_millis(total_started);
                 cached.metrics.lock_wait_ms = wait_ms;
                 cached.metrics.cache_retained_bytes = search_cache_retained_bytes();
                 return Ok(cached);
@@ -1024,61 +1159,73 @@ fn search_page_inner(
     let active_cancellation = shared_cancellation.as_ref().unwrap_or(cancellation);
     let mut flight_guard = SearchFlightGuard::new(cache_key.clone(), cancellation, owned_flight);
     let _source_registration = active_cancellation.register_connection(connection)?;
-    let (result, candidate_count, index_fallback, count_cache_hit) =
+    let mut index_ms = 0;
+    let mut count_ms = 0;
+    let page_ms;
+    let (result, candidate_count, index_fallback, index_fallback_reason, count_cache_hit) =
         if let Some(exact) = plan.exact.as_ref() {
-            (
-                search_exact_page(connection, &plan.request, exact),
-                0,
-                false,
-                false,
-            )
+            let page_started = Instant::now();
+            let result = search_exact_page(connection, &plan.request, exact);
+            page_ms = elapsed_millis(page_started);
+            (result, 0, false, None, false)
         } else {
+            let index_started = Instant::now();
             let candidates = indexed_candidates(index, &plan.request, active_cancellation)?;
+            index_ms = elapsed_millis(index_started);
             let candidate_count = candidates.candidate_count;
             let index_fallback = candidates.index_fallback;
+            let index_fallback_reason = candidates.index_fallback_reason.clone();
+            let count_started = Instant::now();
             let (counts, count_cache_hit) = cached_article_match_counts(
                 connection,
                 cache_key.as_ref(),
                 candidates.rowids.as_deref(),
                 &plan.request,
             )?;
-            match plan.request.view {
-                SearchView::Grouped => (
-                    search_grouped_with_candidates(
-                        connection,
-                        &plan.request,
-                        candidates.rowids.as_deref(),
-                        Some(counts),
-                    ),
-                    candidate_count,
-                    index_fallback,
-                    count_cache_hit,
+            count_ms = elapsed_millis(count_started);
+            let page_started = Instant::now();
+            let result = match plan.request.view {
+                SearchView::Grouped => search_grouped_with_candidates(
+                    connection,
+                    &plan.request,
+                    candidates.rowids.as_deref(),
+                    Some(counts),
                 ),
-                SearchView::Flat => (
-                    search_flat_with_candidates_page(
-                        connection,
-                        &plan.request,
-                        candidates.rowids.as_deref(),
-                        Some(counts),
-                    ),
-                    candidate_count,
-                    index_fallback,
-                    count_cache_hit,
+                SearchView::Flat => search_flat_with_candidates_page(
+                    connection,
+                    &plan.request,
+                    candidates.rowids.as_deref(),
+                    Some(counts),
                 ),
-            }
+            };
+            page_ms = elapsed_millis(page_started);
+            (
+                result,
+                candidate_count,
+                index_fallback,
+                index_fallback_reason,
+                count_cache_hit,
+            )
         };
 
     let mut result = result?;
     result.metrics = SearchMetrics {
         candidate_count,
         index_fallback,
+        index_fallback_reason,
         cache_hit: false,
         count_cache_hit,
         cache_retained_bytes: 0,
         lock_wait_ms: cache_wait_ms,
+        plan_ms,
+        index_ms,
+        count_ms,
+        page_ms,
+        total_ms: elapsed_millis(total_started),
     };
     flight_guard.finish(Some(result.clone()));
     result.metrics.cache_retained_bytes = search_cache_retained_bytes();
+    result.metrics.total_ms = elapsed_millis(total_started);
     result.applied_query = plan.applied;
     result.ambiguities = plan.ambiguities;
     Ok(result)
@@ -1132,39 +1279,49 @@ fn compile_query_plan(
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             match candidates.as_slice() {
-                [(document_id, _)] => {
-                    if let Some(filtered) = normalized.document_id.as_deref() {
-                        if filtered != document_id {
-                            return Err(RetrievalError::InvalidRequest(
-                                "document_id conflicts with the resolved law name".to_owned(),
-                            ));
-                        }
-                    }
-                    normalized.document_id = Some(document_id.clone());
-                    // Search the stored canonical Chinese spelling.  The
-                    // comparison below is literal and document-scoped, so
-                    // `第一条` cannot accidentally include `第十条`.
-                    normalized.query = article_number.clone();
-                    normalized.match_mode = SearchMatchMode::Phrase;
-                    applied = applied_query_for(
-                        &normalized,
-                        Some(document_id.clone()),
-                        Some(article_number.clone()),
-                    );
-                    exact = Some(ExactArticlePlan {
-                        document_id: document_id.clone(),
-                        arabic_article_number,
-                        article_number,
-                    });
-                }
+                [(document_id, _)] => apply_exact_article_plan(
+                    &mut normalized,
+                    &mut applied,
+                    &mut exact,
+                    document_id,
+                    &article_number,
+                    &arabic_article_number,
+                )?,
                 [] => {
                     // The request contains a syntactically exact selector,
                     // but its law name is absent.  Return no results rather
                     // than silently widening the scope.
+                    if normalized.document_id.is_some() {
+                        return Err(RetrievalError::InvalidRequest(
+                            "document_id is not a candidate for the law name".to_owned(),
+                        ));
+                    }
                     ambiguities.push(LawNameAmbiguity {
                         query: law_name,
                         candidates: Vec::new(),
                     });
+                }
+                _ if normalized.document_id.is_some() => {
+                    let filtered = normalized
+                        .document_id
+                        .as_deref()
+                        .expect("guard ensures document_id is present");
+                    let Some((document_id, _)) = candidates
+                        .iter()
+                        .find(|(document_id, _)| document_id == filtered)
+                    else {
+                        return Err(RetrievalError::InvalidRequest(
+                            "document_id is not a candidate for the law name".to_owned(),
+                        ));
+                    };
+                    apply_exact_article_plan(
+                        &mut normalized,
+                        &mut applied,
+                        &mut exact,
+                        document_id,
+                        &article_number,
+                        &arabic_article_number,
+                    )?;
                 }
                 _ => ambiguities.push(LawNameAmbiguity {
                     query: law_name,
@@ -1179,6 +1336,40 @@ fn compile_query_plan(
         ambiguities,
         exact,
     })
+}
+
+fn apply_exact_article_plan(
+    normalized: &mut PagedSearchRequest,
+    applied: &mut SearchAppliedQuery,
+    exact: &mut Option<ExactArticlePlan>,
+    document_id: &str,
+    article_number: &str,
+    arabic_article_number: &str,
+) -> Result<(), RetrievalError> {
+    if let Some(filtered) = normalized.document_id.as_deref() {
+        if filtered != document_id {
+            return Err(RetrievalError::InvalidRequest(
+                "document_id conflicts with the resolved law name".to_owned(),
+            ));
+        }
+    }
+    normalized.document_id = Some(document_id.to_owned());
+    // Search the stored canonical Chinese spelling.  The comparison below is
+    // literal and document-scoped, so `第一条` cannot accidentally include
+    // `第十条`.
+    normalized.query = article_number.to_owned();
+    normalized.match_mode = SearchMatchMode::Phrase;
+    *applied = applied_query_for(
+        normalized,
+        Some(document_id.to_owned()),
+        Some(article_number.to_owned()),
+    );
+    *exact = Some(ExactArticlePlan {
+        document_id: document_id.to_owned(),
+        arabic_article_number: arabic_article_number.to_owned(),
+        article_number: article_number.to_owned(),
+    });
+    Ok(())
 }
 
 fn search_exact_page(
@@ -1963,6 +2154,7 @@ struct IndexedCandidates {
     rowids: Option<Vec<i64>>,
     candidate_count: u64,
     index_fallback: bool,
+    index_fallback_reason: Option<String>,
     // Keep the index connection registered through the authoritative source
     // query; cancellation must interrupt both SQLite connections.
     _registration: Option<CancellationRegistration>,
@@ -1981,10 +2173,12 @@ fn indexed_candidates(
             rowids: None,
             candidate_count: 0,
             index_fallback: true,
+            index_fallback_reason: Some(FALLBACK_REASON_UNSUPPORTED_TERM.to_owned()),
             _registration: None,
         });
     }
     let Some(index) = index else {
+        let has_terms = !query_terms(request).is_empty();
         return Ok(IndexedCandidates {
             rowids: None,
             candidate_count: 0,
@@ -1992,22 +2186,98 @@ fn indexed_candidates(
             // against a missing/stale derived index performs the complete
             // authoritative SQLite scan.  Exact law/article selectors take
             // their equality path before this function and remain false.
-            index_fallback: !query_terms(request).is_empty(),
+            index_fallback: has_terms,
+            index_fallback_reason: has_terms
+                .then_some(FALLBACK_REASON_INDEX_UNAVAILABLE.to_owned()),
             _registration: None,
         });
     };
     let registration = index.register_cancellation(cancellation)?;
     let terms = query_terms(request);
-    let candidates = index.article_rowids_for_terms(&terms, request.match_mode)?;
-    let candidate_count = candidates.as_ref().map_or(0, |candidates| {
+    let probe = index.article_rowids_for_terms_with_reason(
+        &terms,
+        request.match_mode,
+        Some(cancellation),
+    )?;
+    ensure_index_probe_not_cancelled(Some(cancellation))?;
+    let source_parameter_fallback = probe
+        .rowids
+        .as_ref()
+        .is_some_and(|candidates| !candidate_rows_fit_source_queries(request, candidates.len()));
+    let rowids = if source_parameter_fallback {
+        None
+    } else {
+        probe.rowids
+    };
+    let index_fallback_reason = if source_parameter_fallback {
+        Some(FALLBACK_REASON_PARAMETER_LIMIT.to_owned())
+    } else {
+        probe.fallback_reason.map(str::to_owned)
+    };
+    let candidate_count = rowids.as_ref().map_or(0, |candidates| {
         u64::try_from(candidates.len()).unwrap_or(u64::MAX)
     });
     Ok(IndexedCandidates {
-        index_fallback: candidates.is_none(),
-        rowids: candidates,
+        index_fallback: rowids.is_none() && index_fallback_reason.is_some(),
+        index_fallback_reason,
+        rowids,
         candidate_count,
         _registration: Some(registration),
     })
+}
+
+fn candidate_rows_fit_source_queries(request: &PagedSearchRequest, candidate_count: usize) -> bool {
+    let mut count_builder = SqlBuilder::new();
+    let _article_source = article_source_table(&mut count_builder);
+    let _filters = article_filters(&mut count_builder, request);
+    let _predicate = article_match_predicate(&mut count_builder, request);
+    let count_parameters = count_builder.values.len();
+    if !fits_sqlite_parameter_limit(count_parameters, candidate_count) {
+        return false;
+    }
+
+    let mut flat_builder = SqlBuilder::new();
+    let _flat_sql = article_page_sql(
+        &mut flat_builder,
+        request,
+        None,
+        Some((request.limit, request.offset)),
+    );
+    let flat_parameters = flat_builder.values.len() + 2;
+    if !fits_sqlite_parameter_limit(flat_parameters, candidate_count) {
+        return false;
+    }
+
+    let mut grouped_builder = SqlBuilder::new();
+    let _grouped_cte = document_cte(&mut grouped_builder, request, None);
+    let grouped_parameters = grouped_builder.values.len() + 2;
+    if !fits_sqlite_parameter_limit(grouped_parameters, candidate_count) {
+        return false;
+    }
+
+    // A grouped response executes a second query for up to `limit` law
+    // previews. Reserve that worst case before admitting index rowids;
+    // otherwise a page that fits the CTE can still exceed SQLite's variable
+    // limit while rendering previews. Applying this bound to both views keeps
+    // the candidate decision stable when the same query changes presentation.
+    let mut preview_builder = SqlBuilder::new();
+    let _article_source = article_source_table(&mut preview_builder);
+    let _article_score = article_score_expression(&mut preview_builder, request);
+    let _document_score = document_score_expression(&mut preview_builder, request);
+    let _filters = article_filters(&mut preview_builder, request);
+    let _predicate = article_match_predicate(&mut preview_builder, request);
+    let _candidate_filter = candidate_predicate(&mut preview_builder, None);
+    for _ in 0..request.limit as usize {
+        preview_builder.bind_text("");
+    }
+    let preview_parameters = preview_builder.values.len();
+    fits_sqlite_parameter_limit(preview_parameters, candidate_count)
+}
+
+fn fits_sqlite_parameter_limit(base_parameters: usize, candidate_count: usize) -> bool {
+    base_parameters
+        .checked_add(candidate_count)
+        .is_some_and(|total| total <= MAX_SQLITE_PARAMETERS)
 }
 
 fn article_page_sql(
@@ -2376,17 +2646,6 @@ fn document_score_expression(builder: &mut SqlBuilder, request: &PagedSearchRequ
                          OR EXISTS (SELECT 1 FROM law_aliases topic_aliases WHERE topic_aliases.document_id = documents.id AND (topic_aliases.alias LIKE {topic} ESCAPE '\\' OR topic_aliases.normalized_alias LIKE {topic} ESCAPE '\\'))
                     THEN 220000.0 ELSE 0.0 END"
         ));
-        // Contract queries should surface the currently applicable Civil Code
-        // contract provisions even though the document title itself does not
-        // contain “合同”.  The surrounding document predicate requires an
-        // actual article-text match, so this is a topic boost rather than a
-        // fabricated hit.  Other topics continue to use their aliases and
-        // literal article matches.
-        if term.contains('合') && term.contains('同') {
-            scores.push(
-                "CASE WHEN documents.title LIKE '%民法典%' THEN 1300000.0 ELSE 0.0 END".to_owned(),
-            );
-        }
     }
     format!("({})", scores.join(" + "))
 }
@@ -2579,6 +2838,32 @@ mod tests {
                 INSERT INTO law_articles VALUES ('local-a1','local','local-v1','第一条',1,NULL,'公司登记由地方机关负责。');
                 INSERT INTO law_aliases VALUES ('alias','national','公司法','公司法');
                 INSERT INTO law_aliases VALUES ('alias2','local','地方公司登记','地方公司登记');
+                ",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn ambiguous_law_fixture() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE issuing_authorities(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE law_documents(id TEXT PRIMARY KEY, title TEXT NOT NULL, document_type TEXT NOT NULL, authority_id TEXT NOT NULL, jurisdiction TEXT NOT NULL, effectiveness_level TEXT NOT NULL, status TEXT NOT NULL, promulgated_on TEXT, summary TEXT NOT NULL);
+                CREATE TABLE law_versions(id TEXT PRIMARY KEY, document_id TEXT NOT NULL, version_label TEXT NOT NULL, status TEXT NOT NULL, effective_from TEXT NOT NULL, effective_to TEXT, published_on TEXT, source_reference TEXT NOT NULL);
+                CREATE TABLE law_articles(id TEXT PRIMARY KEY, document_id TEXT NOT NULL, version_id TEXT NOT NULL, article_number TEXT NOT NULL, article_order INTEGER NOT NULL, title TEXT, content TEXT NOT NULL);
+                CREATE TABLE law_aliases(id TEXT PRIMARY KEY, document_id TEXT NOT NULL, alias TEXT NOT NULL, normalized_alias TEXT NOT NULL);
+                CREATE TABLE citation_metadata(article_id TEXT PRIMARY KEY, citation_id TEXT NOT NULL, canonical_label TEXT NOT NULL);
+                INSERT INTO issuing_authorities VALUES ('npc','全国人大');
+                INSERT INTO law_documents VALUES ('audit-law','审查法','law','npc','CN','national_law','in_force','2024-01-01','审查合成法');
+                INSERT INTO law_documents VALUES ('other-law','其他法','law','npc','CN','national_law','in_force','2024-01-01','其他合成法');
+                INSERT INTO law_versions VALUES ('audit-now-1','audit-law','现行版','in_force','2024-01-01',NULL,'2024-01-01','ambiguity-fixture');
+                INSERT INTO law_versions VALUES ('other-now-1','other-law','现行版','in_force','2024-01-01',NULL,'2024-01-01','ambiguity-fixture');
+                INSERT INTO law_articles VALUES ('audit-a1','audit-law','audit-now-1','第一条',1,NULL,'审查法第一条正文。');
+                INSERT INTO law_articles VALUES ('other-a1','other-law','other-now-1','第一条',1,NULL,'其他法第一条正文。');
+                INSERT INTO law_aliases VALUES ('audit-alias','audit-law','歧义合成法','歧义合成法');
+                INSERT INTO law_aliases VALUES ('other-alias','other-law','歧义合成法','歧义合成法');
                 ",
             )
             .unwrap();
@@ -2905,6 +3190,40 @@ mod tests {
         assert!(matches!(
             search_page_cancellable(&connection, None, request(SearchView::Flat), &cancellation),
             Err(RetrievalError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn explicit_document_id_resolves_only_a_matching_ambiguous_law_candidate() {
+        let connection = ambiguous_law_fixture();
+        let mut request = request(SearchView::Flat);
+        request.query = "歧义合成法第一条".to_owned();
+        request.limit = 20;
+
+        let ambiguous = search_page(&connection, None, request.clone()).unwrap();
+        assert_eq!(ambiguous.total, 0);
+        assert!(ambiguous.articles.is_empty());
+        assert_eq!(ambiguous.ambiguities.len(), 1);
+        assert_eq!(ambiguous.ambiguities[0].candidates.len(), 2);
+
+        request.document_id = Some("audit-law".to_owned());
+        let selected = search_page(&connection, None, request.clone()).unwrap();
+        assert_eq!(selected.total, 1);
+        assert_eq!(selected.articles[0].article_id, "audit-a1");
+        assert_eq!(
+            selected.applied_query.resolved_document_id.as_deref(),
+            Some("audit-law")
+        );
+        assert_eq!(
+            selected.applied_query.exact_article_number.as_deref(),
+            Some("第一条")
+        );
+
+        request.document_id = Some("unrelated-law".to_owned());
+        assert!(matches!(
+            search_page(&connection, None, request),
+            Err(RetrievalError::InvalidRequest(message))
+                if message.contains("not a candidate")
         ));
     }
 

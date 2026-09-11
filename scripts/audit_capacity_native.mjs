@@ -6,14 +6,17 @@ import { root, startServer, sleep } from "./ai_test_client.mjs";
 
 const output = path.join(path.resolve(process.env.LAWYER_AUDIT_OUTPUT || path.join(root, "work/retest-121")), "capacity-native");
 await fs.mkdir(output, { recursive:true });
+try { await fs.access(path.join(output, "report.json")); throw new Error("evidence_directory_already_used"); } catch (error) { if (error.code !== "ENOENT") throw error; }
 const data = await fs.mkdtemp(path.join(output, "workspace-"));
 let service;
 const controllers = [];
 const requests = [];
 const snapshots = [];
 const checks = [];
+const drainSamples = [];
 try {
-  service = await startServer(data, path.resolve(process.argv[2] || path.join(root,"target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe")), path.join(root,"data/runtime/legal_core.sqlite"), { portable:true });
+  const corpus = path.resolve(process.argv[3] || process.env.LAWYER_AUDIT_CORPUS || path.join(root,"work/retest-121/public-corpus"));
+  service = await startServer(data, path.resolve(process.argv[2] || path.join(root,"target/x86_64-pc-windows-msvc/debug/lawyer-assistance.exe")), path.join(corpus,"legal_core.sqlite"), { portable:true });
   const client = service.client;
   const health = async () => {
     const result = await client.request("/api/v1/health");
@@ -60,6 +63,7 @@ try {
   assert.equal(drained.search.waiting, 0);
   const drainMs = Date.now() - cancelledAt;
   assert(drainMs < 6000);
+  drainSamples.push(drainMs);
   checks.push("disconnect_cancels_waiters_and_underlying_sqlite_workers");
   const sharedQuery = `${client.origin}/api/v1/legal/search/page?${new URLSearchParams({query:`龘${process.pid}99999`,view:"flat",version_scope:"all"})}`;
   const ownerController = new AbortController();
@@ -80,13 +84,46 @@ try {
   for (let n = 0; n < 20 && (await health()).search.active; n++) await sleep(20);
   assert.equal((await health()).search.active, 0);
   checks.push("shared_query_survives_owner_disconnect_until_last_subscriber_finishes");
+  // Repeat with new keys so cancellation latency describes several actual
+  // SQLite workloads, rather than cached empty pages or just fetch abortion.
+  for (let trial = 1; trial <= 4; trial++) {
+    const burstControllers = Array.from({ length: 18 }, () => new AbortController());
+    controllers.push(...burstControllers);
+    const burst = burstControllers.map((controller, n) => fetch(`${client.origin}/api/v1/legal/search/page?${new URLSearchParams({ query:`龘${process.pid}${trial}888${n}`, view:"flat", version_scope:"all" })}`, { headers:{cookie:client.cookie}, signal:controller.signal }).then(async response => ({ status:response.status, body:await response.json() })).catch(error => ({ aborted:error.name === "AbortError", error:error.name })));
+    let occupied;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      occupied = await health();
+      assert(occupied.search.active <= 2 && occupied.search.waiting <= 16);
+      if (occupied.search.active === 2 && occupied.search.waiting === 16) break;
+      await sleep(10);
+    }
+    assert.equal(occupied.search.active, 2);
+    assert.equal(occupied.search.waiting, 16);
+    const began = performance.now();
+    burstControllers.forEach(controller => controller.abort());
+    assert((await Promise.all(burst)).every(outcome => outcome.aborted));
+    let released;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      released = await health();
+      if (released.search.active === 0 && released.search.waiting === 0) break;
+      await sleep(20);
+    }
+    assert.equal(released.search.active, 0);
+    assert.equal(released.search.waiting, 0);
+    const elapsed = performance.now() - began;
+    assert(elapsed < 6000);
+    drainSamples.push(elapsed);
+  }
+  checks.push("five_distinct_full_queue_cancellations_release_underlying_work");
   assert.equal((await client.request("/api/v1/health")).status, "ready");
-  const report = {passed:true,checks,drain_ms:drainMs,snapshots};
+  const sorted = [...drainSamples].sort((a,b) => a-b);
+  const cancellation = { samples_ms:drainSamples, count:sorted.length, p50_ms:sorted[Math.ceil(sorted.length*.5)-1], p95_ms:sorted[Math.ceil(sorted.length*.95)-1], measure:"abort initiated until server search active/waiting both zero" };
+  const report = {passed:true,checks,drain_ms:drainMs,cancellation,snapshots};
   await fs.writeFile(path.join(output,"report.json"),JSON.stringify(report,null,2));
   console.log(JSON.stringify({passed:true,checks,drain_ms:drainMs}));
 } catch (error) {
   controllers.forEach(controller => controller.abort());
-  await fs.writeFile(path.join(output,"report.json"),JSON.stringify({passed:false,checks,error:String(error),snapshots},null,2));
+  await fs.writeFile(path.join(output,"report.json"),JSON.stringify({passed:false,checks,error:String(error),drain_samples_ms:drainSamples,snapshots},null,2));
   throw error;
 } finally {
   if (service) await service.stop();
